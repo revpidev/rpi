@@ -1,0 +1,3 @@
+[submodule "external/pi"]
+	path = external/pi
+	url = https://github.com/earendil-works/pi.git
