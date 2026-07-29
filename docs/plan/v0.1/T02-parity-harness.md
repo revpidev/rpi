@@ -3,8 +3,8 @@
 - **状态**：未开始
 - **里程碑**：M0
 - **依赖**：T01
-- **上游对照**：`external/pi` 测试设施、faux provider、`docs/rpc.md` / `docs/session-format.md` 样例
-- **需求章节**：§11.1、§11.2（二进制体积）
+- **上游对照**：`external/pi` 测试设施、faux provider（`packages/ai/src/providers/faux.ts`）、`docs/rpc.md` / `docs/session-format.md` 样例、`packages/evals/pi-harness.ts`（参考）
+- **需求章节**：§11.1、§11.2（二进制体积）；§5.5（faux 行为）
 - **预估**：0.5–0.8 人月（M0 共 1–1.5，与 T01 合计）
 
 ---
@@ -19,13 +19,14 @@
 ### In
 
 - `pir-test-support`：
-  - faux provider（确定性 stream 事件脚本驱动，编码规范 §12.4）
+  - faux provider（确定性 stream 事件脚本驱动，编码规范 §12.4）：脚本化响应队列 + 响应工厂、`tokensPerSecond`、usage 4 字符/token 估算、cache 模拟（sessionId 且 cacheRetention≠none）、队列空固定错误文案、`state.callCount`
   - 归一化器：剥离 timestamp / uuid / session id / cwd，其余字节保留（**全项目唯一实现**）
-  - diff 工具：归一化后比对事件序列 / JSONL 结构 / RPC transcript
+  - diff 工具：归一化后比对事件序列 / JSONL 结构（含**行序**）/ RPC transcript
   - `VirtualTerminal` 帧记录助手（T11/T12 复用）
 - fixtures 生成 runbook（`fixtures/README.md`）：在钉死 commit 的 `external/pi` 上用 faux provider + 固定 prompt 脚本跑标准场景，导出 session JSONL 与 RPC transcript 到 `fixtures/`（设计文档 §10.2）
-- 首批 fixtures：单轮问答、read/bash 工具调用、steering / follow-up（compaction 场景可随 T08 补）
-- Wasm ABI spike：wasmtime 宿主 + `registerTool` + 一个 dialog 往返的最小闭环
+- 首批 fixtures：单轮问答、read/bash 工具调用、steering / follow-up、**abort、length 截断整批失败**（compaction 场景随 T08 补、RPC 全命令 transcript 随 T10 补）
+- 逐条对拍级基准清单建立（需求 §11.1）：`session-format.md` / `rpc.md` / `compaction.md` / `keybindings.md` / `tmux.md` / `terminal-setup.md`，登记到 `fixtures/README.md`
+- Wasm ABI spike：wasmtime 宿主 + `registerTool` + 一个 dialog 往返 + **一个声明式 UI 组件描述渲染往返**（需求 §9.2 的协议形状验证）
 - 二进制体积实测：嵌入 wasmtime 的 release 单文件体积记录（目标 < 50MB，需求 §11.2）
 
 ### Out
@@ -51,10 +52,10 @@
 ## 自测清单
 
 - [ ] 归一化器单测：同一输出两次归一化结果幂等；timestamp/uuid/cwd 变化不影响 diff 结果
-- [ ] diff 工具对「归一化后相同」的输出判一致，对事件序/结构差异报错并定位
-- [ ] faux provider 可按脚本产出确定性 `StreamEvent` 序列
+- [ ] diff 工具对「归一化后相同」的输出判一致，对事件序/结构/行序差异报错并定位
+- [ ] faux provider 可按脚本产出确定性 `StreamEvent` 序列；cache 模拟与 tokensPerSecond 行为正确
 - [ ] runbook 按步骤可重新生成 fixtures（抽一条场景验证）
-- [ ] spike demo 运行成功：Wasm 插件注册工具并被宿主调用、dialog 往返完成
+- [ ] spike demo 运行成功：Wasm 插件注册工具并被宿主调用、dialog 往返完成、声明式组件描述渲染往返完成
 
 ## 门禁验收
 
@@ -64,7 +65,7 @@
 
 - [ ] `fixtures/` 下有首批样例且 `fixtures/README.md` runbook 完整可重复
 - [ ] 归一化 + diff 为 `pir-test-support` 单一实现
-- [ ] Wasm ABI spike 闭环演示通过
+- [ ] Wasm ABI spike 闭环演示通过（工具注册 + dialog + 组件描述）
 - [ ] 二进制体积实测数据记录（是否 < 50MB；超标则登记偏离并评估）
 
 ## 偏离记录

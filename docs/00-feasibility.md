@@ -52,7 +52,7 @@ Pi 自称 **minimal terminal coding harness**：
 ┌──────────────────────────────────────────────────────────┐
 │  coding-agent：CLI / 四种 Mode / Session / Ext / Skills  │
 ├──────────────────────────────────────────────────────────┤
-│  agent-core：Agent 状态机 + agentLoop + 可选 Harness     │
+│  agent-core：Agent 状态机 + agentLoop + Harness（已决策完整移植，ADR-0003）│
 ├──────────────────────────────────────────────────────────┤
 │  ai：Models / Provider / Api 协议 / Auth / Stream 事件   │
 ├──────────────────────────────────────────────────────────┤

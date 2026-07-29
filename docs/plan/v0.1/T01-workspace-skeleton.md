@@ -4,7 +4,7 @@
 - **里程碑**：M0
 - **依赖**：—
 - **上游对照**：`external/pi/packages/{ai,agent,tui,coding-agent}` 包结构与类型定义
-- **需求章节**：§1.4、§4.1、§4.2（类型面）；§10（单文件部署）
+- **需求章节**：§1.4、§4.1、§4.2（类型面）；§6.2（session 条目类型）；§10（单文件部署）
 - **预估**：0.5–0.7 人月（M0 共 1–1.5，与 T02 合计）
 
 ---
@@ -20,9 +20,12 @@
 
 - workspace `Cargo.toml` + `rustfmt.toml` + release profile（编码规范 §15.4）
 - 六个 crate 骨架：`pir-ai`、`pir-agent`、`pir-tui`、`pir`（bin + lib）、`pir-ext-host`、`pir-test-support`，依赖方向按设计文档 §2.2
-- `pir-ai` 核心类型：`Role` / `Message` / `Context` / `Tool` / `Model` / `ApiKind` / `AssistantMessage`（含 `stopReason` 全集 `stop|length|toolUse|error|aborted`，`pending` 仅瞬时不入 JSONL）
-- `pir-ai` `StreamEvent` 枚举完整定义（M0 锁定，见编码规范 §4.1）
-- `pir-agent` `AgentEvent` / `AgentTool` / `AgentMessage` 联合类型（含 `bashExecution` / `custom` / `branchSummary` / `compactionSummary`）
+- `pir-ai` 核心类型：`Role` / `Message` / `Context` / `Tool`（含 `constrained_sampling`）/ `Model`（含 `thinkingLevelMap` 三态、cost.tiers、headers、compat）/ `ApiKind` / `AssistantMessage`（含 `stopReason` 全集 `stop|length|toolUse|error|aborted`、`pending` 仅瞬时不入 JSONL；`api/provider/model/responseModel?/responseId?/diagnostics?/usage/errorMessage/timestamp`）
+- 签名与诊断字段：`ToolCall.thought_signature?`、`TextContent.text_signature?`、`ThinkingContent.thinking_signature?/redacted?`、`Usage.cache_write1h?/reasoning?`
+- `pir-ai` `StreamEvent` 枚举完整定义（M0 锁定，见编码规范 §4.1）：**变体携带 `content_index`，不同 block 事件可交错**
+- `pir-agent` `AgentEvent`（10 种，**含载荷**：`turn_end{message, toolResults}`、`agent_end{messages}`、`message_update{assistantMessageEvent}` 等）/ `AgentTool`（含 `execution_mode`、`prepare_arguments`）/ `AgentMessage` 联合类型（含 `bashExecution` / `custom` / `branchSummary` / `compactionSummary` 全字段，`ToolResultMessage.details/usage/addedToolNames/isError`）
+- 扩展消息 → LLM 文本格式常量：`COMPACTION_SUMMARY_PREFIX/SUFFIX`、`BRANCH_SUMMARY_PREFIX/SUFFIX`（逐字移植）
+- session 条目类型 serde 骨架：header + 9 种主路径条目 + compaction 两形态（`firstKeptEntryId` / `retainedTail`）+ harness 独有 `active_tools_change` / `leaf`（需求 §6.2）
 - `StreamFn` 类型别名与 `BoxStream` 定义（设计文档 §4.4）
 - 各 crate 主错误枚举占位（`AiError` / `AgentError` / …，`thiserror`）
 - 上游 pin 校验脚本（比对 `external/pi` HEAD 与 `UPSTREAM.md`）
@@ -30,7 +33,7 @@
 
 ### Out
 
-- 任何 API 适配器实现（T03）、agent loop 逻辑（T05）、TUI 渲染（T11）
+- 任何 API 适配器实现（T03）、agent loop 逻辑（T05）、harness 层（T16）、TUI 渲染（T11）
 - 对拍 harness（T02）
 
 ## 开发要点
@@ -51,7 +54,7 @@
 ## 自测清单
 
 - [ ] `cargo build --workspace` / `clippy -D warnings` / `fmt --check` 通过
-- [ ] 类型单测：`StreamEvent` / `AgentEvent` 序列化形状快照测试
+- [ ] 类型单测：`StreamEvent` / `AgentEvent` / session 条目序列化形状快照测试（含 compaction 两形态、签名字段）
 - [ ] pin 校验脚本在正确 commit 上通过；人为切到错误 commit 时失败（验证脚本有效性后切回）
 - [ ] 依赖方向检查：`pir-agent` 不依赖 provider 实现、`pir-tui` 不依赖 `pir-ai`/`pir-agent`（可用 `cargo tree` 核对）
 

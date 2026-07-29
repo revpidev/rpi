@@ -43,6 +43,7 @@ cargo test --workspace
 - 涉及行为契约的任务（事件序、线格式、session JSONL、compaction、RPC、TUI 渲染）必须跑归一化 diff 对拍：
   - fixtures 与归一化脚本来自 `pir-test-support` / `fixtures/`（T02 交付物）；
   - 对拍结果（命令 + 输出摘要）附在任务验收记录中。
+- **逐条对拍级基准**（需求 §11.1）：`session-format.md`、`rpc.md`、`compaction.md`、`keybindings.md`、`tmux.md`/`terminal-setup.md`——涉及这些领域的任务须附「文档条目 → 测试锚点」映射表。
 - 纯基建 / 内部重构类任务若不触碰行为契约，需在验收记录中说明「G3 不适用」的理由。
 
 ### G4 红线检查
@@ -56,6 +57,9 @@ cargo test --workspace
 - [ ] token 估算算法与常量未偏离钉死版 Pi
 - [ ] 非测试代码无 `unwrap()` / `expect()`（有不变式注释的除外）
 - [ ] 日志 / 错误消息中无 API key、token 等凭据
+- [ ] 范围排除项未被引入（ADR-0003 / 需求 §15）：无 server/evals/bun 对应物、无 pi-ai 包级 CLI、无 legacy 启动迁移（migrations.ts 对应物）
+- [ ] grep/find 未引入外部 rg/fd 二进制下载机制（ADR-0003 §2：Rust 原生实现）
+- [ ] session 文件写入未加文件锁（与上游一致；锁仅限 auth/settings/trust）
 
 ### G5 线格式与序列化
 
