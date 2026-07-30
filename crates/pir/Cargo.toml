@@ -1,0 +1,15 @@
+[package]
+name = "pir"
+description = "Port of @earendil-works/pi-coding-agent: CLI modes + lib SDK (the single assembly point)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pir-ai.workspace = true
+pir-agent.workspace = true
+pir-tui.workspace = true
+pir-ext-host.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

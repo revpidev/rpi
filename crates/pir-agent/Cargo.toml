@@ -1,0 +1,15 @@
+[package]
+name = "pir-agent"
+description = "Port of @earendil-works/pi-agent-core: agent loop, state, events, harness layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pir-ai.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true

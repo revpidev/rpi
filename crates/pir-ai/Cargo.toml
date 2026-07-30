@@ -1,0 +1,12 @@
+[package]
+name = "pir-ai"
+description = "Port of @earendil-works/pi-ai: types, stream events, API adapters, providers, auth (library only, no bin; ADR-0003 §4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true

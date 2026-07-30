@@ -1,0 +1,10 @@
+[package]
+name = "pir-test-support"
+description = "Test infrastructure: faux provider, golden JSONL fixtures, normalize/diff, VT helpers (dev-dependency only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true

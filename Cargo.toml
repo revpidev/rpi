@@ -1,0 +1,44 @@
+# Pir workspace — Rust isomorphic reimplementation of Pi (see docs/02-design.md §2).
+[workspace]
+resolver = "2"
+members = [
+    "crates/pir-ai",
+    "crates/pir-agent",
+    "crates/pir-tui",
+    "crates/pir",
+    "crates/pir-ext-host",
+    "crates/pir-test-support",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates (dependency rules: docs/02-design.md §2.1, coding-standards §2.2).
+pir-ai = { path = "crates/pir-ai" }
+pir-agent = { path = "crates/pir-agent" }
+pir-tui = { path = "crates/pir-tui" }
+pir-ext-host = { path = "crates/pir-ext-host" }
+pir-test-support = { path = "crates/pir-test-support" }
+
+# External baseline (coding-standards appendix A).
+serde = { version = "1", features = ["derive"] }
+# preserve_order: JSON object key order must survive round-trips (insertion order,
+# like JS objects) for byte-level wire-format parity with upstream.
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+
+# Single self-contained binary target (coding-standards §15.4).
+# No panic = "abort": the TUI relies on a panic hook to restore terminal state.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

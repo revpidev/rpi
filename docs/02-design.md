@@ -140,6 +140,8 @@ pub enum StreamEvent {
 
 关键字段契约：`AssistantMessage{api,provider,model,responseModel?,responseId?,diagnostics?,usage,stop_reason,error_message,timestamp}`；`Usage{cacheWrite1h?,reasoning?,totalTokens,cost{}}`；`ToolCall.thought_signature?`；`TextContent.text_signature?`；`ThinkingContent.thinking_signature?/redacted?`；`Tool.constrained_sampling`（json_schema strict prefer/require | grammar lark/regex）。
 
+> 表征适配（D-002，T01 已锁定）：`Api` 开放联合 → `ApiKind(String)` newtype + 已知常量；`Model.compat` 条件类型 → 平铺 `ModelCompat`（4 套 compat 接口合并，重名字段类型上游一致，线格式两方向兼容）；消息 `role` 字面值标签由单变体标记枚举承载，保证各消息 struct 独立序列化时自带 `role`。
+
 ### 3.3 Api 适配层
 
 ```
@@ -238,7 +240,8 @@ pir-ai/src/utils/
 |------|---------|------|
 | `agent_loop` | `agent-loop.ts` | 无状态循环，emit 事件；observational EventStream（无屏障） |
 | `agent` | `agent.ts` | 状态、全事件订阅屏障、队列、互斥 run |
-| `types` | `types.ts` | AgentEvent / AgentTool / AgentMessage（含扩展消息文本格式常量） |
+| `types` | `types.ts` | AgentEvent / AgentTool / AgentMessage（含扩展消息文本格式常量；D-002：声明合并折叠进 `messages.rs`，AgentTool 为 `async_trait`） |
+| `session` | `session-manager.ts`（条目类型）+ `harness/types.ts`（SessionTreeEntry） | session 条目 serde 类型单一来源（D-001，T01 落地）；行为逻辑仍在 T07（pir）/ T16（harness） |
 | `harness` | `harness/*` | **完整移植**（ADR-0003 §1）：AgentHarness、SessionStorage/Repo 抽象、JSONL+InMemory、compaction/branch-summary/skills/prompt-templates/默认工具工厂、`stream_proxy` |
 
 `pir`（coding-agent 对应 crate）**不使用** harness——它有自己的 AgentSession/SessionManager/tools（与 Pi 一致）；harness 作为 `pir-agent` 的公共可选层，供 SDK 嵌入方与对拍使用。harness 与 coding-agent 实现的行为差异以 coding-agent 为对拍基准。
@@ -619,7 +622,8 @@ gantt
 | `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（生成）+ `pir update --models`（远程） |
 | `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
 | `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
-| `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*` |
+| `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001） |
+| `packages/coding-agent/src/core/session-manager.ts`（条目类型）+ `packages/agent/src/harness/types.ts`（SessionTreeEntry） | `crates/pir-agent/src/session.rs`（D-001：单一 serde 来源，T07/T16 共用） |
 | `packages/tui/src/tui.ts` | `crates/pir-tui/src/tui.rs` |
 | `packages/tui/src/keys.ts` / `stdin-buffer.ts` / `terminal.ts` | `crates/pir-tui/src/keys.rs` / `stdin_buffer.rs` / `terminal.rs` |
 | `packages/tui/src/components/*`（12 个） | `crates/pir-tui/src/components/*` |

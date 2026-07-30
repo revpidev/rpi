@@ -1,0 +1,2 @@
+# Workspace-wide rustfmt config (coding-standards §13.6). Crates must not override.
+edition = "2021"

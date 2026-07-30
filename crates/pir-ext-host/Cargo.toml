@@ -1,0 +1,9 @@
+[package]
+name = "pir-ext-host"
+description = "Rust + Wasm extension host (no JS execution; ADR-0001)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true

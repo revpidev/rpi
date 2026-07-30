@@ -1,0 +1,9 @@
+[package]
+name = "pir-tui"
+description = "Port of @earendil-works/pi-tui: components, diff renderer, keybindings (crossterm only, no ratatui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
