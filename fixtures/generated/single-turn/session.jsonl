@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"019fb0cc-ec89-7a11-8774-8ba7acae4622","timestamp":"2026-07-30T02:14:07.753Z","cwd":"/tmp/pir-fixture-single-turn-PkAXqR/workspace"}
+{"type":"model_change","id":"3b3c5858","parentId":null,"timestamp":"2026-07-30T02:14:07.755Z","provider":"faux","modelId":"faux-1"}
+{"type":"thinking_level_change","id":"6519b763","parentId":"3b3c5858","timestamp":"2026-07-30T02:14:07.755Z","thinkingLevel":"off"}
+{"type":"message","id":"67e7b122","parentId":"6519b763","timestamp":"2026-07-30T02:14:07.760Z","message":{"role":"user","content":[{"type":"text","text":"Say hello."}],"timestamp":1785377647759}}
+{"type":"message","id":"aa78df9c","parentId":"67e7b122","timestamp":"2026-07-30T02:14:07.761Z","message":{"role":"assistant","content":[{"type":"text","text":"Hello from the faux provider!"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":1353,"output":8,"cacheRead":0,"cacheWrite":1353,"totalTokens":2714,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1785377647758}}

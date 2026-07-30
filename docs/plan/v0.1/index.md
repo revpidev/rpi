@@ -39,7 +39,7 @@
 | ID | 任务 | 里程碑 | 依赖 | 状态 | 验收日期 |
 |----|------|--------|------|------|----------|
 | T01 | [工程骨架与类型契约锁定](./T01-workspace-skeleton.md) | M0 | — | 已完成 | 2026-07-30 |
-| T02 | [对拍基建与关键技术验证](./T02-parity-harness.md) | M0 | T01 | 未开始 | — |
+| T02 | [对拍基建与关键技术验证](./T02-parity-harness.md) | M0 | T01 | 已完成 | 2026-07-30 |
 | T03 | [pir-ai 核心协议（Anthropic + OpenAI 系）](./T03-pir-ai-core-protocols.md) | M1 | T01 | 未开始 | — |
 | T04 | [pir-ai Auth 基础](./T04-pir-ai-auth.md) | M1 | T03 | 未开始 | — |
 | T05 | [pir-agent：agent_loop 与 Agent](./T05-pir-agent-loop.md) | M2 | T01、T02 | 未开始 | — |

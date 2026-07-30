@@ -1,7 +1,10 @@
 # Rust
 /target/
 **/*.rs.bk
+# wasm spike guest（独立 workspace 的构建产物）
+/crates/pir-ext-host/examples/wasm-spike/guest/target/
 
 # 编辑器与系统
 *.swp
 .DS_Store
+.tooling/

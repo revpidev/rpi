@@ -1,6 +1,6 @@
 # T02：对拍基建与关键技术验证
 
-- **状态**：未开始
+- **状态**：已完成
 - **里程碑**：M0
 - **依赖**：T01
 - **上游对照**：`external/pi` 测试设施、faux provider（`packages/ai/src/providers/faux.ts`）、`docs/rpc.md` / `docs/session-format.md` 样例、`packages/evals/pi-harness.ts`（参考）
@@ -43,19 +43,19 @@
 
 ## 进度跟踪
 
-- [ ] 设计细化
-- [ ] 实现
-- [ ] 自测
-- [ ] 门禁验收
-- [ ] 文档回写
+- [x] 设计细化
+- [x] 实现
+- [x] 自测
+- [x] 门禁验收
+- [x] 文档回写
 
 ## 自测清单
 
-- [ ] 归一化器单测：同一输出两次归一化结果幂等；timestamp/uuid/cwd 变化不影响 diff 结果
-- [ ] diff 工具对「归一化后相同」的输出判一致，对事件序/结构/行序差异报错并定位
-- [ ] faux provider 可按脚本产出确定性 `StreamEvent` 序列；cache 模拟与 tokensPerSecond 行为正确
-- [ ] runbook 按步骤可重新生成 fixtures（抽一条场景验证）
-- [ ] spike demo 运行成功：Wasm 插件注册工具并被宿主调用、dialog 往返完成、声明式组件描述渲染往返完成
+- [x] 归一化器单测：同一输出两次归一化结果幂等；timestamp/uuid/cwd 变化不影响 diff 结果
+- [x] diff 工具对「归一化后相同」的输出判一致，对事件序/结构/行序差异报错并定位
+- [x] faux provider 可按脚本产出确定性 `StreamEvent` 序列；cache 模拟与 tokensPerSecond 行为正确
+- [x] runbook 按步骤可重新生成 fixtures（抽一条场景验证）
+- [x] spike demo 运行成功：Wasm 插件注册工具并被宿主调用、dialog 往返完成、声明式组件描述渲染往返完成
 
 ## 门禁验收
 
@@ -63,17 +63,34 @@
 
 任务特有标准：
 
-- [ ] `fixtures/` 下有首批样例且 `fixtures/README.md` runbook 完整可重复
-- [ ] 归一化 + diff 为 `pir-test-support` 单一实现
-- [ ] Wasm ABI spike 闭环演示通过（工具注册 + dialog + 组件描述）
-- [ ] 二进制体积实测数据记录（是否 < 50MB；超标则登记偏离并评估）
+- [x] `fixtures/` 下有首批样例且 `fixtures/README.md` runbook 完整可重复
+- [x] 归一化 + diff 为 `pir-test-support` 单一实现
+- [x] Wasm ABI spike 闭环演示通过（工具注册 + dialog + 组件描述）
+- [x] 二进制体积实测数据记录（是否 < 50MB；超标则登记偏离并评估）
 
 ## 偏离记录
 
 | 偏离 ID | 摘要 | 状态 |
 |---------|------|------|
-| — | （暂无） | — |
+| D-003 | faux provider 确定性化（切块 / 默认 id / 默认 timestamp / 同步工厂；chars/4 usage 估算） | 已关闭 |
 
 ## 验收记录
 
-（待填写，模板见 `gates.md` §3）
+- 验收日期：2026-07-30
+- 验收人：实现者自证（单人开发，按 gates.md §1 逐项自证）
+- G1 构建/静态检查：通过。`cargo fmt --all -- --check` FMT-OK；`cargo build --workspace` Finished；`cargo clippy --workspace --all-targets -- -D warnings` exit=0（工具链：`.tooling/` 内 1.97.1，与系统 rustc 同版本，见 `crates/pir-ext-host/examples/wasm-spike/README.md` 工具链说明）
+- G2 测试：通过（`cargo test --workspace`：63 passed, 0 failed；pir-agent 17 + pir-ai 13 + pir-test-support 27 + fixtures_smoke 6；无 live 测试，非 live 测试不访问网络）
+- G3 对拍：通过（本任务交付对拍工具本身，以归一化/diff 自测替代）。证据：
+  - 归一化幂等 / id 一致映射 / uuid·cwd·timestamp 剥离：normalize.rs 6 单测 + fixtures_smoke 6 测全过；
+  - runbook 可重复性抽验：`node fixtures/generate-fixtures.mjs single-turn` 重生成后 `cargo run -p pir-test-support --example normalize-diff -- <before> <after>` 输出 `OK: inputs are equal after normalization`，exit=0；
+  - events.jsonl 对拍粒度说明（上游 delta 切块非确定）已登记：`fixtures/README.md` §2、D-003
+- G4 红线：通过。`external/pi` HEAD=2efa728、`git status --porcelain` 为空（npm ci 的 node_modules 与 dist 均 gitignored）；未引入 JS/TS 执行能力（wasmtime 为 Wasm runtime）；未读写 `~/.pi`/`.pi`（fixtures 生成全程临时目录）；无 SQLite；token 估算 4 字符/token（D-003 注明 chars/4，BMP 等价）；非测试代码仅 3 处 expect 均有不变式注释（normalize.rs ×2、vt.rs ×1、faux.rs mutex ×1）；无凭据日志；无范围排除项；grep/find 未涉及；无 session 写代码
+- G5 线格式：不适用（本任务未新增线格式类型；fixtures 为上游自身产出格式，faux 复用 T01 已验收的 `pir-ai` 类型）
+- G6 文档同步：通过。回写位置：`02-design.md` §3.7（faux 确定性化）、`fixtures/README.md`（runbook + 逐条对拍基准清单 + events.jsonl 粒度）、`crates/pir-ext-host/examples/wasm-spike/README.md`（spike runbook + musl 实测方法）、溯源注释（faux.rs / normalize.rs / 各新模块文件头）
+- G7 偏离闭环：通过（D-003 已登记并回写，状态「已回写」；无行为级偏离）
+- 任务特有标准：
+  - fixtures 首批 5 场景（single-turn / tool-calls / steering-followup / abort / length-truncation）+ runbook ✅
+  - 归一化 + diff 单一实现于 `pir-test-support`（normalize.rs / diff.rs，lib.rs 文件头声明禁止另写）✅
+  - Wasm ABI spike 闭环：`cargo run -p pir-ext-host --example wasm_spike` 输出 `WASM SPIKE OK`，exit=0（registerTool + dialog + 声明式组件渲染两帧往返）✅
+  - 二进制体积实测：**12.4MB（13,001,728 字节）< 50MB** ✅。`CC_x86_64_unknown_linux_musl=gcc RUSTFLAGS="-C linker=rust-lld" cargo build --release -p pir --target x86_64-unknown-linux-musl`，wasmtime 47.0.2（默认 features，`--wasm-smoke` 钩子强制链入），musl 静态二进制运行 `--wasm-smoke` 输出 `wasmtime engine ok` ✅
+- 结论：**通过**

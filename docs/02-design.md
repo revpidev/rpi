@@ -230,6 +230,8 @@ pir-ai/src/utils/
 
 脚本化响应队列 + 响应工厂 + `tokensPerSecond` + usage 4 字符/token 估算 + cache 模拟（sessionId 且 cacheRetention≠none）+ `state.callCount`；队列空固定错误文案。对拍基建的核心（§10）。
 
+实现位于 `pir-test-support/src/faux.rs`（T02）。为可重复性做了确定性化（偏离 D-003）：delta 切块 min..=max 循环替代 `Math.random`、默认 id 用线程局部计数器、默认 timestamp=0、响应工厂为同步闭包；usage 估算按 chars/4（BMP 与上游 UTF-16/4 等价）。这些只影响测试基建内部，delta 边界不入对拍契约（fixtures 锚点粒度见 `fixtures/README.md` §2）。
+
 ---
 
 ## 4. `pir-agent` 设计

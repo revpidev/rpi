@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"019fb0d5-855c-7b74-aadc-0fff29bd4e07","timestamp":"2026-07-30T02:23:31.164Z","cwd":"/tmp/pir-fixture-abort-lWoBXX/workspace"}
+{"type":"model_change","id":"631c460d","parentId":null,"timestamp":"2026-07-30T02:23:31.164Z","provider":"faux","modelId":"faux-1"}
+{"type":"thinking_level_change","id":"89640e70","parentId":"631c460d","timestamp":"2026-07-30T02:23:31.164Z","thinkingLevel":"off"}
+{"type":"message","id":"ab4a9c80","parentId":"89640e70","timestamp":"2026-07-30T02:23:31.164Z","message":{"role":"user","content":[{"type":"text","text":"Give me a long answer."}],"timestamp":1785378211164}}
+{"type":"message","id":"bd224e4f","parentId":"ab4a9c80","timestamp":"2026-07-30T02:23:31.245Z","message":{"role":"assistant","content":[{"type":"text","text":""}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":1354,"output":138,"cacheRead":0,"cacheWrite":1354,"totalTokens":2846,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"aborted","errorMessage":"Request was aborted","timestamp":1785378211245}}

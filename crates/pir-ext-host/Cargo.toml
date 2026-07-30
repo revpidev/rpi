@@ -7,3 +7,10 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Wasm (L1) extension runtime, embedded into the single release binary
+# (design §7.2; coding-standards appendix A). Used by the T02 ABI spike
+# (examples/wasm_spike.rs); the real host lands in T15.
+wasmtime = "47"
+
+[dev-dependencies]
+serde_json.workspace = true

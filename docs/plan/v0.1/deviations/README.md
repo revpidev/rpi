@@ -30,6 +30,7 @@
 |----|------|------|------|----------|-----|------|
 | D-001 | T01 | 实现细节 | session 条目类型单一来源化（`pir-agent::session`，合并 coding-agent 与 harness 两套定义） | `02-design.md` §4.1、§12 | 不需要 | 已回写 |
 | D-002 | T01 | 实现细节 | TS 类型系统特性的 Rust 表达（声明合并折叠、compat 条件类型合并、AgentTool trait 化、Api 开放联合 newtype 化） | `02-design.md` §3.2、§4.1 | 不需要 | 已回写 |
+| D-003 | T02 | 实现细节 | faux provider 确定性化（切块 / 默认 id / 默认 timestamp / 同步工厂；chars/4 usage 估算） | `02-design.md` §3.7、`fixtures/README.md` §2 | 不需要 | 已关闭 |
 
 ## 4. 状态定义
 
