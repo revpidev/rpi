@@ -25,7 +25,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -125,6 +125,35 @@ pub enum ModelThinkingLevel {
 /// Three-state per level: key absent = provider default, `None` (JSON null) =
 /// level unsupported, `Some(value)` = provider/model-specific mapped value.
 pub type ThinkingLevelMap = std::collections::BTreeMap<ModelThinkingLevel, Option<String>>;
+
+impl ThinkingLevel {
+    /// The corresponding [`ModelThinkingLevel`] variant.
+    pub fn to_model_level(self) -> ModelThinkingLevel {
+        match self {
+            ThinkingLevel::Minimal => ModelThinkingLevel::Minimal,
+            ThinkingLevel::Low => ModelThinkingLevel::Low,
+            ThinkingLevel::Medium => ModelThinkingLevel::Medium,
+            ThinkingLevel::High => ModelThinkingLevel::High,
+            ThinkingLevel::Xhigh => ModelThinkingLevel::Xhigh,
+            ThinkingLevel::Max => ModelThinkingLevel::Max,
+        }
+    }
+}
+
+impl ModelThinkingLevel {
+    /// The wire-format level name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelThinkingLevel::Off => "off",
+            ModelThinkingLevel::Minimal => "minimal",
+            ModelThinkingLevel::Low => "low",
+            ModelThinkingLevel::Medium => "medium",
+            ModelThinkingLevel::High => "high",
+            ModelThinkingLevel::Xhigh => "xhigh",
+            ModelThinkingLevel::Max => "max",
+        }
+    }
+}
 
 /// `ChatTemplateKwargValue`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -493,6 +522,27 @@ pub enum UserContent {
     Blocks(Vec<UserContentBlock>),
 }
 
+impl Default for UserContent {
+    /// Matches the upstream null-content normalization `content: []`
+    /// (transform-messages.ts:71-73).
+    fn default() -> Self {
+        UserContent::Blocks(Vec::new())
+    }
+}
+
+/// Deserializes `null` as `Default::default()`. Tolerates untyped upstream
+/// inputs — custom tools, hand-built histories, old session files — that carry
+/// `content: null`; upstream normalizes these in `transformMessages`
+/// (transform-messages.ts:71-73), which in Rust must happen at the
+/// deserialization boundary since the types cannot hold null.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// `Usage`. Token counts are integers upstream; costs are dollars (floats).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -549,6 +599,7 @@ pub enum StopReason {
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     pub role: UserRole,
+    #[serde(deserialize_with = "null_default")]
     pub content: UserContent,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
@@ -559,6 +610,7 @@ pub struct UserMessage {
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
     pub role: AssistantRole,
+    #[serde(deserialize_with = "null_default")]
     pub content: Vec<AssistantContent>,
     pub api: ApiKind,
     pub provider: String,
@@ -589,6 +641,7 @@ pub struct ToolResultMessage {
     pub tool_call_id: String,
     pub tool_name: String,
     /// Supports text and images.
+    #[serde(deserialize_with = "null_default")]
     pub content: Vec<ToolResultContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
@@ -1249,6 +1302,36 @@ mod tests {
 
     fn to_json<T: Serialize>(v: &T) -> String {
         serde_json::to_string(v).expect("serialization must succeed")
+    }
+
+    #[test]
+    fn message_content_null_deserializes_as_empty() {
+        // Upstream tolerates `content: null` from untyped callers and old
+        // session files (transform-messages.ts:71-73, normalizes to `[]`).
+        let assistant: AssistantMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": null, "api": "anthropic-messages",
+            "provider": "p", "model": "m",
+            "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+                      "totalTokens": 0,
+                      "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0,
+                               "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": "stop", "timestamp": 0
+        }))
+        .expect("assistant with null content");
+        assert_eq!(assistant.content, vec![]);
+
+        let tool_result: ToolResultMessage = serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": "c1", "toolName": "bash",
+            "content": null, "isError": false, "timestamp": 0
+        }))
+        .expect("tool result with null content");
+        assert_eq!(tool_result.content, vec![]);
+
+        let user: UserMessage = serde_json::from_value(json!({
+            "role": "user", "content": null, "timestamp": 0
+        }))
+        .expect("user with null content");
+        assert_eq!(user.content, UserContent::Blocks(vec![]));
     }
 
     #[test]

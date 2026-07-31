@@ -158,19 +158,16 @@ pir-ai/src/api/
   pi_messages.rs
 ```
 
-每个适配器实现：
+每个适配器实现（D-004，T03 已落地）：
 
 ```rust
-#[async_trait]
-pub trait ApiStream: Send + Sync {
-    async fn stream(
-        &self,
-        model: &Model,
-        ctx: &Context,
-        opts: StreamOptions,
-    ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>; // 错误编码为事件，不 Err
+pub trait ProviderStreams: Send + Sync {
+    fn stream(&self, model: &Model, ctx: &Context, opts: Option<StreamOptions>) -> AssistantMessageEventStream;
+    fn stream_simple(&self, model: &Model, ctx: &Context, opts: Option<SimpleStreamOptions>) -> AssistantMessageEventStream;
 }
 ```
+
+同步方法直接返回推送式事件流句柄（对齐上游 `StreamFunction` 形状；错误编码为事件，不返回 Err）。T03 已交付 `anthropic_messages.rs` / `openai_completions.rs`（含 `detect_compat` 表驱动矩阵）/ `openai_responses.rs` + `openai_responses_shared.rs`；清单中其余适配器随 T13 落地。HTTP 层为 reqwest 直连 + 自写 `SseDecoder`，不经过官方 SDK，逐项可观测差异见 D-005（SDK 头/默认超时缺失、严格 SSE 解析文案、`metadata.raw` 取自 HTTP body 等）。
 
 `Models::stream` / `stream_simple` 按 `model.api` 分发（混合 API provider 的 api map 分发，缺 API 时报 stream error）；thinking 在 `stream_simple` 层统一映射（clamp、预算默认表、xhigh/max 预算路径降为 high）；`clamp_max_tokens_to_context`（4096 安全余量，下限 1）。
 
@@ -182,7 +179,7 @@ pub trait ApiStream: Send + Sync {
 
 - `Provider` trait：模型列表、默认 base URL、auth 解析、`filter_models?`、`refresh_models?`、stream/streamSimple
 - 38 个内置工厂（需求 §5.3 清单）；`create_provider` 支持单 API 或按 `model.api` 分发的混合 map；动态 overlay 与 baseline 按 id 合并；`inflight_refresh` 去重
-- 模型目录为**生成物**：`build.rs` 从 models.dev 数据生成内置 catalog（对齐 `generate-models.ts` 的修正规则：定价、能力位、Kimi 零价、strict 能力等）；`pir update --models` 远程 overlay（ETag/4h 新鲜度/generatedAt 比对，对齐 coding-agent `remote-catalog-provider.ts`）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag）+ `refresh({allow_network:false})` 离线恢复
+- 模型目录为**生成物**：`build.rs` 从 models.dev 数据生成内置 catalog（对齐 `generate-models.ts` 的修正规则：定价、能力位、Kimi 零价、strict 能力等；T03 已落 `build.rs` 占位与 `generated.rs` include 机制，空 catalog，正式数据管线在 T13/T14）；`pir update --models` 远程 overlay（ETag/4h 新鲜度/generatedAt 比对，对齐 coding-agent `remote-catalog-provider.ts`）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag，T03 已交付内存与 JSON 文件两实现）+ `refresh({allow_network:false})` 离线恢复。用户 `models.json` 加载移植自 coding-agent `model-config.ts`，落 `pir-ai/src/models_json.rs`（JSONC stripJsonComments、serde+手工校验 pass，措辞差异见 D-006）
 - 应用可按需只注册子集（feature flags 等价 tree-shake）
 
 ### 3.5 Auth
@@ -216,10 +213,13 @@ pir-ai/src/utils/
   overflow.rs             # 三分支 isContextOverflow（pattern 表 / silent / 截断式）
   estimate.rs             # chars/4、image=4800、usage 锚点 trailing 估算
   json_parse.rs           # 流式 partial JSON + repair
-  validation.rs           # 工具参数 schema 校验（TypeBox/JSON-Schema 双路径）+ 宽松类型强转
-  sanitize_unicode.rs     # 去孤立 surrogate
+  validation.rs           # 工具参数 schema 校验（jsonschema 单路径 + 宽松类型强转；措辞 ≠ TypeBox，D-006）
+  sanitize_unicode.rs     # 去孤立 surrogate（Rust String 无孤代理，恒等实现，D-007）
   error_body.rs           # 各 SDK 错误形状归一化，body 截 4000
   deferred_tools.rs       # addedToolNames / splitDeferredTools
+  event_stream.rs         # AssistantMessageEventStream（推送式事件流，result() 屏障）
+  headers.rs              # header 大小写不敏感合并、null 删除、reqwest HeaderMap 转换
+  hash.rs                 # shortHash（id 归一化回填用）
   session_resources.rs    # Codex WS 等 per-session 资源清理
   cost.rs                 # calculateCost：tiers 阶梯（tier 口径 input+cacheRead+cacheWrite 取最高阈值，request-wide）+ cacheWrite1h 按 2× input 硬编码 + service tier 乘数
 ```
@@ -621,6 +621,7 @@ gantt
 | `packages/ai/src/auth/*` | `crates/pir-ai/src/auth/*` |
 | `packages/ai/src/utils/*`（transform/retry/overflow/estimate/…） | `crates/pir-ai/src/utils/*` |
 | `packages/ai/src/models.ts` / `models-store.ts` | `crates/pir-ai/src/models.rs` / `models_store.rs` |
+| `packages/coding-agent/src/core/model-config.ts`（models.json 加载） | `crates/pir-ai/src/models_json.rs`（D-006：serde 校验替代 TypeBox） |
 | `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（生成）+ `pir update --models`（远程） |
 | `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
 | `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
