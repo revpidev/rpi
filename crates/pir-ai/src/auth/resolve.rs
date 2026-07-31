@@ -299,3 +299,521 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    //! 自测清单（docs/plan/v0.1/T04-pir-ai-auth.md）解析链断言，期望语义逐条
+    //! 对照 `packages/ai/src/auth/resolve.ts` @ pi 0.82.1 (2efa728)：
+    //! 显式 apiKey 在 `readCredential` 之前返回；stored credential 拥有
+    //! provider（无匹配 handler → undefined，绝不回退 ambient）；OAuth 过期
+    //! 在 modify 锁内双检查刷新，刷新失败抛 `ModelsError("oauth")` 且不回退
+    //! env。
+
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use serde_json::Map;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::auth::credential_store::InMemoryCredentialStore;
+    use crate::auth::types::{
+        ApiKeyAuth, CredentialInfo, CredentialStore, ModelAuth, ModifyFn, OAuthAuth,
+    };
+
+    const ENV_VAR: &str = "TEST_RESOLVE_API_KEY";
+
+    // ------------------------------------------------------------------
+    // Fakes
+    // ------------------------------------------------------------------
+
+    /// Records `env()` calls; `env_values` stands in for the process env.
+    struct RecordingAuthContext {
+        env_values: HashMap<String, String>,
+        env_calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingAuthContext {
+        fn with(entries: &[(&str, &str)]) -> Self {
+            Self {
+                env_values: entries
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                env_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::with(&[])
+        }
+
+        fn env_calls(&self) -> Vec<String> {
+            self.env_calls.lock().expect("env calls").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AuthContext for RecordingAuthContext {
+        async fn env(&self, name: &str) -> Option<String> {
+            self.env_calls
+                .lock()
+                .expect("env calls")
+                .push(name.to_owned());
+            self.env_values.get(name).cloned()
+        }
+
+        async fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
+
+    /// Mirrors upstream `envApiKeyAuth.resolve` (auth/helpers.ts): a stored
+    /// key wins, otherwise the configured env var resolves through `ctx.env`.
+    /// Records whether it was invoked with a stored credential.
+    struct FakeApiKeyAuth {
+        received_credential: Mutex<Vec<bool>>,
+    }
+
+    impl FakeApiKeyAuth {
+        fn new() -> Self {
+            Self {
+                received_credential: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn received_credential(&self) -> Vec<bool> {
+            self.received_credential.lock().expect("received").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for FakeApiKeyAuth {
+        fn name(&self) -> &str {
+            "Test API key"
+        }
+
+        async fn resolve(
+            &self,
+            ctx: &dyn AuthContext,
+            credential: Option<&ApiKeyCredential>,
+        ) -> Result<Option<AuthResult>, ModelsError> {
+            self.received_credential
+                .lock()
+                .expect("received")
+                .push(credential.is_some());
+            if let Some(credential) = credential {
+                if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
+                    return Ok(Some(AuthResult {
+                        auth: ModelAuth {
+                            api_key: Some(key),
+                            headers: None,
+                            base_url: None,
+                        },
+                        env: credential.env.clone(),
+                        source: Some("stored credential".to_owned()),
+                    }));
+                }
+            }
+            if let Some(value) = ctx.env(ENV_VAR).await.filter(|value| !value.is_empty()) {
+                return Ok(Some(AuthResult {
+                    auth: ModelAuth {
+                        api_key: Some(value),
+                        headers: None,
+                        base_url: None,
+                    },
+                    env: None,
+                    source: Some(ENV_VAR.to_owned()),
+                }));
+            }
+            Ok(None)
+        }
+    }
+
+    /// Counts `refresh` calls; `to_auth` derives `apiKey = access` like the
+    /// upstream anthropic OAuth handler.
+    struct FakeOAuthAuth {
+        refresh_calls: AtomicUsize,
+        refresh_error: Option<String>,
+    }
+
+    impl FakeOAuthAuth {
+        fn succeeding() -> Self {
+            Self {
+                refresh_calls: AtomicUsize::new(0),
+                refresh_error: None,
+            }
+        }
+
+        fn failing(message: &str) -> Self {
+            Self {
+                refresh_calls: AtomicUsize::new(0),
+                refresh_error: Some(message.to_owned()),
+            }
+        }
+
+        fn refresh_calls(&self) -> usize {
+            self.refresh_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl OAuthAuth for FakeOAuthAuth {
+        fn name(&self) -> &str {
+            "Test OAuth"
+        }
+
+        async fn refresh(
+            &self,
+            credential: &OAuthCredential,
+            _signal: Option<&CancellationToken>,
+        ) -> Result<OAuthCredential, ModelsError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.refresh_error {
+                Some(message) => Err(ModelsError::new(ModelsErrorCode::Oauth, message.clone())),
+                None => Ok(OAuthCredential {
+                    refresh: credential.refresh.clone(),
+                    access: "refreshed-access".to_owned(),
+                    expires: now_ms() + 60_000,
+                    extra: Map::new(),
+                }),
+            }
+        }
+
+        async fn to_auth(&self, credential: &OAuthCredential) -> Result<ModelAuth, ModelsError> {
+            Ok(ModelAuth {
+                api_key: Some(credential.access.clone()),
+                headers: None,
+                base_url: None,
+            })
+        }
+    }
+
+    /// `CredentialStore` wrapper counting `read` calls (the explicit-apiKey
+    /// path must return before any store read, resolve.ts:54-60).
+    struct CountingStore {
+        inner: InMemoryCredentialStore,
+        reads: AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn new(inner: InMemoryCredentialStore) -> Self {
+            Self {
+                inner,
+                reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for CountingStore {
+        async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(provider_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
+            self.inner.list().await
+        }
+
+        async fn modify(
+            &self,
+            provider_id: &str,
+            f: ModifyFn,
+        ) -> Result<Option<Credential>, ModelsError> {
+            self.inner.modify(provider_id, f).await
+        }
+
+        async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
+            self.inner.delete(provider_id).await
+        }
+    }
+
+    /// Simulates "another process refreshed meanwhile": `modify` swaps in a
+    /// fresh credential *before* invoking the callback, so the callback's
+    /// authoritative re-check sees an unexpired token (resolve.ts:107).
+    struct SwapOnModifyStore {
+        inner: InMemoryCredentialStore,
+        swap: Mutex<Option<Credential>>,
+    }
+
+    impl SwapOnModifyStore {
+        fn new(inner: InMemoryCredentialStore, swap: Credential) -> Self {
+            Self {
+                inner,
+                swap: Mutex::new(Some(swap)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for SwapOnModifyStore {
+        async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+            self.inner.read(provider_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
+            self.inner.list().await
+        }
+
+        async fn modify(
+            &self,
+            provider_id: &str,
+            f: ModifyFn,
+        ) -> Result<Option<Credential>, ModelsError> {
+            let swap = self.swap.lock().expect("swap").take();
+            if let Some(credential) = swap {
+                let swapped = credential.clone();
+                self.inner
+                    .modify(
+                        provider_id,
+                        Arc::new(move |_| {
+                            let swapped = swapped.clone();
+                            Box::pin(async move { Ok(Some(swapped)) })
+                        }),
+                    )
+                    .await?;
+            }
+            self.inner.modify(provider_id, f).await
+        }
+
+        async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
+            self.inner.delete(provider_id).await
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
+    fn api_key_credential(key: Option<&str>) -> Credential {
+        Credential::ApiKey(ApiKeyCredential {
+            key: key.map(str::to_owned),
+            env: None,
+        })
+    }
+
+    fn oauth_credential(access: &str, expires: i64) -> Credential {
+        Credential::OAuth(OAuthCredential {
+            refresh: "refresh-token".to_owned(),
+            access: access.to_owned(),
+            expires,
+            extra: Map::new(),
+        })
+    }
+
+    async fn store_with(provider_id: &str, credential: Credential) -> InMemoryCredentialStore {
+        let store = InMemoryCredentialStore::new();
+        let stored = credential.clone();
+        store
+            .modify(
+                provider_id,
+                Arc::new(move |_| {
+                    let stored = stored.clone();
+                    Box::pin(async move { Ok(Some(stored)) })
+                }),
+            )
+            .await
+            .expect("seed store");
+        store
+    }
+
+    fn provider_auth(
+        api_key: Option<Arc<dyn ApiKeyAuth>>,
+        oauth: Option<Arc<dyn OAuthAuth>>,
+    ) -> ProviderAuth {
+        ProviderAuth { api_key, oauth }
+    }
+
+    // ------------------------------------------------------------------
+    // Tests
+    // ------------------------------------------------------------------
+
+    /// 自测清单：显式 key > store。overrides.apiKey 在 readCredential 之前
+    /// 返回（resolve.ts:54-60），store 里那条的 key 形状不同可区分。
+    #[tokio::test]
+    async fn explicit_api_key_wins_over_stored_credential() {
+        let store = Arc::new(CountingStore::new(
+            store_with("test", api_key_credential(Some("stored-key"))).await,
+        ));
+        let credentials: Arc<dyn CredentialStore> = store.clone();
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let auth = provider_auth(Some(Arc::new(FakeApiKeyAuth::new())), None);
+
+        let result = resolve_provider_auth(
+            "test",
+            &auth,
+            &credentials,
+            &auth_context,
+            Some(&AuthResolutionOverrides {
+                api_key: Some("explicit-key".to_owned()),
+                env: None,
+            }),
+        )
+        .await
+        .expect("resolve")
+        .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(
+            store.reads.load(Ordering::SeqCst),
+            0,
+            "explicit key path must return before any store read"
+        );
+    }
+
+    /// 自测清单：store 命中即停。stored key 存在时不再查 env（记录式
+    /// AuthContext 断言零调用），结果来自 stored credential。
+    #[tokio::test]
+    async fn stored_key_wins_and_env_is_never_consulted() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("test", api_key_credential(Some("stored-key"))).await);
+        let ctx = Arc::new(RecordingAuthContext::with(&[(ENV_VAR, "env-key")]));
+        let auth_context: Arc<dyn AuthContext> = ctx.clone();
+        let auth = provider_auth(Some(Arc::new(FakeApiKeyAuth::new())), None);
+
+        let result = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("stored-key"));
+        assert_eq!(result.source.as_deref(), Some("stored credential"));
+        assert!(
+            ctx.env_calls().is_empty(),
+            "stored key hit must not consult env: {:?}",
+            ctx.env_calls()
+        );
+    }
+
+    /// 「命中即停」边界：stored credential 无 key 时，handler 仍经 stored
+    /// 路径拿到 `credential: Some(..)` 并通过 `ctx.env` 解析（upstream
+    /// envApiKeyAuth 语义）——链上不走底部 ambient 分支（credential 为
+    /// `None` 才是 ambient）。
+    #[tokio::test]
+    async fn keyless_stored_credential_still_resolves_env_through_handler() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("test", api_key_credential(None)).await);
+        let auth_context: Arc<dyn AuthContext> =
+            Arc::new(RecordingAuthContext::with(&[(ENV_VAR, "env-key")]));
+        let api_key = Arc::new(FakeApiKeyAuth::new());
+        let auth = provider_auth(Some(api_key.clone()), None);
+
+        let result = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("env-key"));
+        assert_eq!(result.source.as_deref(), Some(ENV_VAR));
+        assert_eq!(
+            api_key.received_credential(),
+            vec![true],
+            "handler must be invoked through the stored path (credential present)"
+        );
+    }
+
+    /// 「命中即停」的上游定义（resolve.ts:71）：stored credential 类型无
+    /// 匹配 handler → `undefined`，绝不回退 ambient/env。
+    #[tokio::test]
+    async fn stored_credential_without_matching_handler_returns_none_no_env_fallback() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("test", api_key_credential(Some("stored-key"))).await);
+        let ctx = Arc::new(RecordingAuthContext::with(&[(ENV_VAR, "env-key")]));
+        let auth_context: Arc<dyn AuthContext> = ctx.clone();
+        // Provider has no api_key handler for the stored api_key credential.
+        let auth = provider_auth(None, None);
+
+        let result = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve");
+
+        assert_eq!(result, None);
+        assert!(
+            ctx.env_calls().is_empty(),
+            "no ambient fallback after a store hit: {:?}",
+            ctx.env_calls()
+        );
+    }
+
+    /// 自测清单：ambient 兜底。store 为空 → env 变量命中，source 为变量名。
+    #[tokio::test]
+    async fn ambient_env_resolves_when_store_is_empty() {
+        let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
+        let auth_context: Arc<dyn AuthContext> =
+            Arc::new(RecordingAuthContext::with(&[(ENV_VAR, "env-key")]));
+        let api_key = Arc::new(FakeApiKeyAuth::new());
+        let auth = provider_auth(Some(api_key.clone()), None);
+
+        let result = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("env-key"));
+        assert_eq!(result.source.as_deref(), Some(ENV_VAR));
+        assert_eq!(
+            api_key.received_credential(),
+            vec![false],
+            "ambient path passes no credential"
+        );
+    }
+
+    /// 自测清单：OAuth 刷新失败抛 `ModelsError("oauth")` 且绝不静默回退
+    /// env key；credential 保留在 store 中供重登。
+    #[tokio::test]
+    async fn oauth_refresh_failure_errors_without_env_fallback() {
+        let expired = oauth_credential("expired-access", 0);
+        let store = store_with("test", expired.clone()).await;
+        let credentials: Arc<dyn CredentialStore> = Arc::new(store);
+        let auth_context: Arc<dyn AuthContext> =
+            Arc::new(RecordingAuthContext::with(&[(ENV_VAR, "env-key")]));
+        let oauth = Arc::new(FakeOAuthAuth::failing("invalid_grant"));
+        let auth = provider_auth(Some(Arc::new(FakeApiKeyAuth::new())), Some(oauth.clone()));
+
+        let error = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect_err("refresh failure must error");
+
+        assert_eq!(error.code, ModelsErrorCode::Oauth);
+        assert!(
+            error.message.contains("OAuth refresh failed for test"),
+            "unexpected message: {}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("env-key"),
+            "no env fallback after a failed refresh"
+        );
+        assert_eq!(oauth.refresh_calls(), 1);
+        // 凭据保留（modify 回调抛错不写回），供重登。
+        assert_eq!(credentials.read("test").await.expect("read"), Some(expired));
+    }
+
+    /// 自测清单：modify 锁内双检查——锁内发现 credential 已被另一进程刷新
+    /// （未过期）→ 不调用 refresh，直接用锁内读到的 credential。
+    #[tokio::test]
+    async fn oauth_refresh_is_double_checked_under_the_store_lock() {
+        let expired = oauth_credential("expired-access", 0);
+        let fresh = oauth_credential("fresh-access", now_ms() + 60_000);
+        let store = SwapOnModifyStore::new(store_with("test", expired).await, fresh);
+        let credentials: Arc<dyn CredentialStore> = Arc::new(store);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let result = resolve_provider_auth("test", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("fresh-access"));
+        assert_eq!(result.source.as_deref(), Some("OAuth"));
+        assert_eq!(
+            oauth.refresh_calls(),
+            0,
+            "double check under the lock must skip refresh"
+        );
+    }
+}

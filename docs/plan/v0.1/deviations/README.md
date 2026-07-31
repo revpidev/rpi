@@ -35,6 +35,8 @@
 | D-005 | T03 | 实现细节 | 适配器 HTTP 层 reqwest 直连替代官方 SDK 的可观测差异（SDK 头/超时/严格 SSE 解析文案/metadata.raw 来源/错误前缀范围） | `02-design.md` §3.3 | 不需要 | 已回写 |
 | D-006 | T03 | 实现细节 | 校验/解析层差异（jsonschema 单路径、models.json serde+手工 pass、错误措辞≠TypeBox） | `01-requirements.md` §5.5、`02-design.md` §3.6 | 不需要 | 已回写 |
 | D-007 | T03 | 实现细节 | sanitize_surrogates 在 Rust 侧为恒等（String 无孤立代理） | `02-design.md` §3.6 | 不需要 | 已回写 |
+| D-008 | T04 | 实现细节 | auth 存储与 key DSL 的 Rust 落地差异（fs2 无 stale/compromised、jitter 随机源、`!cmd` 仅 unix、快照保序方案、resolve_headers 形状） | `02-design.md` §3.5、`01-requirements.md` §5.4 | 不需要 | 已回写 |
+| D-009 | T04 | 实现细节 | OAuth 框架的 Rust 落地差异（时钟抽象、测试缝、回调服务分支、错误明细近似、token JSON 严格化、竞速实现） | `02-design.md` §3.5、`01-requirements.md` §5.4 | 不需要 | 已回写 |
 
 ## 4. 状态定义
 

@@ -6,8 +6,13 @@
 
 use crate::types::ProviderEnv;
 
-/// `getProviderEnvValue`: scoped overrides win over `std::env`.
+/// `getProviderEnvValue`: scoped overrides win over `std::env`. Mirrors the
+/// JS `env?.[name] || process.env[name] || undefined` chain: empty strings
+/// are falsy upstream, so an empty override falls through to the process env
+/// and an empty process value resolves to `None`.
 pub fn get_provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    env.and_then(|env| env.get(name).cloned())
-        .or_else(|| std::env::var(name).ok())
+    env.and_then(|env| env.get(name))
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| std::env::var(name).ok().filter(|value| !value.is_empty()))
 }

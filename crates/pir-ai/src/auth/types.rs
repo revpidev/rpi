@@ -1,10 +1,13 @@
 //! Port of `packages/ai/src/auth/types.ts` @ pi 0.82.1 (2efa728) — T03
-//! skeleton: credential types, store/auth interfaces. `AuthInteraction`,
-//! login prompts and OAuth flows land with T04.
+//! skeleton: credential types, store/auth interfaces. T04 added
+//! `login`/`check` to the auth traits; `AuthPrompt`/`AuthEvent`/
+//! `AuthInteraction` live in `super::interaction` (mirroring upstream, where
+//! all of these share `auth/types.ts`). OAuth flows land with T04 part 2.
 //!
 //! Intentional differences: TS method interfaces become `async_trait` traits;
 //! the `signal` becomes `CancellationToken`.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,20 +16,40 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use super::resolve::ModelsError;
+use super::interaction::AuthInteraction;
+use super::resolve::{ModelsError, ModelsErrorCode};
 use crate::types::{ProviderEnv, ProviderHeaders};
 
 /// `ModelAuth` — request auth for a single model request.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct ModelAuth {
     pub api_key: Option<String>,
     pub headers: Option<ProviderHeaders>,
     pub base_url: Option<String>,
 }
 
+// Redacted Debug (coding-standards §11.1): `api_key` and header values (they
+// can carry `Authorization`) never appear in output; structure and
+// non-sensitive fields stay visible.
+impl fmt::Debug for ModelAuth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModelAuth")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .as_ref()
+                    .map(|headers| headers.keys().collect::<Vec<_>>()),
+            )
+            .field("base_url", &self.base_url)
+            .finish()
+    }
+}
+
 /// `ApiKeyCredential` — stored api-key credential. `env` holds provider-scoped
 /// environment/config values such as Cloudflare account/gateway ids.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApiKeyCredential {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
@@ -34,10 +57,20 @@ pub struct ApiKeyCredential {
     pub env: Option<ProviderEnv>,
 }
 
+// Redacted Debug (coding-standards §11.1): the key never appears in output.
+impl fmt::Debug for ApiKeyCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiKeyCredential")
+            .field("key", &self.key.as_ref().map(|_| "[redacted]"))
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
 /// `OAuthCredential` — stored canonical OAuth credential. Extension-provided
 /// extra fields are preserved via the flattened `extra` map (`[key: string]:
 /// unknown` upstream).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct OAuthCredential {
     pub refresh: String,
     pub access: String,
@@ -46,14 +79,38 @@ pub struct OAuthCredential {
     pub extra: Map<String, Value>,
 }
 
+// Redacted Debug (coding-standards §11.1): `refresh`/`access` never appear in
+// output; `extra` values are extension-controlled and may hold tokens, so
+// only the keys are shown.
+impl fmt::Debug for OAuthCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OAuthCredential")
+            .field("refresh", &"[redacted]")
+            .field("access", &"[redacted]")
+            .field("expires", &self.expires)
+            .field("extra", &self.extra.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 /// `Credential` — one type-tagged credential per provider (auth.json shape).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Credential {
     #[serde(rename = "api_key")]
     ApiKey(ApiKeyCredential),
     #[serde(rename = "oauth")]
     OAuth(OAuthCredential),
+}
+
+// Redacted via the inner types' Debug impls (coding-standards §11.1).
+impl fmt::Debug for Credential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Credential::ApiKey(credential) => f.debug_tuple("ApiKey").field(credential).finish(),
+            Credential::OAuth(credential) => f.debug_tuple("OAuth").field(credential).finish(),
+        }
+    }
 }
 
 impl Credential {
@@ -146,7 +203,7 @@ impl AuthContext for DefaultAuthContext {
 }
 
 /// `AuthResult` — result of resolving auth for a model.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct AuthResult {
     pub auth: ModelAuth,
     /// Provider-scoped environment/config values resolved from credentials
@@ -155,6 +212,17 @@ pub struct AuthResult {
     /// Human-readable label for status UI: "ANTHROPIC_API_KEY", "OAuth",
     /// "~/.aws/credentials".
     pub source: Option<String>,
+}
+
+// Redacted via `ModelAuth`'s Debug impl (coding-standards §11.1).
+impl fmt::Debug for AuthResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthResult")
+            .field("auth", &self.auth)
+            .field("env", &self.env)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 /// `AuthType`.
@@ -171,14 +239,39 @@ pub struct AuthCheck {
     pub kind: AuthType,
 }
 
-/// `ApiKeyAuth` — api-key auth: stored key/provider env plus ambient sources.
-///
-/// T03 skeleton: only `resolve` (request-time auth). `login`/`check` arrive
-/// with T04.
+/// `ApiKeyAuth` — api-key auth: stored key/provider env plus ambient sources
+/// (env vars, AWS profiles, ADC files). Ambient-only providers omit `login`.
 #[async_trait::async_trait]
 pub trait ApiKeyAuth: Send + Sync {
     /// Display name, e.g. "Anthropic API key".
     fn name(&self) -> &str;
+
+    /// `login?` — interactive setup (prompt for key/provider env). The
+    /// default errors: ambient-only providers have no login (upstream: the
+    /// method is absent).
+    async fn login(
+        &self,
+        _interaction: &dyn AuthInteraction,
+    ) -> Result<ApiKeyCredential, ModelsError> {
+        Err(ModelsError::new(
+            ModelsErrorCode::Auth,
+            format!(
+                "{} is ambient-only: interactive login is not supported",
+                self.name()
+            ),
+        ))
+    }
+
+    /// `check?` — optional side-effect-free availability check. Use this when
+    /// `resolve()` may execute commands or perform other request-time work.
+    /// Default `None`: Models checks availability by resolving auth.
+    async fn check(
+        &self,
+        _ctx: &dyn AuthContext,
+        _credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthCheck>, ModelsError> {
+        Ok(None)
+    }
 
     /// Resolve auth from the stored credential and/or ambient sources, merging
     /// per field. `None` = not configured.
@@ -190,11 +283,24 @@ pub trait ApiKeyAuth: Send + Sync {
 }
 
 /// `OAuthAuth` — the `refresh`/`toAuth` split lets `Models` own the locked
-/// refresh pattern. `login` arrives with T04.
+/// refresh pattern.
 #[async_trait::async_trait]
 pub trait OAuthAuth: Send + Sync {
     /// Display name, e.g. "Anthropic (Claude Pro/Max)".
     fn name(&self) -> &str;
+
+    /// `login` — interactive OAuth flow (PKCE / device code / localhost
+    /// callback). Required upstream; the default here errors so partial
+    /// implementations stay constructible until T04 part 2 wires the flows.
+    async fn login(
+        &self,
+        _interaction: &dyn AuthInteraction,
+    ) -> Result<OAuthCredential, ModelsError> {
+        Err(ModelsError::new(
+            ModelsErrorCode::Auth,
+            format!("{}: OAuth login is not supported", self.name()),
+        ))
+    }
 
     /// Exchange the refresh token. Network call; errors on failure.
     /// `Models` runs this under the store lock.
@@ -213,4 +319,74 @@ pub trait OAuthAuth: Send + Sync {
 pub struct ProviderAuth {
     pub api_key: Option<Arc<dyn ApiKeyAuth>>,
     pub oauth: Option<Arc<dyn OAuthAuth>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// 脱敏（编码规范 §11.1/§11.2）：凭据 secret 值不得出现在 `{:?}` 输出中，
+    /// 结构与非敏感字段保留可见。
+    #[test]
+    fn debug_output_redacts_credential_secrets() {
+        let mut headers = ProviderHeaders::new();
+        headers.insert(
+            "Authorization".to_owned(),
+            Some("Bearer super-secret-token".to_owned()),
+        );
+        let model_auth = ModelAuth {
+            api_key: Some("sk-secret-key".to_owned()),
+            headers: Some(headers),
+            base_url: Some("https://api.example.com".to_owned()),
+        };
+        let debug = format!("{model_auth:?}");
+        assert!(!debug.contains("sk-secret-key"));
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("[redacted]"));
+        assert!(debug.contains("Authorization"));
+        assert!(debug.contains("https://api.example.com"));
+
+        let api_key = ApiKeyCredential {
+            key: Some("sk-secret-key".to_owned()),
+            env: Some(ProviderEnv::from([(
+                "ACCOUNT_ID".to_owned(),
+                "acct-1".to_owned(),
+            )])),
+        };
+        let debug = format!("{api_key:?}");
+        assert!(!debug.contains("sk-secret-key"));
+        assert!(debug.contains("acct-1"));
+
+        let mut extra = Map::new();
+        extra.insert("accountId".to_owned(), json!("acct-secret-ish"));
+        let oauth = OAuthCredential {
+            refresh: "refresh-secret".to_owned(),
+            access: "access-secret".to_owned(),
+            expires: 123,
+            extra,
+        };
+        let credential = Credential::OAuth(oauth);
+        let debug = format!("{credential:?}");
+        assert!(!debug.contains("refresh-secret"));
+        assert!(!debug.contains("access-secret"));
+        assert!(!debug.contains("acct-secret-ish"));
+        assert!(debug.contains("expires: 123"));
+        assert!(debug.contains("accountId"));
+
+        let result = AuthResult {
+            auth: model_auth,
+            env: None,
+            source: Some("ANTHROPIC_API_KEY".to_owned()),
+        };
+        let debug = format!("{result:?}");
+        assert!(!debug.contains("sk-secret-key"));
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("ANTHROPIC_API_KEY"));
+
+        // api_key 条目同样脱敏。
+        let credential = Credential::ApiKey(api_key);
+        assert!(!format!("{credential:?}").contains("sk-secret-key"));
+    }
 }

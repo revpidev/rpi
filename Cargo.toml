@@ -40,6 +40,11 @@ jsonschema = "0.33"
 regex = "1"
 url = "2"
 httpdate = "1"
+fs2 = "0.4"
+# default-features = false: only the PKCE helpers are used; pulls in neither
+# reqwest nor an HTTP client of its own.
+oauth2 = { version = "5", default-features = false }
+axum = "0.8"
 
 # Single self-contained binary target (coding-standards §15.4).
 # No panic = "abort": the TUI relies on a panic hook to restore terminal state.

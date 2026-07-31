@@ -201,6 +201,7 @@ OAuth flows (7)：anthropic / openai-codex / github-copilot(device) /
 - OAuth 流程用 `oauth2` crate；一次性 localhost 回调页用 `axum`（已决策，§14）；device 轮询 RFC 8628 参数对齐（5s/slow_down/1s 下限/WSL 时钟漂移文案）
 - 交互协议：`AuthInteraction` trait（prompt: text/secret/select/manual_code，per-prompt signal 竞速取消；notify: links/auth_url/device_code/progress）——各模式提供实现（TUI 对话框 / RPC 协议 / print 报错）
 - `options.env` 每请求环境覆盖；代理变量（`HTTP_PROXY/HTTPS_PROXY/no_proxy`）解析
+- Rust 落地注记（T04）：文件锁 fs2 无 stale/onCompromised 对应物、`!cmd` 仅 unix `/bin/sh -c`、快照用 `serde_json::Map` 保序做字节对拍、device code 时钟抽象与 OAuth 测试缝等实现差异——见偏离 D-008 / D-009
 
 ### 3.6 横切模块
 

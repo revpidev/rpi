@@ -19,3 +19,11 @@ jsonschema.workspace = true
 regex.workspace = true
 url.workspace = true
 httpdate.workspace = true
+fs2.workspace = true
+oauth2.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+# PKCE 单测的独立 sha256/base64url 交叉校验（challenge == base64url(sha256(verifier))）。
+sha2 = "0.10"
+base64 = "0.22"

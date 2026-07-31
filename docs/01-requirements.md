@@ -307,6 +307,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - `/login` `/logout` 订阅流；`checkAuth()` / `getAvailable()`
 - 交互协议：`AuthInteraction.prompt()`（text/secret/select/manual_code，per-prompt signal 竞速取消）+ `notify()`（links/auth_url/device_code/progress）
 - `options.env` 每请求环境覆盖（Cloudflare/Azure/Vertex/Bedrock/代理变量都走它）
+- （Rust 落地注记：auth 存储/DSL/OAuth 框架的实现细节差异——fs2 锁语义边界、`!cmd` 仅 unix、快照保序、device 时钟抽象、OAuth 测试缝等，见偏离 D-008 / D-009）
 
 ### 5.5 横切能力
 
