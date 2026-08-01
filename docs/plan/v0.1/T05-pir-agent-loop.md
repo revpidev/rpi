@@ -1,6 +1,6 @@
 # T05：pir-agent — agent_loop 与 Agent
 
-- **状态**：未开始
+- **状态**：已完成
 - **里程碑**：M2
 - **依赖**：T01、T02（faux provider 驱动事件序测试）
 - **上游对照**：`packages/agent/src/agent-loop.ts`、`agent.ts`、`types.ts`、`harness/messages.ts`（扩展消息格式）
@@ -56,11 +56,11 @@
 
 ## 进度跟踪
 
-- [ ] 设计细化
-- [ ] 实现
-- [ ] 自测
-- [ ] 门禁验收
-- [ ] 文档回写
+- [x] 设计细化
+- [x] 实现
+- [x] 自测
+- [x] 门禁验收
+- [x] 文档回写
 
 ## 自测清单
 
@@ -89,8 +89,42 @@
 
 | 偏离 ID | 摘要 | 状态 |
 |---------|------|------|
-| — | （暂无） | — |
+| D-010 | agent_loop 与 Agent 的 Rust 落地差异（11 项实现细节，见 deviations/D-010） | 已回写 |
 
 ## 验收记录
 
-（待填写，模板见 `gates.md` §3）
+- 验收日期：2026-08-01
+- 验收人：kimi-code（T05 执行代理）
+- G1 构建/静态检查：通过（`cargo build --workspace` Finished；`cargo clippy --workspace --all-targets -- -D warnings` exit=0；`cargo fmt --all -- --check` FMT-OK）
+- G2 测试：通过（`cargo test --workspace` 450 passed, 0 failed；其中 pir-agent 83：既有 17 + agent_loop 27 + agent 19 + messages 15 + parity 5；无 live 测试；测试不触网，faux provider 驱动）
+- G3 对拍：通过（parity_events_test.rs 5 场景——single-turn / tool-calls / steering-followup / abort / length-truncation——Agent 事件序列与 `fixtures/generated/<scenario>/events.jsonl` 归一化内容级 diff（`diff_jsonl`，行序敏感）一致；预处理剔除 message_update（delta 边界不入契约，fixtures/README §2）与 AgentSession 层事件（queue_update/agent_settled/willRetry，T16 产物），剥离 usage/details（分别依赖 T07/T16 与 T13 真实工具实现），测试文件头有注释说明）
+- G4 红线：通过（`external/pi` HEAD=2efa728d2 且 porcelain 为空；pir-agent 无 `use pir_ai::providers`、无 broadcast、无 ~/.pi 访问；非测试代码无 unwrap/expect（src 内残留 expect 均在 #[cfg(test)] 或带不变式注释的 serde 测试辅助）；新增依赖仅 tokio/tracing（workspace 已有版本））
+- G5 线格式：通过（AgentEvent/AgentMessage/扩展消息 serde 形状 T01 已锁并有 roundtrip 测试；toolResult 消息 addedToolNames 仅 len>0 挂载、details null 省略对齐上游；扩展消息文本格式 15 个字节级测试锚定）
+- G6 文档同步：通过（agent_loop.rs/agent.rs/messages.rs 头部溯源注释含上游路径+commit 2efa728；D-010 回写 `02-design.md` §4.4）
+- G7 偏离闭环：通过（D-010 已登记 + 已回写）
+
+需求 §4.3 十九条语义 → 测试锚点映射表：
+
+| # | 语义 | 测试锚点 |
+|---|------|----------|
+| 1 | transform→convert→动态 get_api_key→stream_fn；partial 写 context 尾部 | `applies_transform_context_before_convert_to_llm`、`resolves_api_key_dynamically_before_each_llm_call`、`parity_single_turn` |
+| 2 | parallel 默认 / 批内任一 sequential → 整批顺序 | `forces_sequential_when_tool_has_execution_mode_sequential`、`forces_sequential_when_one_of_multiple_tools_is_sequential`、`allows_parallel_when_all_tools_have_execution_mode_parallel` |
+| 3 | parallel 精确语义（preflight 顺序 / immediate 即时 end / end 完成序 / toolResult 源序） | `emits_tool_execution_end_in_completion_order_results_in_source_order`、`parity_tool_calls` |
+| 4 | before_tool_call block / after_tool_call 五字段独立替换 / 钩子抛错降级 | `before_tool_call_block_yields_error_result_without_executing`、`handles_tool_calls_and_results`、`after_tool_call_hook_error_degrades_to_error_result` |
+| 5 | length 整批失败保护 | `does_not_execute_tool_calls_from_length_truncated_message`、`parity_length_truncation` |
+| 6 | 校验失败/工具未找到 → 错误 toolResult；prepareArguments shim | `validation_failure_yields_error_result_without_executing`、`tool_not_found_yields_error_result_without_executing`、`prepares_tool_arguments_for_validation` |
+| 7 | terminate 全员 true 才跳过 LLM | `stops_after_tool_batch_when_every_tool_result_terminates`、`continues_after_parallel_tool_calls_when_not_all_terminate`、`allows_after_tool_call_to_mark_batch_as_terminating` |
+| 8 | steering 双轮询点；注入先行 message_start/end | `injects_queued_messages_after_all_tool_calls_complete`、`parity_steering_followup` |
+| 9 | follow-up 空闲后注入 | `continue_processes_queued_follow_up_after_assistant_turn`、`parity_steering_followup` |
+| 10 | one-at-a-time 默认 / all | `continue_keeps_one_at_a_time_steering_from_assistant_tail` |
+| 11 | error/aborted 提前返回（turn_end([]) + agent_end） | `parity_abort`、`emits_full_lifecycle_events_for_run_failures` |
+| 12 | 首个 turn 不重复 turn_start；prompt 消息事件在 turn_start 后 | `emits_events_with_agent_message_types`、`agent_loop_continue_from_existing_context_without_user_message_events` |
+| 13 | abort 检查点与 "Operation aborted"；sequential 每工具后 break | `abort_in_before_tool_call_yields_operation_aborted_error_result`、`parity_abort` |
+| 14 | continue() 降级链 | `continue_keeps_one_at_a_time_steering_from_assistant_tail`、`continue_processes_queued_follow_up_after_assistant_turn`、`agent_loop_continue_throws_when_last_message_is_assistant` |
+| 15 | prepareNextTurn / shouldStopAfterTurn | `uses_prepare_next_turn_snapshot_before_continuing`、`stops_after_turn_when_should_stop_after_turn_returns_true` |
+| 16 | Agent 全事件屏障；agent_end settle 前 isStreaming/waitForIdle | `awaits_async_subscribers_before_prompt_resolves`、`wait_for_idle_waits_for_async_subscribers` |
+| 17 | handleRunFailure 合成失败消息 + 完整事件序列 | `emits_full_lifecycle_events_for_run_failures` |
+| 18 | tool_execution_update settle 语义 | `ignores_tool_updates_after_execution_settles`、`ignores_settled_parallel_tool_update_while_another_tool_is_running` |
+| 19 | 互斥 activeRun | `throws_when_prompt_called_while_streaming`、`throws_when_continue_called_while_streaming` |
+
+- 结论：通过

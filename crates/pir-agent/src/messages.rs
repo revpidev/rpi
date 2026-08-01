@@ -11,11 +11,13 @@
 //! [`AgentMessage`] union. This is a structural, not behavioral, difference:
 //! the wire shapes are identical.
 //!
-//! The conversion logic (`bashExecutionToText`, `convertToLlm`) lands with the
-//! agent loop / session tasks (T05/T07); only the byte-exact constants are
-//! locked here (T01).
+//! The conversion logic (`bashExecutionToText`, `convertToLlm`) is a verbatim
+//! port of `packages/coding-agent/src/core/messages.ts` @ 2efa728 (T05).
 
-use pir_ai::types::{AssistantMessage, ToolResultMessage, UserContent, UserMessage};
+use pir_ai::types::{
+    AssistantMessage, Message, TextContent, ToolResultMessage, UserContent, UserContentBlock,
+    UserMessage, UserRole,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -137,6 +139,101 @@ pub enum AgentMessage {
     Custom(CustomMessage),
     BranchSummary(BranchSummaryMessage),
     CompactionSummary(CompactionSummaryMessage),
+}
+
+/// `bashExecutionToText` — verbatim port of
+/// `packages/coding-agent/src/core/messages.ts:63-79` @ 2efa728.
+pub fn bash_execution_to_text(msg: &BashExecutionMessage) -> String {
+    let mut text = format!("Ran `{}`\n", msg.command);
+    if msg.output.is_empty() {
+        text.push_str("(no output)");
+    } else {
+        text.push_str(&format!("```\n{}\n```", msg.output));
+    }
+    if msg.cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if let Some(exit_code) = msg.exit_code {
+        if exit_code != 0 {
+            text.push_str(&format!("\n\nCommand exited with code {exit_code}"));
+        }
+    }
+    if msg.truncated {
+        if let Some(full_output_path) = &msg.full_output_path {
+            if !full_output_path.is_empty() {
+                text.push_str(&format!(
+                    "\n\n[Output truncated. Full output: {full_output_path}]"
+                ));
+            }
+        }
+    }
+    text
+}
+
+/// `convertToLlm` — verbatim port of
+/// `packages/coding-agent/src/core/messages.ts:120-164` @ 2efa728.
+///
+/// Converts `AgentMessage[]` to LLM-compatible `Message[]`; messages that
+/// cannot be converted are filtered out.
+pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::BashExecution(b) => {
+                if b.exclude_from_context == Some(true) {
+                    return None;
+                }
+                Some(Message::User(UserMessage {
+                    role: UserRole::User,
+                    content: UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
+                        text: bash_execution_to_text(b),
+                        text_signature: None,
+                    })]),
+                    timestamp: b.timestamp,
+                }))
+            }
+            AgentMessage::Custom(c) => {
+                let content = match &c.content {
+                    UserContent::Text(s) => {
+                        UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
+                            text: s.clone(),
+                            text_signature: None,
+                        })])
+                    }
+                    UserContent::Blocks(blocks) => UserContent::Blocks(blocks.clone()),
+                };
+                Some(Message::User(UserMessage {
+                    role: UserRole::User,
+                    content,
+                    timestamp: c.timestamp,
+                }))
+            }
+            AgentMessage::BranchSummary(b) => Some(Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
+                    text: format!(
+                        "{}{}{}",
+                        BRANCH_SUMMARY_PREFIX, b.summary, BRANCH_SUMMARY_SUFFIX
+                    ),
+                    text_signature: None,
+                })]),
+                timestamp: b.timestamp,
+            })),
+            AgentMessage::CompactionSummary(c) => Some(Message::User(UserMessage {
+                role: UserRole::User,
+                content: UserContent::Blocks(vec![UserContentBlock::Text(TextContent {
+                    text: format!(
+                        "{}{}{}",
+                        COMPACTION_SUMMARY_PREFIX, c.summary, COMPACTION_SUMMARY_SUFFIX
+                    ),
+                    text_signature: None,
+                })]),
+                timestamp: c.timestamp,
+            })),
+            AgentMessage::User(u) => Some(Message::User(u.clone())),
+            AgentMessage::Assistant(a) => Some(Message::Assistant(a.clone())),
+            AgentMessage::ToolResult(t) => Some(Message::ToolResult(t.clone())),
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -1485,10 +1485,13 @@ dependencies = [
  "async-trait",
  "futures",
  "pir-ai",
+ "pir-test-support",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

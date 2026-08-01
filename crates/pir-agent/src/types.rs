@@ -9,7 +9,8 @@
 //!   `async_trait`; parameters/results use `serde_json::Value` where upstream
 //!   is generic over TypeBox schema types, keeping the trait object-safe.
 //! - Hook context/config types (`AgentLoopConfig`, `BeforeToolCallContext`,
-//!   `AgentState`, ...) land with the agent loop task (T05), not here.
+//!   ...) live in `agent_loop.rs` (loop-facing hooks) and `agent.rs`
+//!   (`AgentState`), ported with T05.
 //!
 //! Scope of this file is locked at M0 (T01): variant order and field naming
 //! mirror the upstream TS definitions item by item; changes require gate G3

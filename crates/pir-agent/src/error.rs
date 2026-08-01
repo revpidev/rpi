@@ -20,6 +20,13 @@ pub enum AgentError {
     #[error("harness error: {0}")]
     Harness(String),
 
+    /// Error whose text must match an upstream `Error` message verbatim
+    /// (mutex guards, `continue` preconditions, tool-thrown failures). Use
+    /// this variant whenever the message text is part of the parity contract;
+    /// the other variants add a prefix.
+    #[error("{0}")]
+    Message(String),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

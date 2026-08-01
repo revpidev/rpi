@@ -295,6 +295,8 @@ pub type StreamFn = Arc<dyn Fn(Model, Context, StreamOptions) -> BoxStream<'stat
 
 Agent **不**依赖具体 provider，便于测试 faux 与 proxy。StreamFn 不得 panic（对齐「不得 throw」契约）。
 
+> Rust 落地注记（D-010，T05 验收）：hook 的 args 回传与错误降级经返回值通道表达（`BeforeToolCallResult.args`、`AfterToolCallFn -> Result<..>`）；`BoxStream` 无 result 通道，流无终止事件时合成 error 消息收尾；reasoning/thinking_budgets 保留在 `AgentLoopConfig` 由组装层绑定；listener 屏障为 in-process 按注册序串行 await；`continue()` 命名 `continue_run`。详见 `docs/plan/v0.1/deviations/D-010-agent-loop-rust-notes.md`。
+
 ### 4.5 Harness 层设计要点
 
 - `AgentHarness`：phase 状态机（idle/turn/compaction/branch_summary/retry）；turn snapshot vs config 分离；三队列（steer/followUp/nextTurn）；22 种事件与 hook 结果映射（需求 §4.4）；双订阅模型——`subscribe` 纯观察（支持 `*` 通配），`on` 为带返回值 hook（多 handler 顺序执行、最后非 `undefined` 胜出；patch 型 hook 依次归约）；`entryTransforms`/`entryProjectors` 扩展点（写入/读出两侧变换）；session 树为 leaf 追加 + 重放重建语义
