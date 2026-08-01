@@ -11,5 +11,22 @@ pir-agent.workspace = true
 pir-tui.workspace = true
 pir-ext-host.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+base64.workspace = true
+image.workspace = true
+kamadak-exif.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+pir-test-support.workspace = true

@@ -747,6 +747,10 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 | `wasmtime` | Wasm 扩展 runtime（嵌入主二进制） |
 | `oauth2` | OAuth 流程（自研模块 + 该 crate） |
 | `axum` | OAuth 一次性 localhost 回调页 |
+| `unicode-normalization` | edit fuzzy 匹配 NFKC / read 路径变体 NFD（T06） |
+| `image` + `kamadak-exif` | read 工具图像解码/缩放/EXIF 方向（替代上游 Photon WASM，T06，D-011） |
+| `base64` | read 工具图像附件编码（T06） |
+| `libc` | unix 进程组终止（bash kill tree，T06） |
 | `abi_stable` | L0 动态库扩展插件 ABI |
 | （不引 aws-sdk） | Bedrock 手写 SigV4 + reqwest + 自实现 event-stream 解码 |
 

@@ -38,6 +38,7 @@
 | D-008 | T04 | 实现细节 | auth 存储与 key DSL 的 Rust 落地差异（fs2 无 stale/compromised、jitter 随机源、`!cmd` 仅 unix、快照保序方案、resolve_headers 形状） | `02-design.md` §3.5、`01-requirements.md` §5.4 | 不需要 | 已回写 |
 | D-009 | T04 | 实现细节 | OAuth 框架的 Rust 落地差异（时钟抽象、测试缝、回调服务分支、错误明细近似、token JSON 严格化、竞速实现） | `02-design.md` §3.5、`01-requirements.md` §5.4 | 不需要 | 已回写 |
 | D-010 | T05 | 实现细节 | agent_loop 与 Agent 的 Rust 落地差异（before/after 钩子回传与错误通道、流无终止事件合成、JoinError 合成、details null 省略、Message 错误变体、continue_run 命名等 11 项） | `02-design.md` §4.4 | 不需要 | 已回写 |
+| D-011 | T06 | 实现细节 | 内置工具层 Rust 落地差异（ToolContext 形状、image/kamadak-exif 替代 Photon、自实现 Myers diff、OutputAccumulator 同步 API、on_data Vec<u8>、trackDetachedChildPid 未移植、~/.pir/bin 等 12 项） | `02-design.md` §6.5、`coding-standards.md` 附录 A | 不需要 | 已回写 |
 
 ## 4. 状态定义
 

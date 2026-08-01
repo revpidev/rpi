@@ -46,6 +46,14 @@ fs2 = "0.4"
 oauth2 = { version = "5", default-features = false }
 axum = "0.8"
 
+# T06 built-in tools (pir/src/tools/).
+unicode-normalization = "0.1"   # NFKC/NFD for edit fuzzy matching + read path variants
+libc = "0.2"                    # unix process-group kill (bash kill tree)
+base64 = "0.22"                 # read tool image attachments
+# Pure-Rust image decode/encode/resize for the read tool (replaces upstream Photon WASM).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+kamadak-exif = "0.6"            # EXIF orientation auto-correct on image resize
+
 # Single self-contained binary target (coding-standards §15.4).
 # No panic = "abort": the TUI relies on a panic hook to restore terminal state.
 [profile.release]

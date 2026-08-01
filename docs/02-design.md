@@ -431,6 +431,8 @@ pir/src/tools/
 - grep/find：用 `ignore`/`globset` crate **原生实现 rg/fd 等价行为**（ADR-0003 §2）：相同默认 limit（grep 100 匹配 / find 1000 / ls 500）、相同截断（50KB、grep 单行 500 字符）、gitignore 感知、相同提示文案；**不实现**外部二进制自动下载
 - 行为锚点（截断常数、fuzzy 匹配、超时、节流、环境注入顺序等）逐条见需求 §4.5
 
+> Rust 落地注记（D-011，T06 验收）：`signal`/`on_update` 不进 `ToolContext`，由 `AgentTool::execute` 参数按调用传入（`ToolContext { cwd, session_env }`）；图像处理用 `image` + `kamadak-exif` crate 替代上游 Photon WASM + 手写 EXIF 解析器（行为锚点：2000×2000、4.5MB base64、质量梯度 [80,85,70,55,40]、×0.75 回退、Lanczos3）；diff 生成为自实现 Myers 行级 diff（不引 jsdiff 对应 crate）；`OutputAccumulator` 为同步 API；`trackDetachedChildPid` 崩溃兜底注册表未移植（取消/超时的进程组终止语义完整）。工具开关底层能力为 `resolve_active_tool_names`（allowlist → no-tools → 默认集，deny 后于 allow，对齐 sdk.ts:246-252）+ `create_builtin_tools`，CLI 接线在 T10。详见 `docs/plan/v0.1/deviations/D-011-builtin-tools-rust-notes.md`。
+
 ### 6.6 Modes
 
 | Mode | 实现要点 |

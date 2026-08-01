@@ -11,5 +11,6 @@
 //! Skeleton only (T01); modes land in T10/T12.
 
 pub mod error;
+pub mod tools;
 
 pub use error::PirError;
