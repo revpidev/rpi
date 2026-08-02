@@ -17,4 +17,5 @@ pub mod provider_retry;
 pub mod retry;
 pub mod sanitize_unicode;
 pub mod transform_messages;
+pub mod uuid;
 pub mod validation;

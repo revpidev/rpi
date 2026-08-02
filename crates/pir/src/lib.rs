@@ -10,6 +10,8 @@
 //!
 //! Skeleton only (T01); modes land in T10/T12.
 
+pub mod config;
+pub mod core;
 pub mod error;
 pub mod tools;
 

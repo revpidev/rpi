@@ -399,6 +399,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 加载 Pi 生成的 session（含 TS 扩展产物）时：
 
 - **保留**：所有 entry（含 `custom`、`label`、未知类型）原样保留在 session 树中，写回时不丢数据。
+  - 边界（T07 落地，D-012）：保留为 JSON 语义级（与上游 `JSON.parse`/`stringify` 同级）；合法 JSON 但非对象的行（`42`/`"s"`）加载即丢弃；已知 type 但字段形状不合法的条目降级为 Raw 保留（写回无损，但退出 LLM context 与 model 推导）；未知字段内数字格式化有 `1e2`→`100.0` 级微差。
 - **跳过 LLM context**：无对应扩展的 `custom` message/entry 不进入 `convert_to_llm` 输出；`bashExecution` 按钉死版 Pi 的 `convertToLlm` 规则处理。
 - **通用渲染**：TUI 中未知 custom entry 以通用 JSON 折叠块渲染（类型名 + 数据摘要），不报错、不阻断会话。
 

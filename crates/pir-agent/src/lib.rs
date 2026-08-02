@@ -24,6 +24,7 @@
 pub mod agent;
 pub mod agent_loop;
 pub mod error;
+pub mod harness;
 pub mod messages;
 pub mod session;
 pub mod stream_fn;

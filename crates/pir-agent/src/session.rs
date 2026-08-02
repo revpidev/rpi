@@ -150,6 +150,10 @@ pub struct CustomMessageEntry {
     pub parent_id: Option<String>,
     pub timestamp: String,
     pub custom_type: String,
+    /// Field-level correction vs the T01 skeleton: `#[serde(default)]` mirrors
+    /// the upstream `entry.content ?? []` fallback in
+    /// `sessionEntryToContextMessages` (session-manager.ts:398).
+    #[serde(default)]
     pub content: pir_ai::types::UserContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
@@ -230,6 +234,10 @@ pub struct SessionHeader {
     pub id: String,
     /// ISO timestamp.
     pub timestamp: String,
+    /// Field-level correction vs the T01 skeleton: `#[serde(default)]` because
+    /// old sessions predate the `cwd` field (upstream SessionInfo documents
+    /// "Empty string for old sessions", session-manager.ts:625-628).
+    #[serde(default)]
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
@@ -255,6 +263,97 @@ pub enum FileEntry {
     Label(LabelEntry),
     SessionInfo(SessionInfoEntry),
     Leaf(LeafEntry),
+}
+
+impl FileEntry {
+    /// Convert into the read-side [`SessionEntry`] union; the header variant
+    /// maps to `None` (headers are not tree entries).
+    pub fn into_session_entry(self) -> Option<SessionEntry> {
+        match self {
+            FileEntry::Session(_) => None,
+            FileEntry::Message(e) => Some(SessionEntry::Message(e)),
+            FileEntry::ThinkingLevelChange(e) => Some(SessionEntry::ThinkingLevelChange(e)),
+            FileEntry::ModelChange(e) => Some(SessionEntry::ModelChange(e)),
+            FileEntry::ActiveToolsChange(e) => Some(SessionEntry::ActiveToolsChange(e)),
+            FileEntry::Compaction(e) => Some(SessionEntry::Compaction(e)),
+            FileEntry::BranchSummary(e) => Some(SessionEntry::BranchSummary(e)),
+            FileEntry::Custom(e) => Some(SessionEntry::Custom(e)),
+            FileEntry::CustomMessage(e) => Some(SessionEntry::CustomMessage(e)),
+            FileEntry::Label(e) => Some(SessionEntry::Label(e)),
+            FileEntry::SessionInfo(e) => Some(SessionEntry::SessionInfo(e)),
+            FileEntry::Leaf(e) => Some(SessionEntry::Leaf(e)),
+        }
+    }
+}
+
+impl SessionEntry {
+    /// Upstream `entry.type` literal.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            SessionEntry::Message(_) => "message",
+            SessionEntry::ThinkingLevelChange(_) => "thinking_level_change",
+            SessionEntry::ModelChange(_) => "model_change",
+            SessionEntry::ActiveToolsChange(_) => "active_tools_change",
+            SessionEntry::Compaction(_) => "compaction",
+            SessionEntry::BranchSummary(_) => "branch_summary",
+            SessionEntry::Custom(_) => "custom",
+            SessionEntry::CustomMessage(_) => "custom_message",
+            SessionEntry::Label(_) => "label",
+            SessionEntry::SessionInfo(_) => "session_info",
+            SessionEntry::Leaf(_) => "leaf",
+        }
+    }
+
+    /// `entry.id`.
+    pub fn id(&self) -> &str {
+        match self {
+            SessionEntry::Message(e) => &e.id,
+            SessionEntry::ThinkingLevelChange(e) => &e.id,
+            SessionEntry::ModelChange(e) => &e.id,
+            SessionEntry::ActiveToolsChange(e) => &e.id,
+            SessionEntry::Compaction(e) => &e.id,
+            SessionEntry::BranchSummary(e) => &e.id,
+            SessionEntry::Custom(e) => &e.id,
+            SessionEntry::CustomMessage(e) => &e.id,
+            SessionEntry::Label(e) => &e.id,
+            SessionEntry::SessionInfo(e) => &e.id,
+            SessionEntry::Leaf(e) => &e.id,
+        }
+    }
+
+    /// `entry.parentId`.
+    pub fn parent_id(&self) -> Option<&str> {
+        match self {
+            SessionEntry::Message(e) => e.parent_id.as_deref(),
+            SessionEntry::ThinkingLevelChange(e) => e.parent_id.as_deref(),
+            SessionEntry::ModelChange(e) => e.parent_id.as_deref(),
+            SessionEntry::ActiveToolsChange(e) => e.parent_id.as_deref(),
+            SessionEntry::Compaction(e) => e.parent_id.as_deref(),
+            SessionEntry::BranchSummary(e) => e.parent_id.as_deref(),
+            SessionEntry::Custom(e) => e.parent_id.as_deref(),
+            SessionEntry::CustomMessage(e) => e.parent_id.as_deref(),
+            SessionEntry::Label(e) => e.parent_id.as_deref(),
+            SessionEntry::SessionInfo(e) => e.parent_id.as_deref(),
+            SessionEntry::Leaf(e) => e.parent_id.as_deref(),
+        }
+    }
+
+    /// `entry.timestamp` (ISO string).
+    pub fn timestamp(&self) -> &str {
+        match self {
+            SessionEntry::Message(e) => &e.timestamp,
+            SessionEntry::ThinkingLevelChange(e) => &e.timestamp,
+            SessionEntry::ModelChange(e) => &e.timestamp,
+            SessionEntry::ActiveToolsChange(e) => &e.timestamp,
+            SessionEntry::Compaction(e) => &e.timestamp,
+            SessionEntry::BranchSummary(e) => &e.timestamp,
+            SessionEntry::Custom(e) => &e.timestamp,
+            SessionEntry::CustomMessage(e) => &e.timestamp,
+            SessionEntry::Label(e) => &e.timestamp,
+            SessionEntry::SessionInfo(e) => &e.timestamp,
+            SessionEntry::Leaf(e) => &e.timestamp,
+        }
+    }
 }
 
 #[cfg(test)]

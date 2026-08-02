@@ -406,6 +406,8 @@ parse args (clap)
 
 **存储**：仅 JSONL。路径默认 `~/.pir/agent/sessions/`（`--<cwd>--` 编码：去前导斜杠，`/\:`→`-`）。格式对齐钉死版 Pi；**不做** `~/.pi` 迁移工具。
 
+**Rust 落地注记**（T07，D-012）：实现于 `crates/pir/src/core/session_manager.rs`（同步 IO，调用方自行 `spawn_blocking`），条目类型单一来源在 `pir-agent::session`（D-001）。差异要点：`retainedTail` 形态读取时按上游 `docs/session-format.md`（self-contained checkpoint）与 harness 行为展开进 context（coding-agent 钉死版不展开；主路径只写 `firstKeptEntryId` 形态，不影响对拍契约）；id/uuidv7 由 `pir-ai/src/utils/uuid.rs` 自实现（不引 `rand`/`uuid` crate）；typed 联合体的固有降级边界（合法 JSON 非对象行丢弃、形状不合法的已知条目降级 Raw、header 发现需完整 typed header、数字格式化 `1e2` 级微差）逐条见 D-012；`list`/`listAll` 发现列举留 T12。
+
 ### 6.4 Compaction
 
 独立模块移植 `compaction.ts` / `branch-summarization.ts` / `utils.ts`：
@@ -527,7 +529,7 @@ pub struct PirConfig {
 // 环境变量名由 env_prefix 派生（PIR_CODING_AGENT_DIR 等）
 ```
 
-路径解析单一模块（对齐 Pi `config.ts`），禁止各处拼 `__dirname`。
+路径解析单一模块（对齐 Pi `config.ts`），禁止各处拼 `__dirname`。T07 已落地 `crates/pir/src/config.rs`（agent_dir、sessions 目录与 `--<cwd>--` 编码、`--session-dir` / `PIR_CODING_AGENT_SESSION_DIR` / settings / 默认覆盖链，空串逐级落空对齐上游 falsy 语义）。
 
 ---
 

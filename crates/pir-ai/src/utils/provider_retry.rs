@@ -114,9 +114,12 @@ fn random_unit() -> f64 {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0x9e3779b97f4a7c15)
             | 1;
-        state = STATE
-            .compare_exchange(0, seed, Ordering::Relaxed, Ordering::Relaxed)
-            .unwrap_or(seed);
+        state = match STATE.compare_exchange(0, seed, Ordering::Relaxed, Ordering::Relaxed) {
+            // Won the race: this thread's seed is now the state.
+            Ok(_) => seed,
+            // Lost the race: use the seed another thread installed.
+            Err(current) => current,
+        };
     }
     // xorshift64*
     state ^= state >> 12;
@@ -236,6 +239,20 @@ mod tests {
             },
             message: message.to_owned(),
         }
+    }
+
+    #[test]
+    fn test_random_unit_is_not_constant_zero() {
+        // Regression: a compare_exchange seeding bug pinned the PRNG state to
+        // 0, making xorshift64*(0) = 0 and jitter a no-op. The global state is
+        // process-wide and may already be seeded by other tests — that is
+        // fine; only constant-zero is the failure mode.
+        let a = random_unit();
+        let b = random_unit();
+        assert!((0.0..1.0).contains(&a), "unit range: {a}");
+        assert!((0.0..1.0).contains(&b), "unit range: {b}");
+        assert!(a != 0.0 || b != 0.0, "random_unit pinned at zero");
+        assert_ne!(a, b, "consecutive draws must differ");
     }
 
     #[test]

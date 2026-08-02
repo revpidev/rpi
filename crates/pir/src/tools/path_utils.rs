@@ -172,6 +172,29 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 // -----------------------------------------------------------------------
+// normalizePath / resolvePath with upstream default options (paths.ts:57-84)
+// -----------------------------------------------------------------------
+
+/// `normalizePath` with upstream default options: tilde expansion and
+/// `file://` decoding only (no `@` strip, no Unicode-space normalization).
+pub fn normalize_path(input: &str) -> String {
+    normalize_path_inner(input, false, false)
+}
+
+/// `resolvePath` (paths.ts:81-84): normalize, then resolve against
+/// `base_dir` when the normalized input is not absolute. The result is
+/// lexically cleaned like Node's `path.resolve` (no filesystem access).
+pub fn resolve_path(input: &str, base_dir: &Path) -> PathBuf {
+    let normalized = normalize_path_inner(input, false, false);
+    let normalized_path = PathBuf::from(&normalized);
+    if normalized_path.is_absolute() {
+        normalize_lexical(&normalized_path)
+    } else {
+        normalize_lexical(&base_dir.join(&normalized_path))
+    }
+}
+
+// -----------------------------------------------------------------------
 // expandPath / resolveToCwd (path-utils.ts:40-50)
 // -----------------------------------------------------------------------
 

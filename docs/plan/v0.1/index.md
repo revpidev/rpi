@@ -44,7 +44,7 @@
 | T04 | [pir-ai Auth 基础](./T04-pir-ai-auth.md) | M1 | T03 | 已完成 | 2026-07-31 |
 | T05 | [pir-agent：agent_loop 与 Agent](./T05-pir-agent-loop.md) | M2 | T01、T02 | 已完成 | 2026-08-01 |
 | T06 | [内置四工具与 ToolContext](./T06-builtin-tools.md) | M2 | T05 | 已完成 | 2026-08-01 |
-| T07 | [SessionManager（JSONL 树）](./T07-session-manager.md) | M3 | T01、T05 | 未开始 | — |
+| T07 | [SessionManager（JSONL 树）](./T07-session-manager.md) | M3 | T01、T05 | 已完成 | 2026-08-03 |
 | T08 | [Compaction](./T08-compaction.md) | M3 | T07 | 未开始 | — |
 | T09 | [Settings 与资源加载](./T09-settings-resources.md) | M3 | T01 | 未开始 | — |
 | T16 | [pir-agent harness 层](./T16-agent-harness.md) | M3 | T05、T07、T08 | 未开始 | — |
