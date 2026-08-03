@@ -1,0 +1,6 @@
+HISTORY ONLY SUMMARY
+
+<modified-files>
+src/a.ts
+src/b.ts
+</modified-files>

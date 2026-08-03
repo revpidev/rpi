@@ -1,0 +1,22 @@
+{
+  "tokensBefore": 610,
+  "firstKeptEntryId": "e0006",
+  "usage": {
+    "input": 22,
+    "output": 14,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 36,
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+    }
+  },
+  "details": {
+    "readFiles": [],
+    "modifiedFiles": []
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "readFiles": [
+    "src/oauth.ts"
+  ],
+  "modifiedFiles": [],
+  "maxTokens": 2048,
+  "cacheRetention": "none",
+  "usage": {
+    "input": 11,
+    "output": 7,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "totalTokens": 18,
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0,
+      "total": 0
+    }
+  }
+}

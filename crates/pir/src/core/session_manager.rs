@@ -37,15 +37,16 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use pir_agent::messages::{
-    AgentMessage, BranchSummaryMessage, BranchSummaryRole, CompactionSummaryMessage,
-    CompactionSummaryRole, CustomMessage, CustomRole,
-};
+use pir_agent::messages::AgentMessage;
 use pir_agent::session::{
     BranchSummaryEntry, CompactionEntry, CustomEntry, CustomMessageEntry, FileEntry, LabelEntry,
     MessageEntry, ModelChangeEntry, SessionEntry, SessionHeader, SessionInfoEntry,
     ThinkingLevelChangeEntry, CURRENT_SESSION_VERSION,
 };
+// Entry → context-message conversion and the ISO 8601 parse live in
+// `pir_agent::session` (T08): one implementation shared with the compaction
+// module (stale-usage timestamp guards, agent-session.ts:1974/2030).
+pub use pir_agent::session::{parse_iso8601_ms, session_entry_to_context_messages};
 use pir_ai::types::Usage;
 use pir_ai::utils::uuid::{random_uuid, uuidv7};
 use serde_json::Value;
@@ -88,17 +89,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-/// Days since epoch from civil date (inverse of [`civil_from_days`]).
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let m_adj = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
-    let doy = (153 * m_adj + 2) / 5 + d as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// `new Date(ms).toISOString()` — `YYYY-MM-DDTHH:MM:SS.sssZ`.
 fn format_iso8601_ms(ms: u64) -> String {
     let ms = ms as i64;
@@ -110,44 +100,6 @@ fn format_iso8601_ms(ms: u64) -> String {
     let s = (rem % 60_000) / 1000;
     let milli = rem % 1000;
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
-}
-
-/// Parse the ISO 8601 form Pi writes (`new Date(ts).getTime()` inverse).
-///
-/// Returns `None` for anything else, where upstream `new Date(ts).getTime()`
-/// yields `NaN`; callers substitute `0` (Rust has no NaN for i64).
-fn parse_iso8601_ms(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    // YYYY-MM-DDTHH:MM:SS[.sss]Z
-    if b.len() != 20 && b.len() != 24 {
-        return None;
-    }
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<i64> { s.get(from..to)?.parse::<i64>().ok() };
-    let y = num(0, 4)?;
-    let mo = num(5, 7)? as u32;
-    let d = num(8, 10)? as u32;
-    let h = num(11, 13)?;
-    let mi = num(14, 16)?;
-    let sec = num(17, 19)?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let (milli, z_off) = if b.len() == 24 {
-        if b[19] != b'.' {
-            return None;
-        }
-        (num(20, 23)?, 23)
-    } else {
-        (0, 19)
-    };
-    if b[z_off] != b'Z' {
-        return None;
-    }
-    let days = days_from_civil(y, mo, d);
-    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1000 + milli)
 }
 
 fn now_iso8601() -> String {
@@ -849,95 +801,6 @@ fn get_session_context_settings(path: &[&StoredEntry]) -> (String, Option<Sessio
         }
     }
     (thinking_level, model)
-}
-
-/// `createCustomMessage` (messages.ts:123-138): entry ISO timestamp →
-/// `new Date(timestamp).getTime()`. Unparseable timestamps map to `0`
-/// (upstream `NaN`; i64 has no NaN).
-fn create_custom_message(
-    custom_type: &str,
-    content: pir_ai::types::UserContent,
-    display: bool,
-    details: Option<Value>,
-    timestamp: &str,
-) -> CustomMessage {
-    CustomMessage {
-        role: CustomRole::Custom,
-        custom_type: custom_type.to_owned(),
-        content,
-        display,
-        details,
-        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
-    }
-}
-
-/// `createBranchSummaryMessage` (messages.ts:100-107).
-fn create_branch_summary_message(
-    summary: &str,
-    from_id: &str,
-    timestamp: &str,
-) -> BranchSummaryMessage {
-    BranchSummaryMessage {
-        role: BranchSummaryRole::BranchSummary,
-        summary: summary.to_owned(),
-        from_id: from_id.to_owned(),
-        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
-    }
-}
-
-/// `createCompactionSummaryMessage` (messages.ts:109-120).
-fn create_compaction_summary_message(
-    summary: &str,
-    tokens_before: u64,
-    timestamp: &str,
-) -> CompactionSummaryMessage {
-    CompactionSummaryMessage {
-        role: CompactionSummaryRole::CompactionSummary,
-        summary: summary.to_owned(),
-        tokens_before,
-        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
-    }
-}
-
-/// `sessionEntryToContextMessages` (session-manager.ts:383-408).
-///
-/// Plain `custom` entries (and unknown/raw entries, handled by the caller)
-/// produce no context messages. `compaction` also expands `retainedTail` when
-/// present — session-format.md §Context Building, harness session.ts:123-127
-/// (see file header note).
-pub fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessage> {
-    match entry {
-        SessionEntry::Message(m) => {
-            // Null/missing message content is normalized to `[]` at the
-            // serde boundary (`null_default` in pir-ai types), matching the
-            // upstream null-content guard (session-manager.ts:388-394).
-            vec![m.message.clone()]
-        }
-        SessionEntry::CustomMessage(c) => vec![AgentMessage::Custom(create_custom_message(
-            &c.custom_type,
-            c.content.clone(),
-            c.display,
-            c.details.clone(),
-            &c.timestamp,
-        ))],
-        SessionEntry::BranchSummary(b) if !b.summary.is_empty() => {
-            vec![AgentMessage::BranchSummary(create_branch_summary_message(
-                &b.summary,
-                &b.from_id,
-                &b.timestamp,
-            ))]
-        }
-        SessionEntry::Compaction(c) => {
-            let mut messages = vec![AgentMessage::CompactionSummary(
-                create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp),
-            )];
-            if let Some(tail) = &c.retained_tail {
-                messages.extend(tail.iter().cloned());
-            }
-            messages
-        }
-        _ => Vec::new(),
-    }
 }
 
 /// `buildContextEntries` (session-manager.ts:418-454): the last compaction on

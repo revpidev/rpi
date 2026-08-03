@@ -141,6 +141,65 @@ const SCENARIOS = {
 			await session.prompt("Answer until you run out of tokens.");
 		},
 	},
+
+	/**
+	 * compaction 阈值触发：contextWindow 8192 / reserve 4096 → 阈值 4096 tokens。
+	 * 两轮大回复各触发一次自动压缩：第一轮 split-turn 仅 turn-prefix 摘要
+	 * （history 为空 → "No prior history."），第二轮带 previousSummary 走
+	 * UPDATE prompt + turn-prefix 双调用；第三轮小回复的压缩检查因切点
+	 * 无内容可摘要而静默跳过（stale 守卫同时覆盖 pre-prompt 检查）。
+	 */
+	"compaction-threshold": {
+		options: { models: [{ id: "faux-1", contextWindow: 8192, maxTokens: 65536 }] },
+		settings: { compaction: { reserveTokens: 4096, keepRecentTokens: 512 } },
+		// Factory responses so each assistant timestamp is its own turn's
+		// Date.now() — scripted-upfront timestamps would predate the first
+		// compaction and trip the stale-usage guard (agent-session.ts:1974).
+		responses: () => [
+			() => fauxAssistantMessage(`ALPHA ${"alpha evidence block. ".repeat(560)}`),
+			() => fauxAssistantMessage("Turn prefix summary: the user asked about the alpha topic."),
+			() => fauxAssistantMessage(`BETA ${"beta evidence block. ".repeat(560)}`),
+			() => fauxAssistantMessage("Updated history summary: alpha and beta evidence discussed."),
+			() => fauxAssistantMessage("Turn prefix summary: the user then asked about beta."),
+			() => fauxAssistantMessage("A short final answer."),
+		],
+		async drive(session, { waitForEvent }) {
+			await session.prompt("First question about the alpha topic.");
+			await waitForEvent("compaction_end", 1);
+			await session.prompt("Second question about the beta topic.");
+			await waitForEvent("compaction_end", 2);
+			await session.prompt("A small follow-up question.");
+		},
+	},
+
+	/**
+	 * compaction overflow 恢复：窗口 16384 / reserve 8192（阈值远离正常用量）。
+	 * 第三轮收到 "prompt is too long" 错误 → overflow 恢复压缩（split-turn：
+	 * history 初始摘要 + turn-prefix 摘要两次 LLM 调用）→ willRetry →
+	 * agent.continue 自动重试该轮并成功。
+	 */
+	"compaction-overflow": {
+		options: { models: [{ id: "faux-1", contextWindow: 16384, maxTokens: 65536 }] },
+		settings: { compaction: { reserveTokens: 8192, keepRecentTokens: 256 } },
+		responses: () => [
+			() => fauxAssistantMessage(`FIRST ${"first answer block. ".repeat(80)}`),
+			() => fauxAssistantMessage(`SECOND ${"second answer block. ".repeat(80)}`),
+			() =>
+				fauxAssistantMessage("", {
+					stopReason: "error",
+					errorMessage: "prompt is too long: 200000 tokens > 16384 maximum",
+				}),
+			() => fauxAssistantMessage("History summary: two answers were given before the overflow."),
+			() => fauxAssistantMessage("Turn prefix summary: the user asked the overflowing question."),
+			() => fauxAssistantMessage("Recovered answer after compaction and retry."),
+		],
+		async drive(session, { waitForEvent }) {
+			await session.prompt("Question one.");
+			await session.prompt("Question two.");
+			await session.prompt("The question that overflows the context window.");
+			await waitForEvent("compaction_end", 1);
+		},
+	},
 };
 
 // ---------------------------------------------------------------------------
@@ -148,16 +207,18 @@ const SCENARIOS = {
 // ---------------------------------------------------------------------------
 
 async function waitForEventFactory(events) {
-	return (type, timeoutMs = 15000) =>
+	// `occurrence` waits for the Nth event of a type (1-based) so scenarios
+	// with repeated events (two compactions) don't resolve on the first one.
+	return (type, occurrence = 1, timeoutMs = 15000) =>
 		new Promise((resolve, reject) => {
 			const started = Date.now();
 			const timer = setInterval(() => {
-				if (events.some((e) => e.type === type)) {
+				if (events.filter((e) => e.type === type).length >= occurrence) {
 					clearInterval(timer);
 					resolve();
 				} else if (Date.now() - started > timeoutMs) {
 					clearInterval(timer);
-					reject(new Error(`timed out waiting for event "${type}"`));
+					reject(new Error(`timed out waiting for event "${type}" #${occurrence}`));
 				}
 			}, 5);
 		});
@@ -190,7 +251,7 @@ async function runScenario(name, scenario) {
 		const model = modelRuntime.getModel(faux.provider.id ?? "faux", "faux-1");
 		if (!model) throw new Error(`faux model not registered for scenario ${name}`);
 
-		const settingsManager = SettingsManager.inMemory();
+		const settingsManager = SettingsManager.inMemory(scenario.settings ?? {});
 		const resourceLoader = new DefaultResourceLoader({
 			cwd: workspace,
 			agentDir,

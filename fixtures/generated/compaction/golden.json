@@ -1,0 +1,2283 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "estimateTokens": [
+    {
+      "name": "user_text",
+      "message": {
+        "role": "user",
+        "content": "hello world",
+        "timestamp": 1
+      },
+      "expected": 3
+    },
+    {
+      "name": "user_blocks_text_and_image",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "abcd"
+          },
+          {
+            "type": "image",
+            "data": "QUJD",
+            "mimeType": "image/png"
+          },
+          {
+            "type": "text",
+            "text": "ef"
+          }
+        ],
+        "timestamp": 1
+      },
+      "expected": 1202
+    },
+    {
+      "name": "user_empty_string",
+      "message": {
+        "role": "user",
+        "content": "",
+        "timestamp": 1
+      },
+      "expected": 0
+    },
+    {
+      "name": "assistant_text_thinking_toolcalls",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "thinking",
+            "thinking": "hmm hmm"
+          },
+          {
+            "type": "text",
+            "text": "answer text"
+          },
+          {
+            "type": "toolCall",
+            "id": "call-1",
+            "name": "read",
+            "arguments": {
+              "path": "src/main.rs"
+            }
+          },
+          {
+            "type": "toolCall",
+            "id": "call-2",
+            "name": "bash",
+            "arguments": {
+              "command": "ls -la",
+              "timeout": 1000
+            }
+          }
+        ],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 2
+      },
+      "expected": 21
+    },
+    {
+      "name": "assistant_toolcall_nested_args",
+      "message": {
+        "role": "assistant",
+        "content": [
+          {
+            "type": "toolCall",
+            "id": "call-1",
+            "name": "edit",
+            "arguments": {
+              "path": "a.ts",
+              "edits": [
+                {
+                  "old": "x",
+                  "new": "y"
+                }
+              ],
+              "flags": [
+                "g",
+                "i"
+              ]
+            }
+          }
+        ],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 2
+      },
+      "expected": 18
+    },
+    {
+      "name": "toolResult_text",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call-1",
+        "toolName": "read",
+        "content": [
+          {
+            "type": "text",
+            "text": "file body here"
+          }
+        ],
+        "isError": false,
+        "timestamp": 3
+      },
+      "expected": 4
+    },
+    {
+      "name": "toolResult_image",
+      "message": {
+        "role": "toolResult",
+        "toolCallId": "call-1",
+        "toolName": "read",
+        "content": [
+          {
+            "type": "text",
+            "text": "shot"
+          },
+          {
+            "type": "image",
+            "data": "QUJD",
+            "mimeType": "image/png"
+          }
+        ],
+        "isError": false,
+        "timestamp": 3
+      },
+      "expected": 1201
+    },
+    {
+      "name": "bashExecution",
+      "message": {
+        "role": "bashExecution",
+        "command": "git status",
+        "output": "On branch main\nnothing to commit",
+        "cancelled": false,
+        "truncated": false,
+        "timestamp": 4
+      },
+      "expected": 11
+    },
+    {
+      "name": "custom",
+      "message": {
+        "role": "custom",
+        "customType": "note",
+        "content": "custom content text",
+        "display": false,
+        "timestamp": 5
+      },
+      "expected": 5
+    },
+    {
+      "name": "branchSummary",
+      "message": {
+        "role": "branchSummary",
+        "summary": "branch summary body",
+        "fromId": "e0001",
+        "timestamp": 6
+      },
+      "expected": 5
+    },
+    {
+      "name": "compactionSummary",
+      "message": {
+        "role": "compactionSummary",
+        "summary": "compacted history body",
+        "tokensBefore": 12345,
+        "timestamp": 7
+      },
+      "expected": 6
+    },
+    {
+      "name": "user_unicode_bmp",
+      "message": {
+        "role": "user",
+        "content": "中文测试字符串",
+        "timestamp": 1
+      },
+      "expected": 2
+    }
+  ],
+  "calculateContextTokens": [
+    {
+      "name": "total_tokens_wins",
+      "usage": {
+        "input": 10,
+        "output": 5,
+        "cacheRead": 3,
+        "cacheWrite": 2,
+        "totalTokens": 999,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "expected": 999
+    },
+    {
+      "name": "component_sum_when_total_zero",
+      "usage": {
+        "input": 10,
+        "output": 5,
+        "cacheRead": 3,
+        "cacheWrite": 2,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "expected": 20
+    },
+    {
+      "name": "all_zero",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 0,
+        "cost": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "total": 0
+        }
+      },
+      "expected": 0
+    }
+  ],
+  "estimateContextTokens": [
+    {
+      "name": "no_usage_anchor",
+      "messages": [
+        {
+          "role": "user",
+          "content": "aaaaaaaa",
+          "timestamp": 1
+        },
+        {
+          "role": "user",
+          "content": "bbbb",
+          "timestamp": 2
+        }
+      ],
+      "expected": {
+        "tokens": 3,
+        "usageTokens": 0,
+        "trailingTokens": 3,
+        "lastUsageIndex": null
+      }
+    },
+    {
+      "name": "usage_anchor_with_trailing",
+      "messages": [
+        {
+          "role": "user",
+          "content": "start",
+          "timestamp": 1
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "reply"
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 100,
+            "output": 20,
+            "cacheRead": 5,
+            "cacheWrite": 10,
+            "totalTokens": 135,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 2
+        },
+        {
+          "role": "user",
+          "content": "aaaaaaaa",
+          "timestamp": 3
+        }
+      ],
+      "expected": {
+        "tokens": 137,
+        "usageTokens": 135,
+        "trailingTokens": 2,
+        "lastUsageIndex": 1
+      }
+    },
+    {
+      "name": "skips_aborted_error_and_zero_usage",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "old"
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 50,
+            "output": 10,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 60,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "aborted"
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 999,
+            "output": 999,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 1998,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "aborted",
+          "timestamp": 2
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "err"
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 888,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 889,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "error",
+          "errorMessage": "boom",
+          "timestamp": 3
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "zero"
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 4
+        }
+      ],
+      "expected": {
+        "tokens": 64,
+        "usageTokens": 60,
+        "trailingTokens": 4,
+        "lastUsageIndex": 0
+      }
+    }
+  ],
+  "findCutPoint": [
+    {
+      "name": "crosses_threshold_at_user_boundary",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0001",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0002",
+          "parentId": "e0001",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0003",
+          "parentId": "e0002",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "timestamp": 1
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 3,
+      "keepRecentTokens": 100,
+      "expected": {
+        "firstKeptEntryIndex": 1,
+        "turnStartIndex": -1,
+        "isSplitTurn": false
+      }
+    },
+    {
+      "name": "never_cuts_at_tool_result",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0004",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0005",
+          "parentId": "e0004",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0006",
+          "parentId": "e0005",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0007",
+          "parentId": "e0006",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0008",
+          "parentId": "e0007",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 5,
+      "keepRecentTokens": 110,
+      "expected": {
+        "firstKeptEntryIndex": 3,
+        "turnStartIndex": 0,
+        "isSplitTurn": true
+      }
+    },
+    {
+      "name": "split_turn_mid_turn_cut",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0009",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0010",
+          "parentId": "e0009",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0011",
+          "parentId": "e0010",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0012",
+          "parentId": "e0011",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0013",
+          "parentId": "e0012",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0014",
+          "parentId": "e0013",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0015",
+          "parentId": "e0014",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 7,
+      "keepRecentTokens": 150,
+      "expected": {
+        "firstKeptEntryIndex": 5,
+        "turnStartIndex": 2,
+        "isSplitTurn": true
+      }
+    },
+    {
+      "name": "absorbs_metadata_entries_before_cut",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0017",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0016",
+          "parentId": "e0017",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "label",
+          "id": "e0018",
+          "parentId": "e0016",
+          "timestamp": "2026-08-01T00:00:03.000Z",
+          "targetId": "e0016",
+          "label": "mark"
+        },
+        {
+          "type": "message",
+          "id": "e0019",
+          "parentId": "e0018",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 4,
+      "keepRecentTokens": 20,
+      "expected": {
+        "firstKeptEntryIndex": 1,
+        "turnStartIndex": -1,
+        "isSplitTurn": false
+      }
+    },
+    {
+      "name": "under_budget_keeps_from_first_cut_point",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0020",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0021",
+          "parentId": "e0020",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 2,
+      "keepRecentTokens": 100000,
+      "expected": {
+        "firstKeptEntryIndex": 0,
+        "turnStartIndex": -1,
+        "isSplitTurn": false
+      }
+    },
+    {
+      "name": "no_valid_cut_points",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0022",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0023",
+          "parentId": "e0022",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 2,
+      "keepRecentTokens": 10,
+      "expected": {
+        "firstKeptEntryIndex": 0,
+        "turnStartIndex": -1,
+        "isSplitTurn": false
+      }
+    },
+    {
+      "name": "compaction_boundary_not_crossed",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0024",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "e0025",
+          "parentId": "e0024",
+          "timestamp": "2026-08-01T00:00:04.000Z",
+          "summary": "summary",
+          "firstKeptEntryId": "e0001",
+          "tokensBefore": 500
+        },
+        {
+          "type": "message",
+          "id": "e0026",
+          "parentId": "e0025",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0027",
+          "parentId": "e0026",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        }
+      ],
+      "startIndex": 0,
+      "endIndex": 4,
+      "keepRecentTokens": 20,
+      "expected": {
+        "firstKeptEntryIndex": 2,
+        "turnStartIndex": -1,
+        "isSplitTurn": false
+      }
+    }
+  ],
+  "prepareCompaction": [
+    {
+      "name": "first_compaction",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0001",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0002",
+          "parentId": "e0001",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "read",
+                "arguments": {
+                  "path": "src/a.ts"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0003",
+          "parentId": "e0002",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "file body"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0004",
+          "parentId": "e0003",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0005",
+          "parentId": "e0004",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        }
+      ],
+      "settings": {
+        "enabled": true,
+        "reserveTokens": 16384,
+        "keepRecentTokens": 120
+      },
+      "expected": {
+        "firstKeptEntryId": "e0002",
+        "isSplitTurn": true,
+        "tokensBefore": 229,
+        "previousSummary": null,
+        "messagesToSummarizeCount": 0,
+        "turnPrefixMessagesCount": 1,
+        "fileOps": {
+          "read": [],
+          "written": [],
+          "edited": []
+        }
+      }
+    },
+    {
+      "name": "split_turn_preparation",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0006",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0007",
+          "parentId": "e0006",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "write",
+                "arguments": {
+                  "path": "out.txt",
+                  "content": "c"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0008",
+          "parentId": "e0007",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0009",
+          "parentId": "e0008",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "edit",
+                "arguments": {
+                  "path": "out.txt",
+                  "old": "a",
+                  "new": "b"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0010",
+          "parentId": "e0009",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0011",
+          "parentId": "e0010",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0012",
+          "parentId": "e0011",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        }
+      ],
+      "settings": {
+        "enabled": true,
+        "reserveTokens": 16384,
+        "keepRecentTokens": 150
+      },
+      "expected": {
+        "firstKeptEntryId": "e0011",
+        "isSplitTurn": true,
+        "tokensBefore": 631,
+        "previousSummary": null,
+        "messagesToSummarizeCount": 2,
+        "turnPrefixMessagesCount": 3,
+        "fileOps": {
+          "read": [],
+          "written": [
+            "out.txt"
+          ],
+          "edited": [
+            "out.txt"
+          ]
+        }
+      }
+    },
+    {
+      "name": "trailing_compaction_returns_undefined",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0013",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "e0014",
+          "parentId": "e0013",
+          "timestamp": "2026-08-01T00:00:04.000Z",
+          "summary": "s",
+          "firstKeptEntryId": "e0001",
+          "tokensBefore": 10
+        }
+      ],
+      "settings": {
+        "enabled": true,
+        "reserveTokens": 16384,
+        "keepRecentTokens": 20000
+      },
+      "expected": null
+    },
+    {
+      "name": "iterative_compaction",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0015",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0016",
+          "parentId": "e0015",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "read",
+                "arguments": {
+                  "path": "old.ts"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0017",
+          "parentId": "e0016",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "compaction",
+          "id": "e0018",
+          "parentId": "e0017",
+          "timestamp": "2026-08-01T00:00:04.000Z",
+          "summary": "previous summary body",
+          "firstKeptEntryId": "e0016",
+          "tokensBefore": 1234,
+          "details": {
+            "readFiles": [
+              "prev-read.ts"
+            ],
+            "modifiedFiles": [
+              "prev-mod.ts"
+            ]
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0019",
+          "parentId": "e0018",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0020",
+          "parentId": "e0019",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              },
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "edit",
+                "arguments": {
+                  "path": "prev-mod.ts",
+                  "old": "a",
+                  "new": "b"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0021",
+          "parentId": "e0020",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0022",
+          "parentId": "e0021",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        }
+      ],
+      "settings": {
+        "enabled": true,
+        "reserveTokens": 16384,
+        "keepRecentTokens": 120
+      },
+      "expected": {
+        "firstKeptEntryId": "e0020",
+        "isSplitTurn": true,
+        "tokensBefore": 444,
+        "previousSummary": "previous summary body",
+        "messagesToSummarizeCount": 2,
+        "turnPrefixMessagesCount": 1,
+        "fileOps": {
+          "read": [
+            "old.ts",
+            "prev-read.ts"
+          ],
+          "written": [],
+          "edited": [
+            "prev-mod.ts"
+          ]
+        }
+      }
+    }
+  ],
+  "serializeConversation": [
+    {
+      "name": "all_roles",
+      "messages": [
+        {
+          "role": "user",
+          "content": "what is in a.ts?",
+          "timestamp": 1
+        },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "thinking",
+              "thinking": "let me look"
+            },
+            {
+              "type": "text",
+              "text": "I will read it"
+            },
+            {
+              "type": "toolCall",
+              "id": "call-1",
+              "name": "read",
+              "arguments": {
+                "path": "a.ts"
+              }
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 1,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 2,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 2
+        },
+        {
+          "role": "toolResult",
+          "toolCallId": "call-1",
+          "toolName": "read",
+          "content": [
+            {
+              "type": "text",
+              "text": "const a = 1;"
+            }
+          ],
+          "isError": false,
+          "timestamp": 3
+        }
+      ],
+      "expected": "[User]: what is in a.ts?\n\n[Assistant thinking]: let me look\n\n[Assistant]: I will read it\n\n[Assistant tool calls]: read(path=\"a.ts\")\n\n[Tool result]: const a = 1;"
+    },
+    {
+      "name": "tool_result_truncated_at_2000_chars",
+      "messages": [
+        {
+          "role": "toolResult",
+          "toolCallId": "call-1",
+          "toolName": "bash",
+          "content": [
+            {
+              "type": "text",
+              "text": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+            }
+          ],
+          "isError": false,
+          "timestamp": 1
+        }
+      ],
+      "expected": "[Tool result]: qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n\n[... 137 more characters truncated]"
+    },
+    {
+      "name": "assistant_tool_calls_only",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "call-1",
+              "name": "bash",
+              "arguments": {
+                "command": "ls",
+                "timeout": 5
+              }
+            },
+            {
+              "type": "toolCall",
+              "id": "call-2",
+              "name": "read",
+              "arguments": {
+                "path": "b.ts"
+              }
+            }
+          ],
+          "api": "faux",
+          "provider": "faux",
+          "model": "faux-1",
+          "usage": {
+            "input": 1,
+            "output": 1,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 2,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1
+        }
+      ],
+      "expected": "[Assistant tool calls]: bash(command=\"ls\", timeout=5); read(path=\"b.ts\")"
+    },
+    {
+      "name": "empty_and_blank_parts_dropped",
+      "messages": [
+        {
+          "role": "user",
+          "content": "",
+          "timestamp": 1
+        },
+        {
+          "role": "user",
+          "content": "real question",
+          "timestamp": 2
+        },
+        {
+          "role": "toolResult",
+          "toolCallId": "call-1",
+          "toolName": "read",
+          "content": [],
+          "isError": false,
+          "timestamp": 3
+        }
+      ],
+      "expected": "[User]: real question"
+    }
+  ],
+  "fileOps": [
+    {
+      "name": "read_write_edit_dedup",
+      "ops": {
+        "read": [
+          "b.ts",
+          "a.ts",
+          "c.ts"
+        ],
+        "written": [
+          "c.ts"
+        ],
+        "edited": [
+          "b.ts",
+          "d.ts"
+        ]
+      },
+      "expected": {
+        "readFiles": [
+          "a.ts"
+        ],
+        "modifiedFiles": [
+          "b.ts",
+          "c.ts",
+          "d.ts"
+        ],
+        "formatted": "\n\n<read-files>\na.ts\n</read-files>\n\n<modified-files>\nb.ts\nc.ts\nd.ts\n</modified-files>"
+      }
+    },
+    {
+      "name": "empty",
+      "ops": {
+        "read": [],
+        "written": [],
+        "edited": []
+      },
+      "expected": {
+        "readFiles": [],
+        "modifiedFiles": [],
+        "formatted": ""
+      }
+    },
+    {
+      "name": "read_only",
+      "ops": {
+        "read": [
+          "x.ts",
+          "y.ts"
+        ],
+        "written": [],
+        "edited": []
+      },
+      "expected": {
+        "readFiles": [
+          "x.ts",
+          "y.ts"
+        ],
+        "modifiedFiles": [],
+        "formatted": "\n\n<read-files>\nx.ts\ny.ts\n</read-files>"
+      }
+    }
+  ],
+  "prepareBranchEntries": [
+    {
+      "name": "budget_loading_with_summary_force_keep",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0001",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "branch_summary",
+          "id": "e0002",
+          "parentId": "e0001",
+          "timestamp": "2026-08-01T00:00:05.000Z",
+          "fromId": "e0001",
+          "summary": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss"
+        },
+        {
+          "type": "message",
+          "id": "e0003",
+          "parentId": "e0002",
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0004",
+          "parentId": "e0003",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        }
+      ],
+      "tokenBudget": 260,
+      "expected": {
+        "messageCount": 3,
+        "totalTokens": 300,
+        "roles": [
+          "branchSummary",
+          "user",
+          "assistant"
+        ],
+        "fileOps": {
+          "read": [],
+          "written": [],
+          "edited": []
+        }
+      }
+    },
+    {
+      "name": "no_budget",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0005",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0006",
+          "parentId": "e0005",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        }
+      ],
+      "tokenBudget": 0,
+      "expected": {
+        "messageCount": 2,
+        "totalTokens": 110,
+        "roles": [
+          "user",
+          "assistant"
+        ],
+        "fileOps": {
+          "read": [],
+          "written": [],
+          "edited": []
+        }
+      }
+    },
+    {
+      "name": "tool_results_skipped_file_ops_merged",
+      "entries": [
+        {
+          "type": "message",
+          "id": "e0007",
+          "parentId": null,
+          "timestamp": "2026-08-01T00:00:00.000Z",
+          "message": {
+            "role": "user",
+            "content": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
+            "timestamp": 1
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0008",
+          "parentId": "e0007",
+          "timestamp": "2026-08-01T00:00:01.000Z",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "read",
+                "arguments": {
+                  "path": "r1.ts"
+                }
+              }
+            ],
+            "api": "faux",
+            "provider": "faux",
+            "model": "faux-1",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 2
+          }
+        },
+        {
+          "type": "message",
+          "id": "e0009",
+          "parentId": "e0008",
+          "timestamp": "2026-08-01T00:00:02.000Z",
+          "message": {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [
+              {
+                "type": "text",
+                "text": "body"
+              }
+            ],
+            "isError": false,
+            "timestamp": 3
+          }
+        },
+        {
+          "type": "branch_summary",
+          "id": "e0010",
+          "parentId": "e0009",
+          "timestamp": "2026-08-01T00:00:06.000Z",
+          "fromId": "e0001",
+          "summary": "nested",
+          "details": {
+            "readFiles": [
+              "nested-read.ts"
+            ],
+            "modifiedFiles": [
+              "nested-mod.ts"
+            ]
+          }
+        }
+      ],
+      "tokenBudget": 0,
+      "expected": {
+        "messageCount": 3,
+        "totalTokens": 17,
+        "roles": [
+          "user",
+          "assistant",
+          "branchSummary"
+        ],
+        "fileOps": {
+          "read": [
+            "nested-read.ts",
+            "r1.ts"
+          ],
+          "written": [],
+          "edited": [
+            "nested-mod.ts"
+          ]
+        }
+      }
+    }
+  ],
+  "isContextOverflow": [
+    {
+      "name": "error_pattern_anthropic",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "error",
+        "errorMessage": "prompt is too long: 213462 tokens > 200000 maximum",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": true
+    },
+    {
+      "name": "error_pattern_excluded_throttling",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "error",
+        "errorMessage": "Throttling error: Too many tokens, please wait before trying again.",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": false
+    },
+    {
+      "name": "silent_overflow_zai",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 210000,
+          "output": 10,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 210010,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": true
+    },
+    {
+      "name": "silent_overflow_within_window",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 199999,
+          "output": 10,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 200009,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "stop",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": false
+    },
+    {
+      "name": "xiaomi_truncation_length_zero_output",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 199000,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 199000,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "length",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": true
+    },
+    {
+      "name": "xiaomi_truncation_with_output_not_overflow",
+      "message": {
+        "role": "assistant",
+        "content": [],
+        "api": "faux",
+        "provider": "faux",
+        "model": "faux-1",
+        "usage": {
+          "input": 199000,
+          "output": 5,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 199005,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "stopReason": "length",
+        "timestamp": 1
+      },
+      "contextWindow": 200000,
+      "expected": false
+    }
+  ]
+}

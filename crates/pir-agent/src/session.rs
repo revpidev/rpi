@@ -356,6 +356,200 @@ impl SessionEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Entry → context message conversion (session-manager.ts, shared)
+// ---------------------------------------------------------------------------
+
+/// Days since epoch from civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let m_adj = if m > 2 { m as i64 - 3 } else { m as i64 + 9 };
+    let doy = (153 * m_adj + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parse the ISO 8601 form Pi writes (`new Date(ts).getTime()` inverse).
+///
+/// Returns `None` for anything else, where upstream `new Date(ts).getTime()`
+/// yields `NaN`; callers substitute `0` (Rust has no NaN for i64).
+///
+/// Single source for this parse: the `pir` main path (`session_manager.rs`)
+/// and the compaction wiring both use it (stale-usage timestamp guards,
+/// agent-session.ts:1974/2030).
+pub fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    // YYYY-MM-DDTHH:MM:SS[.sss]Z
+    if b.len() != 20 && b.len() != 24 {
+        return None;
+    }
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> { s.get(from..to)?.parse::<i64>().ok() };
+    let y = num(0, 4)?;
+    let mo = num(5, 7)? as u32;
+    let d = num(8, 10)? as u32;
+    let h = num(11, 13)?;
+    let mi = num(14, 16)?;
+    let sec = num(17, 19)?;
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let (milli, z_off) = if b.len() == 24 {
+        if b[19] != b'.' {
+            return None;
+        }
+        (num(20, 23)?, 23)
+    } else {
+        (0, 19)
+    };
+    if b[z_off] != b'Z' {
+        return None;
+    }
+    let days = days_from_civil(y, mo, d);
+    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1000 + milli)
+}
+
+/// `createCustomMessage` (messages.ts:81-98).
+pub(crate) fn create_custom_message(
+    custom_type: &str,
+    content: pir_ai::types::UserContent,
+    display: bool,
+    details: Option<Value>,
+    timestamp: &str,
+) -> crate::messages::CustomMessage {
+    crate::messages::CustomMessage {
+        role: crate::messages::CustomRole::Custom,
+        custom_type: custom_type.to_owned(),
+        content,
+        display,
+        details,
+        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
+    }
+}
+
+/// `createBranchSummaryMessage` (messages.ts:100-107).
+pub(crate) fn create_branch_summary_message(
+    summary: &str,
+    from_id: &str,
+    timestamp: &str,
+) -> crate::messages::BranchSummaryMessage {
+    crate::messages::BranchSummaryMessage {
+        role: crate::messages::BranchSummaryRole::BranchSummary,
+        summary: summary.to_owned(),
+        from_id: from_id.to_owned(),
+        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
+    }
+}
+
+/// `createCompactionSummaryMessage` (messages.ts:109-120).
+pub(crate) fn create_compaction_summary_message(
+    summary: &str,
+    tokens_before: u64,
+    timestamp: &str,
+) -> crate::messages::CompactionSummaryMessage {
+    crate::messages::CompactionSummaryMessage {
+        role: crate::messages::CompactionSummaryRole::CompactionSummary,
+        summary: summary.to_owned(),
+        tokens_before,
+        timestamp: parse_iso8601_ms(timestamp).unwrap_or(0),
+    }
+}
+
+/// `sessionEntryToContextMessages` (session-manager.ts:383-408).
+///
+/// Plain `custom` entries (and metadata entries) produce no context messages.
+/// `compaction` also expands `retainedTail` when present —
+/// session-format.md §Context Building, harness session.ts:123-127 (D-012;
+/// the pinned coding-agent omits the tail, the doc-level behavior is ported).
+pub fn session_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessage> {
+    match entry {
+        SessionEntry::Message(m) => {
+            // Null/missing message content is normalized to `[]` at the
+            // serde boundary (`null_default` in pir-ai types), matching the
+            // upstream null-content guard (session-manager.ts:388-394).
+            vec![m.message.clone()]
+        }
+        SessionEntry::CustomMessage(c) => vec![AgentMessage::Custom(create_custom_message(
+            &c.custom_type,
+            c.content.clone(),
+            c.display,
+            c.details.clone(),
+            &c.timestamp,
+        ))],
+        SessionEntry::BranchSummary(b) if !b.summary.is_empty() => {
+            vec![AgentMessage::BranchSummary(create_branch_summary_message(
+                &b.summary,
+                &b.from_id,
+                &b.timestamp,
+            ))]
+        }
+        SessionEntry::Compaction(c) => {
+            let mut messages = vec![AgentMessage::CompactionSummary(
+                create_compaction_summary_message(&c.summary, c.tokens_before, &c.timestamp),
+            )];
+            if let Some(tail) = &c.retained_tail {
+                messages.extend(tail.iter().cloned());
+            }
+            messages
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `getLatestCompactionEntry` (session-manager.ts:316-323): the last
+/// `compaction` entry on the path, if any.
+pub fn get_latest_compaction_entry(entries: &[SessionEntry]) -> Option<&CompactionEntry> {
+    entries.iter().rev().find_map(|entry| match entry {
+        SessionEntry::Compaction(c) => Some(c),
+        _ => None,
+    })
+}
+
+/// Message half of `buildSessionContext` (session-manager.ts:418-470) for an
+/// already path-ordered entry slice (root-first, as returned by `getBranch` —
+/// the shape `compaction.ts:736` passes in).
+///
+/// The last compaction on the path takes effect: output = the compaction
+/// entry + entries from `firstKeptEntryId` up to it + everything after it.
+/// For the `retainedTail` form (`firstKeptEntryId` absent) no earlier entries
+/// are walked — the compaction is a self-contained checkpoint.
+pub fn build_context_messages(entries: &[SessionEntry]) -> Vec<AgentMessage> {
+    let compaction_idx = entries
+        .iter()
+        .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
+
+    let context_entries: Vec<&SessionEntry> = match compaction_idx {
+        None => entries.iter().collect(),
+        Some(idx) => {
+            let SessionEntry::Compaction(compaction) = &entries[idx] else {
+                // invariant: rposition matched a Compaction variant above.
+                unreachable!("compaction index must point at a compaction entry")
+            };
+            let mut context_entries: Vec<&SessionEntry> = vec![&entries[idx]];
+            let mut found_first_kept = false;
+            for entry in &entries[..idx] {
+                if Some(entry.id()) == compaction.first_kept_entry_id.as_deref() {
+                    found_first_kept = true;
+                }
+                if found_first_kept {
+                    context_entries.push(entry);
+                }
+            }
+            context_entries.extend(entries[idx + 1..].iter());
+            context_entries
+        }
+    };
+
+    context_entries
+        .iter()
+        .flat_map(|entry| session_entry_to_context_messages(entry))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use pir_ai::types::{AssistantRole, StopReason, Usage};

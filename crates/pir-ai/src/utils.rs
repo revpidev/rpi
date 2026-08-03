@@ -16,6 +16,7 @@ pub mod provider_env;
 pub mod provider_retry;
 pub mod retry;
 pub mod sanitize_unicode;
+pub mod text;
 pub mod transform_messages;
 pub mod uuid;
 pub mod validation;

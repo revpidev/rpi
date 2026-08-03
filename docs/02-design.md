@@ -296,6 +296,8 @@ pub type StreamFn = Arc<dyn Fn(Model, Context, StreamOptions) -> BoxStream<'stat
 Agent **不**依赖具体 provider，便于测试 faux 与 proxy。StreamFn 不得 panic（对齐「不得 throw」契约）。
 
 > Rust 落地注记（D-010，T05 验收）：hook 的 args 回传与错误降级经返回值通道表达（`BeforeToolCallResult.args`、`AfterToolCallFn -> Result<..>`）；`BoxStream` 无 result 通道，流无终止事件时合成 error 消息收尾；reasoning/thinking_budgets 保留在 `AgentLoopConfig` 由组装层绑定；listener 屏障为 in-process 按注册序串行 await；`continue()` 命名 `continue_run`。详见 `docs/plan/v0.1/deviations/D-010-agent-loop-rust-notes.md`。
+>
+> Rust 落地注记（D-013，T08 验收）：`StreamOptions` 增加 `reasoning: Option<ModelThinkingLevel>` 字段——上游 summary 调用经 `SimpleStreamOptions.reasoning` 传 thinking level，而 pir-agent 的 summary 生成直接走本节的 `StreamFn`（裸 `StreamOptions`），reasoning 通道因此落在 `StreamOptions` 上；默认 `None`，既有路径行为不变。
 
 ### 4.5 Harness 层设计要点
 
@@ -417,6 +419,8 @@ parse args (clap)
 - maxTokens 预算（history 0.8× / turn prefix 0.5× / branch 2048）；overflow 三分支 + 同模型守卫 + 一次恢复
 - 文件操作跟踪 → `<read-files>`/`<modified-files>` + `details.{readFiles,modifiedFiles}` 累积
 - 请求隔离：`cacheRetention:"none"` + 新 routing session id（uuidv7）+ 复用 `settings.retry`
+
+**Rust 落地注记**（T08，D-013）：算法层（估算/切点/prompt/summary 生成/branch 装填）落 `crates/pir-agent/src/compaction.rs`（+ `compaction/utils.rs`、`compaction/branch_summarization.rs`），供 coding-agent 与 T16 harness 复用（§4.5）；coding-agent 侧触发接线（双路 `_checkCompaction`、overflow 一次恢复、`_runAutoCompaction`、compaction 事件发射）落 `crates/pir/src/core/compaction_runner.rs`。`parse_iso8601_ms` / `session_entry_to_context_messages` / `get_latest_compaction_entry` / `build_context_messages` 单一来源在 `pir-agent::session`，`pir::core::session_manager` re-export（D-001 延伸）。`estimatedTokensAfter` 按上游 `agent-session.ts` 语义=压缩后 context 消息的纯 `estimateTokens` 求和（非 `estimate.ts` 的 usage 锚点版）。
 
 ### 6.5 工具模块（coding-agent 基准）
 
@@ -639,7 +643,7 @@ gantt
 | `packages/tui/src/components/*`（12 个） | `crates/pir-tui/src/components/*` |
 | `packages/coding-agent/src/core/session-manager.ts` | `crates/pir/src/core/session_manager.rs` |
 | `packages/coding-agent/src/core/agent-session*.ts` | `crates/pir/src/core/agent_session*.rs` |
-| `packages/coding-agent/src/core/compaction/*` | `crates/pir/src/core/compaction/*` |
+| `packages/coding-agent/src/core/compaction/*` | 算法层 `crates/pir-agent/src/compaction*.rs` + 触发接线 `crates/pir/src/core/compaction_runner.rs`（D-013，T08） |
 | `packages/coding-agent/src/core/extensions/*` | `crates/pir/src/core/extensions/*` + `pir-ext-host` |
 | `packages/coding-agent/src/core/tools/*`（基准） | `crates/pir/src/tools/*` |
 | `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/pir/src/tools/bash_executor.rs` |

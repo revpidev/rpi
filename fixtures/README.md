@@ -72,9 +72,11 @@ cargo run -p pir-test-support --example normalize-diff -- \
 | `steering-followup` | 流式中 steer、后续流式中 followUp | 排队语义：无工具调用时 steer/followUp 均作为后续 turn 投递（queue_update 事件、turn 序列） |
 | `abort` | 流式中 `session.abort()` | aborted assistant 消息落盘（stopReason=aborted）、abort 事件序 |
 | `length-truncation` | stopReason=length 收尾 | length 截断消息的持久化形状 |
+| `compaction-threshold` | 8192 窗口/4096 reserve/512 keep：三轮问答，阈值触发两轮压缩（split-turn 前缀 + UPDATE 迭代），第三轮 prepare 为空静默 | CompactionEntry（firstKeptEntryId/usage/details/fromHook=false）、compaction_start/end 事件序、tokensBefore 重算、estimatedTokensAfter |
+| `compaction-overflow` | 16384 窗口：overflow error（"prompt is too long"）→ 恢复压缩 → 重试成功 | overflow 恢复路径、willRetry=true 事件序、恢复预算一次后重置 |
 
-补齐计划（任务索引）：compaction 场景随 **T08**、RPC 全命令 transcript（32 命令）
-随 **T10** 追加；届时本表与生成脚本同步扩展。
+补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 全命令
+transcript（32 命令）随 **T10** 追加，届时本表与生成脚本同步扩展。
 
 ## 4. 归一化 / diff 用法
 
@@ -115,7 +117,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example
 | SessionHeader（含 `parentSession` 变体） | `generated/*/session.jsonl` 首行 | ✅ T02（parentSession 变体 ⏳ T07） |
 | SessionMessageEntry（user/assistant/toolResult） | `single-turn` / `tool-calls` / `abort` | ✅ T02 |
 | ModelChangeEntry / ThinkingLevelChangeEntry | 各 fixtures 第 2/3 行 | ✅ T02 |
-| CompactionEntry（firstKeptEntryId / retainedTail / usage / details / fromHook） | compaction fixtures | ⏳ T08 |
+| CompactionEntry（firstKeptEntryId / retainedTail / usage / details / fromHook） | `compaction-threshold` / `compaction-overflow` fixtures | ✅ T08（firstKeptEntryId 形态；retainedTail 读取兼容见 D-012） |
 | BranchSummaryEntry / CustomEntry / CustomMessageEntry / LabelEntry / SessionInfoEntry | — | ⏳ T07/T08 |
 | Extended messages（bashExecution / custom / branchSummary / compactionSummary） | — | ⏳ T07/T08 |
 | Tree Structure / Context Building 算法 | T07 单测 | ⏳ T07 |
@@ -133,12 +135,12 @@ CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|
-| 触发条件 / 切点规则 / split turns | T08 单测 + compaction fixtures | ⏳ T08 |
-| CompactionEntry / BranchSummaryEntry 结构 | compaction fixtures | ⏳ T08 |
-| Summary Format 章节模板（Goal/Constraints/Progress/…/Critical Context） | T08 快照 | ⏳ T08 |
-| 消息序列化（Message Serialization） | T08 单测 | ⏳ T08 |
+| 触发条件 / 切点规则 / split turns | T08 黄金用例（`compaction/golden.json`）+ `compaction_runner_test` + compaction fixtures | ✅ T08 |
+| CompactionEntry / BranchSummaryEntry 结构 | `compaction-threshold` / `compaction-overflow` fixtures（CompactionEntry）；BranchSummaryEntry 准备/装填在 T08 黄金单测 | ✅ T08（BranchSummaryEntry 持久化 ⏳ T12/T16） |
+| Summary Format 章节模板（Goal/Constraints/Progress/…/Critical Context） | T08 `compaction/prompts/*.txt` 逐字节比对 | ✅ T08 |
+| 消息序列化（Message Serialization） | T08 黄金用例（serializeConversation） | ✅ T08 |
 | session_before_compact / session_before_tree 扩展语义 | T15 扩展事件对拍 | ⏳ T15 |
-| Settings（阈值字段） | T09/T08 用例 | ⏳ T08 |
+| Settings（阈值字段） | T08 用例（reserveTokens/keepRecentTokens）；settings 文件接线 ⏳ T09 | ✅ T08 |
 
 ### 5.4 `docs/keybindings.md`（T11/T12 主场）
 

@@ -264,6 +264,13 @@ pub type OnResponseCallback =
 pub struct StreamOptions {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u32>,
+    /// Reasoning level for reasoning-capable models. Upstream carries this on
+    /// `SimpleStreamOptions`; the pir-agent `StreamFn` shape (design §4.4)
+    /// takes plain `StreamOptions`, so the channel lives here instead
+    /// (compaction `createSummarizationOptions`, compaction.ts:539-553).
+    /// `ModelThinkingLevel` (off-inclusive) because the compaction caller
+    /// passes the agent-side thinking level.
+    pub reasoning: Option<ModelThinkingLevel>,
     pub signal: Option<CancellationToken>,
     pub api_key: Option<String>,
     /// Preferred transport for providers that support multiple transports.
@@ -301,6 +308,7 @@ impl fmt::Debug for StreamOptions {
         f.debug_struct("StreamOptions")
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("reasoning", &self.reasoning)
             .field("signal", &self.signal)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("transport", &self.transport)

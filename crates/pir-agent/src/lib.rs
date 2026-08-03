@@ -23,6 +23,7 @@
 
 pub mod agent;
 pub mod agent_loop;
+pub mod compaction;
 pub mod error;
 pub mod harness;
 pub mod messages;
@@ -37,6 +38,12 @@ pub use agent_loop::{
     AgentLoopConfig, AgentLoopTurnUpdate, BeforeToolCallContext, BeforeToolCallFn,
     BeforeToolCallResult, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
     PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
+};
+pub use compaction::{
+    compact, estimate_context_tokens, estimate_messages_tokens, estimate_tokens, find_cut_point,
+    find_turn_start_index, generate_summary, generate_summary_with_usage, get_last_assistant_usage,
+    prepare_compaction, should_compact, CompactionDetails, CompactionPreparation, CompactionResult,
+    CompactionSettings, CutPointResult, SummarizationArgs, DEFAULT_COMPACTION_SETTINGS,
 };
 pub use error::AgentError;
 pub use messages::{

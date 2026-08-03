@@ -40,6 +40,7 @@
 | D-010 | T05 | 实现细节 | agent_loop 与 Agent 的 Rust 落地差异（before/after 钩子回传与错误通道、流无终止事件合成、JoinError 合成、details null 省略、Message 错误变体、continue_run 命名等 11 项） | `02-design.md` §4.4 | 不需要 | 已回写 |
 | D-011 | T06 | 实现细节 | 内置工具层 Rust 落地差异（ToolContext 形状、image/kamadak-exif 替代 Photon、自实现 Myers diff、OutputAccumulator 同步 API、on_data Vec<u8>、trackDetachedChildPid 未移植、~/.pir/bin 等 12 项） | `02-design.md` §6.5、`coding-standards.md` 附录 A | 不需要 | 已回写 |
 | D-012 | T07 | 实现细节 | SessionManager 与路径模块 Rust 落地差异（retainedTail 展开采 session-format.md/harness 行为、随机源自实现、serde default 修正、list/listAll 留 T12、typed 联合体降级边界 4 项、同步 IO 等 9+2 项） | `02-design.md` §6.3、§8，`01-requirements.md` §6.6 | 不需要 | 已回写 |
+| D-013 | T08 | 实现细节 | compaction 移植 Rust 落地差异（算法层落 pir-agent::compaction + 触发接线 pir::core::compaction_runner、StreamOptions.reasoning 字段、session 共享函数下沉 3 项） | `02-design.md` §4.4、§6.4、§12 | 不需要 | 已回写 |
 
 ## 4. 状态定义
 
