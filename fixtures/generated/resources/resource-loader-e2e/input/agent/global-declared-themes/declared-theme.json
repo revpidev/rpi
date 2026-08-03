@@ -1,0 +1,27 @@
+{
+  "name": "declared-theme",
+  "colors": {
+    "accent": "#ff0000", "border": "#00ff00", "borderAccent": "#0000ff",
+    "borderMuted": "#111111", "success": "#222222", "error": "#333333",
+    "warning": "#444444", "muted": "#555555", "dim": "#666666",
+    "text": "#777777", "thinkingText": "#888888", "selectedBg": "#999999",
+    "userMessageBg": "#aaaaaa", "userMessageText": "#bbbbbb",
+    "customMessageBg": "#cccccc", "customMessageText": "#dddddd",
+    "customMessageLabel": "#eeeeee", "toolPendingBg": "#121212",
+    "toolSuccessBg": "#131313", "toolErrorBg": "#141414", "toolTitle": "#151515",
+    "toolOutput": "#161616", "mdHeading": "#171717", "mdLink": "#181818",
+    "mdLinkUrl": "#191919", "mdCode": "#1a1a1a", "mdCodeBlock": "#1b1b1b",
+    "mdCodeBlockBorder": "#1c1c1c", "mdQuote": "#1d1d1d",
+    "mdQuoteBorder": "#1e1e1e", "mdHr": "#1f1f1f", "mdListBullet": "#202020",
+    "toolDiffAdded": "#212121", "toolDiffRemoved": "#232323",
+    "toolDiffContext": "#242424", "syntaxComment": "#252525",
+    "syntaxKeyword": "#262626", "syntaxFunction": "#272727",
+    "syntaxVariable": "#282828", "syntaxString": "#292929",
+    "syntaxNumber": "#2a2a2a", "syntaxType": "#2b2b2b",
+    "syntaxOperator": "#2c2c2c", "syntaxPunctuation": "#2d2d2d",
+    "thinkingOff": "#2e2e2e", "thinkingMinimal": "#2f2f2f",
+    "thinkingLow": "#303030", "thinkingMedium": "#313131",
+    "thinkingHigh": "#323232", "thinkingXhigh": "#333333",
+    "bashMode": "#343434"
+  }
+}

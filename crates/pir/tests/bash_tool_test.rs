@@ -347,6 +347,66 @@ mod bash_tool_tests {
     }
 
     #[tokio::test]
+    async fn test_session_env_resolved_per_command_start() {
+        // Requirements §3.3: the spawn env is resolved at every command start
+        // (bash.ts `resolveSpawnContext` per execute), not snapshotted at tool
+        // creation — a changed process env is picked up by the next command,
+        // and the session values are re-injected over any inherited `PIR_*`.
+        let ctx = ToolContext {
+            cwd: PathBuf::from("."),
+            session_env: Some(SessionEnv {
+                session_id: "per-command".into(),
+                session_file: None,
+                provider: None,
+                model: Some("model-a".into()),
+                reasoning_level: None,
+            }),
+        };
+        let tool = create_bash_tool(&ctx, BashToolOptions::default());
+
+        std::env::set_var("PIR_BASH_PROBE_VAR", "first");
+        let out1 = run_bash(&tool, "echo $PIR_BASH_PROBE_VAR", None)
+            .await
+            .unwrap();
+        assert!(out1.contains("first"), "out1: {out1}");
+
+        std::env::set_var("PIR_BASH_PROBE_VAR", "second");
+        std::env::set_var("PIR_MODEL", "inherited-wrong");
+        let out2 = run_bash(&tool, "echo $PIR_BASH_PROBE_VAR $PIR_MODEL", None)
+            .await
+            .unwrap();
+        assert!(
+            out2.contains("second"),
+            "env re-resolved at the second command start: {out2}"
+        );
+        assert!(
+            out2.contains("model-a"),
+            "session env re-injected per command, inherited PIR_MODEL stripped: {out2}"
+        );
+
+        // A model switch takes effect immediately for the next command: the
+        // tool rebuilt with the fresh SessionEnv resolves PIR_MODEL anew.
+        let switched = create_bash_tool(
+            &ToolContext {
+                session_env: Some(SessionEnv {
+                    model: Some("model-b".into()),
+                    ..ctx.session_env.clone().unwrap()
+                }),
+                ..ctx
+            },
+            BashToolOptions::default(),
+        );
+        let out3 = run_bash(&switched, "echo $PIR_MODEL", None).await.unwrap();
+        assert!(
+            out3.contains("model-b"),
+            "model switch effective at the next command start: {out3}"
+        );
+
+        std::env::remove_var("PIR_BASH_PROBE_VAR");
+        std::env::remove_var("PIR_MODEL");
+    }
+
+    #[tokio::test]
     async fn test_coalesce_chatty_output() {
         // 5000 lines of output, count onUpdate calls — should be < 25 due to
         // throttling.

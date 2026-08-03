@@ -1,0 +1,191 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "cwd": "repo/sub",
+  "cliSkillPaths": [
+    "cli/cli-skill",
+    "cli/cli-single.md"
+  ],
+  "expected": {
+    "skills": [
+      {
+        "name": "colliding",
+        "description": "Colliding skill from project .pir/skills (wins over CLI)",
+        "filePath": "<path>/repo/sub/.pir/skills/colliding/SKILL.md",
+        "baseDir": "<path>/repo/sub/.pir/skills/colliding",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "project",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/repo/sub/.pir"
+      },
+      {
+        "name": "repo-skill",
+        "description": "Skill from project .pir/skills",
+        "filePath": "<path>/repo/sub/.pir/skills/repo-skill/SKILL.md",
+        "baseDir": "<path>/repo/sub/.pir/skills/repo-skill",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "project",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/repo/sub/.pir"
+      },
+      {
+        "name": "sub-skill",
+        "description": "Skill from cwd .agents/skills",
+        "filePath": "<path>/repo/sub/.agents/skills/sub-skill/SKILL.md",
+        "baseDir": "<path>/repo/sub/.agents/skills/sub-skill",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "project",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/repo/sub/.agents"
+      },
+      {
+        "name": "repo-root-skill",
+        "description": "Skill from the repo-root .agents/skills",
+        "filePath": "<path>/repo/.agents/skills/repo-root-skill/SKILL.md",
+        "baseDir": "<path>/repo/.agents/skills/repo-root-skill",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "project",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/repo/.agents"
+      },
+      {
+        "name": "global-extra",
+        "description": "Skill from global settings path",
+        "filePath": "<path>/agent/global-declared/global-extra/SKILL.md",
+        "baseDir": "<path>/agent/global-declared/global-extra",
+        "disableModelInvocation": false,
+        "source": "local",
+        "scope": "user",
+        "origin": "top-level",
+        "sourceBaseDir": null
+      },
+      {
+        "name": "user-skill",
+        "description": "Skill from the global agent dir",
+        "filePath": "<path>/agent/skills/user-skill/SKILL.md",
+        "baseDir": "<path>/agent/skills/user-skill",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "user",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/agent"
+      },
+      {
+        "name": "home-agents-skill",
+        "description": "Skill from ~/.agents/skills",
+        "filePath": "<path>/home/.agents/skills/home-agents-skill/SKILL.md",
+        "baseDir": "<path>/home/.agents/skills/home-agents-skill",
+        "disableModelInvocation": false,
+        "source": "auto",
+        "scope": "user",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/home/.agents"
+      },
+      {
+        "name": "cli-file-skill",
+        "description": "Skill from a single CLI .md file",
+        "filePath": "<path>/cli/cli-single.md",
+        "baseDir": "<path>/cli",
+        "disableModelInvocation": false,
+        "source": "local",
+        "scope": "temporary",
+        "origin": "top-level",
+        "sourceBaseDir": "<path>/cli"
+      }
+    ],
+    "skillDiagnostics": [
+      {
+        "type": "collision",
+        "message": "name \"colliding\" collision",
+        "path": "<path>/cli/cli-skill/SKILL.md",
+        "collision": {
+          "resourceType": "skill",
+          "name": "colliding",
+          "winnerPath": "<path>/repo/sub/.pir/skills/colliding/SKILL.md",
+          "loserPath": "<path>/cli/cli-skill/SKILL.md",
+          "winnerSource": null,
+          "loserSource": null
+        }
+      }
+    ],
+    "prompts": [
+      {
+        "name": "sub-declared",
+        "description": "Sub declared prompt body.",
+        "argumentHint": null,
+        "filePath": "<path>/repo/sub/.pir/sub-declared-prompts/sub-declared.md"
+      },
+      {
+        "name": "project-prompt",
+        "description": "Project prompt template",
+        "argumentHint": "<topic>",
+        "filePath": "<path>/repo/sub/.pir/prompts/project-prompt.md"
+      },
+      {
+        "name": "sub-prompt",
+        "description": "Sub-project prompt body.",
+        "argumentHint": null,
+        "filePath": "<path>/repo/sub/.pir/prompts/sub-prompt.md"
+      },
+      {
+        "name": "declared-prompt",
+        "description": "Prompt from global settings path.",
+        "argumentHint": null,
+        "filePath": "<path>/agent/global-declared-prompts/declared-prompt.md"
+      },
+      {
+        "name": "global-prompt",
+        "description": "Global prompt template",
+        "argumentHint": null,
+        "filePath": "<path>/agent/prompts/global-prompt.md"
+      }
+    ],
+    "promptDiagnostics": [],
+    "themes": [
+      {
+        "name": "declared-theme",
+        "sourcePath": "<path>/repo/sub/.pir/extra-themes/extra-theme.json"
+      }
+    ],
+    "themeDiagnostics": [
+      {
+        "type": "warning",
+        "message": "Invalid theme \"<path>/repo/sub/.pir/extra-themes/broken-theme.json\":\n\nMissing required color tokens:\n  - accent\n  - bashMode\n  - border\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values.",
+        "path": "<path>/repo/sub/.pir/extra-themes/broken-theme.json",
+        "collision": null
+      },
+      {
+        "type": "collision",
+        "message": "name \"declared-theme\" collision",
+        "path": "<path>/agent/global-declared-themes/declared-theme.json",
+        "collision": {
+          "resourceType": "theme",
+          "name": "declared-theme",
+          "winnerPath": "<path>/repo/sub/.pir/extra-themes/extra-theme.json",
+          "loserPath": "<path>/agent/global-declared-themes/declared-theme.json",
+          "winnerSource": null,
+          "loserSource": null
+        }
+      }
+    ],
+    "contextFiles": [
+      {
+        "path": "<path>/agent/AGENTS.md",
+        "content": "Global agent-dir context file.\n"
+      },
+      {
+        "path": "<path>/repo/AGENTS.md",
+        "content": "Repo-root context file.\n"
+      },
+      {
+        "path": "<path>/repo/sub/AGENTS.md",
+        "content": "Cwd context file.\n"
+      }
+    ],
+    "systemPrompt": null,
+    "appendSystemPrompt": []
+  }
+}

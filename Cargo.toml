@@ -54,6 +54,12 @@ base64 = "0.22"                 # read tool image attachments
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kamadak-exif = "0.6"            # EXIF orientation auto-correct on image resize
 
+# T09 settings & resources (pir/src/core/).
+serde_yaml = "0.9"              # YAML frontmatter (skills / prompt templates)
+# Directory walk with .gitignore/.ignore/.fdignore chain, dotdir skip and
+# symlink following for skills/prompts discovery (upstream walker semantics).
+ignore = "0.4"
+
 # Single self-contained binary target (coding-standards §15.4).
 # No panic = "abort": the TUI relies on a panic hook to restore terminal state.
 [profile.release]

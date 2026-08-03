@@ -1,0 +1,321 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "deepMerge": [
+    {
+      "name": "nested-single-level-shallow-merge",
+      "global": {
+        "compaction": {
+          "enabled": false,
+          "reserveTokens": 4096
+        }
+      },
+      "project": {
+        "compaction": {
+          "keepRecentTokens": 512,
+          "reserveTokens": 8192
+        }
+      },
+      "expected": {
+        "compaction": {
+          "enabled": false,
+          "reserveTokens": 8192,
+          "keepRecentTokens": 512
+        },
+        "branchSummary": {
+          "reserveTokens": 16384,
+          "skipPrompt": false
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "timeoutMs": null,
+          "maxRetries": null,
+          "maxRetryDelayMs": 60000
+        },
+        "packages": [],
+        "extensionPaths": [],
+        "themeSetting": null,
+        "quietStartup": false,
+        "steeringMode": "one-at-a-time"
+      }
+    },
+    {
+      "name": "depth-two-object-replaced",
+      "global": {
+        "retry": {
+          "maxRetries": 5,
+          "provider": {
+            "timeoutMs": 1000,
+            "maxRetries": 2
+          }
+        }
+      },
+      "project": {
+        "retry": {
+          "provider": {
+            "maxRetryDelayMs": 999
+          }
+        }
+      },
+      "expected": {
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "branchSummary": {
+          "reserveTokens": 16384,
+          "skipPrompt": false
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 5,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "timeoutMs": null,
+          "maxRetries": null,
+          "maxRetryDelayMs": 999
+        },
+        "packages": [],
+        "extensionPaths": [],
+        "themeSetting": null,
+        "quietStartup": false,
+        "steeringMode": "one-at-a-time"
+      }
+    },
+    {
+      "name": "arrays-replaced-wholesale",
+      "global": {
+        "packages": [
+          "a",
+          "b"
+        ],
+        "extensions": [
+          "x"
+        ]
+      },
+      "project": {
+        "packages": [
+          "c"
+        ]
+      },
+      "expected": {
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "branchSummary": {
+          "reserveTokens": 16384,
+          "skipPrompt": false
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "timeoutMs": null,
+          "maxRetries": null,
+          "maxRetryDelayMs": 60000
+        },
+        "packages": [
+          "c"
+        ],
+        "extensionPaths": [
+          "x"
+        ],
+        "themeSetting": null,
+        "quietStartup": false,
+        "steeringMode": "one-at-a-time"
+      }
+    },
+    {
+      "name": "scalars-and-null-replaced",
+      "global": {
+        "theme": "dark",
+        "quietStartup": true,
+        "steeringMode": "one-at-a-time"
+      },
+      "project": {
+        "theme": null,
+        "steeringMode": "all"
+      },
+      "expected": {
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "branchSummary": {
+          "reserveTokens": 16384,
+          "skipPrompt": false
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "timeoutMs": null,
+          "maxRetries": null,
+          "maxRetryDelayMs": 60000
+        },
+        "packages": [],
+        "extensionPaths": [],
+        "themeSetting": null,
+        "quietStartup": true,
+        "steeringMode": "all"
+      }
+    },
+    {
+      "name": "branch-summary-merge",
+      "global": {
+        "branchSummary": {
+          "reserveTokens": 1024,
+          "skipPrompt": true
+        }
+      },
+      "project": {
+        "branchSummary": {
+          "skipPrompt": false
+        }
+      },
+      "expected": {
+        "compaction": {
+          "enabled": true,
+          "reserveTokens": 16384,
+          "keepRecentTokens": 20000
+        },
+        "branchSummary": {
+          "reserveTokens": 1024,
+          "skipPrompt": false
+        },
+        "retry": {
+          "enabled": true,
+          "maxRetries": 3,
+          "baseDelayMs": 2000
+        },
+        "providerRetry": {
+          "timeoutMs": null,
+          "maxRetries": null,
+          "maxRetryDelayMs": 60000
+        },
+        "packages": [],
+        "extensionPaths": [],
+        "themeSetting": null,
+        "quietStartup": false,
+        "steeringMode": "one-at-a-time"
+      }
+    }
+  ],
+  "migrations": [
+    {
+      "name": "queue-mode-to-steering-mode",
+      "input": {
+        "queueMode": "all"
+      },
+      "expected": {
+        "steeringMode": "all"
+      }
+    },
+    {
+      "name": "queue-mode-kept-when-steering-mode-present",
+      "input": {
+        "queueMode": "all",
+        "steeringMode": "one-at-a-time"
+      },
+      "expected": {
+        "queueMode": "all",
+        "steeringMode": "one-at-a-time"
+      }
+    },
+    {
+      "name": "websockets-true-to-transport",
+      "input": {
+        "websockets": true
+      },
+      "expected": {
+        "transport": "websocket"
+      }
+    },
+    {
+      "name": "websockets-false-to-transport",
+      "input": {
+        "websockets": false
+      },
+      "expected": {
+        "transport": "sse"
+      }
+    },
+    {
+      "name": "skills-object-with-custom-directories",
+      "input": {
+        "skills": {
+          "enableSkillCommands": false,
+          "customDirectories": [
+            "./a",
+            "./b"
+          ]
+        }
+      },
+      "expected": {
+        "skills": [
+          "./a",
+          "./b"
+        ],
+        "enableSkillCommands": false
+      }
+    },
+    {
+      "name": "skills-object-without-custom-directories",
+      "input": {
+        "skills": {
+          "enableSkillCommands": true
+        }
+      },
+      "expected": {
+        "enableSkillCommands": true
+      }
+    },
+    {
+      "name": "retry-max-delay-ms",
+      "input": {
+        "retry": {
+          "maxDelayMs": 5000,
+          "enabled": false
+        }
+      },
+      "expected": {
+        "retry": {
+          "enabled": false,
+          "provider": {
+            "maxRetryDelayMs": 5000
+          }
+        }
+      }
+    },
+    {
+      "name": "retry-max-delay-ms-provider-wins",
+      "input": {
+        "retry": {
+          "maxDelayMs": 5000,
+          "provider": {
+            "maxRetryDelayMs": 1000
+          }
+        }
+      },
+      "expected": {
+        "retry": {
+          "provider": {
+            "maxRetryDelayMs": 1000
+          }
+        }
+      }
+    }
+  ]
+}

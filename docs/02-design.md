@@ -464,6 +464,8 @@ global ~/.pir/agent + project .pir（trust 门控）+ settings paths + CLI flags
 
 Skills → system prompt XML 注入（仅 read 工具激活时）；Prompt templates → slash 展开器；`resources_discover` 事件可补充路径。
 
+> Rust 落地注记（D-014，T09 验收）：实现为 `core/settings_manager.rs`（同步写盘 + fs2 flock 直接锁目标文件，Settings 为保序 map、畸形值 getter 回落默认）、`core/environment.rs`（进程级 `PIR_*`，agent/session dir 常量留 `config.rs`）、`core/skills.rs`（ignore crate walker）、`core/prompt_templates.rs` + `core/system_prompt.rs`（context files/SYSTEM.md/注入格式；文档段落走 `doc_paths` 参数）、`core/themes.rs` + `core/keybindings.rs`（纯数据/解析/检测逻辑；detectCapabilities/matchesKey/热重载 watcher/TUI helper 下沉 T11/T12）、`core/resource_loader.rs`（统一管线 + dedupePrompts/themes + keybindings 迁移写回 fs2 锁；extensions 仅占位、packages 为 `PackageResourcePaths` 输入口、SDK override 留 T15）。serde_yaml/TypeBox/SyntaxError 引擎级错误文案差异在 fixtures/README.md §3.1 登记排除口径。详见 `docs/plan/v0.1/deviations/D-014-settings-resources-rust-notes.md`。
+
 ---
 
 ## 7. 扩展宿主设计
@@ -648,6 +650,7 @@ gantt
 | `packages/coding-agent/src/core/tools/*`（基准） | `crates/pir/src/tools/*` |
 | `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/pir/src/tools/bash_executor.rs` |
 | `packages/coding-agent/src/core/settings-manager.ts` / `trust-manager.ts` / `keybindings.ts` | `crates/pir/src/core/settings_manager.rs` / `trust_manager.rs` / `keybindings.rs` |
+| `packages/coding-agent/src/core/resource-loader.ts` / `skills.ts` / `prompt-templates.ts` / `system-prompt.ts` / theme 相关（`themes/*`、`theme-schema.json`） | `crates/pir/src/core/resource_loader.rs` / `skills.rs` / `prompt_templates.rs` / `system_prompt.rs` / `themes.rs`（D-014，T09） |
 | `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog.rs`（配合 pir-ai ModelsStore） |
 | `packages/coding-agent/src/modes/*` | `crates/pir/src/modes/*` |
 | `packages/coding-agent/src/cli/*` / `package-manager-cli.ts` | `crates/pir/src/cli/*` |

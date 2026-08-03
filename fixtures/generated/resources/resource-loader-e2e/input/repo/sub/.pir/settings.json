@@ -1,0 +1,4 @@
+{
+  "prompts": ["./sub-declared-prompts"],
+  "themes": ["./extra-themes"]
+}

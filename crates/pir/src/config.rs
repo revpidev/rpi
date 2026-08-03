@@ -149,6 +149,85 @@ pub fn resolve_session_dir_from_env(
     resolve_session_dir(flag_session_dir, env.as_deref(), settings_session_dir)
 }
 
+// ===== T09: settings & declarative-resource paths =====
+//
+// All resource discovery paths used by `core::settings_manager` and
+// `core::resource_loader` live here (coding-standards §10.1). Upstream
+// references: `settings-manager.ts:195-196`, `resource-loader.ts`,
+// `package-manager.ts` (`addAutoDiscoveredResources`).
+
+/// `SYSTEM.md` project/global system-prompt override file name
+/// (resource-loader.ts).
+pub const SYSTEM_PROMPT_FILE_NAME: &str = "SYSTEM.md";
+/// `APPEND_SYSTEM.md` append variant file name (resource-loader.ts).
+pub const APPEND_SYSTEM_PROMPT_FILE_NAME: &str = "APPEND_SYSTEM.md";
+/// `.agents` directory name for the Agent Skills standard locations
+/// (`~/.agents/skills` and ancestor `.agents/skills`).
+pub const AGENTS_DIR_NAME: &str = ".agents";
+
+/// Home directory of the current user (`HOME` / `USERPROFILE`).
+pub fn user_home_dir() -> Option<PathBuf> {
+    home_dir()
+}
+
+/// Global settings file: `{agentDir}/settings.json` (settings-manager.ts:195).
+pub fn get_global_settings_path() -> PathBuf {
+    get_agent_dir().join("settings.json")
+}
+
+/// Project config directory: `{cwd}/.pir` (settings-manager.ts:196,
+/// resource-loader.ts).
+pub fn get_project_config_dir(cwd: &Path) -> PathBuf {
+    cwd.join(CONFIG_DIR_NAME)
+}
+
+/// Project settings file: `{cwd}/.pir/settings.json`.
+pub fn get_project_settings_path(cwd: &Path) -> PathBuf {
+    get_project_config_dir(cwd).join("settings.json")
+}
+
+/// Global keybindings file: `{agentDir}/keybindings.json` (keybindings.ts;
+/// global-only, there is no project-level keybindings file).
+pub fn get_keybindings_path() -> PathBuf {
+    get_agent_dir().join("keybindings.json")
+}
+
+/// Global skills directory: `{agentDir}/skills`.
+pub fn get_global_skills_dir() -> PathBuf {
+    get_agent_dir().join("skills")
+}
+
+/// Project skills directory: `{cwd}/.pir/skills` (trust-gated).
+pub fn get_project_skills_dir(cwd: &Path) -> PathBuf {
+    get_project_config_dir(cwd).join("skills")
+}
+
+/// Global Agent-Standard skills directory: `~/.agents/skills`
+/// (excluded from the ancestor `.agents/skills` scan upstream).
+pub fn get_global_agents_skills_dir() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(AGENTS_DIR_NAME).join("skills"))
+}
+
+/// Global prompt templates directory: `{agentDir}/prompts`.
+pub fn get_global_prompts_dir() -> PathBuf {
+    get_agent_dir().join("prompts")
+}
+
+/// Project prompt templates directory: `{cwd}/.pir/prompts` (trust-gated).
+pub fn get_project_prompts_dir(cwd: &Path) -> PathBuf {
+    get_project_config_dir(cwd).join("prompts")
+}
+
+/// Global themes directory: `{agentDir}/themes`.
+pub fn get_global_themes_dir() -> PathBuf {
+    get_agent_dir().join("themes")
+}
+
+/// Project themes directory: `{cwd}/.pir/themes` (trust-gated).
+pub fn get_project_themes_dir(cwd: &Path) -> PathBuf {
+    get_project_config_dir(cwd).join("themes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

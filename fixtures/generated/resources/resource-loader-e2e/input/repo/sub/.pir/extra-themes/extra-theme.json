@@ -1,0 +1,20 @@
+{
+  "name": "declared-theme",
+  "colors": {
+    "accent": 1, "border": 2, "borderAccent": 3, "borderMuted": 4,
+    "success": 5, "error": 6, "warning": 7, "muted": 8, "dim": 9,
+    "text": 10, "thinkingText": 11, "selectedBg": 12, "userMessageBg": 13,
+    "userMessageText": 14, "customMessageBg": 15, "customMessageText": 16,
+    "customMessageLabel": 17, "toolPendingBg": 18, "toolSuccessBg": 19,
+    "toolErrorBg": 20, "toolTitle": 21, "toolOutput": 22, "mdHeading": 23,
+    "mdLink": 24, "mdLinkUrl": 25, "mdCode": 26, "mdCodeBlock": 27,
+    "mdCodeBlockBorder": 28, "mdQuote": 29, "mdQuoteBorder": 30, "mdHr": 31,
+    "mdListBullet": 32, "toolDiffAdded": 33, "toolDiffRemoved": 34,
+    "toolDiffContext": 35, "syntaxComment": 36, "syntaxKeyword": 37,
+    "syntaxFunction": 38, "syntaxVariable": 39, "syntaxString": 40,
+    "syntaxNumber": 41, "syntaxType": 42, "syntaxOperator": 43,
+    "syntaxPunctuation": 44, "thinkingOff": 45, "thinkingMinimal": 46,
+    "thinkingLow": 47, "thinkingMedium": 48, "thinkingHigh": 49,
+    "thinkingXhigh": 50, "bashMode": 51
+  }
+}

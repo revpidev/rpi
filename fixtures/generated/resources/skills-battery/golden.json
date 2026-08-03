@@ -1,0 +1,360 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "cases": [
+    {
+      "name": "consecutive-hyphens",
+      "skillPaths": [
+        "skills/consecutive-hyphens"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "bad--name",
+            "description": "A skill with consecutive hyphens in the name.",
+            "filePath": "<path>/skills/consecutive-hyphens/SKILL.md",
+            "baseDir": "<path>/skills/consecutive-hyphens",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/consecutive-hyphens"
+          }
+        ],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": "name must not contain consecutive hyphens",
+            "path": "<path>/skills/consecutive-hyphens/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "disable-model-invocation",
+      "skillPaths": [
+        "skills/disable-model-invocation"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "disable-model-invocation",
+            "description": "A skill that cannot be invoked by the model.",
+            "filePath": "<path>/skills/disable-model-invocation/SKILL.md",
+            "baseDir": "<path>/skills/disable-model-invocation",
+            "disableModelInvocation": true,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/disable-model-invocation"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "invalid-name-chars",
+      "skillPaths": [
+        "skills/invalid-name-chars"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "Invalid_Name",
+            "description": "A skill with invalid characters in the name.",
+            "filePath": "<path>/skills/invalid-name-chars/SKILL.md",
+            "baseDir": "<path>/skills/invalid-name-chars",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/invalid-name-chars"
+          }
+        ],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)",
+            "path": "<path>/skills/invalid-name-chars/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "invalid-yaml",
+      "skillPaths": [
+        "skills/invalid-yaml"
+      ],
+      "engineDependentMessages": true,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": null,
+            "path": "<path>/skills/invalid-yaml/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "long-name",
+      "skillPaths": [
+        "skills/long-name"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "this-is-a-very-long-skill-name-that-exceeds-the-sixty-four-character-limit-set-by-the-standard",
+            "description": "A skill with a name that exceeds 64 characters.",
+            "filePath": "<path>/skills/long-name/SKILL.md",
+            "baseDir": "<path>/skills/long-name",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/long-name"
+          }
+        ],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": "name exceeds 64 characters (94)",
+            "path": "<path>/skills/long-name/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "missing-description",
+      "skillPaths": [
+        "skills/missing-description"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<path>/skills/missing-description/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "multiline-description",
+      "skillPaths": [
+        "skills/multiline-description"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": true,
+      "expected": {
+        "skills": [
+          {
+            "name": "multiline-description",
+            "description": "This is a multiline description.\nIt spans multiple lines.\nAnd should be normalized.\n",
+            "filePath": "<path>/skills/multiline-description/SKILL.md",
+            "baseDir": "<path>/skills/multiline-description",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/multiline-description"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "name-mismatch",
+      "skillPaths": [
+        "skills/name-mismatch"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "different-name",
+            "description": "A skill with a name that doesn't match the directory.",
+            "filePath": "<path>/skills/name-mismatch/SKILL.md",
+            "baseDir": "<path>/skills/name-mismatch",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/name-mismatch"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "nested",
+      "skillPaths": [
+        "skills/nested"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "child-skill",
+            "description": "A nested skill in a subdirectory.",
+            "filePath": "<path>/skills/nested/child-skill/SKILL.md",
+            "baseDir": "<path>/skills/nested/child-skill",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/nested/child-skill"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "no-frontmatter",
+      "skillPaths": [
+        "skills/no-frontmatter"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [],
+        "diagnostics": [
+          {
+            "type": "warning",
+            "message": "description is required",
+            "path": "<path>/skills/no-frontmatter/SKILL.md",
+            "collision": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "root-skill-preferred",
+      "skillPaths": [
+        "skills/root-skill-preferred"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "root-skill-preferred",
+            "description": "Root skill should win.",
+            "filePath": "<path>/skills/root-skill-preferred/SKILL.md",
+            "baseDir": "<path>/skills/root-skill-preferred",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/root-skill-preferred"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "unknown-field",
+      "skillPaths": [
+        "skills/unknown-field"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "unknown-field",
+            "description": "A skill with an unknown frontmatter field.",
+            "filePath": "<path>/skills/unknown-field/SKILL.md",
+            "baseDir": "<path>/skills/unknown-field",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/unknown-field"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "valid-skill",
+      "skillPaths": [
+        "skills/valid-skill"
+      ],
+      "engineDependentMessages": false,
+      "engineDependentTrailingNewline": false,
+      "expected": {
+        "skills": [
+          {
+            "name": "valid-skill",
+            "description": "A valid skill for testing purposes.",
+            "filePath": "<path>/skills/valid-skill/SKILL.md",
+            "baseDir": "<path>/skills/valid-skill",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills/valid-skill"
+          }
+        ],
+        "diagnostics": []
+      }
+    },
+    {
+      "name": "collision-first-wins",
+      "skillPaths": [
+        "skills-collision/first",
+        "skills-collision/second"
+      ],
+      "expected": {
+        "skills": [
+          {
+            "name": "calendar",
+            "description": "First calendar skill.",
+            "filePath": "<path>/skills-collision/first/calendar/SKILL.md",
+            "baseDir": "<path>/skills-collision/first/calendar",
+            "disableModelInvocation": false,
+            "source": "local",
+            "scope": "temporary",
+            "origin": "top-level",
+            "sourceBaseDir": "<path>/skills-collision/first/calendar"
+          }
+        ],
+        "diagnostics": [
+          {
+            "type": "collision",
+            "message": "name \"calendar\" collision",
+            "path": "<path>/skills-collision/second/calendar/SKILL.md",
+            "collision": {
+              "resourceType": "skill",
+              "name": "calendar",
+              "winnerPath": "<path>/skills-collision/first/calendar/SKILL.md",
+              "loserPath": "<path>/skills-collision/second/calendar/SKILL.md",
+              "winnerSource": null,
+              "loserSource": null
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

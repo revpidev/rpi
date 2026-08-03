@@ -1,0 +1,90 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "cases": [
+    {
+      "name": "legacy-names-migrate",
+      "input": {
+        "cursorUp": "ctrl+k",
+        "submit": "enter",
+        "followUp": "alt+enter"
+      },
+      "expected": {
+        "config": {
+          "tui.editor.cursorUp": "ctrl+k",
+          "tui.input.submit": "enter",
+          "app.message.followUp": "alt+enter"
+        },
+        "migrated": true
+      }
+    },
+    {
+      "name": "conflict-new-name-wins",
+      "input": {
+        "cursorUp": "up",
+        "tui.editor.cursorUp": "down"
+      },
+      "expected": {
+        "config": {
+          "tui.editor.cursorUp": "down"
+        },
+        "migrated": true
+      }
+    },
+    {
+      "name": "new-names-passthrough",
+      "input": {
+        "app.interrupt": "escape",
+        "tui.select.confirm": "enter"
+      },
+      "expected": {
+        "config": {
+          "tui.select.confirm": "enter",
+          "app.interrupt": "escape"
+        },
+        "migrated": false
+      }
+    },
+    {
+      "name": "extras-sorted-after-known",
+      "input": {
+        "zzz.custom": "x",
+        "app.clear": "ctrl+c",
+        "aaa.custom": "y",
+        "tui.input.newLine": "shift+enter"
+      },
+      "expected": {
+        "config": {
+          "tui.input.newLine": "shift+enter",
+          "app.clear": "ctrl+c",
+          "aaa.custom": "y",
+          "zzz.custom": "x"
+        },
+        "migrated": false
+      }
+    },
+    {
+      "name": "raw-values-preserved",
+      "input": {
+        "selectDown": [
+          "j",
+          "down"
+        ],
+        "selectUp": 5,
+        "tui.select.cancel": null,
+        "app.exit": "ctrl+d"
+      },
+      "expected": {
+        "config": {
+          "tui.select.up": 5,
+          "tui.select.down": [
+            "j",
+            "down"
+          ],
+          "tui.select.cancel": null,
+          "app.exit": "ctrl+d"
+        },
+        "migrated": true
+      }
+    }
+  ]
+}

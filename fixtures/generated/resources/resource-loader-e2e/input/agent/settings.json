@@ -1,0 +1,5 @@
+{
+  "skills": ["./global-declared"],
+  "prompts": ["./global-declared-prompts"],
+  "themes": ["./global-declared-themes"]
+}

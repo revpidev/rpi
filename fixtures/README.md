@@ -78,6 +78,41 @@ cargo run -p pir-test-support --example normalize-diff -- \
 补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 全命令
 transcript（32 命令）随 **T10** 追加，届时本表与生成脚本同步扩展。
 
+### 3.1 resources 用例组（T09 交付）
+
+`fixtures/generated/resources/`：上游真实模块（skills/prompt-templates/theme/
+keybindings/settings-manager/resource-loader，dist 构建）产出的黄金 JSON，
+Rust 侧对拍测试为 `crates/pir/tests/parity_resources_test.rs`（归一化 diff
+复用 pir-test-support，黄金中绝对路径已在生成时替换为 `<path>`，Rust 侧用
+`Normalizer::with_path` 做同一替换）。
+
+生成（在本仓库根目录）：
+
+```bash
+node fixtures/generate-resources-golden.mjs                  # 全量 6 组
+node fixtures/generate-resources-golden.mjs themes settings  # 单组
+```
+
+| 用例组 | 输入 | 覆盖契约 |
+|--------|------|---------|
+| `skills-battery` | 上游 `test/fixtures/skills/` 13 用例目录 + `skills-collision/` 的只读副本（`input/`，不改动 external/） | `loadSkills()` 的 name/description/filePath/baseDir/sourceInfo/disableModelInvocation + warning/collision 诊断形状；先到先得冲突 |
+| `prompt-dsl` | 脚本内嵌 (模板正文, args 字符串) 21 例 | `parseCommandArgs` 引号感知 + `substituteArgs` 全形态（`$1..$N`/`$@`/`$ARGUMENTS`/`${N:-d}`/`${@:-d}`/`${ARGUMENTS:-d}`/`${@:N}`/`${@:N:L}`、缺位空串、不递归） |
+| `themes` | 脚本内嵌自定义主题 JSON 11 例 + 内置 dark/light | `loadThemeFromPath` 双色彩模式（truecolor/256color）解析后 ANSI 颜色表：vars 引用、256 色整数、`""` 默认值、thinkingMax 回退、非法值诊断；内置主题解析后颜色表快照 |
+| `keybindings` | 脚本内嵌旧键名配置 5 例 | `migrateKeybindingsConfig`：旧名迁移、新旧冲突新名胜、定义序+extras 字母序、原始值透传 |
+| `settings` | 脚本内嵌 deepMerge 5 例 + 迁移 8 例 | `deepMergeSettings`（嵌套单层浅合并/深度≥2 替换/数组与标量替换，经 `SettingsManager.fromStorage` getter 面观察）+ 4 条旧格式迁移（queueMode/websockets/skills 对象/retry.maxDelayMs） |
+| `resource-loader-e2e` | `input/` 多级目录树（home `.agents/skills`、全局 agentDir、git repo 内 `.agents/skills`、cwd `.pir`、settings 声明路径、CLI 路径、非法主题 JSON、repo 外隔离用例） | `DefaultResourceLoader` 全管线：rank 序（project settings > project auto > user settings > user auto > CLI 附加）、同名冲突先到先得、git repo root 祖先扫描上界、context files 全局→根→叶序、主题/提示词冲突与非法主题 warning 诊断全文本 |
+
+e2e 目录树的准备由脚本与 Rust 测试各自重复同一流程（`prepareE2eTree`）：
+复制 `input/` → 临时目录，把每个 `.pir/` 复制出 `.pi/` 孪生（上游读 `.pi`、
+pir 读 `.pir`，需求 §1.4 有意改名；黄金统一记录为 `.pir` 拼写），并创建
+git 无法跟踪的 `repo/.git` 标记目录。
+
+**引擎相关排除**（黄金只钉稳定部分，详见生成脚本注释）：`invalid-yaml`
+诊断消息文本（JS yaml vs serde_yaml）、`multiline-description` 块标量末尾
+换行（serde_yaml 在 EOF 处不保留 `|` 的尾换行）、`invalid-color-value-type`
+（typebox vs 手写校验器措辞）、`invalid-json-document`（JS SyntaxError vs
+serde_json 错误文本）。
+
 ## 4. 归一化 / diff 用法
 
 ```rust
@@ -140,7 +175,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example
 | Summary Format 章节模板（Goal/Constraints/Progress/…/Critical Context） | T08 `compaction/prompts/*.txt` 逐字节比对 | ✅ T08 |
 | 消息序列化（Message Serialization） | T08 黄金用例（serializeConversation） | ✅ T08 |
 | session_before_compact / session_before_tree 扩展语义 | T15 扩展事件对拍 | ⏳ T15 |
-| Settings（阈值字段） | T08 用例（reserveTokens/keepRecentTokens）；settings 文件接线 ⏳ T09 | ✅ T08 |
+| Settings（阈值字段） | T08 用例（reserveTokens/keepRecentTokens）；settings 文件接线 `parity_resources_test::parity_settings_*` | ✅ T08 + ✅ T09 |
 
 ### 5.4 `docs/keybindings.md`（T11/T12 主场）
 

@@ -46,7 +46,7 @@
 | T06 | [内置四工具与 ToolContext](./T06-builtin-tools.md) | M2 | T05 | 已完成 | 2026-08-01 |
 | T07 | [SessionManager（JSONL 树）](./T07-session-manager.md) | M3 | T01、T05 | 已完成 | 2026-08-03 |
 | T08 | [Compaction](./T08-compaction.md) | M3 | T07 | 已完成 | 2026-08-03 |
-| T09 | [Settings 与资源加载](./T09-settings-resources.md) | M3 | T01 | 未开始 | — |
+| T09 | [Settings 与资源加载](./T09-settings-resources.md) | M3 | T01 | 已完成 | 2026-08-03 |
 | T16 | [pir-agent harness 层](./T16-agent-harness.md) | M3 | T05、T07、T08 | 未开始 | — |
 | T10 | [Headless 模式：print / json / rpc](./T10-headless-modes.md) | M4 | T03、T04、T05、T06、T07、T08、T09 | 未开始 | — |
 | T11 | [pir-tui 核心引擎](./T11-pir-tui-core.md) | M5 | T01 | 未开始 | — |
@@ -91,3 +91,4 @@ docs/plan/v0.1/
 | 2026-07-28 | 选型收口 | Bedrock 接入 / OAuth 回调 / 动态库 ABI / 事件通道 / 工具并行原语钉死（设计文档 §14），同步 T04/T05/T13/T15 与编码规范 |
 | 2026-07-29 | 覆盖度审查修订 | 依据 2026-07-29 覆盖度审查与 ADR-0003 全面修订：新增 T16（harness 层，M3）；T05 循环语义 9→19 条；T06 补 output_accumulator/bash_executor 与全常数锚点；T07 修正 session 无锁、补延迟落盘/id 规则/条目全集；T10 补 RPC 30 命令与 CLI 全标志语义；T13 provider 清单更新为 39 工厂 + 7 OAuth + compat 矩阵；grep/find/ls 原生实现（ADR-0003 §2）归入 T14；T15 能力面更新为 27 事件 + 27 API + 29 UI；gates 补红线与逐条对拍基准 |
 | 2026-07-29 | 二次覆盖度复核修订 | 对上一轮审查报告逐项回查上游源码后修订：修正系统性计数错误（RPC 30→32、provider 39→38、扩展事件 27→33、API 方法 27→24、UI 方法 29→28、Context 两级→三级补 ReplacedSessionContext、harness 事件 21→22）；修正与源码相反的描述（originator 字面值 "pi"、-p 吞噬条件、bash 输出不清洗、settings 单层浅合并、agent loop terminate 语义、theme `/` 为 light/dark 分隔符、vertex `{location}` 占位符丢弃、theme colors 51 必填、diagnostics 三种字面值、扩展同名冲突分项规则）；补协议字面量（Claude Code 伪装 2.1.75/beta 头/system 前缀、17 条 canonical 工具名、compat 21 字段与 thinkingFormat 10 取值、call_id\|item_id 复合格式、Codex WS 续传、Azure/mistral/Google/Bedrock 字段级清单）、OAuth 遗漏流程（device code 5 家、codex deviceauth 旁路、copilot policy-enable、ANTHROPIC_AUTH_TOKEN 走 Bearer）、compaction 第 4 个 prompt 与格式串、harness 语义（emitRunFailure 失败路径、subscribe/on 双订阅、entryTransforms/entryProjectors、leaf 重放、proxy 12 事件、JSONL 硬要 v3）、终端自省四件套与 auto light/dark、工具 P2 细节（read 图像拒绝子规则/路径变体、edit JSON-string 强转、grep `:`/`-` 分隔、schema 强转表、retry-after 优先级链、calculateCost tier 口径），并标注 Google/Bedrock SDK 委托来源空白 |
+| 2026-08-03 | T09 验收通过 | Settings 与资源加载完成：settings_manager/environment/skills/prompt_templates/system_prompt/themes/keybindings/resource_loader 八模块落地；resources 对拍黄金 6 组（`fixtures/generate-resources-golden.mjs`）；偏离 D-014 登记并回写 `02-design.md` §6.7/§12；设计文档 §12 映射表补 resource-loader/skills/prompt-templates/system-prompt/themes 行 |

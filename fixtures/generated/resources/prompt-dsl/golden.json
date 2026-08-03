@@ -1,0 +1,219 @@
+{
+  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "cases": [
+    {
+      "name": "positional",
+      "content": "Review $1 for $2.",
+      "argsString": "auth.ts security",
+      "args": [
+        "auth.ts",
+        "security"
+      ],
+      "expected": "Review auth.ts for security."
+    },
+    {
+      "name": "positional_missing_is_empty",
+      "content": "[$1][$2][$3]",
+      "argsString": "a b",
+      "args": [
+        "a",
+        "b"
+      ],
+      "expected": "[a][b][]"
+    },
+    {
+      "name": "all_args_at",
+      "content": "files: $@",
+      "argsString": "one \"two words\" three",
+      "args": [
+        "one",
+        "two words",
+        "three"
+      ],
+      "expected": "files: one two words three"
+    },
+    {
+      "name": "all_args_arguments",
+      "content": "files: $ARGUMENTS",
+      "argsString": "one two",
+      "args": [
+        "one",
+        "two"
+      ],
+      "expected": "files: one two"
+    },
+    {
+      "name": "all_args_empty",
+      "content": "[$@]",
+      "argsString": "",
+      "args": [],
+      "expected": "[]"
+    },
+    {
+      "name": "default_used_when_missing",
+      "content": "open ${1:-index.ts}",
+      "argsString": "",
+      "args": [],
+      "expected": "open index.ts"
+    },
+    {
+      "name": "default_not_used_when_present",
+      "content": "open ${1:-index.ts}",
+      "argsString": "main.ts",
+      "args": [
+        "main.ts"
+      ],
+      "expected": "open main.ts"
+    },
+    {
+      "name": "default_at_used_when_empty",
+      "content": "grep ${@:-*}",
+      "argsString": "",
+      "args": [],
+      "expected": "grep *"
+    },
+    {
+      "name": "default_arguments_used_when_empty",
+      "content": "run ${ARGUMENTS:-everything}",
+      "argsString": "",
+      "args": [],
+      "expected": "run everything"
+    },
+    {
+      "name": "default_arguments_present",
+      "content": "run ${ARGUMENTS:-everything}",
+      "argsString": "x y",
+      "args": [
+        "x",
+        "y"
+      ],
+      "expected": "run x y"
+    },
+    {
+      "name": "default_not_recursive",
+      "content": "say ${1:-$2}",
+      "argsString": "",
+      "args": [],
+      "expected": "say $2"
+    },
+    {
+      "name": "arg_value_not_recursive",
+      "content": "echo $1",
+      "argsString": "xx$2yy",
+      "args": [
+        "xx$2yy"
+      ],
+      "expected": "echo xx$2yy"
+    },
+    {
+      "name": "slice_from_second",
+      "content": "rest: ${@:2}",
+      "argsString": "a b c d",
+      "args": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "expected": "rest: b c d"
+    },
+    {
+      "name": "slice_with_length",
+      "content": "mid: ${@:2:2}",
+      "argsString": "a b c d",
+      "args": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "expected": "mid: b c"
+    },
+    {
+      "name": "slice_zero_is_one",
+      "content": "all: ${@:0}",
+      "argsString": "a b",
+      "args": [
+        "a",
+        "b"
+      ],
+      "expected": "all: a b"
+    },
+    {
+      "name": "slice_beyond_end",
+      "content": "none: [${@:5}]",
+      "argsString": "a b",
+      "args": [
+        "a",
+        "b"
+      ],
+      "expected": "none: []"
+    },
+    {
+      "name": "quotes_single_and_double",
+      "content": "$1|$2|$3",
+      "argsString": "'hello world' \"it's\" x",
+      "args": [
+        "hello world",
+        "it's",
+        "x"
+      ],
+      "expected": "hello world|it's|x"
+    },
+    {
+      "name": "unterminated_quote_swallows_rest",
+      "content": "[$1]",
+      "argsString": "\"abc def",
+      "args": [
+        "abc def"
+      ],
+      "expected": "[abc def]"
+    },
+    {
+      "name": "empty_quotes_are_dropped",
+      "content": "[$1]",
+      "argsString": "\"\"",
+      "args": [],
+      "expected": "[]"
+    },
+    {
+      "name": "two_digit_index",
+      "content": "ten: $10",
+      "argsString": "1 2 3 4 5 6 7 8 9 ten",
+      "args": [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+        "ten"
+      ],
+      "expected": "ten: ten"
+    },
+    {
+      "name": "mixed_dsl_forms",
+      "content": "$1 then ${2:-none} then ${@:3}",
+      "argsString": "a b c d",
+      "args": [
+        "a",
+        "b",
+        "c",
+        "d"
+      ],
+      "expected": "a then b then c d"
+    },
+    {
+      "name": "dollar_without_pattern",
+      "content": "cost is $ 5 and $x stays",
+      "argsString": "a",
+      "args": [
+        "a"
+      ],
+      "expected": "cost is $ 5 and $x stays"
+    }
+  ]
+}
