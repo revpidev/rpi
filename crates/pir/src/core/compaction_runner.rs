@@ -116,6 +116,16 @@ fn raw_error_message(error: &PirError) -> String {
 /// prompt task while mode command tasks run session operations (T10
 /// wiring). The agent is shared (`Arc<Agent>`) because the agent loop
 /// drives it concurrently.
+/// Shared handle to the in-flight compaction's cancellation token. Readable
+/// without the runner's async mutex so `abortCompaction`/`dispose` still work
+/// while a compaction is in flight (upstream aborts an AbortController
+/// directly, agent-session.ts:1930-1933).
+pub type AbortTokenCell = Arc<std::sync::Mutex<Option<CancellationToken>>>;
+
+fn lock_abort(cell: &AbortTokenCell) -> std::sync::MutexGuard<'_, Option<CancellationToken>> {
+    cell.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub struct CompactionRunner {
     agent: Arc<Agent>,
     session: Arc<Mutex<SessionManager>>,
@@ -126,7 +136,7 @@ pub struct CompactionRunner {
     thinking_level: ThinkingLevel,
     emit: CompactionEventSink,
     overflow_recovery_attempted: bool,
-    active_token: Option<CancellationToken>,
+    active_token: AbortTokenCell,
 }
 
 impl CompactionRunner {
@@ -151,8 +161,13 @@ impl CompactionRunner {
             thinking_level,
             emit,
             overflow_recovery_attempted: false,
-            active_token: None,
+            active_token: AbortTokenCell::default(),
         }
+    }
+
+    /// Shared abort handle (see [`AbortTokenCell`]).
+    pub fn abort_token_cell(&self) -> AbortTokenCell {
+        self.active_token.clone()
     }
 
     /// Lock the shared session (poison-tolerant, like the rest of the
@@ -201,7 +216,7 @@ impl CompactionRunner {
 
     /// `abortCompaction()` (agent-session.ts:1930-1933).
     pub fn abort_compaction(&self) {
-        if let Some(token) = &self.active_token {
+        if let Some(token) = lock_abort(&self.active_token).as_ref() {
             token.cancel();
         }
     }
@@ -265,7 +280,7 @@ impl CompactionRunner {
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, PirError> {
         let token = CancellationToken::new();
-        self.active_token = Some(token.clone());
+        *lock_abort(&self.active_token) = Some(token.clone());
         self.emit(CompactionEvent::CompactionStart {
             reason: CompactionReason::Manual,
         });
@@ -291,7 +306,7 @@ impl CompactionRunner {
             will_retry: false,
             error_message,
         });
-        self.active_token = None;
+        *lock_abort(&self.active_token) = None;
         outcome
     }
 
@@ -497,7 +512,7 @@ impl CompactionRunner {
             };
 
             self.emit(CompactionEvent::CompactionStart { reason });
-            self.active_token = Some(token.clone());
+            *lock_abort(&self.active_token) = Some(token.clone());
             started = true;
 
             let args = SummarizationArgs {
@@ -550,7 +565,7 @@ impl CompactionRunner {
         }
         .await;
 
-        self.active_token = None;
+        *lock_abort(&self.active_token) = None;
 
         match outcome {
             Ok(should_continue) => should_continue,

@@ -274,7 +274,6 @@ fn create_session_manager(
     parsed: &Args,
     cwd: &Path,
     session_dir: Option<&Path>,
-    out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<SessionManager, String> {
     if parsed.no_session || parsed.help || parsed.list_models.is_some() {
@@ -333,9 +332,11 @@ fn create_session_manager(
                 path,
                 cwd: other_cwd,
             } => {
+                // Headless stdout is reserved for payload (upstream routes
+                // everything through takeOverStdout → stderr).
                 let _ = writeln!(err, "Session found in different project: {other_cwd}");
-                if !prompt_confirm("Fork this session into current directory?", out) {
-                    let _ = writeln!(out, "Aborted.");
+                if !prompt_confirm("Fork this session into current directory?", err) {
+                    let _ = writeln!(err, "Aborted.");
                     std::process::exit(0);
                 }
                 SessionManager::fork_from(
@@ -410,9 +411,10 @@ fn is_local_path(value: &str) -> bool {
     let trimmed = value.trim();
     !(trimmed.starts_with("npm:")
         || trimmed.starts_with("git:")
-        || trimmed.starts_with("http://")
-        || trimmed.starts_with("https://")
-        || trimmed.starts_with("ssh://"))
+        || trimmed.starts_with("github:")
+        || trimmed.starts_with("http:")
+        || trimmed.starts_with("https:")
+        || trimmed.starts_with("ssh:"))
 }
 
 /// `buildSessionOptions` (main.ts:357-453).
@@ -642,7 +644,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         settings_session_dir.as_deref(),
     );
     let mut session_manager =
-        match create_session_manager(&parsed, &cwd, session_dir.as_deref(), &mut out, &mut err) {
+        match create_session_manager(&parsed, &cwd, session_dir.as_deref(), &mut err) {
             Ok(manager) => manager,
             Err(message) => {
                 let _ = writeln!(err, "Error: {message}");
@@ -711,9 +713,10 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 let project_trusted = if should_resolve_trust {
                     false
                 } else {
+                    let stored_trust = trust_store.get(&cwd)?;
                     cached
                         .or(parsed.project_trust_override)
-                        .unwrap_or(!has_trust_requiring || trust_store.get(&cwd) == Some(true))
+                        .unwrap_or(!has_trust_requiring || stored_trust == Some(true))
                 };
 
                 let runtime_settings_manager = SettingsManager::create(
@@ -759,7 +762,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         &trust_store,
                         parsed.project_trust_override,
                         default_project_trust,
-                    );
+                    )?;
                     trust_by_cwd
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -1019,6 +1022,39 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             )
             .await;
             exit_code
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_path;
+
+    /// `isLocalPath` (utils/paths.ts:44-52): `github:` and bare `http:` /
+    /// `https:` / `ssh:` prefixes are non-local too.
+    #[test]
+    fn test_is_local_path_prefixes() {
+        for remote in [
+            "npm:package",
+            "git:repo",
+            "github:user/repo",
+            "http:example.com/x",
+            "http://example.com/x",
+            "https:example.com/x",
+            "https://example.com/x",
+            "ssh:git@example.com",
+            "ssh://git@example.com",
+        ] {
+            assert!(!is_local_path(remote), "{remote} should be remote");
+        }
+        for local in [
+            "skill-name",
+            "./relative/path",
+            "../up/path",
+            "file:///abs/path",
+            "/abs/path",
+        ] {
+            assert!(is_local_path(local), "{local} should be local");
         }
     }
 }

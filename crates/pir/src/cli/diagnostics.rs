@@ -55,11 +55,6 @@ impl Diagnostic {
             message: message.into(),
         }
     }
-
-    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
-        self.scope = Some(scope.into());
-        self
-    }
 }
 
 impl fmt::Display for Diagnostic {

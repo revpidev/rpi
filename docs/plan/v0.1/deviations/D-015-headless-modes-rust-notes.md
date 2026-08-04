@@ -17,7 +17,8 @@
 1. **clap → 手写解析器**（`pir/src/cli/args.rs`）：clap 无法表达上游 `args.ts` 的三类语义——
    `-p` 值吞噬规则、未知 `--flag` 收集为扩展标志透传（`extensionFlagValues` + help 动态段）、
    互斥诊断矩阵（`--fork`/`--session-id` 等）。改为与上游同构的手写扫描器，
-   `args.test.ts` 84 测试全量移植锚定行为。
+   `args.test.ts` 移植测试锚定行为（上游 72 个 `test(` + 3 个补充 = 75；本文档早前
+   写的「84」系笔误，已更正）。
 2. **provider 生态为 T13 子集**：provider-composer、远程 models catalog、38 内置 provider
    工厂整体在 T13；T10 的 ModelRuntime 仅提供组合点（`register_provider`）与
    auth.json/models.json/RuntimeCredentials 覆盖层。
@@ -36,6 +37,47 @@
 7. **SessionManager::list 提前到 T10**：`list/list_all/build_session_info/SessionInfo`
    原规划在 T12；`--session` 三级解析（本项目 id → 全局跨项目）需要会话发现能力，
    提前实现。
+
+## 二次审查补登（2026-08-04）
+
+T10 复审（5 路并行对拍）发现的偏离已修复；以下为修复后**仍然保留**的已知偏离，
+补登备查：
+
+8. **`--wasm-smoke`**（`pir/src/main.rs`）：Rust 独有的 wasmtime 冒烟钩子（T02 测量用，
+   注释标明 T15 移除）；上游无此标志。参数解析前拦截，任意位置出现即生效。
+9. **stdin 阻塞读取**（`app.rs::read_piped_stdin`）：在 async 上下文中同步
+   `read_to_string`；上游为事件驱动。multi-thread runtime 下只阻塞当前 worker，
+   headless 流程无可观察差异，保留。
+10. **SIGHUP 直退**（`modes/print_mode.rs`）：信号处理器在独立线程 `exit(129)`，
+    跳过上游的 `killTrackedDetachedChildren`/`disposeRuntime`；stdout 为行缓冲，
+    实际丢失风险仅限进程内未写完的缓冲。
+11. **RPC 字段形状边界从严**：已知命令的字段类型错误在 serde 边界拒绝
+    （`Invalid command: …`），上游不做校验、在 handler 内以 TypeError 失败——
+    `success:false` 形状一致，错误文案不同（实现内有注释，此处正式登记）。
+12. **模型级 headers 组合期固化**：models.json 的模型 `headers` 与
+    `modelOverrides.*.headers` 在组合期并入 `Model.headers`（上游
+    `modelFromJson` 置 `headers: undefined`，请求期经 `resolveConfiguredModelHeaders`
+    合并）。请求期结果等价，差异仅在于 `Model` 对象上可观察到 headers 字段。
+
+### 二次审查已修复项（备查）
+
+models.json provider `headers`/`authHeader` 全链路丢失（改为组合期包装 auth
+resolve）；模型缺省 `contextWindow`/`maxTokens` 由 0 更正为 128000/16384 且缺
+api/baseUrl 改为组合错误；`modelOverrides` 生效；provider 枚举序改插入序；
+`get_error` 补 availability 错误；`setRuntimeApiKey`/`removeRuntimeApiKey` 末段改走
+`refresh()`；`dispose()` 补 `_disconnectFromAgent`；`wait_for_idle` 修丢失唤醒竞态；
+sdk 恢复路径 `expect` panic（无 model_change 条目的会话）；trust 锁错误吞掉与锁文件名
+（`trust.json.lock`）；RPC 空行回 parse 错误、未知命令 `command` 字段形状、
+`get_commands` 改用当前会话 cwd；print 错误文案剥 `session error: ` 前缀；fork 确认
+提示与 `Aborted.` 改落 stderr；`is_local_path` 补 `github:` 且按 `http:`/`https:`/`ssh:`
+前缀判定；`--session ""`/`--fork ""`/`--api-key ""` 空串按 falsy 处理；工具激活序不再
+按字母排序（保序去重）；agent-loop 内建工具接入 settings
+（`shellCommandPrefix`/`shellPath`/`imageAutoResize`）；compaction abort 经共享
+CancellationToken 在 in-flight 时仍生效；`is_context_overflow` 对 0 窗口按 JS falsy
+处理；`get_session_stats` 省略空 `sessionFile`；`cycle_thinking_level` 未命中语义；
+`bind_extensions` on_error 退订句柄不再 `mem::forget`；help 动态段对齐；
+`format_token_count` 半数舍入；`minimatch` 子集三项语义（`?`/`[...]` 不跨 `/`、
+非独立段 `**` 退化为 `*`，并补 `a/**/b` 匹配 `a/b`）。
 
 ## 影响面
 

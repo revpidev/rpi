@@ -11,18 +11,21 @@ use crate::core::model_runtime::ModelRuntime;
 /// `formatTokenCount` (list-models.ts:14-24): 200000 → "200K", 1000000 → "1M".
 pub fn format_token_count(count: u32) -> String {
     let count = u64::from(count);
+    // JS `toFixed(1)` rounds exact halves up; Rust's `{:.1}` is
+    // round-half-to-even. Pre-round half-away-from-zero to match (counts are
+    // integers, so ties like 1.25M are exactly representable).
     if count >= 1_000_000 {
         let millions = count as f64 / 1_000_000.0;
         if count % 1_000_000 == 0 {
             return format!("{}M", count / 1_000_000);
         }
-        return format!("{millions:.1}M");
+        return format!("{:.1}M", (millions * 10.0).round() / 10.0);
     }
     if count >= 1_000 {
         if count % 1_000 == 0 {
             return format!("{}K", count / 1_000);
         }
-        return format!("{:.1}K", count as f64 / 1_000.0);
+        return format!("{:.1}K", (count as f64 / 100.0).round() / 10.0);
     }
     count.to_string()
 }
@@ -128,5 +131,8 @@ mod tests {
         assert_eq!(format_token_count(1500), "1.5K");
         assert_eq!(format_token_count(999), "999");
         assert_eq!(format_token_count(0), "0");
+        // JS `toFixed(1)` rounds exact halves up (1.25 → "1.3").
+        assert_eq!(format_token_count(1250), "1.3K");
+        assert_eq!(format_token_count(1250000), "1.3M");
     }
 }

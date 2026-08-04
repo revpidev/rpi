@@ -3,7 +3,9 @@
 > 设计文档 §10.2 / 需求 §11.1 / 编码规范 §12.3 的落地目录。
 > 上游对照：`external/pi` @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（0.82.1），钉死，见 `UPSTREAM.md`。
 >
-> **归一化与 diff 只有一处实现**：`pir-test-support`（`normalize.rs` / `diff.rs`）。
+> **归一化与 diff 的共享实现**在 `pir-test-support`（`normalize.rs` / `diff.rs`）。
+> 此外各 parity 测试在 diff 前还会剥离数值型键（`usage`/`details` 等，键表见各测试文件
+> 顶部的 `STRIPPED_KEYS`——目前为各测试文件内的局部实现，共三处）。
 > fixtures 保存**原始字节**；timestamp / uuid / session id / cwd 的剥离在 diff 时进行，不在生成时进行。
 
 ## 1. 目录结构
@@ -131,7 +133,7 @@ diff_event_sequence(expected_events, actual_events)?;
 CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example normalize-diff -- <expected> <actual>`
 —— 各自归一化后 diff，输出首个差异定位（行号 + 上下文）。
 
-归一化规则（`pir-test-support/src/normalize.rs`，全项目唯一实现）：
+归一化规则（`pir-test-support/src/normalize.rs`）：
 
 - `timestamp` 键 → 类型保留常量（数字 → `0`，字符串 → `"<ts>"`）
 - id 键（`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/`sessionId`/`responseId`/`parentSession`）
@@ -139,6 +141,12 @@ CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example
 - 字符串内 ISO-8601 时间戳 → `<ts>`
 - 配置的 cwd / agentDir 路径前缀 → `<path>`
 - 其余字节保留
+
+此外，各 parity 测试在 `diff_jsonl` 前还按场景剥离数值键（`STRIPPED_KEYS`：
+`parity_headless_test.rs` 剥 `usage`/`details`，`parity_compaction_test.rs` 剥
+`usage`/`tokensBefore`/`estimatedTokensAfter`，`parity_tools_test.rs` 剥
+`usage`/`willRetry`/`details`）——token 记账数值不参与对拍；该剥离逻辑目前分散在三个
+测试文件内（未下沉 pir-test-support）。
 
 ## 5. 逐条对拍级基准清单（需求 §11.1）
 

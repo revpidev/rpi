@@ -128,13 +128,14 @@ pub async fn run_print_mode(
                     },
                 )
                 .await
-                .map_err(|e| e.to_string())?;
+                // Upstream prints `error.message` verbatim (print-mode.ts:149-150).
+                .map_err(|e| e.raw_message())?;
         }
         for message in &options.messages {
             session
                 .prompt(message, Default::default())
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.raw_message())?;
         }
         Ok(())
     }

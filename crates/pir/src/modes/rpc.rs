@@ -59,11 +59,12 @@ pub const EXTENSION_UI_FIRE_AND_FORGET_METHODS: [&str; 5] = [
 /// `ExtensionUIContext` methods not supported / degraded in RPC mode
 /// (docs/rpc.md "Extension UI Protocol"; rpc-mode.ts:162-309):
 /// `custom()` → undefined; the working-indicator/footer/header/editor-
-/// component/autocomplete setters are no-ops; `getEditorText()` → "";
+/// component/autocomplete setters are no-ops; `getEditorComponent()` →
+/// undefined; `onTerminalInput()` → no-op unsubscribe; `getEditorText()` → "";
 /// `getToolsExpanded()` → false; `pasteToEditor()` delegates to
 /// `setEditorText()`; `getAllThemes()` → []; `getTheme()` → undefined;
 /// `setTheme()` → `{success:false}`.
-pub const EXTENSION_UI_DEGRADED_METHODS: [&str; 16] = [
+pub const EXTENSION_UI_DEGRADED_METHODS: [&str; 18] = [
     "custom",
     "setWorkingMessage",
     "setWorkingIndicator",
@@ -72,6 +73,8 @@ pub const EXTENSION_UI_DEGRADED_METHODS: [&str; 16] = [
     "setFooter",
     "setHeader",
     "setEditorComponent",
+    "getEditorComponent",
+    "onTerminalInput",
     "setToolsExpanded",
     "addAutocompleteProvider",
     "getEditorText",
@@ -404,9 +407,11 @@ fn parse_command(line: &str) -> ParsedLine {
     let id = parsed.get("id").and_then(Value::as_str).map(str::to_owned);
 
     let Some(type_str) = type_value.and_then(Value::as_str).map(str::to_owned) else {
-        return ParsedLine::Error(error_response(
+        // Upstream `error(id, unknownCommand.type, ...)`: a missing type
+        // omits the `command` key; a non-string type echoes verbatim.
+        return ParsedLine::Error(error_response_raw_command(
             &id,
-            "undefined",
+            type_value,
             &format!("Unknown command: {}", js_render(type_value)),
         ));
     };
@@ -467,15 +472,30 @@ fn error_response(id: &Option<String>, command: &str, message: &str) -> Value {
     Value::Object(object)
 }
 
+/// Raw-`command` variant: upstream passes `unknownCommand.type` through, so
+/// `undefined` drops the key and non-strings echo verbatim (rpc-mode.ts:695-698).
+fn error_response_raw_command(
+    id: &Option<String>,
+    command: Option<&Value>,
+    message: &str,
+) -> Value {
+    let mut object = Map::new();
+    if let Some(id) = id {
+        object.insert("id".to_owned(), Value::String(id.clone()));
+    }
+    object.insert("type".to_owned(), Value::String("response".to_owned()));
+    if let Some(command) = command {
+        object.insert("command".to_owned(), command.clone());
+    }
+    object.insert("success".to_owned(), Value::Bool(false));
+    object.insert("error".to_owned(), Value::String(message.to_owned()));
+    Value::Object(object)
+}
+
 /// Raw error message without the `PirError` Display prefix (upstream sends
 /// `error.message` verbatim).
 fn error_message(error: &PirError) -> String {
-    match error {
-        PirError::Session(message) | PirError::Settings(message) | PirError::Resource(message) => {
-            message.clone()
-        }
-        other => other.to_string(),
-    }
+    error.raw_message()
 }
 
 /// `BashResult` wire shape (bash-executor.ts:29-40): optional fields are
@@ -629,10 +649,9 @@ struct RpcState {
     output: mpsc::UnboundedSender<String>,
     /// Shutdown trigger for the main loop.
     shutdown: mpsc::UnboundedSender<i32>,
-    /// Agent dir + startup cwd for prompt-template `SourceInfo`
-    /// reconstruction (`get_commands`).
+    /// Agent dir for prompt-template `SourceInfo` reconstruction
+    /// (`get_commands`); the project side uses the current session cwd.
     agent_dir: PathBuf,
-    cwd: PathBuf,
 }
 
 impl RpcState {
@@ -1045,9 +1064,15 @@ async fn dispatch(
             let mut commands: Vec<Value> = Vec::new();
             // Extension commands: none with the no-op runner (T15 lists
             // `extensionRunner.getRegisteredCommands()` here).
+            //
+            // Scope templates against the *current* session cwd (upstream
+            // reads `template.sourceInfo`, computed by the loader at load
+            // time): a cross-project `switch_session` must not keep the
+            // startup cwd.
+            let session_cwd = PathBuf::from(session.cwd());
             for template in session.prompt_templates() {
                 let source_info =
-                    prompt_template_source_info(&template, &state.agent_dir, &state.cwd);
+                    prompt_template_source_info(&template, &state.agent_dir, &session_cwd);
                 commands.push(json!({
                     "name": template.name,
                     "description": template.description,
@@ -1176,12 +1201,11 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     });
 
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
-    let (initial_session, agent_dir, cwd) = {
+    let (initial_session, agent_dir) = {
         let runtime_guard = runtime.lock().await;
         (
             runtime_guard.session().clone(),
             runtime_guard.services().agent_dir.clone(),
-            runtime_guard.services().cwd.clone(),
         )
     };
 
@@ -1193,7 +1217,6 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
         output: output_tx.clone(),
         shutdown: shutdown_tx,
         agent_dir,
-        cwd,
     });
 
     // `runtimeHost.setRebindSession` (rpc-mode.ts:312-314).
@@ -1221,9 +1244,9 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
             record = read_record(&mut input) => {
                 match record {
                     Ok(Some(line)) => {
-                        if line.trim().is_empty() {
-                            continue;
-                        }
+                        // No empty-line filtering: upstream feeds every line
+                        // to JSON.parse, so blank lines get a `command:
+                        // "parse"` error response (rpc-mode.ts:732-746).
                         match parse_command(&line) {
                             ParsedLine::Command(command) => {
                                 let state = state.clone();

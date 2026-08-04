@@ -284,7 +284,32 @@ pub fn parse_model_pattern(
 pub fn minimatch_nocase(value: &str, pattern: &str) -> bool {
     let value: Vec<char> = value.to_lowercase().chars().collect();
     let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
-    glob_match(&value, &pattern)
+    glob_match(&value, &normalize_globstars(&pattern))
+}
+
+/// node minimatch treats `**` as a globstar only when it forms a complete
+/// path segment (bounded by `/` or the pattern edges); anywhere else it
+/// collapses to a single `*`.
+fn normalize_globstars(pattern: &[char]) -> Vec<char> {
+    let mut out = Vec::with_capacity(pattern.len());
+    let mut i = 0;
+    while i < pattern.len() {
+        if pattern[i] == '*' && i + 1 < pattern.len() && pattern[i + 1] == '*' {
+            let segment_start = i == 0 || pattern[i - 1] == '/';
+            let segment_end = i + 2 == pattern.len() || pattern[i + 2] == '/';
+            if segment_start && segment_end {
+                out.push('*');
+                out.push('*');
+            } else {
+                out.push('*');
+            }
+            i += 2;
+            continue;
+        }
+        out.push(pattern[i]);
+        i += 1;
+    }
+    out
 }
 
 fn glob_match(value: &[char], pattern: &[char]) -> bool {
@@ -294,6 +319,15 @@ fn glob_match(value: &[char], pattern: &[char]) -> bool {
     }
     if pattern[0] == '*' {
         let crosses_slash = pattern.len() > 1 && pattern[1] == '*';
+        // A globstar may match zero path segments: `a/**/b` also matches
+        // `a/b` (the trailing `/` is absorbed).
+        if crosses_slash
+            && pattern.len() > 2
+            && pattern[2] == '/'
+            && glob_match(value, &pattern[3..])
+        {
+            return true;
+        }
         let rest = if crosses_slash {
             &pattern[2..]
         } else {
@@ -313,12 +347,15 @@ fn glob_match(value: &[char], pattern: &[char]) -> bool {
         return false;
     }
     match pattern[0] {
-        '?' => glob_match(&value[1..], &pattern[1..]),
+        // `?` never matches the path separator.
+        '?' => value[0] != '/' && glob_match(&value[1..], &pattern[1..]),
         '[' => match match_class(pattern) {
             Some(((ranges, negate), rest)) => {
                 let c = value[0];
                 let inside = ranges.iter().any(|(lo, hi)| *lo <= c && c <= *hi);
-                (inside != negate) && glob_match(&value[1..], rest)
+                // Character classes never match the path separator, negated
+                // or not.
+                c != '/' && (inside != negate) && glob_match(&value[1..], rest)
             }
             None => value[0] == '[' && glob_match(&value[1..], &pattern[1..]),
         },
@@ -1194,6 +1231,23 @@ mod tests {
         assert!(minimatch_nocase("gpt-4o", "gpt-[0-9]o"));
         assert!(!minimatch_nocase("gpt-xo", "gpt-[0-9]o"));
         assert!(minimatch_nocase("gpt-xo", "gpt-[!0-9]o"));
+    }
+
+    #[test]
+    fn test_minimatch_path_separator_semantics() {
+        // `?` / `[...]` never match `/` (node minimatch).
+        assert!(!minimatch_nocase("a/b", "a?b"));
+        assert!(!minimatch_nocase("a/b", "a[/]b"));
+        assert!(!minimatch_nocase("a/b", "a[!x]b"));
+        // `**` is a globstar only as a complete path segment; anywhere else
+        // it collapses to `*` and cannot cross `/`.
+        assert!(!minimatch_nocase("foo/bar", "foo**bar"));
+        assert!(!minimatch_nocase("a/x/b", "a**b"));
+        assert!(minimatch_nocase("axxb", "a**b"));
+        // Globstar matches zero path segments: `a/**/b` ≡ `a/b` as well.
+        assert!(minimatch_nocase("a/b", "a/**/b"));
+        assert!(minimatch_nocase("a/x/b", "a/**/b"));
+        assert!(minimatch_nocase("a/x/y/b", "a/**/b"));
     }
 
     // ------------------------------------------------------------------

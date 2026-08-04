@@ -28,8 +28,14 @@ use crate::types::{InputModality, ModelCompat, ModelCost, ModelCostTier, Thinkin
 /// Insertion-ordered string-keyed map, serialized as a JSON object. Upstream
 /// `Record`/`Map` key order is observable (`getProviderIds`), so a `HashMap`
 /// will not do.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderedMap<T>(Vec<(String, T)>);
+
+impl<T> Default for OrderedMap<T> {
+    fn default() -> Self {
+        OrderedMap(Vec::new())
+    }
+}
 
 impl<T> OrderedMap<T> {
     pub fn get(&self, key: &str) -> Option<&T> {
@@ -46,6 +52,38 @@ impl<T> OrderedMap<T> {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().map(|(_, v)| v)
+    }
+
+    /// Upsert: an existing key keeps its position (JS `Map.set` semantics).
+    pub fn insert(&mut self, key: String, value: T) -> Option<T> {
+        for (k, v) in &mut self.0 {
+            if k == &key {
+                return Some(std::mem::replace(v, value));
+            }
+        }
+        self.0.push((key, value));
+        None
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<T> {
+        let position = self.0.iter().position(|(k, _)| k == key)?;
+        Some(self.0.remove(position).1)
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
     }
 }
 

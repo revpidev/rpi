@@ -131,7 +131,13 @@ fn with_trust_file_lock<T>(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let lock_path = path.with_extension("lock");
+    let lock_path = {
+        // Upstream appends: `${path}.lock` (trust-manager.ts:145) —
+        // `trust.json.lock`, not `trust.lock`.
+        let mut os = path.as_os_str().to_owned();
+        os.push(".lock");
+        PathBuf::from(os)
+    };
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -189,18 +195,17 @@ impl ProjectTrustStore {
         }
     }
 
-    /// `get(cwd)`: nearest ancestor decision, `None` when unset.
-    pub fn get(&self, cwd: &Path) -> Option<bool> {
-        self.get_entry(cwd).map(|(_, decision)| decision)
+    /// `get(cwd)`: nearest ancestor decision, `None` when unset. Lock/read
+    /// failures propagate (upstream `getEntry` throws, trust-manager.ts:219-224).
+    pub fn get(&self, cwd: &Path) -> Result<Option<bool>, PirError> {
+        Ok(self.get_entry(cwd)?.map(|(_, decision)| decision))
     }
 
-    pub fn get_entry(&self, cwd: &Path) -> Option<(PathBuf, bool)> {
+    pub fn get_entry(&self, cwd: &Path) -> Result<Option<(PathBuf, bool)>, PirError> {
         with_trust_file_lock(&self.trust_path, || {
             let data = read_trust_file(&self.trust_path)?;
             Ok(find_nearest_trust_entry(&data, cwd))
         })
-        .ok()
-        .flatten()
     }
 
     /// `set(cwd, decision)`: `None` clears the entry.
@@ -243,29 +248,29 @@ pub fn resolve_project_trusted(
     trust_store: &ProjectTrustStore,
     trust_override: Option<bool>,
     default_project_trust: DefaultProjectTrust,
-) -> bool {
+) -> Result<bool, PirError> {
     if let Some(trust_override) = trust_override {
-        return trust_override;
+        return Ok(trust_override);
     }
     if !has_trust_requiring_project_resources(cwd) {
-        return true;
+        return Ok(true);
     }
 
     // The `project_trust` extension event goes here (project-trust.ts:60-75)
     // — no extensions until T15.
 
-    if let Some(decision) = trust_store.get(cwd) {
-        return decision;
+    if let Some(decision) = trust_store.get(cwd)? {
+        return Ok(decision);
     }
 
     match default_project_trust {
-        DefaultProjectTrust::Always => return true,
-        DefaultProjectTrust::Never => return false,
+        DefaultProjectTrust::Always => return Ok(true),
+        DefaultProjectTrust::Never => return Ok(false),
         DefaultProjectTrust::Ask => {}
     }
 
     // `!options.projectTrustContext.hasUI` → false (project-trust.ts:82-85).
-    false
+    Ok(false)
 }
 
 /// Map the settings enum (`settings_manager::DefaultProjectTrust`) to the

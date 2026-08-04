@@ -1006,12 +1006,36 @@ async fn protocol_errors_and_framing() {
         .starts_with("Failed to parse command: "));
     assert!(response.get("id").is_none());
 
+    // 空行 / 纯空白行同样回 parse 错误（上游不过滤空行，JSON.parse("") 抛错）。
+    rpc.send_raw("\n").await;
+    let response = rpc.next_response(None).await;
+    assert_eq!(response["command"], "parse");
+    assert_eq!(response["success"], false);
+    assert!(response["error"]
+        .as_str()
+        .expect("error")
+        .starts_with("Failed to parse command: "));
+
     // 未知命令（rpc-mode.ts:695-698）。
     rpc.send(&json!({"id": "u1", "type": "frobnicate"})).await;
     let response = rpc.next_response(Some("u1")).await;
     assert_eq!(response["success"], false);
     assert_eq!(response["command"], "frobnicate");
     assert_eq!(response["error"], "Unknown command: frobnicate");
+
+    // 非字符串 type：command 原值回显（上游 error(id, unknownCommand.type, ...)）。
+    rpc.send_raw("{\"id\":\"u9\",\"type\":42}\n").await;
+    let response = rpc.next_response(Some("u9")).await;
+    assert_eq!(response["success"], false);
+    assert_eq!(response["command"], 42);
+    assert_eq!(response["error"], "Unknown command: 42");
+
+    // 缺 type：command 键整键省略（JSON.stringify 丢弃 undefined）。
+    rpc.send_raw("{\"id\":\"u10\"}\n").await;
+    let response = rpc.next_response(Some("u10")).await;
+    assert_eq!(response["success"], false);
+    assert!(response.get("command").is_none());
+    assert_eq!(response["error"], "Unknown command: undefined");
 
     // 已知命令但字段形状错误 → 边界拒绝（上游为 TypeError，同为 success:false）。
     rpc.send(&json!({"id": "u2", "type": "prompt"})).await;

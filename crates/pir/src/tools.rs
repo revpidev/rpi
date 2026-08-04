@@ -98,21 +98,44 @@ pub fn resolve_active_tool_names(
     }
 }
 
+/// Settings-derived options for the built-in tools (`_buildRuntime`,
+/// agent-session.ts:2552-2564). `None` keeps each tool's own default.
+#[derive(Default)]
+pub struct BuiltinToolOptions {
+    /// `settingsManager.getImageAutoResize()` → read tool.
+    pub auto_resize_images: Option<bool>,
+    /// `settingsManager.getShellCommandPrefix()` → bash tool.
+    pub shell_command_prefix: Option<String>,
+    /// `settingsManager.getShellPath()` → bash tool.
+    pub shell_path: Option<String>,
+}
+
 /// Construct the built-in tools selected by `active_names`, in list order.
 ///
 /// Unknown names are skipped here (extension/custom tools are attached by the
 /// session assembly layer in T10/T15).
-pub fn create_builtin_tools(ctx: &ToolContext, active_names: &[String]) -> Vec<Arc<dyn AgentTool>> {
+pub fn create_builtin_tools(
+    ctx: &ToolContext,
+    active_names: &[String],
+    options: &BuiltinToolOptions,
+) -> Vec<Arc<dyn AgentTool>> {
     active_names
         .iter()
         .filter_map(|name| match name.as_str() {
-            "read" => Some(read::create_read_tool(
-                ctx,
-                read::ReadToolOptions::default(),
-            )),
+            "read" => {
+                let mut read_options = read::ReadToolOptions::default();
+                if let Some(auto_resize_images) = options.auto_resize_images {
+                    read_options.auto_resize_images = auto_resize_images;
+                }
+                Some(read::create_read_tool(ctx, read_options))
+            }
             "bash" => Some(bash::create_bash_tool(
                 ctx,
-                bash::BashToolOptions::default(),
+                bash::BashToolOptions {
+                    command_prefix: options.shell_command_prefix.clone(),
+                    shell_path: options.shell_path.clone(),
+                    ..Default::default()
+                },
             )),
             "edit" => Some(edit::create_edit_tool(
                 ctx,
@@ -263,7 +286,11 @@ mod wiring_tests {
             cwd: PathBuf::from("."),
             session_env: None,
         };
-        let tools = create_builtin_tools(&ctx, &names(&["write", "grep", "read"]));
+        let tools = create_builtin_tools(
+            &ctx,
+            &names(&["write", "grep", "read"]),
+            &BuiltinToolOptions::default(),
+        );
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         // List order preserved; unknown names skipped (extension tools are
         // attached by the session assembly layer, T10/T15).

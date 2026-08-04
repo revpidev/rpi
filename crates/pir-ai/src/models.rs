@@ -20,6 +20,7 @@ use crate::auth::{
     resolve_provider_auth, AuthContext, AuthResolutionOverrides, AuthResult, CredentialStore,
     DefaultAuthContext, InMemoryCredentialStore, ModelsError, ModelsErrorCode, ProviderAuth,
 };
+use crate::models_json::OrderedMap;
 use crate::types::{
     Context, Model, ModelThinkingLevel, ProviderHeaders, SimpleStreamOptions, StreamOptions,
 };
@@ -243,7 +244,9 @@ pub struct CreateModelsOptions {
 /// stream convenience (T03 subset, see module docs).
 #[derive(Clone)]
 pub struct Models {
-    providers: Arc<RwLock<HashMap<String, Arc<dyn Provider>>>>,
+    /// Insertion-ordered like the upstream JS `Map`: `getModels()` order is
+    /// observable (initial-model fallback, available-model listings).
+    providers: Arc<RwLock<OrderedMap<Arc<dyn Provider>>>>,
     credentials: Arc<dyn CredentialStore>,
     auth_context: Arc<dyn AuthContext>,
 }
@@ -262,7 +265,7 @@ impl Models {
             auth_context: None,
         });
         Self {
-            providers: Arc::new(RwLock::new(HashMap::new())),
+            providers: Arc::new(RwLock::new(OrderedMap::default())),
             credentials: options
                 .credentials
                 .unwrap_or_else(|| Arc::new(InMemoryCredentialStore::new())),

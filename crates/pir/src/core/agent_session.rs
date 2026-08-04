@@ -33,6 +33,7 @@ use pir_agent::session::SessionEntry;
 use pir_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
 use pir_agent::{Agent, AgentError};
 use pir_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
+use pir_ai::models_json::OrderedMap;
 use pir_ai::types::{
     AssistantMessage, ImageContent, Model, StopReason, TextContent, Usage, UserContent,
     UserContentBlock, UserMessage, UserRole,
@@ -223,6 +224,9 @@ pub struct ModelCycleResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStats {
+    /// Upstream `sessionFile: this.sessionFile` — `undefined` is dropped by
+    /// `JSON.stringify`, so the key is omitted for in-memory sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_file: Option<String>,
     pub session_id: String,
     pub user_messages: u64,
@@ -366,6 +370,9 @@ struct AgentSessionInner {
     session_start_event: SessionStartEvent,
 
     compaction: tokio::sync::Mutex<CompactionRunner>,
+    /// Shared compaction abort handle: works while the runner mutex is held
+    /// by an in-flight compaction (`AbortController` upstream).
+    compaction_abort: crate::core::compaction_runner::AbortTokenCell,
 
     listeners: Mutex<Vec<(u64, AgentSessionEventListener)>>,
     next_listener_id: AtomicU64,
@@ -388,11 +395,15 @@ struct AgentSessionInner {
     base_system_prompt: Mutex<String>,
     base_system_prompt_options: Mutex<BuildSystemPromptOptions>,
     system_prompt_override: Mutex<Option<String>>,
-    tool_registry: Mutex<HashMap<String, Arc<dyn AgentTool>>>,
+    tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
     allowed_tool_names: Option<HashSet<String>>,
     excluded_tool_names: Option<HashSet<String>>,
     extension_mode: Mutex<ExtensionMode>,
+    /// `_extensionErrorListener` / `_extensionErrorUnsubscriber`
+    /// (agent-session.ts:2307-2314).
+    extension_error_listener: Mutex<Option<crate::core::extensions::ExtensionErrorListener>>,
+    extension_error_unsubscriber: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// `AgentSession` (agent-session.ts:303-3327). Cheap to clone (Arc inner);
@@ -431,6 +442,7 @@ impl AgentSession {
             thinking_level,
             Arc::new(|_event| {}),
         );
+        let compaction_abort = compaction.abort_token_cell();
 
         let inner = Arc::new(AgentSessionInner {
             agent: config.agent,
@@ -441,6 +453,7 @@ impl AgentSession {
             cwd: config.cwd,
             session_start_event: config.session_start_event,
             compaction: tokio::sync::Mutex::new(compaction),
+            compaction_abort,
             listeners: Mutex::new(Vec::new()),
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
@@ -468,7 +481,7 @@ impl AgentSession {
                 doc_paths: None,
             }),
             system_prompt_override: Mutex::new(None),
-            tool_registry: Mutex::new(HashMap::new()),
+            tool_registry: Mutex::new(OrderedMap::default()),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
                 session_id: String::new(),
                 session_file: None,
@@ -483,6 +496,8 @@ impl AgentSession {
                 .excluded_tool_names
                 .map(|names| names.into_iter().collect()),
             extension_mode: Mutex::new(ExtensionMode::Print),
+            extension_error_listener: Mutex::new(None),
+            extension_error_unsubscriber: Mutex::new(None),
         });
 
         // Subscribe to agent events for internal handling (persistence,
@@ -726,11 +741,13 @@ impl AgentSession {
     /// `dispose` (agent-session.ts:837-854).
     pub fn dispose(&self) {
         self.abort_retry();
-        if let Ok(runner) = self.inner.compaction.try_lock() {
-            runner.abort_compaction();
-        }
+        self.abort_compaction();
         self.abort_bash();
         self.inner.agent.abort();
+        // Unsubscribe before the aborted run's tail events (aborted
+        // `message_end`, retry/compaction triggers) can still reach this
+        // session's persistence (agent-session.ts:851 `_disconnectFromAgent`).
+        self.disconnect_from_agent();
         self.runner().invalidate(
             "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
         );
@@ -893,11 +910,28 @@ impl AgentSession {
             cwd: PathBuf::from(&self.inner.cwd),
             session_env: Some(self.inner.session_env_cell.clone()),
         };
-        let mut registry: HashMap<String, Arc<dyn AgentTool>> = HashMap::new();
+        // `_buildRuntime` feeds settings into the read/bash tool options
+        // (agent-session.ts:2552-2564).
+        let tool_options = {
+            let loader = lock(&self.inner.resource_loader);
+            let settings = loader.settings_manager();
+            crate::tools::BuiltinToolOptions {
+                auto_resize_images: Some(settings.get_image_auto_resize()),
+                shell_command_prefix: settings.get_shell_command_prefix(),
+                shell_path: settings.get_shell_path(),
+            }
+        };
+        // Insertion-ordered like the upstream `Map` registry: iteration order
+        // is observable in the active-tool list and system prompt.
+        let mut registry: OrderedMap<Arc<dyn AgentTool>> = OrderedMap::default();
         // Built-ins come from the shared factory; the active set is applied
         // below via the allow/deny filter.
         let builtin_names = ["read", "bash", "edit", "write"];
-        let builtins = crate::tools::create_builtin_tools(&ctx, &builtin_names.map(str::to_owned));
+        let builtins = crate::tools::create_builtin_tools(
+            &ctx,
+            &builtin_names.map(str::to_owned),
+            &tool_options,
+        );
         for tool in builtins {
             if self.is_allowed_tool(tool.name()) {
                 registry.insert(tool.name().to_owned(), tool);
@@ -932,8 +966,10 @@ impl AgentSession {
                 }
             }
         }
-        active.sort();
-        active.dedup();
+        // Upstream `[...new Set(names)]`: dedup keeping first-occurrence
+        // order (agent-session.ts:2544) — no sorting.
+        let mut seen: HashSet<String> = HashSet::new();
+        active.retain(|name| seen.insert(name.clone()));
         self.set_active_tools_by_name(active);
     }
 
@@ -980,7 +1016,7 @@ impl AgentSession {
         let registry = lock(&self.inner.tool_registry);
         let valid: Vec<String> = tool_names
             .iter()
-            .filter(|name| registry.contains_key(*name))
+            .filter(|name| registry.contains_key(name))
             .cloned()
             .collect();
         drop(registry);
@@ -1488,8 +1524,17 @@ impl AgentSession {
 
     /// `waitForIdle` (agent-session.ts:1548-1553).
     pub async fn wait_for_idle(&self) {
-        while !self.is_idle() {
-            self.inner.idle_notify.notified().await;
+        loop {
+            let notified = self.inner.idle_notify.notified();
+            tokio::pin!(notified);
+            // Register the waiter *before* checking the condition:
+            // `notify_waiters` stores no permit, so a notification landing
+            // between the check and the await would otherwise be lost.
+            notified.as_mut().enable();
+            if self.is_idle() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -1729,11 +1774,12 @@ impl AgentSession {
             return None;
         }
         let levels = self.get_available_thinking_levels();
-        let current_index = levels
-            .iter()
-            .position(|l| *l == self.thinking_level())
-            .unwrap_or(0);
-        let next_level = levels[(current_index + 1) % levels.len()];
+        // `indexOf` miss yields -1 upstream, so (-1 + 1) % len = 0 — the
+        // first level, not the second (agent-session.ts:1709-1710).
+        let next_level = match levels.iter().position(|l| *l == self.thinking_level()) {
+            Some(current_index) => levels[(current_index + 1) % levels.len()],
+            None => levels[0],
+        };
         self.set_thinking_level(next_level);
         Some(next_level)
     }
@@ -1846,10 +1892,12 @@ impl AgentSession {
             .await
     }
 
-    /// `abortCompaction` (agent-session.ts:1930-1933).
+    /// `abortCompaction` (agent-session.ts:1930-1933). Cancels through the
+    /// shared token, so it also works while a compaction holds the runner
+    /// mutex (upstream aborts an AbortController directly).
     pub fn abort_compaction(&self) {
-        if let Ok(runner) = self.inner.compaction.try_lock() {
-            runner.abort_compaction();
+        if let Some(token) = lock(&self.inner.compaction_abort).as_ref() {
+            token.cancel();
         }
     }
 
@@ -2592,9 +2640,16 @@ impl AgentSession {
             *lock(&self.inner.extension_mode) = mode;
         }
         if let Some(on_error) = bindings.on_error {
-            let _unsubscribe = self.runner().on_error(on_error);
-            std::mem::forget(_unsubscribe);
+            *lock(&self.inner.extension_error_listener) = Some(on_error);
         }
+        // `_applyExtensionBindings` (agent-session.ts:2307-2314): the previous
+        // subscription is dropped before re-subscribing — never leaked.
+        if let Some(unsubscribe) = lock(&self.inner.extension_error_unsubscriber).take() {
+            unsubscribe();
+        }
+        let listener = lock(&self.inner.extension_error_listener).clone();
+        *lock(&self.inner.extension_error_unsubscriber) =
+            listener.and_then(|listener| self.runner().on_error(listener));
         let reason = self.inner.session_start_event.reason;
         self.runner().emit("session_start").await;
         let _ = reason;

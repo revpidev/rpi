@@ -32,19 +32,25 @@ use pir_ai::api::openai_completions::OpenAiCompletions;
 use pir_ai::api::openai_responses::OpenAiResponses;
 use pir_ai::auth::file_store::FileCredentialStore;
 use pir_ai::auth::helpers::env_api_key_auth;
+use pir_ai::auth::interaction::AuthInteraction;
 use pir_ai::auth::resolve::{
     resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode,
 };
 use pir_ai::auth::types::{
-    ApiKeyCredential, AuthCheck, AuthContext, AuthResult, AuthType, Credential, CredentialInfo,
-    CredentialStore, CredentialType, DefaultAuthContext, ModifyFn, ProviderAuth,
+    ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthResult, AuthType, Credential,
+    CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext, ModifyFn, ProviderAuth,
 };
 use pir_ai::models::{
     create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsSimpleStreamOptions,
     ModelsStreamOptions, Provider, ProviderApi, ProviderStreams,
 };
-use pir_ai::models_json::{ModelConfig, ModelsJsonModel, ModelsJsonProvider};
-use pir_ai::types::{ApiKind, AssistantMessage, Context, Model, ProviderEnv, ProviderHeaders};
+use pir_ai::models_json::{
+    ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider, OrderedMap,
+};
+use pir_ai::types::{
+    ApiKind, AssistantMessage, Context, Model, ModelCompat, ModelCost, ModelCostRates, ProviderEnv,
+    ProviderHeaders, SimpleStreamOptions, StreamOptions,
+};
 use pir_ai::utils::event_stream::AssistantMessageEventStream;
 
 use crate::config::get_agent_dir;
@@ -250,9 +256,12 @@ pub struct ModelRuntime {
     credentials: Arc<RuntimeCredentials>,
     models_path: Option<PathBuf>,
     config: Mutex<ModelConfig>,
-    native_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
-    extension_providers: Mutex<HashMap<String, ProviderConfigInput>>,
-    composition_errors: Mutex<HashMap<String, String>>,
+    /// Insertion-ordered like the upstream JS `Map`s: provider enumeration
+    /// order is observable (initial-model fallback, available listings).
+    native_providers: Mutex<OrderedMap<Arc<dyn Provider>>>,
+    extension_providers: Mutex<OrderedMap<ProviderConfigInput>>,
+    composition_errors: Mutex<OrderedMap<String>>,
+    availability_error: Mutex<Option<String>>,
     snapshot: RwLock<ModelRuntimeSnapshot>,
 }
 
@@ -290,6 +299,232 @@ fn strings_to_headers<'a>(
         .collect()
 }
 
+/// `composeApiKeyAuth.resolve` wrapper (provider-composer.ts:333-356 +
+/// `withConfiguredAuth`:250-262): merges the configured provider headers into
+/// every resolved auth result and, when `authHeader` is set, adds
+/// `Authorization: Bearer <key>`.
+struct ConfiguredApiKeyAuth {
+    inner: Arc<dyn ApiKeyAuth>,
+    headers: Option<ProviderHeaders>,
+    auth_header: bool,
+}
+
+#[async_trait::async_trait]
+impl ApiKeyAuth for ConfiguredApiKeyAuth {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<ApiKeyCredential, ModelsError> {
+        self.inner.login(interaction).await
+    }
+
+    async fn check(
+        &self,
+        ctx: &dyn AuthContext,
+        credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthCheck>, ModelsError> {
+        self.inner.check(ctx, credential).await
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &dyn AuthContext,
+        credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        let Some(mut result) = self.inner.resolve(ctx, credential).await? else {
+            return Ok(None);
+        };
+        result.auth.headers = merge_headers(result.auth.headers.as_ref(), self.headers.as_ref());
+        if self.auth_header {
+            let Some(api_key) = result.auth.api_key.clone() else {
+                return Err(ModelsError::new(
+                    ModelsErrorCode::Auth,
+                    "authHeader requires a resolved API key",
+                ));
+            };
+            let authorization: ProviderHeaders = [(
+                "Authorization".to_owned(),
+                Some(format!("Bearer {api_key}")),
+            )]
+            .into_iter()
+            .collect();
+            result.auth.headers = merge_headers(result.auth.headers.as_ref(), Some(&authorization));
+        }
+        Ok(Some(result))
+    }
+}
+
+/// No-op passthrough when there is nothing to configure.
+fn wrap_api_key_auth(
+    inner: Arc<dyn ApiKeyAuth>,
+    headers: &Option<ProviderHeaders>,
+    auth_header: bool,
+) -> Arc<dyn ApiKeyAuth> {
+    if headers.is_none() && !auth_header {
+        return inner;
+    }
+    Arc::new(ConfiguredApiKeyAuth {
+        inner,
+        headers: headers.clone(),
+        auth_header,
+    })
+}
+
+fn wrap_provider_auth(
+    mut auth: ProviderAuth,
+    headers: &Option<ProviderHeaders>,
+    auth_header: bool,
+) -> ProviderAuth {
+    if let Some(api_key) = auth.api_key.take() {
+        auth.api_key = Some(wrap_api_key_auth(api_key, headers, auth_header));
+    }
+    auth
+}
+
+/// Base passthrough with auth resolution overridden by configured
+/// headers/`authHeader` (models.json/extension overlay without its own `api`).
+struct AuthOverridingProvider {
+    base: Arc<dyn Provider>,
+    auth: ProviderAuth,
+}
+
+impl Provider for AuthOverridingProvider {
+    fn id(&self) -> &str {
+        self.base.id()
+    }
+
+    fn name(&self) -> &str {
+        self.base.name()
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.base.base_url()
+    }
+
+    fn headers(&self) -> Option<&ProviderHeaders> {
+        self.base.headers()
+    }
+
+    fn auth(&self) -> &ProviderAuth {
+        &self.auth
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        self.base.get_models()
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        self.base.stream(model, context, options)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<SimpleStreamOptions>,
+    ) -> AssistantMessageEventStream {
+        self.base.stream_simple(model, context, options)
+    }
+}
+
+/// `mergeCompat` (provider-composer.ts:78-98): shallow field override, with
+/// the three nested objects merged key-wise. Implemented over the serialized
+/// form so the field list tracks `ModelCompat` automatically.
+fn merge_compat(base: Option<&ModelCompat>, override_: &ModelCompat) -> ModelCompat {
+    let base_value = base.and_then(|base| serde_json::to_value(base).ok());
+    let override_value = serde_json::to_value(override_).ok();
+    let (Some(base_value), Some(override_value)) = (base_value, override_value) else {
+        return override_.clone();
+    };
+    let (Some(base_map), Some(override_map)) = (base_value.as_object(), override_value.as_object())
+    else {
+        return override_.clone();
+    };
+    let mut merged = base_map.clone();
+    for (key, value) in override_map {
+        merged.insert(key.clone(), value.clone());
+    }
+    for key in [
+        "openRouterRouting",
+        "vercelGatewayRouting",
+        "chatTemplateKwargs",
+    ] {
+        let base_nested = base_map.get(key).and_then(serde_json::Value::as_object);
+        let override_nested = override_map.get(key).and_then(serde_json::Value::as_object);
+        if base_nested.is_some() || override_nested.is_some() {
+            let mut nested = base_nested.cloned().unwrap_or_default();
+            if let Some(override_nested) = override_nested {
+                for (key, value) in override_nested {
+                    nested.insert(key.clone(), value.clone());
+                }
+            }
+            merged.insert(key.to_owned(), serde_json::Value::Object(nested));
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_else(|_| override_.clone())
+}
+
+/// `applyModelOverride` (provider-composer.ts:100-122) plus the
+/// `modelOverrides` entry of `rawModelHeaders` (provider-composer.ts:384-397,
+/// merged *under* definition/extension headers).
+fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -> Model {
+    if let Some(name) = &override_.name {
+        model.name = name.clone();
+    }
+    if let Some(reasoning) = override_.reasoning {
+        model.reasoning = reasoning;
+    }
+    if let Some(thinking_level_map) = &override_.thinking_level_map {
+        model.thinking_level_map = Some(match model.thinking_level_map.take() {
+            Some(mut base) => {
+                base.extend(thinking_level_map.clone());
+                base
+            }
+            None => thinking_level_map.clone(),
+        });
+    }
+    if let Some(input) = &override_.input {
+        model.input = input.clone();
+    }
+    if let Some(cost) = &override_.cost {
+        model.cost = ModelCost {
+            rates: ModelCostRates {
+                input: cost.input.unwrap_or(model.cost.rates.input),
+                output: cost.output.unwrap_or(model.cost.rates.output),
+                cache_read: cost.cache_read.unwrap_or(model.cost.rates.cache_read),
+                cache_write: cost.cache_write.unwrap_or(model.cost.rates.cache_write),
+            },
+            tiers: cost.tiers.clone().or_else(|| model.cost.tiers.take()),
+        };
+    }
+    if let Some(context_window) = override_.context_window {
+        model.context_window = context_window as u32;
+    }
+    if let Some(max_tokens) = override_.max_tokens {
+        model.max_tokens = max_tokens as u32;
+    }
+    if let Some(compat) = &override_.compat {
+        model.compat = Some(merge_compat(model.compat.as_ref(), compat));
+    }
+    if let Some(override_headers) = &override_.headers {
+        let mut headers: BTreeMap<String, String> = override_headers.clone().into_iter().collect();
+        if let Some(existing) = model.headers.take() {
+            headers.extend(existing);
+        }
+        model.headers = Some(headers);
+    }
+    model
+}
+
 impl ModelRuntime {
     /// `ModelRuntime.create` (model-runtime.ts:133-172).
     pub async fn create(options: CreateModelRuntimeOptions) -> Arc<Self> {
@@ -316,9 +551,10 @@ impl ModelRuntime {
             credentials,
             models_path,
             config: Mutex::new(config),
-            native_providers: Mutex::new(HashMap::new()),
-            extension_providers: Mutex::new(HashMap::new()),
-            composition_errors: Mutex::new(HashMap::new()),
+            native_providers: Mutex::new(OrderedMap::default()),
+            extension_providers: Mutex::new(OrderedMap::default()),
+            composition_errors: Mutex::new(OrderedMap::default()),
+            availability_error: Mutex::new(None),
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
         });
         runtime.rebuild_providers();
@@ -370,53 +606,108 @@ impl ModelRuntime {
         let api_key_value = extension
             .and_then(|e| e.api_key.clone())
             .or_else(|| config.and_then(|c| c.api_key.clone()));
+
+        // `configuredHeaders` + `authHeader` (provider-composer.ts:271-277,
+        // 305): they wrap auth *resolution* so every request path — including
+        // `stream`/`stream_simple` — sees them.
+        let configured_headers = merge_headers(
+            config
+                .and_then(|c| c.headers.as_ref())
+                .map(|headers| strings_to_headers(headers.iter()))
+                .as_ref(),
+            extension
+                .and_then(|e| e.headers.as_ref())
+                .map(|headers| strings_to_headers(headers.iter()))
+                .as_ref(),
+        );
+        let auth_header = extension
+            .and_then(|e| e.auth_header)
+            .or_else(|| config.and_then(|c| c.auth_header))
+            .unwrap_or(false);
+
         let auth = match &api_key_value {
             Some(env_var) => ProviderAuth {
-                api_key: Some(Arc::new(env_api_key_auth(
-                    format!("{provider_id} API key"),
-                    &[env_var.as_str()],
-                ))),
+                api_key: Some(wrap_api_key_auth(
+                    Arc::new(env_api_key_auth(
+                        format!("{provider_id} API key"),
+                        &[env_var.as_str()],
+                    )),
+                    &configured_headers,
+                    auth_header,
+                )),
                 oauth: None,
             },
-            None => base.map(|b| b.auth().clone()).ok_or_else(|| {
-                format!("Provider {provider_id}: no authentication method configured.")
-            })?,
+            None => {
+                let base_auth = base.map(|b| b.auth().clone()).ok_or_else(|| {
+                    format!("Provider {provider_id}: no authentication method configured.")
+                })?;
+                wrap_provider_auth(base_auth, &configured_headers, auth_header)
+            }
         };
 
         let api = extension
             .and_then(|e| e.api.clone())
             .or_else(|| config.and_then(|c| c.api.clone()));
+
+        // Models are built (and validated) before stream dispatch so a
+        // model-level problem surfaces the upstream per-model composition
+        // error (provider-composer.ts validates `getModels()` first).
+        // The base-passthrough branch skips construction entirely.
+        let mut models = match (&api, base) {
+            (None, Some(_)) => Vec::new(),
+            _ => match extension.and_then(|e| e.models.clone()) {
+                Some(models) => models
+                    .into_iter()
+                    .map(|m| config_model_to_model(provider_id, &api, base_url.as_deref(), m))
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => match config.and_then(|c| c.models.clone()) {
+                    Some(models) => models
+                        .into_iter()
+                        .map(|m| {
+                            json_model_to_model(
+                                provider_id,
+                                &api,
+                                base_url.as_deref(),
+                                config.and_then(|c| c.compat.as_ref()),
+                                m,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    None => base.map(|b| b.get_models()).unwrap_or_default(),
+                },
+            },
+        };
+        // models.json `modelOverrides` are the topmost user-config layer:
+        // applied once, after model construction (provider-composer.ts:434-437).
+        if let Some(overrides) = config.and_then(|c| c.model_overrides.as_ref()) {
+            models = models
+                .into_iter()
+                .map(|model| match overrides.get(&model.id) {
+                    Some(override_) => apply_model_override(model, override_),
+                    None => model,
+                })
+                .collect();
+        }
+
         let streams = match (&api, base) {
             (Some(api), _) => api_streams(api)
                 .ok_or_else(|| format!("No API provider registered for api: {api}"))?,
             (None, Some(base)) => {
                 // Overlay without its own api: stream through the base
-                // provider untouched (models/auth passthrough).
-                return Ok(base.clone());
+                // provider; configured headers/authHeader still wrap auth
+                // resolution (`composeApiKeyAuth`, provider-composer.ts:293).
+                if configured_headers.is_none() && !auth_header {
+                    return Ok(base.clone());
+                }
+                return Ok(Arc::new(AuthOverridingProvider {
+                    base: base.clone(),
+                    auth: wrap_provider_auth(base.auth().clone(), &configured_headers, auth_header),
+                }));
             }
             (None, None) => {
                 return Err(format!("Provider {provider_id}: no api configured."));
             }
         };
-
-        let models = extension
-            .and_then(|e| e.models.clone())
-            .map(|models| {
-                models
-                    .into_iter()
-                    .map(|m| config_model_to_model(provider_id, &api, base_url.as_deref(), m))
-                    .collect::<Vec<_>>()
-            })
-            .or_else(|| {
-                config.and_then(|c| c.models.clone()).map(|models| {
-                    models
-                        .into_iter()
-                        .map(|m| json_model_to_model(provider_id, &api, base_url.as_deref(), m))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .or_else(|| base.map(|b| b.get_models()))
-            .unwrap_or_default();
 
         let headers = base.and_then(|b| b.headers().cloned());
 
@@ -556,8 +847,15 @@ impl ModelRuntime {
         }))
     }
 
-    /// `runAvailabilityRefresh` (model-runtime.ts:240-268).
+    /// `runAvailabilityRefresh` (model-runtime.ts:240-268). Records the last
+    /// failure for `get_error` (upstream `availabilityError`).
     async fn refresh_availability(&self) -> Result<(), ModelsError> {
+        let result = self.refresh_availability_inner().await;
+        *lock(&self.availability_error) = result.as_ref().err().map(|error| error.message.clone());
+        result
+    }
+
+    async fn refresh_availability_inner(&self) -> Result<(), ModelsError> {
         let providers = self.models.get_providers();
         let mut auth = HashMap::new();
         for provider in &providers {
@@ -650,6 +948,9 @@ impl ModelRuntime {
         for (provider_id, error) in lock(&self.composition_errors).iter() {
             errors.push(format!("Provider \"{provider_id}\": {error}"));
         }
+        if let Some(availability_error) = lock(&self.availability_error).as_ref() {
+            errors.push(format!("Availability refresh: {availability_error}"));
+        }
         if errors.is_empty() {
             None
         } else {
@@ -696,27 +997,17 @@ impl ModelRuntime {
             .contains(provider_id)
     }
 
-    /// Configured provider-level headers from models.json / extension
-    /// registration (`configuredHeaders`, provider-composer.ts subset).
-    fn configured_provider_headers(&self, provider_id: &str) -> Option<ProviderHeaders> {
-        let config_headers = lock(&self.config)
-            .get_provider(provider_id)
-            .and_then(|c| c.headers.as_ref().map(strings_to_headers));
-        let extension_headers = lock(&self.extension_providers)
-            .get(provider_id)
-            .and_then(|e| e.headers.as_ref().map(strings_to_headers));
-        merge_headers(config_headers.as_ref(), extension_headers.as_ref())
-    }
-
-    /// `getAuth(model, overrides)` (model-runtime.ts:374-396).
+    /// `getAuth(model, overrides)` (model-runtime.ts:374-396). Provider-level
+    /// configured headers/`authHeader` are baked into the composed provider's
+    /// auth resolution ([`ConfiguredApiKeyAuth`]); model-level headers merge
+    /// in `Models::get_auth`.
     pub async fn get_auth(
         &self,
         model: &Model,
         overrides: Option<&ModelRuntimeAuthOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
         let overrides = overrides.cloned().unwrap_or_default();
-        let resolution = self
-            .models
+        self.models
             .get_auth(
                 model,
                 Some(&AuthResolutionOverrides {
@@ -724,50 +1015,21 @@ impl ModelRuntime {
                     env: overrides.env.clone(),
                 }),
             )
-            .await?;
-        let Some(mut resolution) = resolution else {
-            return Ok(None);
-        };
-        let configured = self.configured_provider_headers(&model.provider);
-        resolution.auth.headers =
-            merge_headers(resolution.auth.headers.as_ref(), configured.as_ref());
-        Ok(Some(resolution))
+            .await
     }
 
     /// `setRuntimeApiKey` (model-runtime.ts:398-415) — non-persistent
-    /// runtime override (the `--api-key` CLI path).
+    /// runtime override (the `--api-key` CLI path). Like upstream, ends in
+    /// `refresh`: models.json is reloaded and providers rebuilt.
     pub async fn set_runtime_api_key(&self, provider_id: &str, api_key: &str) {
         self.credentials.set_runtime_api_key(provider_id, api_key);
-        {
-            let mut snapshot = write(&self.snapshot);
-            snapshot.auth.insert(
-                provider_id.to_owned(),
-                AuthCheck {
-                    source: Some("runtime API key".to_owned()),
-                    kind: AuthType::ApiKey,
-                },
-            );
-            snapshot.configured_providers.insert(provider_id.to_owned());
-            snapshot.stored_providers.insert(provider_id.to_owned());
-            let configured = snapshot.configured_providers.clone();
-            snapshot.available = snapshot
-                .all
-                .iter()
-                .filter(|model| configured.contains(&model.provider))
-                .cloned()
-                .collect();
-        }
-        if let Err(error) = self.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
-        }
+        self.refresh().await;
     }
 
     /// `removeRuntimeApiKey` (model-runtime.ts:417-420).
     pub async fn remove_runtime_api_key(&self, provider_id: &str) {
         self.credentials.remove_runtime_api_key(provider_id);
-        if let Err(error) = self.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
-        }
+        self.refresh().await;
     }
 
     /// `listCredentials` (model-runtime.ts:422-424).
@@ -916,65 +1178,111 @@ fn default_input() -> Vec<pir_ai::types::InputModality> {
     vec![pir_ai::types::InputModality::Text]
 }
 
-/// models.json model definition → runtime `Model`.
+/// models.json model definition → runtime `Model` (`modelFromJson`,
+/// provider-composer.ts:124-159). Structural errors are composition errors,
+/// like upstream throwing out of `getModels`.
 fn json_model_to_model(
     provider_id: &str,
     provider_api: &Option<String>,
     provider_base_url: Option<&str>,
+    provider_compat: Option<&ModelCompat>,
     model: ModelsJsonModel,
-) -> Model {
-    Model {
+) -> Result<Model, String> {
+    // JS `if (!api)` — empty strings are falsy too.
+    let api = model
+        .api
+        .clone()
+        .or_else(|| provider_api.clone())
+        .filter(|api| !api.is_empty());
+    let Some(api) = api else {
+        return Err(format!(
+            "Provider {provider_id}, model {}: no \"api\" specified. Set at provider or model level.",
+            model.id
+        ));
+    };
+    let base_url = model
+        .base_url
+        .clone()
+        .or_else(|| provider_base_url.map(str::to_owned))
+        .filter(|url| !url.is_empty());
+    let Some(base_url) = base_url else {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
+        ));
+    };
+    if let Some(context_window) = model.context_window {
+        if context_window <= 0.0 {
+            return Err(format!(
+                "Provider {provider_id}, model {}: invalid contextWindow",
+                model.id
+            ));
+        }
+    }
+    if let Some(max_tokens) = model.max_tokens {
+        if max_tokens <= 0.0 {
+            return Err(format!(
+                "Provider {provider_id}, model {}: invalid maxTokens",
+                model.id
+            ));
+        }
+    }
+    Ok(Model {
         name: model.name.clone().unwrap_or_else(|| model.id.clone()),
-        api: ApiKind::from(
-            model
-                .api
-                .clone()
-                .or_else(|| provider_api.clone())
-                .unwrap_or_default(),
-        ),
+        api: ApiKind::from(api),
         provider: provider_id.to_owned(),
-        base_url: model
-            .base_url
-            .clone()
-            .or_else(|| provider_base_url.map(str::to_owned))
-            .unwrap_or_default(),
+        base_url,
         reasoning: model.reasoning.unwrap_or(false),
         thinking_level_map: model.thinking_level_map.clone(),
         input: model.input.clone().unwrap_or_else(default_input),
         cost: model.cost.clone().unwrap_or_default(),
-        context_window: model.context_window.unwrap_or(0.0) as u32,
-        max_tokens: model.max_tokens.unwrap_or(0.0) as u32,
+        context_window: model.context_window.unwrap_or(128000.0) as u32,
+        max_tokens: model.max_tokens.unwrap_or(16384.0) as u32,
         headers: model
             .headers
             .as_ref()
             .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        compat: match model.compat.clone() {
+            Some(compat) => Some(merge_compat(provider_compat, &compat)),
+            None => provider_compat.cloned(),
+        },
         id: model.id,
-        compat: model.compat.clone(),
-    }
+    })
 }
 
-/// Extension `ProviderConfigModel` → runtime `Model`.
+/// Extension `ProviderConfigModel` → runtime `Model` (`applyExtension`,
+/// provider-composer.ts:201-228).
 fn config_model_to_model(
     provider_id: &str,
     provider_api: &Option<String>,
     provider_base_url: Option<&str>,
     model: ProviderConfigModel,
-) -> Model {
-    Model {
+) -> Result<Model, String> {
+    let api = model
+        .api
+        .clone()
+        .or_else(|| provider_api.clone())
+        .filter(|api| !api.is_empty());
+    let Some(api) = api else {
+        return Err(format!(
+            "Provider {provider_id}, model {}: no \"api\" specified. Set at provider or model level.",
+            model.id
+        ));
+    };
+    let base_url = model
+        .base_url
+        .clone()
+        .or_else(|| provider_base_url.map(str::to_owned))
+        .filter(|url| !url.is_empty());
+    let Some(base_url) = base_url else {
+        return Err(format!(
+            "Provider {provider_id}: \"baseUrl\" is required when defining custom models."
+        ));
+    };
+    Ok(Model {
         name: model.name.clone().unwrap_or_else(|| model.id.clone()),
-        api: ApiKind::from(
-            model
-                .api
-                .clone()
-                .or_else(|| provider_api.clone())
-                .unwrap_or_default(),
-        ),
+        api: ApiKind::from(api),
         provider: provider_id.to_owned(),
-        base_url: model
-            .base_url
-            .clone()
-            .or_else(|| provider_base_url.map(str::to_owned))
-            .unwrap_or_default(),
+        base_url,
         reasoning: model.reasoning,
         thinking_level_map: model.thinking_level_map.clone(),
         input: if model.input.is_empty() {
@@ -988,5 +1296,219 @@ fn config_model_to_model(
         headers: model.headers.clone(),
         id: model.id,
         compat: model.compat.clone(),
+    })
+}
+
+// ============================================================================
+// Tests: models.json composition layer (provider-composer.ts parity anchors)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "pir-model-runtime-test-{}-{nanos}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn runtime_with_models_json(models_json: &str) -> (TempDir, Arc<ModelRuntime>) {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(agent_dir.join("models.json"), models_json).expect("write models.json");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        })
+        .await;
+        (tmp, runtime)
+    }
+
+    /// Upstream defaults (`modelFromJson`, provider-composer.ts:154-155):
+    /// 128000 / 16384 — never 0 (a 0 window would clamp requests to
+    /// `max_tokens: 1`).
+    #[tokio::test]
+    async fn model_defaults_context_window_and_max_tokens() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "PIR_TEST_COMPOSE_DEFAULTS_KEY",
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        let model = runtime.get_model("custom", "m1").expect("model m1");
+        assert_eq!(model.context_window, 128000);
+        assert_eq!(model.max_tokens, 16384);
+    }
+
+    /// Missing api/baseUrl are composition errors (provider-composer.ts:131-137),
+    /// not silently broken models.
+    #[tokio::test]
+    async fn missing_api_or_base_url_is_a_composition_error() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "no-api": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "PIR_TEST_COMPOSE_NOAPI_KEY",
+                    "models": [{"id": "m1"}]
+                },
+                "no-base-url": {
+                    "api": "openai-completions",
+                    "apiKey": "PIR_TEST_COMPOSE_NOURL_KEY",
+                    "models": [{"id": "m1"}]
+                }
+            }}"#,
+        )
+        .await;
+        assert!(runtime.get_model("no-api", "m1").is_none());
+        assert!(runtime.get_model("no-base-url", "m1").is_none());
+        let error = runtime.get_error().expect("composition errors");
+        assert!(
+            error.contains("no \"api\" specified"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("\"baseUrl\" is required"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Explicit non-positive window/budgets are rejected
+    /// (provider-composer.ts:138-143).
+    #[tokio::test]
+    async fn non_positive_window_or_budget_is_a_composition_error() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "PIR_TEST_COMPOSE_INVALID_KEY",
+                "models": [{"id": "m1", "contextWindow": 0}]
+            }}}"#,
+        )
+        .await;
+        let error = runtime.get_error().expect("composition error");
+        assert!(
+            error.contains("invalid contextWindow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// `modelOverrides` apply over constructed models
+    /// (provider-composer.ts:100-122, 434-437).
+    #[tokio::test]
+    async fn model_overrides_apply() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "PIR_TEST_COMPOSE_OVERRIDE_KEY",
+                "models": [{"id": "m1", "contextWindow": 50000}],
+                "modelOverrides": {
+                    "m1": {
+                        "name": "Overridden",
+                        "reasoning": true,
+                        "contextWindow": 64000,
+                        "maxTokens": 4096
+                    }
+                }
+            }}}"#,
+        )
+        .await;
+        let model = runtime.get_model("custom", "m1").expect("model m1");
+        assert_eq!(model.name, "Overridden");
+        assert!(model.reasoning);
+        assert_eq!(model.context_window, 64000);
+        assert_eq!(model.max_tokens, 4096);
+    }
+
+    /// Provider-level `headers` and `authHeader` wrap auth resolution, so the
+    /// stream path (which resolves through the composed provider auth) sends
+    /// them too (`withConfiguredAuth`, provider-composer.ts:250-262).
+    #[tokio::test]
+    async fn provider_headers_and_auth_header_reach_resolved_auth() {
+        const ENV_KEY: &str = "PIR_TEST_COMPOSE_HEADERS_KEY";
+        std::env::set_var(ENV_KEY, "test-api-key");
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "PIR_TEST_COMPOSE_HEADERS_KEY",
+                "headers": {"X-Custom": "yes"},
+                "authHeader": true,
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        let model = runtime.get_model("custom", "m1").expect("model m1");
+        let auth = runtime
+            .get_auth(&model, None)
+            .await
+            .expect("get_auth")
+            .expect("auth resolved");
+        let headers = auth.auth.headers.expect("headers");
+        assert_eq!(
+            headers.get("X-Custom").and_then(|v| v.as_deref()),
+            Some("yes")
+        );
+        assert_eq!(
+            headers.get("Authorization").and_then(|v| v.as_deref()),
+            Some("Bearer test-api-key")
+        );
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// Provider enumeration order is the models.json insertion order
+    /// (upstream JS `Map` semantics), not hash order.
+    #[tokio::test]
+    async fn provider_order_is_insertion_order() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {
+                "zeta": {
+                    "baseUrl": "https://z.example.com",
+                    "api": "openai-completions",
+                    "apiKey": "PIR_TEST_COMPOSE_ORDER_KEY",
+                    "models": [{"id": "m1"}]
+                },
+                "alpha": {
+                    "baseUrl": "https://a.example.com",
+                    "api": "openai-completions",
+                    "apiKey": "PIR_TEST_COMPOSE_ORDER_KEY",
+                    "models": [{"id": "m1"}]
+                }
+            }}"#,
+        )
+        .await;
+        let order: Vec<String> = runtime
+            .get_models(None)
+            .into_iter()
+            .map(|model| model.provider)
+            .collect();
+        assert_eq!(order, vec!["zeta".to_owned(), "alpha".to_owned()]);
     }
 }

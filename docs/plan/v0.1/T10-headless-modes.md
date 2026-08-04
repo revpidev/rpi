@@ -90,7 +90,7 @@ print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同�
 
 ## 完成摘要（2026-08-04）
 
-T10 全部交付并验收通过：CLI 解析（手写解析器，args.test.ts 84 移植测试）、
+T10 全部交付并验收通过：CLI 解析（手写解析器，args.test.ts 移植测试 75 个：上游 72 + 3 补充）、
 ModelRuntime/ModelResolver、AgentSession 体系、启动管线（`app.rs`）、
 print/json 模式（`modes/print_mode.rs`）、rpc 模式（`modes/rpc.rs`，32 命令
 逐条契约 + 严格 LF 帧 + 关闭语义 + session 替换 rebind）、`pir-rpc` bin、
@@ -110,7 +110,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
 
 ## 自测清单
 
-- [x] §3.1 标志全集解析测试（`cli/args.rs` 移植 `args.test.ts` 84 测试，含组合、互斥、`@file`、扩展标志透传、diagnostics 分级）
+- [x] §3.1 标志全集解析测试（`cli/args.rs` 移植 `args.test.ts` 75 测试（上游 72 + 3 补充），含组合、互斥、`@file`、扩展标志透传、diagnostics 分级）
 - [x] 非 TTY 自动降级 print；interactive + piped stdin 降级（`app.rs::resolve_app_mode` + 冒烟验证）
 - [x] print：stdin 合并（`cli/initial_message.rs` 单测）、多条消息依次发送（`parity_headless_test::print_mode_sends_all_messages_in_order`）、最终 text 块输出（`print_mode_text_output`）、error/aborted exit 1（`print_mode_error_and_aborted_exit_1`）、信号退出码（`rpc_mode_test::rpc_mode_sigterm_exits_143` / `rpc_mode_sighup_exits_129`）
 - [x] json：header + 事件序列 fixtures 归一化 diff 一致（`parity_headless_test` 5 场景 + `print_mode_json_event_stream`）
@@ -139,7 +139,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
 - 验收日期：2026-08-04
 - 验收人：实现者自证（按 gates.md §1 单人流程）
 - G1 构建/静态检查：通过。`cargo build --workspace` ✓；`cargo clippy --workspace --all-targets -- -D warnings` ✓（0 警告）；`cargo fmt --all -- --check` ✓
-- G2 测试：通过。`cargo test --workspace` 全绿（42 个测试目标，0 失败；无 live 测试；非 live 测试全走 FauxProvider，无真实网络）。T10 新增：`rpc_mode_test.rs` 17、`agent_session_test.rs` 5、`parity_headless_test.rs` 9、`sdk_example_test.rs` 1，加上一阶段的 `cli/args.rs` 84 移植测试与 ModelRuntime/ModelResolver 单测
+- G2 测试：通过。`cargo test --workspace` 全绿（42 个测试目标，0 失败；无 live 测试；非 live 测试全走 FauxProvider，无真实网络）。T10 新增：`rpc_mode_test.rs` 17、`agent_session_test.rs` 5、`parity_headless_test.rs` 9、`sdk_example_test.rs` 1，加上一阶段的 `cli/args.rs` 75 移植测试与 ModelRuntime/ModelResolver 单测
 - G3 对拍：通过。场景清单与 diff 结果：
   - session.jsonl + events.jsonl 归一化 diff（`parity_headless_test.rs`）：`single-turn` ✓、`tool-calls` ✓、`steering-followup` ✓、`abort` ✓、`length-truncation` ✓；compaction 两场景由 `parity_compaction_test.rs`（T08）覆盖
   - 归一化口径（沿用既有先例）：`message_update`/`tool_execution_update` 整类排除（delta/分块边界非确定）；`usage`/`details` 键剥离；session 头 cwd 占位；`tool_execution_end` 连续块按 (toolCallId, toolName) 排序（并行完成序非确定）
@@ -188,7 +188,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
     | §2.3 json（header 行 + 事件全集单向流） | `print_mode_json_event_stream` + `parity_headless_test` 5 场景事件 diff |
     | §2.4 rpc（32 命令环） | 上表 32/32 |
     | §2.5 SDK | `sdk_example_test.rs`（Quick Start 等价） |
-    | §3.1 标志全集 | `cli/args.rs` 84 移植测试 + `app.rs` 冒烟矩阵 |
+    | §3.1 标志全集 | `cli/args.rs` 75 移植测试（注：`app.rs` 启动管线目前无测试锚点） |
     | §3.2 子命令 | T14 占位诊断（D-015；`app.rs::PLACEHOLDER_SUBCOMMANDS`） |
     | §3.3 环境变量（bash PIR_* 动态注入） | `agent_session_test` + bash 工具测试（session_env 动态 cell，D-015） |
 - G4 红线：通过。`external/pi` 无改动（HEAD `2efa728`）；无 JS/TS 执行能力；未读写 `~/.pi`；session 仅 JSONL；token 估算未动；新增非测试代码无 `unwrap`/`expect`（`rpc.rs` 锁中毒走 `unwrap_or_else(into_inner)` 既有模式）；日志/响应无凭据；范围排除项未引入；session 写入无锁

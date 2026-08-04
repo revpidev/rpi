@@ -21,3 +21,16 @@ pub enum PirError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
+
+impl PirError {
+    /// Raw message without the `Display` prefix — upstream surfaces
+    /// `error.message` verbatim (print/RPC error paths).
+    pub fn raw_message(&self) -> String {
+        match self {
+            PirError::Session(message)
+            | PirError::Settings(message)
+            | PirError::Resource(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
+}

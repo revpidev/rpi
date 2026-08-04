@@ -70,6 +70,9 @@ fn non_overflow_patterns() -> &'static [Regex] {
 
 /// `isContextOverflow` — three branches, see upstream docs.
 pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u64>) -> bool {
+    // Upstream guards with `if (contextWindow && ...)`: 0 is falsy in JS, so
+    // a zero/unknown window disables Cases 2-3 entirely.
+    let context_window = context_window.filter(|window| *window > 0);
     // Case 1: error message patterns.
     if message.stop_reason == StopReason::Error {
         if let Some(error_message) = &message.error_message {
@@ -188,6 +191,9 @@ mod tests {
         assert!(is_context_overflow(&msg, Some(100)));
         assert!(!is_context_overflow(&msg, Some(200)));
         assert!(!is_context_overflow(&msg, None));
+        // JS `if (contextWindow && ...)`: 0 is falsy — a zero/unknown window
+        // disables the usage-based cases entirely.
+        assert!(!is_context_overflow(&msg, Some(0)));
     }
 
     #[test]

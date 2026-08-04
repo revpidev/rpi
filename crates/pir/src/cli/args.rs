@@ -337,6 +337,16 @@ pub fn parse_args(args: &[String]) -> Args {
         i += 1;
     }
 
+    // JS truthiness at every use site (`if (parsed.fork)` etc.,
+    // main.ts:274/297/705): an empty-string value behaves as if the flag was
+    // never passed — scripts interpolating empty env vars must not fork /
+    // resume / set an empty key.
+    for slot in [&mut result.api_key, &mut result.session, &mut result.fork] {
+        if slot.as_deref() == Some("") {
+            *slot = None;
+        }
+    }
+
     result
 }
 
@@ -379,13 +389,10 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
                     .description
                     .clone()
                     .unwrap_or_else(|| format!("Registered by {}", flag.extension_path));
-                format!(
-                    "  --{}{:<width$}{}",
-                    flag.name,
-                    value,
-                    description,
-                    width = 30 - flag.name.len().min(28)
-                )
+                // Upstream pads the whole `  --name<value>` to column 30
+                // (args.ts:219).
+                let left = format!("  --{}{}", flag.name, value);
+                format!("{left:<30}{description}")
             })
             .collect();
         format!(
@@ -786,6 +793,18 @@ mod tests {
         let result = args(&["--fork", "1234abcd"]);
         assert_eq!(result.fork.as_deref(), Some("1234abcd"));
         assert!(result.messages.is_empty());
+    }
+
+    #[test]
+    fn test_empty_string_values_are_falsy() {
+        // JS truthiness: `--fork ""` / `--session ""` / `--api-key ""`
+        // behave as if the flag was never passed (main.ts:206/274/297/705).
+        let result = args(&["--fork", ""]);
+        assert_eq!(result.fork, None);
+        let result = args(&["--session", ""]);
+        assert_eq!(result.session, None);
+        let result = args(&["--api-key", ""]);
+        assert_eq!(result.api_key, None);
     }
 
     #[test]

@@ -166,13 +166,17 @@ pub async fn create_agent_session(
         }
     };
 
-    let session_manager = options.session_manager.unwrap_or_else(|| {
-        let session_dir = get_default_session_dir_path(&cwd, Some(&agent_dir));
-        Arc::new(Mutex::new(
-            SessionManager::create(&cwd, Some(&session_dir), NewSessionOptions::default())
-                .expect("SessionManager::create on a writable session dir"),
-        ))
-    });
+    let session_manager = match options.session_manager {
+        Some(session_manager) => session_manager,
+        None => {
+            let session_dir = get_default_session_dir_path(&cwd, Some(&agent_dir));
+            Arc::new(Mutex::new(SessionManager::create(
+                &cwd,
+                Some(&session_dir),
+                NewSessionOptions::default(),
+            )?))
+        }
+    };
 
     // Check if the session has existing data to restore (sdk.ts:187-190).
     let (existing_messages, existing_model, existing_thinking_level, has_thinking_entry) = {
@@ -194,8 +198,10 @@ pub async fn create_agent_session(
     let mut model = options.model;
     let mut model_fallback_message: Option<String> = None;
 
-    // If the session has data, try to restore the model from it
-    // (sdk.ts:196-204).
+    // If the session has data, try to restore the model from it. The whole
+    // branch requires a saved model entry (sdk.ts:196 `existingSession.model`)
+    // — a session with messages but no model_change entry falls through to
+    // findInitialModel, like upstream.
     if model.is_none() && has_existing_session {
         if let Some(saved) = &existing_model {
             if let Some(restored) = model_runtime.get_model(&saved.provider, &saved.model_id) {
@@ -203,13 +209,12 @@ pub async fn create_agent_session(
                     model = Some(restored);
                 }
             }
-        }
-        if model.is_none() {
-            let saved = existing_model.clone().expect("checked above");
-            model_fallback_message = Some(format!(
-                "Could not restore model {}/{}",
-                saved.provider, saved.model_id
-            ));
+            if model.is_none() {
+                model_fallback_message = Some(format!(
+                    "Could not restore model {}/{}",
+                    saved.provider, saved.model_id
+                ));
+            }
         }
     }
 
