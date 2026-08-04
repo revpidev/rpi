@@ -21,9 +21,9 @@ pub mod vt;
 pub use diff::{diff_event_sequence, diff_events_normalized, diff_jsonl, diff_text, DiffFailure};
 pub use error::TestSupportError;
 pub use faux::{
-    faux_assistant_message, faux_text, faux_thinking, faux_tool_call, FauxAssistantOptions,
-    FauxContent, FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
-    FauxState,
+    faux_assistant_message, faux_text, faux_thinking, faux_tool_call, FauxAiProvider,
+    FauxAssistantOptions, FauxContent, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    FauxResponseStep, FauxState,
 };
 pub use normalize::Normalizer;
 pub use vt::VirtualTerminal;

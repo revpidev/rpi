@@ -39,7 +39,11 @@ pub struct ToolContext {
     /// Working directory for resolving relative paths.
     pub cwd: PathBuf,
     /// Optional session environment (model, session id, etc.).
-    pub session_env: Option<SessionEnv>,
+    ///
+    /// Shared cell (T10): the owning `AgentSession` updates the contents on
+    /// model/thinking/session-file changes so the bash tool resolves `PIR_*`
+    /// per command spawn (requirements §3.3: 模型切换即时生效).
+    pub session_env: Option<std::sync::Arc<std::sync::RwLock<SessionEnv>>>,
 }
 
 /// Session-level environment metadata, surfaced as `PIR_*` env vars in bash.

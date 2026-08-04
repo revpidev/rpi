@@ -1,0 +1,1024 @@
+//! Application startup pipeline (design §6.1).
+//!
+//! Port of `packages/coding-agent/src/main.ts` @ pi 0.82.1 (2efa728).
+//!
+//! T10 boundaries (task file §Out):
+//! - Subcommand dispatch (install/remove/uninstall/list/update/config) is a
+//!   placeholder: the commands land in T14 and currently exit 1 with a
+//!   diagnostic (upstream would run them).
+//! - Interactive mode and the `--resume` session picker are T12; first-time
+//!   setup never runs in headless modes.
+//! - `--export` parses but reports "not available yet (T14)".
+//! - Migrations (`migrations.ts`) are permanently out of scope (ADR-0003 §3).
+//! - HTTP proxy dispatcher configuration is T13; reqwest's built-in env
+//!   proxy support covers `HTTP_PROXY`/`HTTPS_PROXY`.
+
+use std::collections::HashMap;
+use std::io::{IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use pir_agent::types::ThinkingLevel;
+
+use crate::cli::args::{parse_args, print_help, Args, Mode};
+use crate::cli::diagnostics::{has_error, DiagnosticLevel};
+use crate::cli::file_processor::{process_file_arguments, FileProcessError};
+use crate::cli::initial_message::build_initial_message;
+use crate::cli::list_models::list_models;
+use crate::config::{
+    get_agent_dir, resolve_session_dir_from_env, ENV_OFFLINE, ENV_SKIP_VERSION_CHECK, VERSION,
+};
+use crate::core::agent_session_runtime::{
+    create_agent_session_runtime, CreateAgentSessionRuntimeResult, CreateRuntimeOptions,
+};
+use crate::core::agent_session_services::AgentSessionRuntimeDiagnostic;
+use crate::core::agent_session_services::{
+    create_agent_session_services, CreateAgentSessionServicesOptions,
+};
+use crate::core::auth_guidance::format_no_models_available_message;
+use crate::core::extensions::{SessionStartEvent, SessionStartReason};
+use crate::core::model_resolver::{
+    resolve_cli_model, resolve_model_scope_with_diagnostics, ResolveCliModelOptions, ScopedModel,
+};
+use crate::core::model_runtime::ModelRuntime;
+use crate::core::session_cwd::{format_missing_session_cwd_error, get_missing_session_cwd_issue};
+use crate::core::session_manager::{assert_valid_session_id, NewSessionOptions, SessionManager};
+use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
+use crate::core::trust_manager::{
+    default_project_trust_from_settings, has_trust_requiring_project_resources,
+    resolve_project_trusted, ProjectTrustStore,
+};
+use crate::error::PirError;
+use crate::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
+use crate::modes::rpc::run_rpc_mode;
+use crate::sdk::{create_agent_session, CreateAgentSessionOptions, NoTools};
+use crate::tools::path_utils::resolve_path;
+
+/// Upstream `EXTENSION_LOAD_FAILURE_HINT` (main.ts:52).
+const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"pir -ne\".";
+
+/// Package/config subcommands (T14; main.ts:492-507 dispatches them before
+/// `parseArgs`).
+const PLACEHOLDER_SUBCOMMANDS: [&str; 6] =
+    ["install", "remove", "uninstall", "list", "update", "config"];
+
+fn is_truthy_env_flag(value: Option<&str>) -> bool {
+    match value {
+        None => false,
+        Some(value) => {
+            value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+        }
+    }
+}
+
+/// `resolveAppMode` (main.ts:100-111).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Interactive,
+    Print,
+    Json,
+    Rpc,
+}
+
+fn resolve_app_mode(parsed: &Args, stdin_is_tty: bool, stdout_is_tty: bool) -> AppMode {
+    if parsed.mode == Some(Mode::Rpc) {
+        return AppMode::Rpc;
+    }
+    if parsed.mode == Some(Mode::Json) {
+        return AppMode::Json;
+    }
+    if parsed.print || !stdin_is_tty || !stdout_is_tty {
+        return AppMode::Print;
+    }
+    AppMode::Interactive
+}
+
+/// `collectSettingsDiagnostics` (main.ts:77-85).
+fn collect_settings_diagnostics(
+    settings_manager: &mut SettingsManager,
+    context: &str,
+) -> Vec<AgentSessionRuntimeDiagnostic> {
+    settings_manager
+        .drain_errors()
+        .into_iter()
+        .map(|error| AgentSessionRuntimeDiagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "({context}, {} settings) {}",
+                error.scope.as_str(),
+                error.error
+            ),
+        })
+        .collect()
+}
+
+/// `reportDiagnostics` (main.ts:87-93).
+fn report_diagnostics(diagnostics: &[AgentSessionRuntimeDiagnostic], err: &mut dyn Write) {
+    for diagnostic in diagnostics {
+        let prefix = match diagnostic.level {
+            DiagnosticLevel::Error => "Error: ",
+            DiagnosticLevel::Warning => "Warning: ",
+            DiagnosticLevel::Info => "",
+        };
+        let _ = writeln!(err, "{prefix}{}", diagnostic.message);
+    }
+}
+
+/// `readPipedStdin` (main.ts:59-75).
+fn read_piped_stdin() -> Option<String> {
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut data = String::new();
+    std::io::stdin().read_to_string(&mut data).ok()?;
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// `promptConfirm` (main.ts:192-203).
+fn prompt_confirm(message: &str, out: &mut dyn Write) -> bool {
+    let _ = write!(out, "{message} [y/N] ");
+    let _ = out.flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    let answer = answer.trim().to_lowercase();
+    answer == "y" || answer == "yes"
+}
+
+/// `ResolvedSession` (main.ts:143-147).
+enum ResolvedSession {
+    Path(PathBuf),
+    Local(PathBuf),
+    Global { path: PathBuf, cwd: String },
+    NotFound(String),
+}
+
+/// `findLocalSessionByExactId` (main.ts:153-161).
+fn find_local_session_by_exact_id(
+    session_id: &str,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    SessionManager::list(cwd, session_dir)
+        .into_iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.path)
+}
+
+/// `resolveSessionPath` (main.ts:163-189).
+fn resolve_session_path(
+    session_arg: &str,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+) -> ResolvedSession {
+    // If it looks like a file path, resolve it directly.
+    if session_arg.contains('/') || session_arg.contains('\\') || session_arg.ends_with(".jsonl") {
+        return ResolvedSession::Path(resolve_path(session_arg, cwd));
+    }
+
+    // Current project: exact id, then id prefix.
+    let local_sessions = SessionManager::list(cwd, session_dir);
+    let local_match = local_sessions
+        .iter()
+        .find(|s| s.id == session_arg)
+        .or_else(|| {
+            local_sessions
+                .iter()
+                .find(|s| s.id.starts_with(session_arg))
+        });
+    if let Some(local_match) = local_match {
+        return ResolvedSession::Local(local_match.path.clone());
+    }
+
+    // Global search across all projects.
+    let all_sessions = SessionManager::list_all(session_dir);
+    let global_match = all_sessions
+        .iter()
+        .find(|s| s.id == session_arg)
+        .or_else(|| all_sessions.iter().find(|s| s.id.starts_with(session_arg)));
+    if let Some(global_match) = global_match {
+        return ResolvedSession::Global {
+            path: global_match.path.clone(),
+            cwd: global_match.cwd.clone(),
+        };
+    }
+
+    ResolvedSession::NotFound(session_arg.to_owned())
+}
+
+/// `validateForkFlags` (main.ts:205-219).
+fn validate_fork_flags(parsed: &Args) -> Result<(), String> {
+    if parsed.fork.is_none() {
+        return Ok(());
+    }
+    let mut conflicting: Vec<&str> = Vec::new();
+    if parsed.session.is_some() {
+        conflicting.push("--session");
+    }
+    if parsed.continue_ {
+        conflicting.push("--continue");
+    }
+    if parsed.resume {
+        conflicting.push("--resume");
+    }
+    if parsed.no_session {
+        conflicting.push("--no-session");
+    }
+    if conflicting.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "--fork cannot be combined with {}",
+            conflicting.join(", ")
+        ))
+    }
+}
+
+/// `validateSessionIdFlags` (main.ts:221-242).
+fn validate_session_id_flags(parsed: &Args) -> Result<(), String> {
+    let Some(session_id) = &parsed.session_id else {
+        return Ok(());
+    };
+    let mut conflicting: Vec<&str> = Vec::new();
+    if parsed.session.is_some() {
+        conflicting.push("--session");
+    }
+    if parsed.continue_ {
+        conflicting.push("--continue");
+    }
+    if parsed.resume {
+        conflicting.push("--resume");
+    }
+    if !conflicting.is_empty() {
+        return Err(format!(
+            "--session-id cannot be combined with {}",
+            conflicting.join(", ")
+        ));
+    }
+    assert_valid_session_id(session_id).map_err(|error| match error {
+        // User-facing message without the `PirError` Display prefix
+        // (main.ts:237-240 prints `error.message` raw).
+        PirError::Session(message) => message,
+        other => other.to_string(),
+    })
+}
+
+/// `createSessionManager` (main.ts:264-355).
+fn create_session_manager(
+    parsed: &Args,
+    cwd: &Path,
+    session_dir: Option<&Path>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<SessionManager, String> {
+    if parsed.no_session || parsed.help || parsed.list_models.is_some() {
+        return SessionManager::in_memory(
+            Some(cwd),
+            NewSessionOptions {
+                id: parsed.session_id.clone(),
+                parent_session: None,
+            },
+        )
+        .map_err(|e| e.to_string());
+    }
+
+    if let Some(fork_arg) = &parsed.fork {
+        if let Some(session_id) = &parsed.session_id {
+            if find_local_session_by_exact_id(session_id, cwd, session_dir).is_some() {
+                return Err(format!("Session already exists with id '{session_id}'"));
+            }
+        }
+
+        return match resolve_session_path(fork_arg, cwd, session_dir) {
+            ResolvedSession::Path(path) | ResolvedSession::Local(path) => {
+                SessionManager::fork_from(
+                    &path,
+                    cwd,
+                    session_dir,
+                    crate::core::session_manager::ForkOptions {
+                        id: parsed.session_id.clone(),
+                        entry_id: None,
+                        position: None,
+                    },
+                )
+                .map_err(|e| e.to_string())
+            }
+            ResolvedSession::Global { path, .. } => SessionManager::fork_from(
+                &path,
+                cwd,
+                session_dir,
+                crate::core::session_manager::ForkOptions {
+                    id: parsed.session_id.clone(),
+                    entry_id: None,
+                    position: None,
+                },
+            )
+            .map_err(|e| e.to_string()),
+            ResolvedSession::NotFound(arg) => Err(format!("No session found matching '{arg}'")),
+        };
+    }
+
+    if let Some(session_arg) = &parsed.session {
+        return match resolve_session_path(session_arg, cwd, session_dir) {
+            ResolvedSession::Path(path) | ResolvedSession::Local(path) => {
+                SessionManager::open(&path, session_dir, None).map_err(|e| e.to_string())
+            }
+            ResolvedSession::Global {
+                path,
+                cwd: other_cwd,
+            } => {
+                let _ = writeln!(err, "Session found in different project: {other_cwd}");
+                if !prompt_confirm("Fork this session into current directory?", out) {
+                    let _ = writeln!(out, "Aborted.");
+                    std::process::exit(0);
+                }
+                SessionManager::fork_from(
+                    &path,
+                    cwd,
+                    session_dir,
+                    crate::core::session_manager::ForkOptions {
+                        id: None,
+                        entry_id: None,
+                        position: None,
+                    },
+                )
+                .map_err(|e| e.to_string())
+            }
+            ResolvedSession::NotFound(arg) => Err(format!("No session found matching '{arg}'")),
+        };
+    }
+
+    if parsed.resume {
+        // selectSession is a TUI picker (T12).
+        return Err("--resume session picker is not available yet (T12)".to_owned());
+    }
+
+    if parsed.continue_ {
+        return SessionManager::continue_recent(cwd, session_dir).map_err(|e| e.to_string());
+    }
+
+    if let Some(session_id) = &parsed.session_id {
+        if let Some(existing) = find_local_session_by_exact_id(session_id, cwd, session_dir) {
+            return SessionManager::open(&existing, session_dir, None).map_err(|e| e.to_string());
+        }
+        let _ = writeln!(
+            err,
+            "Warning: No project session found with id '{session_id}'; creating a new session with that id."
+        );
+    }
+
+    let dir = match session_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => crate::config::get_default_session_dir(cwd).map_err(|e| e.to_string())?,
+    };
+    SessionManager::create(
+        cwd,
+        Some(&dir),
+        NewSessionOptions {
+            id: parsed.session_id.clone(),
+            parent_session: None,
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// `resolveCliPaths` (main.ts:455-457).
+fn resolve_cli_paths(cwd: &Path, paths: &Option<Vec<String>>) -> Option<Vec<String>> {
+    paths.as_ref().map(|paths| {
+        paths
+            .iter()
+            .map(|value| {
+                if is_local_path(value) {
+                    resolve_path(value, cwd).to_string_lossy().into_owned()
+                } else {
+                    value.clone()
+                }
+            })
+            .collect()
+    })
+}
+
+/// `isLocalPath` (utils/paths.ts:41-56): bare names, relative paths and
+/// `file:` URLs are local; package sources and remote URLs are not.
+fn is_local_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !(trimmed.starts_with("npm:")
+        || trimmed.starts_with("git:")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("ssh://"))
+}
+
+/// `buildSessionOptions` (main.ts:357-453).
+struct SessionOptionsOut {
+    model: Option<pir_ai::types::Model>,
+    thinking_level: Option<ThinkingLevel>,
+    scoped_models: Vec<ScopedModel>,
+    tools: Option<Vec<String>>,
+    exclude_tools: Option<Vec<String>>,
+    no_tools: Option<NoTools>,
+    cli_thinking_from_model: bool,
+    diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
+}
+
+fn build_session_options(
+    parsed: &Args,
+    scoped_models: &[ScopedModel],
+    has_existing_session: bool,
+    model_runtime: &ModelRuntime,
+    settings_manager: &SettingsManager,
+) -> SessionOptionsOut {
+    let mut out = SessionOptionsOut {
+        model: None,
+        thinking_level: None,
+        scoped_models: Vec::new(),
+        tools: None,
+        exclude_tools: None,
+        no_tools: None,
+        cli_thinking_from_model: false,
+        diagnostics: Vec::new(),
+    };
+
+    // Model from CLI (main.ts:372-397).
+    if let Some(cli_model) = &parsed.model {
+        let resolved = resolve_cli_model(ResolveCliModelOptions {
+            cli_provider: parsed.provider.as_deref(),
+            cli_model: Some(cli_model),
+            cli_thinking: parsed.thinking,
+            model_runtime,
+        });
+        if let Some(warning) = resolved.warning {
+            out.diagnostics.push(AgentSessionRuntimeDiagnostic {
+                level: DiagnosticLevel::Warning,
+                message: warning,
+            });
+        }
+        if let Some(error) = resolved.error {
+            out.diagnostics.push(AgentSessionRuntimeDiagnostic {
+                level: DiagnosticLevel::Error,
+                message: error,
+            });
+        }
+        if let Some(model) = resolved.model {
+            // `--model <pattern>:<thinking>` shorthand; explicit --thinking
+            // still takes precedence (applied below).
+            if parsed.thinking.is_none() && resolved.thinking_level.is_some() {
+                out.thinking_level = resolved.thinking_level;
+                out.cli_thinking_from_model = true;
+            }
+            out.model = Some(model);
+        }
+    }
+
+    if out.model.is_none() && !scoped_models.is_empty() && !has_existing_session {
+        // Saved default wins when it is inside the scope (main.ts:399-419).
+        let saved_model = match (
+            settings_manager.get_default_provider(),
+            settings_manager.get_default_model(),
+        ) {
+            (Some(provider), Some(model_id)) => model_runtime.get_model(&provider, &model_id),
+            _ => None,
+        };
+        let saved_in_scope = saved_model.and_then(|saved| {
+            scoped_models
+                .iter()
+                .find(|sm| pir_ai::models::models_are_equal(Some(&sm.model), Some(&saved)))
+        });
+        match saved_in_scope {
+            Some(scoped) => {
+                out.model = Some(scoped.model.clone());
+                if parsed.thinking.is_none() && scoped.thinking_level.is_some() {
+                    out.thinking_level = scoped.thinking_level;
+                }
+            }
+            None => {
+                let first = &scoped_models[0];
+                out.model = Some(first.model.clone());
+                if parsed.thinking.is_none() && first.thinking_level.is_some() {
+                    out.thinking_level = first.thinking_level;
+                }
+            }
+        }
+    }
+
+    // Explicit --thinking takes precedence (main.ts:421-424).
+    if parsed.thinking.is_some() {
+        out.thinking_level = parsed.thinking;
+    }
+
+    // Scoped models for cycling (main.ts:426-434).
+    if !scoped_models.is_empty() {
+        out.scoped_models = scoped_models.to_vec();
+    }
+
+    // Tools (main.ts:439-450).
+    if parsed.no_tools {
+        out.no_tools = Some(NoTools::All);
+    } else if parsed.no_builtin_tools {
+        out.no_tools = Some(NoTools::Builtin);
+    }
+    out.tools = parsed.tools.clone();
+    out.exclude_tools = parsed.exclude_tools.clone();
+
+    out
+}
+
+/// Prepare the initial message (main.ts:121-140).
+async fn prepare_initial_message(
+    parsed: &mut Args,
+    auto_resize_images: bool,
+    stdin_content: Option<&str>,
+) -> Result<(Option<String>, Option<Vec<pir_ai::types::ImageContent>>), FileProcessError> {
+    if parsed.file_args.is_empty() {
+        let result = build_initial_message(&mut parsed.messages, None, None, stdin_content);
+        return Ok((result.initial_message, result.initial_images));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let processed = process_file_arguments(&parsed.file_args, &cwd, auto_resize_images).await?;
+    let result = build_initial_message(
+        &mut parsed.messages,
+        Some(&processed.text),
+        Some(processed.images),
+        stdin_content,
+    );
+    Ok((result.initial_message, result.initial_images))
+}
+
+/// `main` (main.ts:473-864). Returns the process exit code.
+pub async fn run_app(args: Vec<String>) -> i32 {
+    // Note: `Stdout`/`Stderr` values lock internally per write. Holding a
+    // process-global `StdoutLock`/`StderrLock` across `.await` deadlocks any
+    // spawned task that writes to stdout/stderr (RPC writer/command tasks).
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+
+    // Offline mode (main.ts:476-480).
+    let offline_mode = args.iter().any(|a| a == "--offline")
+        || is_truthy_env_flag(std::env::var(ENV_OFFLINE).ok().as_deref());
+    if offline_mode {
+        // SAFETY-FREE note: single-threaded startup phase; no readers race.
+        std::env::set_var(ENV_OFFLINE, "1");
+        std::env::set_var(ENV_SKIP_VERSION_CHECK, "1");
+    }
+
+    // Subcommand dispatch placeholder (main.ts:492-507; T14).
+    if let Some(first) = args.first() {
+        if PLACEHOLDER_SUBCOMMANDS.contains(&first.as_str()) {
+            let _ = writeln!(err, "Error: pir {first} is not available yet (T14)");
+            return 1;
+        }
+    }
+
+    let parsed = parse_args(&args);
+    if !parsed.diagnostics.is_empty() {
+        for diagnostic in &parsed.diagnostics {
+            let prefix = match diagnostic.level {
+                DiagnosticLevel::Error => "Error",
+                _ => "Warning",
+            };
+            let _ = writeln!(err, "{prefix}: {diagnostic}");
+        }
+        if has_error(&parsed.diagnostics) {
+            return 1;
+        }
+    }
+
+    if parsed.version {
+        let _ = writeln!(out, "{VERSION}");
+        return 0;
+    }
+
+    if parsed.export.is_some() {
+        let _ = writeln!(err, "Error: --export is not available yet (T14)");
+        return 1;
+    }
+
+    let mut app_mode = resolve_app_mode(
+        &parsed,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    );
+
+    if parsed.mode == Some(Mode::Rpc) && !parsed.file_args.is_empty() {
+        let _ = writeln!(err, "Error: @file arguments are not supported in RPC mode");
+        return 1;
+    }
+
+    for validation in [
+        validate_fork_flags(&parsed),
+        validate_session_id_flags(&parsed),
+    ] {
+        if let Err(message) = validation {
+            let _ = writeln!(err, "Error: {message}");
+            return 1;
+        }
+    }
+
+    // Migrations are permanently out of scope (ADR-0003 §3).
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let agent_dir = get_agent_dir();
+    let mut startup_settings_manager = SettingsManager::create(
+        &cwd,
+        Some(&agent_dir),
+        SettingsManagerCreateOptions::default(),
+    );
+    report_diagnostics(
+        &collect_settings_diagnostics(&mut startup_settings_manager, "startup session lookup"),
+        &mut err,
+    );
+
+    // First-time setup is interactive-only (T12); headless modes skip it.
+
+    let settings_session_dir = startup_settings_manager.get_session_dir();
+    let session_dir = resolve_session_dir_from_env(
+        parsed.session_dir.as_deref(),
+        settings_session_dir.as_deref(),
+    );
+    let mut session_manager =
+        match create_session_manager(&parsed, &cwd, session_dir.as_deref(), &mut out, &mut err) {
+            Ok(manager) => manager,
+            Err(message) => {
+                let _ = writeln!(err, "Error: {message}");
+                return 1;
+            }
+        };
+
+    // Header cwd missing (main.ts:579-591): interactive prompts (T12);
+    // headless errors out.
+    if let Some(issue) = get_missing_session_cwd_issue(&session_manager, &cwd) {
+        if app_mode == AppMode::Interactive {
+            // T12 prompt path; unreachable until interactive lands.
+            let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
+            return 1;
+        }
+        let _ = writeln!(err, "{}", format_missing_session_cwd_error(&issue));
+        return 1;
+    }
+
+    if let Some(name) = &parsed.name {
+        let name = name.trim();
+        if name.is_empty() {
+            let _ = writeln!(err, "Error: --name requires a non-empty value");
+            return 1;
+        }
+        if let Err(error) = session_manager.append_session_info(name) {
+            let _ = writeln!(err, "Error: {error}");
+            return 1;
+        }
+    }
+
+    let parsed = Arc::new(parsed);
+    let trust_store = Arc::new(ProjectTrustStore::new(&agent_dir));
+    let trust_by_cwd: Arc<Mutex<HashMap<PathBuf, bool>>> = Arc::new(Mutex::new(HashMap::new()));
+    let default_project_trust =
+        default_project_trust_from_settings(startup_settings_manager.get_default_project_trust());
+    let resolved_extension_paths = resolve_cli_paths(&cwd, &parsed.extensions);
+    let resolved_skill_paths = resolve_cli_paths(&cwd, &parsed.skills);
+    let resolved_prompt_template_paths = resolve_cli_paths(&cwd, &parsed.prompt_templates);
+    let resolved_theme_paths = resolve_cli_paths(&cwd, &parsed.themes);
+
+    // `createRuntime` factory (main.ts:615-739).
+    let create_runtime = {
+        let parsed = parsed.clone();
+        let trust_store = trust_store.clone();
+        let trust_by_cwd = trust_by_cwd.clone();
+        Arc::new(move |options: CreateRuntimeOptions| {
+            let parsed = parsed.clone();
+            let trust_store = trust_store.clone();
+            let trust_by_cwd = trust_by_cwd.clone();
+            let resolved_extension_paths = resolved_extension_paths.clone();
+            let resolved_skill_paths = resolved_skill_paths.clone();
+            let resolved_prompt_template_paths = resolved_prompt_template_paths.clone();
+            let resolved_theme_paths = resolved_theme_paths.clone();
+            Box::pin(async move {
+                let cwd = options.cwd.clone();
+                let has_trust_requiring = has_trust_requiring_project_resources(&cwd);
+                let cached = trust_by_cwd
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&cwd)
+                    .copied();
+                let should_resolve_trust = parsed.project_trust_override.is_none()
+                    && cached.is_none()
+                    && has_trust_requiring;
+                let project_trusted = if should_resolve_trust {
+                    false
+                } else {
+                    cached
+                        .or(parsed.project_trust_override)
+                        .unwrap_or(!has_trust_requiring || trust_store.get(&cwd) == Some(true))
+                };
+
+                let runtime_settings_manager = SettingsManager::create(
+                    &cwd,
+                    Some(&options.agent_dir),
+                    SettingsManagerCreateOptions { project_trusted },
+                );
+                let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+                    cwd: cwd.clone(),
+                    agent_dir: Some(options.agent_dir.clone()),
+                    settings_manager: Some(runtime_settings_manager),
+                    model_runtime: None,
+                    extension_flag_values: parsed.unknown_flags.clone(),
+                    resource_loader_options: Some({
+                        let parsed = parsed.clone();
+                        Box::new(move |loader_options| {
+                            loader_options.additional_extension_paths =
+                                resolved_extension_paths.unwrap_or_default();
+                            loader_options.additional_skill_paths =
+                                resolved_skill_paths.unwrap_or_default();
+                            loader_options.additional_prompt_template_paths =
+                                resolved_prompt_template_paths.unwrap_or_default();
+                            loader_options.additional_theme_paths =
+                                resolved_theme_paths.unwrap_or_default();
+                            loader_options.no_extensions = parsed.no_extensions;
+                            loader_options.no_skills = parsed.no_skills;
+                            loader_options.no_prompt_templates = parsed.no_prompt_templates;
+                            loader_options.no_themes = parsed.no_themes;
+                            loader_options.no_context_files = parsed.no_context_files;
+                            loader_options.system_prompt = parsed.system_prompt.clone();
+                            loader_options.append_system_prompt =
+                                parsed.append_system_prompt.clone();
+                        })
+                    }),
+                })
+                .await?;
+
+                // Two-phase trust resolution (main.ts:626-662 +
+                // resourceLoaderReloadOptions.resolveProjectTrust).
+                if should_resolve_trust {
+                    let trusted = resolve_project_trusted(
+                        &cwd,
+                        &trust_store,
+                        parsed.project_trust_override,
+                        default_project_trust,
+                    );
+                    trust_by_cwd
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(cwd.clone(), trusted);
+                    if trusted {
+                        let mut loader = services
+                            .resource_loader
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        loader.settings_manager_mut().set_project_trusted(true);
+                        loader.set_project_trusted(true);
+                        loader.reload();
+                    }
+                }
+
+                let mut diagnostics: Vec<AgentSessionRuntimeDiagnostic> = Vec::new();
+                diagnostics.extend(services.diagnostics.clone());
+                {
+                    let mut loader = services
+                        .resource_loader
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    diagnostics.extend(collect_settings_diagnostics(
+                        loader.settings_manager_mut(),
+                        "runtime creation",
+                    ));
+                    for error in &loader.resources().extensions.errors {
+                        diagnostics.push(AgentSessionRuntimeDiagnostic {
+                            level: DiagnosticLevel::Error,
+                            message: format!(
+                                "Failed to load extension \"{}\": {}",
+                                error.path.display(),
+                                error.error
+                            ),
+                        });
+                    }
+                }
+
+                let model_patterns = parsed.models.clone().or_else(|| {
+                    let loader = services
+                        .resource_loader
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    loader.settings_manager().get_enabled_models()
+                });
+                let scoped_models = match model_patterns {
+                    Some(patterns) if !patterns.is_empty() => {
+                        let result = resolve_model_scope_with_diagnostics(
+                            &patterns,
+                            &services.model_runtime,
+                        )
+                        .await;
+                        // Upstream prints these immediately via console.warn
+                        // (model-resolver.ts:355-361).
+                        for diagnostic in &result.diagnostics {
+                            eprintln!("Warning: {}", diagnostic.message);
+                        }
+                        result.scoped_models
+                    }
+                    _ => Vec::new(),
+                };
+
+                let has_existing_session = !options
+                    .session_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .build_session_context()
+                    .messages
+                    .is_empty();
+                let session_options = {
+                    let loader = services
+                        .resource_loader
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    build_session_options(
+                        &parsed,
+                        &scoped_models,
+                        has_existing_session,
+                        &services.model_runtime,
+                        loader.settings_manager(),
+                    )
+                };
+                diagnostics.extend(session_options.diagnostics);
+
+                // --api-key: non-persistent runtime override
+                // (main.ts:705-715).
+                if let Some(api_key) = &parsed.api_key {
+                    match &session_options.model {
+                        None => diagnostics.push(AgentSessionRuntimeDiagnostic {
+                            level: DiagnosticLevel::Error,
+                            message: "--api-key requires a model to be specified via --model, --provider/--model, or --models".to_owned(),
+                        }),
+                        Some(model) => {
+                            services
+                                .model_runtime
+                                .set_runtime_api_key(&model.provider, api_key)
+                                .await;
+                            let _ = services.model_runtime.get_available(None).await;
+                        }
+                    }
+                }
+
+                let services_for_options = services.clone();
+                let created = create_agent_session(CreateAgentSessionOptions {
+                    cwd: Some(cwd.clone()),
+                    agent_dir: Some(options.agent_dir.clone()),
+                    model_runtime: Some(services.model_runtime.clone()),
+                    model: session_options.model,
+                    thinking_level: session_options.thinking_level,
+                    scoped_models: session_options.scoped_models,
+                    no_tools: session_options.no_tools,
+                    tools: session_options.tools,
+                    exclude_tools: session_options.exclude_tools,
+                    custom_tools: Vec::new(),
+                    services: Some(services_for_options),
+                    session_manager: Some(options.session_manager),
+                    session_start_event: options.session_start_event.or(Some(SessionStartEvent {
+                        reason: SessionStartReason::Startup,
+                        previous_session_file: None,
+                    })),
+                })
+                .await?;
+
+                // CLI thinking override (main.ts:729-732).
+                let cli_thinking_override =
+                    parsed.thinking.is_some() || session_options.cli_thinking_from_model;
+                if created.session.model().is_some() && cli_thinking_override {
+                    let level = created.session.thinking_level();
+                    created.session.set_thinking_level(level);
+                }
+
+                Ok(CreateAgentSessionRuntimeResult {
+                    session: created.session,
+                    services: created.services.unwrap_or(services),
+                    diagnostics,
+                    model_fallback_message: created.model_fallback_message,
+                })
+            })
+                as futures::future::BoxFuture<
+                    'static,
+                    Result<CreateAgentSessionRuntimeResult, PirError>,
+                >
+        })
+    };
+
+    let runtime_result = create_agent_session_runtime(
+        create_runtime,
+        CreateRuntimeOptions {
+            cwd: session_manager.get_cwd().to_path_buf(),
+            agent_dir: agent_dir.clone(),
+            session_manager: Arc::new(Mutex::new(session_manager)),
+            session_start_event: None,
+        },
+    )
+    .await;
+    let mut runtime = match runtime_result {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(err, "Error: {error}");
+            return 1;
+        }
+    };
+
+    if parsed.help {
+        // Extension flags section is empty until T15 (main.ts:752-758).
+        let _ = write!(out, "{}", print_help(&[], std::io::stdout().is_terminal()));
+        return 0;
+    }
+
+    if let Some(list_models_flag) = &parsed.list_models {
+        let search = match list_models_flag {
+            crate::cli::args::ListModels::All => None,
+            crate::cli::args::ListModels::Search(pattern) => Some(pattern.as_str()),
+        };
+        let (warning, text) = list_models(runtime.services().model_runtime.as_ref(), search).await;
+        if let Some(warning) = warning {
+            let _ = writeln!(err, "{warning}");
+        }
+        let _ = write!(out, "{text}");
+        return 0;
+    }
+
+    // Read piped stdin (main.ts:766-774) — skipped for RPC.
+    let mut stdin_content: Option<String> = None;
+    if app_mode != AppMode::Rpc {
+        stdin_content = read_piped_stdin();
+        if stdin_content.is_some() && app_mode == AppMode::Interactive {
+            app_mode = AppMode::Print;
+        }
+    }
+
+    let mut parsed_owned = (*parsed).clone();
+    let auto_resize = {
+        let loader = runtime
+            .services()
+            .resource_loader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        loader.settings_manager().get_image_auto_resize()
+    };
+    let (initial_message, initial_images) =
+        match prepare_initial_message(&mut parsed_owned, auto_resize, stdin_content.as_deref())
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = writeln!(err, "Error: {error}");
+                return 1;
+            }
+        };
+
+    report_diagnostics(runtime.diagnostics(), &mut err);
+    if runtime
+        .diagnostics()
+        .iter()
+        .any(|d| d.level == DiagnosticLevel::Error)
+    {
+        if runtime
+            .diagnostics()
+            .iter()
+            .any(|d| d.message.contains("Failed to load extension"))
+        {
+            let _ = writeln!(err, "{EXTENSION_LOAD_FAILURE_HINT}");
+        }
+        return 1;
+    }
+
+    if app_mode != AppMode::Interactive && runtime.session().model().is_none() {
+        let _ = writeln!(err, "{}", format_no_models_available_message());
+        return 1;
+    }
+
+    match app_mode {
+        AppMode::Rpc => {
+            let out: Box<dyn Write + Send> = Box::new(std::io::stdout());
+            let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+            run_rpc_mode(runtime, stdin, out).await
+        }
+        AppMode::Interactive => {
+            let _ = writeln!(err, "Error: interactive mode is not available yet (T12)");
+            1
+        }
+        AppMode::Print | AppMode::Json => {
+            let exit_code = run_print_mode(
+                &mut runtime,
+                PrintModeOptions {
+                    mode: match app_mode {
+                        AppMode::Json => PrintOutputMode::Json,
+                        _ => PrintOutputMode::Text,
+                    },
+                    messages: parsed_owned.messages,
+                    initial_message,
+                    initial_images,
+                },
+                &mut out,
+                &mut err,
+            )
+            .await;
+            exit_code
+        }
+    }
+}

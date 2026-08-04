@@ -276,13 +276,13 @@ mod bash_tool_tests {
     async fn test_pir_session_env_injected() {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
-            session_env: Some(SessionEnv {
+            session_env: Some(std::sync::Arc::new(std::sync::RwLock::new(SessionEnv {
                 session_id: "test-session-123".into(),
                 session_file: Some(PathBuf::from("/tmp/test.jsonl")),
                 provider: Some("test-provider".into()),
                 model: Some("test-model".into()),
                 reasoning_level: Some("high".into()),
-            }),
+            }))),
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
         let out = run_bash(&tool, "env", None).await.unwrap();
@@ -324,13 +324,13 @@ mod bash_tool_tests {
     async fn test_expose_session_env_false() {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
-            session_env: Some(SessionEnv {
+            session_env: Some(std::sync::Arc::new(std::sync::RwLock::new(SessionEnv {
                 session_id: "secret-session".into(),
                 session_file: None,
                 provider: None,
                 model: None,
                 reasoning_level: None,
-            }),
+            }))),
         };
         let tool = create_bash_tool(
             &ctx,
@@ -354,13 +354,13 @@ mod bash_tool_tests {
         // and the session values are re-injected over any inherited `PIR_*`.
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
-            session_env: Some(SessionEnv {
+            session_env: Some(std::sync::Arc::new(std::sync::RwLock::new(SessionEnv {
                 session_id: "per-command".into(),
                 session_file: None,
                 provider: None,
                 model: Some("model-a".into()),
                 reasoning_level: None,
-            }),
+            }))),
         };
         let tool = create_bash_tool(&ctx, BashToolOptions::default());
 
@@ -388,10 +388,10 @@ mod bash_tool_tests {
         // tool rebuilt with the fresh SessionEnv resolves PIR_MODEL anew.
         let switched = create_bash_tool(
             &ToolContext {
-                session_env: Some(SessionEnv {
+                session_env: Some(std::sync::Arc::new(std::sync::RwLock::new(SessionEnv {
                     model: Some("model-b".into()),
-                    ..ctx.session_env.clone().unwrap()
-                }),
+                    ..ctx.session_env.clone().unwrap().read().unwrap().clone()
+                }))),
                 ..ctx
             },
             BashToolOptions::default(),

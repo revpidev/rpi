@@ -5,6 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "pir"
+path = "src/main.rs"
+
+[[bin]]
+name = "pir-rpc"
+path = "src/bin/pir_rpc.rs"
+
 [dependencies]
 pir-ai.workspace = true
 pir-agent.workspace = true

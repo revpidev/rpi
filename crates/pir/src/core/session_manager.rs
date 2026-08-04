@@ -102,7 +102,7 @@ fn format_iso8601_ms(ms: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{milli:03}Z")
 }
 
-fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     format_iso8601_ms(now_ms())
 }
 
@@ -2149,4 +2149,249 @@ pub fn path_to_root_or_compaction(
     }
     path.reverse();
     Ok(path.into_iter().cloned().collect())
+}
+
+// ---------------------------------------------------------------------------
+// Session discovery: list / listAll (session-manager.ts:1638-1711)
+// ---------------------------------------------------------------------------
+//
+// Assigned to T12 in the T07 landing note (D-012) but pulled forward: T10's
+// `--session` / `--fork` / `--session-id` resolution needs it. Sequential
+// reads replace upstream's 10-way concurrency limit and progress callbacks
+// (ordering is identical after the `modified` sort; only latency differs).
+
+/// `SessionInfo` (session-manager.ts:174-186). Timestamps are epoch ms
+/// (upstream `Date`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub path: PathBuf,
+    pub id: String,
+    /// Working directory where the session was started. Empty for old
+    /// sessions.
+    pub cwd: String,
+    pub name: Option<String>,
+    pub parent_session_path: Option<String>,
+    pub created_ms: i64,
+    pub modified_ms: i64,
+    pub message_count: u64,
+    pub first_message: String,
+    pub all_messages_text: String,
+}
+
+/// `isMessageWithContent` + `extractTextContent`
+/// (session-manager.ts:658-671).
+fn extract_message_text(message: &AgentMessage) -> Option<String> {
+    match message {
+        AgentMessage::User(user) => {
+            let text = match &user.content {
+                pir_ai::types::UserContent::Text(text) => text.clone(),
+                pir_ai::types::UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        pir_ai::types::UserContentBlock::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            Some(text)
+        }
+        AgentMessage::Assistant(assistant) => {
+            let text = assistant
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pir_ai::types::AssistantContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(text)
+        }
+        AgentMessage::ToolResult(tool_result) => {
+            let text = tool_result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pir_ai::types::ToolResultContent::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// `getMessageActivityTime` (session-manager.ts:673-684).
+fn message_activity_time(entry: &MessageEntry) -> Option<i64> {
+    match &entry.message {
+        AgentMessage::User(user) => Some(user.timestamp),
+        AgentMessage::Assistant(assistant) => Some(assistant.timestamp),
+        _ => parse_iso8601_ms(&entry.timestamp),
+    }
+}
+
+/// `buildSessionInfo` (session-manager.ts:687-766): any read/parse failure
+/// yields `None` (the file is skipped).
+pub fn build_session_info(file_path: &Path) -> Option<SessionInfo> {
+    let stats = std::fs::metadata(file_path).ok()?;
+    let mtime_ms = stats
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let records = parse_session_entries(&content);
+
+    let mut header: Option<SessionHeader> = None;
+    let mut message_count = 0u64;
+    let mut first_message = String::new();
+    let mut all_messages: Vec<String> = Vec::new();
+    let mut name: Option<String> = None;
+    let mut last_activity_time: Option<i64> = None;
+
+    for record in &records {
+        let Some(typed) = record.typed() else {
+            continue;
+        };
+        // First typed entry must be the header (session-manager.ts:705-709).
+        if header.is_none() {
+            if let FileEntry::Session(parsed) = typed {
+                header = Some(parsed.clone());
+                continue;
+            }
+            return None;
+        }
+
+        match typed {
+            FileEntry::SessionInfo(session_info) => {
+                // Latest session_info wins, including explicit clears.
+                name = session_info
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned);
+            }
+            FileEntry::Message(message_entry) => {
+                message_count += 1;
+                if let Some(activity) = message_activity_time(message_entry) {
+                    last_activity_time =
+                        Some(last_activity_time.map_or(activity, |last: i64| last.max(activity)));
+                }
+                let is_user = matches!(message_entry.message, AgentMessage::User(_));
+                let is_assistant = matches!(message_entry.message, AgentMessage::Assistant(_));
+                if !is_user && !is_assistant {
+                    continue;
+                }
+                let Some(text) = extract_message_text(&message_entry.message) else {
+                    continue;
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                all_messages.push(text.clone());
+                if first_message.is_empty() && is_user {
+                    first_message = text;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let header = header?;
+    let header_time = parse_iso8601_ms(&header.timestamp);
+    let modified_ms = match last_activity_time {
+        Some(activity) if activity > 0 => activity,
+        _ => header_time.unwrap_or(mtime_ms),
+    };
+
+    Some(SessionInfo {
+        path: file_path.to_path_buf(),
+        id: header.id.clone(),
+        cwd: header.cwd.clone(),
+        name,
+        parent_session_path: header.parent_session.clone(),
+        created_ms: header_time.unwrap_or(0),
+        modified_ms,
+        message_count,
+        first_message: if first_message.is_empty() {
+            "(no messages)".to_owned()
+        } else {
+            first_message
+        },
+        all_messages_text: all_messages.join(" "),
+    })
+}
+
+/// `listSessionsFromDir` (session-manager.ts:1589-1625).
+fn list_sessions_from_dir(dir: &Path) -> Vec<SessionInfo> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            if let Some(info) = build_session_info(&path) {
+                sessions.push(info);
+            }
+        }
+    }
+    sessions
+}
+
+impl SessionManager {
+    /// `SessionManager.list` (session-manager.ts:1638-1651).
+    pub fn list(cwd: &Path, session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        let dir = match session_dir {
+            Some(dir) => PathBuf::from(normalize_path(&dir.to_string_lossy())),
+            None => match get_default_session_dir(cwd) {
+                Ok(dir) => dir,
+                Err(_) => return Vec::new(),
+            },
+        };
+        let filter_cwd = session_dir.is_some() && dir != get_default_session_dir_path(cwd, None);
+        let resolved_cwd = resolve_path(
+            &cwd.to_string_lossy(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+        );
+        let mut sessions: Vec<SessionInfo> = list_sessions_from_dir(&dir)
+            .into_iter()
+            .filter(|session| {
+                !filter_cwd || session_cwd_matches(Some(session.cwd.as_str()), &resolved_cwd)
+            })
+            .collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+        sessions
+    }
+
+    /// `SessionManager.listAll` (session-manager.ts:1653-1711).
+    pub fn list_all(session_dir: Option<&Path>) -> Vec<SessionInfo> {
+        if let Some(custom_dir) = session_dir {
+            let dir = PathBuf::from(normalize_path(&custom_dir.to_string_lossy()));
+            let mut sessions = list_sessions_from_dir(&dir);
+            sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+            return sessions;
+        }
+
+        let sessions_dir = crate::config::get_sessions_dir();
+        let entries = match std::fs::read_dir(&sessions_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        let mut sessions = Vec::new();
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                sessions.extend(list_sessions_from_dir(&entry.path()));
+            }
+        }
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.modified_ms));
+        sessions
+    }
 }

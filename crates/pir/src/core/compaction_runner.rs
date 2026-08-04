@@ -24,7 +24,7 @@
 //!   path: `apiKey`/`headers`/`env` ride [`SummarizationArgs`] and default to
 //!   `None`, exactly what a custom `streamFn` receives upstream.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use pir_agent::compaction::{
     calculate_context_tokens, compact as run_compact, estimate_context_tokens,
@@ -40,6 +40,7 @@ use pir_ai::utils::retry::{RetryCallbacks, RetryPolicy};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::auth_guidance::format_no_model_selected_message;
 use crate::core::session_manager::SessionManager;
 use crate::error::PirError;
 
@@ -110,12 +111,15 @@ fn raw_error_message(error: &PirError) -> String {
 
 /// Compaction trigger wiring (agent-session.ts compaction methods).
 ///
-/// Owns the `SessionManager` like upstream's `AgentSession` does; the agent
-/// is shared (`Arc<Agent>`) because the agent loop drives it concurrently.
+/// Shares the `SessionManager` (`Arc<Mutex<_>>`) with the owning
+/// `AgentSession`: the agent-event listener persists messages from the
+/// prompt task while mode command tasks run session operations (T10
+/// wiring). The agent is shared (`Arc<Agent>`) because the agent loop
+/// drives it concurrently.
 pub struct CompactionRunner {
     agent: Arc<Agent>,
-    session: SessionManager,
-    model: Model,
+    session: Arc<Mutex<SessionManager>>,
+    model: Option<Model>,
     settings: CompactionSettings,
     retry: Option<RetryPolicy>,
     stream_fn: StreamFn,
@@ -129,8 +133,8 @@ impl CompactionRunner {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent: Arc<Agent>,
-        session: SessionManager,
-        model: Model,
+        session: Arc<Mutex<SessionManager>>,
+        model: Option<Model>,
         settings: CompactionSettings,
         retry: Option<RetryPolicy>,
         stream_fn: StreamFn,
@@ -151,16 +155,42 @@ impl CompactionRunner {
         }
     }
 
-    pub fn session(&self) -> &SessionManager {
-        &self.session
+    /// Lock the shared session (poison-tolerant, like the rest of the
+    /// codebase). Both accessors return the same guard; the two names mirror
+    /// the pre-T10 `session()`/`session_mut()` pair.
+    pub fn session(&self) -> MutexGuard<'_, SessionManager> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn session_mut(&mut self) -> &mut SessionManager {
-        &mut self.session
+    pub fn session_mut(&self) -> MutexGuard<'_, SessionManager> {
+        self.session()
     }
 
-    pub fn into_session(self) -> SessionManager {
-        self.session
+    /// `this.model` updates (setModel / cycleModel / restore) re-sync the
+    /// runner with the session's current model.
+    pub fn set_model(&mut self, model: Option<Model>) {
+        self.model = model;
+    }
+
+    /// Re-read `settingsManager.getCompactionSettings()` before trigger
+    /// checks (upstream reads settings per call).
+    pub fn set_settings(&mut self, settings: CompactionSettings) {
+        self.settings = settings;
+    }
+
+    pub fn set_retry(&mut self, retry: Option<RetryPolicy>) {
+        self.retry = retry;
+    }
+
+    pub fn set_thinking_level(&mut self, thinking_level: ThinkingLevel) {
+        self.thinking_level = thinking_level;
+    }
+
+    /// Re-point the event sink (T10: `AgentSession` forwards compaction
+    /// events into its own event stream after construction resolves the
+    /// circular reference).
+    pub fn set_emit_sink(&mut self, sink: CompactionEventSink) {
+        self.emit = sink;
     }
 
     /// Reset the one-shot overflow recovery budget — upstream resets it on
@@ -222,7 +252,7 @@ impl CompactionRunner {
     /// context messages, so the cut-point and preparation logic sees the same
     /// stream upstream sees for entries it knows.
     fn path_entries(&self) -> Vec<SessionEntry> {
-        self.session
+        self.session()
             .get_branch(None)
             .iter()
             .filter_map(|entry| entry.known().cloned())
@@ -270,6 +300,11 @@ impl CompactionRunner {
         custom_instructions: Option<&str>,
         token: &CancellationToken,
     ) -> Result<CompactionResult, PirError> {
+        // `if (!this.model) throw new Error(formatNoModelSelectedMessage())`
+        // (agent-session.ts:1790-1792).
+        let Some(model) = self.model.clone() else {
+            return Err(PirError::Session(format_no_model_selected_message()));
+        };
         let path_entries = self.path_entries();
         let preparation = prepare_compaction(&path_entries, &self.settings).ok_or_else(|| {
             // Check why we can't compact (agent-session.ts:1801-1807).
@@ -290,7 +325,7 @@ impl CompactionRunner {
         });
         let result = run_compact(
             &preparation,
-            &self.model,
+            &model,
             custom_instructions,
             &self.stream_fn,
             &args,
@@ -313,7 +348,7 @@ impl CompactionRunner {
         &mut self,
         result: CompactionResult,
     ) -> Result<CompactionResult, PirError> {
-        self.session.append_compaction(
+        self.session_mut().append_compaction(
             &result.summary,
             &result.first_kept_entry_id,
             result.tokens_before,
@@ -321,7 +356,7 @@ impl CompactionRunner {
             Some(false),
             result.usage.clone(),
         )?;
-        let session_context = self.session.build_session_context();
+        let session_context = self.session().build_session_context();
         self.agent.set_messages(session_context.messages.clone());
         let estimated_tokens_after = estimate_messages_tokens(&session_context.messages);
 
@@ -351,12 +386,19 @@ impl CompactionRunner {
             return false;
         }
 
-        let context_window = u64::from(self.model.context_window);
+        // `this.model?.contextWindow ?? 0` (agent-session.ts:1960).
+        let context_window = self
+            .model
+            .as_ref()
+            .map(|model| u64::from(model.context_window))
+            .unwrap_or(0);
 
         // Skip the overflow check if the message came from a different model
-        // (agent-session.ts:1962-1967).
-        let same_model = assistant_message.provider == self.model.provider
-            && assistant_message.model == self.model.id;
+        // (agent-session.ts:1962-1967). `this.model && ...` — falsy without a
+        // model.
+        let same_model = self.model.as_ref().is_some_and(|model| {
+            assistant_message.provider == model.provider && assistant_message.model == model.id
+        });
 
         // Skip compaction checks if this assistant message is older than the
         // latest compaction boundary (agent-session.ts:1969-1977).
@@ -445,6 +487,10 @@ impl CompactionRunner {
         let token = CancellationToken::new();
 
         let outcome: Result<bool, PirError> = async {
+            // `if (!this.model) return false` (agent-session.ts:2052-2054).
+            let Some(model) = self.model.clone() else {
+                return Ok(false);
+            };
             let path_entries = self.path_entries();
             let Some(preparation) = prepare_compaction(&path_entries, &self.settings) else {
                 return Ok(false);
@@ -461,7 +507,7 @@ impl CompactionRunner {
                 ..Default::default()
             };
             let callbacks = self.summarization_retry_callbacks(RetrySource::Compaction { reason });
-            let result = run_compact(&preparation, &self.model, None, &self.stream_fn, &args, Some(&callbacks))
+            let result = run_compact(&preparation, &model, None, &self.stream_fn, &args, Some(&callbacks))
                 .await
                 .map_err(|error| PirError::Session(error.to_string()))?;
 

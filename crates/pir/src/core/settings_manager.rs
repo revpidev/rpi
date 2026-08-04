@@ -469,7 +469,10 @@ pub struct SettingsError {
 pub type WithLockCallback<'a> = dyn FnMut(Option<&str>) -> Result<Option<String>, PirError> + 'a;
 
 /// `SettingsStorage` (settings-manager.ts:179-181).
-pub trait SettingsStorage {
+///
+/// `Send + Sync`: the T10 runtime shares the owning `DefaultResourceLoader`
+/// across tasks (`Arc<Mutex<_>>`); both shipped backends are plain data.
+pub trait SettingsStorage: Send + Sync {
     fn with_lock(
         &mut self,
         scope: SettingsScope,

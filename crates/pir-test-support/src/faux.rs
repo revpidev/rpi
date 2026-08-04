@@ -799,6 +799,123 @@ async fn stream_with_deltas(
     }
 }
 
+// ---------------------------------------------------------------------------
+// pir-ai `Provider` adapter
+// ---------------------------------------------------------------------------
+
+/// Static API-key auth for the faux provider: always resolves a dummy key so
+/// `ModelRuntime` availability/auth checks pass in tests.
+struct FauxApiKeyAuth {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl pir_ai::auth::ApiKeyAuth for FauxApiKeyAuth {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn resolve(
+        &self,
+        _ctx: &dyn pir_ai::auth::AuthContext,
+        _credential: Option<&pir_ai::auth::ApiKeyCredential>,
+    ) -> Result<Option<pir_ai::auth::AuthResult>, pir_ai::auth::ModelsError> {
+        Ok(Some(pir_ai::auth::AuthResult {
+            auth: pir_ai::auth::ModelAuth {
+                api_key: Some("faux-key".to_owned()),
+                headers: None,
+                base_url: None,
+            },
+            env: None,
+            source: Some("FAUX_API_KEY".to_owned()),
+        }))
+    }
+}
+
+/// Adapter exposing a [`FauxProvider`] as a pir-ai [`pir_ai::models::Provider`]
+/// so tests can register it into a `ModelRuntime` and drive a full
+/// `AgentSession` / headless mode end to end with scripted responses.
+pub struct FauxAiProvider {
+    faux: Arc<FauxProvider>,
+    provider_auth: pir_ai::auth::ProviderAuth,
+}
+
+impl FauxAiProvider {
+    pub fn new(faux: Arc<FauxProvider>) -> Self {
+        FauxAiProvider {
+            provider_auth: pir_ai::auth::ProviderAuth {
+                api_key: Some(Arc::new(FauxApiKeyAuth {
+                    name: format!("{} API key", faux.provider()),
+                })),
+                oauth: None,
+            },
+            faux,
+        }
+    }
+
+    /// The underlying scripted provider (response queue, counters).
+    pub fn faux(&self) -> &Arc<FauxProvider> {
+        &self.faux
+    }
+}
+
+impl pir_ai::models::Provider for FauxAiProvider {
+    fn id(&self) -> &str {
+        self.faux.provider()
+    }
+
+    fn name(&self) -> &str {
+        self.faux.provider()
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        Some(DEFAULT_BASE_URL)
+    }
+
+    fn headers(&self) -> Option<&pir_ai::types::ProviderHeaders> {
+        None
+    }
+
+    fn auth(&self) -> &pir_ai::auth::ProviderAuth {
+        &self.provider_auth
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        self.faux.models().to_vec()
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<StreamOptions>,
+    ) -> pir_ai::utils::event_stream::AssistantMessageEventStream {
+        let stream = pir_ai::utils::event_stream::AssistantMessageEventStream::new();
+        let producer = stream.clone();
+        let stream_fn = self.faux.stream_fn();
+        let model = model.clone();
+        let context = context.clone();
+        let options = options.unwrap_or_default();
+        tokio::spawn(async move {
+            let mut events = stream_fn(model, context, options);
+            while let Some(event) = events.next().await {
+                producer.push(event);
+            }
+            producer.end(None);
+        });
+        stream
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<pir_ai::types::SimpleStreamOptions>,
+    ) -> pir_ai::utils::event_stream::AssistantMessageEventStream {
+        self.stream(model, context, options.map(|simple| simple.stream))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -26,6 +26,12 @@ pub const CONFIG_DIR_NAME: &str = ".pir";
 pub const ENV_AGENT_DIR: &str = "PIR_CODING_AGENT_DIR";
 /// `ENV_SESSION_DIR` = `{APP_NAME}_CODING_AGENT_SESSION_DIR` (config.ts:496).
 pub const ENV_SESSION_DIR: &str = "PIR_CODING_AGENT_SESSION_DIR";
+/// `PI_OFFLINE` → `PIR_OFFLINE` (requirements §3.3).
+pub const ENV_OFFLINE: &str = "PIR_OFFLINE";
+/// `PI_SKIP_VERSION_CHECK` → `PIR_SKIP_VERSION_CHECK` (requirements §3.3).
+pub const ENV_SKIP_VERSION_CHECK: &str = "PIR_SKIP_VERSION_CHECK";
+/// Package version (`VERSION` in config.ts — from package.json upstream).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
@@ -164,6 +170,30 @@ pub const APPEND_SYSTEM_PROMPT_FILE_NAME: &str = "APPEND_SYSTEM.md";
 /// `.agents` directory name for the Agent Skills standard locations
 /// (`~/.agents/skills` and ancestor `.agents/skills`).
 pub const AGENTS_DIR_NAME: &str = ".agents";
+
+/// `PI_PACKAGE_DIR` → `PIR_PACKAGE_DIR` (config.ts:369).
+pub const ENV_PACKAGE_DIR: &str = "PIR_PACKAGE_DIR";
+
+/// `getPackageDir` (config.ts:367-385): `PIR_PACKAGE_DIR` env override, else
+/// the directory of the current executable (upstream Bun-binary rule; pir is
+/// always a native binary, so the Node `package.json` walk has no
+/// counterpart).
+pub fn get_package_dir() -> PathBuf {
+    if let Some(env_dir) = std::env::var_os(ENV_PACKAGE_DIR) {
+        if !env_dir.is_empty() {
+            return PathBuf::from(normalize_path(&env_dir.to_string_lossy()));
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `getDocsPath` (config.ts): `{packageDir}/docs`.
+pub fn get_docs_path() -> PathBuf {
+    get_package_dir().join("docs")
+}
 
 /// Home directory of the current user (`HOME` / `USERPROFILE`).
 pub fn user_home_dir() -> Option<PathBuf> {

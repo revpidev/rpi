@@ -1,12 +1,22 @@
 //! `core/` — mirrors `packages/coding-agent/src/core/` (design §12 mapping).
 
+pub mod agent_session;
+pub mod agent_session_runtime;
+pub mod agent_session_services;
+pub mod auth_guidance;
 pub mod compaction_runner;
 pub mod environment;
+pub mod extensions;
 pub mod keybindings;
+pub mod model_resolver;
+pub mod model_runtime;
 pub mod prompt_templates;
 pub mod resource_loader;
+pub mod session_cwd;
 pub mod session_manager;
 pub mod settings_manager;
 pub mod skills;
 pub mod system_prompt;
 pub mod themes;
+pub mod trust_manager;
+pub mod usage_totals;

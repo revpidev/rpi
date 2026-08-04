@@ -10,9 +10,13 @@
 //!
 //! Skeleton only (T01); modes land in T10/T12.
 
+pub mod app;
+pub mod cli;
 pub mod config;
 pub mod core;
 pub mod error;
+pub mod modes;
+pub mod sdk;
 pub mod tools;
 
 pub use error::PirError;

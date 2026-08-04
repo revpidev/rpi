@@ -112,8 +112,8 @@ fn fixture(settings: CompactionSettings, responses: Vec<FauxResponseStep>) -> Fi
     let sink = events.clone();
     let runner = CompactionRunner::new(
         agent.clone(),
-        session,
-        model,
+        Arc::new(Mutex::new(session)),
+        Some(model),
         settings,
         None,
         provider.stream_fn(),

@@ -13,3 +13,4 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 tokio-util.workspace = true
 futures.workspace = true
+async-trait.workspace = true

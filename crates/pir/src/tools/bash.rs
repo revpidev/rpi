@@ -384,7 +384,7 @@ pub fn create_local_bash_operations(shell_path: Option<String>) -> Arc<dyn BashO
 
 struct BashTool {
     cwd: PathBuf,
-    session_env: Option<SessionEnv>,
+    session_env: Option<std::sync::Arc<std::sync::RwLock<SessionEnv>>>,
     ops: Arc<dyn BashOperations>,
     command_prefix: Option<String>,
     expose_session_environment: bool,
@@ -479,7 +479,8 @@ impl BashTool {
             env.remove(*k);
         }
         if self.expose_session_environment {
-            if let Some(ref s) = self.session_env {
+            if let Some(ref cell) = self.session_env {
+                let s = cell.read().unwrap_or_else(|e| e.into_inner());
                 env.insert("PIR_SESSION_ID".into(), s.session_id.clone());
                 if let Some(ref f) = s.session_file {
                     env.insert("PIR_SESSION_FILE".into(), f.to_string_lossy().into_owned());

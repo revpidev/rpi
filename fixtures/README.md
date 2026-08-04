@@ -75,8 +75,11 @@ cargo run -p pir-test-support --example normalize-diff -- \
 | `compaction-threshold` | 8192 窗口/4096 reserve/512 keep：三轮问答，阈值触发两轮压缩（split-turn 前缀 + UPDATE 迭代），第三轮 prepare 为空静默 | CompactionEntry（firstKeptEntryId/usage/details/fromHook=false）、compaction_start/end 事件序、tokensBefore 重算、estimatedTokensAfter |
 | `compaction-overflow` | 16384 窗口：overflow error（"prompt is too long"）→ 恢复压缩 → 重试成功 | overflow 恢复路径、willRetry=true 事件序、恢复预算一次后重置 |
 
-补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 全命令
-transcript（32 命令）随 **T10** 追加，届时本表与生成脚本同步扩展。
+补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 覆盖随 **T10**
+交付——采用进程内 32 命令逐条契约测试（`crates/pir/tests/rpc_mode_test.rs`，
+锚定 `docs/rpc.md`）+ 上表场景的三模式对拍（`crates/pir/tests/parity_headless_test.rs`），
+不另录 RPC transcript fixtures（32 命令线协议由契约测试全枚举，transcript
+不增加覆盖面）。
 
 ### 3.1 resources 用例组（T09 交付）
 

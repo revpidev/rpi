@@ -1344,6 +1344,10 @@ fn file_walk(dir: &Path, kind: FileResourceKind, max_depth: Option<usize>) -> Ve
             entries.push(path.to_path_buf());
         }
     }
+    // See skills.rs: upstream emits raw readdir order (filesystem-dependent,
+    // not a portable contract); the pinned goldens capture alphabetical
+    // order. Sort for deterministic parity.
+    entries.sort();
     entries
 }
 

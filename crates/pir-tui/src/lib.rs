@@ -11,5 +11,6 @@
 //! Skeleton only (T01); the engine lands in T11.
 
 pub mod error;
+pub mod fuzzy;
 
 pub use error::TuiError;

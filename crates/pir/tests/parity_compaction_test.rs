@@ -80,11 +80,35 @@ fn now_ms() -> i64 {
 
 /// 脚本响应：调用时刻的新鲜时间戳（上游工厂响应语义）。固定/0 时间戳会被
 /// stale-usage 守卫拦下（agent-session.ts:1974），压缩链将静默断掉。
+///
+/// 防并列：毫秒级时钟下，压缩条目写入（真实时钟）与下一条脚本响应若落在
+/// 同一毫秒，`assistantMessage.timestamp <= compactionTs` 守卫会误杀后续
+/// 检查（并行测试放大此窗口）。工厂先让出 5ms 再取严格递增时间戳。
 fn scripted(content: impl Into<String>) -> FauxResponseStep {
+    static LAST_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let content = content.into();
     FauxResponseStep::Factory(Box::new(move |_context, _options, _state, _model| {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let now = now_ms();
+        // CAS loop: strictly increasing timestamps (`fetch_update` reports
+        // the *previous* value, which would shift the sequence by one).
+        let timestamp = loop {
+            let last = LAST_TS.load(std::sync::atomic::Ordering::SeqCst);
+            let next = last.max(now - 1) + 1;
+            if LAST_TS
+                .compare_exchange(
+                    last,
+                    next,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                break next;
+            }
+        };
         let mut message = faux_assistant_message(content.clone(), FauxAssistantOptions::default());
-        message.timestamp = now_ms();
+        message.timestamp = timestamp;
         message
     }))
 }
@@ -169,8 +193,8 @@ impl Harness {
         let sink_events = compaction_events.clone();
         let runner = CompactionRunner::new(
             agent.clone(),
-            session,
-            model,
+            Arc::new(Mutex::new(session)),
+            Some(model),
             settings,
             None,
             provider.stream_fn(),
@@ -178,7 +202,7 @@ impl Harness {
             Arc::new(move |event| sink_events.lock().expect("events").push(event)),
         );
 
-        let mut harness = Self {
+        let harness = Self {
             agent,
             runner,
             agent_events,
@@ -344,6 +368,7 @@ fn compare(harness: &Harness, scenario: &str) {
         .runner
         .session()
         .get_session_file()
+        .map(|path| path.to_path_buf())
         .expect("file-backed session");
     let actual_session = std::fs::read_to_string(session_file).expect("read actual session");
     let expected_session =

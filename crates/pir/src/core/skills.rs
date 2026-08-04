@@ -125,17 +125,22 @@ fn warning(message: impl Into<String>, path: &Path) -> ResourceDiagnostic {
 // ---------------------------------------------------------------------------
 
 /// `SourceScope` (source-info.ts:3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SourceScope {
+    #[serde(rename = "user")]
     User,
+    #[serde(rename = "project")]
     Project,
+    #[serde(rename = "temporary")]
     Temporary,
 }
 
 /// `SourceOrigin` (source-info.ts:4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum SourceOrigin {
+    #[serde(rename = "package")]
     Package,
+    #[serde(rename = "top-level")]
     TopLevel,
 }
 
@@ -178,12 +183,14 @@ pub fn resource_precedence_rank(metadata: &PathMetadata) -> u8 {
 }
 
 /// `SourceInfo` (source-info.ts:6-12).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceInfo {
     pub path: PathBuf,
     pub source: String,
     pub scope: SourceScope,
     pub origin: SourceOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_dir: Option<PathBuf>,
 }
 
@@ -429,7 +436,15 @@ pub fn collect_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBu
     // A directory that contains SKILL.md is a skill root: keep only the
     // shallowest SKILL.md files and drop everything beneath a skill root
     // (upstream never recurses past one — it `return`s on the first pass).
-    skill_mds.sort_by_key(|p| p.components().count());
+    //
+    // Sort by (depth, path): upstream emits raw `readdirSync` order, which is
+    // filesystem-dependent and therefore not a portable contract — the pinned
+    // goldens capture alphabetical-within-depth order (git checkout order on
+    // the generation machine). Sorting the same way makes the parity
+    // deterministic on any filesystem.
+    skill_mds.sort_by(|a, b| {
+        (a.components().count(), a.as_os_str()).cmp(&(b.components().count(), b.as_os_str()))
+    });
     let mut skill_roots: Vec<PathBuf> = Vec::new();
     for path in skill_mds {
         let Some(parent) = path.parent() else {
