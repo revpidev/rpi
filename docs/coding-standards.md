@@ -371,16 +371,24 @@ pub trait ApiStream: Send + Sync {
 
 ```rust
 pub trait Component: Send {
-    /// Render to ANSI lines at the given terminal width.
     fn render(&self, width: usize) -> Vec<String>;
+    // 默认方法（上游可选成员）：handle_input（no-op）/ wants_key_release（false）/
+    // invalidate（空）/ as_focusable + as_focusable_mut（None，= 非 Focusable）
+    fn handle_input(&mut self, data: &str) {}
+    fn wants_key_release(&self) -> bool { false }
+    fn invalidate(&mut self) {}
+    fn as_focusable(&self) -> Option<&dyn Focusable> { None }
+    fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> { None }
 }
 
 pub trait Focusable: Component {
-    fn handle_input(&mut self, raw: &str);
     fn focused(&self) -> bool;
+    fn set_focused(&mut self, focused: bool); // 上游 `component.focused = ...`
 }
 ```
 
+- 上游结构性检查 `"focused" in component`（`isFocusable`）→ `as_focusable()`
+  （返回 `Option<&dyn Focusable>`，默认 `None`）；形状见设计文档 §5.2
 - 组件输出 ANSI 行，不直接写终端；写终端只有 `Tui` 一处
 - 组件移植优先级与拆分按设计文档 §5.5
 

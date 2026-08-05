@@ -1,0 +1,150 @@
+{
+  "runId": "fc335b5f",
+  "agent": "reviewer",
+  "task": "[Read from: /home/leven/develop/ai/pir/plan.md, /home/leven/develop/ai/pir/progress.md]\n\n审查 /home/leven/develop/ai/pir/crates/pir-tui/src/tui.rs 第 2601-5200 行（overlay 栈 + focus 恢复状态机、输入 dispatch、render 主流程后半、终端自省查询）。这是对上游 external/pi/packages/tui/src/tui.ts（commit 2efa728d）的 Rust 移植。审查重点：1) overlay push/pop 与 focus 恢复的逻辑正确性、CURSOR_MARKER 定位；2) 输入分发与 keybinding 处理与上游一致性（对照 external/pi/packages/tui/src/tui.ts）；3) panic/死锁风险（Mutex 锁顺序、锁内重入、pending 队列 drain）；4) 16ms 节流与 deadline 语义。输出：按严重度（高/中/低/提示）列出发现，每条带 文件:行号、问题描述、建议。不要修改任何文件，只读审查。\n\n---\n**Output:**\nWrite your findings to exactly this path: /tmp/review-tui2.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 0,
+  "usage": {
+    "input": 72690,
+    "output": 41715,
+    "cacheRead": 1454336,
+    "cacheWrite": 0,
+    "cost": 0.025928940799999994,
+    "turns": 32
+  },
+  "model": "deepseek/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 72690,
+        "output": 41715,
+        "cacheRead": 1454336,
+        "cacheWrite": 0,
+        "cost": 0.025928940799999994,
+        "turns": 32
+      }
+    }
+  ],
+  "durationMs": 376609,
+  "toolCount": 50,
+  "launchContractDigest": "d34752505e081fc7b3e270e3de202b86e487e18e8aab4bc4c9f8b25e4db057b6",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:06a5cac20e952fde"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:06a5cac20e952fde"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Returned concrete findings with file:line references and severity: M1 tui.rs:1861/1258/3009 (stop clears render deadline, contradicting header docs; stop+start leaves render stuck), M2 tui.rs:1053-1066 (query timeouts absent from next_deadline), L1 tui.rs:1102-1104 (pump holds inner lock while blocking; header note inaccurate), L2 tui.rs:1996-1997 (always requestRender on default handle_input), plus N1-N7 informational notes; all verified against upstream external/pi/packages/tui/src/tui.ts @ 2efa728d and cargo test (443 passed)."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p pir-tui --lib",
+          "result": "passed",
+          "summary": "443 passed; 0 failed"
+        },
+        {
+          "command": "git submodule status external/pi",
+          "result": "passed",
+          "summary": "external/pi @ 2efa728d, matches stated upstream commit"
+        }
+      ],
+      "validationOutput": [
+        "Line-by-line parity check of tui.rs 1249-3046 vs tui.ts 372-1718 covering: focus-restore state machine, overlay push/pop, input dispatch, do_render pipeline, CURSOR_MARKER extraction/positioning, 16ms throttle/deadline semantics, OSC11/cell-size/color-scheme queries, lock ordering and re-entrancy (run_or_queue/drain_pending_ops)."
+      ],
+      "residualRisks": [
+        "M1: stop()+start() leaves schedule.requested=true with deadline=None until a force render; has_pending_work stays true after stop (untested stop→start sequence).",
+        "M2: introspection query timeout deadlines not included in next_deadline/has_pending_work; latent while the only consumer caps waits at 100ms (examples/tui_smoke.rs).",
+        "L1: Tui::pump holds the inner lock for the whole terminal wait; concurrent stop()/with_terminal() can block until an event arrives.",
+        "keys.rs matching logic was verified only at the call sites (matches_key/is_key_release parity with keys.ts), not re-reviewed in depth (outside the 2601-5200 range)."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Read-only review; no files modified. Findings written to /tmp/review-tui2.md.",
+      "reviewFindings": [
+        "medium: tui.rs:1861+1258+3009 - stop_internal clears render deadline while schedule_render early-returns on stale requested flag; stop+start never renders until force; header-documented fix ineffective",
+        "medium: tui.rs:1053-1066 - next_deadline omits introspection query deadlines; timeout may never fire in deadline-driven loops",
+        "low: tui.rs:1102-1104 - inner lock held during blocking terminal.pump; header comment inaccurate",
+        "low: tui.rs:1996-1997 - unconditional requestRender after default no-op handle_input (documented deviation)",
+        "info: N1-N7 - has_pending_work stuck after stop; CURSOR_MARKER/overlay layout/throttle/lock-order parity confirmed",
+        "no blockers"
+      ],
+      "manualNotes": "plan.md / progress.md do not exist in the repo root (ENOENT); reviewed against the code, the upstream tui.ts @ 2efa728d, and the passing test suite instead."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/home/leven/develop/ai/pir/.pi-subagents/artifacts/fc335b5f_reviewer_1_transcript.jsonl",
+  "timestamp": 1785910571949
+}

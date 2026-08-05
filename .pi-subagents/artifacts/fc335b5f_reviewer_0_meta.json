@@ -1,0 +1,163 @@
+{
+  "runId": "fc335b5f",
+  "agent": "reviewer",
+  "task": "[Read from: /home/leven/develop/ai/pir/plan.md, /home/leven/develop/ai/pir/progress.md]\n\n审查 /home/leven/develop/ai/pir/crates/pir-tui/src/tui.rs 第 1-2600 行（TUI 核心结构、SharedComponent 与重入队列、渲染管线 do_render 前半、VirtualTerminal 差分）。这是对上游 external/pi/packages/tui/src/tui.ts（commit 2efa728d）的 Rust 移植。审查重点：1) 逻辑 bug、边界条件错误（如差分算法、全量回退条件、16ms 节流）；2) panic/死锁风险（Mutex 锁顺序、reentrant）；3) 与上游语义不一致的地方（可对照 external/pi/packages/tui/src/tui.ts）；4) 未处理的错误路径。输出：按严重度（高/中/低/提示）列出发现，每条带 文件:行号、问题描述、建议。不要修改任何文件，只读审查。\n\n---\n**Output:**\nWrite your findings to exactly this path: /tmp/review-tui1.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 0,
+  "usage": {
+    "input": 73334,
+    "output": 62042,
+    "cacheRead": 1512704,
+    "cacheWrite": 0,
+    "cost": 0.0318740912,
+    "turns": 24
+  },
+  "model": "deepseek/deepseek-v4-flash:high",
+  "attemptedModels": [
+    "deepseek/deepseek-v4-flash:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "deepseek/deepseek-v4-flash:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 73334,
+        "output": 62042,
+        "cacheRead": 1512704,
+        "cacheWrite": 0,
+        "cost": 0.0318740912,
+        "turns": 24
+      }
+    }
+  ],
+  "durationMs": 531885,
+  "toolCount": 39,
+  "launchContractDigest": "e9c7fa3a4a46066f1f5d42c6af5bf6188003656d26fa6b01f2c7384c8df9f0bc",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": [
+      "sha256:06a5cac20e952fde"
+    ],
+    "configured": [],
+    "effective": [
+      "sha256:06a5cac20e952fde"
+    ],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "attested",
+    "evidenceStatus": "attested",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": false,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Reviewed tui.rs lines 1-3200 (scope 1-2600 plus do_render remainder) against upstream external/pi/packages/tui/src/tui.ts @ 2efa728d; produced 11 findings (1 high, 3 medium, 3 low, 6 notes) each with file:line, description and recommendation, plus verified-parity list. See /tmp/review-tui1.md."
+        }
+      ],
+      "changedFiles": [],
+      "testsAddedOrUpdated": [],
+      "commandsRun": [
+        {
+          "command": "cargo test -p pir-tui --lib",
+          "result": "passed",
+          "summary": "443 passed; 0 failed (0.08s)"
+        },
+        {
+          "command": "git -C external/pi rev-parse HEAD",
+          "result": "passed",
+          "summary": "2efa728d2ee90ef597626e96b1e28ef2b279f07c matches task's upstream commit"
+        }
+      ],
+      "validationOutput": [
+        "Line-by-line diff-parity check of doRender/differential branches vs tui.ts",
+        "Lock-order analysis: no ABBA; reentrancy self-deadlock risks identified (M2/M3)",
+        "Throttle-timing trace vs upstream requestRender/scheduleRender: equivalent",
+        "Full-render fallback conditions vs upstream: all six match"
+      ],
+      "residualRisks": [
+        "H1: stop()/start() with pending throttled render leaves schedule stuck (requested=true, deadline=None) - render-dead until request_render(true); header promise (tui.rs:59-61) unimplemented; stopped branch at tui.rs:3012 is dead code",
+        "M1: Tui::pump holds inner lock across blocking terminal wait, contradicting header (tui.rs:52-53); unbounded if consumer passes timeout=None",
+        "M2/M3: blocking public methods (stop/start/next_deadline/with_terminal) or self-locking components inside callbacks self-deadlock; only with_terminal documented",
+        "L3/N1: OSC11 timed-out queries swallow later responses and accumulate; color-scheme query Vec grows unboundedly",
+        "L1: contains_component recursion not cycle-safe (stack overflow/abort on cyclic shared_children)",
+        "Existing tests do not cover the stop/start pending-render scenario"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Read-only review; no files modified. 443/443 tests pass.",
+      "reviewFindings": [
+        "high: tui.rs:1862 - stop_internal clears schedule.deadline while requested stays true; after stop()/start() the TUI never renders again (schedule_render early-returns, should_render requires deadline), contradicting header note tui.rs:59-61; remove the deadline clear or reset requested",
+        "medium: tui.rs:1104 - Tui::pump holds inner lock during blocking terminal wait, header claim tui.rs:52-53 false; stop() from other threads blocks, try_read defaults during whole wait",
+        "medium: tui.rs:887-1108 - blocking methods (stop/start/next_deadline/with_terminal/tick/pump) called from input listeners (1900-1911), visible closures (1785-1792), on_debug (1920-1922) or component callbacks self-deadlock; only with_terminal documented",
+        "medium: tui.rs:215-223 - component mutex reentrancy not prohibited; component locking its own SharedComponent inside handle_input/render/shared_children deadlocks",
+        "low: tui.rs:1528-1538 - contains_component recursion not cycle-safe (abort on cycle), unlike is_overlay_focus_ancestor",
+        "low: tui.rs:1197-1209 - is_hidden after overlay removal returns false vs upstream detached-entry state",
+        "low: tui.rs:2000-2019/3030-3036 - OSC11 timed-out query at queue head swallows later query's response (upstream parity bug)",
+        "note: tui.rs:3030-3045 - OSC11 and color-scheme query entries never removed (slow leak; color-scheme leak is new vs upstream listener approach)",
+        "note: tui.rs:734-740 - try_read returns defaults under contention (documented; amplified by M1)",
+        "note: tui.rs:802-822/1542-1574 - interleaved show_overlay ops can invert z-order vs call order (multithreaded only)",
+        "note: tui.rs:388-391 - kitty param parser rejects JS Number hex forms (negligible)",
+        "note: tui.rs:1994-1998 - focused component without handle_input still triggers trailing request_render (documented difference)",
+        "note: tui.rs:2872-2887 - width-overflow panic leaves synchronized-output mode open (upstream parity)",
+        "no blockers"
+      ],
+      "manualNotes": "plan.md/progress.md not found at repo root (no such files); reviewed per docs/plan/v0.1 and the file header instead. Diff-algorithm, full-render fallbacks, throttle and overlay state machine verified equivalent to upstream tui.ts @ 2efa728d. All findings read-only; no files modified."
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/home/leven/develop/ai/pir/.pi-subagents/artifacts/fc335b5f_reviewer_0_transcript.jsonl",
+  "timestamp": 1785910727217
+}

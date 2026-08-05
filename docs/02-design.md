@@ -321,17 +321,42 @@ Pi 的交互契约建立在「ANSI 行列表 + 自定义差分 + Overlay + Kitty
 ```rust
 pub trait Component: Send {
     fn render(&self, width: usize) -> Vec<String>; // ANSI 行，行宽硬约束
-    fn invalidate(&mut self) {}                     // 主题失效重建
+    // 其余均为默认方法（上游可选成员的 Rust 表达）：
+    fn handle_input(&mut self, data: &str) {}          // no-op；无输入处理组件仍收到调用
+    fn wants_key_release(&self) -> bool { false }      // 默认不收 key release（Kitty）
+    fn invalidate(&mut self) {}                        // 主题失效重建
+    fn as_focusable(&self) -> Option<&dyn Focusable> { None }
+    fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> { None }
 }
 
 pub trait Focusable: Component {
-    fn handle_input(&mut self, raw: &str);
     fn focused(&self) -> bool;
-    fn wants_key_release(&self) -> bool { false }
+    fn set_focused(&mut self, focused: bool); // 上游 `component.focused = ...`
 }
-
-pub struct Tui { /* children, overlays, focus, previous_lines, viewport, terminal */ }
 ```
+
+落地要点（T11）：
+
+- **上游可选成员 → 默认方法**：`handleInput` / `wantsKeyRelease` / `invalidate` 直接默认化；
+  上游结构性检查 `"focused" in component`（`isFocusable`，tui.ts）→ `as_focusable()` 返回
+  `Option<&dyn Focusable>`（默认 `None`），`is_focusable()` 为类型守卫。
+- **`CURSOR_MARKER`**（`\x1b_pi:c\x07` 零宽 APC 序列）：focused 组件在渲染输出光标处发出，
+  TUI 提取后定位硬件光标（IME 候选窗定位）。
+- **`RenderHandle`**：可克隆句柄，只暴露 `request_render()`——替代上游 Loader 持有的整个
+  `ui: TUI` 实例（`ui.requestRender()`），组件仅持「请求渲染」能力。
+- **`Container`**：`Vec<Box<dyn Component>>` 子组件，`add_child` / `remove_child`
+  （指针同一性，替代上游 `indexOf` 引用相等）/ `clear`；`Tui` 自身镜像 Container API。
+- **组件存储与同一性**：`SharedComponent = Arc<Mutex<Box<dyn Component>>>`，身份比较
+  `Arc::ptr_eq`（替代 JS 引用 `===`）；overlay 栈条目携带唯一 `id`（替代
+  `restoreState.overlay === entry`）。
+- **重入**：`Tui` 为可克隆句柄包 `Arc<Mutex<TuiInner>>`；持锁期间（组件 `handle_input` /
+  `render` 内或他线程）的变更请求入 pending 队列，当前 dispatch/render 完成后按序
+  drain（替代上游 JS 同步重入 + 引用同一性）；只读查询锁争用返回默认值。
+- **定时器显式化**：上游隐式 `setTimeout` / `setInterval` → 显式 deadline 驱动——
+  `terminal.rs` 的 `next_flush_deadline` / `tick` / `pump`（150ms keyboard 协议缓冲 flush、
+  1s OSC 9;4 keepalive、introspection 查询超时），`tui.rs` 的 `request_render` 只记录意图、
+  `tick` 统一泵动、`next_deadline` 给出事件循环等待超时（16ms 渲染节流）；输入到达重排
+  deadline、到期只触发一次——语义与上游一致。
 
 ### 5.3 渲染
 
@@ -341,7 +366,9 @@ pub struct Tui { /* children, overlays, focus, previous_lines, viewport, termina
 4. 节流 16ms
 5. 行尾 SGR + OSC 8 reset
 6. Kitty 图像行范围 expand + delete
-7. 调试通道：`PIR_DEBUG_REDRAW`（记录全量重绘原因）、`PIR_TUI_WRITE_LOG`
+7. 调试通道：`PIR_DEBUG_REDRAW`（记录全量重绘原因）、`PIR_TUI_WRITE_LOG`（终端写日志）、
+   `PIR_TUI_DEBUG`（debug dump）、`PIR_HARDWARE_CURSOR`（硬件光标）、`PIR_CLEAR_ON_SHRINK`
+   （收缩清屏回退开关）——均依 ADR-0001 改 `PIR_` 前缀
 
 ### 5.4 输入
 
@@ -349,15 +376,31 @@ pub struct Tui { /* children, overlays, focus, previous_lines, viewport, termina
 
 `KeybindingsManager` 读 JSON，映射到 editor/action 枚举（与 Pi token 名一致，含旧键名迁移表 60+ 项，便于配置互通）。**键位判断永不硬编码**（例外：shift+ctrl+d = /debug）。
 
-### 5.5 组件移植清单（12 个，全量）
+输入相关环境变量同上依 ADR-0001 统一 `PIR_` 前缀；协议缓冲 flush / keepalive 采用
+显式 deadline 语义（§5.2），输入到达会重排 flush 截止时间。
 
-1. Terminal / Tui / Text / Container / Spacer / TruncatedText
-2. SelectList / Input / Editor（undo-stack、kill-ring、历史、paste marker、autocomplete）
-3. Markdown（marked 等价 + `trim_partial_closing_fences`）/ Loader / CancellableLoader / Box
-4. Image（Kitty + iTerm2 + 能力检测矩阵）/ SettingsList
-5. Utils：grapheme 宽度（`unicode-width` + ANSI 感知包装）
+### 5.5 组件移植清单（12 个，全量；标注落地状态）
+
+1. **T11 已落地**：Terminal / Tui / Text / Container / Spacer / TruncatedText（引擎 +
+   components/{text,spacer,truncated_text}.rs，Container 在 tui.rs）
+2. **T12**：SelectList / Input / Editor（undo-stack、kill-ring、历史、paste marker、autocomplete）/ Autocomplete
+3. **T11 已落地**：Loader / CancellableLoader / Box；**T12**：Markdown（marked 等价 + `trim_partial_closing_fences`）
+4. **T12**：Image（Kitty + iTerm2 + 能力检测矩阵）/ SettingsList
+5. **T11 已落地**：Utils——grapheme 宽度（`unicode-width` + ANSI 感知包装）
 
 coding-agent 侧 40 个交互组件在 `pir` crate 的 interactive mode 内实现（需求 §8.6 清单）。
+
+### 5.6 终端状态恢复（T11 落地）
+
+`recovery.rs` 承载终端状态恢复：`install_panic_hook`（先恢复终端、再走默认 panic 输出，
+恢复后**不退出进程**——Rust 继续 unwind，main 退出码 101，上游 `uncaughtCrash` 为
+`process.exit(1)`）、`restore_terminal`（Tui 锁被 panic 线程持有时回退固定恢复字节序列，
+避免死锁）、`spawn_signal_restore`（SIGTERM/SIGHUP 恢复后 exit 0，对齐上游
+`shutdown({fromSignal:true})`）。语义来自上游 coding-agent interactive-mode.ts 的
+`uncaughtCrash` / `registerSignalHandlers`（见 D-017）：上游在 coding-agent 层接线
+（Node 信号/异常回调是进程级注册），pir 因编码规范 §8.5 将终端恢复归 TUI 层且 Rust
+panic hook 为进程级状态，故落位 pir-tui；graceful-shutdown 编排（扩展清理、drainInput、
+session 关闭事件）仍留 interactive mode（T12），与上游拆分一致。
 
 ---
 
@@ -645,9 +688,20 @@ gantt
 | `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
 | `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001） |
 | `packages/coding-agent/src/core/session-manager.ts`（条目类型）+ `packages/agent/src/harness/types.ts`（SessionTreeEntry） | `crates/pir-agent/src/session.rs`（D-001：单一 serde 来源，T07/T16 共用） |
-| `packages/tui/src/tui.ts` | `crates/pir-tui/src/tui.rs` |
-| `packages/tui/src/keys.ts` / `stdin-buffer.ts` / `terminal.ts` | `crates/pir-tui/src/keys.rs` / `stdin_buffer.rs` / `terminal.rs` |
-| `packages/tui/src/components/*`（12 个） | `crates/pir-tui/src/components/*` |
+| `packages/tui/src/tui.ts` | `crates/pir-tui/src/tui.rs`（T11 已落地） |
+| `packages/tui/src/terminal.ts` | `crates/pir-tui/src/terminal.rs`（T11 已落地） |
+| `packages/tui/src/stdin-buffer.ts` | `crates/pir-tui/src/stdin_buffer.rs`（T11 已落地） |
+| `packages/tui/src/keys.ts` | `crates/pir-tui/src/keys.rs`（T11 已落地） |
+| `packages/tui/src/keybindings.ts` | `crates/pir-tui/src/keybindings.rs`（T11 已落地） |
+| `packages/tui/src/native-modifiers.ts` | `crates/pir-tui/src/native_modifiers.rs`（T11 已落地；恒 false 缺口见 ADR-0004） |
+| `packages/tui/src/terminal-colors.ts` | `crates/pir-tui/src/terminal_colors.rs`（T11 已落地） |
+| `packages/tui/src/terminal-image.ts` | `crates/pir-tui/src/terminal_image.rs`（T11 已落地） |
+| `packages/tui/src/fuzzy.ts` | `crates/pir-tui/src/fuzzy.rs`（T11 已落地） |
+| `packages/tui/src/utils.ts` | `crates/pir-tui/src/utils.rs`（T11 已落地） |
+| `packages/tui/src/components/{text,spacer,truncated-text,box,loader,cancellable-loader}.ts` | `crates/pir-tui/src/components/{text,spacer,truncated_text,box,loader,cancellable_loader}.rs`（T11 已落地） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（终端恢复 `uncaughtCrash` / `registerSignalHandlers`） | `crates/pir-tui/src/recovery.rs`（T11 已落地，D-017） |
+| `packages/tui/src/components/{select-list,input,editor,markdown,image,settings-list}.ts` | `crates/pir-tui/src/components/*`（T12） |
+| `packages/tui/src/{kill-ring,undo-stack,word-navigation,editor-component,autocomplete}.ts` | `crates/pir-tui/src/*`（T12） |
 | `packages/coding-agent/src/core/session-manager.ts` | `crates/pir/src/core/session_manager.rs` |
 | `packages/coding-agent/src/core/agent-session*.ts` | `crates/pir/src/core/agent_session*.rs` |
 | `packages/coding-agent/src/core/compaction/*` | 算法层 `crates/pir-agent/src/compaction*.rs` + 触发接线 `crates/pir/src/core/compaction_runner.rs`（D-013，T08） |

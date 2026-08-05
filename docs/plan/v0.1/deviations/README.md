@@ -43,6 +43,8 @@
 | D-013 | T08 | 实现细节 | compaction 移植 Rust 落地差异（算法层落 pir-agent::compaction + 触发接线 pir::core::compaction_runner、StreamOptions.reasoning 字段、session 共享函数下沉 3 项） | `02-design.md` §4.4、§6.4、§12 | 不需要 | 已回写 |
 | D-014 | T09 | 实现细节 | settings 与资源加载 Rust 落地差异（同步写盘/fs2 flock、Settings 保序 map 与类型收窄、serde_yaml/TypeBox/SyntaxError 引擎级文案、description 截断按 Unicode scalar、sourceInfo 归 resource_loader、TUI 件下沉 T11/T12、extensions/packages 占位边界等 11 项） | `02-design.md` §6.7、§12 | 不需要 | 已回写 |
 | D-015 | T10 | 实现细节 | headless 模式 Rust 落地差异（clap→手写解析器、provider 生态 T13 子集、--resume picker/子命令/--export 占位、docs 路径=exe dir、session_env 动态 cell、资源枚举确定性排序、SessionManager::list 提前等 7 项） | `02-design.md` §6.1、§6.3、§6.6、§12 | 不需要 | 已回写 |
+| D-016 | T11 | 行为级（功能缺口 2 条）+ 实现细节 | pir-tui 核心引擎 Rust 落地差异（macOS 原生修饰键检测缺失、Windows VT input 缺失两条功能缺口 → 目标平台 TUI 键位行为不同，判行为级理由见偏离文件「功能缺口」节；其余定时器显式 deadline、SharedComponent 与重入、组件实现细节等 31 项） | `01-requirements.md` §8.6、`02-design.md` §5、§12、`coding-standards.md` §8.2、`T11-pir-tui-core.md`、ADR-0004 | ADR-0004（行为级两条）/ 不需要 | 已关闭 |
+| D-017 | T11 | 实现细节 | 终端恢复语义落位 pir-tui `recovery.rs`（上游在 coding-agent interactive-mode 层；panic 后恢复终端不退出进程 exit 101 vs 上游 exit 1；信号恢复 exit 0 对齐 `shutdown({fromSignal:true})`） | `02-design.md` §5.6、§12 | 不需要 | 已关闭 |
 
 ## 4. 状态定义
 
