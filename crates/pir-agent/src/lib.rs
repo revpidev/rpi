@@ -20,6 +20,9 @@
 //!   `packages/coding-agent/src/core/session-manager.ts` and
 //!   `packages/agent/src/harness/types.ts` into one serde skeleton shared by
 //!   the `pir` main path and the harness layer.
+//! - [`harness`] mirrors `packages/agent/src/harness/` (T16 first block: the
+//!   `types.ts` type layer; storage implementations and the session classes
+//!   land in later T16 blocks).
 
 pub mod agent;
 pub mod agent_loop;
@@ -27,6 +30,7 @@ pub mod compaction;
 pub mod error;
 pub mod harness;
 pub mod messages;
+pub mod proxy;
 pub mod session;
 pub mod stream_fn;
 pub mod types;
@@ -46,11 +50,32 @@ pub use compaction::{
     CompactionSettings, CutPointResult, SummarizationArgs, DEFAULT_COMPACTION_SETTINGS,
 };
 pub use error::AgentError;
+pub use harness::{
+    apply_stream_options_patch, AbortResult, AgentHarness, AgentHarnessError,
+    AgentHarnessErrorCode, AgentHarnessEvent, AgentHarnessHook, AgentHarnessListener,
+    AgentHarnessOptions, AgentHarnessOwnEvent, AgentHarnessPhase, AgentHarnessPromptOptions,
+    AgentHarnessResources, AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch,
+    AgentHarnessSystemPrompt, AgentHarnessTool, AgentHarnessToolContextSource,
+    BeforeAgentStartResult, BranchSummaryError, BranchSummaryErrorCode, BranchSummaryResult,
+    ChunkCallback, CompactResult, CompactionError, CompactionErrorCode, ContextResult,
+    CreateDirOptions, CreateTempFileOptions, ExecutionEnv, ExecutionError, ExecutionErrorCode,
+    FileError, FileErrorCode, FileInfo, FileKind, FileOperations, FileSystem, ForkPosition,
+    GenerateBranchSummaryOptions, HarnessHookResult, JsonlSessionCreateOptions,
+    JsonlSessionListOptions, JsonlSessionMetadata, JsonlSessionRepoApi, NavigateTreeOptions,
+    NavigateTreeResult, PatchMap, PendingSessionWrite, PromptTemplate, ReadTextLinesOptions,
+    RemoveOptions, RetryOperation, Session, SessionBeforeCompactResult, SessionBeforeTreeResult,
+    SessionContext, SessionCreateOptions, SessionEntryCursorOptions, SessionError,
+    SessionErrorCode, SessionForkOptions, SessionMetadata, SessionModelRef, SessionRepo,
+    SessionStats, SessionStorage, Shell, ShellExecOptions, ShellExecResult, Skill,
+    SystemPromptContext, ToolCallResult, ToolResultPatch, TreePreparation, TreeSummary, TurnState,
+    UpdateSource,
+};
 pub use messages::{
     bash_execution_to_text, convert_to_llm, AgentMessage, BashExecutionMessage,
     BranchSummaryMessage, CompactionSummaryMessage, CustomMessage, BRANCH_SUMMARY_PREFIX,
     BRANCH_SUMMARY_SUFFIX, COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX,
 };
+pub use proxy::{stream_proxy, ProxyAssistantMessageEvent, ProxyStreamOptions};
 pub use stream_fn::{BoxStream, StreamFn};
 pub use types::{
     AgentEvent, AgentTool, AgentToolResult, AgentToolUpdateCallback, QueueMode, ToolExecutionMode,

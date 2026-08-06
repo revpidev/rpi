@@ -25,6 +25,15 @@
 //!   (session-format.md §Context Building; harness session.ts:123-127). The
 //!   pinned coding-agent `sessionEntryToContextMessages` omits the tail — the
 //!   doc-level behavior is ported here.
+//! - `leaf` records (harness-only format feature; `LeafEntry`) are replayed in
+//!   `build_index` with the harness leaf semantics — the leaf moves to the
+//!   record's `targetId` (`null` clears it), `leafIdAfterEntry`
+//!   (jsonl-storage.ts:134-136) — so a harness session file ending in a `leaf`
+//!   record loads with the same leaf as the harness loader. The main path
+//!   never writes `leaf` records, so files it produces are unaffected
+//!   (upstream coding-agent's "every entry advances the leaf" behavior holds
+//!   for all main-path files; the alignment only applies to harness files,
+//!   matching the T16 interop contract).
 //! - Randomness: `randomUUID()` → `pir_ai::utils::uuid::random_uuid`,
 //!   `uuidv7()` → `pir_ai::utils::uuid::uuidv7` (no `rand`/`uuid` crate in the
 //!   dependency baseline; non-security PRNG, see uuid.rs header).
@@ -1095,7 +1104,19 @@ impl SessionManager {
                 continue;
             };
             self.by_id.insert(id.to_owned(), i);
-            self.leaf_id = Some(id.to_owned());
+            // Harness `leaf` records move the leaf to their `targetId` (`null`
+            // clears it) instead of advancing to their own id — `leafIdAfterEntry`
+            // (jsonl-storage.ts:134-136). The main path never writes leaf records,
+            // so this only affects harness-produced files (see header note).
+            self.leaf_id = if record.type_tag() == "leaf" {
+                record
+                    .raw
+                    .get("targetId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            } else {
+                Some(id.to_owned())
+            };
             // Duck-typed label replay (entry.type === "label").
             if record.type_tag() == "label" {
                 let target = record.raw.get("targetId").and_then(Value::as_str);

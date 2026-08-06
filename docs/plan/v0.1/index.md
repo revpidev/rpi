@@ -47,10 +47,10 @@
 | T07 | [SessionManager（JSONL 树）](./T07-session-manager.md) | M3 | T01、T05 | 已完成 | 2026-08-03 |
 | T08 | [Compaction](./T08-compaction.md) | M3 | T07 | 已完成 | 2026-08-03 |
 | T09 | [Settings 与资源加载](./T09-settings-resources.md) | M3 | T01 | 已完成 | 2026-08-03 |
-| T16 | [pir-agent harness 层](./T16-agent-harness.md) | M3 | T05、T07、T08 | 未开始 | — |
+| T16 | [pir-agent harness 层](./T16-agent-harness.md) | M3 | T05、T07、T08 | 已完成 | 2026-08-06 |
 | T10 | [Headless 模式：print / json / rpc](./T10-headless-modes.md) | M4 | T03、T04、T05、T06、T07、T08、T09 | 已完成 | 2026-08-04 |
 | T11 | [pir-tui 核心引擎](./T11-pir-tui-core.md) | M5 | T01 | 已完成 | 2026-08-05 |
-| T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 待验收（待真机 smoke 人工确认） | — |
+| T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 已完成 | 2026-08-06 |
 | T13 | [全量 Provider 与 OAuth](./T13-providers-oauth.md) | M6 | T03、T04 | 未开始 | — |
 | T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 未开始 | — |
 | T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 未开始 | — |
@@ -87,6 +87,8 @@ docs/plan/v0.1/
 
 | 日期 | 变更 | 说明 |
 |------|------|------|
+| 2026-08-06 | T12 验收完成 | 用户真机 smoke 人工验证通过（本机 + tmux 两种环境：启动、提问、streaming、abort、快捷键、退出恢复），T12 置「已完成」，验收日期 2026-08-06 |
+| 2026-08-06 | T16 验收通过 | pir-agent harness 层完成：types（22 事件/错误族/trait）/agent_harness（phase 机、三队列、持久化屏障、失败重放）/session 门面与四存储实现/env/tools/resources/utils/proxy 全量移植；上游 14 个测试文件意图移植（sqlite-* 除外）+ 互通对拍 4 用例（修复 SessionManager build_index leaf 重放分歧）；偏离 D-020 登记回写（含 harness compaction 变体勘误：prepareCompaction 不提前返回、带 retainedTail，变体移植于 agent_harness.rs）；`02-design.md` §6.4/§12 同步 |
 | 2026-07-28 | v0.1 创建 | 初始 15 任务划分（M0–M8） |
 | 2026-07-28 | 选型收口 | Bedrock 接入 / OAuth 回调 / 动态库 ABI / 事件通道 / 工具并行原语钉死（设计文档 §14），同步 T04/T05/T13/T15 与编码规范 |
 | 2026-07-29 | 覆盖度审查修订 | 依据 2026-07-29 覆盖度审查与 ADR-0003 全面修订：新增 T16（harness 层，M3）；T05 循环语义 9→19 条；T06 补 output_accumulator/bash_executor 与全常数锚点；T07 修正 session 无锁、补延迟落盘/id 规则/条目全集；T10 补 RPC 30 命令与 CLI 全标志语义；T13 provider 清单更新为 39 工厂 + 7 OAuth + compat 矩阵；grep/find/ls 原生实现（ADR-0003 §2）归入 T14；T15 能力面更新为 27 事件 + 27 API + 29 UI；gates 补红线与逐条对拍基准 |

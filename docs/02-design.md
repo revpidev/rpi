@@ -295,7 +295,7 @@ pub type StreamFn = Arc<dyn Fn(Model, Context, StreamOptions) -> BoxStream<'stat
 
 Agent **不**依赖具体 provider，便于测试 faux 与 proxy。StreamFn 不得 panic（对齐「不得 throw」契约）。
 
-> Rust 落地注记（D-010，T05 验收）：hook 的 args 回传与错误降级经返回值通道表达（`BeforeToolCallResult.args`、`AfterToolCallFn -> Result<..>`）；`BoxStream` 无 result 通道，流无终止事件时合成 error 消息收尾；reasoning/thinking_budgets 保留在 `AgentLoopConfig` 由组装层绑定；listener 屏障为 in-process 按注册序串行 await；`continue()` 命名 `continue_run`。详见 `docs/plan/v0.1/deviations/D-010-agent-loop-rust-notes.md`。
+> Rust 落地注记（D-010，T05 验收）：hook 的 args 回传与错误降级经返回值通道表达（`BeforeToolCallResult.args`、`AfterToolCallFn -> Result<..>`）；`BoxStream` 无 result 通道，流无终止事件时合成 error 消息收尾；reasoning 保留在 `AgentLoopConfig` 作为活值，由 `stream_assistant_response` 每轮绑定进 `StreamOptions.reasoning`（镜像上游 `{...config, apiKey, signal}` 展开，2026-08-06 修复前未绑定导致 thinking 级别从未到达请求）；`thinking_budgets` 无 `StreamOptions` 通道、仅 anthropic 适配器消费；listener 屏障为 in-process 按注册序串行 await；`continue()` 命名 `continue_run`。详见 `docs/plan/v0.1/deviations/D-010-agent-loop-rust-notes.md`。
 >
 > Rust 落地注记（D-013，T08 验收）：`StreamOptions` 增加 `reasoning: Option<ModelThinkingLevel>` 字段——上游 summary 调用经 `SimpleStreamOptions.reasoning` 传 thinking level，而 pir-agent 的 summary 生成直接走本节的 `StreamFn`（裸 `StreamOptions`），reasoning 通道因此落在 `StreamOptions` 上；默认 `None`，既有路径行为不变。
 
@@ -475,6 +475,8 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 - 请求隔离：`cacheRetention:"none"` + 新 routing session id（uuidv7）+ 复用 `settings.retry`
 
 **Rust 落地注记**（T08，D-013）：算法层（估算/切点/prompt/summary 生成/branch 装填）落 `crates/pir-agent/src/compaction.rs`（+ `compaction/utils.rs`、`compaction/branch_summarization.rs`），供 coding-agent 与 T16 harness 复用（§4.5）；coding-agent 侧触发接线（双路 `_checkCompaction`、overflow 一次恢复、`_runAutoCompaction`、compaction 事件发射）落 `crates/pir/src/core/compaction_runner.rs`。`parse_iso8601_ms` / `session_entry_to_context_messages` / `get_latest_compaction_entry` / `build_context_messages` 单一来源在 `pir-agent::session`，`pir::core::session_manager` re-export（D-001 延伸）。`estimatedTokensAfter` 按上游 `agent-session.ts` 语义=压缩后 context 消息的纯 `estimateTokens` 求和（非 `estimate.ts` 的 usage 锚点版）。
+
+**T16 勘误补记**（D-020）：本节「供 coding-agent 与 T16 harness 复用」仅对 LLM 调用/估算/切点/文件操作成立——实测钉死源码后确认上游 harness `compaction.ts` 的 `prepareCompaction` 与 coding-agent 版**不同变体**（空 summarize 集不提前返回、准备结果带 `retainedTail`），harness 变体 `prepare_harness_compaction` 移植于 `crates/pir-agent/src/harness/agent_harness.rs`（harness/compaction.ts:640-713），不复用 T08 的 `prepare_compaction`。
 
 ### 6.5 工具模块（coding-agent 基准）
 
@@ -694,7 +696,7 @@ gantt
 | `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（生成）+ `pir update --models`（远程） |
 | `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
 | `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
-| `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001） |
+| `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001；T16 已落地，D-020：compaction/messages 复用 crate 根模块、session 门面 + 四存储实现 + env/tools/resources/utils + `src/proxy.rs` ← `packages/agent/src/proxy.ts`） |
 | `packages/coding-agent/src/core/session-manager.ts`（条目类型）+ `packages/agent/src/harness/types.ts`（SessionTreeEntry） | `crates/pir-agent/src/session.rs`（D-001：单一 serde 来源，T07/T16 共用） |
 | `packages/tui/src/tui.ts` | `crates/pir-tui/src/tui.rs`（T11 已落地） |
 | `packages/tui/src/terminal.ts` | `crates/pir-tui/src/terminal.rs`（T11 已落地） |

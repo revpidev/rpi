@@ -64,7 +64,10 @@ pub struct CompactionDetails {
 
 /// `extractFileOperations` (compaction.ts:42-70): file ops from the previous
 /// compaction's `details` (pi-generated only) plus tool calls in messages.
-fn extract_file_operations(
+///
+/// `pub(crate)` for `harness::agent_harness::prepare_harness_compaction`, the
+/// harness-variant preparation (harness/compaction/compaction.ts:640-713).
+pub(crate) fn extract_file_operations(
     messages: &[AgentMessage],
     entries: &[SessionEntry],
     prev_compaction_index: Option<usize>,

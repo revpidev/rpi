@@ -1137,6 +1137,48 @@ fn leaf_pointer_advances_after_each_append() {
     assert_eq!(session.get_leaf_id(), Some(id3.as_str()));
 }
 
+/// Harness `leaf` records replay with the harness leaf semantics — the leaf
+/// moves to the record's `targetId` (`null` clears it) rather than to the
+/// record's own id (`leafIdAfterEntry`, jsonl-storage.ts:134-136; T16 interop
+/// alignment, see module header). The main path never writes leaf records, so
+/// this only affects harness-produced files.
+#[test]
+fn leaf_records_replay_with_harness_target_semantics() {
+    let tmp = TempDir::new();
+    let file = tmp.path().join("harness.jsonl");
+    // Trailing leaf move: `targetId` wins over the leaf record's own id.
+    let content = format!(
+        "{}\n{}\n{}\n{}\n",
+        header_line("sess-1", "/tmp"),
+        user_line("u1", "", "one"),
+        user_line("u2", "u1", "two"),
+        "{\"type\":\"leaf\",\"id\":\"l1\",\"parentId\":\"u2\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"targetId\":\"u1\"}",
+    );
+    std::fs::write(&file, content).expect("write harness file");
+    let mut sm = SessionManager::open(&file, Some(tmp.path()), None).expect("open");
+    assert_eq!(sm.get_leaf_id(), Some("u1"));
+    assert_eq!(sm.get_leaf_entry().expect("leaf entry").id(), "u1");
+
+    // Continuing parents the next message to the target, not to the leaf record.
+    let id = sm.append_message(user_msg("three")).expect("append");
+    let appended = sm.get_entry(&id).expect("entry");
+    assert_eq!(appended.parent_id(), Some("u1"));
+    assert_eq!(sm.get_leaf_id(), Some(id.as_str()));
+
+    // `targetId: null` clears the leaf (harness moveTo(root)).
+    let null_file = tmp.path().join("harness-null.jsonl");
+    let content = format!(
+        "{}\n{}\n{}\n",
+        header_line("sess-2", "/tmp"),
+        user_line("u1", "", "one"),
+        "{\"type\":\"leaf\",\"id\":\"l1\",\"parentId\":\"u1\",\"timestamp\":\"2025-01-01T00:00:03.000Z\",\"targetId\":null}",
+    );
+    std::fs::write(&null_file, content).expect("write harness file");
+    let sm = SessionManager::open(&null_file, Some(tmp.path()), None).expect("open");
+    assert_eq!(sm.get_leaf_id(), None);
+    assert!(sm.get_branch(None).is_empty());
+}
+
 // ===========================================================================
 // tree-traversal.test.ts — getBranch
 // ===========================================================================

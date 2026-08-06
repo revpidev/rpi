@@ -1811,15 +1811,21 @@ name = "pir-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
+ "ignore",
+ "libc",
  "pir-ai",
  "pir-test-support",
+ "reqwest",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
  "tracing",
+ "unicode-normalization",
 ]
 
 [[package]]

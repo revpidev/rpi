@@ -47,6 +47,7 @@
 | D-017 | T11 | 实现细节 | 终端恢复语义落位 pir-tui `recovery.rs`（上游在 coding-agent interactive-mode 层；panic 后恢复终端不退出进程 exit 101 vs 上游 exit 1；信号恢复 exit 0 对齐 `shutdown({fromSignal:true})`） | `02-design.md` §5.6、§12 | 不需要 | 已关闭 |
 | D-018 | T12 | 实现细节 | Markdown 解析器 comrak 0.54 替代 marked@18.0.5（AST 对应：sourcepos 切片还原 raw、space token 合成、严格删除线/任务判定对齐；3 条残留边缘差异 + 3 个 xterm 用例改输出级断言） | `02-design.md` §5、§12、`01-requirements.md` §8.6 | 不需要 | 已回写 |
 | D-019 | T12 | 实现细节 | interactive 模式移植 Rust 落地笔记（汇总型 25 条：组件 region 模式、显式主题注入、/copy 仅 OSC52、/debug 行段缺口、Ctrl+Z SIGTSTP、轮询主题/git watcher、willRetry 死代码、首启判定、--resume 独立 picker、OutputPad streaming 等，逐条三档标注；「会话切换不重订阅」2026-08-06 修复关闭） | `02-design.md` §5、§12、`01-requirements.md` §8、`T12-interactive-mode.md` | 不需要 | 已回写 |
+| D-020 | T16 | 实现细节 | harness 层 Rust 落地差异（**harness compaction 变体勘误**：prepareCompaction 与 coding-agent 版不同，harness 变体移植于 agent_harness.rs；SessionStorage 写方法 &self+Mutex；SessionManager build_index leaf 重放兼容；skills/templates/system-prompt 独立移植；pir-agent 新增 6 基线依赖；env/tools/truncate/proxy 局部等价 8 组） | `02-design.md` §6.4、§12、`T16-agent-harness.md` | 不需要 | 已回写 |
 
 ## 4. 状态定义
 

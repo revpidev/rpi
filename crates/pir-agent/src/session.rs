@@ -143,6 +143,16 @@ pub struct CustomEntry {
 ///
 /// `display` controls TUI rendering: false = hidden entirely; true = rendered
 /// with distinct styling.
+///
+/// Wire-order note: the fields follow the harness `SessionEntry` base first
+/// (type, id, parentId, timestamp — the crate-wide struct order) and then
+/// `customType, content, display, details`, matching the harness writer
+/// (session.ts:301-309). The coding-agent writer (session-manager.ts:
+/// 1178-1186) instead serializes `type, customType, content, display,
+/// details, id, parentId, timestamp` — the id/parentId/timestamp base at the
+/// tail — which one struct cannot express; no custom serialization is
+/// introduced for that quirk (JSON key order is not semantically meaningful,
+/// and the parity normalizer compares parsed values).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomMessageEntry {
@@ -155,9 +165,9 @@ pub struct CustomMessageEntry {
     /// `sessionEntryToContextMessages` (session-manager.ts:398).
     #[serde(default)]
     pub content: pir_ai::types::UserContent,
+    pub display: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
-    pub display: bool,
 }
 
 /// `LabelEntry` — user-defined bookmarks/markers on entries.
@@ -376,13 +386,20 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 /// Returns `None` for anything else, where upstream `new Date(ts).getTime()`
 /// yields `NaN`; callers substitute `0` (Rust has no NaN for i64).
 ///
+/// Accepted shapes (what `Date.parse` understands — jsonl-repo.ts:123 sorts
+/// sessions by it): `YYYY-MM-DDTHH:MM:SS` with an optional `.sss` fraction
+/// (1-3 digits, fractional — `.1` is 100 ms) and the timezone `Z`,
+/// `±HH:MM`, `±HHMM`, or `±HH`. The result is UTC milliseconds; the two
+/// forms the crate itself writes (`...SSZ` and `...SS.sssZ`) parse exactly as
+/// before.
+///
 /// Single source for this parse: the `pir` main path (`session_manager.rs`)
 /// and the compaction wiring both use it (stale-usage timestamp guards,
 /// agent-session.ts:1974/2030).
 pub fn parse_iso8601_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    // YYYY-MM-DDTHH:MM:SS[.sss]Z
-    if b.len() != 20 && b.len() != 24 {
+    // YYYY-MM-DDTHH:MM:SS[.sss][Z|±HH[:]MM]
+    if b.len() < 20 {
         return None;
     }
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
@@ -398,19 +415,60 @@ pub fn parse_iso8601_ms(s: &str) -> Option<i64> {
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
         return None;
     }
-    let (milli, z_off) = if b.len() == 24 {
-        if b[19] != b'.' {
+    let mut milli = 0i64;
+    let mut offset = 19;
+    if b.get(19) == Some(&b'.') {
+        // Fractional seconds: 1-3 digits, right-padded to milliseconds.
+        let mut digits = 0;
+        let mut value = 0i64;
+        while let Some(&byte) = b.get(20 + digits) {
+            if !byte.is_ascii_digit() {
+                break;
+            }
+            value = value * 10 + (byte - b'0') as i64;
+            digits += 1;
+            if digits == 3 {
+                break;
+            }
+        }
+        if digits == 0 {
             return None;
         }
-        (num(20, 23)?, 23)
-    } else {
-        (0, 19)
-    };
-    if b[z_off] != b'Z' {
-        return None;
+        milli = match digits {
+            1 => value * 100,
+            2 => value * 10,
+            _ => value,
+        };
+        offset = 20 + digits;
     }
+    let zone = s.get(offset..)?;
+    let offset_ms = match zone {
+        "Z" => 0,
+        _ => {
+            let (sign, rest) = match zone.as_bytes().first() {
+                Some(b'+') => (1i64, &zone[1..]),
+                Some(b'-') => (-1i64, &zone[1..]),
+                _ => return None,
+            };
+            let (hh, mm) = if rest.len() == 5 && rest.as_bytes().get(2) == Some(&b':') {
+                (&rest[..2], &rest[3..])
+            } else if rest.len() == 4 {
+                (&rest[..2], &rest[2..])
+            } else if rest.len() == 2 {
+                (rest, "00")
+            } else {
+                return None;
+            };
+            let hh: i64 = hh.parse().ok()?;
+            let mm: i64 = mm.parse().ok()?;
+            if hh > 23 || mm > 59 {
+                return None;
+            }
+            sign * (hh * 3_600_000 + mm * 60_000)
+        }
+    };
     let days = days_from_civil(y, mo, d);
-    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1000 + milli)
+    Some(days * 86_400_000 + h * 3_600_000 + mi * 60_000 + sec * 1000 + milli - offset_ms)
 }
 
 /// `createCustomMessage` (messages.ts:81-98).
@@ -580,6 +638,55 @@ mod tests {
     }
 
     #[test]
+    fn parse_iso8601_ms_accepts_millisecond_free_and_offset_variants() {
+        // The crate's own written forms parse exactly as before.
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T00:00:00.123Z"),
+            parse_iso8601_ms("2026-07-30T00:00:00.123Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T00:00:00Z"),
+            parse_iso8601_ms("2026-07-30T00:00:00.000Z")
+        );
+        // Fractional seconds: 1-3 digits, `.1` = 100 ms.
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T00:00:00.1Z"),
+            parse_iso8601_ms("2026-07-30T00:00:00.100Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T00:00:00.12Z"),
+            parse_iso8601_ms("2026-07-30T00:00:00.120Z")
+        );
+        // Timezone offsets: `+08:00` is UTC minus 8 hours.
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T14:00:00.123+08:00"),
+            parse_iso8601_ms("2026-07-30T06:00:00.123Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T14:00:00+0830"),
+            parse_iso8601_ms("2026-07-30T14:00:00+08:30")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T14:00:00+08"),
+            parse_iso8601_ms("2026-07-30T06:00:00.000Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T14:00:00-05:00"),
+            parse_iso8601_ms("2026-07-30T19:00:00.000Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2026-07-30T00:00:00.000+00:00"),
+            parse_iso8601_ms("2026-07-30T00:00:00.000Z")
+        );
+        // Still rejected: non-ISO separators, missing timezone, bad zones.
+        assert_eq!(parse_iso8601_ms("2024-12-03 14:00:00"), None);
+        assert_eq!(parse_iso8601_ms("not a date"), None);
+        assert_eq!(parse_iso8601_ms("2026-07-30T00:00:00"), None);
+        assert_eq!(parse_iso8601_ms("2026-07-30T00:00:00Zx"), None);
+        assert_eq!(parse_iso8601_ms("2026-07-30T00:00:00+24:00"), None);
+    }
+
+    #[test]
     fn session_header_shape() {
         let header = SessionHeader {
             version: Some(CURRENT_SESSION_VERSION),
@@ -738,12 +845,27 @@ mod tests {
             timestamp: timestamp.clone(),
             custom_type: "note".to_owned(),
             content: pir_ai::types::UserContent::Text("hello".to_owned()),
-            details: None,
             display: false,
+            details: None,
         });
         assert_eq!(
             to_json(&custom_message),
             r#"{"type":"custom_message","id":"e","parentId":null,"timestamp":"t","customType":"note","content":"hello","display":false}"#
+        );
+        // `details` serializes after `display` — the harness writer's order
+        // (session.ts:301-309 `...content, display, details`).
+        let custom_message_with_details = FileEntry::CustomMessage(CustomMessageEntry {
+            id: id.clone(),
+            parent_id: parent_id.clone(),
+            timestamp: timestamp.clone(),
+            custom_type: "note".to_owned(),
+            content: pir_ai::types::UserContent::Text("hello".to_owned()),
+            display: true,
+            details: Some(json!({"ok": true})),
+        });
+        assert_eq!(
+            to_json(&custom_message_with_details),
+            r#"{"type":"custom_message","id":"e","parentId":null,"timestamp":"t","customType":"note","content":"hello","display":true,"details":{"ok":true}}"#
         );
 
         // Label: `label: string | undefined` -> key omitted when None.

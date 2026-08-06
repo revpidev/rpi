@@ -22,7 +22,11 @@ use crate::messages::AgentMessage;
 // ============================================================================
 
 /// `FileOperations` (utils.ts:12-16).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serde derives serve the harness type layer (`harness::types::FileOperations`,
+/// harness/types.ts:862-866), where the same type rides inside event payloads;
+/// the sets serialize as JSON arrays.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileOperations {
     pub read: HashSet<String>,
     pub written: HashSet<String>,
