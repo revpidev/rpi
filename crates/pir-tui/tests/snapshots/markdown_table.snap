@@ -1,0 +1,9 @@
+┌─────────────┬─────────────────────┬────────────┐
+│ Command     │ Description         │ Example    │
+├─────────────┼─────────────────────┼────────────┤
+│ npm install │ Install all         │ npm        │
+│             │ dependencies        │ install    │
+├─────────────┼─────────────────────┼────────────┤
+│ npm run     │ Build the project   │ npm run    │
+│ build       │                     │ build      │
+└─────────────┴─────────────────────┴────────────┘

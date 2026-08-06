@@ -591,12 +591,30 @@ impl KeybindingsManager {
         keys.iter().any(|key| matches_key(data, key))
     }
 
+    /// Whether `data` matches any key bound to the keybinding id `id`
+    /// (string-id form of [`Self::matches`]). App-side ids without a
+    /// [`Keybinding`] variant (`app.*`, injected downstream via declaration
+    /// merging in upstream) use this — the manager is created with the full
+    /// app + tui definitions by the coding-agent startup.
+    pub fn matches_id(&self, data: &str, id: &str) -> bool {
+        let Some(keys) = self.keys_by_id.get(id) else {
+            return false;
+        };
+        keys.iter().any(|key| matches_key(data, key))
+    }
+
     /// Resolved keys for a keybinding (`getKeys`, keybindings.ts:202-204).
     pub fn get_keys(&self, keybinding: Keybinding) -> Vec<String> {
         self.keys_by_id
             .get(keybinding.as_str())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Resolved keys for a keybinding id (string-id form of
+    /// [`Self::get_keys`]; `app.*` ids use this).
+    pub fn get_keys_by_id(&self, id: &str) -> Vec<String> {
+        self.keys_by_id.get(id).cloned().unwrap_or_default()
     }
 
     /// Definition for a keybinding, or `None` when unknown
@@ -806,6 +824,40 @@ mod tests {
             config.insert((*id).to_string(), value.clone());
         }
         KeybindingsManager::new(tui_keybindings().to_vec(), config)
+    }
+
+    #[test]
+    fn matches_id_and_get_keys_by_id_support_arbitrary_ids() {
+        // App-side ids have no `Keybinding` variant (declaration merging
+        // upstream); the string-id forms resolve them the same way.
+        let definitions = vec![
+            (
+                "app.interrupt".to_string(),
+                KeybindingDefinition {
+                    default_keys: KeyBindingValue::Single("escape".to_string()),
+                    description: None,
+                },
+            ),
+            (
+                "app.clear".to_string(),
+                KeybindingDefinition {
+                    default_keys: KeyBindingValue::Multiple(keys(&["ctrl+c", "ctrl+q"])),
+                    description: None,
+                },
+            ),
+        ];
+        let manager = KeybindingsManager::new(definitions, KeybindingsConfig::new());
+        assert!(manager.matches_id("\u{1b}", "app.interrupt"));
+        assert!(!manager.matches_id("\u{3}", "app.interrupt"));
+        assert!(manager.matches_id("\u{3}", "app.clear"));
+        assert!(manager.matches_id("\u{11}", "app.clear"));
+        assert_eq!(
+            manager.get_keys_by_id("app.clear"),
+            keys(&["ctrl+c", "ctrl+q"])
+        );
+        // Unknown ids resolve to empty / no match.
+        assert!(manager.get_keys_by_id("app.nonexistent").is_empty());
+        assert!(!manager.matches_id("\u{1b}", "app.nonexistent"));
     }
 
     #[test]

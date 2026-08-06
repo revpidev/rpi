@@ -383,12 +383,20 @@ pub trait Focusable: Component {
 
 1. **T11 已落地**：Terminal / Tui / Text / Container / Spacer / TruncatedText（引擎 +
    components/{text,spacer,truncated_text}.rs，Container 在 tui.rs）
-2. **T12**：SelectList / Input / Editor（undo-stack、kill-ring、历史、paste marker、autocomplete）/ Autocomplete
-3. **T11 已落地**：Loader / CancellableLoader / Box；**T12**：Markdown（marked 等价 + `trim_partial_closing_fences`）
-4. **T12**：Image（Kitty + iTerm2 + 能力检测矩阵）/ SettingsList
+2. **T12 已落地**：SelectList / Input / Editor（undo-stack、kill-ring、历史、paste marker、autocomplete）/ Autocomplete
+3. **T11 已落地**：Loader / CancellableLoader / Box；**T12 已落地**：Markdown（**comrak 0.54 替代 marked**，D-018；`trim_partial_closing_fences`）
+4. **T12 已落地**：Image（Kitty + iTerm2 + 能力检测矩阵）/ SettingsList
 5. **T11 已落地**：Utils——grapheme 宽度（`unicode-width` + ANSI 感知包装）
 
-coding-agent 侧 40 个交互组件在 `pir` crate 的 interactive mode 内实现（需求 §8.6 清单）。
+coding-agent 侧 40 个交互组件在 `pir` crate 的 interactive mode 内实现（需求 §8.6 清单）：
+消息渲染族 13（assistant/user/tool-execution/diff/bash-execution/branch-summary/
+compaction-summary/skill-invocation/custom-message/custom-entry/footer/custom-editor/
+keybinding-hints 等）与选择器/对话框族 20（tree/session(+search)/config/settings/
+model(+search)/scoped-models/oauth/trust/theme/thinking/show-images/user-message/
+extension 选择器 + login-dialog/extension-editor/extension-input/bordered-loader/
+first-time-setup/status-indicator/countdown-timer/dynamic-border/visual-truncate）——
+彩蛋组件 [DEFER]。模式骨架（interactive_mode.rs）与命令/autocomplete/主题热重载/
+外部编辑器/首启 setup 均落地（T12，D-019）。
 
 ### 5.6 终端状态恢复（T11 落地）
 
@@ -430,7 +438,7 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 
 与 Pi `main.ts` / `createAgentSessionRuntime` 对齐，保证 `/new`、切 cwd、resume 时 **重建 cwd 绑定服务**。**不实现** Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3）。
 
-**Rust 落地注记**（T10，D-015）：实现于 `crates/pir/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker / install 等子命令 / `--export` 为 T12/T14 占位（入口可识别并给「未实现」诊断）；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（pir 无 npm 包随捆 docs）；进程标记环境变量 `PIR_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
+**Rust 落地注记**（T10，D-015）：实现于 `crates/pir/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker 已落地（2026-08-06，`crates/pir/src/cli/session_picker.rs` 独立启动选择器，D-019）；install 等子命令 / `--export` 为 T14 占位（入口可识别并给「未实现」诊断）；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（pir 无 npm 包随捆 docs）；进程标记环境变量 `PIR_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
 
 ### 6.2 `AgentSession`
 
@@ -714,7 +722,12 @@ gantt
 | `packages/coding-agent/src/main.ts`（启动管线） | `crates/pir/src/app.rs` + `main.rs`（D-015，T10） |
 | `packages/coding-agent/src/core/sdk.ts` | `crates/pir/src/sdk.rs` |
 | `packages/coding-agent/src/core/model-runtime.ts` / `model-resolver.ts` | `crates/pir/src/core/model_runtime.rs` / `model_resolver.rs` |
-| `packages/coding-agent/src/modes/*` | `crates/pir/src/modes/*`（`print_mode.rs`、`rpc.rs`；interactive 在 T12） |
+| `packages/coding-agent/src/modes/*` | `crates/pir/src/modes/*`（`print_mode.rs`、`rpc.rs`、`interactive/interactive_mode.rs` + `interactive/commands.rs` + `interactive/autocomplete.rs` + `interactive/theme_watcher.rs` + `interactive/git_branch_watcher.rs` + `interactive/startup_ui.rs` + `interactive/external_editor.rs` + `interactive/interactive_mode/commands_selectors.rs`） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | `crates/pir/src/modes/interactive/interactive_mode.rs`（S4b-S7a 落地） |
+| `packages/coding-agent/src/modes/interactive/components/*`（40 个） | `crates/pir/src/modes/interactive/components/*`（消息族 13 + 选择器/对话框族 20，snake_case；彩蛋 [DEFER]） |
+| `packages/coding-agent/src/core/{slash-commands,cache-stats}.ts` | `crates/pir/src/core/slash_commands.rs`（cache-stats 挂点，T14） |
+| `packages/coding-agent/src/modes/interactive/{model-search,external-editor}.ts` | `crates/pir/src/modes/interactive/{model_search.rs → components/,external_editor.rs}` |
+| `packages/tui/src/components/markdown.ts`（marked） | `crates/pir-tui/src/components/markdown.rs`（**comrak 0.54 替代**，D-018） |
 | `packages/coding-agent/src/cli/*` / `package-manager-cli.ts` | `crates/pir/src/cli/*` |
 | `packages/coding-agent/src/rpc-entry.ts` | `crates/pir/src/bin/pir_rpc.rs`（`[[bin]] pir-rpc`） |
 | ~~`packages/coding-agent/src/migrations.ts`~~ | **不实现**（ADR-0003 §3） |

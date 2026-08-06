@@ -88,7 +88,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -671,6 +671,16 @@ pub struct Tui {
     inbox: Arc<Mutex<VecDeque<InboxEvent>>>,
     next_listener_id: Arc<AtomicU64>,
     next_overlay_id: Arc<AtomicU64>,
+    /// Cached terminal dimensions for lock-free reads from component
+    /// methods (the inner lock is held while components render).
+    size_cache: TerminalSizeCache,
+}
+
+/// Lock-free terminal size cache shared between `Tui` and `TuiInner`.
+#[derive(Clone, Default)]
+struct TerminalSizeCache {
+    rows: Arc<AtomicU16>,
+    columns: Arc<AtomicU16>,
 }
 
 struct TuiInner {
@@ -704,6 +714,7 @@ struct TuiInner {
     overlay_stack: Vec<OverlayStackEntry>,
     overlay_focus_restore: OverlayFocusRestoreState,
     schedule: Arc<Mutex<RenderSchedule>>,
+    size_cache: TerminalSizeCache,
 }
 
 impl Tui {
@@ -724,6 +735,10 @@ impl Tui {
             deadline: None,
             last_render_at: None,
         }));
+        let size_cache = TerminalSizeCache {
+            rows: Arc::new(AtomicU16::new(terminal.rows())),
+            columns: Arc::new(AtomicU16::new(terminal.columns())),
+        };
         let inner = TuiInner {
             terminal,
             children: Vec::new(),
@@ -755,6 +770,7 @@ impl Tui {
             overlay_stack: Vec::new(),
             overlay_focus_restore: OverlayFocusRestoreState::Inactive,
             schedule: Arc::clone(&schedule),
+            size_cache: size_cache.clone(),
         };
         Tui {
             inner: Arc::new(Mutex::new(inner)),
@@ -763,6 +779,7 @@ impl Tui {
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             next_listener_id: Arc::new(AtomicU64::new(1)),
             next_overlay_id: Arc::new(AtomicU64::new(1)),
+            size_cache,
         }
     }
 
@@ -825,6 +842,36 @@ impl Tui {
                 inner.children.remove(index);
             }
         });
+    }
+
+    /// Rust addition (T12-S5a `showSelector`): insert a child at a specific
+    /// position. Upstream swaps `editorContainer` contents in place; the port
+    /// swaps the editor child in the TUI's child list, so position-preserving
+    /// replacement needs an insert. Out-of-range indexes append.
+    pub fn insert_child_at(&self, index: usize, component: SharedComponent) {
+        self.run_or_queue(move |inner| {
+            let index = index.min(inner.children.len());
+            inner.children.insert(index, component);
+        });
+    }
+
+    /// Rust addition (T12-S5a `showSelector`): the position of a child in
+    /// the TUI's child list (identity comparison). `None` on lock contention
+    /// or when not mounted.
+    pub fn child_position(&self, component: &SharedComponent) -> Option<usize> {
+        self.try_read(|inner| {
+            inner
+                .children
+                .iter()
+                .position(|child| same_component(child, component))
+        })
+        .flatten()
+    }
+
+    /// Rust addition (T12-S5a `showSelector`): the number of top-level
+    /// children. 0 on lock contention.
+    pub fn children_len(&self) -> usize {
+        self.try_read(|inner| inner.children.len()).unwrap_or(0)
     }
 
     /// Upstream `clear` (tui.ts:270).
@@ -1015,6 +1062,14 @@ impl Tui {
                 schedule_render(&schedule, false, Instant::now());
             }
         })
+    }
+
+    /// Terminal row count (upstream `terminal.rows`), cached for lock-free
+    /// reads. Components read this from `render`/`handle_input` while the
+    /// inner lock is held, so the cache is refreshed on every render frame
+    /// and initialized at construction.
+    pub fn terminal_rows(&self) -> u16 {
+        self.size_cache.rows.load(Ordering::Relaxed)
     }
 
     // --- lifecycle and driving --------------------------------------------
@@ -2627,6 +2682,14 @@ impl TuiInner {
         }
         let width = i32::from(self.terminal.columns());
         let height = i32::from(self.terminal.rows());
+        // Refresh the lock-free size cache (read by components, e.g. the
+        // Editor's `terminal_rows`, which cannot take the inner lock).
+        self.size_cache
+            .rows
+            .store(self.terminal.rows(), Ordering::Relaxed);
+        self.size_cache
+            .columns
+            .store(self.terminal.columns(), Ordering::Relaxed);
         let width_changed = self.previous_width != 0 && self.previous_width != width;
         let height_changed = self.previous_height != 0 && self.previous_height != height;
         let previous_buffer_length = if self.previous_height > 0 {

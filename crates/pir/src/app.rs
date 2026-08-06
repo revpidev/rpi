@@ -6,8 +6,7 @@
 //! - Subcommand dispatch (install/remove/uninstall/list/update/config) is a
 //!   placeholder: the commands land in T14 and currently exit 1 with a
 //!   diagnostic (upstream would run them).
-//! - Interactive mode and the `--resume` session picker are T12; first-time
-//!   setup never runs in headless modes.
+//! - First-time setup never runs in headless modes.
 //! - `--export` parses but reports "not available yet (T14)".
 //! - Migrations (`migrations.ts`) are permanently out of scope (ADR-0003 §3).
 //! - HTTP proxy dispatcher configuration is T13; reqwest's built-in env
@@ -49,6 +48,7 @@ use crate::core::trust_manager::{
     resolve_project_trusted, ProjectTrustStore,
 };
 use crate::error::PirError;
+use crate::modes::interactive::run_interactive_mode;
 use crate::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
 use crate::modes::rpc::run_rpc_mode;
 use crate::sdk::{create_agent_session, CreateAgentSessionOptions, NoTools};
@@ -270,10 +270,11 @@ fn validate_session_id_flags(parsed: &Args) -> Result<(), String> {
 }
 
 /// `createSessionManager` (main.ts:264-355).
-fn create_session_manager(
+async fn create_session_manager(
     parsed: &Args,
     cwd: &Path,
     session_dir: Option<&Path>,
+    startup_settings_manager: &SettingsManager,
     err: &mut dyn Write,
 ) -> Result<SessionManager, String> {
     if parsed.no_session || parsed.help || parsed.list_models.is_some() {
@@ -356,8 +357,20 @@ fn create_session_manager(
     }
 
     if parsed.resume {
-        // selectSession is a TUI picker (T12).
-        return Err("--resume session picker is not available yet (T12)".to_owned());
+        // `selectSession` (main.ts:321-333, cli/session-picker.ts): a
+        // standalone startup TUI picker shown before the session manager is
+        // created — in every mode, not just interactive.
+        let selected =
+            crate::cli::session_picker::select_session(cwd, session_dir, startup_settings_manager)
+                .await
+                .map_err(|e| e.to_string())?;
+        let Some(selected_path) = selected else {
+            // Cancelled (main.ts:328-330): stdout message, exit code 0.
+            println!("No session selected");
+            std::process::exit(0);
+        };
+        return SessionManager::open(Path::new(&selected_path), session_dir, None)
+            .map_err(|e| e.to_string());
     }
 
     if parsed.continue_ {
@@ -643,14 +656,21 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         parsed.session_dir.as_deref(),
         settings_session_dir.as_deref(),
     );
-    let mut session_manager =
-        match create_session_manager(&parsed, &cwd, session_dir.as_deref(), &mut err) {
-            Ok(manager) => manager,
-            Err(message) => {
-                let _ = writeln!(err, "Error: {message}");
-                return 1;
-            }
-        };
+    let mut session_manager = match create_session_manager(
+        &parsed,
+        &cwd,
+        session_dir.as_deref(),
+        &startup_settings_manager,
+        &mut err,
+    )
+    .await
+    {
+        Ok(manager) => manager,
+        Err(message) => {
+            let _ = writeln!(err, "Error: {message}");
+            return 1;
+        }
+    };
 
     // Header cwd missing (main.ts:579-591): interactive prompts (T12);
     // headless errors out.
@@ -995,6 +1015,10 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         return 1;
     }
 
+    // Captured before the runtime is moved into the interactive mode
+    // (T12-S4b; main.ts:883-885 modelFallbackMessage warning).
+    let runtime_model_fallback_message = runtime.model_fallback_message().map(str::to_string);
+
     match app_mode {
         AppMode::Rpc => {
             let out: Box<dyn Write + Send> = Box::new(std::io::stdout());
@@ -1002,8 +1026,19 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             run_rpc_mode(runtime, stdin, out).await
         }
         AppMode::Interactive => {
-            let _ = writeln!(err, "Error: interactive mode is not available yet (T12)");
-            1
+            // Interactive mode (T12): the TUI owns the terminal; the runtime
+            // is moved in and disposed on exit (interactive-mode.ts:832-920).
+            run_interactive_mode(
+                runtime,
+                crate::modes::interactive::InteractiveModeOptions {
+                    model_fallback_message: runtime_model_fallback_message,
+                    initial_message,
+                    initial_images,
+                    initial_messages: parsed_owned.messages,
+                    verbose: parsed_owned.verbose,
+                },
+            )
+            .await
         }
         AppMode::Print | AppMode::Json => {
             let exit_code = run_print_mode(

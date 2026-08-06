@@ -1,0 +1,6 @@
+→ build                           Build the project
+  run                             Run the application
+  test                            Run tests
+  deploy                          Deploy to production
+  lint                            Run the linter
+  (1/12)

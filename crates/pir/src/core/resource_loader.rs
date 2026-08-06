@@ -326,6 +326,12 @@ impl DefaultResourceLoader {
         &mut self.settings_manager
     }
 
+    /// The agent dir this loader was configured with (used by the
+    /// interactive project-trust store path).
+    pub fn agent_dir(&self) -> &Path {
+        &self.agent_dir
+    }
+
     pub fn resources(&self) -> &LoadedResources {
         &self.resources
     }

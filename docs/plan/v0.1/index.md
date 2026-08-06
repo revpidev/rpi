@@ -50,7 +50,7 @@
 | T16 | [pir-agent harness 层](./T16-agent-harness.md) | M3 | T05、T07、T08 | 未开始 | — |
 | T10 | [Headless 模式：print / json / rpc](./T10-headless-modes.md) | M4 | T03、T04、T05、T06、T07、T08、T09 | 已完成 | 2026-08-04 |
 | T11 | [pir-tui 核心引擎](./T11-pir-tui-core.md) | M5 | T01 | 已完成 | 2026-08-05 |
-| T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 未开始 | — |
+| T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 待验收（待真机 smoke 人工确认） | — |
 | T13 | [全量 Provider 与 OAuth](./T13-providers-oauth.md) | M6 | T03、T04 | 未开始 | — |
 | T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 未开始 | — |
 | T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 未开始 | — |

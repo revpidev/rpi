@@ -12,11 +12,13 @@
 //! terminal_* modules first, then components, the TUI core and terminal
 //! state recovery (`recovery`, coding-standards §8.5).
 
+pub mod autocomplete;
 pub mod components;
 pub mod error;
 pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
+pub mod kill_ring;
 pub mod native_modifiers;
 pub mod recovery;
 pub mod stdin_buffer;
@@ -24,6 +26,8 @@ pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
 pub mod tui;
+pub mod undo_stack;
 pub mod utils;
+pub mod word_navigation;
 
 pub use error::TuiError;

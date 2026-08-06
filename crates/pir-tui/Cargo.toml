@@ -14,7 +14,9 @@ unicode-width.workspace = true
 unicode-segmentation.workspace = true
 tracing.workspace = true
 base64.workspace = true
+regex.workspace = true
 tokio.workspace = true
+comrak.workspace = true
 
 [dev-dependencies]
 pir-test-support.workspace = true

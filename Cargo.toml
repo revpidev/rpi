@@ -64,6 +64,10 @@ ignore = "0.4"
 crossterm = "0.29"              # terminal I/O only (raw mode / read-write / size); no ratatui
 unicode-width = "0.2"           # grapheme width
 unicode-segmentation = "1"      # grapheme clusters
+# T12-S3 markdown component: comrak replaces upstream's `marked` (see
+# crates/pir-tui/src/components/markdown.rs header for the deviation record).
+# default-features = false: only the parser/AST are used, no HTML rendering.
+comrak = { version = "0.54", default-features = false }
 
 # Single self-contained binary target (coding-standards §15.4).
 # No panic = "abort": the TUI relies on a panic hook to restore terminal state.

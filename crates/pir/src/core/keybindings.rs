@@ -15,14 +15,19 @@
 //! - Platform-dependent defaults use `cfg!(target_os = …)` (compile-time).
 //!   Upstream checks `process.platform` at runtime; the observable behaviour
 //!   is identical for a given target.
-//! - The global singleton (`globalKeybindings` / `setKeybindings` /
-//!   `getKeybindings`) is not ported — the TUI runtime (T12) owns lifecycle.
+//! - The global singleton is ported as [`set_keybindings`] /
+//!   [`get_keybindings`] (upstream `globalKeybindings` /
+//!   `setKeybindings` / `getKeybindings`, tui/src/keybindings.ts:233-244).
+//!   The TUI runtime (T12) owns lifecycle: it calls `set_keybindings` once at
+//!   startup with the user-configured manager, and `get_keybindings` lazily
+//!   falls back to defaults-only (upstream `new KeybindingsManager(...)`
+//!   inside `getKeybindings`).
 //! - On-disk migration (`migrateKeybindingsConfigFile` in `migrations.ts`)
 //!   is not ported — the resource loader (T17+) performs disk writes.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use crate::config;
 use crate::error::PirError;
@@ -30,6 +35,30 @@ use crate::error::PirError;
 // ===========================================================================
 // Types
 // ===========================================================================
+
+// ===========================================================================
+// Global singleton (tui/src/keybindings.ts:233-244)
+// ===========================================================================
+
+static GLOBAL_KEYBINDINGS: OnceLock<RwLock<KeybindingsManager>> = OnceLock::new();
+
+/// Replace the process-global [`KeybindingsManager`] (upstream
+/// `setKeybindings`, tui/src/keybindings.ts:234-237). The interactive mode
+/// (T12) calls this once at startup with the user-configured manager;
+/// keybinding hints read it through [`get_keybindings`].
+pub fn set_keybindings(keybindings: KeybindingsManager) {
+    let Ok(mut guard) = get_keybindings().write() else {
+        return;
+    };
+    *guard = keybindings;
+}
+
+/// The process-global [`KeybindingsManager`] (upstream `getKeybindings`,
+/// tui/src/keybindings.ts:238-244), lazily created with defaults only when
+/// [`set_keybindings`] has not been called.
+pub fn get_keybindings() -> &'static RwLock<KeybindingsManager> {
+    GLOBAL_KEYBINDINGS.get_or_init(|| RwLock::new(KeybindingsManager::new()))
+}
 
 /// A keybinding value: single key or array of keys.
 ///

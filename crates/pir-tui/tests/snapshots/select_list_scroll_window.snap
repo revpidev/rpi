@@ -1,0 +1,6 @@
+  format                          Format the codebase
+  check                           Type-check the codebase
+→ publish                         Publish the package
+  bump-version                    Bump the version number
+  generate-docs                   Generate API documentation
+  (9/12)

@@ -16,6 +16,7 @@ pub mod session_cwd;
 pub mod session_manager;
 pub mod settings_manager;
 pub mod skills;
+pub mod slash_commands;
 pub mod system_prompt;
 pub mod themes;
 pub mod trust_manager;
