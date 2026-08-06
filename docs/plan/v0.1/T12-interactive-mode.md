@@ -1,6 +1,6 @@
 # T12：pir-tui 组件与 Interactive 模式
 
-- **状态**：待验收（实现/自测/文档回写完成，G1–G7 通过；任务特有门禁「真机 smoke 人工验证」待用户确认）
+- **状态**：已完成（2026-08-06 用户真机 smoke 人工验收通过）
 - **里程碑**：M5（TUI 为硬性交付，ADR-0002 §3）
 - **依赖**：T10、T11
 - **上游对照**：`packages/tui/src/components/*`、`packages/coding-agent/src/modes/interactive/*`（interactive-mode.ts + 40 组件）、`docs/keybindings.md`（逐条对拍级基准）、`docs/usage.md`、`docs/sessions.md`
@@ -56,7 +56,7 @@
 - [x] S7b 偏离登记 + §8 映射 + 文档回写（2026-08-05）：D-018（comrak）、D-019（T12 笔记）登记并回写；`T12-requirements-8-mapping.md` 46 条映射；`T12-keybindings-mapping.md` 73 条核对
 - [x] 实现
 - [x] 自测
-- [x] 门禁验收（待真机 smoke 确认，见验收记录）
+- [x] 门禁验收（2026-08-06 真机 smoke 人工确认，见验收记录）
 - [x] 文档回写
 
 ## 设计细化记录（2026-08-05）
@@ -123,7 +123,7 @@ pi-tui 业务组件与支撑模块（落 `crates/pir-tui/src/`，镜像上游文
 
 - [x] 需求 §8 全章逐条核对有锚点（`T12-requirements-8-mapping.md`，46 条：40 完成 / 4 挂点 / 1 DEFER / 1 扩展替换挂点，均注 T13/T14/T15 遗留）
 - [x] `keybindings.md` 默认绑定表逐条对拍映射表（`T12-keybindings-mapping.md`，73 条默认键一致，G3）
-- [ ] 真机 smoke 矩阵：本机 + tmux 至少两种环境人工验证（启动、提问、streaming、abort、快捷键、退出恢复）——**待用户人工验证**（脚本化 smoke 见验收记录）
+- [x] 真机 smoke 矩阵：本机 + tmux 至少两种环境人工验证（启动、提问、streaming、abort、快捷键、退出恢复）——**2026-08-06 用户人工确认**（脚本化 smoke 见验收记录）
 - [x] M5 必达声明：Interactive 模式完成一次端到端真实对话（faux 或 live）——**进程内 VT 端到端**（TestTerminal + 真实 session：启动→提问（prompt 错误路径因无 auth）→bash 执行→快捷键→退出恢复；streaming 与真实 provider 对话留待真机 smoke）
 
 ## 偏离记录
@@ -135,8 +135,8 @@ pi-tui 业务组件与支撑模块（落 `crates/pir-tui/src/`，镜像上游文
 
 ## 验收记录
 
-- 验收日期：2026-08-05
-- 验收人：（待定）
+- 验收日期：2026-08-05（脚本化自测）/ 2026-08-06（真机 smoke 人工确认）
+- 验收人：用户（真机 smoke 人工验证，2026-08-06 确认）
 - G1 构建/静态检查：通过——`cargo clippy --workspace --all-targets -D warnings` 通过（0 警告）；`cargo fmt --all -- --check` 通过；`cargo check --workspace` 通过
 - G2 测试：通过——`cargo test --workspace` 2608 passed, 0 failed（`cargo test -p pir` 1282、`cargo test -p pir-tui` 854，含 lib/集成/快照全目标）；live 测试跳过（无 API key）。备注：一次全量并行运行出现 1 例失败未捕获名称，随后针对性重跑 6 轮（interactive 模块 5 轮、pir-tui 3 轮、集成 2 轮）均未复现，疑似并行负载下时序敏感，持续观察
 - G3 对拍：通过——`T12-keybindings-mapping.md` 73 条默认键逐条核对一致；`T12-requirements-8-mapping.md` §8 全章 46 条映射（40 ✅ 4 挂点 1 DEFER 1 挂点，均注 T13/T14/T15 遗留）；渲染快照黄金文件全过（Editor/SelectList/Markdown/SettingsList/Autocomplete）
@@ -148,7 +148,7 @@ pi-tui 业务组件与支撑模块（落 `crates/pir-tui/src/`，镜像上游文
   1. `cargo run -p pir -- --help` 正常输出；无 tty 降级 Print 模式验证（`echo hi | pir` 不触 TUI）
   2. 进程内 VT 端到端（测试基建）：a) 启动→布局树组装→bash `!` 执行→/tree 选择→/name→/quit 信号→shutdown 恢复——`interactive_mode.rs` 集成测试（init/分发链/tree/队列共 60+）；b) **run loop 全路径**：启动→bash 提问→Ctrl+C 清空→Ctrl+D 退出→终端恢复——`run_loop_end_to_end_vt_smoke`（真实 session + 事件循环，见验收记录 G2 测试数）
   3. tmux 可用性：`which tmux` 待真机环境确认（本容器无 tmux）
-- 结论：**待真机 smoke 确认**——本环境无 tty/tmux/provider key，M5 必达的「真机一次端到端真实对话」与「本机+tmux 两种环境人工验证」留待用户在有 tty 的环境执行（`cargo run -p pir` 启动 → 提问 → streaming → abort → Ctrl+C/Ctrl+D 退出 → 终端状态恢复）
+- 结论：**已完成**——2026-08-06 用户在有 tty 的真机环境完成验收：`cargo run -p pir` 启动 → 提问 → streaming → abort → 快捷键 → Ctrl+C/Ctrl+D 退出 → 终端状态恢复，本机 + tmux 至少两种环境人工验证通过。
 
 ### 2026-08-06 修复记录（验收后追加）
 
