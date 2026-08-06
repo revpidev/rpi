@@ -23,7 +23,7 @@
 7. **逐字文案错误变体**：新增 `AgentError::Message(String)`（Display 无前缀），供工具/hook 返回需与上游逐字对齐的错误文案；其余变体 Display 带前缀，不适用该场景。
 8. **`pending_tool_calls` 用 `HashSet<String>`**：JS Set 的插入序迭代在当前无可观察消费者。
 9. **`continue()` → `continue_run`**：Rust 关键字避让，语义不变。
-10. **reasoning/thinking_budgets 不经 StreamFn 转发**：钉死的 `StreamOptions` 无这两个字段；它们保留在 `AgentLoopConfig` 上维持 prepareNextTurn 语义（"off"→None），由组装层注入 StreamFn 时绑定。
+10. **reasoning/thinking_budgets 不经 StreamFn 转发**：钉死的 `StreamOptions` 原无这两个字段（D-013 后 `reasoning` 已落 `StreamOptions`）；它们保留在 `AgentLoopConfig` 上维持 prepareNextTurn 语义（"off"→None）。reasoning 由 `stream_assistant_response` 每轮绑定进 `StreamOptions.reasoning`（镜像上游 `{...config, apiKey, signal}` 展开；2026-08-06 修复前未绑定，thinking 级别从未到达请求，见 `agent_loop.rs` 注释与 `forwards_thinking_level_to_stream_fn_options` 回归测试）；thinking_budgets 无 `StreamOptions` 通道，仅 anthropic 适配器消费。
 11. **listener 屏障为 in-process 串行 await**：设计 §4.3「每 listener 独立 mpsc」适用于事件外发消费者；`Agent::subscribe` 的屏障本身按注册顺序逐个 await listener（与上游 `for (listener) await listener(event, signal)` 同构），屏障语义不变。
 
 ## 影响面

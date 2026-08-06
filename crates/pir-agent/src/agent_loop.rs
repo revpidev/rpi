@@ -819,6 +819,13 @@ async fn stream_assistant_response(
     let mut options = config.stream_options.clone();
     options.api_key = resolved_api_key;
     options.signal = signal.clone();
+    // Upstream spreads the whole config (`{...config, apiKey, signal}`), so
+    // `config.reasoning` — the live thinking level, updated by
+    // `prepareNextTurn` — reaches the request. The pinned `StreamFn` shape
+    // takes plain `StreamOptions`, so bind the channel here instead (design
+    // doc §4.4 D-013). Without this the level set via /settings, the thinking
+    // selector or `setThinkingLevel` never reaches the provider request.
+    options.reasoning = config.reasoning.map(|level| level.to_model_level());
 
     let mut response = stream_function(config.model.clone(), llm_context, options);
 

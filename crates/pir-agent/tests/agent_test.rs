@@ -953,3 +953,45 @@ async fn forwards_session_id_to_stream_fn_options() {
         Some("session-def".to_owned())
     );
 }
+
+#[tokio::test]
+async fn forwards_thinking_level_to_stream_fn_options() {
+    // Regression: the thinking level set on the agent (via /settings, the
+    // thinking selector or setThinkingLevel) must reach the request through
+    // `StreamOptions.reasoning` (design §4.4 D-013; upstream spreads the
+    // whole config into the stream options). Before the fix the level only
+    // sat on `AgentLoopConfig.reasoning`, which the pinned `StreamFn` shape
+    // never forwards, so requests went out with thinking disabled.
+    let received: Arc<Mutex<Vec<Option<pir_ai::types::ModelThinkingLevel>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let stream_fn: StreamFn = {
+        let received = received.clone();
+        Arc::new(move |_model, _context, options| {
+            received.lock().unwrap().push(options.reasoning);
+            futures::stream::iter(vec![StreamEvent::Done {
+                reason: pir_ai::types::DoneReason::Stop,
+                message: assistant_text("ok"),
+            }])
+            .boxed()
+        })
+    };
+
+    // Off (default) → None (thinking omitted / disabled per compat).
+    let agent = Agent::new(AgentOptions::new(stream_fn.clone()));
+    tokio::time::timeout(TEST_TIMEOUT, agent.prompt("hello"))
+        .await
+        .expect("prompt must not hang")
+        .expect("prompt resolves");
+    assert_eq!(received.lock().unwrap().last().copied().flatten(), None);
+
+    // xhigh → Some(Xhigh).
+    agent.set_thinking_level(pir_agent::types::ThinkingLevel::Xhigh);
+    tokio::time::timeout(TEST_TIMEOUT, agent.prompt("think hard"))
+        .await
+        .expect("prompt must not hang")
+        .expect("prompt resolves");
+    assert_eq!(
+        received.lock().unwrap().last().copied().flatten(),
+        Some(pir_ai::types::ModelThinkingLevel::Xhigh)
+    );
+}
