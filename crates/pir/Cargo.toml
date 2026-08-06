@@ -35,6 +35,9 @@ kamadak-exif.workspace = true
 fs2.workspace = true
 serde_yaml.workspace = true
 ignore.workspace = true
+reqwest.workspace = true
+httpdate.workspace = true
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

@@ -195,6 +195,7 @@ async fn start_scenario(
         credentials: None,
         auth_path: Some(agent_dir.join("auth.json")),
         models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
     })
     .await;
     model_runtime
@@ -572,6 +573,7 @@ async fn build_runtime(
         credentials: None,
         auth_path: Some(agent_dir.join("auth.json")),
         models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
     })
     .await;
     model_runtime

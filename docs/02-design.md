@@ -156,6 +156,7 @@ pir-ai/src/api/
   bedrock_converse_stream.rs   # 手写 SigV4 + event-stream 解码（§14）
   mistral_conversations.rs
   pi_messages.rs
+  openrouter_images.rs         # 图像生成：非流式 chat completions + modalities + data: URL 图像（T13 W6，D-037）
 ```
 
 每个适配器实现（D-004，T03 已落地）：
@@ -167,20 +168,21 @@ pub trait ProviderStreams: Send + Sync {
 }
 ```
 
-同步方法直接返回推送式事件流句柄（对齐上游 `StreamFunction` 形状；错误编码为事件，不返回 Err）。T03 已交付 `anthropic_messages.rs` / `openai_completions.rs`（含 `detect_compat` 表驱动矩阵）/ `openai_responses.rs` + `openai_responses_shared.rs`；清单中其余适配器随 T13 落地。HTTP 层为 reqwest 直连 + 自写 `SseDecoder`，不经过官方 SDK，逐项可观测差异见 D-005（SDK 头/默认超时缺失、严格 SSE 解析文案、`metadata.raw` 取自 HTTP body 等）。
+同步方法直接返回推送式事件流句柄（对齐上游 `StreamFunction` 形状；错误编码为事件，不返回 Err）。T03 已交付 `anthropic_messages.rs` / `openai_completions.rs`（含 `detect_compat` 表驱动矩阵）/ `openai_responses.rs` + `openai_responses_shared.rs`；清单中其余适配器随 T13 落地。HTTP 层为 reqwest 直连 + 自写 `SseDecoder`，不经过官方 SDK，逐项可观测差异见 D-005（SDK 头/默认超时缺失、严格 SSE 解析文案、`metadata.raw` 取自 HTTP body 等）。T13 批次适配器的落地差异各自登记：pi-messages 见 D-021、mistral-conversations 见 D-022、google-generative-ai 见 D-023、azure-openai-responses 见 D-024、google-vertex 见 D-025、bedrock-converse-stream 见 D-026。
 
 `Models::stream` / `stream_simple` 按 `model.api` 分发（混合 API provider 的 api map 分发，缺 API 时报 stream error）；thinking 在 `stream_simple` 层统一映射（clamp、预算默认表、xhigh/max 预算路径降为 high）；`clamp_max_tokens_to_context`（4096 安全余量，下限 1）。
 
 各适配器行为锚点见需求 §5.2，逐条移植：**compat 检测矩阵**（openai-completions 行为正确性核心）、Anthropic OAuth 伪装与工具名映射、Codex WS 连接缓存/SSE 回退/zstd/accountId、Google 模型族 thinking 分流、Mistral id 归一化、Bedrock region 解析与 header 白名单、Azure 归一化、pi-messages rewrite 诊断。
 
-**来源空白（Google/Bedrock）**：上游 google-generative-ai 与 google-vertex 适配器委托 `@google/genai` SDK，Bedrock 委托 `@aws-sdk/client-bedrock-runtime` + `@smithy`——基址模板、SSE 帧格式、SigV4、event-stream 解码等传输层细节在 TS 源码中不可考。Rust 实现须从 SDK 行为与 AWS 规范反推，对拍只能基于可观测流量与 SDK 文档；§14 的「手写 SigV4 + reqwest + 自实现 event-stream 解码」决策即源于此。
+**来源空白（Google/Bedrock）**：上游 google-generative-ai 与 google-vertex 适配器委托 `@google/genai` SDK，Bedrock 委托 `@aws-sdk/client-bedrock-runtime` + `@smithy`——基址模板、SSE 帧格式、SigV4、event-stream 解码等传输层细节在 TS 源码中不可考。Rust 实现须从 SDK 行为与 AWS 规范反推，对拍只能基于可观测流量与 SDK 文档；§14 的「手写 SigV4 + reqwest + 自实现 event-stream 解码」决策即源于此。google-generative-ai（T13 W1）已按钉死版 SDK 源码反推落地：`POST {baseUrl}/models/{id}:streamGenerateContent?alt=sse`、`x-goog-api-key` 头、`generationConfig` 拆分与 `systemInstruction` 的 `tContent` 形状、chunk 级流内错误探针等，逐项差异见 D-023。google-vertex（T13 W2）同法反推落地：URL 为 `{base}[/{apiVersion}][/projects/{p}/locations/{l}]/{tModel}:streamGenerateContent?alt=sse`（vertex `tModel` 规则、自定义 baseUrl 的 COLLECTION 作用域与 apiVersion 抑制、global/多区域 `us`/`eu`/区域三档默认端点、含 `{location}` 占位符的 baseUrl 整体丢弃回退默认端点），鉴权为 `x-goog-api-key`（Vertex Express）或 `authorization: Bearer`（ADC）；ADC 子集自实现于 `google_adc.rs`（解析链 `GOOGLE_APPLICATION_CREDENTIALS` → well-known gcloud 文件 → GCE metadata，支持 service_account JWT-bearer 与 authorized_user refresh grant，external_account/impersonated 类型显式报错为已知缺口），逐项差异见 D-025。bedrock-converse-stream（T13 W2）同法反推落地：`POST {endpoint}/model/{extendedEncodeURIComponent(modelId)}/converse-stream` + rest-json1 body（`modelId` 为 path label 不进 body）；SigV4 手写于 `api/bedrock/sigv4.rs`（对齐 `@smithy/signature-v4`：`x-amz-content-sha256` 参与签名、canonical path 二次编码、service `bedrock`，bearer token 时跳过签名），event-stream 帧解码自实现于 `api/bedrock/event_stream.rs`（prelude+双 CRC32、跨 chunk 重组）；凭据链仅 env（profile/SSO/IMDS 为已知缺口），ambient-profile 无 region 时兜底 `us-east-1`，endpoint ruleset 收敛为 `bedrock-runtime.{region}.amazonaws.com[.cn]`，逐项差异见 D-026。
 
 ### 3.4 Provider 层
 
 - `Provider` trait：模型列表、默认 base URL、auth 解析、`filter_models?`、`refresh_models?`、stream/streamSimple
-- 38 个内置工厂（需求 §5.3 清单）；`create_provider` 支持单 API 或按 `model.api` 分发的混合 map；动态 overlay 与 baseline 按 id 合并；`inflight_refresh` 去重
-- 模型目录为**生成物**：`build.rs` 从 models.dev 数据生成内置 catalog（对齐 `generate-models.ts` 的修正规则：定价、能力位、Kimi 零价、strict 能力等；T03 已落 `build.rs` 占位与 `generated.rs` include 机制，空 catalog，正式数据管线在 T13/T14）；`pir update --models` 远程 overlay（ETag/4h 新鲜度/generatedAt 比对，对齐 coding-agent `remote-catalog-provider.ts`）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag，T03 已交付内存与 JSON 文件两实现）+ `refresh({allow_network:false})` 离线恢复。用户 `models.json` 加载移植自 coding-agent `model-config.ts`，落 `pir-ai/src/models_json.rs`（JSONC stripJsonComments、serde+手工校验 pass，措辞差异见 D-006）
-- 应用可按需只注册子集（feature flags 等价 tree-shake）
+- 38 个内置工厂（需求 §5.3 清单）；`create_provider` 支持单 API 或按 `model.api` 分发的混合 map；动态 overlay 与 baseline 按 id 合并；`inflight_refresh` 去重。**注册表骨架已落**（T13 W4，`pir-ai/src/providers.rs`：`BUILTIN_PROVIDERS` 静态 spec 表含全部 38 工厂 id，上游 `all.ts` `builtinProviders()` 注册序逐条核对，纯动态 provider `radius` 无 catalog 条目）；工厂实现为 W4 后续波次（每 provider 一文件 `src/providers/<id>.rs`，工厂签名 `fn() -> Arc<dyn Provider>`，填入 spec 表 `factory` 槽），完成前 `builtin_providers()` 只产出已移植子集
+- 模型目录为**生成物**：`build.rs` 生成内置 catalog。**数据管线已正式化**（T13 W4）：上游 `providers/data/*.json`（37 份 + `.manifest.json`，修正规则——compat delta、thinkingLevelMap、定价 tiers、Kimi 隐含成本等——由 `generate-models.ts` 在生成期全部烘焙进 JSON；上游 `*.models.ts` 经核为纯 `flattenModelCatalog` re-export，Rust 侧无需重放修正）逐字节 vendored 至 `pir-ai/src/providers/data/`（只读，sha256 与 manifest 对拍），`build.rs` 生成 `include_str!` 嵌入表，`generated.rs` 运行时 serde 惰性解析（`OnceLock`；目录访问 API 镜像 `all.ts`：`get_builtin_providers`/`get_builtin_models`/`get_builtin_model`/`get_builtin_model_data_generated_at`）；手动刷新走 `scripts/refresh-model-catalog.sh`（离线，构建期不联网）；**`pir update --models` 远程 overlay 已落**（T13 W6-C：`with_remote_catalog` 装饰器在 `crates/pir/src/core/remote_catalog_provider.rs`（对齐 coding-agent `remote-catalog-provider.ts`，ETag/If-None-Match 复验、4h 新鲜度、generatedAt 比对、inflight 去重，15s 超时在 `model_runtime`/CLI 层），`Models::refresh` 移植 models.ts 276-328（`allow_network` 默认 true、`force`、signal、失败后 `allow_network:false` 离线恢复、未配置 provider 跳过），`createProvider.fetchModels` 钩子延后至 T15 provider-composer 扩展接线）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag，T03 已交付内存与 JSON 文件两实现；W6-C 接入 `ModelRuntime`（models.json 同目录 `models-store.json`，损坏回退内存存储））。落地差异见 D-038用户 `models.json` 加载移植自 coding-agent `model-config.ts`，落 `pir-ai/src/models_json.rs`（JSONC stripJsonComments、serde+手工校验 pass，措辞差异见 D-006）。落地差异见 D-028
+- 应用可按需只注册子集：per-id factory 槽 + `get_builtin_provider_spec`（不引入 cargo feature flags，未引用工厂由链接期死代码消除；D-028）
+- W4 波次注记：工厂按波次分组移植（每组一个 `tests/providers_group_*.rs`）；kimi-coding 的 OAuth（上游构造期 `lazyOAuth` Kimi Code 订阅登录）属 W5 范围，W4 阶段以 `oauth: None` 占位、`ProviderAuth.oauth` 槽为接线点（D-029）；openai-codex 上游为纯 OAuth 工厂（无 api-key 通道），W4 阶段以空 `ProviderAuth` 占位——工厂/目录/适配器接线就位但 auth 恒未配置，W5 填入 OAuth 闭环（D-030）；xai 的 OAuth（SuperGrok / X Premium 订阅登录）同属 W5，W4 阶段同样以 `oauth: None` 占位、仅 `XAI_API_KEY` api-key 通道可用（D-031）；group B（github-copilot / openrouter / vercel-ai-gateway / cloudflare 两家 / opencode / opencode-go / radius）落地注记：`filterModels` 落 `Provider::filter_models` 默认方法（github-copilot 以装饰器覆盖；消费者为 model runtime 的 availability refresh，W7 审查补漏已在 `refresh_availability_inner` 接线并补 runtime 路径测试）；copilot/openrouter/radius 的 OAuth 在 W4 用具名 `PendingOAuth` stub 占位（保留上游 display name，操作报 W5 错误）；**W5 已落地 github-copilot 与 radius 两流程**（`auth/oauth/github_copilot.rs` RFC 8628 device code + enterprise 域名 + 登录后逐模型 policy-enable + per-account baseUrl/`availableModelIds`，`auth/oauth/radius.rs` browser PKCE/1456 回调 + device code，gateway 经 `radius_config` 规范化接线）；cloudflare 两家的 auth helper 落 `src/auth/cloudflare_auth.rs`（ai-gateway 经 `cf-aig-authorization` 头 + 抑制默认 `Authorization`/`x-api-key`），baseUrl 占位符物化落 `src/providers/cloudflare_stream.rs`；radius 为 `create_provider` 核心 + `RadiusProvider` 装饰器（持有规范化 gateway；**W6-C 已落地 `refreshModels` 动态 overlay**——store 恢复、legacy `gatewayConfig` 导入、`{gateway}/v1/config` 拉取 + `models`/`inflightRefresh` 闭包状态，D-032 第 5 项闭环，差异见 D-038），`radius-config.ts` 落 `src/providers/radius_config.rs`（D-032；W5 流程落地差异见 D-033）；**W5 再落地 kimi-coding 与 xai 两流程**（`auth/oauth/kimi_coding.rs` RFC 8628 device code + `KIMI_CODE_OAUTH_HOST`/`KIMI_OAUTH_HOST` 覆盖 + refresh 指数退避重试 + `toAuth` Bearer 头；`auth/oauth/xai.rs` RFC 8628 device code + refresh 不轮换保留旧 token + 5min 过期前移 + `toAuth` api key；`load.ts` 对应物落 `auth/oauth/load.rs` registry 函数表），两工厂 `ProviderAuth.oauth` 槽接线（D-029 / D-031 关闭），落地差异见 D-034；**W5 最后落地 openai-codex 与 openrouter 两流程**（`auth/oauth/openai_codex.rs` PKCE + `id_token_add_organizations`/`codex_cli_simplified_flow`/originator + **deviceauth 旁路** `/api/accounts/deviceauth/usercode|token`、验证 URI `/codex/device`、1455 `/auth/callback` 回调；`auth/oauth/openrouter.rs` PKCE 换永久 key（`Number.MAX_SAFE_INTEGER` 过期）、refresh no-op、临时端口随机路径回调 + 5min 登录超时），openai-codex 工厂 OAuth 槽接线（D-030 关闭）、openrouter 工厂 OAuth 槽接线且 `PendingOAuth` 占位删除（D-032 第 2 项整体解决），落地差异见 D-035
 
 ### 3.5 Auth
 
@@ -202,6 +204,7 @@ OAuth flows (7)：anthropic / openai-codex / github-copilot(device) /
 - 交互协议：`AuthInteraction` trait（prompt: text/secret/select/manual_code，per-prompt signal 竞速取消；notify: links/auth_url/device_code/progress）——各模式提供实现（TUI 对话框 / RPC 协议 / print 报错）
 - `options.env` 每请求环境覆盖；代理变量（`HTTP_PROXY/HTTPS_PROXY/no_proxy`）解析
 - Rust 落地注记（T04）：文件锁 fs2 无 stale/onCompromised 对应物、`!cmd` 仅 unix `/bin/sh -c`、快照用 `serde_json::Map` 保序做字节对拍、device code 时钟抽象与 OAuth 测试缝等实现差异——见偏离 D-008 / D-009
+- Rust 落地注记（T13 W5）：github-copilot（device code + enterprise 域名 + policy-enable + per-account baseUrl/`availableModelIds`）与 radius（browser PKCE/127.0.0.1:1456 回调 + device code，gateway 经 `normalize_radius_gateway_url` 规范化）两流程落 `pir-ai/src/auth/oauth/{github_copilot,radius}.rs` 并接入 W4 工厂占位（D-032 对应项已解决）；实现差异（URL 重写测试缝、ring UUIDv4、poll 错误通道等）见 D-033；kimi-coding 与 xai 两流程亦已落地（`auth/oauth/{kimi_coding,xai}.rs`，均 RFC 8628 device code：kimi 带 env host 覆盖与 refresh 重试、xai refresh 保留未轮换 token，接入两工厂占位，D-029 / D-031 关闭；差异见 D-034）；openai-codex 与 openrouter 两流程已落地（`auth/oauth/{openai_codex,openrouter}.rs`：codex 为 PKCE + `id_token_add_organizations`/`codex_cli_simplified_flow`/originator + **deviceauth 旁路**（`/api/accounts/deviceauth/usercode|token`，验证 URI `/codex/device`）+ 1455 `/auth/callback` 回调与 refresh；openrouter 为 PKCE 换**永久 key**（`expires = Number.MAX_SAFE_INTEGER`）、refresh no-op、临时端口随机路径回调 + 5min 登录超时/30s 交换超时），接入两工厂 OAuth 槽（D-030 关闭、D-032 第 2 项整体解决、`PendingOAuth` 删除）；差异见 D-035
 
 ### 3.6 横切模块
 
@@ -223,9 +226,31 @@ pir-ai/src/utils/
   hash.rs                 # shortHash（id 归一化回填用）
   session_resources.rs    # Codex WS 等 per-session 资源清理
   cost.rs                 # calculateCost：tiers 阶梯（tier 口径 input+cacheRead+cacheWrite 取最高阈值，request-wide）+ cacheWrite1h 按 2× input 硬编码 + service tier 乘数
+  provider_env.rs         # `options.env` 每请求环境覆盖取值（§5.4）
+  text.rs                 # 文本工具（截断/单行化等，供错误文案与渲染共用）
+  uuid.rs                 # uuidv7 / randomUUID（session 与 entry id，§6.1）
 ```
 
-图像子系统独立：`ImagesModels` / `ImagesProvider`（OpenRouter images，chat completions `modalities` 非流式，永不 reject）。
+图像子系统独立：`ImagesModels` / `ImagesProvider`（OpenRouter images，chat completions `modalities` 非流式，永不 reject）。**T13 W6 已落地**（D-037）：`images.ts`（dispatch）/ `images-models.ts`（`ImagesModels` 集合 + `createImagesModels` / `createImagesProvider`，镜像 `models.rs` 的 `Models`，含 refresh 在飞去重）/ `image-models.ts` + `image-models.generated.ts`（目录访问器 + 40 模型静态目录，node 转写）/ `images-api-registry.ts`（api 实现注册表）/ `providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区（`builtinImagesProviders` / `builtinImagesModels`，openrouter 工厂含 api-key + OAuth 双通道）落 `crates/pir-ai/src/images.rs` + `images/*`；适配器 `api/openrouter-images.ts`（+`.lazy.ts` 意图）落 `crates/pir-ai/src/api/openrouter_images.rs`（非流式 `POST {baseUrl}/chat/completions`，`modalities: ["image"]` 或 `["image","text"]`，`data:` URL 图像进 `output`，usage 缓存切分，错误以 `stopReason: "error"`/`"aborted"` 正常返回形态表达）；图像类型（`ImagesApiKind` / `ImagesModel` / `ImagesOptions` / `ImagesContext` / `AssistantImages` 等）入 `types.rs`。测试：`tests/images.rs`（14 用例，loopback HTTP 契约：请求形状/modalities/永不 reject/abort/on_payload/on_response/目录与集合）+ 文件内单测。
+
+Rust 落地注记（T13 W6-B 横切能力收尾）：`transform_messages` / `splitDeferredTools` /
+transport 偏好 / usage 兜底四组与上游钉死版逐一比对一致，无行为级差异：
+
+- cross-provider handoff：上游 `cross-provider-handoff.test.ts` 为 live 测试（`skipIf(!hasAnyApiKey())`，
+  须真实 API keys）不移植，意图由 `transform_messages` 纯函数测试 + 六适配器 normalize 回调覆盖
+  （anthropic/bedrock 64 上限 sanitize、google 条件化、mistral 专用、openai-completions pipe+40 上限、
+  openai-responses pipe+`fc_`+shortHash）；`transform-messages.ts` 的 null content 归一化由 serde 边界
+  容忍（types.rs `null_default`），无运行时步骤（D-036）
+- deferred tools：`splitDeferredTools` 归一化去重为 **last-wins**（对齐上游 `Map.set`：先现者保序、
+  后现者覆盖值）；适配器层 Anthropic `tool_reference` 排除规则（deferred 集合外 / 已加载跳过 / sibling
+  内容位移、keep-one-immediate、OAuth 名称归一 `toClaudeCodeName`、`default_supports_tool_references`
+  模型矩阵、compat 显式覆盖）、Kimi system-tools 序列化（无 content 字段、批量后置、`getToolsByName`
+  last-wins）、OpenAI `tool_search_call|tool_search_output`（execution=client、call_id 关联、
+  defer_loading）均与上游一致
+- transport 偏好：`StreamOptions.transport` 仅 openai-codex-responses 消费（WS/SSE/auto），其余 provider
+  静默忽略，与上游一致（上游亦仅 `openai-codex-responses.ts` 读取）
+- usage 兜底：openai-completions 流处理器含 Moonshot `choice.usage` 兜底（chunk.usage 缺失且
+  choice.usage truthy 时取用），与上游 `openai-completions.ts` 一致
 
 ### 3.7 Faux provider
 
@@ -688,12 +713,16 @@ gantt
 | Pi 路径 | Pir 路径 |
 |---------|----------|
 | `packages/ai/src/api/*` | `crates/pir-ai/src/api/*` |
-| `packages/ai/src/providers/*` | `crates/pir-ai/src/providers/*` |
+| `packages/ai/src/providers/*`（含 `all.ts` 注册表、`data/*.json` vendored） | `crates/pir-ai/src/providers.rs`（注册表）+ `crates/pir-ai/src/providers/*`（T13 W4，D-028） |
 | `packages/ai/src/auth/*` | `crates/pir-ai/src/auth/*` |
 | `packages/ai/src/utils/*`（transform/retry/overflow/estimate/…） | `crates/pir-ai/src/utils/*` |
 | `packages/ai/src/models.ts` / `models-store.ts` | `crates/pir-ai/src/models.rs` / `models_store.rs` |
+| `packages/ai/src/images.ts` / `images-models.ts` / `image-models.ts` / `images-api-registry.ts` / `image-models.generated.ts` | `crates/pir-ai/src/images.rs` + `crates/pir-ai/src/images/*`（T13 W6，D-037） |
+| `packages/ai/src/providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区 | `crates/pir-ai/src/images/providers/*`（T13 W6，D-037） |
+| `packages/ai/src/api/openrouter-images.ts`（+`.lazy.ts` 意图） | `crates/pir-ai/src/api/openrouter_images.rs`（T13 W6，D-037） |
+| `packages/ai/test/openrouter-images.test.ts` / `images-models.test.ts` / `image-model-data.test.ts` | `crates/pir-ai/tests/images.rs`（T13 W6；`images.test.ts` 为 live 测试不移植） |
 | `packages/coding-agent/src/core/model-config.ts`（models.json 加载） | `crates/pir-ai/src/models_json.rs`（D-006：serde 校验替代 TypeBox） |
-| `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（生成）+ `pir update --models`（远程） |
+| `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（嵌入 vendored 数据）+ `scripts/refresh-model-catalog.sh`（手动刷新）+ `pir update --models`（远程，W6）（D-028） |
 | `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
 | `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
 | `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001；T16 已落地，D-020：compaction/messages 复用 crate 根模块、session 门面 + 四存储实现 + env/tools/resources/utils + `src/proxy.rs` ← `packages/agent/src/proxy.ts`） |
@@ -720,7 +749,7 @@ gantt
 | `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/pir/src/tools/bash_executor.rs` |
 | `packages/coding-agent/src/core/settings-manager.ts` / `trust-manager.ts` / `keybindings.ts` | `crates/pir/src/core/settings_manager.rs` / `trust_manager.rs` / `keybindings.rs` |
 | `packages/coding-agent/src/core/resource-loader.ts` / `skills.ts` / `prompt-templates.ts` / `system-prompt.ts` / theme 相关（`themes/*`、`theme-schema.json`） | `crates/pir/src/core/resource_loader.rs` / `skills.rs` / `prompt_templates.rs` / `system_prompt.rs` / `themes.rs`（D-014，T09） |
-| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog.rs`（配合 pir-ai ModelsStore） |
+| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog_provider.rs`（配合 pir-ai ModelsStore；T13 W6-C，D-038） |
 | `packages/coding-agent/src/main.ts`（启动管线） | `crates/pir/src/app.rs` + `main.rs`（D-015，T10） |
 | `packages/coding-agent/src/core/sdk.ts` | `crates/pir/src/sdk.rs` |
 | `packages/coding-agent/src/core/model-runtime.ts` / `model-resolver.ts` | `crates/pir/src/core/model_runtime.rs` / `model_resolver.rs` |
@@ -754,9 +783,28 @@ gantt
 
 2026-07-29 覆盖度审查后新增的实现期细化项（不阻塞开工，随模块设计定稿）：
 
-- Codex WebSocket 状态机的 Rust 表达（连接缓存 TTL、per-session SSE 回退表）
-- compat 检测矩阵的数据化表达（表驱动 vs 代码分支）
+- ~~compat 检测矩阵的数据化表达（表驱动 vs 代码分支）~~——**已定稿（T13 W3/W4）**：`detect_compat` 表驱动矩阵（`openai_completions.rs:199`）+ compat 全量数据生成期烘焙进 vendored JSON（`providers/data/*.json`），见 §3.3
 - 扩展 UI 组件描述的序列化格式（需求 §9.2）
+
+### Codex WebSocket 状态机（2026-08-06 定稿，T13-W3）
+
+落地于 `crates/pir-ai/src/api/codex_ws.rs`（模块文档内有同构图示）：
+
+```text
+Disconnected ──connect(握手, 默认 15s 超时)──► Open ──acquire──► Busy(在途 response.create)
+   ▲                                                              │ 终态 response 事件
+   │                                                              ▼ (keep=true 且可复用)
+   │            5min 空闲 TTL 计时 ──► Closed(驱逐) ◄── Idle(入缓存)
+   │                                                              │ acquire(复用)
+   └── 任何 entry 在下次 acquire 时发现年龄 ≥ 55min ────────────── Busy
+```
+
+- **连接缓存**：per-session 单连接，双 TTL——5min 空闲 TTL（release 时挂起的 spawn 定时任务，以代际计数代替上游 `clearTimeout`）+ 55min 硬年龄上限（acquire 时检查）。
+- **busy 表达**：Rust 中 socket 在 `busy` 期间被**移出** cache entry（所有权随在途请求），release 时放回；entry.busy 时被 acquire 则另开一次性连接（与上游一致）。
+- **可复用性探针**：tungstenite 无 `readyState`，acquire 复用前做一次非阻塞 poll（Pending=存活；Close/EOF/错误=死亡则关闭换新；意外到达的数据帧存入 entry.pending 交付下次读取）。
+- **per-session SSE 永久回退**（单向）：流开始前发生传输失败即把 session 记入回退集合，后续请求直接走 SSE；流开始后的失败直接报错。两类一次重试：`websocket_connection_limit_reached`（流开始前）重连一次、`previous_response_not_found` 重试一次（continuation 已清除，重试发全量上下文）。
+- **缓存续传**：entry 内保存 `{lastRequestBody, lastResponseId, lastResponseItems}`，基线前缀校验（JSON.stringify 序敏感比较）通过后发送 `{previous_response_id, input: delta}`。
+- debug stats 与 session 资源清理经 `pir-ai::session_resources` 注册表（`session-resources.ts` 的移植）挂载。
 
 ---
 
@@ -788,7 +836,7 @@ gantt
 | 动态库插件 ABI | abi_stable（L0 Rust 插件；不手写 C ABI） |
 | Wasm 扩展 | **wasmtime 嵌入主二进制** + host ABI |
 | Token 估算 | **与钉死版 Pi 同一算法**（chars/4、image=4800 等常量逐字节移植） |
-| 模型目录 | build.rs 生成（models.dev 数据源）+ `pir update --models` 远程 overlay |
+| 模型目录 | build.rs 生成（models.dev 数据源）+ `pir update --models` 远程 overlay（`remote-catalog-provider.ts` → `crates/pir/src/core/remote_catalog_provider.rs`，T13 W6-C，D-038） |
 | 产品 Endpoint | settings / env 可配置（更新检查、telemetry、远程 catalog） |
 | 许可证 | **MIT** |
 | TS 嵌入 | **不做** |

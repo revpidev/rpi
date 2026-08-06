@@ -2486,6 +2486,134 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn test_build_params_oauth_used_name_keeps_tool_immediate() {
+        // Upstream "normalizes OAuth names before checking prior tool usage":
+        // an OAuth call to "Read" satisfies the "read" marker, so no tool is
+        // deferred and no tool_reference is emitted.
+        let model = make_model(json!({}));
+        let messages = vec![
+            assistant_message(
+                vec![AssistantContent::ToolCall(crate::types::ToolCall {
+                    id: "toolu_1".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: serde_json::Map::new(),
+                    thought_signature: None,
+                })],
+                "anthropic",
+                "claude-sonnet-4-5",
+            ),
+            tool_result("toolu_1", "loaded", Some(vec!["read"])),
+        ];
+        let ctx = context(messages, Some(vec![tool("base_tool"), tool("read")]));
+        let params =
+            build_params(&model, &ctx, true, &AnthropicOptions::default()).expect("params");
+        let tools = params["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], json!("base_tool"));
+        assert_eq!(tools[1]["name"], json!("Read"));
+        assert!(tools.iter().all(|t| t.get("defer_loading").is_none()));
+        let body = serde_json::to_string(&params).expect("serialize");
+        assert!(!body.contains("tool_reference"));
+    }
+
+    #[test]
+    fn test_build_params_oauth_canonicalized_markers_defer() {
+        // Upstream "matches OAuth-canonicalized markers to active tools":
+        // the "Read" marker canonicalizes to the "read" tool → deferred, and
+        // the tool_reference names the canonical Claude Code casing.
+        let model = make_model(json!({}));
+        let messages = vec![
+            assistant_message(
+                vec![AssistantContent::ToolCall(crate::types::ToolCall {
+                    id: "toolu_1".to_owned(),
+                    name: "base_tool".to_owned(),
+                    arguments: serde_json::Map::new(),
+                    thought_signature: None,
+                })],
+                "anthropic",
+                "claude-sonnet-4-5",
+            ),
+            tool_result("toolu_1", "loaded", Some(vec!["Read"])),
+        ];
+        let ctx = context(messages, Some(vec![tool("base_tool"), tool("read")]));
+        let params =
+            build_params(&model, &ctx, true, &AnthropicOptions::default()).expect("params");
+        let tools = params["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], json!("base_tool"));
+        assert!(tools[0].get("defer_loading").is_none());
+        assert_eq!(tools[1]["name"], json!("Read"));
+        assert_eq!(tools[1]["defer_loading"], json!(true));
+        let content = params["messages"][1]["content"]
+            .as_array()
+            .expect("content");
+        assert_eq!(
+            content[0]["content"],
+            json!([{"type": "tool_reference", "tool_name": "Read"}])
+        );
+    }
+
+    #[test]
+    fn test_build_params_all_tools_deferred_keeps_one_immediate() {
+        // Upstream "keeps one immediate Anthropic tool when every current
+        // tool is marked": the only tool stays immediate, no reference.
+        let model = make_model(json!({}));
+        let messages = vec![tool_result("toolu_1", "loaded", Some(vec!["late_tool"]))];
+        let ctx = context(messages, Some(vec![tool("late_tool")]));
+        let params =
+            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+        let tools = params["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!("late_tool"));
+        assert!(tools[0].get("defer_loading").is_none());
+        let body = serde_json::to_string(&params).expect("serialize");
+        assert!(!body.contains("tool_reference"));
+    }
+
+    #[test]
+    fn test_build_params_missing_tool_marker_no_reference() {
+        // Upstream "does not resurrect a marked tool missing from
+        // Context.tools": markers only defer tools actually present.
+        let model = make_model(json!({}));
+        let messages = vec![tool_result("toolu_1", "loaded", Some(vec!["ghost"]))];
+        let ctx = context(messages, Some(vec![tool("base_tool")]));
+        let params =
+            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+        let tools = params["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!("base_tool"));
+        let body = serde_json::to_string(&params).expect("serialize");
+        assert!(!body.contains("tool_reference"));
+    }
+
+    #[test]
+    fn test_build_params_transport_preference_ignored() {
+        // Transport is a codex-only preference; every other provider silently
+        // ignores it (upstream: only openai-codex-responses.ts reads it).
+        let model = make_model(json!({}));
+        let ctx = context(vec![user_text("hi")], None);
+        let plain =
+            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+        let with_transport = build_params(
+            &model,
+            &ctx,
+            false,
+            &AnthropicOptions {
+                stream: StreamOptions {
+                    transport: Some(crate::types::Transport::Websocket),
+                    ..StreamOptions::default()
+                },
+                ..AnthropicOptions::default()
+            },
+        )
+        .expect("params");
+        assert_eq!(
+            serde_json::to_string(&plain).expect("serialize"),
+            serde_json::to_string(&with_transport).expect("serialize")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // map_stop_reason
     // -----------------------------------------------------------------------

@@ -148,6 +148,7 @@ async fn session_fixture(
         credentials: None,
         auth_path: Some(agent_dir.join("auth.json")),
         models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
     })
     .await;
     model_runtime

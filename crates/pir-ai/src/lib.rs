@@ -12,9 +12,12 @@ pub mod api;
 pub mod auth;
 pub mod error;
 pub mod generated;
+pub mod images;
 pub mod models;
 pub mod models_json;
 pub mod models_store;
+pub mod providers;
+pub mod session_resources;
 pub mod types;
 pub mod utils;
 

@@ -4,11 +4,11 @@
 //! data-level port of the full upstream table (T13 reuses it for the
 //! remaining providers).
 //!
-//! Not ported (T13 scope, provider-owned ambient logins):
+//! Not in this table (provider-owned ambient logins, landed in T13):
 //! - the Vertex ADC `<authenticated>` branch (`hasVertexAdcCredentials`,
-//!   GOOGLE_CLOUD_PROJECT/LOCATION checks) — TODO(T13)
+//!   GOOGLE_CLOUD_PROJECT/LOCATION checks) — `providers/google_vertex.rs`
 //! - the Amazon Bedrock ambient `<authenticated>` branch (AWS_PROFILE / IAM
-//!   keys / bearer token / ECS / IRSA) — TODO(T13)
+//!   keys / bearer token / ECS / IRSA) — `providers/amazon_bedrock.rs`
 //! - the Bun `/proc/self/environ` sandbox fallback (Bun-specific, see
 //!   `utils/provider_env.rs`)
 
@@ -113,11 +113,12 @@ pub fn get_env_api_key(provider: &str, env: Option<&ProviderEnv>) -> Option<Stri
         }
     }
 
-    // TODO(T13): google-vertex ADC `<authenticated>` branch
-    // (hasVertexAdcCredentials + GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT +
-    // GOOGLE_CLOUD_LOCATION) and amazon-bedrock ambient `<authenticated>`
-    // branch (AWS_PROFILE / IAM keys / AWS_BEARER_TOKEN_BEDROCK / ECS /
-    // IRSA) — provider-owned ambient logins, out of T04 scope.
+    // google-vertex ADC `<authenticated>` (GOOGLE_CLOUD_PROJECT /
+    // GCLOUD_PROJECT / GOOGLE_CLOUD_LOCATION) and amazon-bedrock ambient
+    // `<authenticated>` (AWS_PROFILE / IAM keys / AWS_BEARER_TOKEN_BEDROCK)
+    // are provider-owned ambient logins — they live in
+    // `providers/google_vertex.rs` / `providers/amazon_bedrock.rs`, not in
+    // this env-key table.
 
     None
 }

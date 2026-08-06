@@ -581,6 +581,195 @@ pub struct UsageCost {
     pub total: f64,
 }
 
+// ---------------------------------------------------------------------------
+// Images (image generation subsystem: `images.ts` / `images-models.ts` /
+// `image-models.ts` / `images-api-registry.ts` / `api/openrouter-images.ts`)
+// ---------------------------------------------------------------------------
+
+/// `ImagesApi = KnownImagesApi | (string & {})` — open string with the known
+/// constant, mirroring [`ApiKind`] for the image-generation side.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ImagesApiKind(pub String);
+
+impl ImagesApiKind {
+    pub const OPENROUTER_IMAGES: &'static str = "openrouter-images";
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImagesApiKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ImagesApiKind {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for ImagesApiKind {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+/// `ImagesStopReason = "stop" | "error" | "aborted"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImagesStopReason {
+    #[serde(rename = "stop")]
+    Stop,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "aborted")]
+    Aborted,
+}
+
+/// `ImagesInputContent` — `ImagesContext.input` block = Text | Image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ImagesInputContent {
+    Text(TextContent),
+    Image(ImageContent),
+}
+
+/// `ImagesOutputContent` — `AssistantImages.output` block = Text | Image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ImagesOutputContent {
+    Text(TextContent),
+    Image(ImageContent),
+}
+
+/// `ImagesContext`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagesContext {
+    pub input: Vec<ImagesInputContent>,
+}
+
+/// `AssistantImages` — the uniform image-generation result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantImages {
+    pub api: ImagesApiKind,
+    pub provider: String,
+    pub model: String,
+    pub output: Vec<ImagesOutputContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    pub stop_reason: ImagesStopReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp: i64,
+}
+
+/// `ImagesModel.output` entry: `"text" | "image"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImagesOutputModality {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "image")]
+    Image,
+}
+
+/// `ImagesModel<TApi>` — `Omit<Model, "api" | "provider" | "reasoning" |
+/// "contextWindow" | "maxTokens" | "compat">` with `api`/`provider`
+/// re-added and `output` (`"text" | "image"`). The `TApi` type parameter
+/// collapses (all image models flow through the untyped registry, mirroring
+/// the upstream `ImagesApi` open union).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagesModel {
+    pub id: String,
+    pub name: String,
+    pub api: ImagesApiKind,
+    pub provider: String,
+    pub base_url: String,
+    pub input: Vec<InputModality>,
+    pub output: Vec<ImagesOutputModality>,
+    pub cost: ModelCost,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// `ImagesOptions.onPayload` — inspect or replace the wire JSON payload
+/// before sending. Returning `None` keeps the payload unchanged.
+pub type ImagesOnPayloadCallback = Arc<
+    dyn Fn(
+            serde_json::Value,
+            &ImagesModel,
+        ) -> Pin<Box<dyn Future<Output = Option<serde_json::Value>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `ImagesOptions.onResponse` — invoked after an HTTP response is received.
+pub type ImagesOnResponseCallback = Arc<
+    dyn Fn(ProviderResponse, &ImagesModel) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `ImagesOptions` — base options for image generation, mirroring
+/// `StreamOptions` minus the chat-only fields.
+#[derive(Clone, Default)]
+pub struct ImagesOptions {
+    pub signal: Option<CancellationToken>,
+    pub api_key: Option<String>,
+    /// Provider-scoped environment values; precedence over process.env.
+    pub env: Option<ProviderEnv>,
+    pub on_payload: Option<ImagesOnPayloadCallback>,
+    pub on_response: Option<ImagesOnResponseCallback>,
+    /// Custom HTTP headers, merged over provider defaults; `None` suppresses
+    /// a default header.
+    pub headers: Option<ProviderHeaders>,
+    /// HTTP request timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum client-side retry attempts.
+    pub max_retries: Option<u32>,
+    /// Maximum delay (ms) to wait for a server-requested long retry wait.
+    /// Default: 60000; 0 disables the cap.
+    pub max_retry_delay_ms: Option<u64>,
+    /// Optional metadata; providers extract the fields they understand.
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+// Manual Debug: the callback trait objects are not Debug; `api_key` and
+// header values are redacted (coding-standards §11.1/§11.2).
+impl fmt::Debug for ImagesOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ImagesOptions")
+            .field("signal", &self.signal)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("env", &self.env)
+            .field(
+                "on_payload",
+                &self.on_payload.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "on_response",
+                &self.on_response.as_ref().map(|_| "<callback>"),
+            )
+            .field(
+                "headers",
+                &self.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
+            )
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
+            .field("metadata", &self.metadata)
+            .finish()
+    }
+}
+
 /// `StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted"`.
 ///
 /// `pending` exists in the type but is transient only: it is never persisted

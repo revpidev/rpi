@@ -570,7 +570,7 @@ impl InteractiveUi {
         let session = ui.session();
         let runtime = session.model_runtime().clone();
         // Get all available models (interactive-mode.ts:4488-4489).
-        runtime.refresh().await;
+        runtime.refresh(None).await;
         let all_models = runtime.get_available(None).await.unwrap_or_default();
         let all_model_ids: Vec<String> = all_models
             .iter()
@@ -962,7 +962,7 @@ impl InteractiveUi {
         // `getModelCandidates` (interactive-mode.ts:4350-4361): scoped models
         // win; otherwise refresh and list everything.
         let models: Vec<Model> = if self.session().scoped_models().is_empty() {
-            self.session().model_runtime().refresh().await;
+            self.session().model_runtime().refresh(None).await;
             self.session()
                 .model_runtime()
                 .get_available(None)

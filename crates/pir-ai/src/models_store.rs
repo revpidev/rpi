@@ -94,6 +94,9 @@ impl ModelsStore for InMemoryModelsStore {
 pub struct JsonFileModelsStore {
     path: PathBuf,
     state: Mutex<HashMap<String, ModelsStoreEntry>>,
+    /// Serializes `persist` (snapshot → tmp write → rename) so a stale
+    /// snapshot can never win the atomic rename over a newer one.
+    persist_lock: tokio::sync::Mutex<()>,
 }
 
 impl JsonFileModelsStore {
@@ -115,10 +118,19 @@ impl JsonFileModelsStore {
         Ok(Self {
             path,
             state: Mutex::new(state),
+            persist_lock: tokio::sync::Mutex::new(()),
         })
     }
 
+    /// Writes the full state via a unique tmp file + atomic rename. Persists
+    /// are serialized on `persist_lock` and the snapshot is taken after
+    /// acquiring it, so the final rename always carries every entry written
+    /// before the persist started (upstream serializes its read-modify-write
+    /// through a file lock; the cross-process case is out of scope here).
+    /// The tmp name is unique per call so two store instances sharing one
+    /// path cannot clobber each other's tmp file.
     async fn persist(&self) -> Result<(), AiError> {
+        let _persist_guard = self.persist_lock.lock().await;
         let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let content = serde_json::to_string_pretty(&JsonFileModelsStoreFile {
             providers: snapshot,
@@ -131,19 +143,24 @@ impl JsonFileModelsStore {
                 ))
             })?;
         }
-        let tmp = self.path.with_extension("tmp");
-        tokio::fs::write(&tmp, content).await.map_err(|error| {
-            AiError::ModelCatalog(format!(
-                "failed to write models store {}: {error}",
-                tmp.display()
-            ))
-        })?;
-        tokio::fs::rename(&tmp, &self.path).await.map_err(|error| {
-            AiError::ModelCatalog(format!(
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = self.path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let write_result = tokio::fs::write(&tmp, content).await;
+        let result = match write_result {
+            Ok(()) => tokio::fs::rename(&tmp, &self.path).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AiError::ModelCatalog(format!(
                 "failed to persist models store {}: {error}",
                 self.path.display()
-            ))
-        })?;
+            )));
+        }
         Ok(())
     }
 }
@@ -206,6 +223,63 @@ mod tests {
         assert_eq!(loaded.read("openai").await.expect("read"), Some(entry));
         loaded.delete("openai").await.expect("delete");
         assert_eq!(loaded.read("openai").await.expect("read"), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Concurrent writes must not clobber each other's tmp file (unique tmp
+    /// name per persist); every entry survives and no tmp file is left.
+    #[tokio::test]
+    async fn test_json_file_models_store_concurrent_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "pir-models-store-concurrent-{}",
+            std::process::id()
+        ));
+        let path = dir.join("models-store.json");
+        let store = std::sync::Arc::new(
+            JsonFileModelsStore::load(path.clone())
+                .await
+                .expect("load empty"),
+        );
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .write(
+                        &format!("provider-{index}"),
+                        ModelsStoreEntry {
+                            models: vec![],
+                            last_modified: None,
+                            checked_at: Some(index),
+                            etag: None,
+                        },
+                    )
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.expect("join").expect("write");
+        }
+        let loaded = JsonFileModelsStore::load(path.clone())
+            .await
+            .expect("reload");
+        for index in 0..16 {
+            assert!(
+                loaded
+                    .read(&format!("provider-{index}"))
+                    .await
+                    .expect("read")
+                    .is_some(),
+                "provider-{index} missing"
+            );
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "models-store.json")
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {leftovers:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

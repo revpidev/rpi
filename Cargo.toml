@@ -45,11 +45,19 @@ fs2 = "0.4"
 # reqwest nor an HTTP client of its own.
 oauth2 = { version = "5", default-features = false }
 axum = "0.8"
+# T13 Bedrock 适配器手写 SigV4（设计文档 §14：不引 aws-sdk）。
+sha2 = "0.10"
+hmac = "0.12"
+# T13 Codex 适配器：WebSocket 传输与 SSE 请求体 zstd 压缩（设计文档 §14）。
+# rustls + webpki-roots，与 reqwest 的 rustls-tls 保持一致（单文件部署目标）。
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+zstd = "0.13"
 
 # T06 built-in tools (pir/src/tools/).
 unicode-normalization = "0.1"   # NFKC/NFD for edit fuzzy matching + read path variants
 libc = "0.2"                    # unix process-group kill (bash kill tree)
-base64 = "0.22"                 # read tool image attachments
+base64 = "0.22"                 # read tool image attachments; google-vertex ADC JWT encoding (T13)
+ring = "0.17"                   # RS256 signing for google-vertex ADC service-account JWT (T13)
 # Pure-Rust image decode/encode/resize for the read tool (replaces upstream Photon WASM).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kamadak-exif = "0.6"            # EXIF orientation auto-correct on image resize

@@ -548,11 +548,19 @@ pub fn convert_responses_tools(
 /// service-tier cost multiplier).
 pub type ApplyServiceTierPricing<'a> = Box<dyn Fn(&mut Usage, Option<&str>) + Send + 'a>;
 
+/// `resolveServiceTier` hook type: maps (response tier, request tier) to the
+/// effective tier. `None` keeps the default `response ?? request` resolution
+/// (openai-responses); the Codex adapter passes `resolveCodexServiceTier`,
+/// which treats a `"default"` response tier as the requested flex/priority
+/// tier.
+pub type ResolveServiceTier = fn(Option<&str>, Option<&str>) -> Option<String>;
+
 /// `OpenAIResponsesStreamOptions` (processor side).
 pub struct ResponsesStreamOptions<'a> {
     pub service_tier: Option<&'a str>,
     pub grammar_tool_input_properties: &'a HashMap<String, String>,
     pub apply_service_tier_pricing: Option<ApplyServiceTierPricing<'a>>,
+    pub resolve_service_tier: Option<ResolveServiceTier>,
 }
 
 /// Custom (grammar) tool streaming state.
@@ -932,11 +940,14 @@ impl<'a> ResponsesStreamProcessor<'a> {
         }
         calculate_cost(self.model, &mut self.output.usage);
         if let Some(apply) = &self.options.apply_service_tier_pricing {
-            let service_tier = response
-                .get("service_tier")
-                .and_then(Value::as_str)
-                .or(self.options.service_tier);
-            apply(&mut self.output.usage, service_tier);
+            let response_tier = response.get("service_tier").and_then(Value::as_str);
+            let service_tier = match self.options.resolve_service_tier {
+                Some(resolve) => resolve(response_tier, self.options.service_tier),
+                None => response_tier
+                    .or(self.options.service_tier)
+                    .map(str::to_owned),
+            };
+            apply(&mut self.output.usage, service_tier.as_deref());
         }
         // Map status to stop reason.
         self.output.stop_reason = map_stop_reason(response.get("status").and_then(Value::as_str))?;
@@ -1847,6 +1858,7 @@ mod tests {
                     service_tier: None,
                     grammar_tool_input_properties: grammar_props,
                     apply_service_tier_pricing: None,
+                    resolve_service_tier: None,
                 },
             );
             let mut result: Result<(), String> = Ok(());

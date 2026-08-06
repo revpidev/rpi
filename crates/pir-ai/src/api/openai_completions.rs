@@ -146,13 +146,19 @@ pub fn get_deferred_tool_names(messages: &[Message]) -> Vec<String> {
 }
 
 /// `getToolsByName`: tools from `tools` matching `names`, in `names` order.
+/// Upstream builds `new Map(tools.map((tool) => [tool.name, tool]))` — a
+/// later duplicate name overwrites an earlier one.
 pub fn get_tools_by_name(tools: Option<&[Tool]>, names: &[String]) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
+    let mut by_name: HashMap<&str, &Tool> = HashMap::new();
+    for tool in tools {
+        by_name.insert(tool.name.as_str(), tool);
+    }
     names
         .iter()
-        .filter_map(|name| tools.iter().find(|tool| &tool.name == name).cloned())
+        .filter_map(|name| by_name.get(name.as_str()).map(|tool| (*tool).clone()))
         .collect()
 }
 
@@ -3113,6 +3119,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_convert_messages_kimi_deferred_batch_after_all_tool_results() {
+        // Upstream "emits Kimi deferred schemas after all tool results in a
+        // batch": markers from every tool result in the run collect into one
+        // system message placed after all of them.
+        let model = make_model(json!({"compat": {"deferredToolsMode": "kimi"}}));
+        let ctx = context(
+            vec![
+                user_text("Hello"),
+                same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_1", "name": "base_tool", "arguments": {}}
+                ])),
+                tool_result(
+                    "call_1",
+                    json!([{"type": "text", "text": "done"}]),
+                    json!({"addedToolNames": ["late_tool"]}),
+                ),
+                tool_result(
+                    "call_2",
+                    json!([{"type": "text", "text": "done2"}]),
+                    json!({"addedToolNames": ["later_tool"]}),
+                ),
+                user_text("next"),
+            ],
+            Some(vec![
+                tool("base_tool"),
+                tool("late_tool"),
+                tool("later_tool"),
+            ]),
+        );
+        let compat = get_compat(&model);
+        let params = convert(&model, &ctx, &compat);
+        let roles: Vec<&str> = params
+            .iter()
+            .map(|msg| msg["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "tool", "system", "user"]
+        );
+        assert_eq!(
+            params[4]["tools"][0]["function"]["name"],
+            json!("late_tool")
+        );
+        assert_eq!(
+            params[4]["tools"][1]["function"]["name"],
+            json!("later_tool")
+        );
+    }
+
+    #[test]
+    fn test_get_tools_by_name_duplicate_last_wins() {
+        // Upstream `getToolsByName` builds a Map (later duplicates overwrite).
+        let mut canonical = tool("late_tool");
+        canonical.description = "Canonical definition".to_owned();
+        let tools = vec![tool("late_tool"), canonical];
+        let found = get_tools_by_name(Some(&tools), &["late_tool".to_owned()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description, "Canonical definition");
+        assert!(get_tools_by_name(None, &["late_tool".to_owned()]).is_empty());
+    }
+
+    #[test]
     fn test_convert_messages_bridge_after_tool_result() {
         let model = make_model(json!({
             "compat": {"requiresAssistantAfterToolResult": true}
@@ -3142,7 +3210,7 @@ mod build_and_stream_tests {
     use futures::StreamExt;
     use serde_json::{json, Value};
 
-    use super::tests::{context, make_model, same_model_assistant, tool, user_text};
+    use super::tests::{context, make_model, same_model_assistant, tool, tool_result, user_text};
     use super::*;
     use crate::types::{ChatTemplateKwargVar, ThinkingBudgets, ThinkingLevel};
 
@@ -3165,6 +3233,69 @@ mod build_and_stream_tests {
     ) -> Value {
         let compat = get_compat(model);
         build_params(model, ctx, opts, &compat, retention, &no_grammar()).expect("params")
+    }
+
+    // -- transport preference ----------------------------------------------------
+
+    #[test]
+    fn test_build_params_transport_preference_ignored() {
+        // Transport is a codex-only preference; every other provider silently
+        // ignores it (upstream: only openai-codex-responses.ts reads it).
+        let model = make_model(json!({}));
+        let ctx = context(vec![user_text("hi")], None);
+        let plain = params_for(
+            &model,
+            &ctx,
+            &options(StreamOptions::default()),
+            CacheRetention::Short,
+        );
+        let with_transport = params_for(
+            &model,
+            &ctx,
+            &options(StreamOptions {
+                transport: Some(crate::types::Transport::Websocket),
+                ..StreamOptions::default()
+            }),
+            CacheRetention::Short,
+        );
+        assert_eq!(
+            serde_json::to_string(&plain).expect("serialize"),
+            serde_json::to_string(&with_transport).expect("serialize")
+        );
+    }
+
+    #[test]
+    fn test_convert_messages_without_kimi_mode_leaves_tools_unchanged() {
+        // Upstream "leaves OpenAI Completions tools unchanged without Kimi
+        // mode": no system tool message, and build_params keeps every tool.
+        let model = make_model(json!({}));
+        let ctx = context(
+            vec![
+                same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_1", "name": "base_tool", "arguments": {}}
+                ])),
+                tool_result(
+                    "call_1",
+                    json!([{"type": "text", "text": "done"}]),
+                    json!({"addedToolNames": ["late_tool"]}),
+                ),
+            ],
+            Some(vec![tool("base_tool"), tool("late_tool")]),
+        );
+        let compat = get_compat(&model);
+        let params = convert_messages(&model, &ctx, &compat, &no_grammar()).expect("messages");
+        assert!(!params
+            .iter()
+            .any(|msg| msg["role"] == json!("system") && msg.get("tools").is_some()));
+        let opts = options(StreamOptions::default());
+        let built = params_for(&model, &ctx, &opts, CacheRetention::Short);
+        let names: Vec<&str> = built["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(names, ["base_tool", "late_tool"]);
     }
 
     // -- convert_tools -----------------------------------------------------------

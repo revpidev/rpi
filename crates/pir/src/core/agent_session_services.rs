@@ -105,6 +105,7 @@ pub async fn create_agent_session_services(
                 credentials: None,
                 auth_path: Some(agent_dir.join("auth.json")),
                 models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+                ..Default::default()
             })
             .await
         }
@@ -125,7 +126,16 @@ pub async fn create_agent_session_services(
     // Extension provider registrations drain into the model runtime
     // (agent-session-services.ts:155-179) — no extensions yet, so nothing is
     // pending.
-    model_runtime.refresh().await;
+    // Offline refresh (agent-session-services.ts:180
+    // `refresh({ allowNetwork: false })`): session startup must not block on
+    // dynamic catalog network fetches.
+    model_runtime
+        .refresh(Some(pir_ai::models::ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+        }))
+        .await;
     diagnostics.extend(apply_extension_flag_values(&options.extension_flag_values));
 
     Ok(AgentSessionServices {

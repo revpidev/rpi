@@ -757,10 +757,14 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 | `axum` | OAuth 一次性 localhost 回调页 |
 | `unicode-normalization` | edit fuzzy 匹配 NFKC / read 路径变体 NFD（T06） |
 | `image` + `kamadak-exif` | read 工具图像解码/缩放/EXIF 方向（替代上游 Photon WASM，T06，D-011） |
-| `base64` | read 工具图像附件编码（T06） |
-| `libc` | unix 进程组终止（bash kill tree，T06） |
+| `base64` | read 工具图像附件编码（T06）；google-vertex ADC JWT 编码（T13，D-025） |
+| `ring` | google-vertex ADC service_account JWT RS256 签名（T13，D-025；rustls 传递依赖转正） |
+| `libc` | unix 进程组终止（bash kill tree，T06）；codex User-Agent 内核版本 uname（T13，D-027） |
 | `abi_stable` | L0 动态库扩展插件 ABI |
+| `sha2` + `hmac` | Bedrock 手写 SigV4 的 SHA-256/HMAC-SHA256（T13，D-026） |
 | （不引 aws-sdk） | Bedrock 手写 SigV4 + reqwest + 自实现 event-stream 解码 |
+| `tokio-tungstenite` | openai-codex-responses WebSocket 传输（rustls + webpki-roots，T13，D-027） |
+| `zstd` | openai-codex-responses SSE 请求体压缩（T13，D-027） |
 
 > 具体版本以 workspace `Cargo.toml` 为准；升级须评估对钉死行为的影响并重新对拍。
 

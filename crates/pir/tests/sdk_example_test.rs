@@ -68,6 +68,7 @@ async fn sdk_quick_start_one_faux_round() {
         credentials: None,
         auth_path: Some(agent_dir.join("auth.json")),
         models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
     })
     .await;
     model_runtime

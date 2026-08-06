@@ -300,14 +300,14 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 
 - **解析顺序**：显式 `options.apiKey` → **credential store（命中即停，拥有 provider）** → ambient（env var / AWS profile / ADC）。OAuth 是 credential 的一种类型；过期时在 `modify` 锁内双重检查刷新；**刷新失败抛错且绝不静默回退 env key**
 - CredentialStore 契约：`read/list/modify/delete`；`modify` 是唯一写路径（按 provider 串行化 read-modify-write + 跨进程文件锁）；`list()` 只返回 `{providerId,type}` 不解析密钥；credential 判别式 `{type:"api_key",key?,env?} | {type:"oauth",refresh,access,expires,...}` 与 Pi `auth.json` 兼容（0600）
-- env 变量表逐 provider 对齐（`docs/providers.md` 33 家对照表）；Anthropic 三变量优先级 `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY`（`ANTHROPIC_AUTH_TOKEN` 命中时产生 `Authorization: Bearer <token>` 头，`ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` 走 apiKey（x-api-key）路径）
+- env 变量表逐 provider 对齐（`docs/providers.md` 33 家对照表，上游 pi 仓库文档；pir 侧权威对照表为 `env_keys.rs` 全表）；Anthropic 三变量优先级 `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY`（`ANTHROPIC_AUTH_TOKEN` 命中时产生 `Authorization: Bearer <token>` 头，`ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` 走 apiKey（x-api-key）路径）
 - **key 值解析 DSL**（auth.json 与 models.json 通用）：`!cmd` 执行命令取 stdout、`$VAR`/`${VAR}` 插值、`$$`/`$!` 转义
 - **OAuth 流程 7 个**：anthropic（PKCE + 本地回调与 manual_code 竞速）、openai-codex（PKCE、`id_token_add_organizations`、originator）、github-copilot（**device code**，enterprise 域名、per-account baseUrl、登录时拉 `availableModelIds`；登录成功后对每个已知模型 POST `${baseUrl}/models/{id}/policy`（body `{state:"enabled"}`，头 `openai-intent: chat-policy`）做 policy-enable，缺失会导致 Claude/Grok 等模型首次登录后不可用）、openrouter（PKCE 换**永久 API key**，refresh no-op）、kimi-coding、xai、radius；device code 流程实际覆盖 5 个 provider——github-copilot、kimi-coding、xai、radius（均为 RFC 8628 device_code grant）+ openai-codex（OpenAI 私有 deviceauth 端点变体，`/api/accounts/deviceauth/usercode|token`，验证 URI `/codex/device`）；device 轮询遵循 RFC 8628（默认 5s、slow_down +5s、下限 1s、WSL 时钟漂移错误信息）
 - provider 自有 login：Bedrock（bearer-token/aws-profile/credential-chain）、Vertex（api-key/adc/service-account）、Cloudflare（多字段 prompt 存 `credential.env`）
 - `/login` `/logout` 订阅流；`checkAuth()` / `getAvailable()`
 - 交互协议：`AuthInteraction.prompt()`（text/secret/select/manual_code，per-prompt signal 竞速取消）+ `notify()`（links/auth_url/device_code/progress）
 - `options.env` 每请求环境覆盖（Cloudflare/Azure/Vertex/Bedrock/代理变量都走它）
-- （Rust 落地注记：auth 存储/DSL/OAuth 框架的实现细节差异——fs2 锁语义边界、`!cmd` 仅 unix、快照保序、device 时钟抽象、OAuth 测试缝等，见偏离 D-008 / D-009）
+- （Rust 落地注记：auth 存储/DSL/OAuth 框架的实现细节差异——fs2 锁语义边界、`!cmd` 仅 unix、快照保序、device 时钟抽象、OAuth 测试缝等，见偏离 D-008 / D-009；T13 W5 六个 OAuth 流程的落地差异见 D-033 / D-034 / D-035）
 
 ### 5.5 横切能力
 
@@ -332,7 +332,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 
 ### 5.6 Provider 环境变量
 
-逐 provider 对齐 `docs/providers.md` 对照表与 `env-api-keys.ts`（含各区域变体：`QWEN_TOKEN_PLAN_API_KEY`/`_CN_`、`ZAI_API_KEY`/`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`/`MINIMAX_CN_API_KEY`、Xiaomi 四端点等；Moonshot 双 provider 共用 `MOONSHOT_API_KEY`）。
+逐 provider 对齐 `docs/providers.md` 对照表（上游 pi 仓库文档，未随 `external/pi` vendored 子集落地；pir 侧权威对照表为 `crates/pir-ai/src/auth/env_keys.rs` 全表）与 `env-api-keys.ts`（含各区域变体：`QWEN_TOKEN_PLAN_API_KEY`/`_CN_`、`ZAI_API_KEY`/`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`/`MINIMAX_CN_API_KEY`、Xiaomi 四端点等；Moonshot 双 provider 共用 `MOONSHOT_API_KEY`）。
 
 ---
 

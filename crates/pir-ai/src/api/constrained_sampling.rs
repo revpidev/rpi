@@ -124,7 +124,7 @@ fn infer_grammar_input_property(tool: &Tool) -> Result<String, String> {
                 return Err(
                     "grammar constrained sampling requires exactly one required string property"
                         .to_owned(),
-                )
+                );
             }
         };
 

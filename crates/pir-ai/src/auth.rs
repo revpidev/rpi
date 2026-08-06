@@ -10,6 +10,7 @@
 //! (`interaction`). OAuth flows land with T04 part 2.
 
 pub mod anthropic_auth;
+pub mod cloudflare_auth;
 pub mod config_value;
 pub mod credential_store;
 pub mod env_keys;

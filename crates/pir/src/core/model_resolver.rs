@@ -1264,6 +1264,7 @@ mod tests {
             credentials: Some(credentials),
             auth_path: None,
             models_path: ModelsPathInput::Disabled,
+            ..Default::default()
         })
         .await;
         runtime
@@ -1542,6 +1543,7 @@ mod tests {
             credentials: Some(credentials),
             auth_path: None,
             models_path: ModelsPathInput::Disabled,
+            ..Default::default()
         })
         .await;
         runtime

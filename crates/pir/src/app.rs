@@ -3,9 +3,9 @@
 //! Port of `packages/coding-agent/src/main.ts` @ pi 0.82.1 (2efa728).
 //!
 //! T10 boundaries (task file §Out):
-//! - Subcommand dispatch (install/remove/uninstall/list/update/config) is a
-//!   placeholder: the commands land in T14 and currently exit 1 with a
-//!   diagnostic (upstream would run them).
+//! - Subcommand dispatch is a placeholder except `update --models`
+//!   (W6-C): the remaining package commands land in T14 and currently exit
+//!   1 with a diagnostic (upstream would run them).
 //! - First-time setup never runs in headless modes.
 //! - `--export` parses but reports "not available yet (T14)".
 //! - Migrations (`migrations.ts`) are permanently out of scope (ADR-0003 §3).
@@ -57,10 +57,10 @@ use crate::tools::path_utils::resolve_path;
 /// Upstream `EXTENSION_LOAD_FAILURE_HINT` (main.ts:52).
 const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"pir -ne\".";
 
-/// Package/config subcommands (T14; main.ts:492-507 dispatches them before
-/// `parseArgs`).
-const PLACEHOLDER_SUBCOMMANDS: [&str; 6] =
-    ["install", "remove", "uninstall", "list", "update", "config"];
+/// Package/config subcommands (main.ts:492-507 dispatches them before
+/// `parseArgs`). `update` is handled by [`crate::cli::package_command`]
+/// (W6-C lands `update --models`); the rest land in T14.
+const PLACEHOLDER_SUBCOMMANDS: [&str; 5] = ["install", "remove", "uninstall", "list", "config"];
 
 fn is_truthy_env_flag(value: Option<&str>) -> bool {
     match value {
@@ -582,8 +582,13 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         std::env::set_var(ENV_SKIP_VERSION_CHECK, "1");
     }
 
-    // Subcommand dispatch placeholder (main.ts:492-507; T14).
+    // Subcommand dispatch (main.ts:492-507). `update --models` landed in
+    // W6-C (remote model catalog refresh); the remaining package commands
+    // and update targets are T14.
     if let Some(first) = args.first() {
+        if first == "update" {
+            return crate::cli::package_command::run_update(&args).await;
+        }
         if PLACEHOLDER_SUBCOMMANDS.contains(&first.as_str()) {
             let _ = writeln!(err, "Error: pir {first} is not available yet (T14)");
             return 1;

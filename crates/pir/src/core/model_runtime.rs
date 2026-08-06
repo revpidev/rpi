@@ -8,8 +8,6 @@
 //! - No built-in provider catalog: pir-ai implements the API adapters but the
 //!   38 provider factories are T13. The catalog consists of models.json
 //!   custom providers plus SDK/extension registrations.
-//! - `refresh` never touches the network (remote model catalogs are T13); it
-//!   reloads models.json and rebuilds providers.
 //! - models.json `apiKey` is treated as an env var name
 //!   ([`env_api_key_auth`]); command/raw-key config values
 //!   (resolve-config-value.ts) and `oauth: "radius"` are T13.
@@ -19,6 +17,21 @@
 //!   coalesces concurrent refreshes onto one in-flight promise — the
 //!   single-threaded headless flows cannot observe the difference).
 //!
+//! W6-C notes (remote catalog overlay, model-runtime.ts:133-172, 516-537):
+//! - `ModelsStore` persistence (file next to models.json, upstream
+//!   `FileModelsStore`) and `Models::refresh` network plumbing landed:
+//!   `CreateModelRuntimeOptions` gains `modelsStore` / `modelsStorePath` /
+//!   `allowModelNetwork` / `modelRefreshTimeoutMs`; `refresh(options)` runs
+//!   dynamic catalog refreshes with `allowNetwork` defaulting to
+//!   `modelNetworkEnabled` (= `PIR_OFFLINE` unset).
+//! - Built-in providers are not registered yet, so the
+//!   [`remote_catalog_provider`] decorator has no runtime consumer in this
+//!   wave; the registration wave wraps them like upstream
+//!   (model-runtime.ts:144-150).
+//! - A corrupt `models-store.json` falls back to an in-memory store with a
+//!   warning (upstream surfaces per-read `JSON.parse` errors into the
+//!   refresh result; see D-036).
+//!
 //! Upstream mutates through plain class fields; here the mutable registries
 //! live behind mutexes so all methods take `&self` (JS has no borrow
 //! discipline — this is structural, not behavioral).
@@ -26,6 +39,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+
+use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
 
 use pir_ai::api::anthropic_messages::AnthropicMessages;
 use pir_ai::api::openai_completions::OpenAiCompletions;
@@ -41,19 +57,21 @@ use pir_ai::auth::types::{
     CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext, ModifyFn, ProviderAuth,
 };
 use pir_ai::models::{
-    create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsSimpleStreamOptions,
-    ModelsStreamOptions, Provider, ProviderApi, ProviderStreams,
+    create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions,
+    ModelsRefreshResult, ModelsSimpleStreamOptions, ModelsStreamOptions, Provider, ProviderApi,
+    ProviderStreams, RefreshModelsContext,
 };
 use pir_ai::models_json::{
     ModelConfig, ModelsJsonModel, ModelsJsonModelOverride, ModelsJsonProvider, OrderedMap,
 };
+use pir_ai::models_store::{InMemoryModelsStore, JsonFileModelsStore, ModelsStore};
 use pir_ai::types::{
     ApiKind, AssistantMessage, Context, Model, ModelCompat, ModelCost, ModelCostRates, ProviderEnv,
     ProviderHeaders, SimpleStreamOptions, StreamOptions,
 };
 use pir_ai::utils::event_stream::AssistantMessageEventStream;
 
-use crate::config::get_agent_dir;
+use crate::config::{get_agent_dir, ENV_OFFLINE};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -227,8 +245,12 @@ pub enum ModelsPathInput {
     Disabled,
 }
 
-/// `CreateModelRuntimeOptions` (model-runtime.ts:58-70), T10 subset (no
-/// network refresh options — see module docs).
+/// Create-time network model refresh timeout (model-runtime.ts:164,
+/// package-manager-cli.ts:404): 15 seconds.
+pub const DEFAULT_MODEL_REFRESH_TIMEOUT_MS: u64 = 15_000;
+
+/// `CreateModelRuntimeOptions` (model-runtime.ts:58-70), T10 subset. W6-C
+/// added the network refresh options (see module docs).
 #[derive(Default)]
 pub struct CreateModelRuntimeOptions {
     /// Credential storage. Default: file at `auth_path`.
@@ -236,6 +258,18 @@ pub struct CreateModelRuntimeOptions {
     /// Default: `{agentDir}/auth.json`.
     pub auth_path: Option<PathBuf>,
     pub models_path: ModelsPathInput,
+    /// Persistent model storage for dynamic provider catalogs. Default: file
+    /// at `modelsStorePath` (or `{models.json dir}/models-store.json`) when
+    /// models.json is enabled, else in-memory (model-runtime.ts:138-142).
+    pub models_store: Option<Arc<dyn ModelsStore>>,
+    /// File store path used when `models_store` is unset.
+    pub models_store_path: Option<PathBuf>,
+    /// Allow `create()` to refresh model catalogs over the network. Defaults
+    /// to false (model-runtime.ts:66).
+    pub allow_model_network: bool,
+    /// Timeout for the create-time network model refresh (ms). Default:
+    /// 15_000 (model-runtime.ts:67-68).
+    pub model_refresh_timeout_ms: Option<u64>,
 }
 
 /// `ModelRuntimeAuthOverrides` (model-runtime.ts:72-75).
@@ -256,6 +290,9 @@ pub struct ModelRuntime {
     credentials: Arc<RuntimeCredentials>,
     models_path: Option<PathBuf>,
     config: Mutex<ModelConfig>,
+    /// Whether network model-catalog refreshes are allowed at all
+    /// (`PI_OFFLINE` unset, model-runtime.ts:157).
+    model_network_enabled: bool,
     /// Insertion-ordered like the upstream JS `Map`s: provider enumeration
     /// order is observable (initial-model fallback, available listings).
     native_providers: Mutex<OrderedMap<Arc<dyn Provider>>>,
@@ -417,6 +454,20 @@ impl Provider for AuthOverridingProvider {
         self.base.get_models()
     }
 
+    /// `filterModels` forwards to the base (provider-composer.ts:493-494).
+    fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
+        self.base.filter_models(models, credential)
+    }
+
+    /// Overlays keep the base's dynamic catalog refresh
+    /// (provider-composer.ts:475-478).
+    fn refresh_models(
+        &self,
+        context: RefreshModelsContext,
+    ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
+        self.base.refresh_models(context)
+    }
+
     fn stream(
         &self,
         model: &Model,
@@ -433,6 +484,72 @@ impl Provider for AuthOverridingProvider {
         options: Option<SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
         self.base.stream_simple(model, context, options)
+    }
+}
+
+/// Composed provider delegating `refreshModels` to its base
+/// (provider-composer.ts:475-478 `refreshModels: base?.refreshModels …`), so
+/// an overlay built by [`ModelRuntime::compose_provider`] keeps the base's
+/// dynamic catalog refresh.
+struct RefreshDelegatingProvider {
+    base: Arc<dyn Provider>,
+    inner: Arc<dyn Provider>,
+}
+
+impl Provider for RefreshDelegatingProvider {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn base_url(&self) -> Option<&str> {
+        self.inner.base_url()
+    }
+
+    fn headers(&self) -> Option<&ProviderHeaders> {
+        self.inner.headers()
+    }
+
+    fn auth(&self) -> &ProviderAuth {
+        self.inner.auth()
+    }
+
+    fn get_models(&self) -> Vec<Model> {
+        self.inner.get_models()
+    }
+
+    /// `filterModels` comes from the native base provider only
+    /// (provider-composer.ts:492-494).
+    fn filter_models(&self, models: Vec<Model>, credential: Option<&Credential>) -> Vec<Model> {
+        self.base.filter_models(models, credential)
+    }
+
+    fn refresh_models(
+        &self,
+        context: RefreshModelsContext,
+    ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
+        self.base.refresh_models(context)
+    }
+
+    fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        self.inner.stream(model, context, options)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<SimpleStreamOptions>,
+    ) -> AssistantMessageEventStream {
+        self.inner.stream_simple(model, context, options)
     }
 }
 
@@ -541,9 +658,37 @@ impl ModelRuntime {
             ModelsPathInput::Disabled => None,
         };
         let config = ModelConfig::load(models_path.as_deref()).await;
+        // modelsStore (model-runtime.ts:138-142): the file next to
+        // models.json, or in-memory when models.json is disabled. A corrupt
+        // store file falls back to in-memory (D-036).
+        let models_store: Arc<dyn ModelsStore> = match options.models_store {
+            Some(store) => store,
+            None => match &models_path {
+                Some(models_path) => {
+                    let store_path = options.models_store_path.unwrap_or_else(|| {
+                        models_path
+                            .parent()
+                            .map(|parent| parent.join("models-store.json"))
+                            .unwrap_or_else(|| models_path.with_file_name("models-store.json"))
+                    });
+                    match JsonFileModelsStore::load(store_path).await {
+                        Ok(store) => Arc::new(store),
+                        Err(error) => {
+                            tracing::warn!(
+                                "models store load failed (falling back to in-memory): {error}"
+                            );
+                            Arc::new(InMemoryModelsStore::new())
+                        }
+                    }
+                }
+                None => Arc::new(InMemoryModelsStore::new()),
+            },
+        };
+        let model_network_enabled = std::env::var_os(ENV_OFFLINE).is_none();
         let models = Models::new(Some(CreateModelsOptions {
             credentials: Some(credentials.clone()),
             auth_context: None,
+            models_store: Some(models_store),
         }));
 
         let runtime = Arc::new(ModelRuntime {
@@ -551,6 +696,7 @@ impl ModelRuntime {
             credentials,
             models_path,
             config: Mutex::new(config),
+            model_network_enabled,
             native_providers: Mutex::new(OrderedMap::default()),
             extension_providers: Mutex::new(OrderedMap::default()),
             composition_errors: Mutex::new(OrderedMap::default()),
@@ -558,11 +704,32 @@ impl ModelRuntime {
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
         });
         runtime.rebuild_providers();
-        // create() always refreshes availability; upstream awaits refresh here
-        // too (allowNetwork: false in the T10 subset — see module docs).
-        if let Err(error) = runtime.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
+        // create() refreshes dynamic catalogs over the network only when
+        // explicitly enabled, with a default 15s timeout (model-runtime.ts:
+        // 161-170).
+        let refresh_from_network = model_network_enabled && options.allow_model_network;
+        let token = refresh_from_network.then(CancellationToken::new);
+        if let Some(token) = &token {
+            let abort = token.clone();
+            let timeout_ms = options
+                .model_refresh_timeout_ms
+                .unwrap_or(DEFAULT_MODEL_REFRESH_TIMEOUT_MS);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                abort.cancel();
+            });
         }
+        runtime
+            .refresh(Some(ModelsRefreshOptions {
+                allow_network: Some(refresh_from_network),
+                force: None,
+                signal: token,
+            }))
+            .await;
+        // The refresh result (errors/abort) is intentionally not surfaced:
+        // refreshed models remain usable and availability errors are recorded
+        // in `get_error` (upstream awaits without inspecting, model-runtime.ts:
+        // 167).
         runtime
     }
 
@@ -711,7 +878,7 @@ impl ModelRuntime {
 
         let headers = base.and_then(|b| b.headers().cloned());
 
-        Ok(create_provider(CreateProviderOptions {
+        let composed = create_provider(CreateProviderOptions {
             id: provider_id.to_owned(),
             name: Some(name),
             base_url,
@@ -719,7 +886,16 @@ impl ModelRuntime {
             auth,
             models,
             api: ProviderApi::Single(streams),
-        }))
+        });
+        // Overlays keep the base's dynamic catalog refresh
+        // (provider-composer.ts:475-478).
+        Ok(match base {
+            Some(base) => Arc::new(RefreshDelegatingProvider {
+                base: base.clone(),
+                inner: composed,
+            }),
+            None => composed,
+        })
     }
 
     fn recompose_provider(&self, provider_id: &str) {
@@ -872,11 +1048,28 @@ impl ModelRuntime {
             .collect();
         let configured: HashSet<String> = auth.keys().cloned().collect();
         let all = self.models.get_models(None);
-        let available = all
-            .iter()
-            .filter(|model| configured.contains(&model.provider))
-            .cloned()
-            .collect();
+        // `Models.getAvailable` (models.ts:394-408): configured providers
+        // contribute their catalog after the credential-aware
+        // `filterModels` policy (e.g. github-copilot subscription
+        // narrowing).
+        let mut available = Vec::new();
+        for provider in &providers {
+            if !configured.contains(provider.id()) {
+                continue;
+            }
+            let credential = self
+                .credentials
+                .read(provider.id())
+                .await
+                .map_err(|error| {
+                    ModelsError::with_cause(
+                        ModelsErrorCode::Auth,
+                        format!("Credential store read failed for {}", provider.id()),
+                        &error.message,
+                    )
+                })?;
+            available.extend(provider.filter_models(provider.get_models(), credential.as_ref()));
+        }
 
         let mut snapshot = write(&self.snapshot);
         snapshot.all = all;
@@ -1023,13 +1216,18 @@ impl ModelRuntime {
     /// `refresh`: models.json is reloaded and providers rebuilt.
     pub async fn set_runtime_api_key(&self, provider_id: &str, api_key: &str) {
         self.credentials.set_runtime_api_key(provider_id, api_key);
-        self.refresh().await;
+        self.refresh(None).await;
     }
 
     /// `removeRuntimeApiKey` (model-runtime.ts:417-420).
     pub async fn remove_runtime_api_key(&self, provider_id: &str) {
         self.credentials.remove_runtime_api_key(provider_id);
-        self.refresh().await;
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(self.model_network_enabled),
+            force: None,
+            signal: None,
+        }))
+        .await;
     }
 
     /// `listCredentials` (model-runtime.ts:422-424).
@@ -1084,15 +1282,32 @@ impl ModelRuntime {
         self.models.complete_simple(model, context, options).await
     }
 
-    /// `refresh` (model-runtime.ts:516-537): reload models.json, rebuild
-    /// providers, recompute availability. Never touches the network (T13).
-    pub async fn refresh(&self) {
+    /// `refresh(options)` (model-runtime.ts:516-537): reload models.json,
+    /// rebuild providers, refresh dynamic model catalogs, recompute
+    /// availability. `allowNetwork` defaults to `model_network_enabled`
+    /// (upstream `options.allowNetwork ?? this.modelNetworkEnabled`).
+    pub async fn refresh(&self, options: Option<ModelsRefreshOptions>) -> ModelsRefreshResult {
         let config = ModelConfig::load(self.models_path.as_deref()).await;
         *lock(&self.config) = config;
         self.rebuild_providers();
+        let refresh_options = ModelsRefreshOptions {
+            allow_network: Some(
+                options
+                    .as_ref()
+                    .and_then(|o| o.allow_network)
+                    .unwrap_or(self.model_network_enabled),
+            ),
+            force: options.as_ref().and_then(|o| o.force),
+            signal: options.as_ref().and_then(|o| o.signal.clone()),
+        };
+        let result = self.models.refresh(Some(refresh_options)).await;
+        self.update_model_snapshot();
         if let Err(error) = self.refresh_availability().await {
+            // Availability errors are recorded in `get_error`; refreshed
+            // models remain usable (model-runtime.ts:531-535).
             tracing::warn!("availability refresh failed: {}", error.message);
         }
+        result
     }
 
     /// `registerNativeProvider` (model-runtime.ts:539-546). Upstream kicks a
@@ -1110,9 +1325,12 @@ impl ModelRuntime {
         lock(&self.native_providers).insert(id.clone(), provider);
         self.recompose_provider(&id);
         self.update_model_snapshot();
-        if let Err(error) = self.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
-        }
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+        }))
+        .await;
         Ok(())
     }
 
@@ -1138,9 +1356,12 @@ impl ModelRuntime {
         lock(&self.extension_providers).insert(provider_id.to_owned(), effective);
         self.recompose_provider(provider_id);
         self.update_model_snapshot();
-        if let Err(error) = self.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
-        }
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+        }))
+        .await;
         Ok(())
     }
 
@@ -1150,9 +1371,12 @@ impl ModelRuntime {
         lock(&self.native_providers).remove(provider_id);
         self.recompose_provider(provider_id);
         self.update_model_snapshot();
-        if let Err(error) = self.refresh_availability().await {
-            tracing::warn!("availability refresh failed: {}", error.message);
-        }
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: None,
+            signal: None,
+        }))
+        .await;
     }
 }
 
@@ -1307,6 +1531,8 @@ fn config_model_to_model(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use tokio::io::AsyncReadExt;
+
     use super::*;
 
     struct TempDir(PathBuf);
@@ -1343,6 +1569,7 @@ mod tests {
             credentials: None,
             auth_path: Some(agent_dir.join("auth.json")),
             models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
         })
         .await;
         (tmp, runtime)
@@ -1510,5 +1737,155 @@ mod tests {
             .map(|model| model.provider)
             .collect();
         assert_eq!(order, vec!["zeta".to_owned(), "alpha".to_owned()]);
+    }
+
+    // ------------------------------------------------------------------
+    // W6-C: dynamic catalog refresh plumbing (model-runtime.ts:161-170,
+    // 516-537)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn default_model_refresh_timeout_is_15_seconds() {
+        // The create-time / `update --models` timeout default
+        // (model-runtime.ts:164, package-manager-cli.ts:404).
+        assert_eq!(DEFAULT_MODEL_REFRESH_TIMEOUT_MS, 15_000);
+    }
+
+    /// A hung loopback catalog endpoint: accepts the request, reads the
+    /// head, then never responds — the refresh must abort via the signal.
+    async fn hung_catalog_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // Never respond; keep the connection open.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        url
+    }
+
+    /// The shared refresh signal aborts a hanging catalog fetch
+    /// (`update --models` / create-time timeout mechanism): the result
+    /// reports `aborted` and no error is recorded.
+    #[tokio::test]
+    async fn refresh_aborts_hanging_catalog_fetch_via_signal() {
+        const ENV_KEY: &str = "PIR_TEST_MODEL_RUNTIME_REFRESH_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        let url = hung_catalog_server().await;
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let inner = create_provider(CreateProviderOptions {
+            id: "remote-catalog-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth("Test API key", &[ENV_KEY]))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(pir_ai::api::openai_completions::OpenAiCompletions)),
+        });
+        runtime
+            .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
+                inner,
+                Some(url),
+                None,
+            ))
+            .await
+            .expect("register");
+
+        let token = CancellationToken::new();
+        let abort = token.clone();
+        let timeout = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            abort.cancel();
+        });
+        let result = runtime
+            .refresh(Some(ModelsRefreshOptions {
+                allow_network: Some(true),
+                force: Some(true),
+                signal: Some(token),
+            }))
+            .await;
+        timeout.await.expect("timeout task");
+        assert!(result.aborted);
+        assert!(result.errors.is_empty());
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// Runtime-path coverage for `filterModels` (models.ts:394-408 via
+    /// model-runtime.ts:240-268): `get_available` narrows the github-copilot
+    /// catalog through the credential's `availableModelIds` — not just at
+    /// the provider unit level (`oauth_copilot_radius.rs`).
+    #[tokio::test]
+    async fn get_available_applies_copilot_filter_models() {
+        let store = Arc::new(pir_ai::auth::credential_store::InMemoryCredentialStore::new());
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(store.clone()),
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let provider = pir_ai::providers::github_copilot::github_copilot_provider();
+        let full_catalog = provider.get_models();
+        assert!(full_catalog.len() > 1);
+        runtime
+            .register_native_provider(provider)
+            .await
+            .expect("register");
+
+        // No credential → provider not configured → nothing available.
+        assert!(runtime
+            .get_available(None)
+            .await
+            .expect("get_available")
+            .is_empty());
+
+        // A credential exactly as `GitHubCopilotOAuth::login`/`refresh`
+        // produces it (extras: `enterpriseUrl`, `availableModelIds`).
+        let kept = full_catalog[0].id.clone();
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "enterpriseUrl".to_owned(),
+            serde_json::json!("company.ghe.com"),
+        );
+        extra.insert(
+            "availableModelIds".to_owned(),
+            serde_json::json!([kept, "ghost-model"]),
+        );
+        let credential = Credential::OAuth(pir_ai::auth::types::OAuthCredential {
+            refresh: "ghu_refresh_token".to_owned(),
+            access: "tid=test;exp=9999999999;".to_owned(),
+            expires: i64::MAX,
+            extra,
+        });
+        store
+            .modify(
+                "github-copilot",
+                Arc::new(move |_| {
+                    let credential = credential.clone();
+                    Box::pin(async move { Ok(Some(credential)) })
+                }),
+            )
+            .await
+            .expect("modify");
+
+        let available = runtime.get_available(None).await.expect("get_available");
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].id, full_catalog[0].id);
+        // The complete synchronous catalog remains intact.
+        assert_eq!(runtime.get_models(None).len(), full_catalog.len());
     }
 }

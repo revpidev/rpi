@@ -535,6 +535,7 @@ async fn run(
             apply_service_tier_pricing: Some(Box::new(move |usage: &mut Usage, tier| {
                 apply_service_tier_pricing(usage, tier, &model_id);
             })),
+            resolve_service_tier: None,
         },
     );
     let mut decoder = SseDecoder::new();

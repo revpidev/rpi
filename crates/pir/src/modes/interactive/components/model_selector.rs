@@ -357,7 +357,7 @@ impl ModelSelectorComponent {
                     // `ModelRuntime::refresh` takes no signal
                     // (model_runtime.rs:1089), so the timeout is not
                     // enforced here.
-                    runtime.refresh().await;
+                    runtime.refresh(None).await;
                     let mut state = lock(&state);
                     if state.closed {
                         return;
@@ -736,6 +736,7 @@ mod tests {
             models_path: crate::core::model_runtime::ModelsPathInput::Path(
                 agent_dir.join("models.json"),
             ),
+            ..Default::default()
         })
         .await;
         (tmp, runtime)

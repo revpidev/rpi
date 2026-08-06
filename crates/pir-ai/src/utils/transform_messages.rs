@@ -625,4 +625,55 @@ mod tests {
             other => panic!("expected assistant, got {other:?}"),
         }
     }
+
+    #[test]
+    fn test_synthetic_results_only_for_still_missing_tool_calls() {
+        // Copilot test intent ("adds synthetic results only for trailing tool
+        // calls that are still missing results"): of two trailing calls only
+        // the unresolved one gets a synthetic error result; the resolved
+        // result is back-filled to its normalized id.
+        let messages = vec![
+            assistant(
+                "openai",
+                "gpt",
+                StopReason::ToolUse,
+                vec![
+                    tool_call("call_1|fc_1", "read"),
+                    tool_call("call_2|fc_2", "bash"),
+                ],
+            ),
+            tool_result("call_1|fc_1", "read"),
+        ];
+        let mut normalize = |id: &str, _model: &Model, _source: &AssistantMessage| -> String {
+            id.replace('|', "_")
+        };
+        let out = transform_messages(
+            &messages,
+            &model("m", "anthropic", &["text"]),
+            Some(&mut normalize),
+        );
+        assert_eq!(out.len(), 3);
+        match &out[1] {
+            Message::ToolResult(result) => {
+                assert_eq!(result.tool_call_id, "call_1_fc_1");
+                assert!(!result.is_error);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+        match &out[2] {
+            Message::ToolResult(result) => {
+                assert_eq!(result.tool_call_id, "call_2_fc_2");
+                assert_eq!(result.tool_name, "bash");
+                assert!(result.is_error);
+                assert_eq!(
+                    result.content,
+                    vec![ToolResultContent::Text(TextContent {
+                        text: "No result provided".to_owned(),
+                        text_signature: None
+                    })]
+                );
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
 }

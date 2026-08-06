@@ -144,6 +144,7 @@ pub async fn create_agent_session(
                             Some(_) => ModelsPathInput::Path(agent_dir.join("models.json")),
                             None => ModelsPathInput::Default,
                         },
+                        ..Default::default()
                     })
                     .await
                 }
