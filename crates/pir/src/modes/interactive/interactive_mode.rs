@@ -1645,16 +1645,13 @@ impl InteractiveUi {
     /// `showSelector` (interactive-mode.ts:4122-4133): swap the editor in
     /// the TUI child list for a selector entry, preserving its position.
     /// Re-entrant shows (e.g. settings → theme submenu) hide the previous
-    /// selector first. Called from the run loop / drain, never from inside a
-    /// component dispatch.
+    /// selector first. May be called from inside a component dispatch (e.g.
+    /// a keybinding or a selector's own cancel), so the swap must go through
+    /// `Tui::swap_child` — a `child_position` read would fail on the held
+    /// inner lock and the fallback would append after the footer.
     pub(crate) fn show_selector(&self, entry: SharedComponent) {
         self.hide_selector();
-        let index = self.ui.child_position(&self.editor_region);
-        self.ui.remove_child(&self.editor_region);
-        match index {
-            Some(index) => self.ui.insert_child_at(index, entry.clone()),
-            None => self.ui.add_child(entry.clone()),
-        }
+        self.ui.swap_child(&self.editor_region, &entry);
         *lock(&self.active_selector) = Some(entry.clone());
         self.ui.set_focus(Some(entry));
         self.ui.request_render(false);
@@ -1664,12 +1661,7 @@ impl InteractiveUi {
     /// editor at the selector's former position.
     pub(crate) fn hide_selector(&self) {
         if let Some(selector) = lock(&self.active_selector).take() {
-            let index = self.ui.child_position(&selector);
-            self.ui.remove_child(&selector);
-            match index {
-                Some(index) => self.ui.insert_child_at(index, self.editor_region.clone()),
-                None => self.ui.add_child(self.editor_region.clone()),
-            }
+            self.ui.swap_child(&selector, &self.editor_region);
             self.ui.set_focus(Some(self.editor_region.clone()));
             self.ui.request_render(false);
         }
@@ -4735,16 +4727,23 @@ mod tests {
         assert!(ui.ui.child_position(&mode.editor_region).is_none());
 
         // Escape through the TUI dispatch closes the selector and restores
-        // the editor (upstream `tui.select.cancel`).
+        // the editor (upstream `tui.select.cancel`). The cancel runs while
+        // the TUI inner lock is held by `tick`, so this also covers the
+        // mid-dispatch swap path (`Tui::swap_child`).
+        let editor_position = ui
+            .ui
+            .child_position(&lock(&ui.active_selector).clone().expect("selector"))
+            .expect("selector mounted");
         terminal.feed("\u{1b}");
         ui.ui.tick(std::time::Instant::now());
         assert!(
             lock(&ui.active_selector).is_none(),
             "escape closed the selector"
         );
-        assert!(
-            ui.ui.child_position(&mode.editor_region).is_some(),
-            "editor restored"
+        assert_eq!(
+            ui.ui.child_position(&mode.editor_region),
+            Some(editor_position),
+            "editor restored at the selector's position"
         );
     }
 

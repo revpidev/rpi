@@ -50,12 +50,12 @@
 //! - Input delivery: the `Terminal::start` callbacks push raw input into an
 //!   inbox which [`Tui::tick`] drains through the upstream `handleInput` flow.
 //!   Same thread, same order — but delivery never happens inside
-//!   `Terminal::pump`. [`Tui::pump`] does hold the inner lock across the
-//!   (possibly indefinite) event wait: input still lands in the inbox and is
-//!   processed by the tick after the wait, and cross-thread mutations queue
-//!   through the pending-op list, but a cross-thread [`Tui::stop`] blocks
-//!   until `pump` returns. Hosts must pass a finite timeout to `pump` or use
-//!   the non-blocking recovery path (`recovery.rs`'s `try_stop` fallback).
+//!   `Terminal::pump`. [`Tui::pump`] waits on the terminal's lock-free event
+//!   source ([`Terminal::event_source`]), so neither the inner lock nor the
+//!   terminal lock is held across the (possibly indefinite) event wait:
+//!   cross-thread [`Tui::stop`] / [`Tui::with_terminal`] never block behind a
+//!   parked driver. (Terminals without an event source — virtual test
+//!   terminals — fall back to the in-lock [`Terminal::pump`].)
 //! - `Component::handle_input` is a defaulted trait method, so the upstream
 //!   `focusedComponent?.handleInput` existence check always passes: a focused
 //!   component without input handling still gets a no-op call plus the
@@ -666,6 +666,9 @@ fn lock_shared<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Clone)]
 pub struct Tui {
     inner: Arc<Mutex<TuiInner>>,
+    /// Shared with `TuiInner::terminal`; used directly by `pump` /
+    /// `with_terminal` so blocking terminal waits never hold the inner lock.
+    terminal: SharedTerminal,
     schedule: Arc<Mutex<RenderSchedule>>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
     inbox: Arc<Mutex<VecDeque<InboxEvent>>>,
@@ -683,8 +686,18 @@ struct TerminalSizeCache {
     columns: Arc<AtomicU16>,
 }
 
+/// The terminal behind its own mutex, shared between `Tui` (blocking `pump`
+/// waits and `with_terminal`) and `TuiInner` (writes during render/tick).
+/// Lock order is always `inner` → `terminal`; the terminal's input callbacks
+/// only touch the inbox mutex, so no cycle is possible. The blocking wait in
+/// `Terminal::pump` must never hold the inner lock: the driver parks there
+/// between frames, and `std::sync::Mutex` is not FIFO-fair, so a thread that
+/// re-locks in a tight loop starves any parked `lock_inner` waiter (e.g.
+/// `with_terminal` from the run loop) for an unbounded time.
+type SharedTerminal = Arc<Mutex<Box<dyn Terminal + Send>>>;
+
 struct TuiInner {
-    terminal: Box<dyn Terminal + Send>,
+    terminal: SharedTerminal,
     children: Vec<SharedComponent>,
     previous_lines: Vec<String>,
     /// JS `Set<number>`: deduplicated, first-seen insertion order.
@@ -739,8 +752,9 @@ impl Tui {
             rows: Arc::new(AtomicU16::new(terminal.rows())),
             columns: Arc::new(AtomicU16::new(terminal.columns())),
         };
+        let terminal: SharedTerminal = Arc::new(Mutex::new(terminal));
         let inner = TuiInner {
-            terminal,
+            terminal: Arc::clone(&terminal),
             children: Vec::new(),
             previous_lines: Vec::new(),
             previous_kitty_image_ids: Vec::new(),
@@ -774,6 +788,7 @@ impl Tui {
         };
         Tui {
             inner: Arc::new(Mutex::new(inner)),
+            terminal,
             schedule,
             pending: Arc::new(Mutex::new(Vec::new())),
             inbox: Arc::new(Mutex::new(VecDeque::new())),
@@ -855,6 +870,33 @@ impl Tui {
         });
     }
 
+    /// Rust addition: atomically swap `old` for `new` in the child list,
+    /// preserving `old`'s position. Unlike a `child_position` +
+    /// `remove_child` + `insert_child_at` sequence, the position lookup runs
+    /// inside the same locked op, so it is safe to call mid-dispatch (when
+    /// the inner lock is already held, `child_position` would fail and the
+    /// fallback would append at the end). If `old` is not mounted, `new` is
+    /// appended unless it is already mounted.
+    pub fn swap_child(&self, old: &SharedComponent, new: &SharedComponent) {
+        let old = Arc::clone(old);
+        let new = Arc::clone(new);
+        self.run_or_queue(move |inner| {
+            if let Some(index) = inner
+                .children
+                .iter()
+                .position(|child| same_component(child, &old))
+            {
+                inner.children[index] = new;
+            } else if !inner
+                .children
+                .iter()
+                .any(|child| same_component(child, &new))
+            {
+                inner.children.push(new);
+            }
+        });
+    }
+
     /// Rust addition (T12-S5a `showSelector`): the position of a child in
     /// the TUI's child list (identity comparison). `None` on lock contention
     /// or when not mounted.
@@ -915,11 +957,11 @@ impl Tui {
     }
 
     /// Access the terminal (upstream `public terminal`, tui.ts:296). Blocks on
-    /// the inner lock — event-loop / setup code only, never from within a
-    /// component's `handle_input` / `render`.
+    /// the terminal lock only (never the inner lock, so it cannot starve
+    /// behind the driver's pump loop) — event-loop / setup code only, never
+    /// from within a component's `handle_input` / `render`.
     pub fn with_terminal<R>(&self, f: impl FnOnce(&mut dyn Terminal) -> R) -> R {
-        let mut inner = self.lock_inner();
-        f(&mut *inner.terminal)
+        f(&mut **lock_shared(&self.terminal))
     }
 
     // --- listeners --------------------------------------------------------
@@ -987,7 +1029,7 @@ impl Tui {
                     deadline: Some(deadline),
                 });
             inner.pending_osc11_background_replies += 1;
-            inner.terminal.write("\x1b]11;?\x07");
+            inner.terminal().write("\x1b]11;?\x07");
         });
         receiver
     }
@@ -1009,7 +1051,7 @@ impl Tui {
                     sender: Some(sender),
                     deadline: Some(deadline),
                 });
-            inner.terminal.write("\x1b[?996n");
+            inner.terminal().write("\x1b[?996n");
         });
         receiver
     }
@@ -1086,10 +1128,10 @@ impl Tui {
         let on_resize: ResizeHandler = Box::new(move || {
             lock_shared(&resize_inbox).push_back(InboxEvent::Resize);
         });
-        inner.terminal.start(on_input, on_resize);
-        inner.terminal.hide_cursor();
+        inner.terminal().start(on_input, on_resize);
+        inner.terminal().hide_cursor();
         if inner.terminal_color_scheme_notifications_enabled {
-            inner.terminal.write("\x1b[?2031h");
+            inner.terminal().write("\x1b[?2031h");
         }
         inner.query_cell_size();
         inner.request_render(false);
@@ -1157,7 +1199,7 @@ impl Tui {
         };
         let inner = self.lock_inner();
         let query_deadline = inner.next_query_deadline();
-        let terminal_deadline = inner.terminal.next_flush_deadline();
+        let terminal_deadline = inner.terminal().next_flush_deadline();
         let render_deadline = if inner.stopped { None } else { render_deadline };
         [render_deadline, query_deadline, terminal_deadline]
             .into_iter()
@@ -1205,11 +1247,40 @@ impl Tui {
 
     /// Wait up to `timeout` (`None` = indefinitely) for a terminal event,
     /// then drive the TUI like [`Tui::tick`]. Mirrors the upstream event
-    /// loop: terminal events are queued by the `start` callbacks during
-    /// `Terminal::pump` and processed right after. Returns whether the
-    /// terminal dispatched at least one event.
+    /// loop: terminal events arrive on the terminal's event source during the
+    /// wait and are dispatched (to the `start` callbacks, which queue them
+    /// into the inbox) right after. Returns whether the terminal dispatched
+    /// at least one event.
     pub fn pump(&self, timeout: Option<Duration>) -> bool {
-        let dispatched = self.lock_inner().terminal.pump(timeout);
+        // The blocking wait happens on the terminal's event source WITHOUT
+        // holding any lock: the driver parks here between frames, and
+        // `std::sync::Mutex` is not FIFO-fair, so a lock held across the wait
+        // starves blocking lockers on other threads for an unbounded time
+        // (see `SharedTerminal`).
+        let source = lock_shared(&self.terminal).event_source();
+        let Some(source) = source else {
+            // No lock-free event source (virtual test terminals, or before
+            // `start` / after `stop`): legacy behavior, the wait happens
+            // inside the terminal lock.
+            let dispatched = lock_shared(&self.terminal).pump(timeout);
+            self.tick(Instant::now());
+            return dispatched;
+        };
+        let first = source.wait(timeout);
+        let mut dispatched = false;
+        {
+            let mut terminal = lock_shared(&self.terminal);
+            if let Some(event) = first {
+                terminal.dispatch_terminal_event(event);
+                dispatched = true;
+            }
+            // Drain events that queued up behind the first one.
+            while let Some(event) = source.try_recv() {
+                terminal.dispatch_terminal_event(event);
+                dispatched = true;
+            }
+            terminal.tick(Instant::now());
+        }
         self.tick(Instant::now());
         dispatched
     }
@@ -1384,6 +1455,12 @@ fn schedule_render(schedule: &Arc<Mutex<RenderSchedule>>, force: bool, now: Inst
 }
 
 impl TuiInner {
+    /// Lock the shared terminal. Never held across a blocking wait; see
+    /// [`SharedTerminal`] for the lock-ordering rules.
+    fn terminal(&self) -> MutexGuard<'_, Box<dyn Terminal + Send>> {
+        lock_shared(&self.terminal)
+    }
+
     /// `requestRender(true)` state reset (tui.ts:717-724); -1 sentinels
     /// trigger `widthChanged` / `heightChanged`, forcing a full clear.
     fn reset_render_state_for_force(&mut self) {
@@ -1695,7 +1772,7 @@ impl TuiInner {
         if captures {
             self.set_focus(Some(component));
         }
-        self.terminal.hide_cursor();
+        self.terminal().hide_cursor();
         self.request_render(false);
     }
 
@@ -1723,7 +1800,7 @@ impl TuiInner {
             self.set_focus(top_visible.or(entry.pre_focus.clone()));
         }
         if self.overlay_stack.is_empty() {
-            self.terminal.hide_cursor();
+            self.terminal().hide_cursor();
         }
         self.request_render(false);
     }
@@ -1886,7 +1963,7 @@ impl TuiInner {
             self.set_focus(top_visible.or(entry.pre_focus.clone()));
         }
         if self.overlay_stack.is_empty() {
-            self.terminal.hide_cursor();
+            self.terminal().hide_cursor();
         }
         self.request_render(false);
     }
@@ -1908,10 +1985,11 @@ impl TuiInner {
             .as_ref()
             .and_then(|options| options.visible.as_ref())
         {
-            return visible(
-                i32::from(self.terminal.columns()),
-                i32::from(self.terminal.rows()),
-            );
+            // Separate statements: each `terminal()` guard must drop before
+            // the next acquisition (std::sync::Mutex is not reentrant).
+            let columns = i32::from(self.terminal().columns());
+            let rows = i32::from(self.terminal().rows());
+            return visible(columns, rows);
         }
         true
     }
@@ -1953,7 +2031,7 @@ impl TuiInner {
         }
         self.show_hardware_cursor = enabled;
         if !enabled {
-            self.terminal.hide_cursor();
+            self.terminal().hide_cursor();
         }
         self.request_render(false);
     }
@@ -1965,7 +2043,7 @@ impl TuiInner {
         }
         self.terminal_color_scheme_notifications_enabled = enabled;
         if !self.stopped {
-            self.terminal.write(if enabled {
+            self.terminal().write(if enabled {
                 "\x1b[?2031h"
             } else {
                 "\x1b[?2031l"
@@ -1979,7 +2057,7 @@ impl TuiInner {
         if get_capabilities().images.is_none() {
             return;
         }
-        self.terminal.write("\x1b[16t");
+        self.terminal().write("\x1b[16t");
     }
 
     /// `stop` (tui.ts:689-714). A pending render deadline deliberately
@@ -1988,25 +2066,25 @@ impl TuiInner {
     fn stop_internal(&mut self) {
         self.stopped = true;
         if self.terminal_color_scheme_notifications_enabled {
-            self.terminal.write("\x1b[?2031l");
+            self.terminal().write("\x1b[?2031l");
         }
         // Move cursor to the end of the content to prevent
         // overwriting/artifacts on exit.
         if !self.previous_lines.is_empty() {
             // Overwrite the inverted cursor with a normal space to clear the artifact.
-            self.terminal.write(" ");
+            self.terminal().write(" ");
             let target_row = self.previous_lines.len() as i32; // line after the last content
             let line_diff = target_row - self.hardware_cursor_row;
             if line_diff > 0 {
-                self.terminal.write(&format!("\x1b[{line_diff}B"));
+                self.terminal().write(&format!("\x1b[{line_diff}B"));
             } else if line_diff < 0 {
-                self.terminal.write(&format!("\x1b[{}A", -line_diff));
+                self.terminal().write(&format!("\x1b[{}A", -line_diff));
             }
-            self.terminal.write("\r\n");
+            self.terminal().write("\r\n");
         }
 
-        self.terminal.show_cursor();
-        self.terminal.stop();
+        self.terminal().show_cursor();
+        self.terminal().stop();
     }
 
     /// `handleInput` (tui.ts:765-839).
@@ -2629,7 +2707,7 @@ impl TuiInner {
             i += 1;
         }
         buffer.push_str("\x1b[?2026l"); // end synchronized output
-        self.terminal.write(&buffer);
+        self.terminal().write(&buffer);
         self.cursor_row = 0.max(new_lines.len() as i32 - 1);
         self.hardware_cursor_row = self.cursor_row;
         // Reset max lines when clearing, otherwise track growth.
@@ -2680,16 +2758,16 @@ impl TuiInner {
         if self.stopped {
             return;
         }
-        let width = i32::from(self.terminal.columns());
-        let height = i32::from(self.terminal.rows());
+        let width = i32::from(self.terminal().columns());
+        let height = i32::from(self.terminal().rows());
         // Refresh the lock-free size cache (read by components, e.g. the
         // Editor's `terminal_rows`, which cannot take the inner lock).
         self.size_cache
             .rows
-            .store(self.terminal.rows(), Ordering::Relaxed);
+            .store(self.terminal().rows(), Ordering::Relaxed);
         self.size_cache
             .columns
-            .store(self.terminal.columns(), Ordering::Relaxed);
+            .store(self.terminal().columns(), Ordering::Relaxed);
         let width_changed = self.previous_width != 0 && self.previous_width != width;
         let height_changed = self.previous_height != 0 && self.previous_height != height;
         let previous_buffer_length = if self.previous_height > 0 {
@@ -2873,7 +2951,7 @@ impl TuiInner {
                     buffer.push_str(&format!("\x1b[{move_back}A"));
                 }
                 buffer.push_str("\x1b[?2026l");
-                self.terminal.write(&buffer);
+                self.terminal().write(&buffer);
                 self.cursor_row = target_row;
                 self.hardware_cursor_row = target_row;
             }
@@ -3076,7 +3154,7 @@ impl TuiInner {
         }
 
         // Write the entire buffer at once.
-        self.terminal.write(&buffer);
+        self.terminal().write(&buffer);
 
         // Track cursor position for the next render. cursorRow tracks the end
         // of content (for viewport calculation); hardwareCursorRow tracks the
@@ -3110,7 +3188,7 @@ impl TuiInner {
     /// cursor for the IME candidate window.
     fn position_hardware_cursor(&mut self, cursor_pos: Option<CursorPos>, total_lines: i32) {
         let Some(cursor_pos) = cursor_pos.filter(|_| total_lines > 0) else {
-            self.terminal.hide_cursor();
+            self.terminal().hide_cursor();
             return;
         };
 
@@ -3130,14 +3208,14 @@ impl TuiInner {
         buffer.push_str(&format!("\x1b[{}G", target_col + 1));
 
         if !buffer.is_empty() {
-            self.terminal.write(&buffer);
+            self.terminal().write(&buffer);
         }
 
         self.hardware_cursor_row = target_row;
         if self.show_hardware_cursor {
-            self.terminal.show_cursor();
+            self.terminal().show_cursor();
         } else {
-            self.terminal.hide_cursor();
+            self.terminal().hide_cursor();
         }
     }
 

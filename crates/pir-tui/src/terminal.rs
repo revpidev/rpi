@@ -250,16 +250,79 @@ pub trait Terminal {
     fn pump(&mut self, _timeout: Option<Duration>) -> bool {
         false
     }
+
+    /// Lock-free wait handle for the terminal's event stream, available
+    /// after `start`. Lets [`Tui::pump`](crate::tui::Tui::pump) block on
+    /// input WITHOUT holding the terminal lock, so the driver's parked wait
+    /// cannot starve blocking lockers on other threads (see the
+    /// `SharedTerminal` note in tui.rs). `None` for terminals without a
+    /// channel-backed event stream (e.g. the virtual test terminal).
+    #[doc(hidden)]
+    fn event_source(&self) -> Option<TerminalEventSource> {
+        None
+    }
+
+    /// Dispatch an event previously obtained from the [`Terminal::event_source`]
+    /// stream (the [`Tui::pump`](crate::tui::Tui::pump) path).
+    #[doc(hidden)]
+    fn dispatch_terminal_event(&mut self, event: TerminalEvent) {
+        let _ = event;
+    }
 }
 
 /// Raw events produced by the stdin reader thread / SIGWINCH forwarder and
-/// dispatched by [`ProcessTerminal::pump`].
+/// dispatched by [`ProcessTerminal::pump`]. `pub` only so [`Tui::pump`]
+/// (tui.rs) can wait on the event stream without holding the terminal lock;
+/// not part of the supported API.
+///
+/// [`Tui::pump`]: crate::tui::Tui::pump
+#[doc(hidden)]
 #[derive(Debug)]
-enum TerminalEvent {
+pub enum TerminalEvent {
     /// A chunk of stdin decoded as UTF-8 (upstream `data` event string).
     Input(String),
     /// SIGWINCH (upstream `resize` event).
     Resize,
+}
+
+/// Cloneable wait handle for a terminal's event stream (the receiving end of
+/// the channel fed by the stdin reader thread / SIGWINCH forwarder). Lets
+/// the TUI's driver block on input WITHOUT holding the terminal lock: the
+/// driver parks here between frames, and holding a lock across that wait
+/// starves blocking lockers on other threads (`std::sync::Mutex` is not
+/// FIFO-fair; see the `SharedTerminal` note in tui.rs).
+///
+/// `pub` only as part of the [`TerminalEvent`] plumbing; not supported API.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct TerminalEventSource {
+    // `Mutex` because `mpsc::Receiver` is `Send` but not `Sync`; the source
+    // lives inside `ProcessTerminal`, which must stay `Send` for
+    // `drain_input`'s boxed future.
+    rx: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<TerminalEvent>>>,
+}
+
+impl TerminalEventSource {
+    fn new(rx: mpsc::Receiver<TerminalEvent>) -> Self {
+        TerminalEventSource {
+            rx: std::sync::Arc::new(std::sync::Mutex::new(rx)),
+        }
+    }
+
+    /// Wait up to `timeout` (`None` = indefinitely) for the next event.
+    pub fn wait(&self, timeout: Option<Duration>) -> Option<TerminalEvent> {
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        match timeout {
+            Some(limit) => rx.recv_timeout(limit).ok(),
+            None => rx.recv().ok(),
+        }
+    }
+
+    /// Take an already-queued event, if any.
+    pub fn try_recv(&self) -> Option<TerminalEvent> {
+        let rx = self.rx.lock().unwrap_or_else(|e| e.into_inner());
+        rx.try_recv().ok()
+    }
 }
 
 /// Result of [`ProcessTerminal::read_keyboard_protocol_negotiation_sequence`];
@@ -297,7 +360,7 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     /// Explicit-deadline form of `progressInterval`.
     progress_keepalive_deadline: Option<Instant>,
     event_tx: Option<mpsc::Sender<TerminalEvent>>,
-    event_rx: Option<mpsc::Receiver<TerminalEvent>>,
+    event_rx: Option<TerminalEventSource>,
     resize_task: Option<tokio::task::JoinHandle<()>>,
     /// Terminal size query; injectable so tests can simulate "not a tty"
     /// (upstream tests monkey-patch `process.stdout.columns/rows`).
@@ -643,7 +706,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
 
         let (tx, rx) = mpsc::channel();
         self.event_tx = Some(tx);
-        self.event_rx = Some(rx);
+        self.event_rx = Some(TerminalEventSource::new(rx));
 
         // Resize handler wiring (upstream `process.stdout.on("resize")`).
         self.spawn_resize_forwarder();
@@ -745,7 +808,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
 
             loop {
                 if let Some(rx) = &self.event_rx {
-                    while rx.try_recv().is_ok() {
+                    while rx.try_recv().is_some() {
                         last_data_time = Instant::now();
                     }
                 }
@@ -903,8 +966,8 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
 
     fn pump(&mut self, timeout: Option<Duration>) -> bool {
         let first = match (&self.event_rx, timeout) {
-            (Some(rx), Some(limit)) => rx.recv_timeout(limit).ok(),
-            (Some(rx), None) => rx.recv().ok(),
+            (Some(rx), Some(limit)) => rx.wait(Some(limit)),
+            (Some(rx), None) => rx.wait(None),
             (None, Some(limit)) => {
                 // No input source (start() never ran or stop() already ran):
                 // still honor the wait so deadline-driven flushing works.
@@ -923,7 +986,7 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         // Drain events that queued up behind the first one.
         let mut queued = Vec::new();
         if let Some(rx) = &self.event_rx {
-            while let Ok(event) = rx.try_recv() {
+            while let Some(event) = rx.try_recv() {
                 queued.push(event);
             }
         }
@@ -934,6 +997,14 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
 
         self.tick(Instant::now());
         dispatched
+    }
+
+    fn event_source(&self) -> Option<TerminalEventSource> {
+        self.event_rx.clone()
+    }
+
+    fn dispatch_terminal_event(&mut self, event: TerminalEvent) {
+        self.dispatch_event(event);
     }
 }
 
