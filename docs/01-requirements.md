@@ -153,6 +153,11 @@
 
 所有子命令在 `parseArgs` 之前分流处理；各支持 `-a/-na` trust 覆盖与独立 `--help`。
 
+> 实现注记（T14-W3，详见偏离 D-041/D-042）：`update` 全目标（self/extensions/all/单源）与
+> `config` 已接线（`cli/package_command.rs`、`cli/config_command.rs`）；`config` TUI 复用
+> T12 组件（输入换为包管理器全量 `resolve_all`，toggle 直写 settings）；`tui.select.cancel`
+> 绑定 escape+ctrl+c 使上游显式 ctrl+c→onExit 分支不可达的 quirk 保留。
+
 ### 3.3 环境变量
 
 进程级（文档级对齐 `docs/environment-variables.md`，名前綴 `PI_` → `PIR_`）：
@@ -246,7 +251,7 @@ Agent 事件 10 种，**载荷结构同为契约**：
 | bash | **无默认超时**（上限 2³¹−1 ms）；stdout+stderr 合流；tail 截断 2000 行/50KB，超量全量写 `tmpdir/pi-bash-<hex>.log`（滚动缓冲 2×50KB）；返回给 LLM 的输出为原始 UTF-8 解码文本，**不做控制字符清洗**（`\r` 去除/控制字符清洗只发生在 TUI 渲染层与用户 `!`/`!!` bash-executor）；detached 进程组 + 杀进程树取消；onUpdate 100ms 节流；非零退出码抛错附输出；`shellPath`/`shellCommandPrefix` 定制；spawnHook 扩展点；会话环境注入（§3.3） |
 | grep | 行为等价 rg：`--json --line-number --color=never --hidden` 语义；默认 limit=100 匹配（达标即停）；单行截 500 字符；context>0 回读文件补上下文；50KB 字节截断；提示含 `limit=N*2` 翻倍建议（ADR-0003 §2：Rust 原生实现，不下发外部 rg）；输出分隔符仿 grep 惯例——匹配行 `path:lineno: text`，上下文行 `path-lineno- text`（context=0 时全部 `:` 格式） |
 | find | 行为等价 fd：`--glob --color=never --hidden` 语义；git repo 外自动 `--no-require-git` 等价；pattern 含 `/` → full-path 且自动补 `**/` 前缀；默认 limit=1000；相对化输出、保留目录尾斜杠；固定忽略 node_modules/.git |
-| ls | 默认 limit=500；大小写不敏感排序；目录加 `/`；含 dotfiles；stat 失败跳过；50KB 字节截断；提示 `limit=N*2` |
+| ls | 默认 limit=500；大小写不敏感排序（Rust 实现对小写后名称按码位排序，替代上游 `localeCompare` 的 ICU 排序，纯 ASCII 字母数字名称一致，见 D-039）；目录加 `/`；含 dotfiles；stat 失败跳过；50KB 字节截断；提示 `limit=N*2` |
 
 公共：截断常数 `DEFAULT_MAX_LINES=2000`、`DEFAULT_MAX_BYTES=50KB`、`GREP_MAX_LINE_LENGTH=500`；truncateHead 不截整行（首行超限返回 firstLineExceedsLimit）；truncateTail 末行可部分截断（UTF-8 边界感知）；write/edit 经 file mutation queue 按 **realpath** 串行化（ENOENT 退化 resolve 路径；abort 不在事件回调里 reject）；工具可插拔 operations（ReadOperations/BashOperations 等，供扩展/沙箱改道）。
 
@@ -461,6 +466,21 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 离线跳过安装/更新；网络超时 10s；更新检查并发 4
 - 核心包须列 `peerDependencies:"*"`（声明式资源包布局对齐）
 
+> 实现注记（T14-W2，详见偏离 D-040）：落地于 `crates/pir/src/core/package_manager.rs` +
+> `core/git_url.rs` + `cli/package_command.rs`。hosted-git-info 以五 host 子集自实现；
+> npm semver 用 `semver` crate + range 翻译层（`||`/`x` 通配/部分版本/完整版连字符范围，
+> prerelease range 等极端形式视为无效 range 回退）；glob 复用内置 matcher（`{a,b}`/`[abc]`
+> 不支持，同 D-014/D-039）；npm/git 进程经 `PackageCommandRunner` 注入；`resolve()` 的包切片
+> 输出接 `resource_loader` 的 `package_resources` 端口（会话启动接线在后续波次）；
+> 上游 `list` 接受并忽略位置参数的 quirk 保留。
+>
+> 实现注记（T14-W3，详见偏离 D-041）：`update` 编排（`update` / `checkForAvailableUpdates` /
+> 并发 4 worker pool）、版本检查（`core/version_check.rs`，HTTP 经 `LatestVersionTransport`
+> 注入，endpoint 集中常量 `LATEST_VERSION_URL` 留 W6 配置化口子）与自更新
+>（`config.rs` self-update 段：install-method 检测、各包管理器命令构造、可写性检查）落地；
+> pir 恒为原生二进制，非包管理器安装按上游 bun-binary 结局打印 releases 页提示
+>（`SELF_UPDATE_DOWNLOAD_URL` 常量）；release note 经 pir-tui Markdown identity 主题渲染。
+
 ### 7.7 Settings
 
 完整对齐 `docs/settings.md`（全局 `~/.pir/agent/settings.json` + 项目 `.pir/settings.json`）。全键清单（默认值）：
@@ -478,6 +498,8 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 交互弹窗 5 选项：Trust / Trust parent folder (path) / Trust (this session only) / Do not trust / Do not trust (this session only)
 - **两阶段加载**：信任前仅 context 文件 + 全局/CLI/inline 扩展（可处理 `project_trust` 事件，handler ctx 为受限子集）；信任后 setProjectTrusted 并完整 reload
 - `/trust` 只写 trust.json、不重载当前会话；`pir config`/包管理命令同流程；`pir update` 永不提示
+
+> 实现注记（T14-W4，D-043）：决策链落 `core/trust_manager.rs::resolve_project_trusted`（同步；扩展事件经 `extension_event` 参数预发射，`ExtensionRunner::emit_project_trust` 默认 None 待 T15 接通）；启动弹窗落 `modes/interactive/startup_ui.rs::run_startup_selector`（复用 ExtensionSelectorComponent，hasUI=初始 runtime 且 interactive 且非 help/--list-models）；两阶段接线在 `app.rs` create_runtime（未信任建 services → 判定 → set_project_trusted + reload），差集锚点 `tests/resource_loader_test.rs::set_project_trusted_loads_second_phase_resources`。遗留：交互模式 resume 到异 cwd 的信任提示（上游 switchSession projectTrustContextFactory）未接线，`CreateRuntimeOptions.project_trust_context` 已留口子。
 
 ---
 
@@ -518,6 +540,8 @@ Startup header → messages → editor → footer。
 **内置 22 个**：`/settings` `/model` `/scoped-models` `/export` `/import` `/share` `/copy` `/name` `/session` `/changelog` `/hotkeys` `/fork` `/clone` `/tree` `/trust` `/login` `/logout` `/new` `/compact` `/resume` `/reload` `/quit`。
 
 **隐藏/特殊**：`/debug`（写 debug log 到文件，无 autocomplete）；`/llama`（**内置 hidden 扩展注册**，非内置命令）；彩蛋 `/arminsayshi` `/dementedelves`（可 [DEFER]）。
+
+> 实现注记（T14-W6b，详见偏离 D-047）：llama.cpp 集成落 `crates/pir/src/extensions/llama/`（client/huggingface/provider/编排流）+ TUI `modes/interactive/components/llama_view.rs`。T15 宿主缺位期的等价接线：命令表 `extensions/mod.rs::BUILT_IN_EXTENSION_COMMANDS` + dispatch fall-through + autocomplete 直供；provider 进程级单例于 `create_agent_session_services` 注册（`register_native_provider`）。`/login` 的 api-key 通路（含 bare `/login` 的 auth-type 预选择器、`/login <provider>` 精确匹配直进、`Models/ModelRuntime::login/logout`）同波次接线；OAuth 对话框流仍为 stub（T13 遗留）。
 
 **带参数形式**：`/model <模糊词>`（provider/id fuzzy）、`/export <path.html|jsonl>`、`/import <file.jsonl>`、`/name <名字>`、`/compact <自定义指令>`、`/login <provider>`（fuzzy）。
 

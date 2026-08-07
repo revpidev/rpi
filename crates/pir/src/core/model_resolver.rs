@@ -62,13 +62,15 @@ pub const DEFAULT_MODEL_PER_PROVIDER: [(&str, &str); 38] = [
     ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
 ];
 
-fn default_model_for_provider(provider: &str) -> Option<&'static str> {
+/// `defaultModelPerProvider` lookup (`hasDefaultModelProvider` /
+/// `defaultModelPerProvider[providerId]`, interactive-mode.ts:246-248,
+/// 5103) — used by the post-login model auto-selection.
+pub(crate) fn default_model_for_provider(provider: &str) -> Option<&'static str> {
     DEFAULT_MODEL_PER_PROVIDER
         .iter()
         .find(|(p, _)| *p == provider)
         .map(|(_, id)| *id)
 }
-
 /// `ScopedModel` (model-resolver.ts:55-59).
 #[derive(Debug, Clone)]
 pub struct ScopedModel {

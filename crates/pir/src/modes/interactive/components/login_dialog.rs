@@ -13,12 +13,20 @@
 //!   children (so e.g. the auth URL stays visible above a later prompt,
 //!   login-dialog.ts:154-156); the port renders only the latest mode. The
 //!   integration layer should re-issue a `show_*` for every state it wants
-//!   on screen (T13 `AuthEvent` handling).
+//!   on screen (T13 `AuthEvent` handling). For the device-code flow the
+//!   follow-up `showWaiting` line is folded into
+//!   [`LoginDialogState::DeviceCode::waiting`] so both stay visible.
+//! - `select` prompts render inside the dialog ([`LoginDialogState::Select`])
+//!   instead of swapping the editor container for an
+//!   `ExtensionSelectorComponent` (upstream `showAuthSelect`,
+//!   interactive-mode.ts:5204-5235) — the `AuthInteraction` adapter stays
+//!   mounted and the restore step is skipped.
 //! - Pending-input promises (`inputResolver`/`inputRejecter`,
 //!   login-dialog.ts:16-17) are replaced by the `on_submit_manual` /
-//!   `on_prompt_confirm` / `on_cancel` callback fields; Enter is intercepted
-//!   in [`Component::handle_input`] because a Rust closure cannot borrow the
-//!   component mutably (upstream wires `input.onSubmit`, login-dialog.ts:56-64).
+//!   `on_prompt_confirm` / `on_select` / `on_cancel` callback fields; Enter
+//!   is intercepted in [`Component::handle_input`] because a Rust closure
+//!   cannot borrow the component mutably (upstream wires `input.onSubmit`,
+//!   login-dialog.ts:56-64).
 //! - `on_cancel` replaces `onComplete(false, "Login cancelled")`
 //!   (login-dialog.ts:83-91). There is no `AbortSignal`: the flow-cancellation
 //!   contract is that the integration layer tears the login down when
@@ -36,7 +44,7 @@
 
 use std::sync::Arc;
 
-use pir_ai::auth::interaction::AuthInfoLink;
+use pir_ai::auth::interaction::{AuthInfoLink, SelectOption};
 use pir_tui::components::input::Input;
 use pir_tui::components::spacer::Spacer;
 use pir_tui::components::text::Text;
@@ -56,10 +64,15 @@ pub enum LoginDialogState {
         url: String,
         instructions: Option<String>,
     },
-    /// `showDeviceCode` (login-dialog.ts:118-131).
+    /// `showDeviceCode` (login-dialog.ts:118-131) plus the follow-up
+    /// `showWaiting` line (interactive-mode.ts:5264-5266). Upstream appends
+    /// both to the content container; the port's render-from-state model
+    /// folds the waiting message into the state so the integration layer can
+    /// re-issue a single show call (module docs: content replaced per mode).
     DeviceCode {
         user_code: String,
         verification_uri: String,
+        waiting: Option<String>,
     },
     /// `showManualInput` (login-dialog.ts:136-148).
     ManualInput { prompt: String },
@@ -67,6 +80,16 @@ pub enum LoginDialogState {
     Prompt {
         message: String,
         placeholder: Option<String>,
+    },
+    /// In-dialog `select` prompt. Upstream swaps the editor container for a
+    /// separate `ExtensionSelectorComponent` (interactive-mode.ts:5204-5235
+    /// `showAuthSelect`); the port folds the selection into the dialog so
+    /// the `AuthInteraction` adapter stays mounted (intentional difference,
+    /// see module docs).
+    Select {
+        message: String,
+        options: Vec<SelectOption>,
+        selected: usize,
     },
     /// `showInfo` (login-dialog.ts:189-202).
     Info {
@@ -84,6 +107,9 @@ pub enum LoginDialogState {
 
 /// Login dialog component - replaces editor during OAuth login flow
 /// (login-dialog.ts:11-233).
+/// `onSelect` callback (select prompt resolution).
+pub type SelectCallback = Box<dyn FnMut(&str) + Send>;
+
 pub struct LoginDialogComponent {
     theme: Arc<Theme>,
     title: String,
@@ -110,6 +136,9 @@ pub struct LoginDialogComponent {
     /// Submit of a text prompt (login-dialog.ts:172-175).
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     pub on_prompt_confirm: Option<Box<dyn FnMut(&str) + Send>>,
+    /// Selection of a `select` prompt option (upstream `showAuthSelect`
+    /// resolves with the option id, interactive-mode.ts:5221-5223).
+    pub on_select: Option<SelectCallback>,
     /// Cancel / escape (upstream `cancel`, login-dialog.ts:83-91).
     pub on_cancel: Option<Box<dyn FnMut() + Send>>,
 }
@@ -166,6 +195,7 @@ impl LoginDialogComponent {
             on_begin_device_code: None,
             on_submit_manual: None,
             on_prompt_confirm: None,
+            on_select: None,
             on_cancel: None,
         }
     }
@@ -187,11 +217,20 @@ impl LoginDialogComponent {
         }
     }
 
-    /// `showDeviceCode` (login-dialog.ts:118-131).
-    pub fn show_device_code(&mut self, user_code: &str, verification_uri: &str) {
+    /// `showDeviceCode` (login-dialog.ts:118-131) + `showWaiting`
+    /// (interactive-mode.ts:5264-5266). `waiting` is the message the
+    /// integration layer wants visible under the code (upstream appends it
+    /// via a separate `showWaiting` call; the port renders one state).
+    pub fn show_device_code(
+        &mut self,
+        user_code: &str,
+        verification_uri: &str,
+        waiting: Option<&str>,
+    ) {
         self.state = Some(LoginDialogState::DeviceCode {
             user_code: user_code.to_string(),
             verification_uri: verification_uri.to_string(),
+            waiting: waiting.map(str::to_string),
         });
         self.submitted = None;
         if let Some(on_begin_device_code) = self.on_begin_device_code.as_mut() {
@@ -214,6 +253,18 @@ impl LoginDialogComponent {
         self.state = Some(LoginDialogState::Prompt {
             message: message.to_string(),
             placeholder: placeholder.map(str::to_string),
+        });
+        self.submitted = None;
+    }
+
+    /// In-dialog `select` prompt (upstream `showAuthSelect`,
+    /// interactive-mode.ts:5204-5235). The first option is pre-selected;
+    /// Enter fires [`Self::on_select`] with the option id.
+    pub fn show_select(&mut self, message: &str, options: Vec<SelectOption>) {
+        self.state = Some(LoginDialogState::Select {
+            message: message.to_string(),
+            options,
+            selected: 0,
         });
         self.submitted = None;
     }
@@ -268,6 +319,21 @@ impl LoginDialogComponent {
             )
     }
 
+    /// Select-mode navigation (upstream `ExtensionSelectorComponent` arrows,
+    /// extension-selector.ts:247-252).
+    fn select_move(&mut self, delta: isize) {
+        if let Some(LoginDialogState::Select {
+            options, selected, ..
+        }) = self.state.as_mut()
+        {
+            if options.is_empty() {
+                return;
+            }
+            let len = options.len() as isize;
+            *selected = ((*selected as isize + delta).rem_euclid(len)) as usize;
+        }
+    }
+
     /// The input line, or the `> value` echo after a submit
     /// (login-dialog.ts:77-81).
     fn push_input_or_submitted(&self, lines: &mut Vec<String>, width: usize) {
@@ -300,6 +366,7 @@ impl LoginDialogComponent {
             Some(LoginDialogState::DeviceCode {
                 user_code,
                 verification_uri,
+                waiting,
             }) => {
                 lines.extend(Spacer::new(1).render(width));
                 let linked_url = osc8_link(verification_uri, verification_uri);
@@ -319,6 +386,23 @@ impl LoginDialogComponent {
                     )
                     .render(width),
                 );
+                if let Some(waiting) = waiting {
+                    lines.extend(Spacer::new(1).render(width));
+                    lines
+                        .extend(Text::new(self.theme.fg("dim", waiting), 1, 0, None).render(width));
+                    lines.extend(
+                        Text::new(
+                            format!(
+                                "({})",
+                                key_hint(&self.theme, "tui.select.cancel", "to cancel")
+                            ),
+                            1,
+                            0,
+                            None,
+                        )
+                        .render(width),
+                    );
+                }
             }
             Some(LoginDialogState::ManualInput { prompt }) => {
                 lines.extend(Spacer::new(1).render(width));
@@ -361,6 +445,35 @@ impl LoginDialogComponent {
                             "({}{})",
                             key_hint(&self.theme, "tui.select.cancel", "to cancel,"),
                             key_hint(&self.theme, "tui.select.confirm", "to submit"),
+                        ),
+                        1,
+                        0,
+                        None,
+                    )
+                    .render(width),
+                );
+            }
+            Some(LoginDialogState::Select {
+                message,
+                options,
+                selected,
+            }) => {
+                lines.extend(Spacer::new(1).render(width));
+                lines.extend(Text::new(self.theme.fg("text", message), 1, 0, None).render(width));
+                for (index, option) in options.iter().enumerate() {
+                    let label = if index == *selected {
+                        format!("→ {}", self.theme.fg("accent", &option.label))
+                    } else {
+                        format!("  {}", self.theme.fg("text", &option.label))
+                    };
+                    lines.extend(Text::new(label, 1, 0, None).render(width));
+                }
+                lines.extend(
+                    Text::new(
+                        format!(
+                            "({}{})",
+                            key_hint(&self.theme, "tui.select.cancel", "to cancel,"),
+                            key_hint(&self.theme, "tui.select.confirm", "to select"),
                         ),
                         1,
                         0,
@@ -451,6 +564,29 @@ impl Component for LoginDialogComponent {
         // Escape / Ctrl+C cancels (login-dialog.ts:225-228).
         if kb.matches_id(data, "tui.select.cancel") {
             self.cancel();
+            return;
+        }
+
+        // Select mode navigates with up/down and confirms with Enter
+        // (upstream `showAuthSelect` selector, interactive-mode.ts:5216-5228).
+        if matches!(self.state, Some(LoginDialogState::Select { .. })) {
+            if kb.matches_id(data, "tui.select.up") {
+                self.select_move(-1);
+            } else if kb.matches_id(data, "tui.select.down") {
+                self.select_move(1);
+            } else if kb.matches_id(data, "tui.select.confirm") || data == "\n" {
+                let id = match &self.state {
+                    Some(LoginDialogState::Select {
+                        options, selected, ..
+                    }) => options.get(*selected).map(|option| option.id.clone()),
+                    _ => None,
+                };
+                if let Some(id) = id {
+                    if let Some(on_select) = self.on_select.as_mut() {
+                        on_select(&id);
+                    }
+                }
+            }
             return;
         }
 
@@ -631,12 +767,72 @@ mod tests {
         let mut component = dialog();
         component.on_begin_device_code = Some(Box::new(move || *began_cb.lock().unwrap() += 1));
 
-        component.show_device_code("ABC-123", "https://example.com/device");
+        component.show_device_code("ABC-123", "https://example.com/device", None);
         assert_eq!(*began.lock().unwrap(), 1);
 
         let rendered = component.render(80).join("\n");
         assert!(rendered.contains("https://example.com/device"));
         assert!(rendered.contains("Enter code: ABC-123"));
+        // Without a waiting message no cancel hint is shown below the code.
+        assert!(!rendered.contains("to cancel"));
+
+        // The OAuth integration layer folds the `showWaiting` line into the
+        // device-code view (interactive-mode.ts:5264-5266).
+        component.show_device_code(
+            "ABC-123",
+            "https://example.com/device",
+            Some("Waiting for authentication..."),
+        );
+        let rendered = component.render(80).join("\n");
+        assert!(rendered.contains("Waiting for authentication..."));
+        assert!(rendered.contains("Enter code: ABC-123"));
+        assert!(rendered.contains("to cancel"));
+    }
+
+    #[test]
+    fn select_prompt_navigates_and_fires_on_select() {
+        install_global_keybindings();
+        let selected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let selected_cb = Arc::clone(&selected);
+        let mut component = dialog();
+        component.on_select = Some(Box::new(move |id| {
+            selected_cb.lock().unwrap().push(id.to_string())
+        }));
+
+        component.show_select(
+            "Choose an account:",
+            vec![
+                SelectOption {
+                    id: "acct-1".to_string(),
+                    label: "Account one".to_string(),
+                    description: None,
+                },
+                SelectOption {
+                    id: "acct-2".to_string(),
+                    label: "Account two".to_string(),
+                    description: None,
+                },
+            ],
+        );
+
+        // Enter selects the pre-selected first option.
+        component.handle_input("\r");
+        assert_eq!(*selected.lock().unwrap(), vec!["acct-1"]);
+        let rendered = component.render(60).join("\n");
+        assert!(rendered.contains("Choose an account:"));
+        assert!(rendered.contains("Account one"));
+        assert!(rendered.contains("Account two"));
+        assert!(rendered.contains("→"));
+        assert!(rendered.contains("to select"));
+
+        // Down + Enter selects the second option.
+        component.handle_input("\x1b[B");
+        component.handle_input("\r");
+        assert_eq!(*selected.lock().unwrap(), vec!["acct-1", "acct-2"]);
+
+        // Escape cancels instead of selecting.
+        component.handle_input("\x1b");
+        assert_eq!(*selected.lock().unwrap(), vec!["acct-1", "acct-2"]);
     }
 
     #[test]

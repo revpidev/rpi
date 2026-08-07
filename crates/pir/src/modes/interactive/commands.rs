@@ -18,8 +18,14 @@
 //!   the same 100 KB encoded-length cap. Native-tool integration is a TODO
 //!   hook.
 //! - Export (`handle_export_command`): the JSONL branch uses the local
-//!   `AgentSession::export_to_jsonl`; the HTML branch reports the T14 gap
-//!   (upstream `exportToHtml`).
+//!   `AgentSession::export_to_jsonl`; the HTML branch uses
+//!   `AgentSession::export_to_html` (T14 W5; no `renderedTools`
+//!   pre-rendering — export_html.rs header).
+//! - Share (`handle_share_command`): gh calls go through the injectable
+//!   `ShareRunner` (core/share.rs); the cancellable loader's abort and the
+//!   gist worker's completion settle in the drain (`UiCommand::ShareAbort` /
+//!   `ShareCompleted`) instead of upstream's inline promise continuation
+//!   (component lock contract).
 //! - Import (`handle_import_command`): the extension confirmation prompt
 //!   (`showExtensionConfirm`, interactive-mode.ts:5474-5478) and the
 //!   missing-session-cwd prompt (interactive-mode.ts:5489-5501) are T15
@@ -37,9 +43,8 @@
 //! - Session (`handle_session_command`): the cache-waste section
 //!   (interactive-mode.ts:5648, 5692-5699) is a T14 hook — no local
 //!   `computeCacheWaste` (cache-stats port).
-//! - Share (`handle_share_command`): T14 hook (gh auth/gist flow,
-//!   interactive-mode.ts:5511-5603).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -51,11 +56,14 @@ use pir_tui::components::text::Text;
 use crate::core::session_manager::now_iso8601;
 use crate::core::themes::Theme;
 use crate::core::usage_totals::get_usage_cost_breakdown;
+use crate::modes::interactive::components::bordered_loader::BorderedLoaderComponent;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
 use crate::modes::interactive::components::util::to_locale_string;
 use crate::modes::interactive::components::DynamicBorder;
 use crate::modes::interactive::footer::format_tokens;
-use crate::modes::interactive::interactive_mode::{InteractiveMode, InteractiveUi};
+use crate::modes::interactive::interactive_mode::{
+    InteractiveMode, InteractiveUi, ShareState, UiCommand,
+};
 
 /// `MAX_OSC52_ENCODED_LENGTH` (utils/clipboard.ts:20).
 const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
@@ -306,26 +314,130 @@ impl InteractiveUi {
         Ok(())
     }
 
-    /// `handleExportCommand` (interactive-mode.ts:5422-5436): export the
-    /// session to JSONL (HTML export is a T14 gap).
+    /// `handleExportCommand` (interactive-mode.ts:5422-5436): `.jsonl`
+    /// suffix → JSONL branch export, anything else (or no path) → HTML.
     pub(crate) fn handle_export_command(&self, args: &str) {
         let output_path = get_path_command_argument(args, "/export");
-        let Some(output_path) = output_path.filter(|path| path.ends_with(".jsonl")) else {
-            // Upstream falls through to `exportToHtml` for non-JSONL (or
-            // missing) paths (interactive-mode.ts:5426-5431); HTML export is
-            // a T14 gap, reported instead of exported.
-            self.show_error("HTML export is not available yet (T14)");
-            return;
-        };
-        match self.session().export_to_jsonl(Some(&output_path)) {
-            Ok(file_path) => {
-                self.show_status(&format!("Session exported to: {}", file_path.display()))
+        if let Some(jsonl_path) = output_path
+            .as_deref()
+            .filter(|path| path.ends_with(".jsonl"))
+        {
+            match self.session().export_to_jsonl(Some(jsonl_path)) {
+                Ok(file_path) => {
+                    self.show_status(&format!("Session exported to: {}", file_path.display()))
+                }
+                Err(error) => self.show_error(&format!(
+                    "Failed to export session: {}",
+                    error.raw_message()
+                )),
             }
+            return;
+        }
+        match self.session().export_to_html(output_path.as_deref()) {
+            Ok(file_path) => self.show_status(&format!("Session exported to: {file_path}")),
             Err(error) => self.show_error(&format!(
                 "Failed to export session: {}",
                 error.raw_message()
             )),
         }
+    }
+
+    /// `handleShareCommand` (interactive-mode.ts:5511-5603): gh auth check →
+    /// export a temp HTML → cancellable loader while a worker thread runs
+    /// `gh gist create --public=false` → gist ID → viewer URL. Completion
+    /// and abort arrive as `UiCommand::ShareCompleted` / `ShareAbort` and
+    /// settle in the drain (component lock contract).
+    pub(crate) fn handle_share_command(self: &Arc<Self>) {
+        use crate::core::share::GhAuthStatus;
+
+        let runner = lock(&self.share_runner).clone();
+        match runner.auth_status() {
+            GhAuthStatus::NotInstalled => {
+                self.show_error(
+                    "GitHub CLI (gh) is not installed. Install it from https://cli.github.com/",
+                );
+                return;
+            }
+            GhAuthStatus::NotLoggedIn => {
+                self.show_error("GitHub CLI is not logged in. Run 'gh auth login' first.");
+                return;
+            }
+            GhAuthStatus::Ok => {}
+        }
+
+        // `path.join(os.tmpdir(), "session.html")` (interactive-mode.ts:5526).
+        // Divergence (D-045 补记): the file lives in a per-invocation unique
+        // subdirectory so two concurrent pir instances cannot overwrite each
+        // other's export (which would publish the wrong session). The
+        // basename stays `session.html` — gh uses it as the gist file name.
+        let share_dir = std::env::temp_dir().join(format!(
+            "pir-share-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let tmp_file = share_dir.join("session.html");
+        if let Err(error) = std::fs::create_dir_all(&share_dir) {
+            self.show_error(&format!("Failed to export session: {error}"));
+            return;
+        }
+        if let Err(error) = self
+            .session()
+            .export_to_html(Some(&tmp_file.to_string_lossy()))
+        {
+            // T14 review: clean up the (now empty) unique temp directory on
+            // the failure path so failed attempts do not leak `pir-share-*`
+            // directories in /tmp.
+            crate::core::share::cleanup_share_tmp_file(&tmp_file);
+            self.show_error(&format!(
+                "Failed to export session: {}",
+                error.raw_message()
+            ));
+            return;
+        }
+        // The exported HTML may hold private conversation content; keep it
+        // readable by this user only (T14 review).
+        crate::core::share::restrict_share_tmp_file_permissions(&tmp_file);
+
+        // Cancellable loader replacing the editor
+        // (interactive-mode.ts:5529-5538).
+        let cancelled = Arc::new(AtomicBool::new(false));
+        *lock(&self.share_state) = Some(ShareState {
+            cancelled: Arc::clone(&cancelled),
+            tmp_file: tmp_file.clone(),
+        });
+        let mut loader = BorderedLoaderComponent::new(
+            self.render_handle.clone(),
+            Arc::clone(&lock(&self.theme)),
+            "Creating gist...",
+            None,
+        );
+        {
+            // `loader.onAbort` (interactive-mode.ts:5549-5554) — component
+            // callback, so it only flags + queues; the drain settles.
+            let abort_flag = Arc::clone(&cancelled);
+            let ui = self.upgrade_self();
+            loader.on_abort = Some(Box::new(move || {
+                abort_flag.store(true, Ordering::Relaxed);
+                if let Some(ui) = &ui {
+                    ui.push(UiCommand::ShareAbort);
+                    ui.render_handle.request_render();
+                }
+            }));
+        }
+        self.show_selector(pir_tui::tui::shared_component(loader));
+
+        // `spawn("gh", ["gist", "create", "--public=false", tmpFile])`
+        // (interactive-mode.ts:5563) on a worker thread — the run loop must
+        // keep pumping while gh waits on the network.
+        let worker_ui = Arc::clone(self);
+        std::thread::spawn(move || {
+            let outcome = runner.gist_create(&tmp_file, cancelled);
+            worker_ui.push(UiCommand::ShareCompleted(outcome));
+            worker_ui.render_handle.request_render();
+        });
     }
 
     /// `handleChangelogCommand` (interactive-mode.ts:5707-5726). No local
@@ -529,12 +641,6 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleShareCommand` — T14 hook (gh auth/gist flow,
-    /// interactive-mode.ts:5511-5603).
-    pub(crate) fn handle_share_command(&self) {
-        self.show_status("Session sharing is not available yet (T14)");
-    }
-
     /// `handleCompactCommand` (interactive-mode.ts:6018-6026). Errors are
     /// ignored — compaction failures surface through the event stream.
     pub(crate) async fn handle_compact_command(&self, args: &str) {
@@ -591,7 +697,9 @@ impl InteractiveMode {
 mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::InteractiveModeOptions;
-    use crate::modes::interactive::test_support::{build_test_session, TestTerminal};
+    use crate::modes::interactive::test_support::{
+        build_test_session, install_noop_product_transports, TestTerminal,
+    };
     use pir_agent::messages::AgentMessage;
     use pir_ai::types::{ApiKind, AssistantMessage, AssistantRole, StopReason, Usage};
     use pir_tui::tui::Component;
@@ -645,6 +753,8 @@ mod tests {
             InteractiveModeOptions::default(),
             Box::new(TestTerminal::clone(&terminal)),
         );
+        // M1 (T14 review): no product-endpoint requests from unit tests.
+        install_noop_product_transports(&mode);
         (mode, terminal)
     }
 
@@ -808,14 +918,308 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_command_html_reports_t14_gap() {
+    async fn export_command_html_in_memory_session_errors() {
         let (mode, _terminal) = mode_harness().await;
         let ui = &mode.ui_state;
-        ui.handle_export_command("/export");
+        // The harness session is in-memory → the upstream
+        // "Cannot export in-memory session to HTML" error
+        // (index.ts:244-246) surfaces via the shared export error wrapper.
+        ui.handle_export_command("/export out.html");
         let rendered = chat_render(ui);
+        // The 60-col test render wraps the message; assert the unwrapped
+        // fragments.
         assert!(
-            rendered.contains("HTML export is not available yet (T14)"),
+            rendered.contains("Failed to export session: Cannot export in-memory"),
             "rendered: {rendered}"
+        );
+        assert!(rendered.contains("session to HTML"), "rendered: {rendered}");
+    }
+
+    // ---------------------------------------------------------------------
+    // /share
+    // ---------------------------------------------------------------------
+
+    use crate::core::share::{GhAuthStatus, GistCreateOutcome, ShareRunner};
+
+    struct MockShareRunner {
+        auth: GhAuthStatus,
+        outcome: GistCreateOutcome,
+        /// Recorded gist file argument (assert the temp HTML path).
+        gist_file: Mutex<Option<std::path::PathBuf>>,
+    }
+
+    impl MockShareRunner {
+        fn ok() -> Self {
+            MockShareRunner {
+                auth: GhAuthStatus::Ok,
+                outcome: GistCreateOutcome {
+                    code: Some(0),
+                    stdout: "https://gist.github.com/user/abc123\n".to_string(),
+                    stderr: String::new(),
+                },
+                gist_file: Mutex::new(None),
+            }
+        }
+    }
+
+    impl ShareRunner for MockShareRunner {
+        fn auth_status(&self) -> GhAuthStatus {
+            self.auth
+        }
+
+        fn gist_create(
+            &self,
+            file: &std::path::Path,
+            _cancelled: Arc<AtomicBool>,
+        ) -> GistCreateOutcome {
+            *lock(&self.gist_file) = Some(file.to_path_buf());
+            self.outcome.clone()
+        }
+    }
+
+    /// Drain until `pred` matches the chat (the gist worker reports back on
+    /// a thread, so the test polls the queue).
+    fn drain_until(ui: &InteractiveUi, pred: impl Fn(&str) -> bool) -> String {
+        for _ in 0..200 {
+            ui.drain_events();
+            let rendered = chat_render(ui);
+            if pred(&rendered) {
+                return rendered;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        chat_render(ui)
+    }
+
+    #[tokio::test]
+    async fn share_command_gh_not_installed() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let mut runner = MockShareRunner::ok();
+        runner.auth = GhAuthStatus::NotInstalled;
+        ui.set_share_runner(Arc::new(runner));
+        ui.handle_share_command();
+        let rendered = chat_render(ui);
+        // 60-col render wraps; assert the unwrapped fragments.
+        assert!(
+            rendered.contains("GitHub CLI (gh) is not installed."),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("https://cli.github.com/"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn share_command_gh_not_logged_in() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let mut runner = MockShareRunner::ok();
+        runner.auth = GhAuthStatus::NotLoggedIn;
+        ui.set_share_runner(Arc::new(runner));
+        ui.handle_share_command();
+        let rendered = chat_render(ui);
+        // 60-col render wraps; assert the unwrapped fragments.
+        assert!(
+            rendered.contains("GitHub CLI is not logged in."),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("gh auth login"), "rendered: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn share_command_in_memory_session_fails_export() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.set_share_runner(Arc::new(MockShareRunner::ok()));
+        ui.handle_share_command();
+        let rendered = chat_render(ui);
+        // The 60-col test render wraps the message; assert the unwrapped
+        // fragments.
+        assert!(
+            rendered.contains("Failed to export session: Cannot export in-memory"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("session to HTML"), "rendered: {rendered}");
+    }
+
+    /// File-backed `/share` harness: gist create succeeds/fails against the
+    /// mock; completion settles through the drain.
+    struct ShareHarness {
+        mode: InteractiveMode,
+        /// Outlives `mode` (field drop order): the file-backed session
+        /// manager's directory.
+        _tmp: crate::modes::interactive::test_support::TempDir,
+    }
+
+    async fn share_harness(runner: Arc<dyn ShareRunner>) -> ShareHarness {
+        // A file-backed session so the temp HTML export works.
+        let tmp = crate::modes::interactive::test_support::TempDir::new();
+        let session_file = tmp.path().join("s.jsonl");
+        std::fs::write(
+            &session_file,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"sess-share\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp\"}\n",
+                "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"share me\",\"timestamp\":1}}\n",
+            ),
+        )
+        .expect("write session file");
+        let manager = crate::core::session_manager::SessionManager::open(
+            &session_file,
+            Some(tmp.path()),
+            None,
+        )
+        .expect("open session");
+        let harness =
+            crate::modes::interactive::test_support::build_test_session_with_manager(Some(manager))
+                .await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        mode.ui_state.set_share_runner(runner);
+        ShareHarness { mode, _tmp: tmp }
+    }
+
+    /// Success / failure / parse-failure settle through the gist worker +
+    /// drain. The temp payload lives in a unique `pir-share-{pid}-{nanos}/`
+    /// subdirectory (basename `session.html`, interactive-mode.ts:5526).
+    #[tokio::test]
+    async fn share_command_completion_paths() {
+        // Success: viewer URL + gist URL; temp payload cleaned up.
+        let runner = Arc::new(MockShareRunner::ok());
+        let harness = share_harness(runner.clone()).await;
+        let ui = &harness.mode.ui_state;
+        ui.handle_share_command();
+        let rendered = drain_until(ui, |r| r.contains("Share URL:"));
+        assert!(
+            rendered.contains("Share URL: https://pi.dev/session/#abc123"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("Gist: https://gist.github.com/user/abc123"),
+            "rendered: {rendered}"
+        );
+        // The gist payload is the temp HTML (interactive-mode.ts:5526,
+        // 5563) and the drain cleaned it up (interactive-mode.ts:5543-5545).
+        let gist_file = lock(&runner.gist_file).clone().expect("gist file recorded");
+        assert_eq!(gist_file.file_name().expect("basename"), "session.html");
+        let share_dir = gist_file.parent().expect("share dir").to_path_buf();
+        assert!(
+            share_dir
+                .file_name()
+                .expect("dir name")
+                .to_string_lossy()
+                .starts_with("pir-share-"),
+            "unique share dir: {}",
+            share_dir.display()
+        );
+        assert!(!gist_file.exists(), "temp html cleaned up after success");
+        assert!(!share_dir.exists(), "share dir cleaned up after success");
+        drop(harness);
+
+        // gh exits non-zero → trimmed stderr (interactive-mode.ts:5578-5582).
+        let mut failing = MockShareRunner::ok();
+        failing.outcome = GistCreateOutcome {
+            code: Some(1),
+            stdout: String::new(),
+            stderr: "  HTTP 403: forbidden  \n".to_string(),
+        };
+        let harness = share_harness(Arc::new(failing)).await;
+        let ui = &harness.mode.ui_state;
+        ui.handle_share_command();
+        let rendered = drain_until(ui, |r| r.contains("Failed to create gist"));
+        assert!(
+            rendered.contains("Failed to create gist: HTTP 403: forbidden"),
+            "rendered: {rendered}"
+        );
+        drop(harness);
+
+        // Unparseable gh stdout → gist ID error (interactive-mode.ts:5588-5590).
+        let mut empty = MockShareRunner::ok();
+        empty.outcome = GistCreateOutcome {
+            code: Some(0),
+            stdout: "   \n".to_string(),
+            stderr: String::new(),
+        };
+        let harness = share_harness(Arc::new(empty)).await;
+        let ui = &harness.mode.ui_state;
+        ui.handle_share_command();
+        let rendered = drain_until(ui, |r| r.contains("Failed to parse gist ID"));
+        assert!(
+            rendered.contains("Failed to parse gist ID from gh output"),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// The loader's abort settles the share with "Share cancelled"
+    /// (interactive-mode.ts:5549-5554); the late worker completion is
+    /// ignored (single `take` on the share state).
+    #[tokio::test]
+    async fn share_command_abort_cancels() {
+        struct BlockingRunner {
+            entered: Arc<AtomicBool>,
+        }
+        impl ShareRunner for BlockingRunner {
+            fn auth_status(&self) -> GhAuthStatus {
+                GhAuthStatus::Ok
+            }
+
+            fn gist_create(
+                &self,
+                _file: &std::path::Path,
+                cancelled: Arc<AtomicBool>,
+            ) -> GistCreateOutcome {
+                // Signals the wait loop below (T14 review: the previous
+                // wait probed the pre-D-045 fixed `{tmpdir}/session.html`
+                // path, which the unique `pir-share-*` layout never
+                // produces — the loop spun for its full duration).
+                self.entered.store(true, Ordering::Relaxed);
+                for _ in 0..2000 {
+                    if cancelled.load(Ordering::Relaxed) {
+                        // Killed child (upstream `proc.kill()`).
+                        return GistCreateOutcome {
+                            code: None,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                        };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                panic!("abort flag never reached the gist worker");
+            }
+        }
+
+        let entered = Arc::new(AtomicBool::new(false));
+        let harness = share_harness(Arc::new(BlockingRunner {
+            entered: Arc::clone(&entered),
+        }))
+        .await;
+        let ui = &harness.mode.ui_state;
+        ui.handle_share_command();
+        // Wait for the worker to be in flight (the runner's entry flag —
+        // the gist file itself is written by `gh`, which the mock never
+        // spawns).
+        for _ in 0..200 {
+            if entered.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(entered.load(Ordering::Relaxed), "gist worker never started");
+        // The loader's on_abort queues `ShareAbort` (component callback →
+        // drain); invoke the queued path directly.
+        ui.push(UiCommand::ShareAbort);
+        let rendered = drain_until(ui, |r| r.contains("Share cancelled"));
+        assert!(rendered.contains("Share cancelled"), "rendered: {rendered}");
+        // The late completion is a no-op: no gist error surfaces.
+        let rendered = drain_until(ui, |r| r.contains("Failed to create gist"));
+        assert!(
+            !rendered.contains("Failed to create gist"),
+            "late completion ignored: {rendered}"
         );
     }
 
@@ -935,22 +1339,6 @@ mod tests {
             "rendered: {rendered}"
         );
         assert!(rendered.contains("pir-debug.log"), "rendered: {rendered}");
-    }
-
-    // ---------------------------------------------------------------------
-    // /share
-    // ---------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn share_command_shows_t14_status() {
-        let (mode, _terminal) = mode_harness().await;
-        let ui = &mode.ui_state;
-        ui.handle_share_command();
-        let rendered = chat_render(ui);
-        assert!(
-            rendered.contains("Session sharing is not available yet (T14)"),
-            "rendered: {rendered}"
-        );
     }
 
     // ---------------------------------------------------------------------

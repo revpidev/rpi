@@ -20,7 +20,8 @@
 //!   session picks (session selector, user-message fork selector) are routed
 //!   to the run loop over the `EditorInput` channel and executed by
 //!   `InteractiveMode` (`handle_resume_command` / `handle_fork_command`).
-//! - Login/logout selectors mount but the flows are T13 hooks.
+//! - Login/logout selectors and the api-key login flow are wired (T14 W6b);
+//!   the OAuth login dialog flow stays a stub (T13 leftover).
 //! - `handleBashCommand`: local `AgentSession::execute_bash` already records
 //!   the result internally (agent-session.rs:2076), so this port does not
 //!   call `record_bash_result` again (upstream interactive-mode.ts:5967).
@@ -29,15 +30,20 @@
 //!   `rebindCurrentSession`, interactive-mode.ts:1732-1758) instead of the
 //!   runtime's `setRebindSession` hook, which stays `None`.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pir_ai::auth::types::{AuthCheck, AuthType, CredentialType};
+use pir_ai::auth::interaction::{AuthEvent, AuthInteraction, AuthPrompt};
+use pir_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType};
+use pir_ai::auth::{ModelsError, ModelsErrorCode};
 use pir_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use pir_tui::terminal_colors::TerminalColorScheme;
 use pir_tui::tui::{shared_component_from_boxed, Component, Focusable};
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     child_address, install_global_keybindings, lock, remove_child_by_address, EditorInput,
@@ -48,12 +54,18 @@ use crate::core::agent_session::{
 };
 use crate::core::agent_session_runtime::ForkPosition;
 use crate::core::model_resolver::{
-    find_exact_model_reference_match, resolve_model_scope_with_diagnostics,
+    default_model_for_provider, find_exact_model_reference_match,
+    resolve_model_scope_with_diagnostics,
 };
+use crate::core::model_runtime::ModelRuntime;
 use crate::core::session_manager::SessionManager;
 use crate::core::themes::get_available_themes;
 use crate::core::trust_manager::ProjectTrustStore;
+use crate::extensions::llama::{LlamaHost, NotifyLevel};
 use crate::modes::interactive::components::bash_execution::BashExecutionComponent;
+use crate::modes::interactive::components::extension_selector::ExtensionSelectorComponent;
+use crate::modes::interactive::components::llama_view::new_llama_view;
+use crate::modes::interactive::components::login_dialog::LoginDialogComponent;
 use crate::modes::interactive::components::model_selector::ModelSelectorComponent;
 use crate::modes::interactive::components::oauth_selector::{
     AuthSelectorMode, AuthSelectorProvider, OAuthSelectorComponent,
@@ -419,6 +431,533 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
     ui.render_handle.request_render();
 }
 
+/// The interactive-mode [`LlamaHost`]: `ctx.ui.notify` → the status line,
+/// `ctx.modelRegistry.*` → the session's model runtime.
+struct InteractiveLlamaHost {
+    ui: Arc<InteractiveUi>,
+}
+
+#[async_trait::async_trait]
+impl LlamaHost for InteractiveLlamaHost {
+    fn mode_is_tui(&self) -> bool {
+        true
+    }
+
+    fn notify(&self, message: &str, level: NotifyLevel) {
+        match level {
+            NotifyLevel::Info => self.ui.show_status(message),
+            NotifyLevel::Warning => self.ui.show_warning(message),
+            NotifyLevel::Error => self.ui.show_error(message),
+        }
+    }
+
+    async fn provider_auth(&self) -> Result<Option<pir_ai::auth::AuthResult>, ModelsError> {
+        self.ui
+            .session()
+            .model_runtime()
+            .get_provider_auth(crate::extensions::llama::LLAMA_PROVIDER_ID)
+            .await
+    }
+
+    async fn refresh_models(&self) {
+        self.ui.session().model_runtime().refresh(None).await;
+    }
+}
+
+/// `findLoginProviderOptions` (interactive-mode.ts:4888-4899): exact,
+/// case-insensitive match on provider id or name.
+fn find_login_provider_options(
+    runtime: &ModelRuntime,
+    provider_ref: &str,
+) -> Vec<AuthSelectorProvider> {
+    let normalized = provider_ref.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+    runtime
+        .get_providers()
+        .iter()
+        .flat_map(|provider| AuthSelectorProvider::from_provider(provider, None))
+        .filter(|provider| {
+            provider.id.to_lowercase() == normalized || provider.name.to_lowercase() == normalized
+        })
+        .collect()
+}
+
+/// `startProviderLogin` (interactive-mode.ts:4925-4933).
+fn start_provider_login(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider) {
+    match provider.auth_type {
+        AuthType::Oauth => {
+            // `showLoginDialog` (interactive-mode.ts:5286-5312) is a
+            // T15 / OAuth-wave hook; the flow stays stubbed.
+            ui.show_status(&format!(
+                "Provider login is not available yet (T13): {}",
+                provider.id
+            ));
+        }
+        AuthType::ApiKey if provider.method_login => {
+            show_api_key_login_dialog(ui, provider);
+        }
+        AuthType::ApiKey => {
+            show_ambient_auth_dialog(ui, provider);
+        }
+    }
+}
+
+/// `LoginDialogComponent` wired to its `AuthInteraction` adapter: the
+/// dialog callbacks resolve the adapter's pending prompt channel, and
+/// cancel aborts the flow token (upstream `dialog.signal` +
+/// `inputResolver`/`inputRejecter`, login-dialog.ts:16-17, 73-91).
+struct LoginDialogInteraction {
+    dialog: Arc<Mutex<LoginDialogComponent>>,
+    state: Arc<LoginDialogInteractionState>,
+}
+
+/// Shared prompt/cancel state between the mounted dialog and the
+/// adapter.
+struct LoginDialogInteractionState {
+    pending: Mutex<Option<oneshot::Sender<Result<String, ModelsError>>>>,
+    signal: CancellationToken,
+}
+
+impl LoginDialogInteractionState {
+    fn resolve(&self, result: Result<String, ModelsError>) {
+        if let Some(sender) = lock(&self.pending).take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+/// `new Error("Login cancelled")` (login-dialog.ts:86, interactive-mode.ts
+/// :5198): the exact message gates silent cancellation in the UI.
+fn login_cancelled() -> ModelsError {
+    ModelsError::new(ModelsErrorCode::Auth, "Login cancelled")
+}
+
+/// `new LoginDialogComponent(...)` (login-dialog.ts:30-71) plus the
+/// `loginProvider` interaction wiring (interactive-mode.ts:5274-5284).
+fn login_dialog_with_interaction(
+    ui: &Arc<InteractiveUi>,
+    provider_id: &str,
+    provider_name: &str,
+) -> (Arc<Mutex<LoginDialogComponent>>, LoginDialogInteraction) {
+    let theme = Arc::clone(&lock(&ui.theme));
+    let state = Arc::new(LoginDialogInteractionState {
+        pending: Mutex::new(None),
+        signal: CancellationToken::new(),
+    });
+    let dialog = Arc::new(Mutex::new(LoginDialogComponent::new(
+        theme,
+        provider_id,
+        Some(provider_name),
+        None,
+    )));
+    {
+        let mut dialog_guard = lock(&dialog);
+        let state_confirm = Arc::clone(&state);
+        dialog_guard.on_prompt_confirm = Some(Box::new(move |value| {
+            state_confirm.resolve(Ok(value.to_string()));
+        }));
+        let state_manual = Arc::clone(&state);
+        dialog_guard.on_submit_manual = Some(Box::new(move |value| {
+            state_manual.resolve(Ok(value.to_string()));
+        }));
+        let state_select = Arc::clone(&state);
+        dialog_guard.on_select = Some(Box::new(move |id| {
+            state_select.resolve(Ok(id.to_string()));
+        }));
+        let state_cancel = Arc::clone(&state);
+        dialog_guard.on_cancel = Some(Box::new(move || {
+            // `cancel()` (login-dialog.ts:83-91): abort the flow signal
+            // and reject the pending prompt.
+            state_cancel.signal.cancel();
+            state_cancel.resolve(Err(login_cancelled()));
+        }));
+    }
+    let interaction = LoginDialogInteraction {
+        dialog: dialog.clone(),
+        state,
+    };
+    (dialog, interaction)
+}
+
+/// Mount the dialog in place of the editor (upstream
+/// `editorContainer.clear()` + `addChild(dialog)` + `setFocus(dialog)`,
+/// interactive-mode.ts:5179-5182).
+fn mount_login_dialog(ui: &Arc<InteractiveUi>, dialog: &Arc<Mutex<LoginDialogComponent>>) {
+    let entry = shared_component_from_boxed(Box::new(FocusableRegion(dialog.clone())));
+    ui.show_selector(entry);
+}
+
+impl AuthInteraction for LoginDialogInteraction {
+    /// `dialog.signal` (login-dialog.ts:73-75).
+    fn signal(&self) -> Option<CancellationToken> {
+        Some(self.state.signal.clone())
+    }
+
+    /// `showAuthPrompt` (interactive-mode.ts:5237-5259): switch the
+    /// dialog into the prompt mode and await the user's submit/cancel,
+    /// racing the per-prompt signal when one is attached.
+    fn prompt<'a>(&'a self, prompt: AuthPrompt) -> BoxFutureSend<'a, Result<String, ModelsError>> {
+        let dialog = self.dialog.clone();
+        let state = self.state.clone();
+        Box::pin(async move {
+            match &prompt {
+                AuthPrompt::Text {
+                    message,
+                    placeholder,
+                    ..
+                }
+                | AuthPrompt::Secret {
+                    message,
+                    placeholder,
+                    ..
+                } => {
+                    lock(&dialog).show_prompt(message, placeholder.as_deref());
+                }
+                AuthPrompt::ManualCode { message, .. } => {
+                    lock(&dialog).show_manual_input(message);
+                }
+                AuthPrompt::Select {
+                    message, options, ..
+                } => {
+                    lock(&dialog).show_select(message, options.clone());
+                }
+            }
+            // Register the pending channel before releasing the dialog
+            // lock so a fast Enter cannot be dropped.
+            let (tx, rx) = oneshot::channel();
+            *lock(&state.pending) = Some(tx);
+
+            let response = async {
+                match rx.await {
+                    Ok(Ok(value)) => Ok(value),
+                    Ok(Err(error)) => Err(error),
+                    Err(_) => Err(login_cancelled()),
+                }
+            };
+            match prompt.signal() {
+                None => response.await,
+                Some(signal) => {
+                    if signal.is_cancelled() {
+                        Err(login_cancelled())
+                    } else {
+                        tokio::select! {
+                            result = response => result,
+                            _ = signal.cancelled() => Err(login_cancelled()),
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// `notifyAuthDialog` (interactive-mode.ts:5261-5272).
+    fn notify(&self, event: AuthEvent) {
+        let mut dialog = lock(&self.dialog);
+        match event {
+            AuthEvent::AuthUrl { url, instructions } => {
+                dialog.show_auth(&url, instructions.as_deref());
+            }
+            AuthEvent::DeviceCode {
+                user_code,
+                verification_uri,
+                ..
+            } => {
+                // Upstream calls showDeviceCode + showWaiting
+                // (interactive-mode.ts:5264-5266); the port folds the
+                // waiting line into the device-code state.
+                dialog.show_device_code(
+                    &user_code,
+                    &verification_uri,
+                    Some("Waiting for authentication..."),
+                );
+            }
+            AuthEvent::Info { message, links } => {
+                dialog.show_info(&message, links.unwrap_or_default(), false);
+            }
+            AuthEvent::Progress { message } => {
+                dialog.show_progress(&message);
+            }
+        }
+    }
+}
+
+/// `showApiKeyLoginDialog` (interactive-mode.ts:5159-5202): mount the
+/// login dialog, run `ModelRuntime::login` through the dialog adapter,
+/// then complete the authentication. Cancellation ("Login cancelled")
+/// restores the editor without an error line (interactive-mode.ts:5198-
+/// 5199).
+fn show_api_key_login_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider) {
+    let previous_model = ui.session().model();
+    let (dialog, interaction) = login_dialog_with_interaction(ui, &provider.id, &provider.name);
+    mount_login_dialog(ui, &dialog);
+
+    let ui = Arc::clone(ui);
+    let provider_id = provider.id.clone();
+    let provider_name = provider.name.clone();
+    spawn_async(async move {
+        let runtime = ui.session().model_runtime().clone();
+        let result = runtime
+            .login(&provider_id, AuthType::ApiKey, &interaction)
+            .await;
+        ui.hide_selector();
+        match result {
+            Ok(_credential) => {
+                // Completion failures surface like login failures (upstream
+                // `showApiKeyLoginDialog`'s catch, interactive-mode.ts:
+                // 5193-5200).
+                if let Err(error) = complete_provider_authentication(
+                    &ui,
+                    &provider_id,
+                    &provider_name,
+                    AuthType::ApiKey,
+                    previous_model,
+                )
+                .await
+                {
+                    if error.message != "Login cancelled" {
+                        ui.show_error(&format!(
+                            "Failed to save API key for {provider_name}: {}",
+                            error.message
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                if error.message != "Login cancelled" {
+                    ui.show_error(&format!(
+                        "Failed to save API key for {provider_name}: {}",
+                        error.message
+                    ));
+                }
+            }
+        }
+    });
+}
+
+/// `showAmbientAuthDialog` (interactive-mode.ts:5136-5157): an
+/// informational dialog for ambient-only providers (no interactive login
+/// upstream). It stays mounted until the user closes it with Esc.
+fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProvider) {
+    let theme = Arc::clone(&lock(&ui.theme));
+    let dialog = Arc::new(Mutex::new(LoginDialogComponent::new(
+        theme,
+        &provider.id,
+        Some(&provider.name),
+        Some(&format!("{} setup", provider.name)),
+    )));
+    {
+        let mut dialog_guard = lock(&dialog);
+        let ui_restore = Arc::clone(ui);
+        dialog_guard.on_cancel = Some(Box::new(move || {
+            // `onComplete` → `restoreEditor`
+            // (interactive-mode.ts:5146-5147, 5184-5189).
+            ui_restore.hide_selector();
+        }));
+        dialog_guard.show_info(
+            &format!(
+                "{} is configured outside pi.",
+                provider.method_name.as_deref().unwrap_or("Authentication")
+            ),
+            vec![],
+            true,
+        );
+    }
+    mount_login_dialog(ui, &dialog);
+}
+
+/// `completeProviderAuthentication` (interactive-mode.ts:5083-5134):
+/// post-login status line, default-model auto-selection when the agent
+/// still runs the "unknown" placeholder, and the footer/editor refresh.
+/// `getAvailable` failures propagate to the caller, which reports them
+/// like any login failure (upstream lets them reject out of
+/// `showApiKeyLoginDialog`'s try).
+async fn complete_provider_authentication(
+    ui: &Arc<InteractiveUi>,
+    provider_id: &str,
+    provider_name: &str,
+    auth_type: AuthType,
+    previous_model: Option<Model>,
+) -> Result<(), ModelsError> {
+    let runtime = ui.session().model_runtime().clone();
+    let _ = runtime.get_available(None).await?;
+    let action_label = match auth_type {
+        AuthType::Oauth => format!("Logged in to {provider_name}"),
+        AuthType::ApiKey => format!("Saved API key for {provider_name}"),
+    };
+
+    let mut selected_model: Option<Model> = None;
+    let mut selection_error: Option<String> = None;
+    // The agent's "unknown" placeholder maps to `None`
+    // (agent_session.rs `model_or_none`), matching upstream
+    // `isUnknownModel` (interactive-mode.ts:220-222, 5095).
+    if previous_model.is_none() {
+        let available_models = runtime.get_available(None).await?;
+        let provider_models: Vec<Model> = available_models
+            .into_iter()
+            .filter(|model| model.provider == provider_id)
+            .collect();
+        match default_model_for_provider(provider_id) {
+            None => {
+                selection_error = Some(format!(
+                    "{action_label}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
+                ));
+            }
+            Some(_default_model_id) if provider_models.is_empty() => {
+                selection_error = Some(format!(
+                    "{action_label}, but no models are available for that provider. Use /model to select a model."
+                ));
+            }
+            Some(default_model_id) => {
+                let candidate = provider_models
+                    .iter()
+                    .find(|model| model.id == default_model_id)
+                    .cloned();
+                match candidate {
+                    None => {
+                        selection_error = Some(format!(
+                            "{action_label}, but its default model \"{default_model_id}\" is not available. Use /model to select a model."
+                        ));
+                    }
+                    Some(model) => match ui.session().set_model(model.clone()).await {
+                        Ok(()) => selected_model = Some(model),
+                        Err(error) => {
+                            selected_model = None;
+                            selection_error = Some(format!(
+                                    "{action_label}, but selecting its default model failed: {error}. Use /model to select a model."
+                                ));
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    ui.update_available_provider_count();
+    Component::invalidate(&mut *lock(&ui.footer));
+    ui.update_editor_border_color();
+
+    // `getAuthPath()` (config.ts:534-536): `{agentDir}/auth.json`.
+    let auth_path = lock(&ui.session().resource_loader())
+        .agent_dir()
+        .join("auth.json");
+    if let Some(selected) = &selected_model {
+        ui.show_status(&format!(
+            "{action_label}. Selected {}. Credentials saved to {}",
+            selected.id,
+            auth_path.display()
+        ));
+        // `maybeWarnAboutAnthropicSubscriptionAuth` /
+        // `checkDaxnutsEasterEgg` (interactive-mode.ts:5124-5125) are
+        // not ported (unassigned hooks).
+    } else {
+        ui.show_status(&format!(
+            "{action_label}. Credentials saved to {}",
+            auth_path.display()
+        ));
+        if let Some(selection_error) = selection_error {
+            ui.show_error(&selection_error);
+        }
+    }
+    Ok(())
+}
+
+/// `showLoginAuthTypeSelector(providerOptions?)` (interactive-mode.ts:
+/// 4935-4991). With provider options (a `/login <ref>` match offering both
+/// methods): pick the method for that provider. Without options (bare
+/// `/login`): the auth-type pre-selector — both labels are always offered
+/// upstream (`availableAuthTypes` defaults to both), and the choice filters
+/// the provider selector.
+fn show_login_auth_type_selector(
+    ui: &Arc<InteractiveUi>,
+    provider_options: Option<Vec<AuthSelectorProvider>>,
+) {
+    // pir collapses `method.loginLabel` (helpers.ts `lazyOAuth`) — no
+    // provider exposes one yet (upstream oauthLoginLabel,
+    // interactive-mode.ts:4937-4939).
+    let subscription_label = "Sign in with an account";
+    let api_key_label = "Sign in with an API key";
+    let mut options: Vec<&str> = Vec::new();
+    let has_oauth = provider_options
+        .as_ref()
+        .map(|providers| providers.iter().any(|p| p.auth_type == AuthType::Oauth))
+        .unwrap_or(true);
+    let has_api_key = provider_options
+        .as_ref()
+        .map(|providers| providers.iter().any(|p| p.auth_type == AuthType::ApiKey))
+        .unwrap_or(true);
+    if has_oauth {
+        options.push(subscription_label);
+    }
+    if has_api_key {
+        options.push(api_key_label);
+    }
+    if options.is_empty() {
+        ui.show_status("No login methods available.");
+        return;
+    }
+    if let Some(providers) = &provider_options {
+        if options.len() == 1 {
+            // Only one method: start it directly (interactive-mode.ts:4957-
+            // 4962).
+            if let Some(provider) = providers.first() {
+                start_provider_login(ui, provider);
+            }
+            return;
+        }
+    }
+
+    let title = match &provider_options {
+        Some(providers) => match providers.first() {
+            Some(provider) => format!("Select authentication method for {}:", provider.name),
+            None => "Select authentication method:".to_owned(),
+        },
+        None => "Select authentication method:".to_owned(),
+    };
+    let options: Vec<String> = options.into_iter().map(str::to_string).collect();
+    let select_ui = Arc::clone(ui);
+    let selector = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
+        Arc::clone(&lock(&ui.theme)),
+        Some(title),
+        options.clone(),
+        Box::new(move |option: Option<String>| {
+            select_ui.hide_selector();
+            let Some(option) = option else {
+                return;
+            };
+            let auth_type = if option == subscription_label {
+                AuthType::Oauth
+            } else {
+                AuthType::ApiKey
+            };
+            match &provider_options {
+                Some(providers) => {
+                    if let Some(provider) = providers.iter().find(|p| p.auth_type == auth_type) {
+                        start_provider_login(&select_ui, provider);
+                    }
+                }
+                // Bare `/login`: filter the provider list by the chosen
+                // method (interactive-mode.ts:4983-4985).
+                None => InteractiveUi::show_login_selector(&select_ui, Some(auth_type), None),
+            }
+        }),
+        Box::new({
+            let ui = Arc::clone(ui);
+            move || {
+                ui.hide_selector();
+                ui.render_handle.request_render();
+            }
+        }),
+        None,
+    )));
+
+    let entry = shared_component_from_boxed(Box::new(FocusableShell {
+        inner: selector,
+        focused: false,
+    }));
+    ui.show_selector(entry);
+}
 impl InteractiveUi {
     /// `showSettingsSelector` (interactive-mode.ts:4135-4319): mount the
     /// settings selector; `onChange` maps [`SettingsChange`] back to the
@@ -842,17 +1381,33 @@ impl InteractiveUi {
     }
 
     /// `showLoginProviderSelector` (interactive-mode.ts:4993-5034): the login
-    /// provider list. The actual login flows are T13 hooks.
-    pub(crate) fn show_login_selector(ui: &Arc<Self>) {
+    /// provider list. Selecting a row dispatches through
+    /// `startProviderLogin` — the api-key dialog flow, the ambient-info
+    /// dialog, or the OAuth stub. `initial_search_input` mirrors the upstream
+    /// `initialSearchInput` (pre-filled fuzzy search, e.g. the unmatched
+    /// `/login <ref>` fallback).
+    /// `showLoginProviderSelector(authType?, initialSearchInput?)`
+    /// (interactive-mode.ts:4993-5034): the provider list, optionally
+    /// filtered to one auth method (the bare `/login` pre-selector path).
+    pub(crate) fn show_login_selector(
+        ui: &Arc<Self>,
+        auth_type: Option<AuthType>,
+        initial_search_input: Option<String>,
+    ) {
         let providers: Vec<AuthSelectorProvider> = ui
             .session()
             .model_runtime()
             .get_providers()
             .iter()
             .flat_map(|provider| AuthSelectorProvider::from_provider(provider, None))
+            .filter(|provider| auth_type.is_none_or(|kind| provider.auth_type == kind))
             .collect();
         if providers.is_empty() {
-            ui.show_status("No login providers available.");
+            ui.show_status(match auth_type {
+                Some(AuthType::Oauth) => "No subscription providers available.",
+                Some(AuthType::ApiKey) => "No API key providers available.",
+                None => "No login providers available.",
+            });
             return;
         }
 
@@ -861,23 +1416,27 @@ impl InteractiveUi {
             Arc::clone(&lock(&ui.theme)),
             AuthSelectorMode::Login,
             providers,
-            Box::new(move |provider_id: &str| {
-                let provider_id = provider_id.to_string();
+            Box::new(move |provider: &AuthSelectorProvider| {
+                // `done()` then `startProviderLogin`
+                // (interactive-mode.ts:5010-5020).
                 select_ui.hide_selector();
-                // TODO(T13): the OAuth / API-key login flow
-                // (interactive-mode.ts:4925-4933) is not ported yet.
-                select_ui.show_status(&format!(
-                    "Provider login is not available yet (T13): {provider_id}"
-                ));
+                let provider = provider.clone();
+                start_provider_login(&select_ui, &provider);
             }),
             Box::new({
                 let ui = Arc::clone(ui);
                 move || {
                     ui.hide_selector();
-                    ui.render_handle.request_render();
+                    // Cancel from a method-filtered list returns to the
+                    // auth-type pre-selector (interactive-mode.ts:5024-5029).
+                    if auth_type.is_some() {
+                        show_login_auth_type_selector(&ui, None);
+                    } else {
+                        ui.render_handle.request_render();
+                    }
                 }
             }),
-            None,
+            initial_search_input,
         )));
 
         let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
@@ -885,7 +1444,8 @@ impl InteractiveUi {
     }
 
     /// `showOAuthSelector("logout")` (interactive-mode.ts:5036-5081): the
-    /// stored-credential list. Removal is a T13 hook.
+    /// stored-credential list. Selection removes the credential through
+    /// `ModelRuntime::logout` (interactive-mode.ts:5063-5068).
     pub(crate) async fn show_logout_selector(ui: &Arc<Self>) {
         let runtime = ui.session().model_runtime().clone();
         let credentials = runtime.list_credentials().await.unwrap_or_default();
@@ -908,6 +1468,9 @@ impl InteractiveUi {
                         .unwrap_or_else(|| credential.provider_id.clone()),
                     auth_type,
                     method_name: None,
+                    // Logout rows do not run a login flow; the flag is
+                    // unused here.
+                    method_login: false,
                     status: Some(AuthCheck {
                         source: Some("stored credential".to_string()),
                         kind,
@@ -922,13 +1485,30 @@ impl InteractiveUi {
             Arc::clone(&lock(&ui.theme)),
             AuthSelectorMode::Logout,
             providers,
-            Box::new(move |provider_id: &str| {
-                let provider_id = provider_id.to_string();
+            Box::new(move |provider: &AuthSelectorProvider| {
+                // `done()` first, then the async removal
+                // (interactive-mode.ts:5054-5072).
                 select_ui.hide_selector();
-                // TODO(T13): modelRuntime.logout (interactive-mode.ts:5063).
-                select_ui.show_status(&format!(
-                    "Provider logout is not available yet (T13): {provider_id}"
-                ));
+                let provider = provider.clone();
+                let ui = Arc::clone(&select_ui);
+                spawn_async(async move {
+                    let runtime = ui.session().model_runtime().clone();
+                    match runtime.logout(&provider.id).await {
+                        Ok(()) => {
+                            ui.update_available_provider_count();
+                            let message = if provider.auth_type == AuthType::Oauth {
+                                format!("Logged out of {}", provider.name)
+                            } else {
+                                format!(
+                                    "Removed stored API key for {}. Environment variables and models.json config are unchanged.",
+                                    provider.name
+                                )
+                            };
+                            ui.show_status(&message);
+                        }
+                        Err(error) => ui.show_error(&format!("Logout failed: {}", error.message)),
+                    }
+                });
             }),
             Box::new({
                 let ui = Arc::clone(ui);
@@ -942,6 +1522,97 @@ impl InteractiveUi {
 
         let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
         ui.show_selector(entry);
+    }
+
+    // =========================================================================
+    // Built-in extension commands (extensions/index.ts builtInExtensions)
+    // =========================================================================
+
+    /// The llama.cpp extension's `/llama` handler (extensions/llama/index.ts
+    /// `registerCommand("llama", …)`): mount the manager view in place of the
+    /// editor and run the flow on a spawned task. `showLlamaUi`'s `done()`
+    /// becomes `hide_selector` (ui.ts:480-492); flow errors notify like the
+    /// upstream error boundary.
+    pub(crate) fn handle_llama_command(ui: &Arc<Self>) {
+        let (view, mut view_ui) =
+            new_llama_view(Arc::clone(&lock(&ui.theme)), ui.render_handle.clone());
+        ui.show_selector(shared_component_from_boxed(Box::new(FocusableRegion(
+            Arc::new(Mutex::new(view)),
+        ))));
+        let ui = Arc::clone(ui);
+        spawn_async(async move {
+            let host = InteractiveLlamaHost {
+                ui: Arc::clone(&ui),
+            };
+            // `findHuggingFaceToken()` (huggingface.ts:46-61) — process env +
+            // the user's home directory.
+            let env = crate::extensions::llama::huggingface::process_env();
+            let home = crate::extensions::llama::huggingface::default_home_dir();
+            let token = crate::extensions::llama::find_hugging_face_token(&env, &home).await;
+            let hugging_face = crate::extensions::llama::HuggingFaceClient::new(
+                token,
+                crate::extensions::llama::DEFAULT_HUGGING_FACE_URL,
+            );
+            let result = crate::extensions::llama::run_llama_manager(
+                &host,
+                &crate::extensions::llama::shared_llama_provider(),
+                &mut view_ui,
+                hugging_face,
+            )
+            .await;
+            ui.hide_selector();
+            if let Err(error) = result {
+                ui.show_error(&error.message);
+            }
+            ui.render_handle.request_render();
+        });
+    }
+
+    // =========================================================================
+    // Login flows (interactive-mode.ts:4888-5312)
+    // =========================================================================
+
+    /// `handleLoginCommand` (interactive-mode.ts:4901-4923): bare `/login`
+    /// shows the auth-type pre-selector; a provider ref resolves exact
+    /// (case-insensitive id/name) matches, single-hit starts the flow
+    /// directly, a dual-method provider asks for the method, and a miss
+    /// opens the provider selector with the ref pre-filled.
+    pub(crate) async fn handle_login_command(&self, provider_ref: Option<&str>) {
+        let Some(ui) = self.upgrade_self() else {
+            return;
+        };
+        let runtime = ui.session().model_runtime().clone();
+        // Upstream awaits getAvailable() first (interactive-mode.ts:4902);
+        // errors surface through the later flow stages.
+        let _ = runtime.get_available(None).await;
+
+        let Some(provider_ref) = provider_ref.map(str::trim).filter(|r| !r.is_empty()) else {
+            // Bare `/login`: the auth-type pre-selector first
+            // (interactive-mode.ts:4903-4905).
+            show_login_auth_type_selector(&ui, None);
+            return;
+        };
+
+        let matches = find_login_provider_options(&runtime, provider_ref);
+        if matches.len() == 1 {
+            start_provider_login(&ui, &matches[0]);
+            return;
+        }
+        if matches.len() > 1 {
+            let mut ids = HashSet::new();
+            for provider in &matches {
+                ids.insert(provider.id.as_str());
+            }
+            if ids.len() == 1 {
+                // One provider offering both auth methods
+                // (interactive-mode.ts:4914-4919): pick the method.
+                show_login_auth_type_selector(&ui, Some(matches.clone()));
+                return;
+            }
+        }
+        // No match / ambiguous ref: the provider list with the reference
+        // pre-filled into the search (interactive-mode.ts:4922).
+        Self::show_login_selector(&ui, None, Some(provider_ref.to_string()));
     }
 
     // =========================================================================
@@ -1844,7 +2515,7 @@ mod tests {
     #[tokio::test]
     async fn login_selector_mounts_with_providers() {
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
-        InteractiveUi::show_login_selector(&mode.ui_state);
+        InteractiveUi::show_login_selector(&mode.ui_state, None, None);
         assert!(
             selector_mounted(&mode.ui_state),
             "login selector mounted; chat: {}",

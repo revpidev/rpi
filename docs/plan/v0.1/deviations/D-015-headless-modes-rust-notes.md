@@ -90,3 +90,13 @@ CancellationToken 在 in-flight 时仍生效；`is_context_overflow` 对 0 窗�
 - **回写位置**：`docs/02-design.md` §6.1（启动管线落地注记 + 手写解析器）、§6.3（list/listAll 提前 T10）、§6.6（Modes 落地注记）、§12（映射表 main.ts/sdk/model-runtime/modes/rpc-entry 行）
 - **回写日期**：2026-08-04
 - **ADR**：不需要
+
+## 补记（2026-08-07，T14 终审）
+
+第 4 项「docs 路径 = 可执行文件目录」的另一处后果：`auth_guidance.rs` 的
+`get_provider_login_help()` 与上游 `auth-guidance.ts` 同构，**无条件**将
+`{packageDir}/docs/providers.md`、`models.md` 两个路径拼进登录帮助文案（不像
+system prompt 的 docs 段那样探测存在性、缺失整段省略）。上游 npm 包随捆 docs/
+目录故该路径恒有效；pir 单文件发布形态下 exe 旁无 docs/，打印的路径无效。
+判定：实现细节偏离，同一根因（无捆绑 package docs）已由本文件第 4 项登记；
+不影响功能（仅提示文案中的路径不可直接打开），不单列新偏离条目。

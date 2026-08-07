@@ -118,6 +118,10 @@ impl ApiKeyAuth for CloudflareAuth {
         "Cloudflare API key"
     }
 
+    fn supports_login(&self) -> bool {
+        true
+    }
+
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,

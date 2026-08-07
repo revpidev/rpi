@@ -74,6 +74,16 @@ impl AuthPrompt {
             signal: None,
         }
     }
+
+    /// The per-prompt cancellation signal, if any.
+    pub fn signal(&self) -> Option<CancellationToken> {
+        match self {
+            AuthPrompt::Text { signal, .. }
+            | AuthPrompt::Secret { signal, .. }
+            | AuthPrompt::Select { signal, .. }
+            | AuthPrompt::ManualCode { signal, .. } => signal.clone(),
+        }
+    }
 }
 
 /// `AuthInfoLink`.

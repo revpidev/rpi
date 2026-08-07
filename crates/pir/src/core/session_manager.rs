@@ -1544,6 +1544,14 @@ impl SessionManager {
             })
     }
 
+    /// Raw JSON header object — upstream `getHeader()` returns the parsed
+    /// object as-is (a type assertion, not a re-serialization), so unknown
+    /// extension fields survive into the HTML export; the typed view above
+    /// drops them (T14 review fix).
+    pub fn get_header_raw(&self) -> Option<&Value> {
+        self.records.iter().find(|r| r.is_header()).map(|r| r.raw())
+    }
+
     /// `getEntries` — all entries, header excluded.
     pub fn get_entries(&self) -> Vec<StoredEntry> {
         self.records

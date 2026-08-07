@@ -12,11 +12,11 @@
 //!   configured auth method (a provider offering both methods appears twice)
 //!   and the entries are sorted by name (byte order; upstream
 //!   `localeCompare`).
-//! - `on_select` receives only the provider id (upstream passes
-//!   `(providerId, authType)`, oauth-selector.ts:202). When a provider offers
-//!   both methods its two rows share the id, so the integration layer cannot
-//!   tell which row was chosen — the T13 wiring must extend the callback or
-//!   filter the list per method.
+//! - `on_select` receives the full selected [`AuthSelectorProvider`] (the
+//!   row carries `auth_type` / `method_name`); upstream passes
+//!   `(providerId, authType)`, oauth-selector.ts:202. The T13 login wiring
+//!   uses the row to pick the login flow (api-key dialog vs ambient info vs
+//!   the OAuth stub).
 //! - `status` is injected per row; the component never queries the runtime
 //!   (upstream reads `getProviderAuthStatus` while building the list,
 //!   interactive-mode.ts:4848-4853). Statuses come from `check_auth` /
@@ -44,13 +44,17 @@ use crate::core::themes::Theme;
 use crate::modes::interactive::components::dynamic_border::DynamicBorder;
 
 /// `AuthSelectorProvider` (oauth-selector.ts:14-20): one selectable row.
-/// `method` is collapsed to its display name.
+/// `method` is collapsed to its display name plus the login capability.
 #[derive(Debug, Clone)]
 pub struct AuthSelectorProvider {
     pub id: String,
     pub name: String,
     pub auth_type: AuthType,
     pub method_name: Option<String>,
+    /// Whether the auth method exposes an interactive `login` (upstream
+    /// `method?.login`, interactive-mode.ts:4928). OAuth methods always have
+    /// one upstream; ambient-only api-key methods do not.
+    pub method_login: bool,
     pub status: Option<AuthCheck>,
 }
 
@@ -68,6 +72,7 @@ impl AuthSelectorProvider {
                 name: provider.name().to_string(),
                 auth_type: AuthType::Oauth,
                 method_name: auth.oauth.as_ref().map(|method| method.name().to_string()),
+                method_login: true,
                 status: status.clone(),
             });
         }
@@ -80,6 +85,10 @@ impl AuthSelectorProvider {
                     .api_key
                     .as_ref()
                     .map(|method| method.name().to_string()),
+                method_login: auth
+                    .api_key
+                    .as_ref()
+                    .is_some_and(|method| method.supports_login()),
                 status,
             });
         }
@@ -158,8 +167,11 @@ pub struct OAuthSelectorComponent {
     // positioning (oauth-selector.ts:33-40).
     focused: bool,
 
-    /// `onSelectCallback` — called with the selected provider id.
-    on_select: Box<dyn FnMut(&str) + Send>,
+    /// `onSelectCallback` — called with the selected provider row. The row
+    /// carries `auth_type` / `method_name`, which the T13 login wiring needs
+    /// to pick the flow (upstream passes `(providerId, authType)`,
+    /// oauth-selector.ts:202).
+    on_select: Box<dyn FnMut(&AuthSelectorProvider) + Send>,
     /// `onCancelCallback`.
     on_cancel: Box<dyn FnMut() + Send>,
 }
@@ -170,7 +182,7 @@ impl OAuthSelectorComponent {
         theme: Arc<Theme>,
         mode: AuthSelectorMode,
         providers: Vec<AuthSelectorProvider>,
-        on_select: Box<dyn FnMut(&str) + Send>,
+        on_select: Box<dyn FnMut(&AuthSelectorProvider) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         initial_search_input: Option<String>,
     ) -> Self {
@@ -380,8 +392,8 @@ impl Component for OAuthSelectorComponent {
         // Enter (oauth-selector.ts:198-203)
         else if kb.matches_id(data, "tui.select.confirm") {
             if let Some(selected) = self.filtered_providers.get(self.selected_index) {
-                let id = selected.id.clone();
-                (self.on_select)(&id);
+                let selected = selected.clone();
+                (self.on_select)(&selected);
             }
         }
         // Escape or Ctrl+C (oauth-selector.ts:205-207)
@@ -433,6 +445,7 @@ mod tests {
             name: name.to_string(),
             auth_type,
             method_name: None,
+            method_login: auth_type == AuthType::Oauth,
             status,
         }
     }
@@ -456,7 +469,7 @@ mod tests {
                 provider("anthropic", "Anthropic", AuthType::Oauth, None),
                 provider("openai", "OpenAI", AuthType::ApiKey, None),
             ],
-            Box::new(move |id| selected_cb.lock().unwrap().push(id.to_string())),
+            Box::new(move |provider| selected_cb.lock().unwrap().push(provider.id.clone())),
             Box::new(move || *cancelled_cb.lock().unwrap() += 1),
             None,
         );
@@ -589,6 +602,7 @@ mod tests {
             name: "X".into(),
             auth_type: AuthType::ApiKey,
             method_name: None,
+            method_login: false,
             status: Some(AuthCheck {
                 kind: AuthType::ApiKey,
                 source: source.map(str::to_string),
@@ -611,6 +625,7 @@ mod tests {
             name: "Y".into(),
             auth_type: AuthType::Oauth,
             method_name: None,
+            method_login: true,
             status: Some(AuthCheck {
                 kind: AuthType::ApiKey,
                 source: None,

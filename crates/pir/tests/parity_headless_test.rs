@@ -628,6 +628,7 @@ async fn build_runtime(
             agent_dir,
             session_manager,
             session_start_event: None,
+            project_trust_context: None,
         },
     )
     .await

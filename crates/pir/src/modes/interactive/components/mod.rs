@@ -21,6 +21,7 @@ pub mod extension_input;
 pub mod extension_selector;
 pub mod first_time_setup;
 pub mod keybinding_hints;
+pub mod llama_view;
 pub mod login_dialog;
 pub mod model_search;
 pub mod model_selector;

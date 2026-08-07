@@ -44,10 +44,12 @@
 //! Intentional differences:
 //! - `bindExtensions` is called with `mode: None` (upstream binds via
 //!   `bindCurrentSessionExtensions` with no explicit mode for interactive).
-//! - Startup notices (changelog asset — T15), version/package-update checks
-//!   and telemetry (T14), and the tmux keyboard checks (unassigned) are not
-//!   ported; the `loadedResourcesContainer` shows the merged diagnostics
-//!   block only (see `show_loaded_resources`).
+//! - Startup notices (changelog asset — T15) and the package-update check
+//!   (npm-registry probing, not a product endpoint) are not ported; the
+//!   startup version check and install telemetry landed with T14-W6a
+//!   (ADR-0002 §8); the tmux keyboard checks (unassigned) are not ported;
+//!   the `loadedResourcesContainer` shows the merged diagnostics block only
+//!   (see `show_loaded_resources`).
 //! - `setRebindSession`/`setBeforeSessionInvalidate` runtime hooks stay
 //!   `None`: session switching rebinds the UI explicitly via
 //!   `InteractiveMode::rebind_session_ui` (called from each command handler)
@@ -75,7 +77,7 @@ use pir_ai::types::{
     AssistantContent, ImageContent, ModelThinkingLevel, StopReason, ToolResultContent,
 };
 use pir_tui::components::editor::{EditorOptions, EditorTheme};
-use pir_tui::components::markdown::MarkdownTheme;
+use pir_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use pir_tui::components::select_list::SelectListTheme;
 use pir_tui::components::spacer::Spacer;
 use pir_tui::components::text::Text;
@@ -107,10 +109,10 @@ use crate::modes::interactive::components::status_indicator::{
 use crate::modes::interactive::components::tree_selector::TreeSelectorComponent;
 use crate::modes::interactive::components::user_message_selector::UserMessageSelectorComponent;
 use crate::modes::interactive::components::{
-    tool_execution::ToolResultState, BashExecutionComponent, BranchSummaryMessageComponent,
-    CompactionSummaryMessageComponent, CustomEntryComponent, CustomMessageComponent,
-    SkillInvocationMessageComponent, ToolExecutionComponent, ToolExecutionOptions,
-    ToolResultContentLoose, UserMessageComponent,
+    dynamic_border::DynamicBorder, tool_execution::ToolResultState, BashExecutionComponent,
+    BranchSummaryMessageComponent, CompactionSummaryMessageComponent, CustomEntryComponent,
+    CustomMessageComponent, SkillInvocationMessageComponent, ToolExecutionComponent,
+    ToolExecutionOptions, ToolResultContentLoose, UserMessageComponent,
 };
 use crate::modes::interactive::custom_editor::{CustomEditor, CustomEditorRegion, EscapeHandler};
 use crate::modes::interactive::footer::{FooterComponent, FooterDataProvider};
@@ -415,6 +417,15 @@ pub(crate) enum UiCommand {
     /// footer (upstream `onBranchChange` subscriber,
     /// interactive-mode.ts:807-809).
     GitBranchChanged,
+    /// Mode-internal: the startup version check found a newer release
+    /// (interactive-mode.ts:843-847 → `showNewVersionNotification`).
+    NewVersionAvailable(crate::core::version_check::LatestPirRelease),
+    /// `/share`: the loader's `on_abort` (interactive-mode.ts:5549-5554) —
+    /// kill gh, restore the editor, clean up, "Share cancelled".
+    ShareAbort,
+    /// `/share`: the gist worker finished
+    /// (interactive-mode.ts:5575-5602).
+    ShareCompleted(crate::core::share::GistCreateOutcome),
     /// Mode-internal: Alt+Up dequeue (deferred — restore touches the editor).
     Dequeue,
     /// Mode-internal: clipboard paste (deferred — insertion touches the
@@ -982,6 +993,27 @@ pub(crate) struct InteractiveUi {
     /// `flush_pending_bash_components`.
     #[allow(dead_code)] // read only by flush + tests
     pending_bash_components: Mutex<Vec<(usize, Arc<Mutex<BashExecutionComponent>>)>>,
+    /// Injectable `gh` runner for `/share` (core/share.rs; the W2
+    /// `PackageCommandRunner` pattern). `SystemShareRunner` in production;
+    /// tests swap a mock via [`InteractiveUi::set_share_runner`].
+    pub(crate) share_runner: Mutex<Arc<dyn crate::core::share::ShareRunner>>,
+    /// Injectable install-telemetry transport (core/telemetry.rs; the
+    /// `PackageCommandRunner` pattern). `ReqwestReportInstallTransport` in
+    /// production; tests swap a no-op via
+    /// [`InteractiveUi::set_report_install_transport`] so `cargo test` never
+    /// touches product endpoints (T14 review M1).
+    pub(crate) report_install_transport:
+        Mutex<Arc<dyn crate::core::telemetry::ReportInstallTransport>>,
+    /// Injectable version-check transport (core/version_check.rs).
+    /// `ReqwestLatestVersionTransport` in production; tests swap a no-op via
+    /// [`InteractiveUi::set_latest_version_transport`] (same M1 discipline).
+    pub(crate) latest_version_transport:
+        Mutex<Arc<dyn crate::core::version_check::LatestVersionTransport>>,
+    /// In-flight `/share` state between the loader swap and the gist
+    /// worker's completion (interactive-mode.ts:5540-5560). `None` once the
+    /// drain has settled the share (success, failure or abort) — the
+    /// single-`take` makes a late completion/abort double-queue a no-op.
+    pub(crate) share_state: Mutex<Option<ShareState>>,
     /// `lastSigintTime` / `lastEscapeTime` (interactive-mode.ts:354-355).
     last_sigint_time: AtomicU64,
     last_escape_time: AtomicU64,
@@ -1033,14 +1065,55 @@ struct StatusTextTrack {
     handle: Arc<Mutex<Text>>,
 }
 
+/// In-flight `/share` (gist) state — the loader's cancel flag and the temp
+/// HTML file to clean up (interactive-mode.ts:5540-5560).
+pub(crate) struct ShareState {
+    /// Set by the loader's `on_abort`; the gist worker's runner polls it and
+    /// kills `gh` (upstream `proc.kill()`, interactive-mode.ts:5551).
+    pub(crate) cancelled: Arc<AtomicBool>,
+    /// `{tmpdir}/pir-share-{pid}-{nanos}/session.html` — basename kept from
+    /// upstream `path.join(os.tmpdir(), "session.html")`
+    /// (interactive-mode.ts:5526); the unique subdirectory avoids two
+    /// concurrent instances clobbering each other's export. Removed via
+    /// [`crate::core::share::cleanup_share_tmp_file`].
+    pub(crate) tmp_file: std::path::PathBuf,
+}
+
 impl InteractiveUi {
     pub(crate) fn push(&self, command: UiCommand) {
         lock(&self.event_queue).push_back(command);
     }
 
+    /// Swap the `/share` gh runner (tests inject a mock; production keeps
+    /// the `SystemShareRunner` installed at init).
+    #[allow(dead_code)] // test hook (lib builds never swap the runner)
+    pub(crate) fn set_share_runner(&self, runner: Arc<dyn crate::core::share::ShareRunner>) {
+        *lock(&self.share_runner) = runner;
+    }
+
+    /// Swap the install-telemetry transport (tests inject a no-op; T14
+    /// review M1 — unit tests must never reach product endpoints).
+    #[allow(dead_code)] // test hook (lib builds never swap the transport)
+    pub(crate) fn set_report_install_transport(
+        &self,
+        transport: Arc<dyn crate::core::telemetry::ReportInstallTransport>,
+    ) {
+        *lock(&self.report_install_transport) = transport;
+    }
+
+    /// Swap the version-check transport (tests inject a no-op; T14 review
+    /// M1).
+    #[allow(dead_code)] // test hook (lib builds never swap the transport)
+    pub(crate) fn set_latest_version_transport(
+        &self,
+        transport: Arc<dyn crate::core::version_check::LatestVersionTransport>,
+    ) {
+        *lock(&self.latest_version_transport) = transport;
+    }
+
     /// The live `Arc<InteractiveUi>` for callbacks that need one; `None`
     /// once the mode is dropped.
-    fn upgrade_self(&self) -> Option<Arc<Self>> {
+    pub(crate) fn upgrade_self(&self) -> Option<Arc<Self>> {
         lock(&self.self_arc)
             .as_ref()
             .and_then(|weak| weak.upgrade())
@@ -1601,6 +1674,54 @@ impl InteractiveUi {
                 Component::invalidate(&mut *lock(&self.footer));
                 self.render_handle.request_render();
             }
+            UiCommand::NewVersionAvailable(release) => {
+                // `checkForNewPiVersion(...).then(...)` continuation
+                // (interactive-mode.ts:843-847), routed through the drain
+                // like every other async result.
+                self.show_new_version_notification(&release);
+            }
+            UiCommand::ShareAbort => {
+                // `loader.onAbort` (interactive-mode.ts:5549-5554): kill gh
+                // (the runner polls the flag), restore the editor, clean up.
+                // Ignored when the share already settled (single `take`).
+                let Some(state) = lock(&self.share_state).take() else {
+                    return;
+                };
+                state.cancelled.store(true, Ordering::Relaxed);
+                self.hide_selector();
+                crate::core::share::cleanup_share_tmp_file(&state.tmp_file);
+                self.show_status("Share cancelled");
+            }
+            UiCommand::ShareCompleted(outcome) => {
+                // The `close` handler (interactive-mode.ts:5575-5602).
+                // Ignored when the share already settled (abort won).
+                let Some(state) = lock(&self.share_state).take() else {
+                    return;
+                };
+                if state.cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+                self.hide_selector();
+                crate::core::share::cleanup_share_tmp_file(&state.tmp_file);
+                if outcome.code != Some(0) {
+                    let trimmed = outcome.stderr.trim();
+                    let detail = if trimmed.is_empty() {
+                        "Unknown error"
+                    } else {
+                        trimmed
+                    };
+                    self.show_error(&format!("Failed to create gist: {detail}"));
+                    return;
+                }
+                // `gh` prints `https://gist.github.com/<user>/<gistId>`.
+                let gist_url = outcome.stdout.trim();
+                let Some(gist_id) = crate::core::share::parse_gist_id(gist_url) else {
+                    self.show_error("Failed to parse gist ID from gh output");
+                    return;
+                };
+                let preview_url = crate::config::get_share_viewer_url(gist_id);
+                self.show_status(&format!("Share URL: {preview_url}\nGist: {gist_url}"));
+            }
         }
     }
 
@@ -2098,6 +2219,74 @@ impl InteractiveUi {
             0,
             None,
         )));
+        self.render_handle.request_render();
+    }
+
+    /// `showNewVersionNotification` (interactive-mode.ts:3885-3912): bordered
+    /// "Update Available" block with the run-prompt line, an optional
+    /// Markdown note, and the changelog link (OSC 8 when the terminal
+    /// supports hyperlinks).
+    pub(crate) fn show_new_version_notification(
+        &self,
+        release: &crate::core::version_check::LatestPirRelease,
+    ) {
+        let theme = Arc::clone(&lock(&self.theme));
+        let warning_border = |theme: &Arc<crate::core::themes::Theme>| {
+            let theme = Arc::clone(theme);
+            Box::new(move |text: &str| theme.fg("warning", text))
+                as pir_tui::components::text::ColorFn
+        };
+        let action = theme.fg("accent", &format!("{APP_NAME} update"));
+        let update_instruction = theme.fg(
+            "muted",
+            &format!("New version {} is available. Run ", release.version),
+        ) + &action;
+        let changelog_url = "https://pi.dev/changelog";
+        let styled_url = theme.fg("accent", changelog_url);
+        let changelog_link = if pir_tui::terminal_image::get_capabilities().hyperlinks {
+            pir_tui::terminal_image::hyperlink(&styled_url, changelog_url)
+        } else {
+            styled_url
+        };
+        let changelog_line = theme.fg("muted", "Changelog: ") + &changelog_link;
+        let heading = crate::core::themes::Theme::bold(&theme.fg("warning", "Update Available"));
+        let note = release
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|note| !note.is_empty())
+            .map(str::to_owned);
+
+        self.add_chat_child(Box::new(Spacer::new(1)));
+        self.add_chat_child(Box::new(DynamicBorder::new(warning_border(&theme))));
+        self.add_chat_child(Box::new(Text::new(
+            format!("{heading}\n{update_instruction}"),
+            1,
+            0,
+            None,
+        )));
+        if let Some(note) = note {
+            let muted = {
+                let theme = Arc::clone(&theme);
+                Box::new(move |text: &str| theme.fg("muted", text))
+                    as pir_tui::components::text::ColorFn
+            };
+            self.add_chat_child(Box::new(Spacer::new(1)));
+            self.add_chat_child(Box::new(Markdown::new(
+                note,
+                1,
+                0,
+                Arc::clone(&lock(&self.markdown_theme)),
+                Some(DefaultTextStyle {
+                    color: Some(muted),
+                    ..Default::default()
+                }),
+                None,
+            )));
+            self.add_chat_child(Box::new(Spacer::new(1)));
+        }
+        self.add_chat_child(Box::new(Text::new(changelog_line, 1, 0, None)));
+        self.add_chat_child(Box::new(DynamicBorder::new(warning_border(&theme))));
         self.render_handle.request_render();
     }
 
@@ -3017,6 +3206,14 @@ impl InteractiveMode {
             is_bash_mode: Mutex::new(false),
             bash_component: Mutex::new(None),
             pending_bash_components: Mutex::new(Vec::new()),
+            share_runner: Mutex::new(Arc::new(crate::core::share::SystemShareRunner)),
+            report_install_transport: Mutex::new(Arc::new(
+                crate::core::telemetry::ReqwestReportInstallTransport,
+            )),
+            latest_version_transport: Mutex::new(Arc::new(
+                crate::core::version_check::ReqwestLatestVersionTransport,
+            )),
+            share_state: Mutex::new(None),
             last_sigint_time: AtomicU64::new(0),
             last_escape_time: AtomicU64::new(0),
             auto_compaction_escape_handler: Mutex::new(None),
@@ -3083,6 +3280,30 @@ impl InteractiveMode {
                 on_error: None,
             })
             .await;
+
+        // Install telemetry (interactive-mode.ts:685 →
+        // `getChangelogForDisplay` 991-1014 → `reportInstallTelemetry`
+        // 1017-1036): a fresh install or version change records
+        // `lastChangelogVersion` and fires the anonymous ping (gated by
+        // offline / `enableInstallTelemetry` / the endpoint, ADR-0002 §8).
+        // The changelog asset itself is T15; the ping is fire-and-forget.
+        let has_messages = self.session.has_messages();
+        let report = self.session.settings_manager(|settings| {
+            crate::core::telemetry::prepare_install_report(settings, VERSION, has_messages)
+        });
+        if let Some((enabled, endpoint)) = report {
+            let transport = lock(&self.ui_state.report_install_transport).clone();
+            tokio::spawn(async move {
+                crate::core::telemetry::report_install(
+                    VERSION,
+                    enabled,
+                    endpoint.as_deref(),
+                    crate::core::environment::is_offline(),
+                    &*transport,
+                )
+                .await;
+            });
+        }
 
         // Assemble the UI tree (interactive-mode.ts:707-719): the container
         // chain order IS the layout — header → loaded resources → chat →
@@ -3204,6 +3425,30 @@ impl InteractiveMode {
     /// from a dedicated thread while this loop sequences prompts.
     pub async fn run(&mut self) {
         self.init().await;
+
+        // Start the version check asynchronously (interactive-mode.ts:
+        // 842-847): the resolved endpoint (ADR-0002 §8) already applies the
+        // skip/offline/disabled gates — `None` means no probe at all.
+        let probe_url = self.session.settings_manager(|settings| {
+            crate::core::version_check::startup_version_check_url(
+                settings.get_version_check_url().as_deref(),
+            )
+        });
+        if let Some(probe_url) = probe_url {
+            let ui_state = Arc::clone(&self.ui_state);
+            let transport = lock(&self.ui_state.latest_version_transport).clone();
+            tokio::spawn(async move {
+                if let Some(release) = crate::core::version_check::check_for_new_pir_release(
+                    VERSION,
+                    &*transport,
+                    Some(&probe_url),
+                )
+                .await
+                {
+                    ui_state.push(UiCommand::NewVersionAvailable(release));
+                }
+            });
+        }
 
         let driver_ui = self.ui.clone();
         let driver_shared = Arc::clone(&self.ui_state);
@@ -3515,7 +3760,16 @@ impl InteractiveMode {
                 Some(())
             }
             "login" => {
-                InteractiveUi::show_login_selector(&self.ui_state);
+                // `/login` or `/login <ref>` (interactive-mode.ts:2736-2741):
+                // a ref goes through `handleLoginCommand` — exact provider
+                // match starts the flow directly; otherwise the provider
+                // list opens with the ref pre-filled into the search.
+                let provider_ref = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+                ui.handle_login_command(provider_ref.as_deref()).await;
                 Some(())
             }
             "logout" => {
@@ -3552,7 +3806,20 @@ impl InteractiveMode {
                 ui.handle_debug_command();
                 Some(())
             }
-            _ => None,
+            _ => {
+                // Built-in (hidden) extension commands — the llama.cpp
+                // extension's `/llama` (extensions/index.ts
+                // `builtInExtensions`). Upstream these dispatch through
+                // `session.prompt`'s extension-command path (a T15 hook);
+                // pir routes them here (D-047).
+                match crate::extensions::built_in_extension_command(name) {
+                    Some(command) if command.name == "llama" => {
+                        InteractiveUi::handle_llama_command(&self.ui_state);
+                        Some(())
+                    }
+                    _ => None,
+                }
+            }
         };
         handled.is_some()
     }
@@ -3808,7 +4075,7 @@ mod tests {
 
     use super::*;
     use crate::modes::interactive::test_support::{
-        build_test_session, TempDir, TestSession, TestTerminal,
+        build_test_session, install_noop_product_transports, TempDir, TestSession, TestTerminal,
     };
 
     // ---------------------------------------------------------------------
@@ -3886,11 +4153,69 @@ mod tests {
             InteractiveModeOptions::default(),
             Box::new(TestTerminal::clone(&terminal)),
         );
+        // M1 (T14 review): unit tests must never reach product endpoints —
+        // swap the production transports for no-op ones before `init()`.
+        install_noop_product_transports(&mode);
         (mode, terminal, harness.session)
     }
 
     fn chat_children(ui: &InteractiveUi) -> usize {
         lock(&ui.chat_container).children.len()
+    }
+
+    /// M1 anchor: `init()` (install telemetry) and `run()` (startup version
+    /// check) must go through the injectable transports — with the no-op
+    /// transports installed, a full init + run sequence performs zero real
+    /// product requests (previously every test run emitted real anonymous
+    /// pings to pi.dev). Counters are 0 when the env gates the ping closed
+    /// (e.g. `PIR_OFFLINE`/`PIR_SKIP_VERSION_CHECK` in the dev env) and 1
+    /// when armed — either way no network is touched.
+    #[tokio::test]
+    async fn init_and_run_make_no_product_network_requests() {
+        let harness = build_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        let (telemetry, version_check) = install_noop_product_transports(&mode);
+
+        let mut mode = mode;
+        mode.init().await;
+        // Let the fire-and-forget spawns run to completion (no-op: instant).
+        tokio::task::yield_now().await;
+        let telemetry_calls = telemetry.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            telemetry_calls <= 1,
+            "init must go through the injected no-op transport, got {telemetry_calls} calls"
+        );
+        assert_eq!(
+            version_check.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "init must not emit version checks"
+        );
+
+        // run() spawns the startup version probe; drive it briefly, then
+        // shut down and let the probe future resolve.
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(async move {
+                mode.run().await;
+            });
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(terminal.is_started(), "terminal started by run()");
+        terminal.feed("\u{4}"); // Ctrl+D → shutdown
+        let _ = handle.join();
+        let version_calls = version_check.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            version_calls <= 1,
+            "run must go through the injected no-op transport, got {version_calls} calls"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -3930,6 +4255,9 @@ mod tests {
             UiCommand::ThemeChanged => "theme_changed",
             UiCommand::ApplyThemeName(_) => "apply_theme_name",
             UiCommand::GitBranchChanged => "git_branch_changed",
+            UiCommand::NewVersionAvailable(_) => "new_version_available",
+            UiCommand::ShareAbort => "share_abort",
+            UiCommand::ShareCompleted(_) => "share_completed",
             UiCommand::Dequeue => "dequeue",
             UiCommand::PasteImage => "paste_image",
         }
@@ -4362,6 +4690,58 @@ mod tests {
         assert!(matches!(*lock(&ui.status), ActiveStatus::Idle));
         // The run loop was signalled to flush the compaction queue.
         assert!(*mode.flush_rx.borrow() == 1, "flush signal sent");
+    }
+
+    #[tokio::test]
+    async fn new_version_available_renders_update_notification() {
+        // `showNewVersionNotification` (interactive-mode.ts:3885-3912) via
+        // the drain: bordered block, version line, note, changelog link.
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let before = chat_children(ui);
+        ui.push(UiCommand::NewVersionAvailable(
+            crate::core::version_check::LatestPirRelease {
+                version: "99.0.0".to_string(),
+                package_name: None,
+                note: Some("**breaking** changes".to_string()),
+            },
+        ));
+        ui.drain_events();
+        // Spacer + border + heading + note spacer + note + spacer +
+        // changelog + border.
+        assert_eq!(chat_children(ui) - before, 8);
+        let rendered = lock(&ui.chat_container).render(80).join("\n");
+        assert!(
+            rendered.contains("Update Available"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("New version 99.0.0 is available. Run"),
+            "rendered: {rendered}"
+        );
+        assert!(rendered.contains("pir update"), "rendered: {rendered}");
+        assert!(rendered.contains("breaking"), "rendered: {rendered}");
+        assert!(
+            rendered.contains("https://pi.dev/changelog"),
+            "rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_version_available_without_note_skips_markdown() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let before = chat_children(ui);
+        ui.push(UiCommand::NewVersionAvailable(
+            crate::core::version_check::LatestPirRelease {
+                version: "99.0.0".to_string(),
+                package_name: None,
+                note: None,
+            },
+        ));
+        ui.drain_events();
+        // Spacer + border + heading + changelog + border.
+        assert_eq!(chat_children(ui) - before, 5);
     }
 
     #[tokio::test]

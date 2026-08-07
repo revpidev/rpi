@@ -26,6 +26,10 @@ impl ApiKeyAuth for BedrockAuth {
         "AWS credentials or bearer token"
     }
 
+    fn supports_login(&self) -> bool {
+        true
+    }
+
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,

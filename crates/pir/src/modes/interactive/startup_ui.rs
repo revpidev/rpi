@@ -11,8 +11,11 @@
 //!   of resolved packages.
 //! - The terminal used by the dialog is injectable for tests (the
 //!   `with_terminal` variant); production uses a `ProcessTerminal`.
-//! - Telemetry sending on analytics opt-in is out of scope: the settings are
-//!   persisted, sending lands with the telemetry task.
+//! - Upstream 0.82.1 has no analytics sender: `enableAnalytics` (opt-in,
+//!   default false) and the generated `trackingId` are persisted only, so
+//!   there is nothing to send here (verified against the pinned tree —
+//!   `getEnableAnalytics` has no consumer outside settings/first-time
+//!   setup). The install ping is `core::telemetry` (T14-W6a).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +29,7 @@ use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::themes::{get_available_themes, load_theme};
 use crate::error::PirError;
 
+use super::components::extension_selector::ExtensionSelectorComponent;
 use super::components::first_time_setup::{FirstTimeSetupComponent, FirstTimeSetupResult};
 use super::theme_watcher::detect_terminal_theme_for_auto;
 
@@ -194,6 +198,148 @@ pub(crate) async fn run_first_time_setup_with_terminal(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Startup selector (project-trust prompt)
+// ---------------------------------------------------------------------------
+
+/// TUI entry wrapper for the startup selector (same shape as
+/// [`SetupRegion`]): forwards component calls and focus.
+struct SelectorRegion(Arc<Mutex<ExtensionSelectorComponent>>);
+
+impl Component for SelectorRegion {
+    fn render(&self, width: usize) -> Vec<String> {
+        lock(&self.0).render(width)
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        lock(&self.0).handle_input(data);
+    }
+
+    fn invalidate(&mut self) {
+        lock(&self.0).invalidate();
+    }
+
+    fn as_focusable(&self) -> Option<&dyn Focusable> {
+        Some(self)
+    }
+
+    fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
+}
+
+impl Focusable for SelectorRegion {
+    fn focused(&self) -> bool {
+        // Always ready for input while shown (the setup wrapper pattern).
+        true
+    }
+
+    fn set_focused(&mut self, _focused: bool) {}
+}
+
+/// `showStartupSelector` (startup-ui.ts:134-164): a selector shown before
+/// the interactive TUI exists, on its own short-lived `Tui`. Blocks until
+/// the user confirms an option (its label) or cancels (`None`).
+///
+/// Intentional differences:
+/// - Synchronous: the trust store callers are sync (trust-manager.ts:156-159);
+///   the pump driver thread runs while the caller blocks on the result
+///   channel.
+/// - Package-based startup themes (`loadStartupThemes`, startup-ui.ts:60-75)
+///   are not ported — same exemption as the first-time setup dialog.
+/// - `clearStartupTui`'s 25ms repaint delay is dropped; `ui.stop()` restores
+///   the terminal.
+pub(crate) fn run_startup_selector(
+    settings: &crate::core::settings_manager::SettingsManager,
+    title: &str,
+    options: &[String],
+) -> Option<String> {
+    run_startup_selector_with_terminal(settings, title, options, Box::new(ProcessTerminal::new()))
+}
+
+/// Terminal-injectable variant (test seam).
+pub(crate) fn run_startup_selector_with_terminal(
+    settings: &crate::core::settings_manager::SettingsManager,
+    title: &str,
+    options: &[String],
+    terminal: Box<dyn pir_tui::terminal::Terminal + Send>,
+) -> Option<String> {
+    super::interactive_mode::install_global_keybindings();
+
+    // `createStartupTui` theme resolution (startup-ui.ts:78-87), minus
+    // package themes and the async OSC re-detection.
+    let terminal_theme = crate::core::themes::detect_terminal_background_from_env().theme;
+    let theme_name =
+        crate::core::themes::resolve_theme_setting(settings.get_theme().as_deref(), terminal_theme)
+            .unwrap_or_else(|| terminal_theme.as_str().to_string());
+    let theme = match load_theme(&theme_name, None) {
+        Ok(theme) => Arc::new(theme),
+        Err(_) => return None,
+    };
+
+    let ui = Tui::with_options(
+        terminal,
+        Some(settings.get_show_hardware_cursor()),
+        Some(crate::config::get_agent_dir()),
+    );
+    ui.set_clear_on_shrink(settings.get_clear_on_shrink());
+    ui.start();
+    let stop = Arc::new(AtomicBool::new(false));
+    let driver_ui = ui.clone();
+    let driver_stop = Arc::clone(&stop);
+    let driver = std::thread::Builder::new()
+        .name("pir-startup-selector".to_string())
+        .spawn(move || {
+            while !driver_stop.load(Ordering::Relaxed) {
+                driver_ui.pump(Some(Duration::from_millis(50)));
+            }
+        });
+
+    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let fire = {
+        let tx = Arc::clone(&tx);
+        move |value: Option<String>| {
+            if let Some(tx) = lock(&tx).take() {
+                let _ = tx.send(value);
+            }
+        }
+    };
+    let on_select = {
+        let fire = fire;
+        Box::new(move |value: Option<String>| fire(value)) as Box<dyn FnMut(Option<String>) + Send>
+    };
+    let on_cancel = Box::new(move || {}) as Box<dyn FnMut() + Send>;
+    let component = Arc::new(Mutex::new(ExtensionSelectorComponent::new(
+        theme,
+        Some(title.to_string()),
+        options.to_vec(),
+        on_select,
+        on_cancel,
+        None,
+    )));
+
+    let Ok(driver) = driver else {
+        // No pump thread → no input; fail closed (cancel).
+        ui.stop();
+        return None;
+    };
+
+    let entry = shared_component_from_boxed(Box::new(SelectorRegion(Arc::clone(&component))));
+    ui.add_child(entry.clone());
+    ui.set_focus(Some(entry));
+    ui.request_render(false);
+
+    // Block until the component fires (confirm/cancel); a disconnected
+    // channel means the UI died — treat as cancel.
+    let result = rx.recv().unwrap_or(None);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = driver.join();
+    ui.stop();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc as StdArc;
@@ -336,5 +482,58 @@ mod tests {
             .session
             .settings_manager(|settings| settings.get_theme());
         assert_eq!(theme, None, "no theme persisted on cancel");
+    }
+
+    #[test]
+    fn startup_selector_returns_selected_label() {
+        let settings = crate::core::settings_manager::SettingsManager::in_memory(
+            crate::core::settings_manager::Settings::new(),
+            crate::core::settings_manager::SettingsManagerCreateOptions::default(),
+        );
+        let terminal = StdArc::new(TestTerminal::new());
+        let terminal_box: Box<dyn Terminal + Send> = Box::new(TestTerminal::clone(&terminal));
+        let options = vec!["Trust".to_string(), "Do not trust".to_string()];
+
+        let selector = std::thread::spawn(move || {
+            run_startup_selector_with_terminal(
+                &settings,
+                "Trust project folder?",
+                &options,
+                terminal_box,
+            )
+        });
+
+        while !terminal.is_started() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Let the focus settle before feeding input.
+        std::thread::sleep(Duration::from_millis(100));
+        // Down + confirm selects the second option.
+        terminal.feed("\x1b[B");
+        terminal.feed("\r");
+        let selected = selector.join().expect("selector thread");
+        assert_eq!(selected.as_deref(), Some("Do not trust"));
+    }
+
+    #[test]
+    fn startup_selector_escape_cancels() {
+        let settings = crate::core::settings_manager::SettingsManager::in_memory(
+            crate::core::settings_manager::Settings::new(),
+            crate::core::settings_manager::SettingsManagerCreateOptions::default(),
+        );
+        let terminal = StdArc::new(TestTerminal::new());
+        let terminal_box: Box<dyn Terminal + Send> = Box::new(TestTerminal::clone(&terminal));
+
+        let selector = std::thread::spawn(move || {
+            run_startup_selector_with_terminal(&settings, "t", &["a".to_string()], terminal_box)
+        });
+
+        while !terminal.is_started() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        terminal.feed("\x1b");
+        let selected = selector.join().expect("selector thread");
+        assert_eq!(selected, None);
     }
 }

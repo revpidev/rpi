@@ -553,8 +553,8 @@ impl FileSettingsStorage {
 impl SettingsStorage for FileSettingsStorage {
     /// `withLock` (settings-manager.ts:226-254): the lock is only acquired
     /// when the file exists or a write is about to happen; the directory is
-    /// only created when a write actually happens; the write is non-atomic
-    /// (`writeFileSync` ↔ `std::fs::write`, no temp file + rename).
+    /// only created when a write actually happens; the write is atomic
+    /// (temp file + rename — upstream `writeFileSync` is not; T14 review).
     fn with_lock(
         &mut self,
         scope: SettingsScope,
@@ -585,7 +585,10 @@ impl SettingsStorage for FileSettingsStorage {
             if guard.is_none() {
                 guard = Some(Self::acquire_lock_with_retry(path, true)?);
             }
-            std::fs::write(path, next)?;
+            // Atomic write (temp + rename in the same directory; T14
+            // review — upstream's `writeFileSync` can truncate the store
+            // on crash mid-write, hard-failing the next read).
+            crate::config::atomic_write(path, &next)?;
         }
 
         // Explicit release mirroring upstream's `finally { release() }`; the
@@ -1638,6 +1641,27 @@ impl SettingsManager {
         self.settings
             .get_bool("enableInstallTelemetry")
             .unwrap_or(true)
+    }
+
+    /// `versionCheckUrl` setting — pir-specific (ADR-0002 §8, no upstream
+    /// counterpart): overrides the version-check endpoint; `off` disables
+    /// it. Resolution lives in [`crate::core::version_check`].
+    pub fn get_version_check_url(&self) -> Option<String> {
+        self.settings.get_str("versionCheckUrl").map(str::to_string)
+    }
+
+    /// `telemetryUrl` setting — pir-specific (ADR-0002 §8): overrides the
+    /// install-telemetry endpoint; `off` disables it. Resolution lives in
+    /// [`crate::core::telemetry`].
+    pub fn get_telemetry_url(&self) -> Option<String> {
+        self.settings.get_str("telemetryUrl").map(str::to_string)
+    }
+
+    /// `modelCatalogUrl` setting — pir-specific (ADR-0002 §8): overrides the
+    /// remote model catalog base URL; `off` disables it. Resolution lives in
+    /// [`crate::core::remote_catalog_provider`].
+    pub fn get_model_catalog_url(&self) -> Option<String> {
+        self.settings.get_str("modelCatalogUrl").map(str::to_string)
     }
 
     /// `setEnableInstallTelemetry` (settings-manager.ts:944-948).
@@ -3219,6 +3243,38 @@ mod tests {
         manager.set_enable_analytics(false);
         manager.set_enable_analytics(true);
         assert_eq!(manager.get_tracking_id().as_deref(), Some(first.as_str()));
+    }
+
+    /// The pir-specific endpoint URL settings (ADR-0002 §8): absent by
+    /// default, read as raw camelCase strings when present (disable/off
+    /// semantics live in [`crate::config::resolve_endpoint`]).
+    #[test]
+    fn test_endpoint_url_settings_read_raw_strings() {
+        let dirs = test_dirs();
+        let manager = create(&dirs);
+        assert_eq!(manager.get_version_check_url(), None);
+        assert_eq!(manager.get_telemetry_url(), None);
+        assert_eq!(manager.get_model_catalog_url(), None);
+
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({
+                "versionCheckUrl": "https://mirror.test/latest",
+                "telemetryUrl": "off",
+                "modelCatalogUrl": "https://mirror.test",
+            }),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_version_check_url().as_deref(),
+            Some("https://mirror.test/latest")
+        );
+        assert_eq!(manager.get_telemetry_url().as_deref(), Some("off"));
+        assert_eq!(
+            manager.get_model_catalog_url().as_deref(),
+            Some("https://mirror.test")
+        );
     }
 
     /// `InMemorySettingsStorage` round-trips writes within a manager

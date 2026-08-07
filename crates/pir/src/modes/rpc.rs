@@ -952,7 +952,6 @@ async fn dispatch(
             let path = state
                 .session()
                 .export_to_html(output_path.as_deref())
-                .await
                 .map_err(|error| error_message(&error))?;
             Ok(Some(json!({ "path": path })))
         }

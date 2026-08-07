@@ -208,6 +208,33 @@ pub struct ExtensionErrorInfo {
     pub error: String,
 }
 
+/// `ProjectTrustEventDecision` (extensions/types.ts): `"yes" | "no" |
+/// "undecided"`. `Undecided` falls through to the next handler
+/// (runner.ts:216-218); the first yes/no wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectTrustEventDecision {
+    Yes,
+    No,
+    Undecided,
+}
+
+impl ProjectTrustEventDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProjectTrustEventDecision::Yes => "yes",
+            ProjectTrustEventDecision::No => "no",
+            ProjectTrustEventDecision::Undecided => "undecided",
+        }
+    }
+}
+
+/// `ProjectTrustEventResult` (extensions/types.ts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectTrustEventResult {
+    pub trusted: ProjectTrustEventDecision,
+    pub remember: Option<bool>,
+}
+
 /// Registered slash command handle (extensions/types.ts
 /// `RegisteredCommand`). Never produced by the no-op runner.
 #[derive(Debug, Clone)]
@@ -295,6 +322,16 @@ pub trait ExtensionRunner: Send + Sync {
     /// `resources_discover` (agent-session.ts:2254-2277).
     async fn emit_resources_discover(&self, _cwd: &str, _reason: &str) -> ResourceExtensionPaths {
         ResourceExtensionPaths::default()
+    }
+
+    /// `project_trust` event (`emitProjectTrustEvent`, runner.ts:201-231):
+    /// handlers run in order, `undecided` falls through, the first yes/no
+    /// wins. Returns the winning result, or `None` when no handler decides
+    /// (or none are registered — the default until the T15 host lands).
+    /// The restricted [`ProjectTrustContext`](crate::core::trust_manager::ProjectTrustContext)
+    /// is supplied by the trust resolver, not by this method.
+    async fn emit_project_trust(&self, _cwd: &std::path::Path) -> Option<ProjectTrustEventResult> {
+        None
     }
 
     /// `getCommand(name)` — extension slash command lookup.

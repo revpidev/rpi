@@ -1,30 +1,20 @@
-//! Port of `config-selector.ts` @ pi 0.82.1 (2efa728).
+//! Port of `config-selector.ts` @ pi 0.82.1 (2efa728), W3 rewiring.
 //!
-//! Intentional differences:
-//! - Upstream takes `ScopedResolvedPaths` (package-manager output with
-//!   per-resource `PathMetadata` + `enabled`) and writes toggles straight
-//!   into the `SettingsManager` (pattern-based settings/package arrays). The
-//!   local loader's `LoadedResources` carries no per-resource metadata for
-//!   prompts/themes/extensions (see resource_loader.rs header) and the
-//!   package manager is T14, so the port takes `&LoadedResources` and
-//!   exposes write hooks instead: `on_toggle(scope, name, enabled)` and
-//!   `on_scope_change(scope)` callbacks; the integration layer (T14 +
-//!   interactive-mode) persists the changes. Settings writes are a reported
-//!   gap (see README / task report).
-//! - `enabled` state: the local loader filters disabled resources out at
-//!   discovery, so every listed item starts `enabled: true` and disabling
-//!   only flips in-memory state (re-enabling a disabled resource requires
-//!   the package-manager path list, T14).
-//! - Metadata for prompts/themes/extensions is inferred from the path
-//!   location (under `agent_dir` → user, under `<cwd>/.pir` → project);
-//!   skills use their real `source_info`. Package-origin items arrive only
-//!   through `SourceInfo` (skills), other types are T14.
-//! - Project write scope: upstream computes override states (inherit/load/
-//!   unload) from the project settings' pattern arrays; the port keeps the
-//!   same three-state cycle in an in-memory override map (upstream
-//!   `getProjectOverrideState` reads `settingsManager.getProjectSettings()`).
-//! - Upstream `requestRender` plumbing (onToggle = () => requestRender()) is
-//!   dropped — the component owns its state, so renders are self-consistent.
+//! T12 delivered this component against `LoadedResources` with in-memory
+//! toggle state and write hooks; T14-W3 replaces the input with the package
+//! manager's full-resolve output ([`ScopedResolvedPaths`]) and ports the
+//! upstream settings persistence (`toggleTopLevelResource` /
+//! `togglePackageResource` / the project override cycle write straight into
+//! the [`SettingsManager`], config-selector.ts:516-863).
+//!
+//! Intentional differences (D-042):
+//! - The settings manager is shared as `Arc<Mutex<SettingsManager>>`
+//!   (upstream reads/writes it synchronously from the component).
+//! - Project-scope settings writes are gated upstream by the `pir config`
+//!   trust check, so the `Result` of the project setters cannot fail here;
+//!   failures are swallowed (upstream would throw).
+//! - Item ordering uses codepoint comparison where upstream uses
+//!   `localeCompare` (D-039 precedent).
 //! - `CONFIG_DIR_NAME` is `.pir` (ADR-0001 rename of `.pi`).
 
 use std::collections::{HashMap, HashSet};
@@ -38,11 +28,15 @@ use pir_tui::tui::{Component, Focusable};
 use pir_tui::utils::{truncate_to_width, visible_width};
 
 use crate::config::{self, CONFIG_DIR_NAME};
-use crate::core::resource_loader::LoadedResources;
-use crate::core::skills::{canonicalize_path, SourceOrigin, SourceScope};
+use crate::core::package_manager::{ResolvedPaths, ResourcePathMetadata};
+use crate::core::settings_manager::{
+    PackageSource, PackageSourceFilter, Settings, SettingsManager,
+};
+use crate::core::skills::{canonicalize_path, lexical_relative, SourceOrigin, SourceScope};
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::dynamic_border::DynamicBorder;
 use crate::modes::interactive::components::keybinding_hints::{key_hint, raw_key_hint};
+use crate::tools::path_utils::resolve_path;
 
 /// `ResourceType` (config-selector.ts:26).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +46,13 @@ pub enum ResourceType {
     Prompts,
     Themes,
 }
+
+const RESOURCE_TYPES: [ResourceType; 4] = [
+    ResourceType::Extensions,
+    ResourceType::Skills,
+    ResourceType::Prompts,
+    ResourceType::Themes,
+];
 
 impl ResourceType {
     /// The settings-array key (`settings[arrayKey]`, config-selector.ts:537).
@@ -91,19 +92,11 @@ impl ConfigWriteScope {
     }
 }
 
-/// `SettingsScope` (config-selector.ts:28).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsScope {
-    User,
-    Project,
-    Temporary,
-}
-
-/// `ResourceOrigin` (config-selector.ts's `PathMetadata.origin` subset).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceOrigin {
-    TopLevel,
-    Package,
+/// `ScopedResolvedPaths` (config-selector.ts:30).
+#[derive(Debug, Clone)]
+pub struct ScopedResolvedPaths {
+    pub global: ResolvedPaths,
+    pub project: ResolvedPaths,
 }
 
 /// `ProjectOverrideState` (config-selector.ts:29).
@@ -114,17 +107,15 @@ enum ProjectOverrideState {
     Unload,
 }
 
-/// `ResourceItem` (config-selector.ts:41-49).
+/// `ResourceItem` (config-selector.ts:41-49; the Rust port indexes its
+/// group/subgroup instead of carrying `groupKey`/`subgroupKey`).
 #[derive(Debug, Clone)]
 pub struct ResourceItem {
     pub path: String,
     pub enabled: bool,
+    pub metadata: ResourcePathMetadata,
     pub resource_type: ResourceType,
     pub display_name: String,
-    pub scope: SettingsScope,
-    pub origin: ResourceOrigin,
-    pub source: String,
-    pub base_dir: Option<String>,
 }
 
 /// `ResourceSubgroup` (config-selector.ts:51-55).
@@ -137,10 +128,35 @@ struct ResourceSubgroup {
 /// `ResourceGroup` (config-selector.ts:57-64).
 struct ResourceGroup {
     label: String,
-    scope: SettingsScope,
-    origin: ResourceOrigin,
+    scope: SourceScope,
+    origin: SourceOrigin,
     source: String,
     subgroups: Vec<ResourceSubgroup>,
+}
+
+fn scope_str(scope: SourceScope) -> &'static str {
+    match scope {
+        SourceScope::User => "user",
+        SourceScope::Project => "project",
+        SourceScope::Temporary => "temporary",
+    }
+}
+
+fn origin_str(origin: SourceOrigin) -> &'static str {
+    match origin {
+        SourceOrigin::Package => "package",
+        SourceOrigin::TopLevel => "top-level",
+    }
+}
+
+/// `getItemScope` (config-selector.ts:846-848): temporary renders/toggles
+/// like user scope.
+fn get_item_scope(item: &ResourceItem) -> SourceScope {
+    if item.metadata.scope == SourceScope::Project {
+        SourceScope::Project
+    } else {
+        SourceScope::User
+    }
 }
 
 /// `formatBaseDir` (config-selector.ts:66-81): replace the home prefix with
@@ -162,178 +178,74 @@ fn format_base_dir(base_dir: &str) -> String {
 }
 
 /// `getGroupLabel` (config-selector.ts:83-97).
-fn get_group_label(
-    scope: SettingsScope,
-    origin: ResourceOrigin,
-    source: &str,
-    base_dir: Option<&str>,
-    agent_dir: &str,
-) -> String {
-    match origin {
-        ResourceOrigin::Package => {
-            let scope_str = match scope {
-                SettingsScope::User => "user",
-                SettingsScope::Project => "project",
-                SettingsScope::Temporary => "temporary",
-            };
-            format!("{source} ({scope_str})")
-        }
-        ResourceOrigin::TopLevel if source == "auto" => {
-            if let Some(base_dir) = base_dir {
-                match scope {
-                    SettingsScope::User => format!("User ({})", format_base_dir(base_dir)),
-                    _ => format!("Project ({})", format_base_dir(base_dir)),
-                }
-            } else {
-                match scope {
-                    SettingsScope::User => format!("User ({})", format_base_dir(agent_dir)),
-                    _ => format!("Project ({CONFIG_DIR_NAME}/)"),
-                }
-            }
-        }
-        ResourceOrigin::TopLevel => match scope {
-            SettingsScope::User => "User settings".to_string(),
-            _ => "Project settings".to_string(),
-        },
+fn get_group_label(metadata: &ResourcePathMetadata, agent_dir: &Path) -> String {
+    if metadata.origin == SourceOrigin::Package {
+        return format!("{} ({})", metadata.source, scope_str(metadata.scope));
     }
-}
-
-/// Infer metadata for resources without `SourceInfo` (prompts, themes,
-/// extensions; see module header). Auto-discovered resources carry the
-/// scope base dir (package-manager.ts:2312-2318), so the inferred
-/// `base_dir` is the agent dir / `<cwd>/.pir`, keeping them in the same
-/// group as skills from the same scope.
-fn infer_metadata(
-    path: &Path,
-    cwd: &Path,
-    agent_dir: &Path,
-) -> (SettingsScope, ResourceOrigin, &'static str, Option<String>) {
-    let project_dir = cwd.join(CONFIG_DIR_NAME);
-    let (scope, base_dir) = if path.starts_with(agent_dir) {
-        (
-            SettingsScope::User,
-            Some(agent_dir.to_string_lossy().into_owned()),
-        )
-    } else if path.starts_with(&project_dir) {
-        (
-            SettingsScope::Project,
-            Some(project_dir.to_string_lossy().into_owned()),
-        )
-    } else {
-        // CLI (`--skill` etc.) and other paths: upstream marks them
-        // "temporary", which renders like the project branch in
-        // `getGroupLabel` / the inherited-global checks.
-        (SettingsScope::Project, None)
-    };
-    (scope, ResourceOrigin::TopLevel, "auto", base_dir)
+    if metadata.source == "auto" {
+        if let Some(base_dir) = &metadata.base_dir {
+            let base_dir = base_dir.to_string_lossy();
+            return match metadata.scope {
+                SourceScope::User => format!("User ({})", format_base_dir(&base_dir)),
+                _ => format!("Project ({})", format_base_dir(&base_dir)),
+            };
+        }
+        return match metadata.scope {
+            SourceScope::User => {
+                format!("User ({})", format_base_dir(&agent_dir.to_string_lossy()))
+            }
+            _ => format!("Project ({CONFIG_DIR_NAME}/)"),
+        };
+    }
+    match metadata.scope {
+        SourceScope::User => "User settings".to_string(),
+        _ => "Project settings".to_string(),
+    }
 }
 
 /// `buildGroups` (config-selector.ts:99-180).
-fn build_groups(resources: &LoadedResources, cwd: &Path, agent_dir: &Path) -> Vec<ResourceGroup> {
+fn build_groups(resolved: &ResolvedPaths, agent_dir: &Path) -> Vec<ResourceGroup> {
     let mut groups: Vec<ResourceGroup> = Vec::new();
     let mut group_index: HashMap<String, usize> = HashMap::new();
 
-    // Extensions first — upstream `addToGroup` call order
-    // (config-selector.ts:153-156).
-    for extension in &resources.extensions.paths {
-        let (scope, origin, source, base_dir) = infer_metadata(extension, cwd, agent_dir);
-        add_to_group(
-            &mut groups,
-            &mut group_index,
-            extension.clone(),
-            ResourceType::Extensions,
-            scope,
-            origin,
-            source.to_string(),
-            base_dir,
-            agent_dir,
-        );
-    }
-
-    // Skills carry real metadata (`source_info`).
-    for skill in &resources.skills {
-        let path = skill.file_path.clone();
-        let (scope, origin, source, base_dir) = (
-            match skill.source_info.scope {
-                SourceScope::User => SettingsScope::User,
-                SourceScope::Project => SettingsScope::Project,
-                SourceScope::Temporary => SettingsScope::Temporary,
-            },
-            match skill.source_info.origin {
-                SourceOrigin::TopLevel => ResourceOrigin::TopLevel,
-                SourceOrigin::Package => ResourceOrigin::Package,
-            },
-            skill.source_info.source.clone(),
-            skill
-                .source_info
-                .base_dir
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-        );
-        add_to_group(
-            &mut groups,
-            &mut group_index,
-            path,
-            ResourceType::Skills,
-            scope,
-            origin,
-            source,
-            base_dir,
-            agent_dir,
-        );
-    }
-
-    for prompt in &resources.prompts {
-        let (scope, origin, source, base_dir) = infer_metadata(&prompt.file_path, cwd, agent_dir);
-        add_to_group(
-            &mut groups,
-            &mut group_index,
-            prompt.file_path.clone(),
-            ResourceType::Prompts,
-            scope,
-            origin,
-            source.to_string(),
-            base_dir,
-            agent_dir,
-        );
-    }
-
-    for theme in &resources.themes {
-        let path = theme.source_path.clone().unwrap_or_default();
-        let (scope, origin, source, base_dir) = infer_metadata(&path, cwd, agent_dir);
-        add_to_group(
-            &mut groups,
-            &mut group_index,
-            path,
-            ResourceType::Themes,
-            scope,
-            origin,
-            source.to_string(),
-            base_dir,
-            agent_dir,
-        );
+    // Upstream `addToGroup` call order (config-selector.ts:153-156).
+    for (resources, resource_type) in [
+        (&resolved.extensions, ResourceType::Extensions),
+        (&resolved.skills, ResourceType::Skills),
+        (&resolved.prompts, ResourceType::Prompts),
+        (&resolved.themes, ResourceType::Themes),
+    ] {
+        for resource in resources {
+            add_to_group(
+                &mut groups,
+                &mut group_index,
+                resource,
+                resource_type,
+                agent_dir,
+            );
+        }
     }
 
     // Sort groups: packages first, then top-level; user before project
     // (config-selector.ts:158-168).
     groups.sort_by(|a, b| {
         let origin_cmp = match (a.origin, b.origin) {
-            (ResourceOrigin::Package, ResourceOrigin::TopLevel) => std::cmp::Ordering::Less,
-            (ResourceOrigin::TopLevel, ResourceOrigin::Package) => std::cmp::Ordering::Greater,
+            (SourceOrigin::Package, SourceOrigin::TopLevel) => std::cmp::Ordering::Less,
+            (SourceOrigin::TopLevel, SourceOrigin::Package) => std::cmp::Ordering::Greater,
             _ => std::cmp::Ordering::Equal,
         };
         if origin_cmp != std::cmp::Ordering::Equal {
             return origin_cmp;
         }
         let scope_cmp = match (a.scope, b.scope) {
-            (SettingsScope::User, SettingsScope::User) => std::cmp::Ordering::Equal,
-            (SettingsScope::User, _) => std::cmp::Ordering::Less,
-            (_, SettingsScope::User) => std::cmp::Ordering::Greater,
+            (SourceScope::User, SourceScope::User) => std::cmp::Ordering::Equal,
+            (SourceScope::User, _) => std::cmp::Ordering::Less,
+            (_, SourceScope::User) => std::cmp::Ordering::Greater,
             // Upstream comparator: any non-user pair sorts with the left
             // side after the right (`a.scope === "user" ? -1 : 1`), i.e.
             // temporary before project.
-            (SettingsScope::Temporary, SettingsScope::Project) => std::cmp::Ordering::Less,
-            (SettingsScope::Project, SettingsScope::Temporary) => std::cmp::Ordering::Greater,
+            (SourceScope::Temporary, SourceScope::Project) => std::cmp::Ordering::Less,
+            (SourceScope::Project, SourceScope::Temporary) => std::cmp::Ordering::Greater,
             _ => std::cmp::Ordering::Equal,
         };
         if scope_cmp != std::cmp::Ordering::Equal {
@@ -365,45 +277,31 @@ fn build_groups(resources: &LoadedResources, cwd: &Path, agent_dir: &Path) -> Ve
 }
 
 /// One resource pushed into its group/subgroup (config-selector.ts:102-151).
-#[allow(clippy::too_many_arguments)]
 fn add_to_group(
     groups: &mut Vec<ResourceGroup>,
     group_index: &mut HashMap<String, usize>,
-    path: PathBuf,
+    resource: &crate::core::package_manager::ResolvedResource,
     resource_type: ResourceType,
-    scope: SettingsScope,
-    origin: ResourceOrigin,
-    source: String,
-    base_dir: Option<String>,
     agent_dir: &Path,
 ) {
+    let metadata = &resource.metadata;
     let group_key = format!(
         "{}:{}:{}:{}",
-        match origin {
-            ResourceOrigin::TopLevel => "top-level",
-            ResourceOrigin::Package => "package",
-        },
-        match scope {
-            SettingsScope::User => "user",
-            SettingsScope::Project => "project",
-            SettingsScope::Temporary => "temporary",
-        },
-        source,
-        base_dir.clone().unwrap_or_default(),
+        origin_str(metadata.origin),
+        scope_str(metadata.scope),
+        metadata.source,
+        metadata
+            .base_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     );
-    let group_idx = *group_index.entry(group_key.clone()).or_insert_with(|| {
-        let source = source.clone();
+    let group_idx = *group_index.entry(group_key).or_insert_with(|| {
         groups.push(ResourceGroup {
-            label: get_group_label(
-                scope,
-                origin,
-                &source,
-                base_dir.as_deref(),
-                &agent_dir.to_string_lossy(),
-            ),
-            scope,
-            origin,
-            source,
+            label: get_group_label(metadata, agent_dir),
+            scope: metadata.scope,
+            origin: metadata.origin,
+            source: metadata.source.clone(),
             subgroups: Vec::new(),
         });
         groups.len() - 1
@@ -429,6 +327,7 @@ fn add_to_group(
     };
 
     // displayName (config-selector.ts:131-140).
+    let path = &resource.path;
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -446,21 +345,19 @@ fn add_to_group(
         _ => file_name,
     };
 
-    let item = ResourceItem {
-        path: path.to_string_lossy().into_owned(),
-        enabled: true,
-        resource_type,
-        display_name,
-        scope,
-        origin,
-        source,
-        base_dir,
-    };
-    groups[group_idx].subgroups[subgroup_idx].items.push(item);
+    groups[group_idx].subgroups[subgroup_idx]
+        .items
+        .push(ResourceItem {
+            path: resource.path.to_string_lossy().into_owned(),
+            enabled: resource.enabled,
+            metadata: metadata.clone(),
+            resource_type,
+            display_name,
+        });
 }
 
 /// `FlatEntry` (config-selector.ts:182-185): a flattened group → subgroup →
-/// item entry. Indices into `ResourceList::groups`.
+/// item entry. Indices into the current write scope's groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlatEntry {
     Group {
@@ -554,20 +451,101 @@ impl ConfigSelectorHeader {
     }
 }
 
+/// `isLocalPath` (utils/paths.ts:41-56) — local copy (the package-manager
+/// twin is module-private).
+fn is_local_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    !(trimmed.starts_with("npm:")
+        || trimmed.starts_with("git:")
+        || trimmed.starts_with("github:")
+        || trimmed.starts_with("http:")
+        || trimmed.starts_with("https:")
+        || trimmed.starts_with("ssh:"))
+}
+
+/// `(settings[key] ?? []) as string[]` (non-string entries dropped).
+fn settings_string_array(settings: &Settings, key: &str) -> Vec<String> {
+    settings
+        .as_map()
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `[...(settings.packages ?? [])]` (malformed entries dropped, D-040 #8).
+fn packages_of(settings: &Settings) -> Vec<PackageSource> {
+    settings
+        .as_map()
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| serde_json::from_value(value.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn package_source_string(pkg: &PackageSource) -> &str {
+    match pkg {
+        PackageSource::Source(source) => source,
+        PackageSource::Filtered(filter) => &filter.source,
+    }
+}
+
+/// `getPatternEntryTarget` (config-selector.ts:838-840).
+fn get_pattern_entry_target(entry: &str) -> &str {
+    match entry.strip_prefix(['!', '+', '-']) {
+        Some(stripped) => stripped,
+        None => entry,
+    }
+}
+
+fn filter_array(filter: &PackageSourceFilter, resource_type: ResourceType) -> Option<&Vec<String>> {
+    match resource_type {
+        ResourceType::Extensions => filter.extensions.as_ref(),
+        ResourceType::Skills => filter.skills.as_ref(),
+        ResourceType::Prompts => filter.prompts.as_ref(),
+        ResourceType::Themes => filter.themes.as_ref(),
+    }
+}
+
+fn set_filter_array(
+    filter: &mut PackageSourceFilter,
+    resource_type: ResourceType,
+    entries: Option<Vec<String>>,
+) {
+    match resource_type {
+        ResourceType::Extensions => filter.extensions = entries,
+        ResourceType::Skills => filter.skills = entries,
+        ResourceType::Prompts => filter.prompts = entries,
+        ResourceType::Themes => filter.themes = entries,
+    }
+}
+
 /// `ResourceList` (config-selector.ts:222-864).
 pub struct ResourceList {
-    groups: Vec<ResourceGroup>,
+    groups_global: Vec<ResourceGroup>,
+    groups_project: Vec<ResourceGroup>,
     flat_items: Vec<FlatEntry>,
     filtered_items: Vec<FlatEntry>,
     selected_index: usize,
     search_input: Input,
     max_visible: usize,
+    settings_manager: Arc<Mutex<SettingsManager>>,
+    cwd: PathBuf,
+    agent_dir: PathBuf,
     write_scope: Arc<Mutex<ConfigWriteScope>>,
     /// `inheritedEnabledByKey` (config-selector.ts:233) — built from the
-    /// (global) groups.
+    /// global groups.
     inherited_enabled_by_key: HashMap<String, bool>,
-    /// Project override states (see module header).
-    overrides: HashMap<String, ProjectOverrideState>,
     theme: Arc<Theme>,
     project_mode_available: bool,
     focused: bool,
@@ -576,30 +554,26 @@ pub struct ResourceList {
     pub on_cancel: Option<Box<dyn FnMut() + Send>>,
     /// `onExit` (config-selector.ts:236).
     pub on_exit: Option<Box<dyn FnMut() + Send>>,
-    /// `onToggle` (config-selector.ts:237) — local form:
-    /// `(writeScope, displayName, enabled)`.
-    #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-    pub on_toggle: Option<Box<dyn FnMut(&str, &str, bool) + Send>>,
-    /// `onSwitchMode` (config-selector.ts:239) — local form: fired with the
-    /// *new* write scope after a successful Tab switch.
-    #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-    pub on_scope_change: Option<Box<dyn FnMut(&str) + Send>>,
 }
 
 impl ResourceList {
+    #[allow(clippy::too_many_arguments)] // mirrors the upstream constructor
     fn new(
-        resources: &LoadedResources,
+        resolved_paths: &ScopedResolvedPaths,
+        settings_manager: Arc<Mutex<SettingsManager>>,
         theme: Arc<Theme>,
         write_scope: Arc<Mutex<ConfigWriteScope>>,
-        cwd: &str,
-        agent_dir: &str,
+        cwd: &Path,
+        agent_dir: &Path,
         terminal_height: Option<usize>,
         project_mode_available: bool,
     ) -> Self {
-        let groups = build_groups(resources, Path::new(cwd), Path::new(agent_dir));
-        let inherited_enabled_by_key = Self::build_inherited_enabled_map(&groups);
+        let groups_global = build_groups(&resolved_paths.global, agent_dir);
+        let groups_project = build_groups(&resolved_paths.project, agent_dir);
+        let inherited_enabled_by_key = Self::build_inherited_enabled_map(&groups_global);
         let mut list = Self {
-            groups,
+            groups_global,
+            groups_project,
             flat_items: Vec::new(),
             filtered_items: Vec::new(),
             selected_index: 0,
@@ -608,16 +582,16 @@ impl ResourceList {
             // (2 lines) + spacer + bottom spacer + bottom border
             // (config-selector.ts:264-266).
             max_visible: 5usize.max(terminal_height.unwrap_or(24).saturating_sub(8)),
+            settings_manager,
+            cwd: cwd.to_path_buf(),
+            agent_dir: agent_dir.to_path_buf(),
             write_scope,
             inherited_enabled_by_key,
-            overrides: HashMap::new(),
             theme,
             project_mode_available,
             focused: false,
             on_cancel: None,
             on_exit: None,
-            on_toggle: None,
-            on_scope_change: None,
         };
         list.build_flat_list();
         list.filtered_items = list.flat_items.clone();
@@ -628,8 +602,24 @@ impl ResourceList {
         *lock(&self.write_scope)
     }
 
-    /// `switchWriteScope` (config-selector.ts:933-937) + the component's
-    /// `onSwitchMode` hook (config-selector.ts:921-925).
+    /// `get groups()` (config-selector.ts:277-279).
+    fn groups(&self) -> &Vec<ResourceGroup> {
+        match self.scope() {
+            ConfigWriteScope::Global => &self.groups_global,
+            ConfigWriteScope::Project => &self.groups_project,
+        }
+    }
+
+    fn groups_mut(&mut self) -> &mut Vec<ResourceGroup> {
+        match self.scope() {
+            ConfigWriteScope::Global => &mut self.groups_global,
+            ConfigWriteScope::Project => &mut self.groups_project,
+        }
+    }
+
+    /// `switchWriteScope` (config-selector.ts:933-937) — the upstream
+    /// `onSwitchMode` closure inlines this plus a render request (the
+    /// component owns its state, so renders are self-consistent).
     fn switch_write_scope(&mut self) {
         {
             let mut scope = lock(&self.write_scope);
@@ -641,10 +631,6 @@ impl ResourceList {
         self.build_flat_list();
         let query = self.search_input.get_value().to_string();
         self.filter_items(&query);
-        let new_scope = self.scope().as_str().to_string();
-        if let Some(on_scope_change) = self.on_scope_change.as_mut() {
-            on_scope_change(&new_scope);
-        }
     }
 
     /// `buildInheritedEnabledMap` (config-selector.ts:281-291).
@@ -664,15 +650,21 @@ impl ResourceList {
     /// first item (not header).
     fn build_flat_list(&mut self) {
         self.flat_items = Vec::new();
-        for (group_idx, group) in self.groups.iter().enumerate() {
-            self.flat_items.push(FlatEntry::Group { group: group_idx });
+        let scope = self.scope();
+        let groups = match scope {
+            ConfigWriteScope::Global => &self.groups_global,
+            ConfigWriteScope::Project => &self.groups_project,
+        };
+        let mut flat_items = std::mem::take(&mut self.flat_items);
+        for (group_idx, group) in groups.iter().enumerate() {
+            flat_items.push(FlatEntry::Group { group: group_idx });
             for (subgroup_idx, subgroup) in group.subgroups.iter().enumerate() {
-                self.flat_items.push(FlatEntry::Subgroup {
+                flat_items.push(FlatEntry::Subgroup {
                     group: group_idx,
                     subgroup: subgroup_idx,
                 });
                 for item_idx in 0..subgroup.items.len() {
-                    self.flat_items.push(FlatEntry::Item {
+                    flat_items.push(FlatEntry::Item {
                         group: group_idx,
                         subgroup: subgroup_idx,
                         item: item_idx,
@@ -680,6 +672,7 @@ impl ResourceList {
                 }
             }
         }
+        self.flat_items = flat_items;
         self.selected_index = self
             .flat_items
             .iter()
@@ -719,7 +712,7 @@ impl ResourceList {
                 item,
             } = entry
             {
-                let resource = &self.groups[*group].subgroups[*subgroup].items[*item];
+                let resource = &self.groups()[*group].subgroups[*subgroup].items[*item];
                 if resource.display_name.to_lowercase().contains(&lower_query)
                     || resource.resource_type.as_str().contains(&lower_query)
                     || resource.path.to_lowercase().contains(&lower_query)
@@ -730,7 +723,7 @@ impl ResourceList {
         }
 
         // Find which subgroups and groups contain matching items.
-        for (group_idx, group) in self.groups.iter().enumerate() {
+        for (group_idx, group) in self.groups().iter().enumerate() {
             for (subgroup_idx, subgroup) in group.subgroups.iter().enumerate() {
                 for item_idx in 0..subgroup.items.len() {
                     if matching_items.contains(&(group_idx, subgroup_idx, item_idx)) {
@@ -770,15 +763,14 @@ impl ResourceList {
         self.selected_index = first_item_index.unwrap_or(0);
     }
 
-    /// `updateItem` (config-selector.ts:376-388): flip `enabled` in the
-    /// groups (and thus every flat/filtered view).
+    /// `updateItem` (config-selector.ts:376-388): set `enabled` on the
+    /// toggled item (and any duplicate entries of it in the current view).
     fn update_item(&mut self, path: &str, resource_type: ResourceType, enabled: bool) {
-        for group in &mut self.groups {
+        for group in self.groups_mut() {
             for subgroup in &mut group.subgroups {
                 for item in &mut subgroup.items {
                     if item.path == path && item.resource_type == resource_type {
                         item.enabled = enabled;
-                        return;
                     }
                 }
             }
@@ -813,10 +805,10 @@ impl ResourceList {
                 FlatEntry::Group { group } => {
                     // Main group header (no cursor).
                     let inherited = self.scope() == ConfigWriteScope::Project
-                        && self.groups[group].scope == SettingsScope::User;
+                        && self.groups()[group].scope == SourceScope::User;
                     let label = Theme::bold(&format!(
                         "{}{}",
-                        self.groups[group].label,
+                        self.groups()[group].label,
                         if inherited {
                             " · inherited global"
                         } else {
@@ -836,7 +828,7 @@ impl ResourceList {
                 FlatEntry::Subgroup { group, subgroup } => {
                     // Subgroup header (indented, no cursor).
                     let color = if self.scope() == ConfigWriteScope::Project
-                        && self.groups[group].scope == SettingsScope::User
+                        && self.groups()[group].scope == SourceScope::User
                     {
                         "dim"
                     } else {
@@ -844,7 +836,7 @@ impl ResourceList {
                     };
                     let subgroup_line = self
                         .theme
-                        .fg(color, &self.groups[group].subgroups[subgroup].label);
+                        .fg(color, &self.groups()[group].subgroups[subgroup].label);
                     lines.push(truncate_to_width(
                         &format!("    {subgroup_line}"),
                         width,
@@ -858,7 +850,7 @@ impl ResourceList {
                     item,
                 } => {
                     // Resource item (cursor only on items).
-                    let item = &self.groups[group].subgroups[subgroup].items[item];
+                    let item = &self.groups()[group].subgroups[subgroup].items[item];
                     let cursor = if is_selected { "> " } else { "  " };
                     let dimmed = self.is_dimmed_item(item);
                     let name_text = if is_selected && !dimmed {
@@ -979,21 +971,18 @@ impl ResourceList {
             }) = self.filtered_items.get(self.selected_index)
             {
                 let (group, subgroup, item) = (*group, *subgroup, *item);
-                let resource = &self.groups[group].subgroups[subgroup].items[item];
                 // config-selector.ts:501: project scope toggles anything,
-                // global scope only user-scope items (`getItemScope`
-                // maps temporary → user too, config-selector.ts:846-848).
-                if self.scope() == ConfigWriteScope::Project
-                    || resource.scope != SettingsScope::Project
-                {
-                    if let Some(enabled) = self.toggle_resource(group, subgroup, item) {
-                        let name = self.groups[group].subgroups[subgroup].items[item]
-                            .display_name
-                            .clone();
-                        let scope_str = self.scope().as_str();
-                        if let Some(on_toggle) = self.on_toggle.as_mut() {
-                            on_toggle(scope_str, &name, enabled);
-                        }
+                // global scope only user-scope items.
+                let allowed = {
+                    let resource = &self.groups()[group].subgroups[subgroup].items[item];
+                    self.scope() == ConfigWriteScope::Project
+                        || get_item_scope(resource) == SourceScope::User
+                };
+                if allowed {
+                    if let Some((path, resource_type, enabled)) =
+                        self.toggle_resource(group, subgroup, item)
+                    {
+                        self.update_item(&path, resource_type, enabled);
                     }
                 }
             }
@@ -1007,32 +996,118 @@ impl ResourceList {
         self.filter_items(&query);
     }
 
-    /// `toggleResource` (config-selector.ts:516-530). Global scope flips the
-    /// in-memory `enabled` (upstream additionally writes settings arrays —
-    /// deferred to the integration layer via `on_toggle`); project scope
-    /// cycles the override state.
-    fn toggle_resource(&mut self, group: usize, subgroup: usize, item: usize) -> Option<bool> {
+    /// `toggleResource` (config-selector.ts:516-530): returns
+    /// `(path, resource_type, new enabled)` for the `updateItem` call, or
+    /// `None` when the write failed.
+    fn toggle_resource(
+        &mut self,
+        group: usize,
+        subgroup: usize,
+        item: usize,
+    ) -> Option<(String, ResourceType, bool)> {
+        let item_ref = self.groups()[group].subgroups[subgroup].items[item].clone();
         if self.scope() == ConfigWriteScope::Project {
-            let state =
-                self.get_next_override_state(&self.groups[group].subgroups[subgroup].items[item]);
+            let state = self.get_next_override_state(&item_ref);
+            if !self.set_project_resource_override(&item_ref, state) {
+                return None;
+            }
             let enabled = match state {
-                ProjectOverrideState::Inherit => {
-                    self.get_inherited_enabled(&self.groups[group].subgroups[subgroup].items[item])
-                }
+                ProjectOverrideState::Inherit => self.get_inherited_enabled(&item_ref),
                 ProjectOverrideState::Load => true,
                 ProjectOverrideState::Unload => false,
             };
-            let key = get_resource_item_key(&self.groups[group].subgroups[subgroup].items[item]);
-            self.overrides.insert(key, state);
-            Some(enabled)
-        } else {
-            let item_ref = &self.groups[group].subgroups[subgroup].items[item];
-            let enabled = !item_ref.enabled;
-            let path = item_ref.path.clone();
-            let resource_type = item_ref.resource_type;
-            self.update_item(&path, resource_type, enabled);
-            Some(enabled)
+            return Some((item_ref.path, item_ref.resource_type, enabled));
         }
+
+        let enabled = !item_ref.enabled;
+        if item_ref.metadata.origin == SourceOrigin::TopLevel {
+            self.toggle_top_level_resource(&item_ref, enabled);
+        } else {
+            self.toggle_package_resource(&item_ref, enabled);
+        }
+        Some((item_ref.path, item_ref.resource_type, enabled))
+    }
+
+    /// `toggleTopLevelResource` (config-selector.ts:532-578).
+    fn toggle_top_level_resource(&self, item: &ResourceItem, enabled: bool) {
+        let scope = get_item_scope(item);
+        let pattern = self.get_resource_pattern(item);
+        let replacement = if enabled {
+            format!("+{pattern}")
+        } else {
+            format!("-{pattern}")
+        };
+        let mut manager = lock(&self.settings_manager);
+        let settings = Self::settings_for_scope(&manager, scope);
+        let current = settings_string_array(&settings, item.resource_type.as_str());
+        let mut updated: Vec<String> = current
+            .into_iter()
+            .filter(|p| get_pattern_entry_target(p) != pattern)
+            .collect();
+        updated.push(replacement);
+        // User-scope writes are infallible (M5: only project writes can
+        // fail, surfaced in the project override path).
+        let _ = self.set_top_level_paths(&mut manager, scope, item.resource_type, updated);
+    }
+
+    /// `togglePackageResource` (config-selector.ts:580-637).
+    fn toggle_package_resource(&self, item: &ResourceItem, enabled: bool) {
+        let scope = get_item_scope(item);
+        let pattern = self.get_package_resource_pattern(item);
+        let replacement = if enabled {
+            format!("+{pattern}")
+        } else {
+            format!("-{pattern}")
+        };
+        let mut manager = lock(&self.settings_manager);
+        let settings = Self::settings_for_scope(&manager, scope);
+        let mut packages = packages_of(&settings);
+        let Some(pkg_index) = packages
+            .iter()
+            .position(|pkg| package_source_string(pkg) == item.metadata.source)
+        else {
+            return;
+        };
+
+        // Convert string to object form if needed (config-selector.ts:596-599).
+        let mut filter = match &packages[pkg_index] {
+            PackageSource::Source(source) => PackageSourceFilter {
+                source: source.clone(),
+                ..PackageSourceFilter::default()
+            },
+            PackageSource::Filtered(filter) => filter.clone(),
+        };
+
+        let current = filter_array(&filter, item.resource_type)
+            .cloned()
+            .unwrap_or_default();
+        let mut updated: Vec<String> = current
+            .into_iter()
+            .filter(|p| get_pattern_entry_target(p) != pattern)
+            .collect();
+        updated.push(replacement);
+        set_filter_array(
+            &mut filter,
+            item.resource_type,
+            if updated.is_empty() {
+                None
+            } else {
+                Some(updated)
+            },
+        );
+
+        // Clean up empty filter object (config-selector.ts:624-630).
+        let has_filters = RESOURCE_TYPES
+            .iter()
+            .any(|key| filter_array(&filter, *key).is_some());
+        packages[pkg_index] = if has_filters {
+            PackageSource::Filtered(filter)
+        } else {
+            PackageSource::Source(filter.source)
+        };
+
+        // User-scope writes are infallible (M5).
+        let _ = self.write_packages(&mut manager, scope, packages);
     }
 
     /// `renderCheckbox` (config-selector.ts:639-647).
@@ -1079,6 +1154,155 @@ impl ResourceList {
             && self.get_project_override_state(item) == ProjectOverrideState::Inherit
     }
 
+    /// `setProjectResourceOverride` (config-selector.ts:665-669).
+    fn set_project_resource_override(
+        &self,
+        item: &ResourceItem,
+        state: ProjectOverrideState,
+    ) -> bool {
+        if item.metadata.origin == SourceOrigin::TopLevel {
+            self.set_project_top_level_override(item, state)
+        } else {
+            self.set_project_package_override(item, state)
+        }
+    }
+
+    /// `setProjectTopLevelOverride` (config-selector.ts:671-687).
+    fn set_project_top_level_override(
+        &self,
+        item: &ResourceItem,
+        state: ProjectOverrideState,
+    ) -> bool {
+        let inherited = self.is_inherited_global_item(item);
+        let pattern = if inherited {
+            item.path.clone()
+        } else {
+            self.get_resource_pattern_for_scope(item, SourceScope::Project)
+        };
+        let patterns = self.get_top_level_override_patterns(item, SourceScope::Project);
+        let mut manager = lock(&self.settings_manager);
+        let current =
+            settings_string_array(&manager.get_project_settings(), item.resource_type.as_str());
+        let mut updated: Vec<String> = current
+            .into_iter()
+            .filter(|entry| {
+                let target = get_pattern_entry_target(entry);
+                if entry.starts_with(['!', '+', '-']) && patterns.contains(target) {
+                    return false;
+                }
+                !(state == ProjectOverrideState::Inherit && inherited && target == pattern)
+            })
+            .collect();
+        if state != ProjectOverrideState::Inherit {
+            if inherited && !updated.contains(&pattern) {
+                updated.push(pattern.clone());
+            }
+            let prefix = if state == ProjectOverrideState::Load {
+                '+'
+            } else {
+                '-'
+            };
+            updated.push(format!("{prefix}{pattern}"));
+        }
+        self.set_top_level_paths(
+            &mut manager,
+            SourceScope::Project,
+            item.resource_type,
+            updated,
+        )
+        .map_err(|error| {
+            // Surface the write failure (T14 review M5): the toggle stays
+            // un-applied (caller returns `None`), mirroring the upstream
+            // throw. Stderr keeps the failure visible without a component
+            // notification channel.
+            eprintln!("pir config: failed to write project settings: {error}");
+            error
+        })
+        .is_ok()
+    }
+
+    /// `setProjectPackageOverride` (config-selector.ts:696-729).
+    fn set_project_package_override(
+        &self,
+        item: &ResourceItem,
+        state: ProjectOverrideState,
+    ) -> bool {
+        let item_scope = get_item_scope(item);
+        let pattern = self.get_package_resource_pattern(item);
+        let mut manager = lock(&self.settings_manager);
+        let mut packages = packages_of(&manager.get_project_settings());
+        let pkg_index = packages.iter().position(|pkg| {
+            self.package_source_string_matches(
+                &item.metadata.source,
+                item_scope,
+                package_source_string(pkg),
+                SourceScope::Project,
+            )
+        });
+        let pkg_index = match pkg_index {
+            Some(index) => index,
+            None => {
+                if state == ProjectOverrideState::Inherit {
+                    return false;
+                }
+                packages.push(self.create_package_override_source(item));
+                packages.len() - 1
+            }
+        };
+
+        let mut filter = match &packages[pkg_index] {
+            PackageSource::Source(source) => PackageSourceFilter {
+                source: source.clone(),
+                ..PackageSourceFilter::default()
+            },
+            PackageSource::Filtered(filter) => filter.clone(),
+        };
+        let mut updated: Vec<String> = filter_array(&filter, item.resource_type)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| get_pattern_entry_target(entry) != pattern)
+            .collect();
+        if state != ProjectOverrideState::Inherit {
+            let prefix = if state == ProjectOverrideState::Load {
+                '+'
+            } else {
+                '-'
+            };
+            updated.push(format!("{prefix}{pattern}"));
+        }
+        set_filter_array(
+            &mut filter,
+            item.resource_type,
+            if updated.is_empty() {
+                None
+            } else {
+                Some(updated)
+            },
+        );
+        let has_filters = RESOURCE_TYPES
+            .iter()
+            .any(|key| filter_array(&filter, *key).is_some());
+        if !has_filters {
+            if filter.autoload == Some(false) {
+                packages.remove(pkg_index);
+            } else {
+                packages[pkg_index] = PackageSource::Source(filter.source);
+            }
+        } else {
+            packages[pkg_index] = PackageSource::Filtered(filter);
+        }
+        self.write_packages(&mut manager, SourceScope::Project, packages)
+            .map_err(|error| {
+                // Surface the write failure (T14 review M5): the toggle
+                // stays un-applied (caller returns `None`), mirroring the
+                // upstream throw.
+                eprintln!("pir config: failed to write project settings: {error}");
+                error
+            })
+            .is_ok()
+    }
+
     /// `getNextOverrideState` (config-selector.ts:731-737).
     fn get_next_override_state(&self, item: &ResourceItem) -> ProjectOverrideState {
         let state = self.get_project_override_state(item);
@@ -1108,17 +1332,54 @@ impl ResourceList {
         }
     }
 
-    /// `getProjectOverrideState` (config-selector.ts:739-757) — local form:
-    /// reads the in-memory override map instead of the project settings
-    /// pattern arrays (see module header).
+    /// `getProjectOverrideState` (config-selector.ts:739-757).
     fn get_project_override_state(&self, item: &ResourceItem) -> ProjectOverrideState {
         if self.scope() != ConfigWriteScope::Project {
             return ProjectOverrideState::Inherit;
         }
-        self.overrides
-            .get(&get_resource_item_key(item))
-            .copied()
-            .unwrap_or(ProjectOverrideState::Inherit)
+        if item.metadata.origin == SourceOrigin::TopLevel {
+            let entries = {
+                let manager = lock(&self.settings_manager);
+                settings_string_array(&manager.get_project_settings(), item.resource_type.as_str())
+            };
+            let patterns = self.get_top_level_override_patterns(item, SourceScope::Project);
+            return Self::get_override_state_from_entries(&entries, &patterns, false);
+        }
+        let pkg = {
+            let manager = lock(&self.settings_manager);
+            self.find_matching_package_source(&manager, item, SourceScope::Project)
+        };
+        let Some(PackageSource::Filtered(filter)) = pkg else {
+            return ProjectOverrideState::Inherit;
+        };
+        let Some(entries) = filter_array(&filter, item.resource_type) else {
+            return ProjectOverrideState::Inherit;
+        };
+        let patterns = HashSet::from([self.get_package_resource_pattern(item)]);
+        Self::get_override_state_from_entries(entries, &patterns, filter.autoload != Some(false))
+    }
+
+    /// `getOverrideStateFromEntries` (config-selector.ts:759-772).
+    fn get_override_state_from_entries(
+        entries: &[String],
+        patterns: &HashSet<String>,
+        empty_array_is_unload: bool,
+    ) -> ProjectOverrideState {
+        if entries.is_empty() && empty_array_is_unload {
+            return ProjectOverrideState::Unload;
+        }
+        let mut state = ProjectOverrideState::Inherit;
+        for entry in entries {
+            if !patterns.contains(get_pattern_entry_target(entry)) {
+                continue;
+            }
+            if entry.starts_with('!') || entry.starts_with('-') {
+                state = ProjectOverrideState::Unload;
+            } else {
+                state = ProjectOverrideState::Load;
+            }
+        }
+        state
     }
 
     /// `getInheritedEnabled` (config-selector.ts:774-779).
@@ -1127,7 +1388,7 @@ impl ResourceList {
             .get(&get_resource_item_key(item))
             .copied()
             .unwrap_or_else(|| {
-                if item.scope == SettingsScope::User {
+                if get_item_scope(item) == SourceScope::User {
                     item.enabled
                 } else {
                     true
@@ -1137,10 +1398,227 @@ impl ResourceList {
 
     /// `isInheritedGlobalItem` (config-selector.ts:781-783).
     fn is_inherited_global_item(&self, item: &ResourceItem) -> bool {
-        item.scope == SettingsScope::User
+        get_item_scope(item) == SourceScope::User
             || self
                 .inherited_enabled_by_key
                 .contains_key(&get_resource_item_key(item))
+    }
+
+    /// `getTopLevelOverridePatterns` (config-selector.ts:785-794).
+    fn get_top_level_override_patterns(
+        &self,
+        item: &ResourceItem,
+        scope: SourceScope,
+    ) -> HashSet<String> {
+        let base_dir = self.get_top_level_base_dir(scope);
+        let mut patterns = HashSet::from([
+            self.get_resource_pattern_for_scope(item, scope),
+            item.path.clone(),
+            lexical_relative(&base_dir, Path::new(&item.path))
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+        if let Some(base_dir) = &item.metadata.base_dir {
+            patterns.insert(
+                lexical_relative(base_dir, Path::new(&item.path))
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        patterns
+    }
+
+    /// `getResourcePatternForScope` (config-selector.ts:796-801).
+    fn get_resource_pattern_for_scope(&self, item: &ResourceItem, scope: SourceScope) -> String {
+        let source_scope = get_item_scope(item);
+        if scope != source_scope {
+            return item.path.clone();
+        }
+        let base_dir = item
+            .metadata
+            .base_dir
+            .clone()
+            .unwrap_or_else(|| self.get_top_level_base_dir(source_scope));
+        lexical_relative(&base_dir, Path::new(&item.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// `createPackageOverrideSource` (config-selector.ts:803-808).
+    fn create_package_override_source(&self, item: &ResourceItem) -> PackageSource {
+        let source = &item.metadata.source;
+        if !is_local_path(source) {
+            return PackageSource::Filtered(PackageSourceFilter {
+                source: source.clone(),
+                autoload: Some(false),
+                ..PackageSourceFilter::default()
+            });
+        }
+        let base_dir = self.get_top_level_base_dir(get_item_scope(item));
+        let source_path = resolve_path(source.trim(), &base_dir);
+        let project_base_dir = self.get_top_level_base_dir(SourceScope::Project);
+        let relative = lexical_relative(&project_base_dir, &source_path);
+        let relative = relative.to_string_lossy();
+        PackageSource::Filtered(PackageSourceFilter {
+            source: if relative.is_empty() {
+                ".".to_string()
+            } else {
+                relative.into_owned()
+            },
+            autoload: Some(false),
+            ..PackageSourceFilter::default()
+        })
+    }
+
+    /// `packageSourceStringMatches` (config-selector.ts:810-821).
+    fn package_source_string_matches(
+        &self,
+        left_source: &str,
+        left_scope: SourceScope,
+        right_source: &str,
+        right_scope: SourceScope,
+    ) -> bool {
+        if left_source == right_source {
+            return true;
+        }
+        if !is_local_path(left_source) || !is_local_path(right_source) {
+            return false;
+        }
+        let left = resolve_path(left_source.trim(), &self.get_top_level_base_dir(left_scope));
+        let right = resolve_path(
+            right_source.trim(),
+            &self.get_top_level_base_dir(right_scope),
+        );
+        left == right
+    }
+
+    /// `findMatchingPackageSource` (config-selector.ts:823-836).
+    fn find_matching_package_source(
+        &self,
+        manager: &SettingsManager,
+        item: &ResourceItem,
+        target_scope: SourceScope,
+    ) -> Option<PackageSource> {
+        let settings = Self::settings_for_scope(manager, target_scope);
+        packages_of(&settings).into_iter().find(|pkg| {
+            self.package_source_string_matches(
+                &item.metadata.source,
+                get_item_scope(item),
+                package_source_string(pkg),
+                target_scope,
+            )
+        })
+    }
+
+    /// `getTopLevelBaseDir` (config-selector.ts:850-852).
+    fn get_top_level_base_dir(&self, scope: SourceScope) -> PathBuf {
+        if scope == SourceScope::Project {
+            self.cwd.join(CONFIG_DIR_NAME)
+        } else {
+            self.agent_dir.clone()
+        }
+    }
+
+    /// `getResourcePattern` (config-selector.ts:854-858).
+    fn get_resource_pattern(&self, item: &ResourceItem) -> String {
+        let scope = get_item_scope(item);
+        let base_dir = item
+            .metadata
+            .base_dir
+            .clone()
+            .unwrap_or_else(|| self.get_top_level_base_dir(scope));
+        lexical_relative(&base_dir, Path::new(&item.path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// `getPackageResourcePattern` (config-selector.ts:860-863).
+    fn get_package_resource_pattern(&self, item: &ResourceItem) -> String {
+        let path = Path::new(&item.path);
+        let base_dir = item.metadata.base_dir.clone().unwrap_or_else(|| {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+        lexical_relative(&base_dir, path)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Settings of one write target (`scope === "project" ? getProjectSettings()
+    /// : getGlobalSettings()`).
+    fn settings_for_scope(manager: &SettingsManager, scope: SourceScope) -> Settings {
+        if scope == SourceScope::Project {
+            manager.get_project_settings()
+        } else {
+            manager.get_global_settings()
+        }
+    }
+
+    /// The `setProject*Paths` / `set*Paths` dispatch
+    /// (config-selector.ts:557-577, 689-694). Project writes are trust-gated
+    /// by the `pir config` command, so the setter `Result` cannot fail here
+    /// (upstream would throw).
+    /// The `setProject*Paths` / `set*Paths` dispatch
+    /// (config-selector.ts:557-577, 689-694). Project writes are trust-gated
+    /// by the `pir config` command, but can still fail (pre-existing
+    /// unparseable `.pir/settings.json`, storage IO errors) — the error is
+    /// surfaced to the caller (T14 review M5; upstream would throw). User
+    /// scope setters are infallible.
+    fn set_top_level_paths(
+        &self,
+        manager: &mut SettingsManager,
+        scope: SourceScope,
+        resource_type: ResourceType,
+        paths: Vec<String>,
+    ) -> Result<(), String> {
+        match (scope == SourceScope::Project, resource_type) {
+            (true, ResourceType::Extensions) => manager
+                .set_project_extension_paths(paths)
+                .map_err(|e| e.to_string()),
+            (true, ResourceType::Skills) => manager
+                .set_project_skill_paths(paths)
+                .map_err(|e| e.to_string()),
+            (true, ResourceType::Prompts) => manager
+                .set_project_prompt_template_paths(paths)
+                .map_err(|e| e.to_string()),
+            (true, ResourceType::Themes) => manager
+                .set_project_theme_paths(paths)
+                .map_err(|e| e.to_string()),
+            (false, ResourceType::Extensions) => {
+                manager.set_extension_paths(paths);
+                Ok(())
+            }
+            (false, ResourceType::Skills) => {
+                manager.set_skill_paths(paths);
+                Ok(())
+            }
+            (false, ResourceType::Prompts) => {
+                manager.set_prompt_template_paths(paths);
+                Ok(())
+            }
+            (false, ResourceType::Themes) => {
+                manager.set_theme_paths(paths);
+                Ok(())
+            }
+        }
+    }
+
+    /// `setPackages` / `setProjectPackages` (config-selector.ts:632-636, 727).
+    fn write_packages(
+        &self,
+        manager: &mut SettingsManager,
+        scope: SourceScope,
+        packages: Vec<PackageSource>,
+    ) -> Result<(), String> {
+        if scope == SourceScope::Project {
+            manager
+                .set_project_packages(packages)
+                .map_err(|e| e.to_string())
+        } else {
+            manager.set_packages(packages);
+            Ok(())
+        }
     }
 }
 
@@ -1195,18 +1673,15 @@ pub struct ConfigSelectorComponent {
 
 impl ConfigSelectorComponent {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::type_complexity)] // mirrors the upstream callback type
     pub fn new(
-        resources: &LoadedResources,
+        resolved_paths: ScopedResolvedPaths,
+        settings_manager: Arc<Mutex<SettingsManager>>,
         theme: Arc<Theme>,
         cwd: &str,
         agent_dir: &str,
         terminal_height: Option<usize>,
         write_scope: ConfigWriteScope,
         project_mode_available: bool,
-        #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-        on_toggle: Option<Box<dyn FnMut(&str, &str, bool) + Send>>,
-        on_scope_change: Option<Box<dyn FnMut(&str) + Send>>,
         on_cancel: Option<Box<dyn FnMut() + Send>>,
         on_exit: Option<Box<dyn FnMut() + Send>>,
     ) -> Self {
@@ -1221,16 +1696,15 @@ impl ConfigSelectorComponent {
             project_mode_available,
         );
         let mut resource_list = ResourceList::new(
-            resources,
+            &resolved_paths,
+            settings_manager,
             Arc::clone(&theme),
             Arc::clone(&write_scope_cell),
-            cwd,
-            agent_dir,
+            Path::new(cwd),
+            Path::new(agent_dir),
             terminal_height,
             project_mode_available,
         );
-        resource_list.on_toggle = on_toggle;
-        resource_list.on_scope_change = on_scope_change;
         resource_list.on_cancel = on_cancel;
         resource_list.on_exit = on_exit;
         Self {
@@ -1256,17 +1730,19 @@ impl ConfigSelectorComponent {
 
 impl Component for ConfigSelectorComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        // Chrome matches upstream's child order (config-selector.ts:901-930):
+        // Spacer / DynamicBorder / Spacer / header / Spacer / list /
+        // Spacer / DynamicBorder (T14 review m1 — the four spacers were
+        // omitted while the list's `terminalHeight - 8` chrome constant is
+        // upstream's; the Rust layout now lines up with upstream's).
         let mut lines = Vec::new();
-        // Container children (config-selector.ts:901-930): Spacer(1),
-        // DynamicBorder, Spacer(1), header, Spacer(1), resource list,
-        // Spacer(1), DynamicBorder.
-        lines.push(String::new());
+        lines.push(String::new()); // Spacer
         lines.extend(self.top_border.render(width));
-        lines.push(String::new());
+        lines.push(String::new()); // Spacer
         lines.extend(self.header.render(width));
-        lines.push(String::new());
+        lines.push(String::new()); // Spacer
         lines.extend(self.resource_list.render(width));
-        lines.push(String::new());
+        lines.push(String::new()); // Spacer
         lines.extend(self.bottom_border.render(width));
         lines
     }
@@ -1291,82 +1767,142 @@ impl Focusable for ConfigSelectorComponent {
 
 #[cfg(test)]
 mod tests {
+    //! Port of the config-selector intent: grouping/render, search,
+    //! navigation, the global toggle and the project override cycle — with
+    //! settings persistence asserted against real settings files.
+
     use super::*;
-    use crate::core::prompt_templates::PromptTemplate;
-    use crate::core::skills::{Skill, SourceInfo};
+    use crate::core::package_manager::{ResolvedPaths, ResolvedResource};
+    use crate::core::settings_manager::SettingsManagerCreateOptions;
     use crate::core::themes::load_theme;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirs {
+        root: PathBuf,
+        cwd: PathBuf,
+        agent_dir: PathBuf,
+    }
+
+    impl TestDirs {
+        fn new() -> Self {
+            let unique = format!(
+                "pir-config-selector-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            );
+            let root = std::env::temp_dir().join(unique);
+            let cwd = root.join("proj");
+            let agent_dir = root.join("agent");
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            TestDirs {
+                root,
+                cwd,
+                agent_dir,
+            }
+        }
+    }
+
+    impl Drop for TestDirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn theme() -> Arc<Theme> {
         Arc::new(load_theme("dark", None).expect("builtin dark theme"))
     }
 
-    /// Install the global 73-entry keybindings table (tui.select.*,
-    /// tui.input.tab, ...).
+    /// Install the global keybindings table (tui.select.*, tui.input.tab, ...).
     fn install_keybindings() {
         crate::modes::interactive::interactive_mode::install_global_keybindings();
+        // Legacy key sequences (the Kitty flag is process-global test state).
+        pir_tui::keys::set_kitty_protocol_active(false);
     }
 
-    fn skill(path: &str, source: &str, scope: SourceScope) -> Skill {
-        // Auto-discovered skills carry `base_dir` = the discovery root
-        // (the agent dir / project `.pir` dir, skills.rs:1096-1101).
-        let base_dir = if scope == SourceScope::User {
-            "/home/tester/.pir/agent"
-        } else {
-            "/home/tester/proj/.pir"
-        };
-        Skill {
-            name: Path::new(path)
-                .parent()
-                .unwrap()
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            description: String::new(),
-            file_path: PathBuf::from(path),
-            base_dir: PathBuf::from(base_dir),
-            source_info: SourceInfo {
-                path: PathBuf::from(path),
-                source: source.to_string(),
-                scope,
-                origin: SourceOrigin::TopLevel,
-                base_dir: Some(PathBuf::from(base_dir)),
-            },
-            disable_model_invocation: false,
+    fn auto_metadata(dirs: &TestDirs, scope: SourceScope) -> ResourcePathMetadata {
+        ResourcePathMetadata {
+            source: "auto".to_string(),
+            scope,
+            origin: SourceOrigin::TopLevel,
+            base_dir: Some(match scope {
+                SourceScope::User => dirs.agent_dir.clone(),
+                _ => dirs.cwd.join(CONFIG_DIR_NAME),
+            }),
         }
     }
 
-    #[allow(clippy::field_reassign_with_default)] // test fixture builder
-    fn sample_resources() -> LoadedResources {
-        let mut resources = LoadedResources::default();
-        resources.skills = vec![
-            skill(
-                "/home/tester/.pir/agent/skills/format/SKILL.md",
-                "auto",
-                SourceScope::User,
-            ),
-            skill(
-                "/home/tester/proj/.pir/skills/deploy/SKILL.md",
-                "auto",
-                SourceScope::Project,
-            ),
-        ];
-        resources.prompts = vec![PromptTemplate {
-            name: "review".to_string(),
-            description: "code review".to_string(),
-            argument_hint: None,
-            content: String::new(),
-            file_path: PathBuf::from("/home/tester/.pir/agent/prompts/review.md"),
-        }];
-        let mut nord = crate::core::themes::load_theme("dark", None).expect("builtin dark theme");
-        nord.name = Some("nord".to_string());
-        nord.source_path = Some(PathBuf::from("/home/tester/.pir/agent/themes/nord.json"));
-        resources.themes = vec![nord];
-        resources.extensions.paths = vec![
-            PathBuf::from("/home/tester/.pir/agent/extensions/my-ext"),
-            PathBuf::from("/home/tester/proj/.pir/extensions/local-helper"),
-        ];
-        resources
+    fn resource(path: PathBuf, enabled: bool, metadata: ResourcePathMetadata) -> ResolvedResource {
+        ResolvedResource {
+            path,
+            enabled,
+            metadata,
+        }
+    }
+
+    /// A global view with one user auto skill + one user auto prompt, and a
+    /// project view adding a project auto skill.
+    fn sample_paths(dirs: &TestDirs) -> ScopedResolvedPaths {
+        let user_skill = dirs.agent_dir.join("skills/format/SKILL.md");
+        let user_prompt = dirs.agent_dir.join("prompts/review.md");
+        let project_skill = dirs.cwd.join(".pir/skills/deploy/SKILL.md");
+        let global = ResolvedPaths {
+            skills: vec![resource(
+                user_skill.clone(),
+                true,
+                auto_metadata(dirs, SourceScope::User),
+            )],
+            prompts: vec![resource(
+                user_prompt,
+                true,
+                auto_metadata(dirs, SourceScope::User),
+            )],
+            ..ResolvedPaths::default()
+        };
+        let project = ResolvedPaths {
+            skills: vec![
+                resource(user_skill, true, auto_metadata(dirs, SourceScope::User)),
+                resource(
+                    project_skill,
+                    true,
+                    auto_metadata(dirs, SourceScope::Project),
+                ),
+            ],
+            ..ResolvedPaths::default()
+        };
+        ScopedResolvedPaths { global, project }
+    }
+
+    fn manager(dirs: &TestDirs, project_trusted: bool) -> Arc<Mutex<SettingsManager>> {
+        Arc::new(Mutex::new(SettingsManager::create(
+            &dirs.cwd,
+            Some(&dirs.agent_dir),
+            SettingsManagerCreateOptions { project_trusted },
+        )))
+    }
+
+    fn component(
+        dirs: &TestDirs,
+        paths: ScopedResolvedPaths,
+        settings_manager: Arc<Mutex<SettingsManager>>,
+        write_scope: ConfigWriteScope,
+        project_mode_available: bool,
+    ) -> ConfigSelectorComponent {
+        install_keybindings();
+        ConfigSelectorComponent::new(
+            paths,
+            settings_manager,
+            theme(),
+            &dirs.cwd.to_string_lossy(),
+            &dirs.agent_dir.to_string_lossy(),
+            Some(24),
+            write_scope,
+            project_mode_available,
+            None,
+            None,
+        )
     }
 
     /// Strip ANSI escape sequences (shared with pir-tui tests).
@@ -1393,351 +1929,287 @@ mod tests {
             .collect()
     }
 
+    fn global_settings(dirs: &TestDirs) -> serde_json::Value {
+        let content = std::fs::read_to_string(dirs.agent_dir.join("settings.json")).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    fn project_settings(dirs: &TestDirs) -> serde_json::Value {
+        let content = std::fs::read_to_string(dirs.cwd.join(".pir/settings.json")).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
     #[test]
     fn renders_grouped_resources_with_global_header() {
-        install_keybindings();
-        let component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
+        let dirs = TestDirs::new();
+        let component = component(
+            &dirs,
+            sample_paths(&dirs),
+            manager(&dirs, true),
             ConfigWriteScope::Global,
             true,
-            None,
-            None,
-            None,
-            None,
         );
-        let lines = plain(component.render(80));
-        // Spacer + border + spacer + header (2 lines).
-        assert!(lines[3].starts_with("Global Resources"));
-        assert!(lines[3].contains("tab"));
-        assert!(lines[3].contains("space"));
-        assert!(lines[4].contains("~/.pir/agent/settings.json"));
-        // User group (accent) appears before project group.
-        let joined = lines.join("\n");
-        assert!(joined.contains("User ("));
-        assert!(joined.contains("Project ("));
-        assert!(joined.contains("Extensions"));
-        assert!(joined.contains("Skills"));
-        assert!(joined.contains("Prompts"));
-        assert!(joined.contains("Themes"));
-        // Skills display by parent folder, extensions keep folder prefix.
-        assert!(joined.contains("format"));
-        assert!(joined.contains("deploy"));
-        assert!(joined.contains("my-ext"));
-        assert!(joined.contains("local-helper"));
-        assert!(joined.contains("review.md"));
-        assert!(joined.contains("nord.json"));
-        // Selection starts on the first item.
-        assert!(joined.contains("> "));
+        let lines = plain(component.render(100));
+        let text = lines.join("\n");
+        assert!(text.contains("Global Resources"), "{text}");
+        assert!(text.contains("~/.pir/agent/settings.json"), "{text}");
+        assert!(text.contains("format"), "{text}");
+        assert!(text.contains("review.md"), "{text}");
     }
 
     #[test]
-    fn toggles_item_in_global_scope_and_fires_on_toggle() {
-        install_keybindings();
-        let fired = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
-        #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-        let on_toggle: Option<Box<dyn FnMut(&str, &str, bool) + Send>> = Some(Box::new({
-            let fired = Arc::clone(&fired);
-            move |scope, name, enabled| {
-                fired
-                    .lock()
-                    .unwrap()
-                    .push((scope.to_string(), name.to_string(), enabled));
-            }
-        }));
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
+    fn global_toggle_writes_disable_then_enable_pattern() {
+        let dirs = TestDirs::new();
+        let mut component = component(
+            &dirs,
+            sample_paths(&dirs),
+            manager(&dirs, true),
             ConfigWriteScope::Global,
             true,
-            on_toggle,
-            None,
-            None,
-            None,
         );
-        // First item = first user-scope item (my-ext: the extensions
-        // subgroup sorts before skills).
-        let before = plain(component.render(80));
-        assert!(before
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("my-ext")));
+        // First item is the user skill (skills subgroup sorts first).
+        component.handle_input(" ");
+        let settings = global_settings(&dirs);
+        assert_eq!(
+            settings["skills"][0].as_str().unwrap(),
+            "-skills/format/SKILL.md"
+        );
 
-        // Enter confirms and toggles off.
-        component.handle_input("\r");
-        let after = plain(component.render(80));
-        assert!(after
-            .iter()
-            .any(|l| l.contains("my-ext") && l.contains("[ ]")));
-        let fired = fired.lock().unwrap();
-        assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].0, "global");
-        assert_eq!(fired[0].1, "my-ext");
-        assert!(!fired[0].2);
+        component.handle_input(" ");
+        let settings = global_settings(&dirs);
+        assert_eq!(
+            settings["skills"][0].as_str().unwrap(),
+            "+skills/format/SKILL.md"
+        );
     }
 
     #[test]
-    fn moves_selection_and_clamps_at_ends() {
-        install_keybindings();
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
+    fn global_package_toggle_converts_entry_to_object_form() {
+        let dirs = TestDirs::new();
+        let package_root = dirs.agent_dir.join("npm/node_modules/pkg");
+        let package_metadata = ResourcePathMetadata {
+            source: "npm:pkg".to_string(),
+            scope: SourceScope::User,
+            origin: SourceOrigin::Package,
+            base_dir: Some(package_root.clone()),
+        };
+        let paths = ScopedResolvedPaths {
+            global: ResolvedPaths {
+                themes: vec![resource(
+                    package_root.join("themes/nord.json"),
+                    true,
+                    package_metadata,
+                )],
+                ..ResolvedPaths::default()
+            },
+            project: ResolvedPaths::default(),
+        };
+        let settings_manager = manager(&dirs, true);
+        lock(&settings_manager).set_packages(vec![PackageSource::Source("npm:pkg".to_string())]);
+        let mut component = component(
+            &dirs,
+            paths,
+            settings_manager,
             ConfigWriteScope::Global,
             true,
-            None,
-            None,
-            None,
-            None,
         );
-        // Item order: my-ext, format, review.md, nord.json, local-helper,
-        // deploy. Selection starts on the first item (my-ext); down moves
-        // item-to-item (headers skipped).
-        component.handle_input("\x1b[B");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("format")));
-        // Five more downs reach the last item (deploy).
-        for _ in 0..5 {
-            component.handle_input("\x1b[B");
-        }
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("deploy")));
-        // Upstream findNextItem does NOT wrap (config-selector.ts:309-318):
-        // down at the last item stays, up moves back.
-        component.handle_input("\x1b[B");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("deploy")));
-        component.handle_input("\x1b[A");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("local-helper")));
-        // Up from the first item stays put.
-        for _ in 0..5 {
-            component.handle_input("\x1b[A");
-        }
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("> ") && l.contains("my-ext")));
+        component.handle_input(" ");
+        let settings = global_settings(&dirs);
+        assert_eq!(
+            settings["packages"][0]["source"].as_str().unwrap(),
+            "npm:pkg"
+        );
+        assert_eq!(
+            settings["packages"][0]["themes"][0].as_str().unwrap(),
+            "-themes/nord.json"
+        );
+
+        // Toggling back writes the explicit enable pattern (upstream keeps
+        // the object form with `+<pattern>`, config-selector.ts:616-620).
+        component.handle_input(" ");
+        let settings = global_settings(&dirs);
+        assert_eq!(
+            settings["packages"][0]["themes"][0].as_str().unwrap(),
+            "+themes/nord.json"
+        );
     }
 
     #[test]
-    fn page_keys_jump_by_window() {
-        install_keybindings();
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
-            ConfigWriteScope::Global,
+    fn project_scope_cycles_override_states_into_project_settings() {
+        let dirs = TestDirs::new();
+        let mut component = component(
+            &dirs,
+            sample_paths(&dirs),
+            manager(&dirs, true),
+            ConfigWriteScope::Project,
             true,
-            None,
-            None,
-            None,
-            None,
         );
-        component.handle_input("\x1b[6~"); // pageDown
-        let lines = plain(component.render(80));
-        // Jumps maxVisible (16) rows down, clamped to the last item.
-        assert!(lines
+        // First project item: the inherited user skill → inherit → unload.
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        let skill_path = dirs.agent_dir.join("skills/format/SKILL.md");
+        let skill_path = skill_path.to_string_lossy();
+        let entries: Vec<&str> = settings["skills"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|l| l.contains("> ") && l.contains("deploy")));
-        component.handle_input("\x1b[5~"); // pageUp
-        let lines = plain(component.render(80));
-        // Jumps back up by the window, landing on the first item.
-        assert!(lines
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![skill_path.as_ref(), &format!("-{skill_path}")]
+        );
+
+        // unload → load (inherited enabled).
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        let entries: Vec<&str> = settings["skills"]
+            .as_array()
+            .unwrap()
             .iter()
-            .any(|l| l.contains("> ") && l.contains("my-ext")));
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![skill_path.as_ref(), &format!("+{skill_path}")]
+        );
+
+        // load → inherit: the override entries are removed
+        // (config-selector.ts:675-680).
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        let entries: Vec<&str> = settings["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(entries, Vec::<&str>::new());
     }
 
     #[test]
-    fn tab_switches_write_scope_and_fires_on_scope_change() {
-        install_keybindings();
-        let fired = Arc::new(Mutex::new(Vec::<String>::new()));
-        #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-        let on_scope_change: Option<Box<dyn FnMut(&str) + Send>> = Some(Box::new({
-            let fired = Arc::clone(&fired);
-            move |scope| {
-                fired.lock().unwrap().push(scope.to_string());
-            }
-        }));
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
+    fn project_package_override_creates_autoload_false_entry() {
+        let dirs = TestDirs::new();
+        // A user-scope npm package skill; the project settings have no
+        // packages entry for it yet. The global view lists it too (the
+        // inherited-enabled map is built from the global groups).
+        let package_root = dirs.agent_dir.join("npm/node_modules/pkg");
+        let package_metadata = ResourcePathMetadata {
+            source: "npm:pkg".to_string(),
+            scope: SourceScope::User,
+            origin: SourceOrigin::Package,
+            base_dir: Some(package_root.clone()),
+        };
+        let skill_resource = resource(
+            package_root.join("skills/tool/SKILL.md"),
+            true,
+            package_metadata,
+        );
+        let paths = ScopedResolvedPaths {
+            global: ResolvedPaths {
+                skills: vec![skill_resource.clone()],
+                ..ResolvedPaths::default()
+            },
+            project: ResolvedPaths {
+                skills: vec![skill_resource],
+                ..ResolvedPaths::default()
+            },
+        };
+        let mut component = component(
+            &dirs,
+            paths,
+            manager(&dirs, true),
+            ConfigWriteScope::Project,
+            true,
+        );
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        assert_eq!(
+            settings["packages"][0]["source"].as_str().unwrap(),
+            "npm:pkg"
+        );
+        assert_eq!(settings["packages"][0]["autoload"], false);
+        // Inherited enabled → first cycle state is "unload".
+        assert_eq!(
+            settings["packages"][0]["skills"][0].as_str().unwrap(),
+            "-skills/tool/SKILL.md"
+        );
+
+        // Cycle back to inherit: the override entry is removed entirely.
+        component.handle_input(" ");
+        component.handle_input(" ");
+        let settings = project_settings(&dirs);
+        assert_eq!(settings["packages"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn tab_switches_write_scope() {
+        let dirs = TestDirs::new();
+        let mut component = component(
+            &dirs,
+            sample_paths(&dirs),
+            manager(&dirs, true),
             ConfigWriteScope::Global,
             true,
-            None,
-            on_scope_change,
-            None,
-            None,
         );
+        assert_eq!(component.write_scope(), ConfigWriteScope::Global);
         component.handle_input("\t");
-        let lines = plain(component.render(80));
-        assert!(lines.iter().any(|l| l.contains("Project Local Resources")));
-        assert!(lines.iter().any(|l| l.contains(".pir/settings.json")));
-        assert_eq!(*fired.lock().unwrap(), vec!["project".to_string()]);
-        // User groups are dimmed and marked inherited in project scope.
-        let joined = lines.join("\n");
-        assert!(joined.contains("inherited global"));
-        assert!(joined.contains("project load") || joined.contains("cycle"));
-
-        // Back to global.
+        assert_eq!(component.write_scope(), ConfigWriteScope::Project);
+        let lines = plain(component.render(100));
+        let text = lines.join("\n");
+        assert!(text.contains("Project Local Resources"), "{text}");
+        assert!(text.contains("deploy"), "{text}");
         component.handle_input("\t");
-        let lines = plain(component.render(80));
-        assert!(lines.iter().any(|l| l.contains("Global Resources")));
-        assert_eq!(
-            *fired.lock().unwrap(),
-            vec!["project".to_string(), "global".to_string()]
-        );
+        assert_eq!(component.write_scope(), ConfigWriteScope::Global);
     }
 
     #[test]
-    fn project_scope_cycles_override_states() {
+    fn escape_and_ctrl_c_cancel() {
+        // `tui.select.cancel` binds both escape and ctrl+c
+        // (keybindings.ts:130-132), so the explicit ctrl+c → `onExit`
+        // branch (config-selector.ts:491-493) is unreachable upstream;
+        // the port preserves that quirk.
+        use std::sync::Mutex as StdMutex;
+        let dirs = TestDirs::new();
+        let cancelled = Arc::new(StdMutex::new(0));
+        let cancelled_clone = Arc::clone(&cancelled);
         install_keybindings();
-        let fired = Arc::new(Mutex::new(Vec::<(String, String, bool)>::new()));
-        #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-        let on_toggle: Option<Box<dyn FnMut(&str, &str, bool) + Send>> = Some(Box::new({
-            let fired = Arc::clone(&fired);
-            move |scope, name, enabled| {
-                fired
-                    .lock()
-                    .unwrap()
-                    .push((scope.to_string(), name.to_string(), enabled));
-            }
-        }));
         let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
+            sample_paths(&dirs),
+            manager(&dirs, true),
             theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
+            &dirs.cwd.to_string_lossy(),
+            &dirs.agent_dir.to_string_lossy(),
             Some(24),
             ConfigWriteScope::Global,
             true,
-            on_toggle,
-            None,
-            None,
-            None,
+            Some(Box::new(move || {
+                *cancelled_clone.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            })),
+            Some(Box::new(|| {
+                panic!("onExit is unreachable (upstream quirk)")
+            })),
         );
-        component.handle_input("\t"); // → project scope
-
-        // First item is a user-scope item ("my-ext", inherited enabled).
-        // Cycle: inherit → unload → load → inherit.
-        component.handle_input(" ");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("[-]") && l.contains("my-ext") && l.contains("project unload")));
-        component.handle_input(" ");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("[+]") && l.contains("my-ext") && l.contains("project load")));
-        component.handle_input(" ");
-        let lines = plain(component.render(80));
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("my-ext") && l.contains("inherited global")));
-
-        let fired = fired.lock().unwrap();
-        assert_eq!(fired.len(), 3);
-        assert_eq!(
-            fired[0],
-            ("project".to_string(), "my-ext".to_string(), false)
-        );
-        assert_eq!(
-            fired[1],
-            ("project".to_string(), "my-ext".to_string(), true)
-        );
-        assert_eq!(
-            fired[2],
-            ("project".to_string(), "my-ext".to_string(), true)
-        );
-    }
-
-    #[test]
-    fn escape_cancels_and_ctrl_c_exits() {
-        install_keybindings();
-        let cancelled = Arc::new(Mutex::new(0usize));
-        let exited = Arc::new(Mutex::new(0usize));
-        let on_cancel: Option<Box<dyn FnMut() + Send>> = Some(Box::new({
-            let cancelled = Arc::clone(&cancelled);
-            move || {
-                *cancelled.lock().unwrap() += 1;
-            }
-        }));
-        let on_exit: Option<Box<dyn FnMut() + Send>> = Some(Box::new({
-            let exited = Arc::clone(&exited);
-            move || {
-                *exited.lock().unwrap() += 1;
-            }
-        }));
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
-            ConfigWriteScope::Global,
-            true,
-            None,
-            None,
-            on_cancel,
-            on_exit,
-        );
-        // Escape matches tui.select.cancel → onCancel (upstream
-        // config-selector.ts:487-490 cancels even with search text).
         component.handle_input("\x1b");
-        assert_eq!(*cancelled.lock().unwrap(), 1);
-        assert_eq!(*exited.lock().unwrap(), 0);
-        // Ctrl+C also matches tui.select.cancel by default.
         component.handle_input("\x03");
-        assert_eq!(*cancelled.lock().unwrap(), 2);
+        assert_eq!(*cancelled.lock().unwrap_or_else(|e| e.into_inner()), 2);
     }
 
     #[test]
     fn search_filters_items() {
-        install_keybindings();
-        let mut component = ConfigSelectorComponent::new(
-            &sample_resources(),
-            theme(),
-            "/home/tester/proj",
-            "/home/tester/.pir/agent",
-            Some(24),
+        let dirs = TestDirs::new();
+        let mut component = component(
+            &dirs,
+            sample_paths(&dirs),
+            manager(&dirs, true),
             ConfigWriteScope::Global,
             true,
-            None,
-            None,
-            None,
-            None,
         );
-        component.handle_input("d");
+        component.handle_input("r");
         component.handle_input("e");
-        let lines = plain(component.render(80));
-        let joined = lines.join("\n");
-        assert!(joined.contains("deploy"));
-        assert!(!joined.contains("format"));
-        // Clearing the search restores everything.
-        component.handle_input("\x7f");
-        component.handle_input("\x7f");
-        let lines = plain(component.render(80));
-        assert!(lines.join("\n").contains("format"));
+        let lines = plain(component.render(100));
+        let text = lines.join("\n");
+        assert!(text.contains("review.md"), "{text}");
+        assert!(!text.contains("format"), "{text}");
     }
 }

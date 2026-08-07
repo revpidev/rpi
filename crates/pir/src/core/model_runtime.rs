@@ -352,6 +352,10 @@ impl ApiKeyAuth for ConfiguredApiKeyAuth {
         self.inner.name()
     }
 
+    fn supports_login(&self) -> bool {
+        self.inner.supports_login()
+    }
+
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,
@@ -1211,6 +1215,16 @@ impl ModelRuntime {
             .await
     }
 
+    /// `getAuth(providerId)` (model-runtime.ts:380 string arm) — provider-level
+    /// auth resolution without a model (the llama.cpp extension's
+    /// `modelRegistry.getProviderAuth`, T14 W6b).
+    pub async fn get_provider_auth(
+        &self,
+        provider_id: &str,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        self.models.get_provider_auth(provider_id, None).await
+    }
+
     /// `setRuntimeApiKey` (model-runtime.ts:398-415) — non-persistent
     /// runtime override (the `--api-key` CLI path). Like upstream, ends in
     /// `refresh`: models.json is reloaded and providers rebuilt.
@@ -1233,6 +1247,43 @@ impl ModelRuntime {
     /// `listCredentials` (model-runtime.ts:422-424).
     pub async fn list_credentials(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
         self.credentials.list().await
+    }
+
+    /// `login` (model-runtime.ts:503-507): run the provider's login through
+    /// `Models`, then refresh so the new credential takes effect in model
+    /// availability and provider composition.
+    pub async fn login(
+        &self,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<Credential, ModelsError> {
+        let credential = self
+            .models
+            .login(provider_id, auth_type, interaction)
+            .await?;
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(self.model_network_enabled),
+            force: None,
+            signal: None,
+        }))
+        .await;
+        Ok(credential)
+    }
+
+    /// `logout` (model-runtime.ts:509-514): remove the stored credential,
+    /// reset credential-dependent compatibility projections, then refresh so
+    /// the unconfigured provider is skipped by availability.
+    pub async fn logout(&self, provider_id: &str) -> Result<(), ModelsError> {
+        self.models.logout(provider_id).await?;
+        self.recompose_provider(provider_id);
+        self.refresh(Some(ModelsRefreshOptions {
+            allow_network: Some(self.model_network_enabled),
+            force: None,
+            signal: None,
+        }))
+        .await;
+        Ok(())
     }
 
     pub fn has_runtime_api_key(&self, provider_id: &str) -> bool {

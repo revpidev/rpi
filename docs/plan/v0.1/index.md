@@ -52,7 +52,7 @@
 | T11 | [pir-tui 核心引擎](./T11-pir-tui-core.md) | M5 | T01 | 已完成 | 2026-08-05 |
 | T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 已完成 | 2026-08-06 |
 | T13 | [全量 Provider 与 OAuth](./T13-providers-oauth.md) | M6 | T03、T04 | 已完成 | 2026-08-07 |
-| T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 未开始 | — |
+| T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 已完成 | 2026-08-07 |
 | T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 未开始 | — |
 
 ## 4. 里程碑映射与并行建议
@@ -87,6 +87,7 @@ docs/plan/v0.1/
 
 | 日期 | 变更 | 说明 |
 |------|------|------|
+| 2026-08-07 | T14 验收完成 | 可选工具 / Packages / Trust / Export / llama / 更新完成（W1–W7 七波次）：grep/find/ls Rust 原生实现（ignore/globset，rg 15/fd 10.4 实机交叉验证）；package-manager 核心 + install/remove/list 子命令；update 全目标（互斥矩阵/--force/release note/self 更新/并发 4）+ config 子命令；trust 产品化（完整优先级链 + 启动弹窗 + 两阶段加载）；HTML/JSONL export（模板资产逐字节内嵌对拍）+ gist share；endpoint/telemetry 配置化（三个 PIR_*_URL + settings 三键 + "off" 零请求）；llama.cpp 集成（/llama + /login llama.cpp + HF 搜索下载）；gnu release 29MB 发布物 smoke 全过（musl 本次豁免，用户决策）；终审修复 7 项（edit 测试目录竞态、display() 凭据脱敏、/share 临时文件串号等）；偏离 D-039~D-047 登记回写（D-039 第 1 条 → ADR-0005、D-044 → ADR-0006 留 T15 关闭，其余验收后置「已关闭」）；`01-requirements.md` §3.2/§4.5/§7.6/§7.8/§10、`02-design.md` §6.1/§8/§12 同步 |
 | 2026-08-07 | T13 验收完成 | 全量 Provider 与 OAuth 完成（W1–W7 七波次）：7 个新适配器（pi-messages/mistral/google-generative-ai+google-shared/azure/google-vertex+ADC/bedrock 手写 SigV4+event-stream/codex WS 含缓存续传与 zstd）、38 工厂 + 目录生成管线（37 份 vendored JSON、1153 模型、compat 全量）、6 OAuth 流程 + load registry、images 子系统、handoff/deferred tools 收尾（修复 last-wins 语义偏差）、远程 catalog overlay + `pir update --models`；需求 §5 映射表 55 条、上游测试移植清单 114 文件逐条标注、live smoke 无 key 全豁免；偏离 D-021~D-038 登记回写（D-029/030/031 已关闭）；`02-design.md` §3.3–3.6/§12/§13 同步（WS 状态机开放项定稿） |
 | 2026-08-06 | T12 验收完成 | 用户真机 smoke 人工验证通过（本机 + tmux 两种环境：启动、提问、streaming、abort、快捷键、退出恢复），T12 置「已完成」，验收日期 2026-08-06 |
 | 2026-08-06 | T16 验收通过 | pir-agent harness 层完成：types（22 事件/错误族/trait）/agent_harness（phase 机、三队列、持久化屏障、失败重放）/session 门面与四存储实现/env/tools/resources/utils/proxy 全量移植；上游 14 个测试文件意图移植（sqlite-* 除外）+ 互通对拍 4 用例（修复 SessionManager build_index leaf 重放分歧）；偏离 D-020 登记回写（含 harness compaction 变体勘误：prepareCompaction 不提前返回、带 retainedTail，变体移植于 agent_harness.rs）；`02-design.md` §6.4/§12 同步 |

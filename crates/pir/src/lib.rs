@@ -15,6 +15,7 @@ pub mod cli;
 pub mod config;
 pub mod core;
 pub mod error;
+pub mod extensions;
 pub mod modes;
 pub mod sdk;
 pub mod tools;

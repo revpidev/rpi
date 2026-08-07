@@ -67,6 +67,11 @@ serde_yaml = "0.9"              # YAML frontmatter (skills / prompt templates)
 # Directory walk with .gitignore/.ignore/.fdignore chain, dotdir skip and
 # symlink following for skills/prompts discovery (upstream walker semantics).
 ignore = "0.4"
+# T14 optional tools: glob matching for the find tool (fd --glob equivalent).
+globset = "0.4"
+# T14 packages: npm semver ranges (`semver.valid`/`validRange`/`satisfies`/
+# `maxSatisfying` equivalents) for package version pinning and update checks.
+semver = "1"
 
 # T11 pir-tui core engine (coding-standards appendix A).
 crossterm = "0.29"              # terminal I/O only (raw mode / read-write / size); no ratatui

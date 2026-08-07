@@ -35,6 +35,24 @@ pub const REMOTE_CATALOG_REFRESH_INTERVAL_MS: i64 = 4 * 60 * 60 * 1000;
 /// `DEFAULT_CATALOG_BASE_URL` (remote-catalog-provider.ts:5).
 pub const DEFAULT_CATALOG_BASE_URL: &str = "https://pi.dev";
 
+/// Resolve the remote catalog base URL (ADR-0002 §8, T14-W6a):
+/// `PIR_MODEL_CATALOG_URL` env > `modelCatalogUrl` setting >
+/// [`DEFAULT_CATALOG_BASE_URL`]; the literal `off` disables the remote
+/// catalog entirely (`None` — callers must not construct the overlay, so no
+/// network request can occur). Pir-specific: upstream has no override
+/// (model-runtime.ts:69 `catalogBaseUrl` is an internal option only).
+///
+/// Note: built-in providers are not registered with the overlay yet (the
+/// registration wave wraps them per model-runtime.ts:144-150, D-038); this
+/// resolver is the single entry point that wave must call.
+pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
+    crate::config::endpoint_from_env(
+        crate::config::ENV_MODEL_CATALOG_URL,
+        settings_url,
+        DEFAULT_CATALOG_BASE_URL,
+    )
+}
+
 /// Store errors surface as `ModelsError("model_source", …)` on the refresh
 /// path (same mapping as `Models::refresh`).
 fn store_error(error: pir_ai::error::AiError) -> ModelsError {
@@ -91,7 +109,7 @@ fn parse_catalog(provider_id: &str, value: &serde_json::Value) -> Result<Vec<Mod
 }
 
 /// `encodeURIComponent` — every byte except unreserved characters.
-fn encode_uri_component(value: &str) -> String {
+pub(crate) fn encode_uri_component(value: &str) -> String {
     const UNRESERVED: &[char] = &['-', '_', '.', '!', '~', '*', '\'', '(', ')'];
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -1168,5 +1186,28 @@ mod tests {
     #[test]
     fn refresh_interval_constant_is_four_hours() {
         assert_eq!(REMOTE_CATALOG_REFRESH_INTERVAL_MS, 4 * 60 * 60 * 1000);
+    }
+
+    // ---- T14-W6a: catalog endpoint resolution (ADR-0002 §8) ----
+
+    /// Read-only env use: no test writes `PIR_MODEL_CATALOG_URL` (the
+    /// env-override logic is covered by the pure
+    /// [`crate::config::resolve_endpoint`] tests).
+    #[test]
+    fn model_catalog_endpoint_defaults_and_settings_override() {
+        assert_eq!(
+            crate::config::ENV_MODEL_CATALOG_URL,
+            "PIR_MODEL_CATALOG_URL"
+        );
+        assert_eq!(
+            model_catalog_endpoint(None).as_deref(),
+            Some(DEFAULT_CATALOG_BASE_URL)
+        );
+        assert_eq!(
+            model_catalog_endpoint(Some("https://mirror.test")).as_deref(),
+            Some("https://mirror.test")
+        );
+        // Settings `off` disables the endpoint.
+        assert_eq!(model_catalog_endpoint(Some("off")), None);
     }
 }

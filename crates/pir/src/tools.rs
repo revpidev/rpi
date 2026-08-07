@@ -1,8 +1,9 @@
 //! Built-in tools support modules.
 //!
-//! This module groups the shared infrastructure used by the four built-in tools
-//! (read, write, edit, bash): truncation, path resolution, file-mutation
-//! queueing, output accumulation, and output sanitization.
+//! This module groups the shared infrastructure used by the built-in tools
+//! (read, write, edit, bash, and the optional grep/find/ls): truncation, path
+//! resolution, file-mutation queueing, output accumulation, and output
+//! sanitization.
 //!
 //! Intentional Rust difference: upstream's `ToolContext` carries `signal`
 //! (AbortSignal) and `onUpdate` callback. In the Rust port these are supplied
@@ -15,7 +16,10 @@ pub mod bash_executor;
 pub mod edit;
 pub mod edit_diff;
 pub mod file_mutation_queue;
+pub mod find;
+pub mod grep;
 pub mod image_process;
+pub mod ls;
 pub mod mime;
 pub mod output_accumulator;
 pub mod path_utils;
@@ -145,6 +149,15 @@ pub fn create_builtin_tools(
                 ctx,
                 write::WriteToolOptions::default(),
             )),
+            "grep" => Some(grep::create_grep_tool(
+                ctx,
+                grep::GrepToolOptions::default(),
+            )),
+            "find" => Some(find::create_find_tool(
+                ctx,
+                find::FindToolOptions::default(),
+            )),
+            "ls" => Some(ls::create_ls_tool(ctx, ls::LsToolOptions::default())),
             _ => None,
         })
         .collect()
@@ -288,12 +301,29 @@ mod wiring_tests {
         };
         let tools = create_builtin_tools(
             &ctx,
-            &names(&["write", "grep", "read"]),
+            &names(&["write", "custom-x", "read"]),
             &BuiltinToolOptions::default(),
         );
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         // List order preserved; unknown names skipped (extension tools are
         // attached by the session assembly layer, T10/T15).
         assert_eq!(tool_names, vec!["write", "read"]);
+    }
+
+    #[test]
+    fn test_create_builtin_tools_includes_optional_tools() {
+        // Optional tools (T14 W1) are constructed by the factory; the session
+        // assembly decides whether they become active.
+        let ctx = ToolContext {
+            cwd: PathBuf::from("."),
+            session_env: None,
+        };
+        let tools = create_builtin_tools(
+            &ctx,
+            &names(&["read", "grep", "find", "ls"]),
+            &BuiltinToolOptions::default(),
+        );
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(tool_names, vec!["read", "grep", "find", "ls"]);
     }
 }

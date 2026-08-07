@@ -34,6 +34,10 @@ pub struct CreateRuntimeOptions {
     pub agent_dir: PathBuf,
     pub session_manager: Arc<Mutex<SessionManager>>,
     pub session_start_event: Option<SessionStartEvent>,
+    /// `projectTrustContext` (agent-session-runtime.ts:40): supplied by the
+    /// interactive mode for session switches; `None` lets the factory build
+    /// its own (main.ts:648-655).
+    pub project_trust_context: Option<crate::core::trust_manager::ProjectTrustContext>,
 }
 
 /// `CreateAgentSessionRuntimeFactory` (agent-session-runtime.ts:35-42).
@@ -258,6 +262,7 @@ impl AgentSessionRuntime {
                     previous_session_file: previous_session_file
                         .map(|p| p.to_string_lossy().into_owned()),
                 }),
+                project_trust_context: None,
             })
             .await?,
         );
@@ -313,6 +318,7 @@ impl AgentSessionRuntime {
                     previous_session_file: previous_session_file
                         .map(|p| p.to_string_lossy().into_owned()),
                 }),
+                project_trust_context: None,
             })
             .await?,
         );
@@ -419,6 +425,7 @@ impl AgentSessionRuntime {
                             previous_session_file: previous_session_file
                                 .map(|p| p.to_string_lossy().into_owned()),
                         }),
+                        project_trust_context: None,
                     })
                     .await?,
                 );
@@ -460,6 +467,7 @@ impl AgentSessionRuntime {
                             .clone()
                             .map(|p| p.to_string_lossy().into_owned()),
                     }),
+                    project_trust_context: None,
                 })
                 .await?,
             );
@@ -507,6 +515,7 @@ impl AgentSessionRuntime {
                         .clone()
                         .map(|p| p.to_string_lossy().into_owned()),
                 }),
+                project_trust_context: None,
             })
             .await?,
         );
@@ -583,6 +592,7 @@ impl AgentSessionRuntime {
                     previous_session_file: previous_session_file
                         .map(|p| p.to_string_lossy().into_owned()),
                 }),
+                project_trust_context: None,
             })
             .await?,
         );

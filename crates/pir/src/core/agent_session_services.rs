@@ -123,9 +123,20 @@ pub async fn create_agent_session_services(
     loader.reload();
 
     let mut diagnostics = Vec::new();
-    // Extension provider registrations drain into the model runtime
-    // (agent-session-services.ts:155-179) — no extensions yet, so nothing is
-    // pending.
+    // Built-in (hidden) extension provider registrations drain into the
+    // model runtime (agent-session-services.ts:166-178
+    // `pendingNativeProviderRegistrations`): the llama.cpp extension is the
+    // only built-in (extensions/index.ts `builtInExtensions`); until the T15
+    // extension host lands, this is the registration seam (D-047).
+    if let Err(message) = model_runtime
+        .register_native_provider(crate::extensions::llama::shared_llama_provider().provider())
+        .await
+    {
+        diagnostics.push(AgentSessionRuntimeDiagnostic {
+            level: DiagnosticLevel::Error,
+            message: format!("Extension \"<inline:llama.cpp>\" error: {message}"),
+        });
+    }
     // Offline refresh (agent-session-services.ts:180
     // `refresh({ allowNetwork: false })`): session startup must not block on
     // dynamic catalog network fetches.

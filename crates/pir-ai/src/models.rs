@@ -1,10 +1,11 @@
 //! Port of `packages/ai/src/models.ts` @ pi 0.82.1 (2efa728) — T03 scope:
 //! `Provider` / `ProviderStreams` traits, `create_provider` with api-map
 //! dispatch, `Models` (auth application + stream/stream_simple dispatch),
-//! thinking-level helpers.
+//! thinking-level helpers. `login` / `logout` landed here with the T13 login
+//! wiring (`Models::login` / `Models::logout`).
 //!
 //! Out of T03 scope (upstream features landing later): `checkAuth` /
-//! `getAvailable` / `login` / `logout` (T04). `filterModels` landed in T13 W4
+//! `getAvailable` (T04). `filterModels` landed in T13 W4
 //! as a [`Provider`] trait method; the availability surface that applies it
 //! (`get_available`, model-runtime.ts:240-268 → models.ts:394-408) lives in
 //! pir's model runtime (`crates/pir/src/core/model_runtime.rs`), not on
@@ -32,9 +33,9 @@ use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{
-    resolve_provider_auth, AuthContext, AuthResolutionOverrides, AuthResult, Credential,
-    CredentialStore, DefaultAuthContext, InMemoryCredentialStore, ModelsError, ModelsErrorCode,
-    ProviderAuth,
+    resolve_provider_auth, AuthContext, AuthInteraction, AuthResolutionOverrides, AuthResult,
+    AuthType, Credential, CredentialStore, DefaultAuthContext, InMemoryCredentialStore,
+    ModelsError, ModelsErrorCode, ProviderAuth,
 };
 use crate::models_json::OrderedMap;
 use crate::models_store::{
@@ -510,6 +511,90 @@ impl Models {
             .find(|model| model.id == id)
     }
 
+    /// `login` (models.ts:431-445): run the provider's auth-method login
+    /// (api-key prompt or OAuth flow), then write the resulting credential
+    /// through the store's serialized `modify` path. The store write is the
+    /// only mutation; the returned credential is the login's own result.
+    ///
+    /// OAuth support is stubbed at the trait level until T04 part 2 wires the
+    /// flows ([`OAuthAuth::login`]'s default errors), matching the
+    /// interactive layer, which keeps the OAuth dialog a T15 hook.
+    pub async fn login(
+        &self,
+        provider_id: &str,
+        auth_type: AuthType,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<Credential, ModelsError> {
+        let provider = self.get_provider(provider_id).ok_or_else(|| {
+            ModelsError::new(
+                ModelsErrorCode::Provider,
+                format!("Unknown provider: {provider_id}"),
+            )
+        })?;
+        let credential = match auth_type {
+            AuthType::Oauth => {
+                // OAuth methods always expose login upstream (the interface
+                // requires it); pir's `OAuthAuth::login` default errors until
+                // the T04 part 2 flows land.
+                let Some(oauth) = provider.auth().oauth.clone() else {
+                    return Err(ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!("{} does not support oauth login", provider.name()),
+                    ));
+                };
+                Credential::OAuth(oauth.login(interaction).await?)
+            }
+            AuthType::ApiKey => {
+                let Some(api_key) = provider.auth().api_key.clone() else {
+                    return Err(ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!("{} does not support api_key login", provider.name()),
+                    ));
+                };
+                // Upstream `method?.login` (models.ts:435): ambient-only
+                // providers carry no login method; pir encodes the same
+                // distinction in `ApiKeyAuth::supports_login`.
+                if !api_key.supports_login() {
+                    return Err(ModelsError::new(
+                        ModelsErrorCode::Auth,
+                        format!("{} does not support api_key login", provider.name()),
+                    ));
+                }
+                Credential::ApiKey(api_key.login(interaction).await?)
+            }
+        };
+        let provider_id_owned = provider_id.to_owned();
+        let credential_for_store = credential.clone();
+        self.credentials
+            .modify(
+                provider_id,
+                Arc::new(move |_| {
+                    let credential = credential_for_store.clone();
+                    Box::pin(async move { Ok(Some(credential)) })
+                }),
+            )
+            .await
+            .map_err(|error| {
+                ModelsError::with_cause(
+                    ModelsErrorCode::Auth,
+                    format!("Credential store modify failed for {provider_id_owned}"),
+                    &error.message,
+                )
+            })?;
+        Ok(credential)
+    }
+
+    /// `logout` (models.ts:447-453): remove the stored credential.
+    pub async fn logout(&self, provider_id: &str) -> Result<(), ModelsError> {
+        self.credentials.delete(provider_id).await.map_err(|error| {
+            ModelsError::with_cause(
+                ModelsErrorCode::Auth,
+                format!("Credential store delete failed for {provider_id}"),
+                &error.message,
+            )
+        })
+    }
+
     /// `refresh(options)` (models.ts:276-328): refresh every configured
     /// dynamic provider concurrently. Provider errors and cancellation are
     /// returned without rejecting; static and unconfigured providers are
@@ -709,6 +794,27 @@ impl Models {
                 format!("Unknown provider: {}", model.provider),
             )
         })
+    }
+
+    /// `getAuth(providerId)` (models.ts:413-429 string arm) — provider-level
+    /// auth resolution without a model (no model-header merge). Used by the
+    /// llama.cpp extension's `configuredClient` (T14 W6b).
+    pub async fn get_provider_auth(
+        &self,
+        provider_id: &str,
+        overrides: Option<&AuthResolutionOverrides>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        let Some(provider) = self.get_provider(provider_id) else {
+            return Ok(None);
+        };
+        resolve_provider_auth(
+            provider.id(),
+            provider.auth(),
+            &self.credentials,
+            &self.auth_context,
+            overrides,
+        )
+        .await
     }
 
     /// `getAuth` — resolves provider auth plus static model headers.
@@ -994,10 +1100,10 @@ pub fn models_are_equal(a: Option<&Model>, b: Option<&Model>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Map};
 
     use super::*;
-    use crate::auth::{ApiKeyAuth, ModelAuth};
+    use crate::auth::{ApiKeyAuth, ApiKeyCredential, AuthEvent, AuthPrompt, ModelAuth};
     use crate::types::{ApiKind, DoneReason, ModelThinkingLevel, StopReason, StreamEvent, Usage};
 
     fn model(provider: &str, api: &str) -> Model {
@@ -1186,6 +1292,352 @@ mod tests {
             .await
             .expect("result");
         assert_eq!(result.stop_reason, StopReason::Stop);
+    }
+
+    // ------------------------------------------------------------------
+    // login / logout (models.ts:431-453)
+    // ------------------------------------------------------------------
+
+    /// Records the prompts it receives and answers with a fixed string.
+    struct RecordingInteraction {
+        prompts: Mutex<Vec<AuthPrompt>>,
+        answer: String,
+    }
+
+    impl RecordingInteraction {
+        fn with_answer(answer: &str) -> Self {
+            Self {
+                prompts: Mutex::new(Vec::new()),
+                answer: answer.to_owned(),
+            }
+        }
+
+        fn prompts(&self) -> Vec<AuthPrompt> {
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl AuthInteraction for RecordingInteraction {
+        fn prompt<'a>(
+            &'a self,
+            prompt: AuthPrompt,
+        ) -> crate::auth::types::BoxFutureSend<'a, Result<String, ModelsError>> {
+            Box::pin(async move {
+                self.prompts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(prompt);
+                Ok(self.answer.clone())
+            })
+        }
+
+        fn notify(&self, _event: AuthEvent) {}
+    }
+
+    /// api-key auth with a working `login` (upstream `envApiKeyAuth` /
+    /// `anthropicApiKeyAuth` shape): prompts for the key, records the prompt.
+    struct PromptLoginAuth {
+        prompts: Mutex<Vec<AuthPrompt>>,
+    }
+
+    impl PromptLoginAuth {
+        fn new() -> Self {
+            Self {
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<AuthPrompt> {
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for PromptLoginAuth {
+        fn name(&self) -> &str {
+            "Test API key"
+        }
+
+        fn supports_login(&self) -> bool {
+            true
+        }
+
+        async fn login(
+            &self,
+            interaction: &dyn AuthInteraction,
+        ) -> Result<crate::auth::ApiKeyCredential, ModelsError> {
+            let key = interaction
+                .prompt(AuthPrompt::secret("Enter Test API key"))
+                .await?;
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(AuthPrompt::secret("Enter Test API key"));
+            Ok(crate::auth::ApiKeyCredential {
+                key: Some(key),
+                env: None,
+            })
+        }
+
+        async fn resolve(
+            &self,
+            _ctx: &dyn AuthContext,
+            _credential: Option<&crate::auth::ApiKeyCredential>,
+        ) -> Result<Option<AuthResult>, ModelsError> {
+            Ok(None)
+        }
+    }
+
+    /// OAuth auth with a working `login` (used to pin the OAuth branch shape;
+    /// the interactive OAuth dialog itself stays a T15 stub).
+    struct PromptLoginOAuth;
+
+    #[async_trait::async_trait]
+    impl crate::auth::OAuthAuth for PromptLoginOAuth {
+        fn name(&self) -> &str {
+            "Test OAuth"
+        }
+
+        async fn login(
+            &self,
+            interaction: &dyn AuthInteraction,
+        ) -> Result<crate::auth::OAuthCredential, ModelsError> {
+            let _ = interaction.prompt(AuthPrompt::secret("Authorize")).await?;
+            Ok(crate::auth::OAuthCredential {
+                refresh: "refresh-token".to_owned(),
+                access: "access-token".to_owned(),
+                expires: 0,
+                extra: Map::new(),
+            })
+        }
+
+        async fn refresh(
+            &self,
+            credential: &crate::auth::OAuthCredential,
+            _signal: Option<&tokio_util::sync::CancellationToken>,
+        ) -> Result<crate::auth::OAuthCredential, ModelsError> {
+            Ok(credential.clone())
+        }
+
+        async fn to_auth(
+            &self,
+            credential: &crate::auth::OAuthCredential,
+        ) -> Result<ModelAuth, ModelsError> {
+            Ok(ModelAuth {
+                api_key: Some(credential.access.clone()),
+                headers: None,
+                base_url: None,
+            })
+        }
+    }
+
+    fn models_with_store() -> (Models, Arc<InMemoryCredentialStore>) {
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let models = Models::new(Some(CreateModelsOptions {
+            credentials: Some(store.clone()),
+            auth_context: None,
+            models_store: None,
+        }));
+        (models, store)
+    }
+
+    /// api_key login runs the method's `login` with the interaction, writes
+    /// the credential through the store, and returns it (models.ts:438-444).
+    #[tokio::test]
+    async fn test_models_login_api_key_writes_credential() {
+        let (models, store) = models_with_store();
+        let api_key = Arc::new(PromptLoginAuth::new());
+        models.set_provider(create_provider(CreateProviderOptions {
+            id: "test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(api_key.clone()),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(EchoStreams)),
+        }));
+        let interaction = RecordingInteraction::with_answer("entered-key");
+
+        let credential = models
+            .login("test", AuthType::ApiKey, &interaction)
+            .await
+            .expect("login");
+
+        assert_eq!(
+            credential,
+            Credential::ApiKey(ApiKeyCredential {
+                key: Some("entered-key".to_owned()),
+                env: None,
+            })
+        );
+        assert_eq!(
+            store.read("test").await.expect("read"),
+            Some(credential),
+            "login result must be persisted"
+        );
+        assert_eq!(api_key.prompts().len(), 1);
+        assert!(matches!(
+            api_key.prompts()[0],
+            AuthPrompt::Secret { ref message, .. } if message == "Enter Test API key"
+        ));
+    }
+
+    /// OAuth login runs the oauth method's `login` and persists the OAuth
+    /// credential (models.ts:434-444). The interactive OAuth dialog stays a
+    /// stub, but the Models layer path is complete.
+    #[tokio::test]
+    async fn test_models_login_oauth_writes_credential() {
+        let (models, store) = models_with_store();
+        models.set_provider(create_provider(CreateProviderOptions {
+            id: "test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: None,
+                oauth: Some(Arc::new(PromptLoginOAuth)),
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(EchoStreams)),
+        }));
+        let interaction = RecordingInteraction::with_answer("authorized");
+
+        let credential = models
+            .login("test", AuthType::Oauth, &interaction)
+            .await
+            .expect("login");
+
+        match credential {
+            Credential::OAuth(ref oauth) => {
+                assert_eq!(oauth.access, "access-token");
+                assert_eq!(oauth.refresh, "refresh-token");
+            }
+            other => panic!("expected oauth credential, got {other:?}"),
+        }
+        assert_eq!(
+            store.read("test").await.expect("read"),
+            Some(credential),
+            "login result must be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_models_login_unknown_provider_errors() {
+        let (models, _store) = models_with_store();
+        let error = models
+            .login(
+                "ghost",
+                AuthType::ApiKey,
+                &RecordingInteraction::with_answer("k"),
+            )
+            .await
+            .expect_err("unknown provider must error");
+        assert_eq!(error.code, ModelsErrorCode::Provider);
+        assert_eq!(error.message, "Unknown provider: ghost");
+    }
+
+    /// Ambient-only providers (no `login` upstream) error with the upstream
+    /// message before any prompt is shown (models.ts:435-437).
+    #[tokio::test]
+    async fn test_models_login_ambient_only_provider_errors() {
+        let (models, _store) = models_with_store();
+        // StaticKeyAuth implements resolve but not login.
+        models.set_provider(create_provider(CreateProviderOptions {
+            id: "test".to_owned(),
+            name: Some("Test provider".to_owned()),
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(StaticKeyAuth)),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(EchoStreams)),
+        }));
+        let interaction = RecordingInteraction::with_answer("k");
+        let error = models
+            .login("test", AuthType::ApiKey, &interaction)
+            .await
+            .expect_err("ambient-only provider must error");
+        assert_eq!(error.code, ModelsErrorCode::Auth);
+        assert_eq!(
+            error.message,
+            "Test provider does not support api_key login"
+        );
+        assert!(
+            interaction.prompts().is_empty(),
+            "no prompt may be shown before the capability check"
+        );
+    }
+
+    /// A provider missing the requested auth method errors with the upstream
+    /// message (`method` is undefined, models.ts:434-437).
+    #[tokio::test]
+    async fn test_models_login_missing_auth_method_errors() {
+        let (models, _store) = models_with_store();
+        models.set_provider(create_provider(CreateProviderOptions {
+            id: "test".to_owned(),
+            name: Some("Test provider".to_owned()),
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: None,
+                oauth: Some(Arc::new(PromptLoginOAuth)),
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(EchoStreams)),
+        }));
+        let interaction = RecordingInteraction::with_answer("k");
+        let error = models
+            .login("test", AuthType::ApiKey, &interaction)
+            .await
+            .expect_err("missing api_key method must error");
+        assert_eq!(error.code, ModelsErrorCode::Auth);
+        assert_eq!(
+            error.message,
+            "Test provider does not support api_key login"
+        );
+        assert!(interaction.prompts().is_empty());
+
+        let interaction = RecordingInteraction::with_answer("k");
+        let error = models
+            .login("test", AuthType::Oauth, &interaction)
+            .await
+            .expect("oauth login");
+        assert!(matches!(error, Credential::OAuth(_)));
+    }
+
+    #[tokio::test]
+    async fn test_models_logout_deletes_the_stored_credential() {
+        let (models, store) = models_with_store();
+        store
+            .modify(
+                "test",
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Ok(Some(Credential::ApiKey(ApiKeyCredential {
+                            key: Some("stored-key".to_owned()),
+                            env: None,
+                        })))
+                    })
+                }),
+            )
+            .await
+            .expect("seed");
+
+        models.logout("test").await.expect("logout");
+        assert_eq!(store.read("test").await.expect("read"), None);
+        // Logging out without a credential is a no-op (models.ts:447-453).
+        models.logout("test").await.expect("logout again");
     }
 
     fn thinking_model(map: Option<serde_json::Value>) -> Model {

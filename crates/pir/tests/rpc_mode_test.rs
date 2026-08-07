@@ -284,6 +284,7 @@ async fn boot(
             agent_dir: agent_dir.clone(),
             session_manager,
             session_start_event: None,
+            project_trust_context: None,
         },
     )
     .await
@@ -1072,11 +1073,11 @@ async fn protocol_errors_and_framing() {
 }
 
 // ---------------------------------------------------------------------------
-// export_html 占位（T14）
+// export_html（T14-W5：真实导出；in-memory 会话报上游错误）
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn export_html_placeholder() {
+async fn export_html_in_memory_session_errors() {
     let mut rpc = start_rpc(vec![]).await;
     rpc.send(&json!({"id": "x1", "type": "export_html"})).await;
     let response = rpc.next_response(Some("x1")).await;
@@ -1084,7 +1085,7 @@ async fn export_html_placeholder() {
     assert!(response["error"]
         .as_str()
         .expect("error")
-        .contains("not available yet"));
+        .contains("Cannot export in-memory session to HTML"));
 
     assert_eq!(rpc.close_and_wait().await, 0);
 }

@@ -27,6 +27,10 @@ impl ApiKeyAuth for VertexAuth {
         "Google Cloud credentials"
     }
 
+    fn supports_login(&self) -> bool {
+        true
+    }
+
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,

@@ -598,7 +598,7 @@ fn resolve_against_cwd(path: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// `isPattern` (package-manager.ts:271-273).
-fn is_pattern(s: &str) -> bool {
+pub(crate) fn is_pattern(s: &str) -> bool {
     s.starts_with('!')
         || s.starts_with('+')
         || s.starts_with('-')
@@ -607,7 +607,7 @@ fn is_pattern(s: &str) -> bool {
 }
 
 /// `splitPatterns` (package-manager.ts:283-299).
-fn split_patterns(entries: &[String]) -> (Vec<String>, Vec<String>) {
+pub(crate) fn split_patterns(entries: &[String]) -> (Vec<String>, Vec<String>) {
     let mut plain = Vec::new();
     let mut patterns = Vec::new();
     for entry in entries {
@@ -621,7 +621,7 @@ fn split_patterns(entries: &[String]) -> (Vec<String>, Vec<String>) {
 }
 
 /// `getOverridePatterns` (package-manager.ts:697-699).
-fn get_override_patterns(entries: &[String]) -> Vec<String> {
+pub(crate) fn get_override_patterns(entries: &[String]) -> Vec<String> {
     entries
         .iter()
         .filter(|p| p.starts_with('!') || p.starts_with('+') || p.starts_with('-'))
@@ -632,7 +632,7 @@ fn get_override_patterns(entries: &[String]) -> Vec<String> {
 /// Minimal glob matcher replacing `minimatch` (see module docs): `*`
 /// matches within a path segment, `**` across segments (including zero
 /// segments before a `/`), `?` a single non-separator character.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     fn inner(pattern: &[char], text: &[char]) -> bool {
         let Some((&head, rest)) = pattern.split_first() else {
             return text.is_empty();
@@ -676,13 +676,13 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 /// `toPosixPath` (skills.ts:20-22).
-fn to_posix_path(path: &Path) -> String {
+pub(crate) fn to_posix_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// Node `path.relative` for lexical (already-resolved) inputs.
-fn lexical_relative(base: &Path, path: &Path) -> PathBuf {
+pub(crate) fn lexical_relative(base: &Path, path: &Path) -> PathBuf {
     let base_components: Vec<_> = base.components().collect();
     let path_components: Vec<_> = path.components().collect();
     let mut common = 0;
@@ -705,16 +705,16 @@ fn lexical_relative(base: &Path, path: &Path) -> PathBuf {
 /// The match candidate strings of `matchesAnyPattern` /
 /// `matchesAnyExactPattern` (package-manager.ts:644-652, 677-685). For
 /// `SKILL.md` files the parent directory variants also participate.
-struct MatchCandidates {
-    rel: String,
-    name: String,
-    abs: String,
-    parent_rel: Option<String>,
-    parent_name: Option<String>,
-    parent_abs: Option<String>,
+pub(crate) struct MatchCandidates {
+    pub(crate) rel: String,
+    pub(crate) name: String,
+    pub(crate) abs: String,
+    pub(crate) parent_rel: Option<String>,
+    pub(crate) parent_name: Option<String>,
+    pub(crate) parent_abs: Option<String>,
 }
 
-fn match_candidates(file_path: &Path, base_dir: &Path) -> MatchCandidates {
+pub(crate) fn match_candidates(file_path: &Path, base_dir: &Path) -> MatchCandidates {
     let name = file_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -745,7 +745,7 @@ fn match_candidates(file_path: &Path, base_dir: &Path) -> MatchCandidates {
 }
 
 /// `matchesAnyPattern` (package-manager.ts:654-670).
-fn matches_any_pattern(candidates: &MatchCandidates, patterns: &[String]) -> bool {
+pub(crate) fn matches_any_pattern(candidates: &MatchCandidates, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
         let pattern = pattern.replace(std::path::MAIN_SEPARATOR, "/");
         if glob_match(&pattern, &candidates.rel)
@@ -781,7 +781,7 @@ fn normalize_exact_pattern(pattern: &str) -> String {
 }
 
 /// `matchesAnyExactPattern` (package-manager.ts:687-695).
-fn matches_any_exact_pattern(candidates: &MatchCandidates, patterns: &[String]) -> bool {
+pub(crate) fn matches_any_exact_pattern(candidates: &MatchCandidates, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return false;
     }

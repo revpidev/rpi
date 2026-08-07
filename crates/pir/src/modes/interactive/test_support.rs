@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pir_tui::terminal::{InputHandler, ResizeHandler, Terminal};
@@ -197,7 +197,78 @@ pub(crate) struct TestSession {
     pub(crate) cwd: PathBuf,
 }
 
+// ---------------------------------------------------------------------------
+// No-op product-endpoint transports (T14 review M1)
+// ---------------------------------------------------------------------------
+//
+// Unit tests must never emit real requests to product endpoints (pi.dev
+// install telemetry / version checks). Every mode test harness swaps the
+// production transports for these no-ops via
+// [`install_noop_product_transports`]; the optional counters let a test
+// assert the injection actually carries the calls.
+
+/// No-op [`ReportInstallTransport`]: records the invocation count, never
+/// touches the network.
+#[derive(Default)]
+pub(crate) struct NoopReportInstallTransport(pub(crate) Arc<AtomicUsize>);
+
+impl crate::core::telemetry::ReportInstallTransport for NoopReportInstallTransport {
+    fn get<'a>(
+        &'a self,
+        _url: &'a str,
+        _user_agent: &'a str,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn futures::Future<Output = Result<(), String>> + Send + 'a>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// No-op [`LatestVersionTransport`]: records the invocation count, never
+/// touches the network.
+#[derive(Default)]
+pub(crate) struct NoopLatestVersionTransport(pub(crate) Arc<AtomicUsize>);
+
+impl crate::core::version_check::LatestVersionTransport for NoopLatestVersionTransport {
+    fn get<'a>(
+        &'a self,
+        _url: &'a str,
+        _user_agent: &'a str,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn futures::Future<Output = Result<Option<String>, String>> + Send + 'a>> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { Ok(None) })
+    }
+}
+
+/// Swap both product-endpoint transports on a mode for the no-ops. Returns
+/// the installed instances (their counters can be inspected by tests).
+pub(crate) fn install_noop_product_transports(
+    mode: &crate::modes::interactive::interactive_mode::InteractiveMode,
+) -> (
+    Arc<NoopReportInstallTransport>,
+    Arc<NoopLatestVersionTransport>,
+) {
+    let report_install = Arc::new(NoopReportInstallTransport::default());
+    let latest_version = Arc::new(NoopLatestVersionTransport::default());
+    mode.ui_state.set_report_install_transport(
+        Arc::clone(&report_install) as Arc<dyn crate::core::telemetry::ReportInstallTransport>
+    );
+    mode.ui_state
+        .set_latest_version_transport(Arc::clone(&latest_version)
+            as Arc<dyn crate::core::version_check::LatestVersionTransport>);
+    (report_install, latest_version)
+}
+
 pub(crate) async fn build_test_session() -> TestSession {
+    build_test_session_with_manager(None).await
+}
+
+/// [`build_test_session`] with an optional caller-provided session manager
+/// (e.g. file-backed for `/export` / `/share` tests).
+pub(crate) async fn build_test_session_with_manager(
+    manager: Option<SessionManager>,
+) -> TestSession {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -230,10 +301,12 @@ pub(crate) async fn build_test_session() -> TestSession {
         .get_model("custom", "m1")
         .expect("test model must compose");
 
-    let session_manager = Arc::new(Mutex::new(
-        SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+    let session_manager = match manager {
+        Some(manager) => manager,
+        None => SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
             .expect("in-memory session manager"),
-    ));
+    };
+    let session_manager = Arc::new(Mutex::new(session_manager));
 
     let created = create_agent_session(CreateAgentSessionOptions {
         cwd: Some(cwd.clone()),

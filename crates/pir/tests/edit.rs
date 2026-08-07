@@ -25,13 +25,19 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new() -> Self {
+        // pid + nanos alone can collide when two parallel tests call
+        // SystemTime::now() within the same coarse clock tick (observed flake:
+        // two tests share a dir and one's Drop deletes the other's files).
+        // The atomic counter makes the name unique within the process.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "pir-edit-test-{}-{}",
+            "pir-edit-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)

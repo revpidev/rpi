@@ -246,6 +246,15 @@ pub trait ApiKeyAuth: Send + Sync {
     /// Display name, e.g. "Anthropic API key".
     fn name(&self) -> &str;
 
+    /// `login?` presence (upstream: the method is absent for ambient-only
+    /// providers, models.ts:435 `method?.login`, interactive-mode.ts:4928).
+    /// Defaults to `false`; implementations that override [`Self::login`]
+    /// must return `true` so the interactive layer can pick the login dialog
+    /// over the ambient-info dialog.
+    fn supports_login(&self) -> bool {
+        false
+    }
+
     /// `login?` — interactive setup (prompt for key/provider env). The
     /// default errors: ambient-only providers have no login (upstream: the
     /// method is absent).

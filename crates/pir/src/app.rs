@@ -3,11 +3,11 @@
 //! Port of `packages/coding-agent/src/main.ts` @ pi 0.82.1 (2efa728).
 //!
 //! T10 boundaries (task file §Out):
-//! - Subcommand dispatch is a placeholder except `update --models`
-//!   (W6-C): the remaining package commands land in T14 and currently exit
-//!   1 with a diagnostic (upstream would run them).
+//! - Subcommand dispatch: `update` (all targets since T14-W3),
+//!   install/remove/uninstall/list (T14-W2) and `config` (T14-W3) are real.
 //! - First-time setup never runs in headless modes.
-//! - `--export` parses but reports "not available yet (T14)".
+//! - `--export` exports the session file to HTML and exits (T14-W5,
+//!   `core::export_html::export_from_file`).
 //! - Migrations (`migrations.ts`) are permanently out of scope (ADR-0003 §3).
 //! - HTTP proxy dispatcher configuration is T13; reqwest's built-in env
 //!   proxy support covers `HTTP_PROXY`/`HTTPS_PROXY`.
@@ -45,7 +45,7 @@ use crate::core::session_manager::{assert_valid_session_id, NewSessionOptions, S
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::trust_manager::{
     default_project_trust_from_settings, has_trust_requiring_project_resources,
-    resolve_project_trusted, ProjectTrustStore,
+    resolve_project_trusted, ProjectTrustContext, ProjectTrustStore,
 };
 use crate::error::PirError;
 use crate::modes::interactive::run_interactive_mode;
@@ -57,10 +57,10 @@ use crate::tools::path_utils::resolve_path;
 /// Upstream `EXTENSION_LOAD_FAILURE_HINT` (main.ts:52).
 const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"pir -ne\".";
 
-/// Package/config subcommands (main.ts:492-507 dispatches them before
-/// `parseArgs`). `update` is handled by [`crate::cli::package_command`]
-/// (W6-C lands `update --models`); the rest land in T14.
-const PLACEHOLDER_SUBCOMMANDS: [&str; 5] = ["install", "remove", "uninstall", "list", "config"];
+// Package/config subcommands dispatch before `parseArgs` (main.ts:492-507):
+// `config` (`cli::config_command`, T14-W3), `update`
+// (`cli::package_command::run_update`, W6-C/T14-W3) and
+// install/remove/uninstall/list (`cli::package_command`, T14-W2).
 
 fn is_truthy_env_flag(value: Option<&str>) -> bool {
     match value {
@@ -583,15 +583,18 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     }
 
     // Subcommand dispatch (main.ts:492-507). `update --models` landed in
-    // W6-C (remote model catalog refresh); the remaining package commands
-    // and update targets are T14.
+    // W6-C (remote model catalog refresh); install/remove/uninstall/list
+    // landed in T14-W2; the remaining update targets and `config` landed
+    // in T14-W3.
     if let Some(first) = args.first() {
+        if first == "config" {
+            return crate::cli::config_command::run_config(&args).await;
+        }
         if first == "update" {
             return crate::cli::package_command::run_update(&args).await;
         }
-        if PLACEHOLDER_SUBCOMMANDS.contains(&first.as_str()) {
-            let _ = writeln!(err, "Error: pir {first} is not available yet (T14)");
-            return 1;
+        if crate::cli::package_command::parse_package_command(&args).is_some() {
+            return crate::cli::package_command::run_package_command(&args);
         }
     }
 
@@ -614,9 +617,22 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         return 0;
     }
 
-    if parsed.export.is_some() {
-        let _ = writeln!(err, "Error: --export is not available yet (T14)");
-        return 1;
+    if let Some(export_file) = &parsed.export {
+        // `pir --export <file> [output.html]` (main.ts:526-538): export the
+        // session file to HTML and exit; the first positional message is the
+        // output path.
+        let output_path = parsed.messages.first().map(String::as_str);
+        let options = crate::core::export_html::ExportOptions::from_output_path(output_path);
+        return match crate::core::export_html::export_from_file(export_file, &options) {
+            Ok(result) => {
+                let _ = writeln!(out, "Exported to: {result}");
+                0
+            }
+            Err(error) => {
+                let _ = writeln!(err, "Error: {}", error.raw_message());
+                1
+            }
+        };
     }
 
     let mut app_mode = resolve_app_mode(
@@ -706,6 +722,17 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     let trust_by_cwd: Arc<Mutex<HashMap<PathBuf, bool>>> = Arc::new(Mutex::new(HashMap::new()));
     let default_project_trust =
         default_project_trust_from_settings(startup_settings_manager.get_default_project_trust());
+    // Startup trust prompt settings (main.ts:650-653 + startup-ui.ts:60-68):
+    // an in-memory manager over the global settings — the prompt runs before
+    // project trust resolves, so project settings must not leak in.
+    let trust_prompt_settings = Arc::new(SettingsManager::in_memory(
+        startup_settings_manager.get_global_settings(),
+        SettingsManagerCreateOptions::default(),
+    ));
+    // `trustPromptMode` (main.ts:608): help/--list-models run the prompt
+    // path in print mode, i.e. without UI.
+    let trust_prompt_has_ui =
+        app_mode == AppMode::Interactive && !parsed.help && parsed.list_models.is_none();
     let resolved_extension_paths = resolve_cli_paths(&cwd, &parsed.extensions);
     let resolved_skill_paths = resolve_cli_paths(&cwd, &parsed.skills);
     let resolved_prompt_template_paths = resolve_cli_paths(&cwd, &parsed.prompt_templates);
@@ -720,11 +747,15 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             let parsed = parsed.clone();
             let trust_store = trust_store.clone();
             let trust_by_cwd = trust_by_cwd.clone();
+            let trust_prompt_settings = trust_prompt_settings.clone();
             let resolved_extension_paths = resolved_extension_paths.clone();
             let resolved_skill_paths = resolved_skill_paths.clone();
             let resolved_prompt_template_paths = resolved_prompt_template_paths.clone();
             let resolved_theme_paths = resolved_theme_paths.clone();
             Box::pin(async move {
+                // `isInitialRuntime` (main.ts:622): the trust prompt with UI
+                // is limited to the initial runtime (main.ts:654).
+                let is_initial_runtime = options.session_start_event.is_none();
                 let cwd = options.cwd.clone();
                 let has_trust_requiring = has_trust_requiring_project_resources(&cwd);
                 let cached = trust_by_cwd
@@ -782,11 +813,37 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 // Two-phase trust resolution (main.ts:626-662 +
                 // resourceLoaderReloadOptions.resolveProjectTrust).
                 if should_resolve_trust {
+                    // The `project_trust` extension event stays `None` until
+                    // the T15 host loads the pre-trust extension set
+                    // (resource-loader.ts:333-353); its priority position is
+                    // `resolve_project_trusted`'s `extension_event` parameter
+                    // (project-trust.ts:54-70).
+                    let mut trust_context = match options.project_trust_context {
+                        Some(context) => context,
+                        None if is_initial_runtime && trust_prompt_has_ui => {
+                            // `createProjectTrustContext` (cli/project-trust.ts):
+                            // the startup selector runs before the TUI exists.
+                            // NOTE: the selector blocks this executor thread
+                            // while the user decides (startup is sequential).
+                            let settings = trust_prompt_settings.clone();
+                            ProjectTrustContext {
+                                has_ui: true,
+                                select: Some(Box::new(move |title, options| {
+                                    crate::modes::interactive::startup_ui::run_startup_selector(
+                                        &settings, title, options,
+                                    )
+                                })),
+                            }
+                        }
+                        None => ProjectTrustContext::headless(),
+                    };
                     let trusted = resolve_project_trusted(
                         &cwd,
                         &trust_store,
                         parsed.project_trust_override,
                         default_project_trust,
+                        None,
+                        &mut trust_context,
                     )?;
                     trust_by_cwd
                         .lock()
@@ -940,6 +997,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             agent_dir: agent_dir.clone(),
             session_manager: Arc::new(Mutex::new(session_manager)),
             session_start_event: None,
+            project_trust_context: None,
         },
     )
     .await;

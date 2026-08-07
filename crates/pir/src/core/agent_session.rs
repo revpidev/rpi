@@ -15,8 +15,8 @@
 //!   loaded" until the T15 host lands.
 //! - The model is `Option`-like via the pir-agent `"unknown"` placeholder
 //!   (T05 structural decision): [`model_or_none`] maps it to `None`.
-//! - `exportToHtml` is T14; [`AgentSession::export_to_html`] returns a
-//!   "not available" error until then.
+//! - `exportToHtml` is synchronous (pure CPU + file IO) and never emits
+//!   `renderedTools` — pir has no JS tool renderers (export_html.rs header).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -327,8 +327,9 @@ const THINKING_LEVELS: [ThinkingLevel; 5] = [
 ];
 
 /// Built-in tool prompt snippets/guidelines (upstream ToolDefinition fields:
-/// tools/read.ts:213-214, bash.ts:328-331, edit.ts:297-304, write.ts:191-192).
-/// The bash guideline follows the `PIR_` env rename (ADR-0001).
+/// tools/read.ts:213-214, bash.ts:328-331, edit.ts:297-304, write.ts:191-192,
+/// grep.ts:132, find.ts:118, ls.ts:104). The bash guideline follows the
+/// `PIR_` env rename (ADR-0001).
 fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
     match name {
         "read" => Some("Read file contents"),
@@ -337,6 +338,9 @@ fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
             "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
         ),
         "write" => Some("Create or overwrite files"),
+        "grep" => Some("Search file contents for patterns (respects .gitignore)"),
+        "find" => Some("Find files by glob pattern (respects .gitignore)"),
+        "ls" => Some("List directory contents"),
         _ => None,
     }
 }
@@ -841,6 +845,12 @@ impl AgentSession {
         self.inner.agent.state().messages
     }
 
+    /// `state.messages.length > 0` (interactive-mode.ts:993) without cloning
+    /// the history.
+    pub fn has_messages(&self) -> bool {
+        !self.inner.agent.state().messages.is_empty()
+    }
+
     pub fn steering_mode(&self) -> QueueMode {
         self.inner.agent.steering_mode()
     }
@@ -925,11 +935,17 @@ impl AgentSession {
         // is observable in the active-tool list and system prompt.
         let mut registry: OrderedMap<Arc<dyn AgentTool>> = OrderedMap::default();
         // Built-ins come from the shared factory; the active set is applied
-        // below via the allow/deny filter.
+        // below via the allow/deny filter. All seven built-in definitions are
+        // registered (createAllToolDefinitions, tools/index.ts:156-166): the
+        // four default coding tools plus the optional grep/find/ls (T14 W1).
+        // Optional tools stay inactive unless named via --tools /
+        // set_active_tools_by_name.
+        const ALL_BUILTIN_TOOL_NAMES: [&str; 7] =
+            ["read", "bash", "edit", "write", "grep", "find", "ls"];
         let builtin_names = ["read", "bash", "edit", "write"];
         let builtins = crate::tools::create_builtin_tools(
             &ctx,
-            &builtin_names.map(str::to_owned),
+            &ALL_BUILTIN_TOOL_NAMES.map(str::to_owned),
             &tool_options,
         );
         for tool in builtins {
@@ -961,7 +977,7 @@ impl AgentSession {
             }
         } else {
             for tool in lock(&self.inner.tool_registry).keys() {
-                if !active.contains(tool) && !builtin_names.contains(&tool.as_str()) {
+                if !active.contains(tool) && !ALL_BUILTIN_TOOL_NAMES.contains(&tool.as_str()) {
                     active.push(tool.clone());
                 }
             }
@@ -2538,12 +2554,39 @@ impl AgentSession {
     // Export
     // ==================================================================
 
-    /// `exportToHtml` — T14. The RPC `export_html` command reports this
-    /// error until then.
-    pub async fn export_to_html(&self, _output_path: Option<&str>) -> Result<String, PirError> {
-        Err(PirError::Session(
-            "HTML export is not available yet (T14)".to_owned(),
-        ))
+    /// `exportToHtml` (agent-session.ts:3210-3231): theme from settings when
+    /// it names a loadable theme, state slices from the agent. Synchronous —
+    /// the upstream `async` only awaits the (pure CPU + file IO) export.
+    ///
+    /// Upstream also builds a `ToolHtmlRenderer` for extension custom tools
+    /// (agent-session.ts:3217-3222); pir has no JS tool renderers, so
+    /// `renderedTools` is never emitted (export_html.rs module header).
+    pub fn export_to_html(&self, output_path: Option<&str>) -> Result<String, PirError> {
+        let configured_theme_name = self.settings_manager(|settings| settings.get_theme());
+        let theme_name = configured_theme_name
+            .filter(|name| crate::core::themes::get_theme_by_name(name).is_some());
+
+        let state = self.inner.agent.state();
+        let tools = state
+            .tools
+            .iter()
+            .map(|tool| crate::core::export_html::ExportToolInfo {
+                name: tool.name().to_string(),
+                description: tool.description().to_string(),
+                parameters: tool.parameters().clone(),
+            })
+            .collect();
+
+        let session_manager = lock(&self.inner.session_manager);
+        crate::core::export_html::export_session_to_html(
+            &session_manager,
+            Some(state.system_prompt.clone()),
+            Some(tools),
+            &crate::core::export_html::ExportOptions {
+                output_path: output_path.map(str::to_owned),
+                theme_name,
+            },
+        )
     }
 
     /// `exportToJsonl` (agent-session.ts:3234-3265).

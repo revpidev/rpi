@@ -463,7 +463,7 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 
 与 Pi `main.ts` / `createAgentSessionRuntime` 对齐，保证 `/new`、切 cwd、resume 时 **重建 cwd 绑定服务**。**不实现** Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3）。
 
-**Rust 落地注记**（T10，D-015）：实现于 `crates/pir/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker 已落地（2026-08-06，`crates/pir/src/cli/session_picker.rs` 独立启动选择器，D-019）；install 等子命令 / `--export` 为 T14 占位（入口可识别并给「未实现」诊断）；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（pir 无 npm 包随捆 docs）；进程标记环境变量 `PIR_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
+**Rust 落地注记**（T10，D-015）：实现于 `crates/pir/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker 已落地（2026-08-06，`crates/pir/src/cli/session_picker.rs` 独立启动选择器，D-019）；install/remove/list 子命令（T14-W2，D-040）与 `--export`（T14-W5，D-045）已落地；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（pir 无 npm 包随捆 docs）；进程标记环境变量 `PIR_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
 
 ### 6.2 `AgentSession`
 
@@ -531,7 +531,7 @@ pir/src/tools/
 
 RPC 与 Interactive 共享 `AgentSessionRuntime` 方法，避免两套会话逻辑。独立入口 `pir-rpc`（等价 `--mode rpc`）。
 
-**Rust 落地注记**（T10，D-015）：print/json 落 `crates/pir/src/modes/print_mode.rs`，rpc 落 `crates/pir/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`pir-rpc` bin 为 `crates/pir/src/bin/pir_rpc.rs`（Cargo `[[bin]] pir-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 报 T14 占位错误。interactive 模式在 T12。
+**Rust 落地注记**（T10，D-015）：print/json 落 `crates/pir/src/modes/print_mode.rs`，rpc 落 `crates/pir/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`pir-rpc` bin 为 `crates/pir/src/bin/pir_rpc.rs`（Cargo `[[bin]] pir-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 已接真实导出（T14-W5，D-045；in-memory 会话报上游错误）。interactive 模式在 T12。
 
 ### 6.7 ResourceLoader
 
@@ -619,6 +619,8 @@ pub struct PirConfig {
 ```
 
 路径解析单一模块（对齐 Pi `config.ts`），禁止各处拼 `__dirname`。T07 已落地 `crates/pir/src/config.rs`（agent_dir、sessions 目录与 `--<cwd>--` 编码、`--session-dir` / `PIR_CODING_AGENT_SESSION_DIR` / settings / 默认覆盖链，空串逐级落空对齐上游 falsy 语义）。
+
+**产品 endpoint 配置化**（ADR-0002 §8，T14-W6a，D-046）：版本检查 / install telemetry / 远程模型目录三类产品 HTTP 回调的 endpoint 在 settings 与 `PIR_*` env 可配置、可整体关闭。统一解析器 `config::resolve_endpoint`：env（`PIR_VERSION_CHECK_URL` / `PIR_TELEMETRY_URL` / `PIR_MODEL_CATALOG_URL`）> settings（`versionCheckUrl` / `telemetryUrl` / `modelCatalogUrl`，camelCase）> 内置默认（`https://pi.dev`，与上游硬编码值一致）；任一级取字面量 `off` 即关闭，关闭后不产生任何网络请求。消费点：`update --self/--all` 的版本探测、交互模式启动版本检查通知（`UiCommand::NewVersionAvailable`）、install telemetry ping（`core/telemetry.rs`，默认开、`PIR_TELEMETRY`/`enableInstallTelemetry` 可关、payload 仅版本号）；远程 catalog 的运行时消费随内置 provider 注册波次接线（D-038），解析器已就位。`enableAnalytics` 默认 false 且上游 0.82.1 无发送通道，按构造零请求。
 
 ---
 
@@ -742,6 +744,8 @@ gantt
 | `packages/tui/src/components/{select-list,input,editor,markdown,image,settings-list}.ts` | `crates/pir-tui/src/components/*`（T12） |
 | `packages/tui/src/{kill-ring,undo-stack,word-navigation,editor-component,autocomplete}.ts` | `crates/pir-tui/src/*`（T12） |
 | `packages/coding-agent/src/core/session-manager.ts` | `crates/pir/src/core/session_manager.rs` |
+| `packages/coding-agent/src/core/export-html/index.ts`（+ 模板资产） | `crates/pir/src/core/export_html.rs`（+ `export_html/` 逐字节 vendored 模板；T14-W5，D-045） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（`handleShareCommand` 的 gh 调用切片） | `crates/pir/src/core/share.rs`（`ShareRunner` 注入；T14-W5，D-045） |
 | `packages/coding-agent/src/core/agent-session*.ts` | `crates/pir/src/core/agent_session*.rs` |
 | `packages/coding-agent/src/core/compaction/*` | 算法层 `crates/pir-agent/src/compaction*.rs` + 触发接线 `crates/pir/src/core/compaction_runner.rs`（D-013，T08） |
 | `packages/coding-agent/src/core/extensions/*` | `crates/pir/src/core/extensions/*` + `pir-ext-host` |
@@ -749,7 +753,9 @@ gantt
 | `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/pir/src/tools/bash_executor.rs` |
 | `packages/coding-agent/src/core/settings-manager.ts` / `trust-manager.ts` / `keybindings.ts` | `crates/pir/src/core/settings_manager.rs` / `trust_manager.rs` / `keybindings.rs` |
 | `packages/coding-agent/src/core/resource-loader.ts` / `skills.ts` / `prompt-templates.ts` / `system-prompt.ts` / theme 相关（`themes/*`、`theme-schema.json`） | `crates/pir/src/core/resource_loader.rs` / `skills.rs` / `prompt_templates.rs` / `system_prompt.rs` / `themes.rs`（D-014，T09） |
-| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog_provider.rs`（配合 pir-ai ModelsStore；T13 W6-C，D-038） |
+| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog_provider.rs`（配合 pir-ai ModelsStore；T13 W6-C，D-038；endpoint 解析 `model_catalog_endpoint` T14-W6a，D-046） |
+| `packages/coding-agent/src/utils/version-check.ts` | `crates/pir/src/core/version_check.rs`（T14-W3；endpoint 配置 + `checkForNewPiVersion` 启动检查 T14-W6a，D-046） |
+| `packages/coding-agent/src/core/telemetry.ts` + `interactive-mode.ts` 的 `reportInstallTelemetry` / `showNewVersionNotification` 切片 | `crates/pir/src/core/telemetry.rs` + `interactive_mode.rs`（T14-W6a，D-046） |
 | `packages/coding-agent/src/main.ts`（启动管线） | `crates/pir/src/app.rs` + `main.rs`（D-015，T10） |
 | `packages/coding-agent/src/core/sdk.ts` | `crates/pir/src/sdk.rs` |
 | `packages/coding-agent/src/core/model-runtime.ts` / `model-resolver.ts` | `crates/pir/src/core/model_runtime.rs` / `model_resolver.rs` |

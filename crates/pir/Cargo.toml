@@ -35,6 +35,11 @@ kamadak-exif.workspace = true
 fs2.workspace = true
 serde_yaml.workspace = true
 ignore.workspace = true
+globset.workspace = true
+semver.workspace = true
+# T14 packages: sha256 hash for temporary (`-e`) extension install dirs
+# (package-manager.ts getTemporaryDir).
+sha2.workspace = true
 reqwest.workspace = true
 httpdate.workspace = true
 url.workspace = true
