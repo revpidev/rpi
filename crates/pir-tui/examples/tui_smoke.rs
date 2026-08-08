@@ -1,4 +1,4 @@
-//! Minimal TUI smoke demo (T11 gate: 真机 smoke).
+//! Minimal TUI smoke demo (T11 gate: real-terminal smoke).
 //!
 //! Boots `Tui` + `ProcessTerminal`, renders a `Text` and an animated
 //! `Loader`, exits on `q` or after a 10s timeout, then stops the TUI (which

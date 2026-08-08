@@ -52,35 +52,71 @@ pub struct CreateAgentSessionServicesOptions {
     pub resource_loader_options: Option<ResourceLoaderOptionsCustomizer>,
 }
 
-/// `applyExtensionFlagValues` (agent-session-services.ts:81-127). With zero
-/// registered extension flags (no extension host yet) every collected flag
-/// is unknown — matching upstream with no extensions loaded.
-fn apply_extension_flag_values(
+/// `applyExtensionFlagValues` (agent-session-services.ts:81-127) — called by
+/// the caller AFTER the extension host's final load, so only the loaded
+/// extensions' registered flags decide "unknown". Boolean flags set `true`
+/// regardless of the given value; string flags require a value.
+pub fn apply_extension_flag_values(
+    host: &pir_ext_host::host::NativeExtensionHost,
     extension_flag_values: &[(String, UnknownFlagValue)],
 ) -> Vec<AgentSessionRuntimeDiagnostic> {
+    let mut diagnostics = Vec::new();
     if extension_flag_values.is_empty() {
-        return Vec::new();
+        return diagnostics;
     }
-    let unknown_flags: Vec<&String> = extension_flag_values.iter().map(|(name, _)| name).collect();
-    let message = if unknown_flags.len() == 1 {
-        format!("Unknown option: --{}", unknown_flags[0])
-    } else {
-        format!(
-            "Unknown options: {}",
-            unknown_flags
-                .iter()
-                .map(|name| format!("--{name}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    vec![AgentSessionRuntimeDiagnostic {
-        level: DiagnosticLevel::Error,
-        message,
-    }]
+    let registered_flags = host.get_flags();
+    let mut unknown: Vec<&String> = Vec::new();
+    for (name, value) in extension_flag_values {
+        match registered_flags.get(name) {
+            None => unknown.push(name),
+            Some(flag) => match (flag.flag_type, value) {
+                (pir_ext_host::types::FlagType::Boolean, _) => {
+                    host.runtime()
+                        .set_flag_value(name, pir_ext_host::types::FlagValue::Boolean(true));
+                }
+                (pir_ext_host::types::FlagType::String, UnknownFlagValue::String(value)) => {
+                    host.runtime().set_flag_value(
+                        name,
+                        pir_ext_host::types::FlagValue::String(value.clone()),
+                    );
+                }
+                (pir_ext_host::types::FlagType::String, UnknownFlagValue::Boolean(_)) => {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!("Extension flag \"--{name}\" requires a value"),
+                    });
+                }
+            },
+        }
+    }
+    if !unknown.is_empty() {
+        let message = if unknown.len() == 1 {
+            format!("Unknown option: --{}", unknown[0])
+        } else {
+            format!(
+                "Unknown options: {}",
+                unknown
+                    .iter()
+                    .map(|name| format!("--{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        diagnostics.push(AgentSessionRuntimeDiagnostic {
+            level: DiagnosticLevel::Error,
+            message,
+        });
+    }
+    diagnostics
 }
 
 /// `createAgentSessionServices` (agent-session-services.ts:134-191).
+///
+/// T15 W3: `extension_flag_values` are validated and applied by the caller
+/// AFTER the extension host's final load (`applyExtensionFlagValues`,
+/// agent-session-services.ts:81-127, wired in app.rs): only the loaded
+/// extensions' registered flags decide "unknown", so services creation no
+/// longer reports them.
 pub async fn create_agent_session_services(
     options: CreateAgentSessionServicesOptions,
 ) -> Result<AgentSessionServices, PirError> {
@@ -147,7 +183,9 @@ pub async fn create_agent_session_services(
             signal: None,
         }))
         .await;
-    diagnostics.extend(apply_extension_flag_values(&options.extension_flag_values));
+    // `options.extension_flag_values`: applied post-load by the caller
+    // (see header); intentionally not judged here.
+    let _ = &options.extension_flag_values;
 
     Ok(AgentSessionServices {
         cwd,

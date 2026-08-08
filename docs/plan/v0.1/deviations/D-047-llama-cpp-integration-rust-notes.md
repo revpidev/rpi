@@ -102,3 +102,28 @@ T15 扩展宿主就位后：迁移 `/llama` 到真正的扩展命令注册与 `c
    `parse_hugging_face_model_splits_quant` 为纯单元测试（上游同名测试同文件），
    准确口径为 16 loopback + 1 单元。
 5. **`EXACT_MODEL_PATTERN` 提为 `LazyLock` 编译一次**（原每次 confirm 重编译正则）。
+
+## T15 W7 迁移记录（2026-08-08）
+
+关闭条件兑现：llama.cpp 已迁移为经真扩展宿主加载的内置 hidden 扩展，
+本文件第 1/2/3 条描述的临时机制全部移除：
+
+1. `BUILT_IN_EXTENSION_COMMANDS` 直供表删除；`crates/pir/src/extensions/
+   llama/mod.rs` 新增 `inline_extension()`——`Named { name: "llama.cpp",
+   hidden: true }` 的内联扩展，factory 内经宿主 API
+   `register_native_provider` + `register_command("llama")` 注册，两阶段
+   启动均经 `builtin_extensions` 走标准加载路径。interactive dispatch 删
+   `/llama` 特例（走 prompt 扩展命令路径），autocomplete 改用
+   `runner.registered_commands()`。
+2. `shared_llama_provider` 进程级单例与 `agent_session_services.rs` 的强制
+   注册块删除；provider 由扩展 factory 注册，`app.rs` 在
+   `create_agent_session` 前冲刷 `take_pending_native_provider_registrations`
+   进 model_runtime（修初始模型可见性）。
+3. `/llama` TUI 挂载改经宿主 `ctx.ui()`（`UiBridge::as_any` 新增 downcast
+   口子）→ `InteractiveUiBridge` → `InteractiveUi::handle_llama_command`，
+   LlamaView 组件机制本身不变。
+4. 证据测试：`extensions/mod.rs` 新单测经真宿主验证注册（命令 + provider
+   均经宿主 API 可见）；17 个 llama_extension loopback 测试保持绿色。
+
+第 4–8 条（取消/并发原语、连接错误分类、/login 通路、env 注入、细节近似）
+为 llama 集成自身的落地差异，与宿主迁移无关，维持原登记。

@@ -69,6 +69,12 @@ impl CustomEditor {
         self.editor.get_text()
     }
 
+    /// `pasteToEditor` (types.ts:212): full paste handling (large-paste
+    /// collapse) via the inner editor's paste path.
+    pub fn paste_text(&mut self, text: &str) {
+        self.editor.handle_paste(text);
+    }
+
     pub fn set_text(&mut self, text: &str) {
         self.editor.set_text(text);
     }

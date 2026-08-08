@@ -1,0 +1,4 @@
+# 独立 crate（wasm32 target 集）——构建产物不入库；库 crate 惯例不提交
+# 自身 Cargo.lock（serde/serde_json 版本已由 Cargo.toml 钉住）。
+/target/
+/Cargo.lock

@@ -1,18 +1,24 @@
-//! G3 对拍：`fixtures/generated/<scenario>/events.jsonl`（上游 `createAgentSession`
-//! + faux provider 实录）vs `pir-agent` 的 `Agent` 在相同脚本下产出的事件序列。
+//! G3 parity: `fixtures/generated/<scenario>/events.jsonl` (recorded from
+//! the upstream `createAgentSession` + faux provider) vs the event sequence
+//! the `pir-agent` `Agent` produces under the same script.
 //!
-//! 对拍粒度（见 fixtures/README.md §2 与测试内注释）：
-//! - `message_update` 事件整类排除：上游 faux 用 `Math.random` 切 delta，delta
-//!   边界与数量不入契约；pir 侧 faux 为确定性切块。
-//! - `queue_update` / `agent_settled` / `agent_end.willRetry` 排除：这些是
-//!   coding-agent `AgentSession` 层（T16）事件，`Agent` 层不产生。
-//! - `usage` 键排除：usage 由 faux 按完整 session context（系统提示 + 工具
-//!   清单，session/harness 层 T07/T16 的产物）估算，Agent 层无法 1:1 复现。
-//! - `details` 键排除：fixture 的 read/bash 是上游真实工具（T13），其结果
-//!   details 形状不属于 Agent 层契约；测试工具只复现 content。
-//! - 其余内容（事件类型序、消息/toolResult 载荷、stopReason、工具调用参数、
-//!   完成序/源序语义）在 `pir_test_support` 归一化（timestamp/id 剥离）后做
-//!   行序敏感的 JSONL diff。
+//! Comparison granularity (see fixtures/README.md §2 and in-test comments):
+//! - the whole `message_update` event class is excluded: the upstream faux
+//!   slices deltas with `Math.random`, so delta boundaries/counts are not
+//!   part of the contract; the pir-side faux chunks deterministically.
+//! - `queue_update` / `agent_settled` / `agent_end.willRetry` are excluded:
+//!   they are coding-agent `AgentSession`-layer (T16) events that the
+//!   `Agent` layer does not produce.
+//! - the `usage` key is excluded: faux estimates usage from the full session
+//!   context (system prompt + tool list, produced at the session/harness
+//!   layer T07/T16), which the Agent layer cannot reproduce 1:1.
+//! - the `details` key is excluded: the fixture read/bash calls ran the
+//!   upstream real tools (T13), whose result-details shape is not part of
+//!   the Agent-layer contract; the test tools only reproduce `content`.
+//! - everything else (event-type order, message/toolResult payloads,
+//!   stopReason, tool-call arguments, completion/source-order semantics) is
+//!   line-order-sensitive JSONL-diffed after `pir_test_support`
+//!   normalization (timestamp/id stripping).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

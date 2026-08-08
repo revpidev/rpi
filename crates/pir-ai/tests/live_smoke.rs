@@ -1,11 +1,12 @@
-//! Live smoke tests against real provider endpoints (T03 自测清单; T13 W7 扩展
-//! mistral / google-generative-ai / azure-openai-responses / bedrock).
+//! Live smoke tests against real provider endpoints (T03 self-check list;
+//! T13 W7 adds mistral / google-generative-ai / azure-openai-responses /
+//! bedrock).
 //!
 //! Gated (coding-standards §12.6): every test returns immediately unless
 //! `PIR_LIVE_TEST=1` is set **and** the provider's API key env var is present.
 //! Model ids can be overridden via `PIR_LIVE_<PROVIDER>_MODEL`; base URLs via
-//! `PIR_LIVE_<PROVIDER>_BASE_URL`. openai-codex (OAuth 登录态) and
-//! pi-messages (内部端点) intentionally have no live target.
+//! `PIR_LIVE_<PROVIDER>_BASE_URL`. openai-codex (OAuth sign-in state) and
+//! pi-messages (internal endpoint) intentionally have no live target.
 
 use futures::StreamExt;
 use pir_ai::api::anthropic_messages::AnthropicMessages;

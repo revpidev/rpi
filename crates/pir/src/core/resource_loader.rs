@@ -381,6 +381,12 @@ impl DefaultResourceLoader {
         self.settings_manager.set_project_trusted(trusted);
     }
 
+    /// Replace the package-resource input port (T15 W7: startup resolves
+    /// packages per trust state and re-feeds the loader before `reload`).
+    pub fn set_package_resources(&mut self, package_resources: PackageResourcePaths) {
+        self.package_resources = package_resources;
+    }
+
     /// `reload()` (resource-loader.ts:341-493), minus extension/package
     /// loading. All failures degrade to diagnostics — this never errors.
     pub fn reload(&mut self) {

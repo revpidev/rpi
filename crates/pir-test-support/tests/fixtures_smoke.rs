@@ -1,6 +1,7 @@
 //! Smoke test: the T02 fixtures on disk must parse, normalize idempotently,
 //! and carry no volatile data after normalization (coding-standards §12.3;
-//! T02 自测清单「归一化器单测」对真实 fixtures 的验证）.
+//! the T02 self-check "normalizer unit tests" applied to the real
+//! fixtures).
 
 use pir_test_support::{diff_jsonl, Normalizer};
 

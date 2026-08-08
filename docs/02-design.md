@@ -582,6 +582,14 @@ pub trait ExtensionApi: Send + Sync {
 - 内置扩展用 Rust 编写（llama.cpp UI、示例 permission gate）
 - 动态库插件（`abi_stable`，已决策，见 §14）
 
+> **T15 落地注记（2026-08-08）**：L0 动态库插件已按 abi_stable 0.11.3 落地
+> （`crates/pir-ext-host/src/native.rs`），ABI 形状受 StableAbi 约束收敛
+> （host-call 句柄按值打包 `PirHostCalls`、cookie 为 `*const c_void`、缓冲
+> 一律 `RVec<u8>` 拥有型）；无沙箱信任模型明示。核心动作/事件层差异
+> （tool_call 改参穿线、user_bash operations、ProviderConfig 闭包拒绝、
+> newSession setup、exec SIGKILL、非 RPC 模式 command.* 未绑）逐条见偏离
+> D-048 / D-050 与 ADR-0007。
+
 **`WasmExtensionHost`（L1）**
 
 - Wasm 插件 + host ABI，能力面与 L0 对齐
@@ -784,13 +792,13 @@ gantt
 
 实现期细节在模块设计中细化，收敛为两项（M0 spike 实测后定）：
 
-1. **Wasm ABI 字节布局**（含 UI 组件描述协议形状）
-2. **扩展包 manifest 字段**
+1. **Wasm ABI 字节布局**（含 UI 组件描述协议形状）——**已定稿（T15 W6/W7）**：`docs/extension-abi.md`（wasm ABI v1 + §1.1 原生动态库插件段）
+2. **扩展包 manifest 字段**——**已定稿（T15 W6/W7）**：`pir-extension.json`（`name`/`version`/`description`/`wasm`/`native`/`capabilities`/`pirAbi`），见 `docs/extension-abi.md` §5
 
 2026-07-29 覆盖度审查后新增的实现期细化项（不阻塞开工，随模块设计定稿）：
 
 - ~~compat 检测矩阵的数据化表达（表驱动 vs 代码分支）~~——**已定稿（T13 W3/W4）**：`detect_compat` 表驱动矩阵（`openai_completions.rs:199`）+ compat 全量数据生成期烘焙进 vendored JSON（`providers/data/*.json`），见 §3.3
-- 扩展 UI 组件描述的序列化格式（需求 §9.2）
+- ~~扩展 UI 组件描述的序列化格式（需求 §9.2）~~——**已定稿（T15 W4）**：ComponentTree wire schema v1（`text`/`spacer`/`box`/`column` 四节点，无 `row` 横向容器；未知 type fail-visible），见 `extension-abi.md` §7 与偏离 D-049
 
 ### Codex WebSocket 状态机（2026-08-06 定稿，T13-W3）
 

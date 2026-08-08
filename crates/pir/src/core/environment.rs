@@ -155,32 +155,6 @@ pub fn cache_retention_long() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Share viewer URL (config.ts:502-508)
-// ---------------------------------------------------------------------------
-
-/// `PI_SHARE_VIEWER_URL` (config.ts:506) — Pir rename (ADR-0001).
-pub const ENV_SHARE_VIEWER_URL: &str = "PIR_SHARE_VIEWER_URL";
-
-/// `DEFAULT_SHARE_VIEWER_URL` (config.ts:502). Points at the upstream-hosted
-/// viewer; not renamed by ADR-0001.
-pub const DEFAULT_SHARE_VIEWER_URL: &str = "https://pi.dev/session/";
-
-/// `process.env.PI_SHARE_VIEWER_URL || DEFAULT_SHARE_VIEWER_URL`
-/// (config.ts:506): JS `||` semantics — an empty string falls back to the
-/// default.
-pub fn share_viewer_base_url() -> String {
-    std::env::var(ENV_SHARE_VIEWER_URL)
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_SHARE_VIEWER_URL.to_string())
-}
-
-/// `getShareViewerUrl(gistId)` (config.ts:505-508).
-pub fn share_viewer_url(gist_id: &str) -> String {
-    format!("{}#{gist_id}", share_viewer_base_url())
-}
-
-// ---------------------------------------------------------------------------
 // Terminal / TUI toggles
 // ---------------------------------------------------------------------------
 
@@ -422,21 +396,6 @@ mod tests {
         assert!(cache_retention_long());
         std::env::set_var(ENV_CACHE_RETENTION, "LONG");
         assert!(!cache_retention_long());
-    }
-
-    // Port of config.ts:506 — empty string falls back to the default.
-    #[test]
-    fn test_share_viewer_base_url_fallback() {
-        let (_lock, _guard) = EnvGuard::set(&[(ENV_SHARE_VIEWER_URL, None)]);
-        assert_eq!(share_viewer_base_url(), DEFAULT_SHARE_VIEWER_URL);
-        std::env::set_var(ENV_SHARE_VIEWER_URL, "");
-        assert_eq!(share_viewer_base_url(), DEFAULT_SHARE_VIEWER_URL);
-        std::env::set_var(ENV_SHARE_VIEWER_URL, "https://example.com/view/");
-        assert_eq!(share_viewer_base_url(), "https://example.com/view/");
-        assert_eq!(
-            share_viewer_url("abc123"),
-            "https://example.com/view/#abc123"
-        );
     }
 
     // Port of experimental.ts:2 / timings.ts:6 / tui.ts:1331 — exact "1".

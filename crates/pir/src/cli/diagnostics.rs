@@ -1,4 +1,4 @@
-//! Startup diagnostics (requirements §3.1 诊断体系).
+//! Startup diagnostics (requirements §3.1 diagnostics system).
 //!
 //! Args/settings parsing produces warning/error diagnostics; any error
 //! diagnostic aborts startup with exit code 1. Settings-sourced diagnostics

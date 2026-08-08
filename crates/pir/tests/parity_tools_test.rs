@@ -1,15 +1,20 @@
-//! G3 对拍（T06）：`fixtures/generated/tool-calls/events.jsonl`（上游真实工具
-//! 实录）vs `pir::tools` 的真实 read/bash 工具在相同 faux 脚本下产出的事件序列。
+//! G3 parity (T06): `fixtures/generated/tool-calls/events.jsonl` (recorded
+//! from the upstream real tools) vs the event sequence produced by pir's
+//! real read/bash tools under the same faux script.
 //!
-//! 对拍粒度与 `pir-agent/tests/parity_events_test.rs` 一致（`message_update`
-//! 整类排除、`usage`/`willRetry`/`details` 键排除、归一化后行序敏感 diff）。
+//! Comparison granularity matches `pir-agent/tests/parity_events_test.rs`
+//! (`message_update` excluded wholesale, `usage`/`willRetry`/`details` keys
+//! excluded, order-sensitive diff after normalization).
 //!
-//! 与 T05 对拍的两点差异：
-//! - 工具换成真实实现：`read` 读真实临时目录中的 `note.txt`（内容与上游
-//!   fixture  stub 的输出一致），`bash` 真实 spawn `echo fixture-bash-output`。
-//! - `read` 包了一层延迟 30ms 的 `ReadOperations`：fixture 中并行工具的完成序
-//!   是 [bash, read]（上游实录时机如此），而完成序本身是计时相关的。延迟只
-//!   作用在 IO 层，工具的路径解析/读取/截断逻辑全部为真实路径。
+//! Two differences from the T05 parity:
+//! - the tools are the real implementations: `read` reads a `note.txt` in a
+//!   real temp dir (content matching the upstream fixture stub's output),
+//!   and `bash` really spawns `echo fixture-bash-output`.
+//! - `read` is wrapped in a `ReadOperations` with a 30ms delay: the parallel
+//!   tools in the fixture complete in the order [bash, read] (as recorded
+//!   upstream), and completion order is timing-dependent. The delay only
+//!   affects the IO layer; path resolution/read/truncation all run the real
+//!   paths.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

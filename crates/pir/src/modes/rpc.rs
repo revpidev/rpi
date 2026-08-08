@@ -15,16 +15,15 @@
 //! `extension_ui_response` frames are routed to a pending-request map. With
 //! the no-op `ExtensionRunner` no requests are ever emitted.
 
-use std::collections::HashMap;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use pir_agent::types::{QueueMode, ThinkingLevel};
 use pir_ai::types::ImageContent;
@@ -38,6 +37,8 @@ use crate::core::extensions::{ExtensionMode, InputSource, StreamingBehavior};
 use crate::core::prompt_templates::PromptTemplate;
 use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
 use crate::error::PirError;
+
+pub mod ui_bridge;
 
 // ============================================================================
 // Extension UI protocol reservation (rpc-types.ts RpcExtensionUIRequest)
@@ -597,7 +598,7 @@ fn session_state_json(session: &AgentSession) -> Value {
 /// :213-233): synthetic local/top-level info scoped by the default prompt
 /// directories. pir's `PromptTemplate` carries no `sourceInfo` (D-014 §7);
 /// the RPC layer reconstructs it from the file path.
-fn prompt_template_source_info(
+pub(crate) fn prompt_template_source_info(
     template: &PromptTemplate,
     agent_dir: &Path,
     cwd: &Path,
@@ -639,9 +640,10 @@ struct RpcState {
     session: RwLock<AgentSession>,
     /// Unsubscribe handle of the current event subscription.
     unsubscribe: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// Pending extension UI dialog requests (T15; empty with the no-op
-    /// runner). `extension_ui_response` frames resolve these.
-    pending_ui: Mutex<HashMap<String, oneshot::Sender<Value>>>,
+    /// Pending extension UI dialog requests (T15 W4): shared with the
+    /// [`ui_bridge::RpcUiBridge`]; `extension_ui_response` frames resolve
+    /// these.
+    pending_ui: ui_bridge::PendingUiTable,
     /// Set by the (T15) extension `ctx.shutdown()` handler; honored on the
     /// next `agent_settled` event (rpc-mode.ts:727-730).
     shutdown_requested: AtomicBool,
@@ -649,9 +651,6 @@ struct RpcState {
     output: mpsc::UnboundedSender<String>,
     /// Shutdown trigger for the main loop.
     shutdown: mpsc::UnboundedSender<i32>,
-    /// Agent dir for prompt-template `SourceInfo` reconstruction
-    /// (`get_commands`); the project side uses the current session cwd.
-    agent_dir: PathBuf,
 }
 
 impl RpcState {
@@ -670,11 +669,23 @@ impl RpcState {
 /// `rebindSession` (rpc-mode.ts:316-363): bind extensions on the given
 /// session, then (re)subscribe its event stream to stdout. Used for the
 /// initial bind at startup and after every session replacement.
-async fn rebind_session(state: &Arc<RpcState>, session: AgentSession) {
+async fn rebind_session(
+    state: &Arc<RpcState>,
+    session: AgentSession,
+    runtime: &Weak<tokio::sync::Mutex<AgentSessionRuntime>>,
+) {
     let error_output = state.output.clone();
+    // `ctx.shutdown()` → flag honored at the next `agent_settled`
+    // (rpc-mode.ts:727-730).
+    let shutdown_state = Arc::downgrade(state);
     session
         .bind_extensions(ExtensionBindings {
             mode: Some(ExtensionMode::Rpc),
+            shutdown: Some(Arc::new(move || {
+                if let Some(state) = shutdown_state.upgrade() {
+                    state.shutdown_requested.store(true, Ordering::SeqCst);
+                }
+            })),
             on_error: Some(Arc::new(move |error| {
                 let _ = error_output.send(serialize_json_line(&json!({
                     "type": "extension_error",
@@ -685,6 +696,19 @@ async fn rebind_session(state: &Arc<RpcState>, session: AgentSession) {
             })),
         })
         .await;
+
+    // `bindCommandContext` (runner.ts:410-418): runtime-backed command
+    // actions on the session's host (Weak — the runtime owns this closure's
+    // inverse path).
+    if let Some(runtime) = runtime.upgrade() {
+        if let Some(host) =
+            crate::core::extension_host_adapter::host_of_runner(&session.extension_runner())
+        {
+            host.runtime().set_command_actions(Some(Arc::new(
+                crate::core::extension_context::RuntimeCommandActions::new(&runtime),
+            )));
+        }
+    }
 
     let event_output = state.output.clone();
     let state_weak = Arc::downgrade(state);
@@ -959,7 +983,7 @@ async fn dispatch(
             let cancelled = runtime
                 .lock()
                 .await
-                .switch_session(&session_path, None, None)
+                .switch_session(&session_path, None, None, None)
                 .await
                 .map_err(|error| error_message(&error))?;
             Ok(Some(json!({ "cancelled": cancelled })))
@@ -1060,38 +1084,12 @@ async fn dispatch(
         // ---------------- Commands ----------------
         RpcCommand::GetCommands { .. } => {
             let session = state.session();
-            let mut commands: Vec<Value> = Vec::new();
-            // Extension commands: none with the no-op runner (T15 lists
-            // `extensionRunner.getRegisteredCommands()` here).
-            //
-            // Scope templates against the *current* session cwd (upstream
-            // reads `template.sourceInfo`, computed by the loader at load
-            // time): a cross-project `switch_session` must not keep the
-            // startup cwd.
-            let session_cwd = PathBuf::from(session.cwd());
-            for template in session.prompt_templates() {
-                let source_info =
-                    prompt_template_source_info(&template, &state.agent_dir, &session_cwd);
-                commands.push(json!({
-                    "name": template.name,
-                    "description": template.description,
-                    "source": "prompt",
-                    "sourceInfo": source_info,
-                }));
-            }
-            let skills = {
-                let loader = session.resource_loader();
-                let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
-                loader.resources().skills.clone()
-            };
-            for skill in skills {
-                commands.push(json!({
-                    "name": format!("skill:{}", skill.name),
-                    "description": skill.description,
-                    "source": "skill",
-                    "sourceInfo": skill.source_info,
-                }));
-            }
+            // Extension commands (with `:N` invocation names) → prompt
+            // templates → skills (agent-session.ts:2332-2355). The session
+            // helper scopes template sourceInfo against the *current* cwd,
+            // so a cross-project `switch_session` does not keep the startup
+            // cwd.
+            let commands = session.get_commands_info();
             Ok(Some(json!({ "commands": commands })))
         }
     }
@@ -1200,40 +1198,55 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     });
 
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
-    let (initial_session, agent_dir) = {
-        let runtime_guard = runtime.lock().await;
-        (
-            runtime_guard.session().clone(),
-            runtime_guard.services().agent_dir.clone(),
-        )
-    };
+    let initial_session = runtime.lock().await.session().clone();
 
     let state = Arc::new(RpcState {
         session: RwLock::new(initial_session.clone()),
         unsubscribe: Mutex::new(None),
-        pending_ui: Mutex::new(HashMap::new()),
+        pending_ui: ui_bridge::new_pending_ui_table(),
         shutdown_requested: AtomicBool::new(false),
         output: output_tx.clone(),
         shutdown: shutdown_tx,
-        agent_dir,
     });
 
     // `runtimeHost.setRebindSession` (rpc-mode.ts:312-314).
     {
         let rebind_state = state.clone();
+        let rebind_runtime = Arc::downgrade(&runtime);
         runtime
             .lock()
             .await
             .set_rebind_session(Some(Box::new(move |session| {
                 let rebind_state = rebind_state.clone();
+                let rebind_runtime = rebind_runtime.clone();
                 Box::pin(async move {
-                    rebind_session(&rebind_state, session).await;
+                    rebind_session(&rebind_state, session, &rebind_runtime).await;
                 })
             })));
     }
 
     // Initial bind (rpc-mode.ts:381).
-    rebind_session(&state, initial_session).await;
+    rebind_session(&state, initial_session.clone(), &Arc::downgrade(&runtime)).await;
+
+    // `setUIContext(createExtensionUIContext(), "rpc")` (T15 W4): the RPC
+    // extension UI bridge rides the session's extension host.
+    if let Some(host) = initial_session
+        .extension_runner()
+        .as_any()
+        .and_then(|any| {
+            any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
+        })
+        .map(|adapter| adapter.host().clone())
+    {
+        host.set_ui(
+            Some(Arc::new(ui_bridge::RpcUiBridge::new(
+                output_tx.clone(),
+                state.pending_ui.clone(),
+                crate::core::themes::default_theme_json(),
+            ))),
+            pir_ext_host::types::ExtensionMode::Rpc,
+        );
+    }
 
     // Input loop: each command is handled on its own task so `abort` /
     // `abort_bash` can land while a long-running `bash`/`prompt` is in
@@ -1301,6 +1314,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     drop(state);
     drop(runtime);
     drop(output_tx);
+    drop(initial_session);
     let _ = writer.await;
     exit_code
 }

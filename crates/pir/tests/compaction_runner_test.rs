@@ -1,6 +1,7 @@
-//! `CompactionRunner::check_compaction` 的分支覆盖（agent-session.ts
-//! `_checkCompaction` :1953-2042 的每个守卫）与手动 `compact()` 的错误路径
-//! （:1799-1807/:1868-1870）。happy path 由 `parity_compaction_test.rs` 对拍。
+//! Branch coverage of `CompactionRunner::check_compaction` (every guard of
+//! agent-session.ts `_checkCompaction` :1953-2042) plus the manual
+//! `compact()` error paths (:1799-1807/:1868-1870). The happy path is
+//! covered by the `parity_compaction_test.rs` parity suite.
 
 use std::sync::{Arc, Mutex};
 

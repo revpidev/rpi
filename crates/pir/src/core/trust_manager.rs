@@ -351,12 +351,28 @@ pub enum DefaultProjectTrust {
 /// run their own pump loop inside.
 pub type ProjectTrustSelect = Box<dyn FnMut(&str, &[String]) -> Option<String> + Send>;
 
+/// Async selector callback behind [`ProjectTrustContext::select_async`]
+/// (T15 W7, ADR-0006): the TUI trust prompt runs on the event loop and must
+/// be awaited, so it cannot use the blocking [`ProjectTrustSelect`].
+pub type ProjectTrustSelectAsync = std::sync::Arc<
+    dyn Fn(String, Vec<String>) -> futures::future::BoxFuture<'static, Option<String>>
+        + Send
+        + Sync,
+>;
+
+/// `projectTrustContextFactory` (interactive-mode.ts:4816/4830): builds the
+/// trust prompt context for a target cwd (T15 W7, `switch_session`).
+pub type ProjectTrustContextFactory =
+    std::sync::Arc<dyn Fn(&std::path::Path) -> ProjectTrustContext + Send + Sync>;
+
 /// `ProjectTrustContext` (extensions/types.ts:525-530), minus the
 /// confirm/input/notify surface the trust flow never uses: `has_ui` gates
 /// the interactive ask branch, `select` renders the prompt.
 pub struct ProjectTrustContext {
     pub has_ui: bool,
     pub select: Option<ProjectTrustSelect>,
+    /// Async selector variant; takes precedence when present.
+    pub select_async: Option<ProjectTrustSelectAsync>,
 }
 
 impl ProjectTrustContext {
@@ -366,6 +382,7 @@ impl ProjectTrustContext {
         ProjectTrustContext {
             has_ui: false,
             select: None,
+            select_async: None,
         }
     }
 }
@@ -432,19 +449,85 @@ pub fn resolve_project_trusted(
         let options = get_project_trust_options(cwd, true);
         let labels: Vec<String> = options.iter().map(|option| option.label.clone()).collect();
         let selected = select(&format_project_trust_prompt(cwd), &labels);
-        if let Some(selected) = selected {
-            if let Some(option) = options.iter().find(|option| option.label == selected) {
-                if !option.updates.is_empty() {
-                    let updates: Vec<(PathBuf, Option<bool>)> = option
-                        .updates
-                        .iter()
-                        .map(|update| (update.path.clone(), update.decision))
-                        .collect();
-                    trust_store.set_many(&updates)?;
-                }
-                return Ok(option.trusted);
+        return apply_trust_selection(cwd, &options, selected, trust_store);
+    }
+    Ok(false)
+}
+
+/// Shared tail: apply a chosen label (project-trust.ts:36-44, 90-95).
+fn apply_trust_selection(
+    _cwd: &Path,
+    options: &[ProjectTrustOption],
+    selected: Option<String>,
+    trust_store: &ProjectTrustStore,
+) -> Result<bool, PirError> {
+    if let Some(selected) = selected {
+        if let Some(option) = options.iter().find(|option| option.label == selected) {
+            if !option.updates.is_empty() {
+                let updates: Vec<(PathBuf, Option<bool>)> = option
+                    .updates
+                    .iter()
+                    .map(|update| (update.path.clone(), update.decision))
+                    .collect();
+                trust_store.set_many(&updates)?;
             }
+            return Ok(option.trusted);
         }
+    }
+    Ok(false)
+}
+
+/// Async variant for contexts carrying `select_async` (T15 W7, ADR-0006):
+/// identical decision chain, but the selector is awaited on the event loop.
+pub async fn resolve_project_trusted_async(
+    cwd: &Path,
+    trust_store: &ProjectTrustStore,
+    trust_override: Option<bool>,
+    default_project_trust: DefaultProjectTrust,
+    extension_event: Option<ProjectTrustEventResult>,
+    context: &mut ProjectTrustContext,
+) -> Result<bool, PirError> {
+    if context.select_async.is_none() {
+        return resolve_project_trusted(
+            cwd,
+            trust_store,
+            trust_override,
+            default_project_trust,
+            extension_event,
+            context,
+        );
+    }
+    if let Some(trust_override) = trust_override {
+        return Ok(trust_override);
+    }
+    if !has_trust_requiring_project_resources(cwd) {
+        return Ok(true);
+    }
+    if let Some(event) = extension_event {
+        if event.trusted != ProjectTrustEventDecision::Undecided {
+            let trusted = event.trusted == ProjectTrustEventDecision::Yes;
+            if event.remember == Some(true) {
+                trust_store.set(cwd, Some(trusted))?;
+            }
+            return Ok(trusted);
+        }
+    }
+    if let Some(decision) = trust_store.get(cwd)? {
+        return Ok(decision);
+    }
+    match default_project_trust {
+        DefaultProjectTrust::Always => return Ok(true),
+        DefaultProjectTrust::Never => return Ok(false),
+        DefaultProjectTrust::Ask => {}
+    }
+    if !context.has_ui {
+        return Ok(false);
+    }
+    if let Some(select) = context.select_async.clone() {
+        let options = get_project_trust_options(cwd, true);
+        let labels: Vec<String> = options.iter().map(|option| option.label.clone()).collect();
+        let selected = select(format_project_trust_prompt(cwd), labels).await;
+        return apply_trust_selection(cwd, &options, selected, trust_store);
     }
     Ok(false)
 }
@@ -883,6 +966,7 @@ mod tests {
         let mut context = ProjectTrustContext {
             has_ui: true,
             select: Some(select_returning(Some("Trust"))),
+            select_async: None,
         };
         let trusted = resolve_project_trusted(
             &dirs.cwd,
@@ -905,6 +989,7 @@ mod tests {
         let mut context = ProjectTrustContext {
             has_ui: true,
             select: Some(select_returning(Some(&label))),
+            select_async: None,
         };
         let trusted = resolve_project_trusted(
             &dirs.cwd,
@@ -931,6 +1016,7 @@ mod tests {
         let mut context = ProjectTrustContext {
             has_ui: true,
             select: Some(select_returning(Some("Trust (this session only)"))),
+            select_async: None,
         };
         let trusted = resolve_project_trusted(
             &dirs.cwd,
@@ -950,6 +1036,7 @@ mod tests {
         let mut context = ProjectTrustContext {
             has_ui: true,
             select: Some(select_returning(Some("Do not trust"))),
+            select_async: None,
         };
         let trusted = resolve_project_trusted(
             &dirs.cwd,
@@ -969,6 +1056,7 @@ mod tests {
         let mut context = ProjectTrustContext {
             has_ui: true,
             select: Some(select_returning(None)),
+            select_async: None,
         };
         let trusted = resolve_project_trusted(
             &dirs.cwd,

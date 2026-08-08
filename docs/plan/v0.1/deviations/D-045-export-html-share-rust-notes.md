@@ -87,3 +87,12 @@
 4. **`share_command_abort_cancels` 测试等待条件修正**：原测试轮询旧的固定路径
    `{tmpdir}/session.html`（D-045 补记前的布局），在新唯一子目录布局下永不命中、
    空转 1s；改为经 mock runner 的进入标志等待 worker 在途。
+
+## T15 W7 复核结论（2026-08-08）
+
+`ToolHtmlRenderer` / `renderedTools` 维持「不移植」登记，复核理由：W4 落的
+扩展渲染是 TUI 声明式组件树（JSON 描述符，extension-abi.md §7），而上游
+HTML export 的预渲染管线吃的是 ANSI 文本（`ansi-to-html.ts`）；pir 的扩展
+渲染树没有 ANSI 形态可直接喂 export，移植该管线需另起 JSON 树→HTML 渲染器，
+超出 parity 范围且无实际消费者（扩展工具在导出 HTML 中回退通用渲染，与
+viewer 的可选链行为一致）。如未来需要，另立任务而非本偏离解决。

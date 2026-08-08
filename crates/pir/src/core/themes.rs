@@ -700,6 +700,8 @@ pub fn parse_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJ
             }
         }
         Some(colors_val) => {
+            // Invariant: the `!is_object()` arm above already rejected
+            // non-object `colors` values, so this is an object.
             let obj = colors_val.as_object().unwrap();
             // Check required keys
             for key in REQUIRED_COLOR_KEYS {
@@ -946,6 +948,20 @@ pub fn get_available_themes() -> Vec<ThemeInfo> {
 /// Default theme name based on environment detection (theme.ts:791-793).
 pub fn get_default_theme() -> TerminalTheme {
     detect_terminal_background_from_env().theme
+}
+
+/// The raw default (dark) theme JSON — the value `ctx.ui.theme` returns on
+/// bridges without theme access (upstream returns the statically imported
+/// default theme object, rpc-mode.ts:283-285 / runner.ts:256-258).
+pub fn default_theme_json() -> serde_json::Value {
+    serde_json::from_str(DARK_THEME_JSON).expect("built-in dark theme JSON is valid")
+}
+
+/// A theme's raw JSON value by name (for `ctx.ui.theme` / `getTheme`).
+pub fn theme_json_value(name: &str) -> Option<serde_json::Value> {
+    load_theme_json(name)
+        .ok()
+        .and_then(|theme| serde_json::to_value(theme).ok())
 }
 
 // ===========================================================================

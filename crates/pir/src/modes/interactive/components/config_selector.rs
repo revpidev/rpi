@@ -1213,9 +1213,10 @@ impl ResourceList {
         .map_err(|error| {
             // Surface the write failure (T14 review M5): the toggle stays
             // un-applied (caller returns `None`), mirroring the upstream
-            // throw. Stderr keeps the failure visible without a component
-            // notification channel.
-            eprintln!("pir config: failed to write project settings: {error}");
+            // throw. Logged through tracing (file sink in TUI mode,
+            // coding-standards §16.1) — there is no component notification
+            // channel here.
+            tracing::error!("pir config: failed to write project settings: {error}");
             error
         })
         .is_ok()
@@ -1297,7 +1298,7 @@ impl ResourceList {
                 // Surface the write failure (T14 review M5): the toggle
                 // stays un-applied (caller returns `None`), mirroring the
                 // upstream throw.
-                eprintln!("pir config: failed to write project settings: {error}");
+                tracing::error!("pir config: failed to write project settings: {error}");
                 error
             })
             .is_ok()

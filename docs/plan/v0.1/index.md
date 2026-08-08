@@ -53,7 +53,7 @@
 | T12 | [pir-tui 组件与 Interactive 模式](./T12-interactive-mode.md) | M5 | T10、T11 | 已完成 | 2026-08-06 |
 | T13 | [全量 Provider 与 OAuth](./T13-providers-oauth.md) | M6 | T03、T04 | 已完成 | 2026-08-07 |
 | T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 已完成 | 2026-08-07 |
-| T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 未开始 | — |
+| T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 已完成 | 2026-08-09 |
 
 ## 4. 里程碑映射与并行建议
 
@@ -87,6 +87,7 @@ docs/plan/v0.1/
 
 | 日期 | 变更 | 说明 |
 |------|------|------|
+| 2026-08-09 | T15 验收完成 | 扩展宿主 L0+L1 与 Parity Freeze 完成（W1–W8 八波次）：`pir-ext-host` 宿主核心（注册表同名冲突规则全量/发现加载/串行 emit/错误总线）、33 事件全接线（含 tool_call 改参穿线、before_provider_request/headers 链式、user_bash、project_trust、resources_discover）、24 API 动作绑定、28 UI 方法三桥（Interactive/Rpc 9+18 降级/Null）、三级 Context 与 stale 失效、L1 wasmtime 宿主（ABI v1 + capability 沙箱 + fuel）与 `pir-ext-sdk`、L0 abi_stable 动态库插件（`native` manifest 字段）、安装管理 e2e 与启动管线 packages→loader 接线、llama 迁移真扩展（D-047 关闭）、switchSession 异步信任选择器（ADR-0006/D-044 关闭）、`--wasm-smoke` 钩子移除；Parity Freeze：`docs/parity-checklist.md` 四类清单（扩展 API 88 条逐条锚点）+ session 互通终验补全栈 faux 续跑测试 + 需求 §1.2 五条总核对全过；gnu release 复测 32,125,208B ≈30.6MiB < 50MB；偏离 D-048~D-050 登记回写（行为级三缺口 → ADR-0007）、`02-design.md` §7.2/§13 定稿回写、README 状态节同步；测试 3815 passed / 0 failed |
 | 2026-08-07 | T14 验收完成 | 可选工具 / Packages / Trust / Export / llama / 更新完成（W1–W7 七波次）：grep/find/ls Rust 原生实现（ignore/globset，rg 15/fd 10.4 实机交叉验证）；package-manager 核心 + install/remove/list 子命令；update 全目标（互斥矩阵/--force/release note/self 更新/并发 4）+ config 子命令；trust 产品化（完整优先级链 + 启动弹窗 + 两阶段加载）；HTML/JSONL export（模板资产逐字节内嵌对拍）+ gist share；endpoint/telemetry 配置化（三个 PIR_*_URL + settings 三键 + "off" 零请求）；llama.cpp 集成（/llama + /login llama.cpp + HF 搜索下载）；gnu release 29MB 发布物 smoke 全过（musl 本次豁免，用户决策）；终审修复 7 项（edit 测试目录竞态、display() 凭据脱敏、/share 临时文件串号等）；偏离 D-039~D-047 登记回写（D-039 第 1 条 → ADR-0005、D-044 → ADR-0006 留 T15 关闭，其余验收后置「已关闭」）；`01-requirements.md` §3.2/§4.5/§7.6/§7.8/§10、`02-design.md` §6.1/§8/§12 同步 |
 | 2026-08-07 | T13 验收完成 | 全量 Provider 与 OAuth 完成（W1–W7 七波次）：7 个新适配器（pi-messages/mistral/google-generative-ai+google-shared/azure/google-vertex+ADC/bedrock 手写 SigV4+event-stream/codex WS 含缓存续传与 zstd）、38 工厂 + 目录生成管线（37 份 vendored JSON、1153 模型、compat 全量）、6 OAuth 流程 + load registry、images 子系统、handoff/deferred tools 收尾（修复 last-wins 语义偏差）、远程 catalog overlay + `pir update --models`；需求 §5 映射表 55 条、上游测试移植清单 114 文件逐条标注、live smoke 无 key 全豁免；偏离 D-021~D-038 登记回写（D-029/030/031 已关闭）；`02-design.md` §3.3–3.6/§12/§13 同步（WS 状态机开放项定稿） |
 | 2026-08-06 | T12 验收完成 | 用户真机 smoke 人工验证通过（本机 + tmux 两种环境：启动、提问、streaming、abort、快捷键、退出恢复），T12 置「已完成」，验收日期 2026-08-06 |

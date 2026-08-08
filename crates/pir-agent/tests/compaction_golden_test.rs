@@ -1,12 +1,15 @@
-//! T08 黄金数值对拍：`fixtures/generated/compaction/golden.json` 与
-//! `prompts/*.txt`（由 `fixtures/generate-compaction-golden.mjs` 驱动上游
-//! dist 真函数产出）逐值/逐字节比对 `pir_agent::compaction` 的移植实现。
+//! T08 golden-value parity: `fixtures/generated/compaction/golden.json` and
+//! `prompts/*.txt` (produced by `fixtures/generate-compaction-golden.mjs`
+//! driving the upstream dist real functions) compared value-by-value /
+//! byte-by-byte against the `pir_agent::compaction` port.
 //!
-//! 覆盖：estimateTokens / calculateContextTokens / estimateContextTokens /
-//! findCutPoint / prepareCompaction / serializeConversation / file ops /
-//! prepareBranchEntries / isContextOverflow，以及全部 summarization prompt
-//! 渲染（history 初始/更新、turn prefix、split-turn 合并摘要、文件列表追加、
-//! branch summary、preamble 拼接、maxTokens/cacheRetention/sessionId 选项）。
+//! Coverage: estimateTokens / calculateContextTokens /
+//! estimateContextTokens / findCutPoint / prepareCompaction /
+//! serializeConversation / file ops / prepareBranchEntries /
+//! isContextOverflow, plus every summarization prompt render (history
+//! initial/update, turn prefix, split-turn merged summaries, file-list
+//! appends, branch summary, preamble join, and the
+//! maxTokens/cacheRetention/sessionId options).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

@@ -1,28 +1,36 @@
-//! G3 互通对拍（T16 自测清单「互通」条目）：harness JSONL 产物 ↔ T07 主路径
-//! `SessionManager` 双向加载 + 既有 fixtures 交叉验证。
+//! G3 interop parity (T16 self-check "interop" item): harness JSONL output
+//! ↔ T07 main-path `SessionManager` loading in both directions, cross-checked
+//! against the existing fixtures.
 //!
-//! 三个方向：
-//! - **harness → 主路径**（`harness_session_loads_in_session_manager_*`）：
-//!   用 `JsonlSessionStorage` + `Session` 门面构造会话（全部 11 种条目，
-//!   `firstKeptEntryId` / `retainedTail` 两形态 compaction、`active_tools_change`、
-//!   `leaf` 移动，含以 leaf 记录收尾的会话）写盘后由 `SessionManager` 打开：
-//!   条目数/类型/载荷逐一保留、leaf 按 harness 语义重建、context 与 harness 侧
-//!   一致（主路径读取时展开 retainedTail，见设计文档 §457 注记）、无损写回、
-//!   续跑追加不丢数据。
-//! - **主路径 → harness**（`session_manager_session_loads_in_harness_repo`）：
-//!   `SessionManager` 构造等价会话写盘后经 `JsonlSessionRepo::open` 加载：
-//!   header / 条目 / leaf 重建正确，`get_path_to_root_or_compaction` 两形态
-//!   （无 compaction 全路径 + `firstKeptEntryId` 截断）行走与主路径一致，
-//!   stats / name / label / context 一致。
-//! - **fixtures 交叉**（`harness_storage_loads_all_fixture_sessions`）：
-//!   `fixtures/generated/*/session.jsonl`（上游 coding-agent 实录；`compaction/`
-//!   目录无 session.jsonl，compaction 场景在 `compaction-threshold` /
-//!   `compaction-overflow`）逐一用 harness `JsonlSessionStorage` 加载成功
-//!   （version 3 硬校验、条目全解析、leaf 正确），并与 `SessionManager` 三方
-//!   交叉：typed 条目相等、leaf 相等、path-to-root-or-compaction 相等。
+//! Three directions:
+//! - **harness → main path** (`harness_session_loads_in_session_manager_*`):
+//!   sessions built with the `JsonlSessionStorage` + `Session` facade (all
+//!   11 entry kinds, compaction in both `firstKeptEntryId` / `retainedTail`
+//!   forms, `active_tools_change`, `leaf` moves, including sessions ending
+//!   on a leaf record) are written to disk and opened by `SessionManager`:
+//!   entry count/type/payload preserved one by one, the leaf rebuilt per
+//!   harness semantics, context matching the harness side (the main path
+//!   expands retainedTail on read, see design doc §457 note), lossless
+//!   write-back, and continued appends without data loss.
+//! - **main path → harness** (`session_manager_session_loads_in_harness_repo`):
+//!   equivalent sessions built by `SessionManager` are written to disk and
+//!   loaded via `JsonlSessionRepo::open`: header / entries / leaf rebuilt
+//!   correctly, `get_path_to_root_or_compaction` walking both shapes (full
+//!   path without compaction + `firstKeptEntryId` truncation) matching the
+//!   main path, and stats / name / label / context identical.
+//! - **fixtures cross-check** (`harness_storage_loads_all_fixture_sessions`):
+//!   `fixtures/generated/*/session.jsonl` (upstream coding-agent recordings;
+//!   the `compaction/`
+//!   dir has no session.jsonl; the compaction scenarios in
+//!   `compaction-threshold` / `compaction-overflow`) are each loaded
+//!   successfully with the harness `JsonlSessionStorage` (hard version-3
+//!   check, all entries parsed, leaf correct) and cross-checked three ways
+//!   against `SessionManager`: typed entries equal, leaf equal,
+//!   path-to-root-or-compaction equal.
 //!
-//! harness 侧文件系统用 `NodeExecutionEnv`（真实 tokio 实现，非测试替身），
-//! 因此本文件同时覆盖 storage 的真实 I/O 路径。
+//! The harness-side filesystem runs on `NodeExecutionEnv` (a real tokio
+//! implementation, not a test stand-in), so this file also covers the
+//! storage layer's real I/O paths.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

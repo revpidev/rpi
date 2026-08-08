@@ -1,0 +1,21 @@
+[package]
+name = "pir-wasm-extension-example"
+description = "Example pir wasm extension (permission gate): ABI v1 guest"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Standalone crate: built for wasm32-unknown-unknown, not the host
+# workspace's default target set.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pir-ext-sdk = { path = "../../crates/pir-ext-sdk" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = "s"
+strip = true

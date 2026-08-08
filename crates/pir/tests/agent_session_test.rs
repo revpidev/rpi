@@ -1,8 +1,10 @@
-//! `AgentSession` 单元测试：prompt 生命周期事件序、queue_update、auto-retry、
-//! bash 结果在流式期间的暂存与下个 prompt 前的 flush。
+//! `AgentSession` unit tests: prompt lifecycle event ordering,
+//! queue_update, auto-retry, and bash-result staging during streaming with
+//! the flush before the next prompt.
 //!
-//! 与 `rpc_mode_test.rs` 的全栈契约测试互补：这里直接驱动 `AgentSession`
-//! （经 `create_agent_session` 组装 + FauxProvider 脚本化响应），不走 RPC 线协议。
+//! Complements the full-stack contract tests in `rpc_mode_test.rs`: here the
+//! `AgentSession` is driven directly (assembled via `create_agent_session` +
+//! scripted FauxProvider responses) without the RPC wire protocol.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

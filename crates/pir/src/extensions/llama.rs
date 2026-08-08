@@ -18,6 +18,60 @@ pub mod client;
 pub mod huggingface;
 pub mod provider;
 
+// ---------------------------------------------------------------------------
+// Built-in extension registration (T15 W7, closes D-047)
+// ---------------------------------------------------------------------------
+
+/// The built-in hidden extension (extensions/index.ts `builtInExtensions`):
+/// registers the llama.cpp provider (native overload, runner.ts:394-400)
+/// and the `/llama` command through the real extension host.
+pub fn inline_extension() -> pir_ext_host::loader::InlineExtension {
+    pir_ext_host::loader::InlineExtension::Named {
+        name: "llama.cpp".to_owned(),
+        hidden: true,
+        factory: Arc::new(|api| {
+            Box::pin(async move {
+                api.register_native_provider(shared_llama_provider().provider())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                api.register_command(
+                    "llama",
+                    Some("Manage llama.cpp router models".to_owned()),
+                    Arc::new(|_args, ctx| Box::pin(llama_command(ctx))),
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        }),
+    }
+}
+
+/// `/llama` handler (index.ts:170-180): the manager UI requires the
+/// interactive TUI; it mounts through the interactive bridge's native
+/// escape hatch (L0-only downcast).
+async fn llama_command(ctx: pir_ext_host::api::ExtensionCommandContext) -> Result<(), String> {
+    let is_tui = matches!(ctx.mode(), Ok(pir_ext_host::types::ExtensionMode::Tui));
+    let ui = ctx.ui().map_err(|e| e.to_string())?;
+    if !is_tui {
+        ui.notify(
+            "The /llama manager requires the interactive TUI",
+            pir_ext_host::api::NotifyType::Error,
+        );
+        return Ok(());
+    }
+    let bridge = ui
+        .as_any()
+        .and_then(|any| {
+            any.downcast_ref::<crate::modes::interactive::interactive_mode::ui_bridge::InteractiveUiBridge>()
+        })
+        .and_then(|bridge| bridge.interactive_ui());
+    let Some(ui) = bridge else {
+        return Err("/llama requires the interactive UI bridge".to_owned());
+    };
+    crate::modes::interactive::interactive_mode::InteractiveUi::handle_llama_command(&ui);
+    Ok(())
+}
+
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;

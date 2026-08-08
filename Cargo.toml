@@ -7,6 +7,7 @@ members = [
     "crates/pir-tui",
     "crates/pir",
     "crates/pir-ext-host",
+    "crates/pir-test-native-plugin",
     "crates/pir-test-support",
 ]
 
@@ -35,6 +36,7 @@ tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 jsonschema = "0.33"
 regex = "1"

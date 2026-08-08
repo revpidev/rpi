@@ -108,6 +108,32 @@ impl WorkingStatusIndicator {
         }
     }
 
+    /// With custom indicator frames/interval
+    /// (`WorkingIndicatorOptions`, types.ts:115-120).
+    pub fn with_options(
+        render_handle: RenderHandle,
+        message: impl Into<String>,
+        theme: Arc<Theme>,
+        indicator: Option<LoaderIndicatorOptions>,
+    ) -> Self {
+        WorkingStatusIndicator {
+            inner: StatusIndicator::new(
+                StatusIndicatorKind::Working,
+                render_handle,
+                Box::new({
+                    let theme = Arc::clone(&theme);
+                    move |spinner: &str| theme.fg("accent", spinner)
+                }),
+                Box::new({
+                    let theme = Arc::clone(&theme);
+                    move |text: &str| theme.fg("muted", text)
+                }),
+                message,
+                indicator,
+            ),
+        }
+    }
+
     pub fn dispose(&mut self) {
         self.inner.dispose();
     }

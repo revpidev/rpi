@@ -172,6 +172,14 @@ impl FooterDataProvider {
             .insert(key.into(), text.into());
     }
 
+    /// `setStatus(key, undefined)` — clear the entry (types.ts:147).
+    pub fn remove_extension_status(&self, key: &str) {
+        self.extension_statuses
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
     /// `onBranchChange` (footer-data-provider.ts:139-143). The mode wires
     /// branch changes through `UiCommand::GitBranchChanged` instead; this
     /// stays a no-op hook kept for interface parity (extensions).

@@ -12,6 +12,8 @@
 | [UPSTREAM](./UPSTREAM.md) | 钉死的 Pi commit（0.82.1 / `2efa728`） |
 | [ADR-0001](./docs/adr/0001-extension-and-config-dir.md) | 扩展=Rust/Wasm；配置=`~/.pir` |
 | [ADR-0002](./docs/adr/0002-baseline-decisions.md) | 版本钉死、TUI、token、单文件、JSONL、endpoint、MIT |
+| [Extension ABI](./docs/extension-abi.md) | wasm（L1）/ 原生动态库（L0）扩展 ABI v1 |
+| [Parity Checklist](./docs/parity-checklist.md) | 协议 / session 格式 / 扩展 API / TUI 四类对拍证据（T15 冻结） |
 
 ## 上游对照
 
@@ -23,4 +25,7 @@ MIT（与 Pi 相同）。
 
 ## 状态
 
-调研与基线决策已完成，可进入 M0 工程骨架。
+v0.1 全部任务（T01–T16）完成：四层 crate（`pir-ai` / `pir-agent` / `pir-tui` /
+`pir`）+ 扩展宿主（`pir-ext-host`，L0 Rust 内置/动态库 + L1 Wasm）交付，
+Parity Freeze 对拍清单见 [docs/parity-checklist.md](./docs/parity-checklist.md)，
+进度索引见 [docs/plan/v0.1/index.md](./docs/plan/v0.1/index.md)。

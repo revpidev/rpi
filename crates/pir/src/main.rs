@@ -5,19 +5,6 @@ fn main() {
     // SAFETY-FREE note: set before the runtime starts; no readers race.
     std::env::set_var("PIR_CODING_AGENT", "true");
 
-    // T02 measurement hook: exercises the embedded wasmtime runtime (kept
-    // linked into the release binary); T15 replaces this with the real host.
-    if std::env::args().any(|a| a == "--wasm-smoke") {
-        match pir_ext_host::wasm_smoke() {
-            Ok(info) => println!("{info}"),
-            Err(e) => {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

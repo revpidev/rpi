@@ -1,15 +1,21 @@
-//! G3 对拍（T07）：`fixtures/generated/*/session.jsonl`（上游 coding-agent
-//! 真实 session 实录）经 `pir::core::session_manager::SessionManager` 加载 →
-//! 树/context 构建 → `export_jsonl()` 写回，与原始 fixture 归一化 diff。
+//! G3 parity (T07): `fixtures/generated/*/session.jsonl` (real session
+//! recordings from the upstream coding-agent) loaded by
+//! `pir::core::session_manager::SessionManager` → tree/context building →
+//! written back via `export_jsonl()`, normalized-diffed against the original
+//! fixture.
 //!
-//! 覆盖两个层面：
-//! - **无损往返**：打开 v3 fixture 后 export 的行序列与原文件在
-//!   `pir_test_support` Normalizer 语义下一致（id/timestamp 一致映射）。
-//! - **加载 + 续跑**：打开 fixture 后追加 user/assistant 消息，context 包含
-//!   旧消息 + 新消息，文件追加两行，重开后状态完整。
+//! Two levels:
+//! - **lossless round trip**: after opening a v3 fixture, the exported line
+//!   sequence matches the original under the `pir_test_support` Normalizer
+//!   semantics (consistent id/timestamp mapping).
+//! - **load + continue**: after opening a fixture, appended user/assistant
+//!   messages put the context into a state that includes old and new
+//!   messages, two appended file lines, and a complete state after
+//!   reopening.
 //!
-//! fixture 中没有 compaction/branch_summary/label 条目，这些形态由
-//! `core::session_manager::tests` 的合成单测覆盖。
+//! The fixtures contain no compaction/branch_summary/label entries; those
+//! shapes are covered by the synthetic unit tests in
+//! `core::session_manager::tests`.
 
 use std::path::PathBuf;
 
@@ -199,4 +205,109 @@ fn parity_fixture_sessions_continue_after_load() {
             "{scenario}: reload context"
         );
     }
+}
+
+/// W8 session 互通终验：上游实录 fixture 加载进全栈 `AgentSession`（faux
+/// provider），经真实 `prompt()` 续跑一轮——文件恰好追加 user+assistant
+/// 两条 message 行、原有行逐字节不动、重开后 context 含旧消息 + 新回合。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parity_fixture_session_prompt_continue_with_faux_provider() {
+    use pir::core::agent_session::PromptOptions;
+    use pir::core::agent_session_services::{
+        create_agent_session_services, CreateAgentSessionServicesOptions,
+    };
+    use pir::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
+    use pir::sdk::{create_agent_session, CreateAgentSessionOptions};
+    use pir_test_support::faux::{FauxAiProvider, FauxProvider, FauxProviderOptions};
+    use std::sync::{Arc, Mutex};
+
+    let (dir, staged, original) = stage_fixture("single-turn");
+    let cwd = dir.0.join("workspace");
+    let agent_dir = dir.0.join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let provider = FauxProvider::new(FauxProviderOptions::default());
+    provider.set_responses(vec![faux_assistant_message(
+        "continued answer",
+        FauxAssistantOptions::default(),
+    )
+    .into()]);
+    let model = provider.get_model(None).expect("faux model");
+
+    let model_runtime = pir::core::model_runtime::ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: None,
+        auth_path: Some(agent_dir.join("auth.json")),
+        models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+        ..Default::default()
+    })
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+
+    let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+        cwd: cwd.clone(),
+        agent_dir: Some(agent_dir.clone()),
+        settings_manager: None,
+        model_runtime: Some(model_runtime.clone()),
+        extension_flag_values: Vec::new(),
+        resource_loader_options: None,
+    })
+    .await
+    .expect("services");
+
+    // cwd_override：fixture header 的 cwd 是上游实录机的 /tmp 路径（本机不存在）。
+    let session_manager =
+        SessionManager::open(&staged, None, Some(&cwd)).expect("open fixture session");
+    let before_lines = non_empty_lines(&original);
+
+    let created = create_agent_session(CreateAgentSessionOptions {
+        cwd: Some(cwd),
+        agent_dir: Some(agent_dir),
+        model_runtime: Some(model_runtime),
+        model: Some(model),
+        services: Some(services),
+        session_manager: Some(Arc::new(Mutex::new(session_manager))),
+        ..Default::default()
+    })
+    .await
+    .expect("create session from fixture");
+
+    created
+        .session
+        .prompt("continued question", PromptOptions::default())
+        .await
+        .expect("prompt");
+
+    // 文件恰好追加两行（同 model/thinking 不变，无额外条目），前缀不动。
+    let on_disk = std::fs::read_to_string(&staged).expect("read continued session");
+    let continued_lines = non_empty_lines(&on_disk);
+    assert_eq!(
+        continued_lines.len(),
+        before_lines.len() + 2,
+        "file appended exactly the continued turn"
+    );
+    assert_eq!(
+        continued_lines[..before_lines.len()],
+        before_lines[..],
+        "original fixture lines untouched"
+    );
+
+    // 重开：旧消息完整，末条是 faux 续跑的 assistant 回复。
+    let reopened = SessionManager::open(&staged, None, Some(&dir.0.join("workspace")))
+        .expect("reopen continued session");
+    let ctx = reopened.build_session_context();
+    let last = ctx.messages.last().expect("continued assistant message");
+    let last_json = serde_json::to_value(last).expect("serialize last message");
+    assert_eq!(
+        last_json.get("role").and_then(Value::as_str),
+        Some("assistant"),
+        "last context message is the continued assistant reply"
+    );
+    assert!(
+        last_json.to_string().contains("continued answer"),
+        "continued reply content present: {last_json}"
+    );
 }

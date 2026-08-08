@@ -1,8 +1,10 @@
-//! RPC 模式 32 命令契约测试（`docs/rpc.md` 逐条对拍基准）+ 帧格式/错误路径。
+//! RPC-mode contract tests for all 32 commands (`docs/rpc.md` is the
+//! per-command parity baseline) plus frame formats/error paths.
 //!
-//! 驱动方式：经 `run_rpc_mode` 全栈运行（真实 `AgentSessionRuntime` +
-//! FauxProvider 脚本化响应），客户端用 duplex 流逐条下发命令并读取响应，
-//! 与 rpc.md 的线协议逐条核对。
+//! Driven through `run_rpc_mode` full-stack (real `AgentSessionRuntime` +
+//! scripted FauxProvider responses); the client sends commands one by one
+//! over a duplex stream and checks each response against the rpc.md wire
+//! protocol.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

@@ -51,7 +51,7 @@ use crate::core::auth_guidance::{
 use crate::core::compaction_runner::{CompactionEvent, CompactionRunner};
 use crate::core::extensions::{
     read_runner, ExtensionMode, ExtensionRunner, ExtensionRunnerRef, InputEventResult, InputSource,
-    SessionStartEvent, StreamingBehavior,
+    SessionStartEvent, SessionStartReason, StreamingBehavior,
 };
 use crate::core::model_resolver::ScopedModel;
 use crate::core::model_runtime::ModelRuntime;
@@ -196,6 +196,10 @@ pub struct AgentSessionConfig {
 pub struct ExtensionBindings {
     pub mode: Option<ExtensionMode>,
     pub on_error: Option<crate::core::extensions::ExtensionErrorListener>,
+    /// `shutdownHandler` (agent-session.ts:2235-2238 area): mode-specific
+    /// graceful shutdown behind extension `ctx.shutdown()`
+    /// (docs/extensions.md:1018-1034). `None` = no-op (print modes).
+    pub shutdown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `PromptOptions` (agent-session.ts:238-249).
@@ -400,6 +404,10 @@ struct AgentSessionInner {
     base_system_prompt_options: Mutex<BuildSystemPromptOptions>,
     system_prompt_override: Mutex<Option<String>>,
     tool_registry: Mutex<OrderedMap<Arc<dyn AgentTool>>>,
+    /// `ToolDefinitionEntry` registry (agent-session.ts:2460 `_toolDefinitions`).
+    tool_definitions: Mutex<OrderedMap<ToolDefinitionEntry>>,
+    /// `_customTools` (agent-session.ts:345) — SDK-provided tools.
+    custom_tools: Vec<Arc<dyn AgentTool>>,
     session_env_cell: Arc<std::sync::RwLock<crate::tools::SessionEnv>>,
     allowed_tool_names: Option<HashSet<String>>,
     excluded_tool_names: Option<HashSet<String>>,
@@ -407,6 +415,8 @@ struct AgentSessionInner {
     /// `_extensionErrorListener` / `_extensionErrorUnsubscriber`
     /// (agent-session.ts:2307-2314).
     extension_error_listener: Mutex<Option<crate::core::extensions::ExtensionErrorListener>>,
+    /// Mode-provided shutdown handler (`ExtensionBindings::shutdown`, T15 W5).
+    extension_shutdown_handler: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     extension_error_unsubscriber: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
@@ -414,6 +424,40 @@ struct AgentSessionInner {
 /// all clones share the same session state.
 pub struct AgentSession {
     inner: Arc<AgentSessionInner>,
+}
+
+/// Weak handle to a session. The host actions hold this to break the
+/// session → runner-ref → host → actions → session Arc cycle (T15 W3).
+#[derive(Clone)]
+pub struct WeakAgentSession {
+    inner: std::sync::Weak<AgentSessionInner>,
+}
+
+impl WeakAgentSession {
+    pub fn upgrade(&self) -> Option<AgentSession> {
+        self.inner.upgrade().map(|inner| AgentSession { inner })
+    }
+}
+
+/// `_refreshToolRegistry` options (agent-session.ts:2550-2553).
+#[derive(Debug, Clone, Default)]
+pub struct RefreshToolRegistryOptions {
+    /// Replacement active set; `None` keeps the current one.
+    pub active_tool_names: Option<Vec<String>>,
+    /// Activate every extension/SDK tool (initial build + reload).
+    pub include_all_extension_tools: bool,
+}
+
+/// Tool definition metadata entry (`ToolDefinitionEntry`,
+/// agent-session.ts:2458-2503) — drives `getAllTools` and the system
+/// prompt's snippet/guideline sections.
+#[derive(Debug, Clone)]
+pub struct ToolDefinitionEntry {
+    pub description: String,
+    pub parameters: serde_json::Value,
+    pub prompt_snippet: Option<String>,
+    pub prompt_guidelines: Vec<String>,
+    pub source_info: crate::core::skills::SourceInfo,
 }
 
 impl AgentSession {
@@ -432,7 +476,7 @@ impl AgentSession {
                 config.agent.stream_function.clone(),
             )
         };
-        let compaction = CompactionRunner::new(
+        let mut compaction = CompactionRunner::new(
             config.agent.clone(),
             config.session_manager.clone(),
             model,
@@ -446,6 +490,9 @@ impl AgentSession {
             thinking_level,
             Arc::new(|_event| {}),
         );
+        // T15 W2: `session_before_compact` / `session_compact` ride the
+        // shared runner slot (read per emit, swap-safe).
+        compaction.set_extension_runner(config.extension_runner_ref.clone());
         let compaction_abort = compaction.abort_token_cell();
 
         let inner = Arc::new(AgentSessionInner {
@@ -486,6 +533,8 @@ impl AgentSession {
             }),
             system_prompt_override: Mutex::new(None),
             tool_registry: Mutex::new(OrderedMap::default()),
+            tool_definitions: Mutex::new(OrderedMap::default()),
+            custom_tools: config.custom_tools.clone(),
             session_env_cell: Arc::new(std::sync::RwLock::new(crate::tools::SessionEnv {
                 session_id: String::new(),
                 session_file: None,
@@ -501,6 +550,7 @@ impl AgentSession {
                 .map(|names| names.into_iter().collect()),
             extension_mode: Mutex::new(ExtensionMode::Print),
             extension_error_listener: Mutex::new(None),
+            extension_shutdown_handler: Mutex::new(None),
             extension_error_unsubscriber: Mutex::new(None),
         });
 
@@ -535,12 +585,19 @@ impl AgentSession {
             }
         }
 
-        session.build_tool_runtime(config.initial_active_tool_names, config.custom_tools);
+        session.build_tool_runtime(config.initial_active_tool_names);
         session
     }
 
     fn runner(&self) -> Arc<dyn ExtensionRunner> {
         read_runner(&self.inner.extension_runner_ref)
+    }
+
+    /// Weak handle for the host-action bridge (T15 W3).
+    pub fn downgrade(&self) -> WeakAgentSession {
+        WeakAgentSession {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     // ==================================================================
@@ -752,6 +809,19 @@ impl AgentSession {
         // `message_end`, retry/compaction triggers) can still reach this
         // session's persistence (agent-session.ts:851 `_disconnectFromAgent`).
         self.disconnect_from_agent();
+        // Detach the extension error listener (T15 W3): it lives in the
+        // host's runner core, and RPC-mode listeners capture the stdout
+        // sender — leaving it subscribed cycles session ↔ host ↔ output and
+        // the process never reaches exit.
+        if let Some(unsubscribe) = lock(&self.inner.extension_error_unsubscriber).take() {
+            unsubscribe();
+        }
+        lock(&self.inner.extension_error_listener).take();
+        // Drop the UI bridge for the same reason (T15 W4: the RPC bridge
+        // holds the stdout sender; the interactive bridge holds the UI).
+        if let Some(host) = crate::core::extension_host_adapter::host_of_runner(&self.runner()) {
+            host.clear_ui();
+        }
         self.runner().invalidate(
             "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
         );
@@ -908,20 +978,74 @@ impl AgentSession {
                 .is_some_and(|excluded| excluded.contains(name))
     }
 
-    /// `_buildRuntime` tool-registry half (agent-session.ts:2547-2599,
-    /// tool half :2454-2545), T10 subset (no extension tools).
-    fn build_tool_runtime(
-        &self,
-        initial_active_tool_names: Option<Vec<String>>,
-        custom_tools: Vec<Arc<dyn AgentTool>>,
-    ) {
-        self.sync_session_env();
+    /// `_buildRuntime` tool half (agent-session.ts:2547-2599 →
+    /// `_refreshToolRegistry` with the initial active set and
+    /// `includeAllExtensionTools: true`, agent-session.ts:394-400).
+    fn build_tool_runtime(&self, initial_active_tool_names: Option<Vec<String>>) {
+        let default_active: Vec<String> = match initial_active_tool_names {
+            Some(names) => names,
+            None => ["read", "bash", "edit", "write"]
+                .map(str::to_owned)
+                .to_vec(),
+        };
+        self.refresh_tool_registry(RefreshToolRegistryOptions {
+            active_tool_names: Some(default_active),
+            include_all_extension_tools: true,
+        });
+    }
+    /// `_normalizePromptSnippet` (agent-session.ts:997-1004).
+    fn normalize_prompt_snippet(text: Option<&str>) -> Option<String> {
+        let text = text?;
+        let mut one_line = String::with_capacity(text.len());
+        let mut pending_space = false;
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                pending_space = true;
+            } else {
+                if pending_space && !one_line.is_empty() {
+                    one_line.push(' ');
+                }
+                one_line.push(ch);
+                pending_space = false;
+            }
+        }
+        let trimmed = one_line.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    }
+
+    /// `_normalizePromptGuidelines` (agent-session.ts:1006-1017).
+    fn normalize_prompt_guidelines(guidelines: Option<&[String]>) -> Vec<String> {
+        let mut unique: Vec<String> = Vec::new();
+        for guideline in guidelines.unwrap_or(&[]) {
+            let normalized = guideline.trim();
+            if !normalized.is_empty() && !unique.iter().any(|g| g == normalized) {
+                unique.push(normalized.to_owned());
+            }
+        }
+        unique
+    }
+
+    fn synthetic_tool_source_info(path: &str, source: &str) -> crate::core::skills::SourceInfo {
+        crate::core::skills::SourceInfo {
+            path: PathBuf::from(path),
+            source: source.to_owned(),
+            scope: crate::core::skills::SourceScope::Temporary,
+            origin: crate::core::skills::SourceOrigin::TopLevel,
+            base_dir: None,
+        }
+    }
+
+    /// Build fresh built-in tool executables with settings-derived options
+    /// (agent-session.ts:2552-2564).
+    fn build_builtin_tools(&self) -> Vec<Arc<dyn AgentTool>> {
         let ctx = crate::tools::ToolContext {
             cwd: PathBuf::from(&self.inner.cwd),
             session_env: Some(self.inner.session_env_cell.clone()),
         };
-        // `_buildRuntime` feeds settings into the read/bash tool options
-        // (agent-session.ts:2552-2564).
         let tool_options = {
             let loader = lock(&self.inner.resource_loader);
             let settings = loader.settings_manager();
@@ -931,62 +1055,133 @@ impl AgentSession {
                 shell_path: settings.get_shell_path(),
             }
         };
-        // Insertion-ordered like the upstream `Map` registry: iteration order
-        // is observable in the active-tool list and system prompt.
-        let mut registry: OrderedMap<Arc<dyn AgentTool>> = OrderedMap::default();
-        // Built-ins come from the shared factory; the active set is applied
-        // below via the allow/deny filter. All seven built-in definitions are
-        // registered (createAllToolDefinitions, tools/index.ts:156-166): the
-        // four default coding tools plus the optional grep/find/ls (T14 W1).
-        // Optional tools stay inactive unless named via --tools /
-        // set_active_tools_by_name.
         const ALL_BUILTIN_TOOL_NAMES: [&str; 7] =
             ["read", "bash", "edit", "write", "grep", "find", "ls"];
-        let builtin_names = ["read", "bash", "edit", "write"];
-        let builtins = crate::tools::create_builtin_tools(
+        crate::tools::create_builtin_tools(
             &ctx,
             &ALL_BUILTIN_TOOL_NAMES.map(str::to_owned),
             &tool_options,
-        );
-        for tool in builtins {
-            if self.is_allowed_tool(tool.name()) {
-                registry.insert(tool.name().to_owned(), tool);
+        )
+    }
+
+    /// `_refreshToolRegistry` (agent-session.ts:2454-2545): full rebuild of
+    /// the executable registry + definition metadata (built-in → extension →
+    /// SDK custom, later `Map.set` wins per name), then the active-set
+    /// computation and system-prompt rebuild.
+    fn refresh_tool_registry(&self, options: RefreshToolRegistryOptions) {
+        self.sync_session_env();
+        let previous_registry_names: HashSet<String> =
+            lock(&self.inner.tool_registry).keys().cloned().collect();
+        let previous_active_tool_names = self.get_active_tool_names();
+
+        let mut definitions: OrderedMap<ToolDefinitionEntry> = OrderedMap::default();
+        let mut registry: OrderedMap<Arc<dyn AgentTool>> = OrderedMap::default();
+
+        for tool in self.build_builtin_tools() {
+            if !self.is_allowed_tool(tool.name()) {
+                continue;
             }
+            let name = tool.name().to_owned();
+            definitions.insert(
+                name.clone(),
+                ToolDefinitionEntry {
+                    description: tool.description().to_owned(),
+                    parameters: tool.parameters().clone(),
+                    prompt_snippet: Self::normalize_prompt_snippet(builtin_tool_snippet(&name)),
+                    prompt_guidelines: Self::normalize_prompt_guidelines(Some(
+                        &builtin_tool_guidelines(&name)
+                            .iter()
+                            .map(|g| (*g).to_owned())
+                            .collect::<Vec<_>>(),
+                    )),
+                    source_info: Self::synthetic_tool_source_info(
+                        &format!("<builtin:{name}>"),
+                        "builtin",
+                    ),
+                },
+            );
+            registry.insert(name, tool);
         }
-        for tool in custom_tools {
-            if self.is_allowed_tool(tool.name()) {
-                registry.insert(tool.name().to_owned(), tool);
+        // Extension tools (override built-ins by name, agent-session.ts:2514-2517).
+        for entry in self.runner().extension_tool_entries() {
+            if !self.is_allowed_tool(&entry.name) {
+                continue;
             }
+            definitions.insert(
+                entry.name.clone(),
+                ToolDefinitionEntry {
+                    description: entry.description,
+                    parameters: entry.parameters,
+                    prompt_snippet: Self::normalize_prompt_snippet(entry.prompt_snippet.as_deref()),
+                    prompt_guidelines: Self::normalize_prompt_guidelines(
+                        entry.prompt_guidelines.as_deref(),
+                    ),
+                    source_info: entry.source_info,
+                },
+            );
+            registry.insert(entry.name.clone(), entry.tool);
         }
+        // SDK custom tools (agent-session.ts:2465-2468).
+        for tool in &self.inner.custom_tools {
+            if !self.is_allowed_tool(tool.name()) {
+                continue;
+            }
+            let tool = tool.clone();
+            let name = tool.name().to_owned();
+            definitions.insert(
+                name.clone(),
+                ToolDefinitionEntry {
+                    description: tool.description().to_owned(),
+                    parameters: tool.parameters().clone(),
+                    prompt_snippet: None,
+                    prompt_guidelines: Vec::new(),
+                    source_info: Self::synthetic_tool_source_info(&format!("<sdk:{name}>"), "sdk"),
+                },
+            );
+            registry.insert(name, tool);
+        }
+
+        *lock(&self.inner.tool_definitions) = definitions;
         *lock(&self.inner.tool_registry) = registry;
 
-        let default_active: Vec<String> = match initial_active_tool_names {
-            Some(names) => names,
-            None => builtin_names.map(str::to_owned).to_vec(),
-        };
-        // includeAllExtensionTools: custom (SDK) tools join the active set.
-        let mut active: Vec<String> = default_active
+        // Active-set computation (agent-session.ts:2518-2543).
+        let mut next_active: Vec<String> = options
+            .active_tool_names
+            .clone()
+            .unwrap_or(previous_active_tool_names)
             .into_iter()
             .filter(|name| self.is_allowed_tool(name))
             .collect();
         if self.inner.allowed_tool_names.is_some() {
             for name in lock(&self.inner.tool_registry).keys() {
-                if !active.contains(name) && self.is_allowed_tool(name) {
-                    active.push(name.clone());
+                if self.is_allowed_tool(name) {
+                    next_active.push(name.clone());
                 }
             }
-        } else {
-            for tool in lock(&self.inner.tool_registry).keys() {
-                if !active.contains(tool) && !ALL_BUILTIN_TOOL_NAMES.contains(&tool.as_str()) {
-                    active.push(tool.clone());
+        } else if options.include_all_extension_tools {
+            // `wrappedExtensionTools` = extension + SDK custom tools
+            // (built-ins are never auto-activated here).
+            let definitions = lock(&self.inner.tool_definitions);
+            for name in definitions.keys() {
+                if definitions
+                    .get(name)
+                    .is_some_and(|entry| entry.source_info.source != "builtin")
+                {
+                    next_active.push(name.clone());
+                }
+            }
+        } else if options.active_tool_names.is_none() {
+            for name in lock(&self.inner.tool_registry).keys() {
+                if !previous_registry_names.contains(name) {
+                    next_active.push(name.clone());
                 }
             }
         }
         // Upstream `[...new Set(names)]`: dedup keeping first-occurrence
         // order (agent-session.ts:2544) — no sorting.
         let mut seen: HashSet<String> = HashSet::new();
-        active.retain(|name| seen.insert(name.clone()));
-        self.set_active_tools_by_name(active);
+        next_active.retain(|name| seen.insert(name.clone()));
+        self.set_active_tools_by_name(next_active);
     }
 
     /// Refresh the shared `PIR_*` session env cell (requirements §3.3: bash
@@ -1003,6 +1198,74 @@ impl AgentSession {
         cell.provider = model.as_ref().map(|m| m.provider.clone());
         cell.model = model.as_ref().map(|m| m.id.clone());
         cell.reasoning_level = Some(thinking_level_str(self.thinking_level()).to_owned());
+    }
+
+    /// `refreshTools` action target (`_refreshToolRegistry()` no-options
+    /// call, agent-session.ts:2395): re-reads the extension runner's
+    /// registered tools, so `registerTool` at runtime takes effect.
+    pub fn refresh_extension_tools(&self) {
+        self.refresh_tool_registry(RefreshToolRegistryOptions::default());
+    }
+
+    /// `getAllTools` (agent-session.ts:906-913) — `ToolInfo[]` JSON.
+    pub fn get_all_tools(&self) -> Vec<serde_json::Value> {
+        let definitions = lock(&self.inner.tool_definitions);
+        definitions
+            .keys()
+            .map(|name| {
+                let entry = definitions.get(name).expect("key from the same map");
+                serde_json::json!({
+                    "name": name,
+                    "description": entry.description,
+                    "parameters": entry.parameters,
+                    "promptGuidelines": if entry.prompt_guidelines.is_empty() {
+                        None
+                    } else {
+                        Some(entry.prompt_guidelines.clone())
+                    },
+                    "sourceInfo": entry.source_info,
+                })
+            })
+            .collect()
+    }
+
+    /// `getCommands` (agent-session.ts:2332-2355): extension commands (with
+    /// `:N` invocation names) → prompt templates → skills.
+    pub fn get_commands_info(&self) -> Vec<serde_json::Value> {
+        let mut commands: Vec<serde_json::Value> = Vec::new();
+        for command in self.runner().registered_commands() {
+            commands.push(serde_json::json!({
+                "name": command.invocation_name,
+                "description": command.description,
+                "source": "extension",
+                "sourceInfo": command.source_info,
+            }));
+        }
+        let (agent_dir, skills) = {
+            let loader = lock(&self.inner.resource_loader);
+            (
+                loader.agent_dir().to_path_buf(),
+                loader.resources().skills.clone(),
+            )
+        };
+        let cwd = PathBuf::from(&self.inner.cwd);
+        for template in self.prompt_templates() {
+            commands.push(serde_json::json!({
+                "name": template.name,
+                "description": template.description,
+                "source": "prompt",
+                "sourceInfo": crate::modes::rpc::prompt_template_source_info(&template, &agent_dir, &cwd),
+            }));
+        }
+        for skill in skills {
+            commands.push(serde_json::json!({
+                "name": format!("skill:{}", skill.name),
+                "description": skill.description,
+                "source": "skill",
+                "sourceInfo": skill.source_info,
+            }));
+        }
+        commands
     }
 
     /// `setActiveToolsByName` (agent-session.ts:926-941).
@@ -1029,26 +1292,31 @@ impl AgentSession {
 
     /// `_rebuildSystemPrompt` (agent-session.ts:1021-1055).
     fn rebuild_system_prompt(&self, tool_names: &[String]) -> String {
-        let registry = lock(&self.inner.tool_registry);
-        let valid: Vec<String> = tool_names
-            .iter()
-            .filter(|name| registry.contains_key(name))
-            .cloned()
-            .collect();
-        drop(registry);
-
-        let mut tool_snippets: HashMap<String, String> = HashMap::new();
-        let mut prompt_guidelines: Vec<String> = Vec::new();
-        for name in &valid {
-            if let Some(snippet) = builtin_tool_snippet(name) {
-                tool_snippets.insert(name.clone(), snippet.to_owned());
-            }
-            for guideline in builtin_tool_guidelines(name) {
-                if !prompt_guidelines.iter().any(|g| g == guideline) {
-                    prompt_guidelines.push((*guideline).to_owned());
+        let (valid, tool_snippets, prompt_guidelines) = {
+            let definitions = lock(&self.inner.tool_definitions);
+            let valid: Vec<String> = tool_names
+                .iter()
+                .filter(|name| definitions.get(name).is_some())
+                .cloned()
+                .collect();
+            // Snippets/guidelines ride the (possibly extension-overridden)
+            // definitions — overrides do NOT inherit the built-in text
+            // (agent-session.ts:2489-2503).
+            let mut tool_snippets: HashMap<String, String> = HashMap::new();
+            let mut prompt_guidelines: Vec<String> = Vec::new();
+            for name in &valid {
+                let entry = definitions.get(name).expect("filtered above");
+                if let Some(snippet) = &entry.prompt_snippet {
+                    tool_snippets.insert(name.clone(), snippet.clone());
+                }
+                for guideline in &entry.prompt_guidelines {
+                    if !prompt_guidelines.iter().any(|g| g == guideline) {
+                        prompt_guidelines.push(guideline.clone());
+                    }
                 }
             }
-        }
+            (valid, tool_snippets, prompt_guidelines)
+        };
 
         let loader = lock(&self.inner.resource_loader);
         let resources = loader.resources();
@@ -1267,9 +1535,21 @@ impl AgentSession {
             messages.extend(lock(&self.inner.pending_next_turn_messages).drain(..));
 
             // before_agent_start extension event (agent-session.ts:1224-1253).
+            // The event carries the fully assembled base system prompt and
+            // the build options; the runner chains `systemPrompt`
+            // replacements across handlers (runner.ts:1068-1132).
+            let (base_prompt, prompt_options_json) = {
+                let base = lock(&self.inner.base_system_prompt).clone();
+                (base, self.system_prompt_options_json())
+            };
             if let Some(result) = self
                 .runner()
-                .emit_before_agent_start(&expanded_text, images.as_deref())
+                .emit_before_agent_start(
+                    &expanded_text,
+                    images.as_deref(),
+                    &base_prompt,
+                    prompt_options_json,
+                )
                 .await
             {
                 for msg in result.messages {
@@ -1319,20 +1599,18 @@ impl AgentSession {
         }
     }
 
-    /// `_tryExecuteExtensionCommand` (agent-session.ts:1270-1294) — always
-    /// false with the no-op runner.
+    /// `_tryExecuteExtensionCommand` (agent-session.ts:1267-1294): parse
+    /// name + args, dispatch to the runner; handler errors are reported via
+    /// `emit_error` inside the runner adapter.
     async fn try_execute_extension_command(&self, text: &str) -> bool {
         let space_index = text.find(' ');
-        let command_name = match space_index {
-            Some(index) => &text[1..index],
-            None => &text[1..],
+        let (command_name, args) = match space_index {
+            Some(index) => (&text[1..index], &text[index + 1..]),
+            None => (&text[1..], ""),
         };
-        let Some(_command) = self.runner().get_command(command_name) else {
-            return false;
-        };
-        // Extension command execution is T15; unreachable with the no-op
-        // runner.
-        true
+        self.runner()
+            .execute_extension_command(command_name, args)
+            .await
     }
 
     /// `_expandSkillCommand` (agent-session.ts:1301-1325).
@@ -1507,6 +1785,29 @@ impl AgentSession {
             },
         )
         .await
+    }
+
+    /// `appendEntry` host action body (agent-session.ts:2375-2382):
+    /// persist a custom entry, then emit `entry_appended` with it.
+    pub fn append_entry(&self, custom_type: &str, data: Option<serde_json::Value>) {
+        let entry_id = {
+            let result = lock(&self.inner.session_manager).append_custom_entry(custom_type, data);
+            match result {
+                Ok(entry_id) => entry_id,
+                Err(error) => {
+                    tracing::warn!("session append failed: {error}");
+                    return;
+                }
+            }
+        };
+        let entry = lock(&self.inner.session_manager)
+            .get_entry(&entry_id)
+            .and_then(|stored| stored.known().cloned());
+        if let Some(entry) = entry {
+            self.emit(AgentSessionEvent::Session(SessionEvent::EntryAppended {
+                entry: Box::new(entry),
+            }));
+        }
     }
 
     /// `clearQueue` (agent-session.ts:1510-1518).
@@ -2685,6 +2986,9 @@ impl AgentSession {
         if let Some(on_error) = bindings.on_error {
             *lock(&self.inner.extension_error_listener) = Some(on_error);
         }
+        if let Some(shutdown) = bindings.shutdown {
+            *lock(&self.inner.extension_shutdown_handler) = Some(shutdown);
+        }
         // `_applyExtensionBindings` (agent-session.ts:2307-2314): the previous
         // subscription is dropped before re-subscribing — never leaked.
         if let Some(unsubscribe) = lock(&self.inner.extension_error_unsubscriber).take() {
@@ -2693,11 +2997,125 @@ impl AgentSession {
         let listener = lock(&self.inner.extension_error_listener).clone();
         *lock(&self.inner.extension_error_unsubscriber) =
             listener.and_then(|listener| self.runner().on_error(listener));
-        let reason = self.inner.session_start_event.reason;
-        self.runner().emit("session_start").await;
-        let _ = reason;
-        // extendResourcesFromExtensions: no-op with the default runner
-        // (has_handlers("resources_discover") is false).
+        let event = &self.inner.session_start_event;
+        self.runner()
+            .emit_event(
+                "session_start",
+                serde_json::json!({
+                    "type": "session_start",
+                    "reason": event.reason.as_str(),
+                    "previousSessionFile": event.previous_session_file,
+                }),
+            )
+            .await;
+
+        // `extendResourcesFromExtensions` (agent-session.ts:2251).
+        let discover_reason = match self.inner.session_start_event.reason {
+            SessionStartReason::Reload => "reload",
+            _ => "startup",
+        };
+        self.extend_resources_from_extensions(discover_reason).await;
+    }
+
+    /// `extendResourcesFromExtensions` (agent-session.ts:2254-2277):
+    /// extension-provided resource paths extend the loader, then the base
+    /// system prompt is rebuilt over the extended resources.
+    async fn extend_resources_from_extensions(&self, reason: &str) {
+        if !self.runner().has_handlers("resources_discover") {
+            return;
+        }
+        let paths = self
+            .runner()
+            .emit_resources_discover(&self.inner.cwd, reason)
+            .await;
+        if paths.skill_paths.is_empty()
+            && paths.prompt_paths.is_empty()
+            && paths.theme_paths.is_empty()
+        {
+            return;
+        }
+        lock(&self.inner.resource_loader).extend_resources(&paths);
+        let tool_names = self.get_active_tool_names();
+        let base = self.rebuild_system_prompt(&tool_names);
+        *lock(&self.inner.base_system_prompt) = base.clone();
+        self.inner.agent.set_system_prompt(base);
+    }
+
+    /// Invoke the mode-provided extension shutdown handler (T15 W5; no-op
+    /// when the mode bound none, e.g. print).
+    pub(crate) fn extension_shutdown(&self) {
+        if let Some(handler) = lock(&self.inner.extension_shutdown_handler).clone() {
+            handler();
+        }
+    }
+
+    /// `_baseSystemPromptOptions` as the extension-facing JSON
+    /// (`getSystemPromptOptions`, types.ts:349). Subset: the
+    /// serializable fields extensions inspect.
+    pub(crate) fn system_prompt_options_json(&self) -> serde_json::Value {
+        let options = lock(&self.inner.base_system_prompt_options);
+        let mut json = serde_json::json!({
+            "promptGuidelines": options.prompt_guidelines,
+            "cwd": options.cwd.to_string_lossy(),
+        });
+        if let Some(map) = json.as_object_mut() {
+            if let Some(custom) = &options.custom_prompt {
+                map.insert("customPrompt".to_owned(), custom.clone().into());
+            }
+            if let Some(tools) = &options.selected_tools {
+                map.insert("selectedTools".to_owned(), tools.clone().into());
+            }
+            if let Some(append) = &options.append_system_prompt {
+                map.insert("appendSystemPrompt".to_owned(), append.clone().into());
+            }
+        }
+        json
+    }
+
+    /// `reload` (agent-session.ts:2600-2628): session_shutdown(reload) →
+    /// settings/resources reload → host reload (factories re-run, factory
+    /// cache generation bumped, flag values preserved) → actions re-bind →
+    /// tool registry rebuild → session_start(reload) +
+    /// resources_discover(reload).
+    pub async fn reload(&self) {
+        let runner = self.runner();
+        if runner.has_handlers("session_shutdown") {
+            runner
+                .emit_event(
+                    "session_shutdown",
+                    serde_json::json!({"type": "session_shutdown", "reason": "reload"}),
+                )
+                .await;
+        }
+        {
+            let mut loader = lock(&self.inner.resource_loader);
+            loader.settings_manager_mut().reload();
+            loader.reload();
+        }
+        if let Some(host) = crate::core::extension_host_adapter::host_of_runner(&runner) {
+            let errors = host.reload().await;
+            for error in errors {
+                tracing::warn!("extension reload: {}: {}", error.path, error.error);
+            }
+            // The fresh runtime is unbound — re-bind the session actions
+            // (flushes provider registrations from the re-run factories).
+            crate::core::extension_actions::bind_session_actions(&host, self).await;
+        }
+        // `_buildRuntime({activeToolNames, includeAllExtensionTools: true})`
+        // (agent-session.ts:2610-2615).
+        self.refresh_tool_registry(RefreshToolRegistryOptions {
+            active_tool_names: Some(self.get_active_tool_names()),
+            include_all_extension_tools: true,
+        });
+        // session_start + extendResources with reason "reload"
+        // (agent-session.ts:2623-2626).
+        runner
+            .emit_event(
+                "session_start",
+                serde_json::json!({"type": "session_start", "reason": "reload"}),
+            )
+            .await;
+        self.extend_resources_from_extensions("reload").await;
     }
 
     /// `hasExtensionHandlers` (agent-session.ts:3317-3319).

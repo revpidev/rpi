@@ -1,8 +1,6 @@
-# Rust
-/target/
+# Rust（工作区根 target 与各 crate 内误产物目录）
+**/target/
 **/*.rs.bk
-# wasm spike guest（独立 workspace 的构建产物）
-/crates/pir-ext-host/examples/wasm-spike/guest/target/
 
 # 编辑器与系统
 *.swp

@@ -11,8 +11,11 @@
 
 pub mod autocomplete;
 pub mod commands;
+pub mod component_tree;
 pub mod components;
 pub mod custom_editor;
+pub mod extension_renderers;
+pub(crate) mod extension_shortcuts;
 pub mod external_editor;
 pub mod footer;
 pub(crate) mod git_branch_watcher;

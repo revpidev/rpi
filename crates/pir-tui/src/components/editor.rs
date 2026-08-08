@@ -1130,7 +1130,7 @@ impl Editor {
 
     /// Handle a completed bracketed paste (upstream `handlePaste`,
     /// editor.ts:1156-1222).
-    fn handle_paste(&mut self, pasted_text: &str) {
+    pub fn handle_paste(&mut self, pasted_text: &str) {
         self.cancel_autocomplete();
         self.exit_history_browsing();
         self.last_action = None;

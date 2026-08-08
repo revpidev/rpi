@@ -27,6 +27,7 @@ tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 regex.workspace = true
 unicode-normalization.workspace = true
 base64.workspace = true

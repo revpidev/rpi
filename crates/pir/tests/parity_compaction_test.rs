@@ -1,22 +1,29 @@
-//! T08 对拍：`fixtures/generated/compaction-{threshold,overflow}/`（上游
-//! `createAgentSession` + faux 实录）vs `pir::core::compaction_runner::
-//! CompactionRunner` 驱动的相同脚本。
+//! T08 parity: `fixtures/generated/compaction-{threshold,overflow}/`
+//! (recorded from the upstream `createAgentSession` + faux) vs the same
+//! script driven by `pir::core::compaction_runner::CompactionRunner`.
 //!
-//! 测试内复刻 agent-session 的最小接线（`_handleAgentEvent` 的持久化 +
-//! `_runAgentPrompt` 的 post-run 检查循环 + prompt 提交前检查，
-//! agent-session.ts:595-665/1061-1103/1197-1202）——这部分归 T10 的
-//! AgentSession 吸纳，此处只为对拍而复刻。
+//! The tests replicate the minimal agent-session wiring (`_handleAgentEvent`
+//! persistence + `_runAgentPrompt`'s post-run check loop + the pre-prompt
+//! checks, agent-session.ts:595-665/1061-1103/1197-1202) — that wiring is
+//! absorbed by T10's AgentSession; it is replicated here only for parity.
 //!
-//! 归一化约定（在 `pir_test_support` Normalizer 之上追加）：
-//! - `usage` 整键剥离：faux usage 由完整 context（含系统提示）估算且有
-//!   prompt-cache 双计；上游 fixture 的系统提示是 coding-agent 构建器产物
-//!   （T12 才移植），pir 侧用定长填充系统提示，数值不可比。
-//! - `tokensBefore` / `estimatedTokensAfter` 同理（由 usage 锚点推出）。
-//!   触发*决策*（何时压缩、切点、摘要内容、firstKeptEntryId、willRetry、
-//!   事件类型序）仍在契约内，逐值比对。
-//! - session 头 `cwd` 替换为占位符（临时目录路径）。
-//! - 事件比对只取 compaction 事件子集（compaction_start/compaction_end/
-//!   summarization_retry_*）；Agent 层事件不属于 runner 契约。
+//! Normalization conventions (on top of the `pir_test_support`
+//! Normalizer):
+//! - the whole `usage` key is stripped: faux usage is estimated from the
+//!   full context (including the system prompt) and double-counts
+//!   prompt-cache; the upstream fixture system prompt is a coding-agent
+//!   builder artifact (only ported in T12), and pir pads a fixed-length
+//!   system prompt, so the numbers are not comparable.
+//! - `tokensBefore` / `estimatedTokensAfter` likewise (derived from the
+//!   usage anchor). The compaction *decision* (when to compact, the cut
+//!   point, summary content, firstKeptEntryId, willRetry,
+//!   event-type order) stays in the contract and is compared value by
+//!   value.
+//! - the session header `cwd` is replaced with a placeholder (temp-dir
+//!   path).
+//! - event comparison takes only the compaction event subset
+//!   (compaction_start/compaction_end/summarization_retry_*); Agent-layer
+//!   events are not part of the runner contract.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

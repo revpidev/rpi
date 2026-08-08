@@ -14,7 +14,8 @@
 //!   gitignore rules still apply. Repository detection walks up from the
 //!   search path looking for a `.git` entry (find.ts:230-239).
 //! - `** /node_modules/**` and `**/.git/**` are always excluded
-//!   (requirements §4.5: 固定忽略 node_modules/.git, matching upstream's
+//!   (requirements §4.5: always ignore node_modules/.git, matching
+//!   upstream's
 //!   custom-operations ignore list at find.ts:165).
 //! - A pattern containing `/` switches to full-path matching and gets a
 //!   `**/` prefix unless it starts with `/` or `**/` or equals `**`

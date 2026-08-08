@@ -1,12 +1,14 @@
-//! SDK 示例测试（自测清单：「crate 外部调用 `create_agent_session` 完成一轮
-//! faux 对话」）—— `docs/sdk.md` "Quick Start" 的 Rust 对应：
+//! SDK example test (self-check item: "call `create_agent_session` from
+//! outside the crate and complete one faux conversation") — the Rust
+//! counterpart of the `docs/sdk.md` "Quick Start":
 //!
 //! ```text
 //! ModelRuntime::create → createAgentSession({ sessionManager: inMemory,
 //! modelRuntime, model }) → session.subscribe(...) → session.prompt(...)
 //! ```
 //!
-//! 只经 `pir::sdk` / 公开 re-export 路径组装，验证 SDK 表面的可用性。
+//! Assembled only through the `pir::sdk` / public re-export surface, to
+//! verify the SDK is usable from outside the crate.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

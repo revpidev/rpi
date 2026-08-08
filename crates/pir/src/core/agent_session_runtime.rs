@@ -101,8 +101,8 @@ impl ReplacedSessionContext {
 
 /// Callbacks wired by the hosting mode (RPC/interactive).
 pub type RebindSessionCallback = Box<dyn Fn(AgentSession) -> BoxFuture<'static, ()> + Send + Sync>;
-pub type WithSessionCallback<'a> =
-    Option<&'a (dyn Fn(ReplacedSessionContext) -> BoxFuture<'a, ()> + Send + Sync)>;
+pub type WithSessionCallback =
+    Option<Box<dyn Fn(ReplacedSessionContext) -> BoxFuture<'static, ()> + Send + Sync>>;
 
 /// `AgentSessionRuntime` (agent-session-runtime.ts:74-403).
 pub struct AgentSessionRuntime {
@@ -172,39 +172,68 @@ impl AgentSessionRuntime {
         self.rebind_session = rebind;
     }
 
-    async fn emit_before_switch(&self, reason: &str, _target_session_file: Option<&str>) -> bool {
+    async fn emit_before_switch(&self, reason: &str, target_session_file: Option<&str>) -> bool {
         let runner = self.session.extension_runner();
         if !runner.has_handlers("session_before_switch") {
             return false;
         }
-        let _ = reason;
+        // Payload per agent-session-runtime.ts:140-145.
         runner
-            .emit_cancelable("session_before_switch")
+            .emit_cancelable_with(
+                "session_before_switch",
+                serde_json::json!({
+                    "type": "session_before_switch",
+                    "reason": reason,
+                    "targetSessionFile": target_session_file,
+                }),
+            )
             .await
             .map(|result| result.cancel)
             .unwrap_or(false)
     }
 
-    async fn emit_before_fork(&self, _entry_id: &str, _position: ForkPosition) -> bool {
+    async fn emit_before_fork(&self, entry_id: &str, position: ForkPosition) -> bool {
         let runner = self.session.extension_runner();
         if !runner.has_handlers("session_before_fork") {
             return false;
         }
+        // Payload per agent-session-runtime.ts:154-160.
         runner
-            .emit_cancelable("session_before_fork")
+            .emit_cancelable_with(
+                "session_before_fork",
+                serde_json::json!({
+                    "type": "session_before_fork",
+                    "entryId": entry_id,
+                    "position": match position {
+                        ForkPosition::Before => "before",
+                        ForkPosition::At => "at",
+                    },
+                }),
+            )
             .await
             .map(|result| result.cancel)
             .unwrap_or(false)
     }
 
     /// `teardownCurrent` (agent-session-runtime.ts:167-175).
-    async fn teardown_current(&self, reason: SessionShutdownReason, _target: Option<String>) {
-        let _ = reason;
-        let _ = &_target;
-        self.session
+    async fn teardown_current(&self, reason: SessionShutdownReason, target: Option<String>) {
+        if self
+            .session
             .extension_runner()
-            .emit("session_shutdown")
-            .await;
+            .has_handlers("session_shutdown")
+        {
+            self.session
+                .extension_runner()
+                .emit_event(
+                    "session_shutdown",
+                    serde_json::json!({
+                        "type": "session_shutdown",
+                        "reason": reason.as_str(),
+                        "targetSessionFile": target,
+                    }),
+                )
+                .await;
+        }
         self.session.dispose();
     }
 
@@ -216,7 +245,7 @@ impl AgentSessionRuntime {
     }
 
     /// `finishSessionReplacement` (agent-session-runtime.ts:184-191).
-    async fn finish_session_replacement(&self, with_session: WithSessionCallback<'_>) {
+    async fn finish_session_replacement(&self, with_session: WithSessionCallback) {
         if let Some(rebind) = &self.rebind_session {
             rebind(self.session.clone()).await;
         }
@@ -229,11 +258,17 @@ impl AgentSessionRuntime {
     }
 
     /// `switchSession` (agent-session-runtime.ts:193-221).
+    /// `project_trust_context_factory` (interactive-mode.ts:4816/4830):
+    /// builds the trust prompt context for the target cwd (T15 W7); called
+    /// only when the target session lives in another cwd.
     pub async fn switch_session(
         &mut self,
         session_path: &str,
         cwd_override: Option<&str>,
-        with_session: WithSessionCallback<'_>,
+        with_session: WithSessionCallback,
+        project_trust_context_factory: Option<
+            crate::core::trust_manager::ProjectTrustContextFactory,
+        >,
     ) -> Result<bool, PirError> {
         if self.emit_before_switch("resume", Some(session_path)).await {
             return Ok(true);
@@ -254,7 +289,7 @@ impl AgentSessionRuntime {
             .await;
         self.apply(
             (self.create_runtime)(CreateRuntimeOptions {
-                cwd: new_cwd,
+                cwd: new_cwd.clone(),
                 agent_dir: self.services.agent_dir.clone(),
                 session_manager,
                 session_start_event: Some(SessionStartEvent {
@@ -262,7 +297,9 @@ impl AgentSessionRuntime {
                     previous_session_file: previous_session_file
                         .map(|p| p.to_string_lossy().into_owned()),
                 }),
-                project_trust_context: None,
+                project_trust_context: project_trust_context_factory
+                    .filter(|_| new_cwd != *self.cwd())
+                    .map(|factory| factory(&new_cwd)),
             })
             .await?,
         );
@@ -275,7 +312,7 @@ impl AgentSessionRuntime {
         &mut self,
         parent_session: Option<&str>,
         setup: NewSessionSetup<'_>,
-        with_session: WithSessionCallback<'_>,
+        with_session: WithSessionCallback,
     ) -> Result<bool, PirError> {
         if self.emit_before_switch("new", None).await {
             return Ok(true);
@@ -340,7 +377,7 @@ impl AgentSessionRuntime {
         &mut self,
         entry_id: &str,
         position: ForkPosition,
-        with_session: WithSessionCallback<'_>,
+        with_session: WithSessionCallback,
     ) -> Result<ForkResult, PirError> {
         if self.emit_before_fork(entry_id, position).await {
             return Ok(ForkResult {

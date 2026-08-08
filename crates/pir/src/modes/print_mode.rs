@@ -91,15 +91,38 @@ pub async fn run_print_mode(
 
     // bindExtensions + event subscription (print-mode.ts:71-109).
     let session = runtime.session().clone();
+    let print_mode = match options.mode {
+        PrintOutputMode::Json => ExtensionMode::Json,
+        PrintOutputMode::Text => ExtensionMode::Print,
+    };
     session
         .bind_extensions(crate::core::agent_session::ExtensionBindings {
-            mode: Some(match options.mode {
-                PrintOutputMode::Json => ExtensionMode::Json,
-                PrintOutputMode::Text => ExtensionMode::Print,
-            }),
+            mode: Some(print_mode),
             on_error: None,
+            // print/json: shutdown is a no-op (docs/extensions.md:1018-1034).
+            shutdown: None,
         })
         .await;
+    // `setUIContext(noOpUIContext)` equivalent (T15 W4): print/json modes
+    // bind the null bridge — `hasUI` stays false, `ctx.ui` never throws.
+    if let Some(host) = session
+        .extension_runner()
+        .as_any()
+        .and_then(|any| {
+            any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
+        })
+        .map(|adapter| adapter.host().clone())
+    {
+        host.set_ui(
+            Some(std::sync::Arc::new(
+                pir_ext_host::bridges::NullUiBridge::new(crate::core::themes::default_theme_json()),
+            )),
+            match print_mode {
+                ExtensionMode::Json => pir_ext_host::types::ExtensionMode::Json,
+                _ => pir_ext_host::types::ExtensionMode::Print,
+            },
+        );
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let json_mode = options.mode == PrintOutputMode::Json;
     let _unsubscribe = session.subscribe(std::sync::Arc::new(move |event: AgentSessionEvent| {

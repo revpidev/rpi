@@ -74,6 +74,10 @@ pub struct CreateAgentSessionOptions {
     pub session_manager: Option<Arc<Mutex<SessionManager>>>,
     /// Session start event metadata for extension runtime startup.
     pub session_start_event: Option<SessionStartEvent>,
+    /// Loaded extension host (T15 W2). When present, the session's
+    /// `ExtensionRunnerRef` is seeded with the host adapter instead of the
+    /// no-op runner.
+    pub extension_host: Option<Arc<pir_ext_host::host::NativeExtensionHost>>,
 }
 
 /// `CreateAgentSessionResult` (sdk.ts:88-95), T10 subset (no extensions
@@ -336,12 +340,14 @@ pub async fn create_agent_session(
     };
 
     // Agent stream function (sdk.ts:302-330) with provider retry/timeout
-    // settings and the extension header hook (no-op seam).
-    let extension_runner = {
-        let runner: Arc<dyn crate::core::extensions::ExtensionRunner> =
-            NoopExtensionRunner::shared();
-        runner
-    };
+    // settings and the extension header hook.
+    let extension_runner: Arc<dyn crate::core::extensions::ExtensionRunner> =
+        match &options.extension_host {
+            Some(host) => Arc::new(
+                crate::core::extension_host_adapter::ExtensionHostAdapter::new(host.clone()),
+            ),
+            None => NoopExtensionRunner::shared(),
+        };
     let extension_runner_ref = new_extension_runner_ref(extension_runner);
     let stream_fn = {
         let model_runtime = model_runtime.clone();
@@ -467,6 +473,18 @@ pub async fn create_agent_session(
             high: budgets.high.map(|v| v as u32),
         });
     agent_options.max_retry_delay_ms = Some(max_retry_delay_ms);
+    // Tool interception + provider response hooks read the runner at
+    // execution time (agent-session.ts:459-462 `_installAgentToolHooks`), so
+    // a runner swap needs no reinstall.
+    agent_options.before_tool_call = Some(
+        crate::core::extensions::extension_before_tool_call_hook(extension_runner_ref.clone()),
+    );
+    agent_options.after_tool_call = Some(crate::core::extensions::extension_after_tool_call_hook(
+        extension_runner_ref.clone(),
+    ));
+    agent_options.on_response = Some(crate::core::extensions::extension_on_response_callback(
+        extension_runner_ref.clone(),
+    ));
 
     let agent = Arc::new(Agent::new(agent_options));
 

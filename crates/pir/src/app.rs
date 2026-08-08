@@ -640,6 +640,11 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         std::io::stdin().is_terminal(),
         std::io::stdout().is_terminal(),
     );
+    // Tracing init (coding-standards §16): stderr sink for print/json/rpc,
+    // file sink for the interactive TUI (never stderr while rendering).
+    // Must run before any `tracing::` call; the handle lives until run_app
+    // returns so the buffered file writer is flushed on drop.
+    let _log_sink = crate::logging::LogSink::install(app_mode == AppMode::Interactive);
 
     if parsed.mode == Some(Mode::Rpc) && !parsed.file_args.is_empty() {
         let _ = writeln!(err, "Error: @file arguments are not supported in RPC mode");
@@ -738,15 +743,68 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     let resolved_prompt_template_paths = resolve_cli_paths(&cwd, &parsed.prompt_templates);
     let resolved_theme_paths = resolve_cli_paths(&cwd, &parsed.themes);
 
+    /// T15 W7: resolve package resources (extensions/skills/prompts/themes)
+    /// per the current trust state; failures degrade to empty + a warning
+    /// (the resource loader surfaces discovery diagnostics as usual).
+    async fn resolve_package_resource_paths(
+        cwd: &Path,
+        agent_dir: &Path,
+        project_trusted: bool,
+    ) -> crate::core::resource_loader::PackageResourcePaths {
+        // Fresh settings manager per call (SettingsManager is not Clone;
+        // the package manager takes it by value).
+        let settings_manager = SettingsManager::create(
+            cwd,
+            Some(agent_dir),
+            SettingsManagerCreateOptions { project_trusted },
+        );
+        // `packageManager.resolve()` — the package slice
+        // (resource-loader.ts:495 `this.packageManager.resolve()`).
+        match crate::core::package_manager::DefaultPackageManager::with_options(
+            crate::core::package_manager::PackageManagerOptions {
+                cwd: cwd.to_path_buf(),
+                agent_dir: agent_dir.to_path_buf(),
+                settings_manager,
+                runner: None,
+                offline: None,
+            },
+        )
+        .resolve(None)
+        {
+            Ok(paths) => paths.to_package_resource_paths(),
+            Err(message) => {
+                eprintln!("Warning: package resolution failed: {message}");
+                crate::core::resource_loader::PackageResourcePaths::default()
+            }
+        }
+    }
+
+    fn enabled_extension_paths(
+        paths: &crate::core::resource_loader::PackageResourcePaths,
+    ) -> Vec<String> {
+        paths
+            .extension_paths
+            .iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| entry.path.to_string_lossy().into_owned())
+            .collect()
+    }
+
     // `createRuntime` factory (main.ts:615-739).
+    // T15 W3: the extension host built inside the closure is stashed here so
+    // `--help` can render the dynamic extension-flag section (main.ts:752-758).
+    let startup_host: Arc<Mutex<Option<Arc<pir_ext_host::host::NativeExtensionHost>>>> =
+        Arc::new(Mutex::new(None));
     let create_runtime = {
         let parsed = parsed.clone();
         let trust_store = trust_store.clone();
+        let startup_host = startup_host.clone();
         let trust_by_cwd = trust_by_cwd.clone();
         Arc::new(move |options: CreateRuntimeOptions| {
             let parsed = parsed.clone();
             let trust_store = trust_store.clone();
             let trust_by_cwd = trust_by_cwd.clone();
+            let startup_host = startup_host.clone();
             let trust_prompt_settings = trust_prompt_settings.clone();
             let resolved_extension_paths = resolved_extension_paths.clone();
             let resolved_skill_paths = resolved_skill_paths.clone();
@@ -780,6 +838,11 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     Some(&options.agent_dir),
                     SettingsManagerCreateOptions { project_trusted },
                 );
+                // T15 W7: package resources feed the loader's rank-4 port
+                // (skills/prompts/themes) and the extension host's package
+                // paths (merge order: CLI first, packages after).
+                let package_resource_paths =
+                    resolve_package_resource_paths(&cwd, &options.agent_dir, project_trusted).await;
                 let services = create_agent_session_services(CreateAgentSessionServicesOptions {
                     cwd: cwd.clone(),
                     agent_dir: Some(options.agent_dir.clone()),
@@ -810,14 +873,70 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 })
                 .await?;
 
+                // T15 W2: the real extension host enters the startup
+                // pipeline with the two-phase trust-aware load
+                // (resource-loader.ts:327-353 `loadProjectTrustExtensions`,
+                // :520-571 `loadFinalExtensionSet`). CLI `-e` paths are the
+                // existence-checked list from the resource loader.
+                let cli_extension_paths: Vec<String> = {
+                    let loader = services
+                        .resource_loader
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    loader
+                        .resources()
+                        .extensions
+                        .paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect()
+                };
+                let extension_host =
+                    pir_ext_host::host::NativeExtensionHost::new(&cwd.to_string_lossy());
+                // Built-in hidden extensions (extensions/index.ts
+                // `builtInExtensions`) load as inline factories — trust
+                // independent, like upstream.
+                let builtin_extensions = vec![crate::extensions::llama::inline_extension()];
+                let mut project_trust_diagnostics: Vec<AgentSessionRuntimeDiagnostic> = Vec::new();
+
                 // Two-phase trust resolution (main.ts:626-662 +
                 // resourceLoaderReloadOptions.resolveProjectTrust).
-                if should_resolve_trust {
-                    // The `project_trust` extension event stays `None` until
-                    // the T15 host loads the pre-trust extension set
-                    // (resource-loader.ts:333-353); its priority position is
-                    // `resolve_project_trusted`'s `extension_event` parameter
-                    // (project-trust.ts:54-70).
+                let extension_load_errors = if should_resolve_trust {
+                    // Pre-trust bootstrap: user/global + CLI `-e` + inline;
+                    // project-local extensions stay out (its errors are
+                    // carried into the final pass result, so drop them here).
+                    let _ = extension_host
+                        .load_startup_pre_trust(
+                            options.agent_dir.clone(),
+                            cli_extension_paths.clone(),
+                            builtin_extensions.clone(),
+                            parsed.no_extensions,
+                        )
+                        .await;
+
+                    // The `project_trust` extension event on the pre-trust
+                    // set (project-trust.ts:54-70); its result takes the
+                    // priority position of `resolve_project_trusted`'s
+                    // `extension_event` parameter.
+                    let (trust_result, trust_errors) = extension_host
+                        .emit_project_trust(serde_json::json!({
+                            "type": "project_trust",
+                            "cwd": cwd.to_string_lossy(),
+                        }))
+                        .await;
+                    for error in trust_errors {
+                        project_trust_diagnostics.push(AgentSessionRuntimeDiagnostic {
+                            level: DiagnosticLevel::Warning,
+                            message: format!(
+                                "Extension \"{}\" project_trust error: {}",
+                                error.extension_path, error.error
+                            ),
+                        });
+                    }
+                    let extension_event = trust_result
+                        .as_ref()
+                        .map(crate::core::extension_host_adapter::parse_project_trust_result);
+
                     let mut trust_context = match options.project_trust_context {
                         Some(context) => context,
                         None if is_initial_runtime && trust_prompt_has_ui => {
@@ -828,6 +947,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                             let settings = trust_prompt_settings.clone();
                             ProjectTrustContext {
                                 has_ui: true,
+                                select_async: None,
                                 select: Some(Box::new(move |title, options| {
                                     crate::modes::interactive::startup_ui::run_startup_selector(
                                         &settings, title, options,
@@ -837,31 +957,137 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         }
                         None => ProjectTrustContext::headless(),
                     };
-                    let trusted = resolve_project_trusted(
-                        &cwd,
-                        &trust_store,
-                        parsed.project_trust_override,
-                        default_project_trust,
-                        None,
-                        &mut trust_context,
-                    )?;
+                    // T15 W7 (ADR-0006): the async TUI selector takes
+                    // precedence when the context carries one.
+                    let trusted = if trust_context.select_async.is_some() {
+                        crate::core::trust_manager::resolve_project_trusted_async(
+                            &cwd,
+                            &trust_store,
+                            parsed.project_trust_override,
+                            default_project_trust,
+                            extension_event,
+                            &mut trust_context,
+                        )
+                        .await?
+                    } else {
+                        resolve_project_trusted(
+                            &cwd,
+                            &trust_store,
+                            parsed.project_trust_override,
+                            default_project_trust,
+                            extension_event,
+                            &mut trust_context,
+                        )?
+                    };
                     trust_by_cwd
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(cwd.clone(), trusted);
-                    if trusted {
-                        let mut loader = services
-                            .resource_loader
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        loader.settings_manager_mut().set_project_trusted(true);
-                        loader.set_project_trusted(true);
-                        loader.reload();
+                    let package_extension_paths = if trusted {
+                        {
+                            let mut loader = services
+                                .resource_loader
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            loader.settings_manager_mut().set_project_trusted(true);
+                            loader.set_project_trusted(true);
+                        }
+                        // Re-resolve packages with the trusted settings and
+                        // re-feed the loader before the reload (T15 W7).
+                        let trusted_paths =
+                            resolve_package_resource_paths(&cwd, &options.agent_dir, true).await;
+                        let extension_paths = enabled_extension_paths(&trusted_paths);
+                        {
+                            let mut loader = services
+                                .resource_loader
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            loader.set_package_resources(trusted_paths);
+                            loader.reload();
+                        }
+                        extension_paths
+                    } else {
+                        enabled_extension_paths(&package_resource_paths)
+                    };
+
+                    // Final pass: the full set for the resolved trust state;
+                    // pre-trust extensions are reused (resource-loader.ts:520-571).
+                    // The built-ins are re-passed so `/reload` replays them from
+                    // the recorded spec — the reuse path does NOT re-run inline
+                    // factories (pre-trust already loaded them).
+                    extension_host
+                        .load_startup_final(
+                            options.agent_dir.clone(),
+                            cli_extension_paths.clone(),
+                            package_extension_paths,
+                            builtin_extensions.clone(),
+                            trusted,
+                            parsed.no_extensions,
+                        )
+                        .await
+                } else {
+                    // Single-phase load (trust already decided or nothing to
+                    // gate): project-local rides the current trust state;
+                    // built-ins run here (no pre-trust pass).
+                    extension_host
+                        .load_startup_final(
+                            options.agent_dir.clone(),
+                            cli_extension_paths.clone(),
+                            enabled_extension_paths(&package_resource_paths),
+                            builtin_extensions.clone(),
+                            project_trusted,
+                            parsed.no_extensions,
+                        )
+                        .await
+                };
+
+                // Flush native provider registrations from extension load
+                // into the model runtime BEFORE session creation, so
+                // extension models are visible to initial model resolution
+                // (upstream flushes at runner.bindCore; our bind happens
+                // after session construction, so the native half goes
+                // early — agent-session-services.ts:166-178).
+                for registration in extension_host
+                    .runtime()
+                    .take_pending_native_provider_registrations()
+                {
+                    if let Err(message) = services
+                        .model_runtime
+                        .register_native_provider(registration.provider)
+                        .await
+                    {
+                        project_trust_diagnostics.push(AgentSessionRuntimeDiagnostic {
+                            level: DiagnosticLevel::Error,
+                            message: format!(
+                                "Extension \"{}\" error: {message}",
+                                registration.extension_path
+                            ),
+                        });
                     }
                 }
 
+                // `applyExtensionFlagValues`
+                // (agent-session-services.ts:81-127) — runs after the final
+                // extension load so the registered flags are known.
+                let flag_diagnostics =
+                    crate::core::agent_session_services::apply_extension_flag_values(
+                        &extension_host,
+                        &parsed.unknown_flags,
+                    );
+
                 let mut diagnostics: Vec<AgentSessionRuntimeDiagnostic> = Vec::new();
+                diagnostics.extend(project_trust_diagnostics);
                 diagnostics.extend(services.diagnostics.clone());
+                diagnostics.extend(flag_diagnostics);
+                for error in &extension_load_errors {
+                    diagnostics.push(AgentSessionRuntimeDiagnostic {
+                        level: DiagnosticLevel::Error,
+                        message: format!(
+                            "Failed to load extension \"{}\": {}",
+                            error.path, error.error
+                        ),
+                    });
+                }
                 {
                     let mut loader = services
                         .resource_loader
@@ -948,6 +1174,9 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 }
 
                 let services_for_options = services.clone();
+                let extension_host = Arc::new(extension_host);
+                *startup_host.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(extension_host.clone());
                 let created = create_agent_session(CreateAgentSessionOptions {
                     cwd: Some(cwd.clone()),
                     agent_dir: Some(options.agent_dir.clone()),
@@ -961,12 +1190,22 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     custom_tools: Vec::new(),
                     services: Some(services_for_options),
                     session_manager: Some(options.session_manager),
+                    extension_host: Some(extension_host.clone()),
                     session_start_event: options.session_start_event.or(Some(SessionStartEvent {
                         reason: SessionStartReason::Startup,
                         previous_session_file: None,
                     })),
                 })
                 .await?;
+
+                // `runner.bindCore(...)` (agent-session.ts:2356-2443): the
+                // host actions bind against the live session; queued
+                // provider registrations flush here.
+                crate::core::extension_actions::bind_session_actions(
+                    &extension_host,
+                    &created.session,
+                )
+                .await;
 
                 // CLI thinking override (main.ts:729-732).
                 let cli_thinking_override =
@@ -1010,8 +1249,32 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     };
 
     if parsed.help {
-        // Extension flags section is empty until T15 (main.ts:752-758).
-        let _ = write!(out, "{}", print_help(&[], std::io::stdout().is_terminal()));
+        // Dynamic extension-flag section (main.ts:752-758), populated from
+        // the host the initial runtime loaded.
+        let extension_flags: Vec<crate::cli::args::ExtensionFlag> = startup_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|host| {
+                host.get_flags()
+                    .iter()
+                    .map(|(_, flag)| crate::cli::args::ExtensionFlag {
+                        name: flag.name.clone(),
+                        flag_type: match flag.flag_type {
+                            pir_ext_host::types::FlagType::Boolean => "boolean".to_owned(),
+                            pir_ext_host::types::FlagType::String => "string".to_owned(),
+                        },
+                        description: flag.description.clone(),
+                        extension_path: flag.extension_path.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = write!(
+            out,
+            "{}",
+            print_help(&extension_flags, std::io::stdout().is_terminal())
+        );
         return 0;
     }
 

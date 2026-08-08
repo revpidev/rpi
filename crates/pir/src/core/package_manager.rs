@@ -3452,7 +3452,9 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
 }
 
 /// `resolveExtensionEntries` (package-manager.ts:546-574): explicit
-/// `pi.extensions` manifest entries, else `index.ts` / `index.js`.
+/// `pi.extensions` manifest entries, else `index.ts` / `index.js`. T15 W7:
+/// wasm extension packages — `pir-extension.json` with a `wasm` field, or
+/// `index.wasm` (mirrors the ext-host loader's directory rules).
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let package_json_path = dir.join("package.json");
     if package_json_path.exists() {
@@ -3470,6 +3472,23 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
                 }
             }
         }
+    }
+    let wasm_manifest_path = dir.join("pir-extension.json");
+    if wasm_manifest_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&wasm_manifest_path) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(wasm) = manifest.get("wasm").and_then(|w| w.as_str()) {
+                    let resolved = dir.join(wasm);
+                    if resolved.is_file() {
+                        return Some(vec![resolved]);
+                    }
+                }
+            }
+        }
+    }
+    let index_wasm = dir.join("index.wasm");
+    if index_wasm.exists() {
+        return Some(vec![index_wasm]);
     }
     let index_ts = dir.join("index.ts");
     if index_ts.exists() {
@@ -3499,7 +3518,7 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if name.ends_with(".ts") || name.ends_with(".js") {
+            if name.ends_with(".ts") || name.ends_with(".js") || name.ends_with(".wasm") {
                 entries.push(path);
             }
         } else if path.is_dir() {

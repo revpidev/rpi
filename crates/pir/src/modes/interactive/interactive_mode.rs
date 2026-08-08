@@ -67,6 +67,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::modes::interactive::component_tree::component_from_tree;
 use pir_agent::messages::{
     AgentMessage, BranchSummaryMessage, BranchSummaryRole, CompactionSummaryMessage,
     CompactionSummaryRole, CustomMessage, CustomRole,
@@ -77,6 +78,7 @@ use pir_ai::types::{
     AssistantContent, ImageContent, ModelThinkingLevel, StopReason, ToolResultContent,
 };
 use pir_tui::components::editor::{EditorOptions, EditorTheme};
+use pir_tui::components::loader::LoaderIndicatorOptions;
 use pir_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownTheme};
 use pir_tui::components::select_list::SelectListTheme;
 use pir_tui::components::spacer::Spacer;
@@ -96,7 +98,7 @@ use crate::core::agent_session::{
 };
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::compaction_runner::{CompactionEvent, CompactionReason, RetrySource};
-use crate::core::extensions::StreamingBehavior;
+use crate::core::extensions::{ExtensionRunner, StreamingBehavior};
 use crate::core::settings_manager::DoubleEscapeAction;
 use crate::core::themes::{load_theme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
@@ -146,7 +148,8 @@ fn now_millis() -> u64 {
 /// allowance covers hook-only paths (e.g. selectors mounted while their
 /// follow-up flow is still a T13/T15 hook).
 #[allow(dead_code)]
-mod commands_selectors;
+pub(crate) mod commands_selectors;
+pub(crate) mod ui_bridge;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
@@ -944,6 +947,12 @@ pub(crate) struct InteractiveUi {
     /// The editor's tree entry (T12-S5a `showSelector` swaps this child in
     /// the TUI's child list for the active selector, preserving position).
     editor_region: SharedComponent,
+    /// Header/footer tree entries (stored at init) + the active extension
+    /// overrides (T15 W4 `setHeader`/`setFooter` region swaps).
+    header_region: Mutex<Option<SharedComponent>>,
+    footer_region: Mutex<Option<SharedComponent>>,
+    custom_header: Mutex<Option<SharedComponent>>,
+    custom_footer: Mutex<Option<SharedComponent>>,
     /// The active selector entry, if any (T12-S5a).
     active_selector: Mutex<Option<SharedComponent>>,
     /// Weak self-reference for callbacks that need the `Arc<InteractiveUi>`
@@ -967,10 +976,12 @@ pub(crate) struct InteractiveUi {
     /// `apply_runtime_settings` refreshes it on session rebind
     /// (interactive-mode.ts:1715).
     output_pad: AtomicUsize,
-    /// `hiddenThinkingLabel` (interactive-mode.ts:351-352).
-    hidden_thinking_label: String,
-    /// `workingVisible` (interactive-mode.ts:348).
-    working_visible: bool,
+    /// `hiddenThinkingLabel` (interactive-mode.ts:351-352). Mutex: the T15
+    /// extension UI bridge updates it (`setHiddenThinkingLabel`).
+    hidden_thinking_label: Mutex<String>,
+    /// `workingVisible` (interactive-mode.ts:348). Atomic: the T15 bridge
+    /// updates it (`setWorkingVisible`).
+    working_visible: AtomicBool,
     /// `workingMessage` (interactive-mode.ts:347) — extension-driven (T15).
     working_message: Mutex<Option<String>>,
 
@@ -1178,7 +1189,7 @@ impl InteractiveUi {
                 if let Some(handler) = lock(&self.retry_escape_handler).take() {
                     lock(&self.editor).on_escape = Some(handler);
                 }
-                if self.working_visible {
+                if self.working_visible.load(Ordering::Relaxed) {
                     let message = lock(&self.working_message)
                         .clone()
                         .unwrap_or_else(|| "Working...".to_string());
@@ -1247,7 +1258,7 @@ impl InteractiveUi {
                                 *lock(&self.hide_thinking_block),
                                 Arc::clone(&lock(&self.theme)),
                                 Arc::clone(&lock(&self.markdown_theme)),
-                                self.hidden_thinking_label.clone(),
+                                lock(&self.hidden_thinking_label).clone(),
                                 self.output_pad.load(Ordering::Relaxed),
                             );
                         component.update_content(assistant.clone());
@@ -1745,9 +1756,13 @@ impl InteractiveUi {
                 show_images: self.show_images,
                 image_width_cells: self.image_width_cells,
             },
-            // TODO(T15): registered tool definitions
-            // (getRegisteredToolDefinition, interactive-mode.ts:2944).
-            None,
+            // `getRegisteredToolDefinition` (interactive-mode.ts:2944):
+            // extension render hooks; overrides without hooks inherit the
+            // built-in rendering.
+            crate::modes::interactive::extension_renderers::host_tool_definition(
+                &self.session(),
+                tool_name,
+            ),
             Arc::clone(&lock(&self.theme)),
             self.render_handle.clone(),
             self.cwd.clone(),
@@ -1940,6 +1955,69 @@ impl InteractiveUi {
         }
         status.dispose();
         *status = ActiveStatus::Idle;
+    }
+
+    // ==================================================================
+    // T15 W4: extension UI bridge support
+    // ==================================================================
+
+    /// Re-apply the working indicator after a bridge `setWorking*` call:
+    /// only touches the status row when a Working indicator is currently
+    /// active (otherwise the stored values apply at the next turn start,
+    /// interactive-mode.ts:1181-1190).
+    pub(crate) fn refresh_working_indicator(
+        &self,
+        indicator: Option<pir_ext_host::api::WorkingIndicatorOptions>,
+    ) {
+        let active = matches!(&*lock(&self.status), ActiveStatus::Working(_));
+        if !self.working_visible.load(Ordering::Relaxed) {
+            self.clear_status_indicator(Some(StatusIndicatorKind::Working));
+        } else if active {
+            let message = lock(&self.working_message)
+                .clone()
+                .unwrap_or_else(|| "Working...".to_string());
+            let theme = Arc::clone(&lock(&self.theme));
+            let indicator = indicator.map(|options| LoaderIndicatorOptions {
+                frames: options.frames,
+                interval_ms: options.interval_ms,
+            });
+            self.show_status_indicator(ActiveStatus::Working(
+                WorkingStatusIndicator::with_options(
+                    self.render_handle.clone(),
+                    message,
+                    theme,
+                    indicator,
+                ),
+            ));
+        }
+        self.render_handle.request_render();
+    }
+
+    /// `setHeader`/`setFooter` region swap: a declarative tree replaces the
+    /// region's content; `None` restores the built-in region.
+    pub(crate) fn swap_region_component(
+        &self,
+        default_region: &SharedComponent,
+        component: Option<pir_ext_host::types::ComponentTree>,
+        slot: &Mutex<Option<SharedComponent>>,
+    ) {
+        let current = lock(slot).take();
+        match (component, current) {
+            (Some(tree), current) => {
+                let component = component_from_tree(&tree, &Arc::clone(&lock(&self.theme)));
+                let entry = shared_component_from_boxed(component);
+                match current {
+                    Some(custom) => self.ui.swap_child(&custom, &entry),
+                    None => self.ui.swap_child(default_region, &entry),
+                }
+                *lock(slot) = Some(entry);
+            }
+            (None, Some(custom)) => {
+                self.ui.swap_child(&custom, default_region);
+            }
+            (None, None) => {}
+        }
+        self.ui.request_render(false);
     }
 
     /// `showLoadedResources` (interactive-mode.ts:1421-1627): the loaded
@@ -2365,11 +2443,14 @@ impl InteractiveUi {
         let SessionEntry::Custom(custom_entry) = entry else {
             return;
         };
-        // TODO(T15): extension entry renderers (extensionRunner
-        // getEntryRenderer). Until then the no-op renderer renders nothing,
-        // matching upstream with zero extensions loaded.
+        // `getEntryRenderer` (custom-entry.ts); no renderer → renders
+        // nothing, matching upstream with zero extensions loaded.
         let renderer: crate::modes::interactive::components::custom_entry::EntryRenderer =
-            Box::new(|_, _, _| None);
+            crate::modes::interactive::extension_renderers::host_entry_renderer(
+                &self.session(),
+                &custom_entry.custom_type,
+            )
+            .unwrap_or_else(|| Box::new(|_, _, _| None));
         let mut component = CustomEntryComponent::new(
             custom_entry.clone(),
             renderer,
@@ -2432,8 +2513,11 @@ impl InteractiveUi {
                 if custom_message.display {
                     let mut component = CustomMessageComponent::new(
                         custom_message.clone(),
-                        // TODO(T15): extension message renderers.
-                        None,
+                        // `getMessageRenderer` (custom-message.ts:69-85).
+                        crate::modes::interactive::extension_renderers::host_message_renderer(
+                            &self.session(),
+                            &custom_message.custom_type,
+                        ),
                         Arc::clone(&lock(&self.theme)),
                         Arc::clone(&lock(&self.markdown_theme)),
                         self.output_pad.load(Ordering::Relaxed),
@@ -2518,7 +2602,7 @@ impl InteractiveUi {
                         *lock(&self.hide_thinking_block),
                         Arc::clone(&lock(&self.theme)),
                         Arc::clone(&lock(&self.markdown_theme)),
-                        self.hidden_thinking_label.clone(),
+                        lock(&self.hidden_thinking_label).clone(),
                         self.output_pad.load(Ordering::Relaxed),
                     );
                 self.add_chat_child(Box::new(component));
@@ -2759,7 +2843,7 @@ impl InteractiveUi {
         self.set_tools_expanded(expanded);
     }
 
-    fn set_tools_expanded(&self, expanded: bool) {
+    pub(crate) fn set_tools_expanded(&self, expanded: bool) {
         *lock(&self.tool_output_expanded) = expanded;
         if let Some(header) = lock(&self.built_in_header).as_ref() {
             lock(header).set_expanded(expanded);
@@ -3050,15 +3134,17 @@ impl InteractiveUi {
     }
 }
 
-/// `isExtensionCommand` (interactive-mode.ts:4017-4027) — the no-op
-/// extension runner never has commands; T15 wires the real check.
-fn is_extension_command(text: &str) -> bool {
+/// `isExtensionCommand` (interactive-mode.ts:4017-4027).
+fn is_extension_command(runner: &Arc<dyn ExtensionRunner>, text: &str) -> bool {
     if !text.starts_with('/') {
         return false;
     }
-    // TODO(T15): extensionRunner.getCommand(commandName).
-    let _ = text;
-    false
+    let space_index = text.find(' ');
+    let command_name = match space_index {
+        Some(index) => &text[1..index],
+        None => &text[1..],
+    };
+    runner.get_command(command_name).is_some()
 }
 
 fn compaction_status_reason(reason: CompactionReason) -> CompactionStatusReason {
@@ -3186,6 +3272,10 @@ impl InteractiveMode {
             footer,
             footer_data,
             editor_region: editor_region.clone(),
+            header_region: Mutex::new(None),
+            footer_region: Mutex::new(None),
+            custom_header: Mutex::new(None),
+            custom_footer: Mutex::new(None),
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
             built_in_header: Mutex::new(None),
@@ -3198,8 +3288,8 @@ impl InteractiveMode {
             output_pad: AtomicUsize::new(
                 session.settings_manager(|settings| settings.get_output_pad()) as usize,
             ),
-            hidden_thinking_label: "Thinking...".to_string(),
-            working_visible: true,
+            hidden_thinking_label: Mutex::new("Thinking...".to_string()),
+            working_visible: AtomicBool::new(true),
             working_message: Mutex::new(None),
             last_status_spacer: Mutex::new(None),
             last_status_text: Mutex::new(None),
@@ -3278,8 +3368,43 @@ impl InteractiveMode {
             .bind_extensions(ExtensionBindings {
                 mode: None,
                 on_error: None,
+                shutdown: Some({
+                    let shutdown_tx = self.ui_state.shutdown_tx.clone();
+                    std::sync::Arc::new(move || {
+                        let _ = shutdown_tx.send(true);
+                    })
+                }),
             })
             .await;
+
+        // Extension shortcuts on the default editor
+        // (interactive-mode.ts:1827-1841): the editor consults this hook
+        // before its own key handling; conflict resolution (reserved keys,
+        // last-wins) lives in the host (runner.ts:490-533).
+        crate::modes::interactive::extension_shortcuts::install_extension_shortcuts(
+            &self.ui_state,
+            &self.session,
+        );
+
+        // `setUIContext(createExtensionUIContext(), "tui")` (T15 W4): the
+        // interactive bridge on the session's extension host.
+        {
+            let runner = self.session.extension_runner();
+            if let Some(host) = runner
+                .as_any()
+                .and_then(|any| {
+                    any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
+                })
+                .map(|adapter| adapter.host().clone())
+            {
+                host.set_ui(
+                    Some(Arc::new(ui_bridge::InteractiveUiBridge::new(
+                        &self.ui_state,
+                    ))),
+                    pir_ext_host::types::ExtensionMode::Tui,
+                );
+            }
+        }
 
         // Install telemetry (interactive-mode.ts:685 →
         // `getChangelogForDisplay` 991-1014 → `reportInstallTelemetry`
@@ -3313,8 +3438,9 @@ impl InteractiveMode {
         let add_region = |container: Arc<Mutex<Container>>| {
             shared_component_from_boxed(Box::new(SharedChild(container)))
         };
-        self.ui
-            .add_child(add_region(ui_state.header_container.clone()));
+        let header_region = add_region(ui_state.header_container.clone());
+        *lock(&ui_state.header_region) = Some(header_region.clone());
+        self.ui.add_child(header_region);
         self.ui
             .add_child(add_region(ui_state.loaded_resources_container.clone()));
         self.ui
@@ -3330,10 +3456,10 @@ impl InteractiveMode {
         self.ui.add_child(self.editor_region.clone());
         self.ui
             .add_child(add_region(ui_state.widgets_below.clone()));
-        self.ui
-            .add_child(shared_component_from_boxed(Box::new(SharedChild(
-                ui_state.footer.clone(),
-            ))));
+        let footer_region =
+            shared_component_from_boxed(Box::new(SharedChild(ui_state.footer.clone())));
+        *lock(&ui_state.footer_region) = Some(footer_region.clone());
+        self.ui.add_child(footer_region);
         self.ui.set_focus(Some(self.editor_region.clone()));
 
         InteractiveUi::setup_key_handlers(&ui_state);
@@ -3806,20 +3932,11 @@ impl InteractiveMode {
                 ui.handle_debug_command();
                 Some(())
             }
-            _ => {
-                // Built-in (hidden) extension commands — the llama.cpp
-                // extension's `/llama` (extensions/index.ts
-                // `builtInExtensions`). Upstream these dispatch through
-                // `session.prompt`'s extension-command path (a T15 hook);
-                // pir routes them here (D-047).
-                match crate::extensions::built_in_extension_command(name) {
-                    Some(command) if command.name == "llama" => {
-                        InteractiveUi::handle_llama_command(&self.ui_state);
-                        Some(())
-                    }
-                    _ => None,
-                }
-            }
+            // Extension commands (incl. the built-in llama.cpp `/llama`)
+            // fall through to `session.prompt`'s extension-command path
+            // (agent-session.ts:1121-1129) — registered with the real host
+            // since T15 W3/W7.
+            _ => None,
         };
         handled.is_some()
     }
@@ -3896,7 +4013,7 @@ impl InteractiveMode {
         let will_retry = false;
         if will_retry {
             for message in messages {
-                if is_extension_command(&message.text) {
+                if is_extension_command(&self.session.extension_runner(), &message.text) {
                     self.prompt_or_shutdown(&message.text, PromptOptions::default())
                         .await;
                 } else if message.mode == StreamingBehavior::FollowUp {
@@ -3911,9 +4028,9 @@ impl InteractiveMode {
 
         // `isExtensionCommand` (interactive-mode.ts:4017-4027): the no-op
         // extension runner never has commands — T15 hook.
-        let first_prompt_index = messages
-            .iter()
-            .position(|message| !is_extension_command(&message.text));
+        let first_prompt_index = messages.iter().position(|message| {
+            !is_extension_command(&self.session.extension_runner(), &message.text)
+        });
         let Some(first_prompt_index) = first_prompt_index else {
             // All extension commands — execute them all (currently never).
             for message in messages {
@@ -3981,7 +4098,7 @@ impl InteractiveMode {
         for index in 0..rest.len() {
             let message = &rest[index];
             let queue_future = async {
-                if is_extension_command(&message.text) {
+                if is_extension_command(&self.session.extension_runner(), &message.text) {
                     self.session
                         .prompt(&message.text, PromptOptions::default())
                         .await
@@ -6163,5 +6280,139 @@ mod tests {
 
         // 退出恢复：终端 stop 被调用（raw 模式还原）。
         assert!(!terminal.is_started(), "terminal restored on shutdown");
+    }
+
+    // ---------------------------------------------------------------------
+    // T15 W4: InteractiveUiBridge VT 测试
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn w4_bridge_select_dialog_roundtrip_and_timeout() {
+        use pir_ext_host::api::UiBridge;
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let bridge = Arc::new(bridge);
+
+        // select：对话框挂载在编辑器位置，回车解析为选项值。
+        let b = bridge.clone();
+        let task = tokio::spawn(async move {
+            b.select("Pick one", &["Allow".to_owned(), "Block".to_owned()], None)
+                .await
+        });
+        for _ in 0..100 {
+            if lock(&mode.ui_state.active_selector).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let selector = lock(&mode.ui_state.active_selector)
+            .clone()
+            .expect("selector mounted");
+        lock(&selector).handle_input("\r");
+        assert_eq!(task.await.expect("task"), Some("Allow".to_owned()));
+        // 对话框关闭、编辑器复位。
+        assert!(lock(&mode.ui_state.active_selector).is_none());
+
+        // confirm 走 Yes/No 选择器（interactive-mode.ts:2262-2269）。
+        let b = bridge.clone();
+        let task = tokio::spawn(async move { b.confirm("Sure?", "really", None).await });
+        for _ in 0..100 {
+            if lock(&mode.ui_state.active_selector).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let selector = lock(&mode.ui_state.active_selector)
+            .clone()
+            .expect("confirm mounted");
+        lock(&selector).handle_input("\r");
+        assert!(task.await.expect("task"));
+
+        // timeout：自动解析默认值并关闭。
+        let b = bridge.clone();
+        let task = tokio::spawn(async move {
+            b.select(
+                "t",
+                &["x".to_owned()],
+                Some(pir_ext_host::api::UiDialogOptions { timeout: Some(40) }),
+            )
+            .await
+        });
+        assert_eq!(task.await.expect("task"), None);
+        assert!(lock(&mode.ui_state.active_selector).is_none());
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn w4_bridge_widget_footer_header_and_status() {
+        use pir_ext_host::api::{UiBridge, WidgetContent};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+
+        // setWidget（string[]，aboveEditor 默认）→ 渲染进 widgets_above。
+        bridge.set_widget(
+            "w1",
+            Some(WidgetContent::Lines(vec!["WIDGET-LINE".to_owned()])),
+            None,
+        );
+        {
+            let container = lock(&ui.widgets_above);
+            let rendered = container
+                .children
+                .iter()
+                .flat_map(|c| c.render(80))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                pir_test_support::vt::strip_ansi(&rendered).contains("WIDGET-LINE"),
+                "widget rendered: {rendered:?}"
+            );
+        }
+        // 清除 → 容器空。
+        bridge.set_widget("w1", None, None);
+        assert!(lock(&ui.widgets_above).children.is_empty());
+
+        // setHeader 组件描述替换 header 区域；None 恢复内置。
+        bridge.set_header(Some(serde_json::json!({
+            "type": "text", "props": {"text": "EXT-HEADER"}
+        })));
+        assert!(lock(&ui.custom_header).is_some());
+        bridge.set_header(None);
+        assert!(lock(&ui.custom_header).is_none());
+
+        // setFooter 同理。
+        bridge.set_footer(Some(serde_json::json!({
+            "type": "text", "props": {"text": "EXT-FOOTER"}
+        })));
+        assert!(lock(&ui.custom_footer).is_some());
+        bridge.set_footer(None);
+        assert!(lock(&ui.custom_footer).is_none());
+
+        // setStatus 进 footer 数据；None 清除。
+        bridge.set_status("ext", Some("busy"));
+        assert_eq!(
+            ui.footer_data
+                .get_extension_statuses()
+                .get("ext")
+                .map(String::as_str),
+            Some("busy")
+        );
+        bridge.set_status("ext", None);
+        assert!(!ui.footer_data.get_extension_statuses().contains_key("ext"));
+
+        // editor 文本读写 + paste 路径。
+        bridge.set_editor_text("hello");
+        assert_eq!(bridge.get_editor_text(), "hello");
+        bridge.paste_to_editor("pasted-content");
+        assert!(bridge.get_editor_text().contains("pasted-content"));
+
+        // tools expanded。
+        assert!(!bridge.get_tools_expanded());
+        bridge.set_tools_expanded(true);
+        assert!(bridge.get_tools_expanded());
+        mode.shutdown().await;
     }
 }

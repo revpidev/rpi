@@ -241,24 +241,24 @@ pub(crate) fn create_base_autocomplete_provider(
         .collect();
 
     // Extension commands (interactive-mode.ts:599-608): filtered to names
-    // not shadowed by a built-in, invocation name as command name. The T15
-    // extension-host registry is absent; the built-in hidden extensions
-    // (currently just llama.cpp's `/llama`) come from the static table
-    // (D-047). The hidden built-in carries no source tag, so the
-    // description passes through unprefixed.
-    let extension_commands: Vec<SlashCommandOrItem> =
-        crate::extensions::BUILT_IN_EXTENSION_COMMANDS
-            .iter()
-            .filter(|command| !is_builtin_command(command.name))
-            .map(|command| {
-                SlashCommandOrItem::Command(TuiSlashCommand {
-                    name: command.name.to_string(),
-                    description: Some(command.description.to_string()),
-                    argument_hint: None,
-                    get_argument_completions: None,
-                })
+    // not shadowed by a built-in, invocation name as command name, from the
+    // extension host's registry (T15). The hidden built-in carries no
+    // source tag, so the description passes through unprefixed.
+    let extension_commands: Vec<SlashCommandOrItem> = ui
+        .session()
+        .extension_runner()
+        .registered_commands()
+        .iter()
+        .filter(|command| !is_builtin_command(&command.invocation_name))
+        .map(|command| {
+            SlashCommandOrItem::Command(TuiSlashCommand {
+                name: command.invocation_name.clone(),
+                description: command.description.clone(),
+                argument_hint: None,
+                get_argument_completions: None,
             })
-            .collect();
+        })
+        .collect();
 
     // Skill commands (interactive-mode.ts:610-622): `skill:<name>` per
     // loaded skill, file path recorded for the slash-command dispatch.

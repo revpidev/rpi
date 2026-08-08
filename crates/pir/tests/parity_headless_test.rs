@@ -1,18 +1,25 @@
-//! T10 三模式对拍：`fixtures/generated/<scenario>/`（上游 `createAgentSession`
-//! + faux 实录）vs pir 的 `AgentSession`（全栈组装）与 print/json 模式。
+//! T10 three-mode parity: `fixtures/generated/<scenario>/` (recorded from
+//! the upstream `createAgentSession` + faux) vs pir's `AgentSession`
+//! (full-stack assembly) in print/json modes.
 //!
-//! 场景驱动脚本逐条移植自 `fixtures/generate-fixtures.mjs`（same prompts、
-//! steer/followUp/abort 时序、工具调用参数）。
+//! The scenario scripts are ported entry by entry from
+//! `fixtures/generate-fixtures.mjs` (same prompts, steer/followUp/abort
+//! timing, tool-call arguments).
 //!
-//! 归一化约定（沿用 parity_compaction_test / parity_events_test 的先例）：
-//! - `message_update` / `tool_execution_update` 事件整类排除：上游 faux 用
-//!   `Math.random` 切 delta，delta 边界与输出分块不入契约。
-//! - `usage` / `details` 键剥离：usage 由完整 context（含上游构建器系统
-//!   提示）估算，details 是工具内部描述结构，均不属于会话/事件线格式契约。
-//! - session 头 `cwd` 替换为占位符。
+//! Normalization conventions (following the parity_compaction_test /
+//! parity_events_test precedent):
+//! - the whole `message_update` / `tool_execution_update` event classes are
+//!   excluded: the upstream faux slices deltas with `Math.random`, so delta
+//!   boundaries and output chunking are not part of the contract.
+//! - the `usage` / `details` keys are stripped: usage is estimated from the
+//!   full context (including the upstream builder's system prompt) and
+//!   details is a tool-internal description shape — neither belongs to the
+//!   session/event wire-format contract.
+//! - the session header `cwd` is replaced with a placeholder.
 //!
-//! compaction 场景不在此重复：`parity_compaction_test.rs`（T08）已按同等
-//! 归一化口径覆盖 threshold/overflow 两场景。
+//! The compaction scenario is not repeated here:
+//! `parity_compaction_test.rs` (T08) covers the threshold/overflow scenarios
+//! under the same normalization.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

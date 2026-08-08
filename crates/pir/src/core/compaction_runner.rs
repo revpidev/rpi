@@ -11,9 +11,9 @@
 //! I/O goes through [`SessionManager`].
 //!
 //! Intentional differences:
-//! - Extension hooks (`session_before_compact` / `session_compact`) are not
-//!   ported — the extension host lands later (T17+). `fromExtension` is
-//!   therefore always false.
+//! - The `signal` field of `session_before_compact` does not cross the
+//!   extension boundary (not serializable); extension cancellation rides the
+//!   `{cancel: true}` result instead.
 //! - Unknown/raw session entries are dropped when converting the branch to
 //!   typed entries; they carry zero context, so `prepareCompaction` sees the
 //!   same message stream either way.
@@ -51,6 +51,16 @@ pub enum CompactionReason {
     Manual,
     Threshold,
     Overflow,
+}
+
+impl CompactionReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CompactionReason::Manual => "manual",
+            CompactionReason::Threshold => "threshold",
+            CompactionReason::Overflow => "overflow",
+        }
+    }
 }
 
 /// `source` of `summarization_retry_attempt_start` (agent-session.ts:173-178).
@@ -137,6 +147,10 @@ pub struct CompactionRunner {
     emit: CompactionEventSink,
     overflow_recovery_attempted: bool,
     active_token: AbortTokenCell,
+    /// Extension runner slot (T15 W2): read per emit so a runner swap
+    /// (session replacement / reload) takes effect without rebuilding the
+    /// runner. `None` in bare test fixtures = no extensions.
+    extension_runner: Option<crate::core::extensions::ExtensionRunnerRef>,
 }
 
 impl CompactionRunner {
@@ -162,7 +176,24 @@ impl CompactionRunner {
             emit,
             overflow_recovery_attempted: false,
             active_token: AbortTokenCell::default(),
+            extension_runner: None,
         }
+    }
+
+    /// T15 W2: install the extension runner slot (AgentSession passes its
+    /// shared `ExtensionRunnerRef`).
+    pub fn set_extension_runner(
+        &mut self,
+        runner_ref: crate::core::extensions::ExtensionRunnerRef,
+    ) {
+        self.extension_runner = Some(runner_ref);
+    }
+
+    /// Current extension runner, if installed.
+    fn extension_runner(&self) -> Option<Arc<dyn crate::core::extensions::ExtensionRunner>> {
+        self.extension_runner
+            .as_ref()
+            .map(crate::core::extensions::read_runner)
     }
 
     /// Shared abort handle (see [`AbortTokenCell`]).
@@ -288,9 +319,15 @@ impl CompactionRunner {
         let outcome = self.compact_inner(custom_instructions, &token).await;
 
         // Upstream: aborted = message === "Compaction cancelled" ||
-        // error.name === "AbortError" (agent-session.ts:1911). The only
-        // "Compaction cancelled" source here is the token check.
-        let aborted = outcome.is_err() && token.is_cancelled();
+        // error.name === "AbortError" (agent-session.ts:1911). Sources here:
+        // the abort token, and an extension's `session_before_compact`
+        // cancel (:1819-1821).
+        let aborted = match &outcome {
+            Err(error) => {
+                token.is_cancelled() || raw_error_message(error) == "Compaction cancelled"
+            }
+            Ok(_) => false,
+        };
         let (result, error_message) = match &outcome {
             Ok(result) => (Some(Box::new(result.clone())), None),
             Err(error) if aborted => (None, None),
@@ -308,6 +345,42 @@ impl CompactionRunner {
         });
         *lock_abort(&self.active_token) = None;
         outcome
+    }
+
+    /// `session_before_compact` emit shared by the manual and auto paths
+    /// (agent-session.ts:1812-1831 / :2079-2105). `Ok(None)` proceeds with
+    /// the default summarization; `Ok(Some(_))` is an extension-provided
+    /// compaction (`fromExtension`); `Err("Compaction cancelled")` cancels.
+    async fn emit_session_before_compact(
+        &self,
+        preparation: &pir_agent::compaction::CompactionPreparation,
+        path_entries: &[SessionEntry],
+        custom_instructions: Option<&str>,
+        reason: CompactionReason,
+        will_retry: bool,
+    ) -> Result<Option<CompactionResult>, PirError> {
+        let Some(runner) = self.extension_runner() else {
+            return Ok(None);
+        };
+        if !runner.has_handlers("session_before_compact") {
+            return Ok(None);
+        }
+        let event = crate::core::extensions::SessionBeforeCompactEvent {
+            preparation: serde_json::to_value(preparation)
+                .map_err(|error| PirError::Session(error.to_string()))?,
+            branch_entries: serde_json::to_value(path_entries)
+                .map_err(|error| PirError::Session(error.to_string()))?,
+            custom_instructions: custom_instructions.map(str::to_owned),
+            reason: reason.as_str().to_owned(),
+            will_retry,
+        };
+        let Some(result) = runner.emit_session_before_compact(&event).await else {
+            return Ok(None);
+        };
+        if result.cancel == Some(true) {
+            return Err(PirError::Session("Compaction cancelled".into()));
+        }
+        Ok(result.compaction)
     }
 
     async fn compact_inner(
@@ -329,51 +402,104 @@ impl CompactionRunner {
             }
         })?;
 
-        let args = SummarizationArgs {
-            signal: Some(token.clone()),
-            thinking_level: Some(self.thinking_level),
-            retry: self.retry,
-            ..Default::default()
+        // Extension-provided compaction (agent-session.ts:1809-1828).
+        let extension_compaction = self
+            .emit_session_before_compact(
+                &preparation,
+                &path_entries,
+                custom_instructions,
+                CompactionReason::Manual,
+                false,
+            )
+            .await?;
+        let from_extension = extension_compaction.is_some();
+
+        let result = match extension_compaction {
+            Some(compaction) => compaction,
+            None => {
+                let args = SummarizationArgs {
+                    signal: Some(token.clone()),
+                    thinking_level: Some(self.thinking_level),
+                    retry: self.retry,
+                    ..Default::default()
+                };
+                let callbacks = self.summarization_retry_callbacks(RetrySource::Compaction {
+                    reason: CompactionReason::Manual,
+                });
+                run_compact(
+                    &preparation,
+                    &model,
+                    custom_instructions,
+                    &self.stream_fn,
+                    &args,
+                    Some(&callbacks),
+                )
+                .await
+                .map_err(|error| PirError::Session(error.to_string()))?
+            }
         };
-        let callbacks = self.summarization_retry_callbacks(RetrySource::Compaction {
-            reason: CompactionReason::Manual,
-        });
-        let result = run_compact(
-            &preparation,
-            &model,
-            custom_instructions,
-            &self.stream_fn,
-            &args,
-            Some(&callbacks),
-        )
-        .await
-        .map_err(|error| PirError::Session(error.to_string()))?;
 
         if token.is_cancelled() {
             return Err(PirError::Session("Compaction cancelled".into()));
         }
 
-        self.finish_compaction(result)
+        self.finish_compaction(result, from_extension, CompactionReason::Manual, false)
+            .await
     }
 
-    /// Append the compaction entry, rebuild context, and compute the result
-    /// payload shared by the manual and auto paths
+    /// Append the compaction entry, rebuild context, emit `session_compact`,
+    /// and compute the result payload shared by the manual and auto paths
     /// (agent-session.ts:1872-1900 / :2153-2181).
-    fn finish_compaction(
+    async fn finish_compaction(
         &mut self,
         result: CompactionResult,
+        from_extension: bool,
+        reason: CompactionReason,
+        will_retry: bool,
     ) -> Result<CompactionResult, PirError> {
         self.session_mut().append_compaction(
             &result.summary,
             &result.first_kept_entry_id,
             result.tokens_before,
             result.details.clone(),
-            Some(false),
+            Some(from_extension),
             result.usage.clone(),
         )?;
         let session_context = self.session().build_session_context();
         self.agent.set_messages(session_context.messages.clone());
         let estimated_tokens_after = estimate_messages_tokens(&session_context.messages);
+
+        // `session_compact` with the saved entry (found by summary,
+        // agent-session.ts:1876-1891 / :2156-2172).
+        if let Some(runner) = self.extension_runner() {
+            if runner.has_handlers("session_compact") {
+                let saved_entry = self
+                    .session()
+                    .get_entries()
+                    .into_iter()
+                    .filter_map(|entry| entry.known().cloned())
+                    .find(
+                        |entry| matches!(entry, SessionEntry::Compaction(compaction) if compaction.summary == result.summary),
+                    );
+                if let Some(entry) = saved_entry {
+                    match serde_json::to_value(&entry) {
+                        Ok(value) => {
+                            runner
+                                .emit_session_compact(
+                                    value,
+                                    from_extension,
+                                    reason.as_str(),
+                                    will_retry,
+                                )
+                                .await;
+                        }
+                        Err(error) => {
+                            tracing::warn!("session_compact payload serialize failed: {error}")
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(CompactionResult {
             estimated_tokens_after: Some(estimated_tokens_after),
@@ -515,16 +641,49 @@ impl CompactionRunner {
             *lock_abort(&self.active_token) = Some(token.clone());
             started = true;
 
-            let args = SummarizationArgs {
-                signal: Some(token.clone()),
-                thinking_level: Some(self.thinking_level),
-                retry: self.retry,
-                ..Default::default()
-            };
-            let callbacks = self.summarization_retry_callbacks(RetrySource::Compaction { reason });
-            let result = run_compact(&preparation, &model, None, &self.stream_fn, &args, Some(&callbacks))
+            // Extension-provided compaction (agent-session.ts:2079-2105).
+            let extension_compaction = match self
+                .emit_session_before_compact(
+                    &preparation,
+                    &path_entries,
+                    None,
+                    reason,
+                    will_retry,
+                )
                 .await
-                .map_err(|error| PirError::Session(error.to_string()))?;
+            {
+                Ok(compaction) => compaction,
+                Err(error) if raw_error_message(&error) == "Compaction cancelled" => {
+                    // Extension cancel (agent-session.ts:2085-2092).
+                    self.emit(CompactionEvent::CompactionEnd {
+                        reason,
+                        result: None,
+                        aborted: true,
+                        will_retry: false,
+                        error_message: None,
+                    });
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            let from_extension = extension_compaction.is_some();
+
+            let result = match extension_compaction {
+                Some(compaction) => compaction,
+                None => {
+                    let args = SummarizationArgs {
+                        signal: Some(token.clone()),
+                        thinking_level: Some(self.thinking_level),
+                        retry: self.retry,
+                        ..Default::default()
+                    };
+                    let callbacks =
+                        self.summarization_retry_callbacks(RetrySource::Compaction { reason });
+                    run_compact(&preparation, &model, None, &self.stream_fn, &args, Some(&callbacks))
+                        .await
+                        .map_err(|error| PirError::Session(error.to_string()))?
+                }
+            };
 
             if token.is_cancelled() {
                 self.emit(CompactionEvent::CompactionEnd {
@@ -537,7 +696,9 @@ impl CompactionRunner {
                 return Ok(false);
             }
 
-            let result = self.finish_compaction(result)?;
+            let result = self
+                .finish_compaction(result, from_extension, reason, will_retry)
+                .await?;
             self.emit(CompactionEvent::CompactionEnd {
                 reason,
                 result: Some(Box::new(result)),

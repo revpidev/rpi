@@ -169,7 +169,10 @@ impl CredentialStore for RuntimeCredentials {
 // ============================================================================
 
 /// `ProviderConfigInput["models"][number]` (provider-composer.ts:56-68).
-#[derive(Debug, Clone, Default)]
+/// `Deserialize` (camelCase) serves the extension host's
+/// `registerProvider(name, config)` JSON boundary (T15 W3).
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfigModel {
     pub id: String,
     pub name: Option<String>,
@@ -186,9 +189,11 @@ pub struct ProviderConfigModel {
 }
 
 /// `ProviderConfigInput` (provider-composer.ts:44-69) — T10 subset: the
-/// closure-bearing fields (`streamSimple`, `oauth`, `refreshModels`) arrive
-/// with the extension host (T15).
-#[derive(Debug, Clone, Default)]
+/// closure-bearing fields (`streamSimple`, `oauth`, `refreshModels`) are
+/// rejected by the extension action layer (candidate deviation, T15 W3).
+/// `Deserialize` (camelCase) serves the host's JSON boundary.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfigInput {
     pub name: Option<String>,
     pub base_url: Option<String>,

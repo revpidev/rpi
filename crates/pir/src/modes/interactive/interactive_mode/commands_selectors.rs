@@ -1673,7 +1673,29 @@ impl InteractiveUi {
         }
         // The reload box (interactive-mode.ts:5330-5356) is not ported; the
         // editor stays mounted (unassigned — no v0.1 task claims it).
-        lock(&self.session().resource_loader()).reload();
+        //
+        // `session.reload()` (agent-session.ts:2600-2628) — the upstream
+        // reload-box body (:5371): settings/resources reload + extension
+        // host reload (factories re-run, factory cache generation bumped) +
+        // tool-registry rebuild + session_start/resources_discover(reload)
+        // events. Runs in the background so the TUI stays responsive.
+        let session = self.session();
+        let Some(ui) = self.upgrade_self() else {
+            return;
+        };
+        let ui_weak = Arc::downgrade(&ui);
+        spawn_async(async move {
+            session.reload().await;
+            // The host's extension set was replaced — re-resolve the
+            // shortcut hook against the fresh registry (the init-time
+            // snapshot would keep stale shortcuts alive and miss new
+            // ones). Idempotent.
+            if let Some(ui) = ui_weak.upgrade() {
+                crate::modes::interactive::extension_shortcuts::install_extension_shortcuts(
+                    &ui, &session,
+                );
+            }
+        });
         // Re-install both keybinding globals (re-reads the config file,
         // keybindings.ts:354-357).
         install_global_keybindings();
@@ -1686,7 +1708,7 @@ impl InteractiveUi {
             self.show_warning(&diagnostic);
         }
         self.show_status(
-            "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
+            "Reloading keybindings, extensions, skills, prompts, themes, and context files",
         );
     }
 
@@ -1702,9 +1724,6 @@ impl InteractiveUi {
             self.show_warning("A bash command is already running. Press Esc to cancel it first.");
             return;
         }
-        // TODO(T15): extension user_bash interception
-        // (interactive-mode.ts:5932-5940) — extension-provided results are
-        // not handled yet.
 
         let component = Arc::new(Mutex::new(BashExecutionComponent::new(
             command.to_string(),
@@ -1732,6 +1751,49 @@ impl InteractiveUi {
         let ui = self.upgrade_self();
         let render_handle = self.render_handle.clone();
         spawn_async(async move {
+            // `user_bash` extension interception (interactive-mode.ts:5931-5940):
+            // the first non-empty handler result wins; a full `result`
+            // replacement skips local execution entirely (:5942-5966).
+            let runner = session.extension_runner();
+            if runner.has_handlers("user_bash") {
+                let cwd = session.cwd().to_owned();
+                if let Some(result) = runner
+                    .emit_user_bash(&command, exclude_from_context, &cwd)
+                    .await
+                {
+                    if !result.output.is_empty() {
+                        lock(&component).append_output(&result.output);
+                    }
+                    lock(&component).set_complete(
+                        result.exit_code,
+                        result.cancelled,
+                        result.truncated.then(|| TruncationResult {
+                            content: result.output.clone(),
+                            truncated: true,
+                            truncated_by: None,
+                            total_lines: 0,
+                            total_bytes: 0,
+                            output_lines: 0,
+                            output_bytes: 0,
+                            last_line_partial: false,
+                            first_line_exceeds_limit: false,
+                            max_lines: 0,
+                            max_bytes: 0,
+                        }),
+                        result
+                            .full_output_path
+                            .as_ref()
+                            .map(|path| path.to_string_lossy().into_owned()),
+                    );
+                    session.record_bash_result(&command, &result, exclude_from_context);
+                    if let Some(ui) = &ui {
+                        *lock(&ui.bash_component) = None;
+                        ui.render_handle.request_render();
+                    }
+                    return;
+                }
+            }
+
             let on_chunk: BashChunkCallback = {
                 let component = Arc::clone(&component);
                 let render_handle = render_handle.clone();
@@ -1891,7 +1953,31 @@ impl InteractiveMode {
             InteractiveUi::show_session_selector(&self.ui_state);
             return;
         }
-        match self.runtime.switch_session(path, None, None).await {
+        // ADR-0006/D-044 closure: cross-cwd resumes prompt via the TUI
+        // trust selector (async bridge, T15 W7).
+        let ui_weak = Arc::downgrade(&self.ui_state);
+        let trust_factory = Arc::new(move |_cwd: &std::path::Path| {
+            let ui_weak = ui_weak.clone();
+            crate::core::trust_manager::ProjectTrustContext {
+                has_ui: true,
+                select: None,
+                select_async: Some(Arc::new(move |title: String, options: Vec<String>| {
+                    let ui_weak = ui_weak.clone();
+                    Box::pin(async move {
+                        use pir_ext_host::api::UiBridge;
+                        let ui = ui_weak.upgrade()?;
+                        super::ui_bridge::InteractiveUiBridge::new(&ui)
+                            .select(&title, &options, None)
+                            .await
+                    }) as futures::future::BoxFuture<'static, Option<String>>
+                })),
+            }
+        });
+        match self
+            .runtime
+            .switch_session(path, None, None, Some(trust_factory))
+            .await
+        {
             Ok(cancelled) => {
                 if cancelled {
                     return;
@@ -1944,6 +2030,12 @@ impl InteractiveMode {
             .bind_extensions(ExtensionBindings {
                 mode: None,
                 on_error: None,
+                shutdown: Some({
+                    let shutdown_tx = self.ui_state.shutdown_tx.clone();
+                    std::sync::Arc::new(move || {
+                        let _ = shutdown_tx.send(true);
+                    })
+                }),
             })
             .await;
 
@@ -2564,9 +2656,10 @@ mod tests {
         let (mode, _terminal, _session, _tmp) = mode_harness().await;
         mode.ui_state.handle_reload_command();
         let chat = rendered_chat(&mode.ui_state);
-        // The dim status line wraps at the 60-cell render width.
+        // The dim status line wraps at the 60-cell render width. The reload
+        // itself runs in the background (session.reload is async).
         assert!(
-            chat.contains("Reloaded keybindings, extensions, skills, prompts, themes,"),
+            chat.contains("Reloading keybindings, extensions, skills, prompts,"),
             "chat: {chat}"
         );
     }

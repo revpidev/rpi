@@ -118,7 +118,10 @@ fn get_message_from_entry_for_compaction(entry: &SessionEntry) -> Option<AgentMe
 /// Result from [`compact`] — the SessionManager adds id/parentId when saving
 /// (`CompactionResult`, compaction.ts:88-97). Serialized camelCase for the
 /// `compaction_end` event payload (agent-session.ts:157-163).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// `Deserialize` was added in T15 W1 so the extension host's
+/// `session_before_compact` result can carry an extension-provided
+/// compaction back across the JSON event boundary (types.ts:1106-1109).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
     pub summary: String,
@@ -796,8 +799,11 @@ fn summary_max_tokens(reserve_tokens: u64, factor: f64, model: &Model) -> u64 {
 // Compaction Preparation (for extensions)
 // ============================================================================
 
-/// `CompactionPreparation` (compaction.ts:692-708).
-#[derive(Debug, Clone)]
+/// `CompactionPreparation` (compaction.ts:692-708). `Serialize` (camelCase)
+/// serves the `session_before_compact` extension event payload
+/// (types.ts:588).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionPreparation {
     /// Id of first entry to keep.
     pub first_kept_entry_id: String,

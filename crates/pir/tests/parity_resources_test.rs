@@ -1,16 +1,23 @@
-//! T09 对拍层：`fixtures/generated/resources/`（上游真实模块产出的黄金
-//! JSON，见 `fixtures/generate-resources-golden.mjs`）vs pir 对应实现加载
-//! 同一输入的归一化 diff。
+//! T09 parity layer: `fixtures/generated/resources/` (golden JSON produced
+//! by the upstream real modules, see `fixtures/generate-resources-golden.mjs`)
+//! vs the normalized diff of pir's corresponding implementation loading the
+//! same input.
 //!
-//! 归一化约定（沿用 `pir_test_support`，无第二套实现）：
-//! - 黄金中的绝对路径已在生成时替换为 `<path>`；Rust 侧对 actual 用
-//!   `Normalizer::with_path(root)` 做同一替换后比对。
-//! - 比较文本统一经 serde 解析后重新渲染（两侧同格式），diff 由
-//!   `diff_text` 完成并定位首个差异。
-//! - 主题颜色表两侧均按键排序（Rust `HashMap` 无迭代序；上游 Map 为插入
-//!   序，排序是测试侧整形而非归一化）。
-//! - `.pi` → `.pir` 是有意改名（需求 §1.4 / ADR-0001）：e2e 黄金已统一为
-//!   `.pir` 拼写，测试两侧跑同一棵含 `.pir` + `.pi` 双份的目录树。
+//! Normalization conventions (reusing `pir_test_support`; no second
+//! implementation):
+//! - absolute paths in the goldens were replaced with `<path>` at
+//!   generation time; the Rust side applies the same replacement to the
+//!   actuals with `Normalizer::with_path(root)` before comparing.
+//! - comparison texts are re-rendered through serde on both sides (same
+//!   format); the diff runs through `diff_text` and locates the first
+//!   difference.
+//! - theme color tables are key-sorted on both sides (a Rust `HashMap` has
+//!   no iteration order; the upstream Map is insertion-
+//!   order; the sort is test-side reshaping, not normalization).
+//! - `.pi` → `.pir` is the intentional rename (requirements §1.4 /
+//!   ADR-0001): the e2e goldens already use the `.pir` spelling, and the
+//!   tests run both sides against one directory tree containing both `.pir`
+//!   and `.pi` copies.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

@@ -1,7 +1,8 @@
 //! Contract tests: drive each T03 adapter's `stream()` over a scripted local
 //! HTTP server with recorded SSE streams, and assert both sides of the
 //! contract — the request shape (method / path / key headers / body JSON) and
-//! the emitted `StreamEvent` sequence (design §10.2, task T03 自测清单).
+//! the emitted `StreamEvent` sequence (design §10.2, task T03 self-check
+//! list).
 //!
 //! The SSE payloads are recorded in the upstream wire format (the same shapes
 //! the upstream vitest suites feed through the real SDK event parsers).

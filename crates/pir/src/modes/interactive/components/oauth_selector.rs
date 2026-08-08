@@ -24,7 +24,8 @@
 //! - Rows are re-derived in `render` instead of being rebuilt as child
 //!   components (upstream `updateList`, oauth-selector.ts:114-162).
 //! - Escape/Ctrl+C cancels directly (oauth-selector.ts:205-207). The T12-S5a
-//!   task brief's generic rule "Esc：搜索非空先清搜索，否则 on_cancel" does
+//!   task brief's generic rule "Esc: clear a non-empty search first,
+//!   otherwise on_cancel" does
 //!   not match this file — that behavior belongs to scoped-models-selector.ts
 //!   (scoped-models-selector.ts:350-359), a different component. Kept
 //!   upstream-faithful; revisit if the integration layer wants it.
