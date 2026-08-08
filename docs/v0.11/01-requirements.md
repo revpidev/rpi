@@ -125,7 +125,7 @@
 
 ### 3.3 渲染与内容
 
-- R3.3.1 **Mermaid 渲染**：`markdown.mermaid` 设置（`off`|`final`|`streaming`，默认 streaming）。grok-mermaid 为 TS 依赖，pir 需自绘或选 Rust 等价物（设计文档决策）。
+- R3.3.1 **Mermaid 渲染**：`markdown.mermaid` 设置（`off`|`final`|`streaming`，默认 streaming）。上游依赖 grok-mermaid（TS），其本身是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）`xai-grok-markdown/src/mermaid.rs` 的移植——pir 直接移植该 Rust 原作（设计 §5.6），无 [VARIANT] 缺口。
 - R3.3.2 **LaTeX 渲染**：继承 pir-tui 的 Unicode math（见 §5.4）。
 - R3.3.3 扩展 API `pi.registerMarkdownTransformer()`：链式、宽度感知（context 含 `messageType`/`isStreaming`/`availableWidth`），作用于 assistant/user/thinking 渲染。
 
@@ -273,4 +273,4 @@
 - **上游契约仍在演化**：harness v2 的 D0（record 契约重写）、J4–J6（v3 归一化）、H0+（运行时）、I2（事件导出）均未落地。v0.11 边界选择"存储层不动 + Agent 循环微行为 + 产品层全量"，harness 运行时明确保持 v1 语义（§1.2）。
 - **变更簇相互依赖**：length-stop 恢复链（`32850ef7c`+`e56893f4c`+`8eda4f5b2`+`3852cb2b8`）须作为整体实现，单独摘取会引入新竞态。
 - **渲染时序基线重录**：R5.3.1 使所有逐帧 TUI 黄金文件失效，需在升级早期统一重录。
-- **Mermaid（R3.3.1）依赖选型**：grok-mermaid 无 Rust 等价物，设计文档需在"自绘简化子集 / 嵌入 JS 引擎 / 标记 [VARIANT]"间决策。
+- **Mermaid（R3.3.1）移植适配**：grok-mermaid 的 Rust 原作（xai-org/grok-build `mermaid.rs`）依赖 ratatui 样式类型，移植时需做样式模型映射层；以 grok-mermaid fixtures 双向校验防移植偏差。

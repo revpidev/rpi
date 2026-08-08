@@ -193,15 +193,14 @@ pub fn to_json_event(ev: &AgentSessionEvent) -> Option<JsonAgentSessionEvent>
 
 ### 5.6 Mermaid 决策（R3.3.1）
 
-上游用 grok-mermaid（TS）。pir 三个选项：
+上游用 grok-mermaid（TS）。**grok-mermaid 本身是 Rust 移植品**：源头是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）的 `crates/codegen/xai-grok-markdown/src/mermaid.rs`——单文件 5237 行的自包含终端 Mermaid 渲染器（graph/flowchart、sequenceDiagram、stateDiagram → Unicode box-drawing，不支持的图类型回退带框原文）。因此 pir 不需要自绘，也不需要 JS 引擎：
 
-| 选项 | 说明 | 建议 |
-|------|------|------|
-| A. 自绘简化子集 | 流程图/时序图 ASCII/Unicode 渲染 | 工作量大、偏离上游 |
-| B. 标记 [VARIANT]：`markdown.mermaid` 仅支持 `off`，`final/streaming` 按 `off` 处理并记录缺口 | 零依赖 | **v0.11 默认** |
-| C. 嵌入 JS 引擎 | 违背无 JS 宿主原则（ADR-0001） | 排除 |
+- **方案：移植 Rust 原作**。以 `mermaid.rs` 为蓝本移植到 `pir-tui/src/mermaid.rs`（或独立子模块）。原作的对外接触面很小：`render(src, styles) -> Option<MermaidArt>`（行 + span 结构），唯二需要适配的是 `ratatui::style::Style`/`Line`/`Span` 与 `unicode-width`——前者映射到 pir-tui 自有样式模型，后者 pir-tui 已有等价物。
+- **对拍基线**：pi 侧渲染结果即 grok-mermaid 输出，与 Rust 原作同算法；移植后可用上游 `mermaid.ts` 组件的测试用例 + grok-mermaid 的 fixtures 双向校验。
+- **署名**：Apache-2.0，保留源文件头部出处声明与 LICENSE 归因（NOTICE 或文件头注释）。
+- 未发布到 crates.io，采用移植而非依赖；上游 grok-build 持续同步 xAI monorepo，移植后把源文件 commit 哈希记入代码注释便于日后追更新。
 
-采用 B，settings 解析保留三态键值以便后续补实现。
+工作量预估低于自绘子集，且天然与上游行为一致（同一算法源头）。
 
 ---
 
@@ -224,7 +223,7 @@ pub fn to_json_event(ev: &AgentSessionEvent) -> Option<JsonAgentSessionEvent>
 | M4 TUI 重构 | R5.1 trait 化 + R5.3 行为修正（基线重录） | main-screen 黄金文件等价 + 新基线入库 |
 | M5 全屏子系统 | R5.2 全屏渲染器 + 布局引擎 + R5.4 LaTeX + R3.2 接线 | alt-screen 30+ 场景验收；模式热切换无重放 |
 
-明确不做（[DEFER]/[VARIANT] 汇总）：server/protocol/client 远程栈、sqlite v4 后端、harness v2 运行时、telemetry 管线、deferred 请求生命周期、evals 体系、mermaid 渲染（B 方案缺口）。
+明确不做（[DEFER]/[VARIANT] 汇总）：server/protocol/client 远程栈、sqlite v4 后端、harness v2 运行时、telemetry 管线、deferred 请求生命周期、evals 体系。
 
 ---
 
