@@ -309,6 +309,10 @@ pub struct ModelRuntime {
     /// Whether network model-catalog refreshes are allowed at all
     /// (`PI_OFFLINE` unset, model-runtime.ts:157).
     model_network_enabled: bool,
+    /// Resolved refresh timeout (`modelRefreshTimeoutMs ?? 15s`,
+    /// model-runtime.ts:163-165): bounds the create-time refresh and the
+    /// post-login/logout refresh ([`bounded_refresh_signal`]) alike.
+    model_refresh_timeout_ms: u64,
     /// Insertion-ordered like the upstream JS `Map`s: provider enumeration
     /// order is observable (initial-model fallback, available listings).
     native_providers: Mutex<OrderedMap<Arc<dyn Provider>>>,
@@ -662,11 +666,16 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
     model
 }
 
-/// A cancellation token for the post-login/logout refresh: the create-time
-/// refresh timeout bounds the whole refresh, and an optional interaction
-/// signal (the login dialog's cancel token) aborts it early — a stuck
-/// remote-catalog fetch can no longer freeze the login flow indefinitely.
-fn bounded_refresh_signal(interaction_signal: Option<CancellationToken>) -> CancellationToken {
+/// A cancellation token for the post-login/logout refresh: the resolved
+/// refresh timeout (`model_refresh_timeout_ms`, the same value that bounds
+/// the create-time refresh) bounds the whole refresh, and an optional
+/// interaction signal (the login dialog's cancel token) aborts it early — a
+/// stuck remote-catalog fetch can no longer freeze the login flow
+/// indefinitely.
+fn bounded_refresh_signal(
+    timeout_ms: u64,
+    interaction_signal: Option<CancellationToken>,
+) -> CancellationToken {
     let token = CancellationToken::new();
     if let Some(parent) = interaction_signal {
         let child = token.clone();
@@ -680,7 +689,7 @@ fn bounded_refresh_signal(interaction_signal: Option<CancellationToken>) -> Canc
     }
     let timeout = token.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(DEFAULT_MODEL_REFRESH_TIMEOUT_MS)).await;
+        tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
         timeout.cancel();
     });
     token
@@ -729,6 +738,12 @@ impl ModelRuntime {
             },
         };
         let model_network_enabled = std::env::var_os(ENV_OFFLINE).is_none();
+        // Resolved once here so the create-time refresh and the
+        // post-login/logout refresh (`bounded_refresh_signal`) share the
+        // same configured bound.
+        let model_refresh_timeout_ms = options
+            .model_refresh_timeout_ms
+            .unwrap_or(DEFAULT_MODEL_REFRESH_TIMEOUT_MS);
         let models = Models::new(Some(CreateModelsOptions {
             credentials: Some(credentials.clone()),
             auth_context: None,
@@ -741,6 +756,7 @@ impl ModelRuntime {
             models_path,
             config: Mutex::new(config),
             model_network_enabled,
+            model_refresh_timeout_ms,
             native_providers: Mutex::new(OrderedMap::default()),
             extension_providers: Mutex::new(OrderedMap::default()),
             composition_errors: Mutex::new(OrderedMap::default()),
@@ -773,9 +789,7 @@ impl ModelRuntime {
         let token = refresh_from_network.then(CancellationToken::new);
         if let Some(token) = &token {
             let abort = token.clone();
-            let timeout_ms = options
-                .model_refresh_timeout_ms
-                .unwrap_or(DEFAULT_MODEL_REFRESH_TIMEOUT_MS);
+            let timeout_ms = model_refresh_timeout_ms;
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
                 abort.cancel();
@@ -1311,10 +1325,12 @@ impl ModelRuntime {
     /// `Models`, then refresh so the new credential takes effect in model
     /// availability and provider composition.
     ///
-    /// The post-login refresh runs under a bounded signal (the create-time
-    /// refresh timeout plus the interaction's own cancellation token): a
-    /// stuck remote-catalog fetch must not freeze the login flow forever
-    /// (upstream has no bound here — its fetch is equally unbounded).
+    /// The post-login refresh runs under a bounded signal (the resolved
+    /// `model_refresh_timeout_ms` — the same value that bounds the
+    /// create-time refresh — plus the interaction's own cancellation
+    /// token): a stuck remote-catalog fetch must not freeze the login flow
+    /// forever (upstream has no bound here — its fetch is equally
+    /// unbounded).
     pub async fn login(
         &self,
         provider_id: &str,
@@ -1325,7 +1341,7 @@ impl ModelRuntime {
             .models
             .login(provider_id, auth_type, interaction)
             .await?;
-        let signal = bounded_refresh_signal(interaction.signal());
+        let signal = bounded_refresh_signal(self.model_refresh_timeout_ms, interaction.signal());
         self.refresh(Some(ModelsRefreshOptions {
             allow_network: Some(self.model_network_enabled),
             force: None,
@@ -1342,7 +1358,7 @@ impl ModelRuntime {
     pub async fn logout(&self, provider_id: &str) -> Result<(), ModelsError> {
         self.models.logout(provider_id).await?;
         self.recompose_provider(provider_id);
-        let signal = bounded_refresh_signal(None);
+        let signal = bounded_refresh_signal(self.model_refresh_timeout_ms, None);
         self.refresh(Some(ModelsRefreshOptions {
             allow_network: Some(self.model_network_enabled),
             force: None,
@@ -2112,6 +2128,78 @@ mod tests {
             .expect("login task")
             .expect("login succeeds despite the aborted refresh");
         assert!(matches!(credential, Credential::ApiKey(_)));
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// The bounded signal's timeout is the resolved `model_refresh_timeout_ms`
+    /// (not a hardcoded default): a short configured timeout aborts a hanging
+    /// post-login refresh without any interaction cancel.
+    #[tokio::test]
+    async fn login_hung_refresh_aborts_via_configured_timeout() {
+        const ENV_KEY: &str = "PIR_TEST_MODEL_RUNTIME_LOGIN_TIMEOUT_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        let url = hung_catalog_server().await;
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            model_refresh_timeout_ms: Some(200),
+            ..Default::default()
+        })
+        .await;
+        let inner = create_provider(CreateProviderOptions {
+            id: "login-timeout-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth(
+                    "Login timeout test API key",
+                    &[ENV_KEY],
+                ))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(pir_ai::api::openai_completions::OpenAiCompletions)),
+        });
+        runtime
+            .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
+                inner,
+                Some(url),
+                None,
+            ))
+            .await
+            .expect("register");
+
+        struct MockInteraction;
+        impl AuthInteraction for MockInteraction {
+            fn signal(&self) -> Option<CancellationToken> {
+                None
+            }
+            fn prompt<'a>(
+                &'a self,
+                _prompt: pir_ai::auth::interaction::AuthPrompt,
+            ) -> pir_ai::auth::types::BoxFutureSend<'a, Result<String, ModelsError>> {
+                Box::pin(async move { Ok("test-key".to_owned()) })
+            }
+            fn notify(&self, _event: pir_ai::auth::interaction::AuthEvent) {}
+        }
+
+        let interaction = MockInteraction;
+        let started = std::time::Instant::now();
+        let credential = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            runtime.login("login-timeout-test", AuthType::ApiKey, &interaction),
+        )
+        .await
+        .expect("configured timeout must unblock the login")
+        .expect("login succeeds despite the timed-out refresh");
+        assert!(matches!(credential, Credential::ApiKey(_)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "200ms configured timeout, not the 15s default; elapsed: {:?}",
+            started.elapsed()
+        );
         std::env::remove_var(ENV_KEY);
     }
 

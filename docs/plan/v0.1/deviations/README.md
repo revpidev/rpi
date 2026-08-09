@@ -79,8 +79,8 @@
 | D-049 | T15 | 第 1 条行为级 / 余实现细节 | 扩展 UI/渲染层落地差异（**custom() 声明式 v1 无交互回传、展示后立即 resolve undefined**——交互需求走 UiBridge::as_any 原生口子；ComponentTree schema v1 无 `row` 横向容器、未知 type fail-visible 渲染） | `02-design.md` §13、`extension-abi.md` §7、T15 偏离表 | ADR-0007（第 1 条） | 已回写 |
 | D-050 | T15 | 实现细节 | L0 原生动态库插件（abi_stable 0.11.3）落地差异（ABI 形状收敛：PirHostCalls 结构体按值传 host-call 句柄、cookie=*const c_void、RVec<u8> 拥有型缓冲；无沙箱信任模型明示——capability 只管扩展 API 面；manifest 新增 `native` 字段与 wasm 互斥、wasm 优先；无 fuel/Store/专属线程） | `extension-abi.md` §1.1/§5、`02-design.md` §7.2、T15 偏离表 | 不需要 | 已回写 |
 | D-051 | T17 | 行为级 | 语法高亮以 syntect 替代 hljs 10.7.3（无 Rust 等价库，逐字节须手工移植 hljs 文法数月级且 G4 禁 JS 执行；hljs 正则近似质量低于 syntect）。write/read 高亮分支、Markdown 代码块、write 增量缓存均走 syntect；**高亮 ANSI token 分段与逐 token 配色不与上游对拍**（scope→Theme 锚定上游同组 theme 键保持同色系）；结构/文案/钳制/计时仍逐字对拍 | T17 任务文件、`01-requirements.md` §8.6、`parity-checklist.md` §5 | ADR-0008 | 已关闭 |
-| D-053 | T13 | 实现细节 | 登录/登出后 refresh 加有界信号：`login`/`logout` 的 refresh 在 15s 超时 + 交互取消令牌下执行（上游 model-runtime.ts:503-514 无信号无超时，端点不可达时登录流永久挂起——2026-08-09 真实复现）。健康网络下与上游一致；挂起时 15s 内或对话框取消时恢复 | `model_runtime.rs` `login`/`logout` 注记 | 不需要 | 已回写 |
 | D-052 | T13 遗留 | 实现细节 | 内置 provider 注册波次补齐（D-038 接线）：`ModelRuntime::create` 播种 38 内置工厂（radius 原样透传、其余按 `model_catalog_endpoint` 包 `with_remote_catalog`），`CreateModelRuntimeOptions.catalog_base_url` 对齐上游 `catalogBaseUrl`，settings `modelCatalogUrl` 经 services 层传入；models.json 恢复「只写自定义/覆盖」的 provider-composer 语义，`/login` 选择器与 `pir update --models` 消费内置目录 | `02-design.md` §产品 endpoint 配置化、`model_runtime.rs`/`remote_catalog_provider.rs` 模块注记 | 不需要 | 已回写 |
+| D-053 | T13 | 实现细节 | 登录/登出后 refresh 加有界信号：`login`/`logout` 的 refresh 在刷新超时（`model_refresh_timeout_ms` 解析值，默认 15s，与 create 期刷新同一配置）+ 交互取消令牌下执行（上游 model-runtime.ts:503-514 无信号无超时，端点不可达时登录流永久挂起——2026-08-09 真实复现）。健康网络下与上游一致；挂起时超时内或对话框取消时恢复 | `model_runtime.rs` `login`/`logout` 注记 | 不需要 | 已回写 |
 
 ## 4. 状态定义
 

@@ -23,12 +23,14 @@ overlay 拉取（`{catalogBaseUrl}/api/models/providers/{id}`）。端点不可�
 
 修复：`login`/`logout` 的 refresh 改为在**有界信号**下执行——
 
-1. 15s 上限（`DEFAULT_MODEL_REFRESH_TIMEOUT_MS`，与 create 期刷新一致）；
+1. 刷新超时上限（`model_refresh_timeout_ms` 解析值，默认
+   `DEFAULT_MODEL_REFRESH_TIMEOUT_MS` = 15s，与 create 期刷新同一配置值，
+   2026-08-09 审查后统一——此前此处硬编码默认常量，自定义超时不生效）；
 2. 联动 `AuthInteraction::signal()`（登录对话框取消令牌）：用户 Ctrl+C 取消
    对话框时立即中止刷新，登录任务返回、对话框关闭、编辑器恢复。
 
 健康网络下行为与上游一致（刷新正常完成、结果不对外暴露）；差异仅在
-网络挂起时的恢复路径（上游永久挂死 → 本实现 15s 内或取消时恢复）。
+网络挂起时的恢复路径（上游永久挂死 → 本实现超时内或取消时恢复）。
 
 ## 回写位置
 

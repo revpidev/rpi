@@ -406,6 +406,15 @@ pub async fn create_agent_session(
                 // lives only in `stream_simple` (design §3.3), which is why
                 // sessions recorded no thinking blocks despite a non-off
                 // thinking level.
+                //
+                // `thinking_budgets` is re-read from settings on every
+                // stream call, so mid-session settings changes take effect
+                // on the next request. `AgentOptions.thinking_budgets`
+                // below is a creation-time snapshot that rides
+                // `AgentLoopConfig` for upstream prepareNextTurn parity
+                // (D-010) but is never bound into `StreamOptions` — so the
+                // two channels intentionally differ in timing, and only
+                // this per-call read reaches the provider.
                 let thinking_budgets = {
                     let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
                     thinking_budgets_to_ai(loader.settings_manager().get_thinking_budgets())
