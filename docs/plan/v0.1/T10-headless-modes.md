@@ -73,7 +73,7 @@ print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同�
 | `main.ts` json 段 + `docs/json.md` | `rpi/src/modes/json_mode.rs` | |
 | `modes/rpc/{rpc-mode,rpc-types,jsonl}.ts` + `docs/rpc.md` | `rpi/src/modes/rpc.rs` | 32 命令逐条契约 |
 | `main.ts` 启动管线 | `rpi/src/app.rs` + `main.rs` | 模式分发 rpc>json>print(-p/非 TTY)；子命令分流留 T14 占位 |
-| `rpc-entry.ts` | `rpi/src/bin/pir_rpc.rs`（`[[bin]] rpi-rpc`） | 等价 `--mode rpc` |
+| `rpc-entry.ts` | `rpi/src/bin/rpi_rpc.rs`（`[[bin]] rpi-rpc`） | 等价 `--mode rpc` |
 | `sdk.ts` | `rpi/src/sdk.rs` + lib.rs re-export | create_agent_session / create_agent_session_runtime |
 
 ### 关键结构决策
@@ -179,7 +179,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
     | get_last_assistant_text | `prompt_lifecycle_messages_state_stats`、`entries_tree_fork_messages`（null） |
     | set_session_name | `session_name_and_get_commands`（+ 空名错误） |
     | get_commands | `session_name_and_get_commands`（空目录）、`get_commands_with_prompt_template`（prompt 模板 + sourceInfo 重建） |
-    | 协议项 | 帧（LF 严格/U+2028/U+2029/CRLF/EOF 尾行）、parse 错误、未知命令、字段形状错误、extension_ui_response 路由：`protocol_errors_and_framing`；EOF 退出 0：全部用例 `close_and_wait`；SIGTERM=143/SIGHUP=129：`rpc_mode_sigterm_exits_143`/`rpc_mode_sighup_exits_129`；独立入口：`pir_rpc_bin_end_to_end` |
+    | 协议项 | 帧（LF 严格/U+2028/U+2029/CRLF/EOF 尾行）、parse 错误、未知命令、字段形状错误、extension_ui_response 路由：`protocol_errors_and_framing`；EOF 退出 0：全部用例 `close_and_wait`；SIGTERM=143/SIGHUP=129：`rpc_mode_sigterm_exits_143`/`rpc_mode_sighup_exits_129`；独立入口：`rpi_rpc_bin_end_to_end` |
   - 需求逐条核对（§2.2–§2.5、§3.1–§3.3）：
 
     | 需求条目 | 测试锚点 |

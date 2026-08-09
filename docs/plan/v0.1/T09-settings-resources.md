@@ -52,13 +52,13 @@
 ## 自测清单
 
 - [x] settings 合并语义：嵌套单层浅合并（深度≥2 整体替换）、数组整体替换、字段级持久化、旧格式迁移 4 条——`settings_manager.rs` 内测 `test_deep_merge_*`×4 / `test_migrate_*`×4 / 字段级持久化 4 例；对拍 `parity_resources_test.rs::parity_settings_deep_merge` / `parity_settings_migrations`
-- [x] 资源发现顺序、两种 skills 模式、rank 与去重规则测试（构造多级目录 fixture）——`skills_test.rs::skills_discovery_pir_and_agents_modes_end_to_end` / `skills_rank_project_settings_beats_project_auto_on_name_collision` 等；`resource_loader_test.rs` rank 全排序例；对拍 `parity_resource_loader_e2e`
+- [x] 资源发现顺序、两种 skills 模式、rank 与去重规则测试（构造多级目录 fixture）——`skills_test.rs::skills_discovery_rpi_and_agents_modes_end_to_end` / `skills_rank_project_settings_beats_project_auto_on_name_collision` 等；`resource_loader_test.rs` rank 全排序例；对拍 `parity_resource_loader_e2e`
 - [x] context files 边界：到文件系统根 vs skills 到 git root（构造 repo 内外用例）——`system_prompt_test.rs::global_then_ancestors_root_side_first`（穿越 .git 界）；`skills_test.rs` 祖先扫描三例（git 上界/无 repo/家目录排除）
 - [x] skills：XML 摘要注入（含 read 工具未激活时不注入）、frontmatter 各字段语义、`/skill:name` 展开格式与上游代码一致——`skills_test.rs::skills_xml_injection_gate_and_disable_model_invocation` / `skills_xml_block_exact_shape_from_disk` / `skills_expand_command_exact_format_with_args` / `skills_frontmatter_field_semantics`；对拍 `parity_skills_battery`（上游 13+1 fixture 目录）
 - [x] prompt template 展开：DSL 各形态与上游一致（含切片与默认值）——`prompt_templates.rs` 内测 DSL 电池 + 引号感知分词；对拍 `parity_prompt_dsl`（21 对黄金）
 - [x] themes：51+1 token 解析、vars 引用、256 色整数、缺失 token 回退、非法值诊断——`themes_test.rs::test_all_51_required_tokens_parse_in_builtin_themes` / `test_thinking_max_optional_fallback` / `test_custom_theme_with_vars` / `test_missing_colors_diagnostics` / `test_invalid_color_value_diagnostics` 等；对拍 `parity_themes`（11 自定义 + dark/light 快照，双色彩模式）
 - [x] keybindings：旧键名迁移、平台差异默认值、token 名与上游文档逐条核对——`keybindings_test.rs::test_migration_all_*`×3 / 默认表逐条对拍 3 例 / 平台差异 3 例；迁移写回 `resource_loader_test.rs::keybindings_migration_writes_back_to_disk`；对拍 `parity_keybindings`
-- [x] 环境变量：进程级全集生效；bash 注入变量模型切换即时生效——`environment.rs` 内测 13 例；`bash_tool_test.rs::test_pir_session_env_injected` / `test_pir_env_stripped_when_no_session` / `test_session_env_resolved_per_command_start`（本任务补的即时生效锚点）
+- [x] 环境变量：进程级全集生效；bash 注入变量模型切换即时生效——`environment.rs` 内测 13 例；`bash_tool_test.rs::test_rpi_session_env_injected` / `test_rpi_env_stripped_when_no_session` / `test_session_env_resolved_per_command_start`（本任务补的即时生效锚点）
 
 ## 门禁验收
 
@@ -95,7 +95,7 @@
 | 条目 | 锚点 |
 |------|------|
 | 进程级 `RPI_*` 全集（marker/PACKAGE_DIR/OFFLINE/SKIP_VERSION_CHECK/TELEMETRY/CACHE_RETENTION/SHARE_VIEWER_URL/STARTUP_BENCHMARK/TUI_WRITE_LOG/VISUAL/EDITOR 等） | `core/environment.rs` 内测 13 例（`test_coding_agent_marker` / `test_package_dir_override` / `test_is_offline_truthy_flag` / `test_skip_version_check_any_non_empty` / `test_telemetry_enabled_override` / `test_cache_retention_long_exact_match` / `test_share_viewer_base_url_fallback` / `test_startup_benchmark_truthy_flag` / `test_tui_write_log_path` / `test_external_editor_from_env_precedence` 等） |
-| bash 会话注入 5 变量（每次命令启动解析、模型切换即时生效、未启用删除继承） | `rpi/tests/bash_tool_test.rs::test_pir_session_env_injected` / `test_pir_env_stripped_when_no_session` / `test_expose_session_env_false` / `test_session_env_resolved_per_command_start` |
+| bash 会话注入 5 变量（每次命令启动解析、模型切换即时生效、未启用删除继承） | `rpi/tests/bash_tool_test.rs::test_rpi_session_env_injected` / `test_rpi_env_stripped_when_no_session` / `test_expose_session_env_false` / `test_session_env_resolved_per_command_start` |
 
 **§7.1 Context files**
 
@@ -112,7 +112,7 @@
 
 | 条目 | 锚点 |
 |------|------|
-| 发现路径全集 + 两种发现模式 + trust 门控 | `skills_test.rs::skills_discovery_pir_and_agents_modes_end_to_end` / `skills_trust_gate_excludes_project_auto_discovery` |
+| 发现路径全集 + 两种发现模式 + trust 门控 | `skills_test.rs::skills_discovery_rpi_and_agents_modes_end_to_end` / `skills_trust_gate_excludes_project_auto_discovery` |
 | 祖先 `.agents/skills` 上界 git repo root（无 repo 到根；`~/.agents` 排除） | `skills_test.rs` 祖先扫描三例 |
 | ignore 文件链 / dotdir / node_modules / 符号链接 | `skills_test.rs::skills_discovery_respects_fdignore_chain` 等 |
 | frontmatter 语义（name 仅警告 / description 缺失不加载 / disable-model-invocation） | `skills_test.rs::skills_frontmatter_field_semantics`；对拍 `parity_skills_battery` |

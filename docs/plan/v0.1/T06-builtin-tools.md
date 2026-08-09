@@ -56,7 +56,7 @@
 
 - [x] 上游 tools 相关测试意图移植通过（tools.test.ts 的 read/write/edit/bash 用例意图、path-utils.test.ts、edit-tool-legacy-input.test.ts、file-mutation-queue.test.ts、harness/truncate.test.ts 全部移植，snake_case 同名锚定）
 - [x] edit-diff 边界用例集（无匹配/多匹配/部分匹配/fuzzy 命中）与上游语义一致（`tests/edit_diff.rs` 53 例 + `tests/edit.rs` fuzzy/CRLF 18 例）
-- [x] bash：流式 update 100ms 节流（`test_coalesce_chatty_output`：5000 行更新数 < 25）、tail 截断 + 临时文件（`test_line_truncation_writes_temp_file`）、取消后进程组无残留（`test_no_zombie_after_cancel`）、环境注入 5 变量且用户 bash 不注入（`test_pir_session_env_injected` / `test_pir_env_stripped_when_no_session` / `test_expose_session_env_false`；bash_executor 路径不经注入逻辑）
+- [x] bash：流式 update 100ms 节流（`test_coalesce_chatty_output`：5000 行更新数 < 25）、tail 截断 + 临时文件（`test_line_truncation_writes_temp_file`）、取消后进程组无残留（`test_no_zombie_after_cancel`）、环境注入 5 变量且用户 bash 不注入（`test_rpi_session_env_injected` / `test_rpi_env_stripped_when_no_session` / `test_expose_session_env_false`；bash_executor 路径不经注入逻辑）
 - [x] bash_executor：`!`/`!!` 路径输出清洗（`test_ansi_stripped` / `test_carriage_return_removed`）、超量临时文件、abort → `cancelled: true`；`excludeFromContext` 为 `bashExecution` 消息组装层语义（T10/T12 接线），本任务交付独立执行路径与清洗
 - [x] file mutation queue：并发 edit/write 串行化语义正确（`test_serializes_same_file` / `test_parallel_different_files` / `test_symlink_alias_same_queue` + `tests/write.rs` 共享队列用例）；abort 不撕裂队列（write/edit abort 用例）
 - [x] 截断/超时/节流常量与上游逐值核对表（见验收记录 §G3 附表）
@@ -140,7 +140,7 @@
 | bash：onUpdate 100ms 节流合并 | `test_coalesce_chatty_output`（5000 行 < 25 次更新） |
 | bash：非零退出码抛错附输出 | `test_exit_1_error`（`Command exited with code 1`） |
 | bash：shellPath / shellCommandPrefix / spawn_hook | `test_spawn_error_bad_shell`、`test_command_prefix`/`test_no_prefix`、`test_spawn_hook_called`/`test_spawn_hook_can_modify_env` |
-| bash：会话环境注入 5 RPI_*（先删后注、未启用清除继承） | `test_pir_session_env_injected`、`test_pir_env_stripped_when_no_session`、`test_expose_session_env_false` |
+| bash：会话环境注入 5 RPI_*（先删后注、未启用清除继承） | `test_rpi_session_env_injected`、`test_rpi_env_stripped_when_no_session`、`test_expose_session_env_false` |
 | bash-executor：滚动缓冲 2×50KB、超 50KB 临时文件、stripAnsi+清洗+去 \r、无超时、不注入 RPI_* | `test_large_output_writes_temp_file`、`test_ansi_stripped`、`test_carriage_return_removed`、`test_abort_returns_cancelled`（无 timeout 参数、不经注入路径——源码形状锚定） |
 | file mutation queue：realpath 键（symlink alias 同队列）、串行/并行、abort 不撕裂 | `tools::file_mutation_queue::tests`（serializes/parallel/symlink/gc）+ `tests/write.rs`（共享队列、abort） |
 | 截断公共：truncateHead 不截整行/首行超限；truncateTail 末行部分截断 UTF-8 边界感知 | `tools::truncate::tests`（17 例，移植 harness/truncate.test.ts 意图） |

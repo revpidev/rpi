@@ -71,10 +71,10 @@
 ### 开放项定稿（回写设计 §13）
 
 **1. Wasm ABI v1（字节布局）**——沿用 T02 spike 形状，收敛为两条泛化通道：
-- guest 导出：`memory`、`pir_alloc(len:u32)->u32`、`pir_dealloc(ptr:u32,len:u32)`、`rpi_extension_init()->u64`、`rpi_dispatch(ptr:u32,len:u32)->u64`；
-- host 导入（模块名 `rpi`）：`pir_host_call(ptr:u32,len:u32)->u64`；
-- 载荷均为 guest 线性内存中的 UTF-8 JSON：guest→host 传 `(ptr,len)`；host→guest 返回 `u64 = (ptr<<32)|len`（由 `pir_alloc` 分配，guest 读后 `pir_dealloc`）；
-- `pir_host_call` 请求 `{"call":"<method>","args":{...},"seq":N}`，响应 `{"ok":...}|{"error":{"kind","message"}}`；method 覆盖 24 API（`registerTool` 等）+ 28 UI（`ui.select` 等）+ events 总线；
+- guest 导出：`memory`、`rpi_alloc(len:u32)->u32`、`rpi_dealloc(ptr:u32,len:u32)`、`rpi_extension_init()->u64`、`rpi_dispatch(ptr:u32,len:u32)->u64`；
+- host 导入（模块名 `rpi`）：`rpi_host_call(ptr:u32,len:u32)->u64`；
+- 载荷均为 guest 线性内存中的 UTF-8 JSON：guest→host 传 `(ptr,len)`；host→guest 返回 `u64 = (ptr<<32)|len`（由 `rpi_alloc` 分配，guest 读后 `rpi_dealloc`）；
+- `rpi_host_call` 请求 `{"call":"<method>","args":{...},"seq":N}`，响应 `{"ok":...}|{"error":{"kind","message"}}`；method 覆盖 24 API（`registerTool` 等）+ 28 UI（`ui.select` 等）+ events 总线；
 - `rpi_dispatch` 消息 `{"kind":"event","event":"<name>","payload":{...}}` → 返回 handler 结果 JSON；`{"kind":"toolExecute",...}` / `{"kind":"render",...}`；每扩展分发串行（镜像上游 handler 串行语义）；
 - 并发模型：每扩展实例独立 Store + 专属阻塞线程，host call 内经 channel 等 async 侧 oneshot 结果。
 

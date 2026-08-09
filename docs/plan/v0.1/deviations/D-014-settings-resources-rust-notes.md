@@ -20,7 +20,7 @@
    文件不存在时的写路径先 `O_CREAT` 建空文件再上锁（内容不变）；竞争重试仅
    `WouldBlock`（对应 ELOCKED），10×20ms `thread::sleep`。keybindings 旧键迁移写回
    （上游 `migrations.ts:157-172` 无锁）按 G4「锁仅限 auth/settings/trust」加了同款
-   fs2 锁；其锁/写 I/O 失败传播为 `PirError::Resource`（上游全部吞掉）。
+   fs2 锁；其锁/写 I/O 失败传播为 `RpiError::Resource`（上游全部吞掉）。
 3. **Settings 内部表示**：insertion-ordered `serde_json::Map`（JS 对象插入序/spread
    语义），未知键完整往返。文件中类型错误的值（如 `steeringMode: 5`）在 getter 回落
    默认/跳过，而非 JS 的原样透传/TypeError——有效配置行为一致。
