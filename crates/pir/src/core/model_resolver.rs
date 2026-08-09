@@ -1450,9 +1450,12 @@ mod tests {
             cli_thinking: None,
             model_runtime: &runtime,
         });
+        // The built-in catalog is always seeded (model-runtime.ts:181-190),
+        // so the unmatched-model branch applies (model-resolver.ts:603);
+        // the "No models available" branch is unreachable with built-ins.
         assert_eq!(
             result.error.as_deref(),
-            Some("No models available. Check your installation or add models to models.json.")
+            Some("Model \"anything\" not found. Use --list-models to see available models.")
         );
     }
 

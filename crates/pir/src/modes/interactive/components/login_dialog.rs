@@ -37,8 +37,13 @@
 //!   login-dialog.ts:111); [`LoginDialogComponent::show_device_code`] fires
 //!   `on_begin_device_code` (upstream does nothing there — a T13 convenience
 //!   hook). Both are `Option` fields so the hooks stay inert until wired.
-//! - No `requestRender` (upstream `this.tui.requestRender()`, login-dialog.ts
-//!   :112, 130, …): the tree wrapper owns render scheduling.
+//! - No `requestRender` in the component: the driver only re-renders when
+//!   scheduled, so every `show_*` state mutation fires the
+//!   [`LoginDialogComponent::on_state_change`] hook (wired to the UI's
+//!   `RenderHandle` by the integration layer) — the port's equivalent of
+//!   upstream's per-method `this.tui.requestRender()` (login-dialog.ts:112,
+//!   130, …). Without it, prompt/device-code/info updates from the spawned
+//!   login task never reach the screen.
 //! - Waiting/progress lines are plain dim `Text` lines exactly as upstream;
 //!   the port does not depend on the (cross-group) `bordered_loader`.
 
@@ -141,6 +146,13 @@ pub struct LoginDialogComponent {
     pub on_select: Option<SelectCallback>,
     /// Cancel / escape (upstream `cancel`, login-dialog.ts:83-91).
     pub on_cancel: Option<Box<dyn FnMut() + Send>>,
+    /// Fired after every `show_*` state mutation (upstream calls
+    /// `this.tui.requestRender()` in each show method, login-dialog.ts:112,
+    /// 130, 145, 158, 184, 193, 210, 219): the driver only re-renders when
+    /// scheduled, and the login flow's async state changes (prompt / device
+    /// code / info from the spawned login task) never pass through input —
+    /// without this the dialog can stay frozen on an empty frame.
+    pub on_state_change: Option<Box<dyn FnMut() + Send>>,
 }
 
 /// `(text) => theme.fg("border", text)` (dynamic-border.ts:14).
@@ -197,12 +209,21 @@ impl LoginDialogComponent {
             on_prompt_confirm: None,
             on_select: None,
             on_cancel: None,
+            on_state_change: None,
         }
     }
 
     /// The current display mode.
     pub fn state(&self) -> Option<&LoginDialogState> {
         self.state.as_ref()
+    }
+
+    /// Fire [`Self::on_state_change`] after a `show_*` mutation (upstream
+    /// calls `this.tui.requestRender()` inline in every show method).
+    fn notify_state_change(&mut self) {
+        if let Some(on_state_change) = self.on_state_change.as_mut() {
+            on_state_change();
+        }
     }
 
     /// `showAuth` (login-dialog.ts:96-113).
@@ -215,6 +236,7 @@ impl LoginDialogComponent {
         if let Some(on_begin_oauth) = self.on_begin_oauth.as_mut() {
             on_begin_oauth();
         }
+        self.notify_state_change();
     }
 
     /// `showDeviceCode` (login-dialog.ts:118-131) + `showWaiting`
@@ -236,6 +258,7 @@ impl LoginDialogComponent {
         if let Some(on_begin_device_code) = self.on_begin_device_code.as_mut() {
             on_begin_device_code();
         }
+        self.notify_state_change();
     }
 
     /// `showManualInput` (login-dialog.ts:136-148).
@@ -245,6 +268,7 @@ impl LoginDialogComponent {
             prompt: prompt.to_string(),
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `showPrompt` (login-dialog.ts:154-176).
@@ -255,6 +279,7 @@ impl LoginDialogComponent {
             placeholder: placeholder.map(str::to_string),
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// In-dialog `select` prompt (upstream `showAuthSelect`,
@@ -267,12 +292,14 @@ impl LoginDialogComponent {
             selected: 0,
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `showDetails` (login-dialog.ts:179-186).
     pub fn show_details(&mut self, lines: Vec<String>) {
         self.state = Some(LoginDialogState::Details(lines));
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `showInfo` (login-dialog.ts:189-202).
@@ -283,6 +310,7 @@ impl LoginDialogComponent {
             show_close_hint,
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `showWaiting` (login-dialog.ts:207-212).
@@ -291,6 +319,7 @@ impl LoginDialogComponent {
             message: message.to_string(),
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `showProgress` (login-dialog.ts:217-220).
@@ -299,6 +328,7 @@ impl LoginDialogComponent {
             message: message.to_string(),
         });
         self.submitted = None;
+        self.notify_state_change();
     }
 
     /// `cancel` (login-dialog.ts:83-91): rejects the pending input (here:
@@ -648,6 +678,31 @@ mod tests {
 
     fn dialog() -> LoginDialogComponent {
         LoginDialogComponent::new(theme(), "anthropic", Some("Anthropic"), None)
+    }
+
+    #[test]
+    fn show_methods_fire_state_change_callback() {
+        install_global_keybindings();
+        let fired = Arc::new(Mutex::new(0usize));
+        let fired_cb = Arc::clone(&fired);
+        let mut component = dialog();
+        component.on_state_change = Some(Box::new(move || {
+            *fired_cb.lock().unwrap() += 1;
+        }));
+        component.show_prompt("Enter MiniMax CN API key", None);
+        component.show_waiting("Waiting for authentication...");
+        component.show_auth("https://example.com/auth", None);
+        component.show_device_code("CODE-1234", "https://example.com/device", None);
+        component.show_manual_input("Enter code:");
+        component.show_select("Pick:", Vec::new());
+        component.show_details(vec!["line".to_owned()]);
+        component.show_info("info", Vec::new(), false);
+        component.show_progress("working");
+        assert_eq!(
+            *fired.lock().unwrap(),
+            9,
+            "every show_* mutation schedules a re-render"
+        );
     }
 
     #[test]

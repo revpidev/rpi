@@ -42,9 +42,11 @@ pub const DEFAULT_CATALOG_BASE_URL: &str = "https://pi.dev";
 /// network request can occur). Pir-specific: upstream has no override
 /// (model-runtime.ts:69 `catalogBaseUrl` is an internal option only).
 ///
-/// Note: built-in providers are not registered with the overlay yet (the
-/// registration wave wraps them per model-runtime.ts:144-150, D-038); this
-/// resolver is the single entry point that wave must call.
+/// Wired at `ModelRuntime::create` (D-052): built-in providers are seeded
+/// and wrapped per model-runtime.ts:144-150; the services layer passes the
+/// `modelCatalogUrl` setting through `CreateModelRuntimeOptions`
+/// `catalog_base_url`, env-only callers (SDK, `update --models`) resolve
+/// here with `None`.
 pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
     crate::config::endpoint_from_env(
         crate::config::ENV_MODEL_CATALOG_URL,

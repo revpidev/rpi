@@ -554,6 +554,13 @@ fn login_dialog_with_interaction(
     )));
     {
         let mut dialog_guard = lock(&dialog);
+        // Async `show_*` updates from the spawned login task must schedule a
+        // re-render (upstream calls `this.tui.requestRender()` in each show
+        // method; login-dialog.ts:112, 130, …).
+        let render_handle = ui.render_handle.clone();
+        dialog_guard.on_state_change = Some(Box::new(move || {
+            render_handle.request_render();
+        }));
         let state_confirm = Arc::clone(&state);
         dialog_guard.on_prompt_confirm = Some(Box::new(move |value| {
             state_confirm.resolve(Ok(value.to_string()));
@@ -749,6 +756,10 @@ fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProv
     )));
     {
         let mut dialog_guard = lock(&dialog);
+        let render_handle = ui.render_handle.clone();
+        dialog_guard.on_state_change = Some(Box::new(move || {
+            render_handle.request_render();
+        }));
         let ui_restore = Arc::clone(ui);
         dialog_guard.on_cancel = Some(Box::new(move || {
             // `onComplete` → `restoreEditor`
@@ -2612,6 +2623,199 @@ mod tests {
             selector_mounted(&mode.ui_state),
             "login selector mounted; chat: {}",
             rendered_chat(&mode.ui_state)
+        );
+    }
+
+    /// `/login minimax-cn` must reach the api-key prompt dialog: the built-in
+    /// provider (seeded since D-052) uses `env_api_key_auth`, whose login
+    /// prompts for the key.
+    /// Full user path: bare `/login` → auth-type selector → "Sign in with
+    /// an API key" → provider list → pick `minimax-cn` → key prompt dialog.
+    #[tokio::test]
+    async fn login_bare_flow_to_api_key_prompt_via_input() {
+        let (mut mode, terminal, _session, _tmp) = mode_harness().await;
+        mode.init().await;
+        mode.ui_state.handle_login_command(None).await;
+        assert!(
+            selector_mounted(&mode.ui_state),
+            "auth-type selector mounted"
+        );
+
+        // Down + Enter selects "Sign in with an API key".
+        terminal.feed("\x1b[B");
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Search narrows the api-key provider list to the two MiniMax rows.
+        for ch in "minimax".chars() {
+            terminal.feed(&ch.to_string());
+        }
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The fuzzy match puts "MiniMax" (intl) first; move down to the CN
+        // row — the provider from the user report.
+        terminal.feed("\x1b[B");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rendered = lock(&mode.ui_state.active_selector)
+            .as_ref()
+            .map(|entry| entry.lock().unwrap().render(60).join("\n"))
+            .unwrap_or_default();
+        assert!(
+            rendered.contains("MiniMax CN"),
+            "api-key provider list after auth-type pick + search; rendered: {rendered}"
+        );
+
+        // Enter confirms the highlighted row.
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let rendered = lock(&mode.ui_state.active_selector)
+            .as_ref()
+            .map(|entry| entry.lock().unwrap().render(60).join("\n"))
+            .unwrap_or_default();
+        assert!(
+            rendered.contains("Enter MiniMax CN API key"),
+            "key prompt dialog; rendered: {rendered}"
+        );
+
+        // Type the key and confirm; the credential is stored.
+        terminal.feed("sk-minimax-test");
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let credentials = mode
+            .ui_state
+            .session()
+            .model_runtime()
+            .list_credentials()
+            .await
+            .expect("list credentials");
+        assert!(
+            credentials
+                .iter()
+                .any(|entry| entry.provider_id == "minimax-cn"
+                    && entry.credential_type == CredentialType::ApiKey),
+            "stored credential; got: {:?}",
+            credentials
+                .iter()
+                .map(|entry| (entry.provider_id.as_str(), entry.credential_type))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The full post-Enter path must complete: store credential → refresh
+    /// (incl. the remote-catalog overlay) → hide the dialog → status line.
+    #[tokio::test]
+    async fn login_enter_completes_flow_and_hides_dialog() {
+        let (mut mode, terminal, _session, _tmp) = mode_harness().await;
+        mode.init().await;
+        mode.ui_state.handle_login_command(Some("minimax-cn")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        mode.ui_state.ui.tick(std::time::Instant::now());
+
+        terminal.feed("sk-minimax-test");
+        terminal.feed("\r");
+
+        // The spawned login task (store + refresh + complete) must finish:
+        // the selector is hidden only after `ModelRuntime::login` returns.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            mode.ui_state.ui.tick(std::time::Instant::now());
+            if !selector_mounted(&mode.ui_state) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "login flow did not complete: selector still mounted"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(
+            chat.contains("Saved API key for MiniMax CN"),
+            "completion status; chat: {chat}"
+        );
+    }
+
+    /// Regression: a SECOND `/login` for a provider whose credential is
+    /// already stored must not hang (the real-app report: after the first
+    /// successful login, `/login minimax-cn` froze the UI).
+    #[tokio::test]
+    async fn second_login_with_stored_credential_does_not_hang() {
+        let (mut mode, terminal, _session, _tmp) = mode_harness().await;
+        mode.init().await;
+
+        // First login stores the credential (full flow incl. refresh).
+        mode.ui_state.handle_login_command(Some("minimax-cn")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        terminal.feed("sk-minimax-test");
+        terminal.feed("\r");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            mode.ui_state.ui.tick(std::time::Instant::now());
+            if !selector_mounted(&mode.ui_state) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "first login stalled");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // Second `/login` must reach the prompt again (no hang).
+        mode.ui_state.handle_login_command(Some("minimax-cn")).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        let rendered = lock(&mode.ui_state.active_selector)
+            .as_ref()
+            .map(|entry| entry.lock().unwrap().render(60).join("\n"))
+            .unwrap_or_default();
+        assert!(
+            rendered.contains("Enter MiniMax CN API key"),
+            "second login prompt; rendered: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_minimax_cn_shows_key_prompt_and_stores_credential() {
+        let (mut mode, terminal, _session, _tmp) = mode_harness().await;
+        mode.init().await;
+        mode.ui_state.handle_login_command(Some("minimax-cn")).await;
+        // The login task runs on the spawned async; let it reach the prompt.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        let rendered = lock(&mode.ui_state.active_selector)
+            .as_ref()
+            .map(|entry| entry.lock().unwrap().render(60).join("\n"))
+            .unwrap_or_default();
+        assert!(
+            rendered.contains("Enter MiniMax CN API key"),
+            "key prompt visible; rendered: {rendered}"
+        );
+
+        // Type the key and confirm; the credential lands in the store.
+        terminal.feed("sk-minimax-test");
+        terminal.feed("\r");
+        mode.ui_state.ui.tick(std::time::Instant::now());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let credentials = mode
+            .ui_state
+            .session()
+            .model_runtime()
+            .list_credentials()
+            .await
+            .expect("list credentials");
+        assert!(
+            credentials
+                .iter()
+                .any(|entry| entry.provider_id == "minimax-cn"
+                    && entry.credential_type == CredentialType::ApiKey),
+            "stored credential; got: {:?}",
+            credentials
+                .iter()
+                .map(|entry| (entry.provider_id.as_str(), entry.credential_type))
+                .collect::<Vec<_>>()
         );
     }
 

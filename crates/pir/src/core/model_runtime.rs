@@ -5,9 +5,10 @@
 //! plus `runtime-credentials.ts`.
 //!
 //! T10 subset boundaries (full parity lands with T13 providers):
-//! - No built-in provider catalog: pir-ai implements the API adapters but the
-//!   38 provider factories are T13. The catalog consists of models.json
-//!   custom providers plus SDK/extension registrations.
+//! - The 38 built-in provider factories are T13; `ModelRuntime::create`
+//!   seeds them from `pir_ai::providers::builtin_providers()` since the
+//!   registration wave (D-052), so models.json composes overrides only
+//!   (provider-composer) — same shape as upstream model-runtime.ts:181-190.
 //! - models.json `apiKey` is treated as an env var name
 //!   ([`env_api_key_auth`]); command/raw-key config values
 //!   (resolve-config-value.ts) and `oauth: "radius"` are T13.
@@ -24,10 +25,12 @@
 //!   `allowModelNetwork` / `modelRefreshTimeoutMs`; `refresh(options)` runs
 //!   dynamic catalog refreshes with `allowNetwork` defaulting to
 //!   `modelNetworkEnabled` (= `PIR_OFFLINE` unset).
-//! - Built-in providers are not registered yet, so the
-//!   [`remote_catalog_provider`] decorator has no runtime consumer in this
-//!   wave; the registration wave wraps them like upstream
-//!   (model-runtime.ts:144-150).
+//! - The registration wave (D-052) wraps every static built-in in
+//!   [`remote_catalog_provider::with_remote_catalog`] at `create()` time
+//!   (radius passes through), resolved through
+//!   [`remote_catalog_provider::model_catalog_endpoint`] (env > settings >
+//!   `https://pi.dev`, literal `off` disables the overlay) — the
+//!   `pir update --models` consumer path (model-runtime.ts:144-150, D-038).
 //! - A corrupt `models-store.json` falls back to an in-memory store with a
 //!   warning (upstream surfaces per-read `JSON.parse` errors into the
 //!   refresh result; see D-036).
@@ -39,6 +42,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
@@ -72,6 +76,7 @@ use pir_ai::types::{
 use pir_ai::utils::event_stream::AssistantMessageEventStream;
 
 use crate::config::{get_agent_dir, ENV_OFFLINE};
+use crate::core::remote_catalog_provider::{model_catalog_endpoint, with_remote_catalog};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -258,6 +263,12 @@ pub const DEFAULT_MODEL_REFRESH_TIMEOUT_MS: u64 = 15_000;
 /// added the network refresh options (see module docs).
 #[derive(Default)]
 pub struct CreateModelRuntimeOptions {
+    /// `catalogBaseUrl` (model-runtime.ts:77): remote model-catalog overlay
+    /// base URL. `None` resolves `PIR_MODEL_CATALOG_URL` env > default
+    /// `https://pi.dev` through [`model_catalog_endpoint`]; the literal
+    /// `off` disables the overlay entirely (ADR-0002 §8) — built-in
+    /// providers are then registered without the remote-catalog decorator.
+    pub catalog_base_url: Option<String>,
     /// Credential storage. Default: file at `auth_path`.
     pub credentials: Option<Arc<dyn CredentialStore>>,
     /// Default: `{agentDir}/auth.json`.
@@ -651,6 +662,30 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
     model
 }
 
+/// A cancellation token for the post-login/logout refresh: the create-time
+/// refresh timeout bounds the whole refresh, and an optional interaction
+/// signal (the login dialog's cancel token) aborts it early — a stuck
+/// remote-catalog fetch can no longer freeze the login flow indefinitely.
+fn bounded_refresh_signal(interaction_signal: Option<CancellationToken>) -> CancellationToken {
+    let token = CancellationToken::new();
+    if let Some(parent) = interaction_signal {
+        let child = token.clone();
+        let parent = parent.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = parent.cancelled() => child.cancel(),
+                () = child.cancelled() => {}
+            }
+        });
+    }
+    let timeout = token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(DEFAULT_MODEL_REFRESH_TIMEOUT_MS)).await;
+        timeout.cancel();
+    });
+    token
+}
+
 impl ModelRuntime {
     /// `ModelRuntime.create` (model-runtime.ts:133-172).
     pub async fn create(options: CreateModelRuntimeOptions) -> Arc<Self> {
@@ -712,6 +747,24 @@ impl ModelRuntime {
             availability_error: Mutex::new(None),
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
         });
+        // Seed the built-in providers (model-runtime.ts:181-190): every
+        // static catalog provider is wrapped in the persisted remote-catalog
+        // overlay (`withRemoteCatalog`); radius is a dynamic provider and
+        // passes through unchanged. models.json then composes over these
+        // bases as the overlay layer (provider-composer), so users only
+        // write custom/override config — D-038 registration wave.
+        let catalog_base_url = model_catalog_endpoint(options.catalog_base_url.as_deref());
+        let builtin_generated_at = pir_ai::generated::get_builtin_model_data_generated_at();
+        for provider in pir_ai::providers::builtin_providers() {
+            let provider = if provider.id() == "radius" {
+                provider
+            } else if let Some(base_url) = &catalog_base_url {
+                with_remote_catalog(provider, Some(base_url.clone()), builtin_generated_at)
+            } else {
+                provider
+            };
+            lock(&runtime.native_providers).insert(provider.id().to_owned(), provider);
+        }
         runtime.rebuild_providers();
         // create() refreshes dynamic catalogs over the network only when
         // explicitly enabled, with a default 15s timeout (model-runtime.ts:
@@ -1257,6 +1310,11 @@ impl ModelRuntime {
     /// `login` (model-runtime.ts:503-507): run the provider's login through
     /// `Models`, then refresh so the new credential takes effect in model
     /// availability and provider composition.
+    ///
+    /// The post-login refresh runs under a bounded signal (the create-time
+    /// refresh timeout plus the interaction's own cancellation token): a
+    /// stuck remote-catalog fetch must not freeze the login flow forever
+    /// (upstream has no bound here — its fetch is equally unbounded).
     pub async fn login(
         &self,
         provider_id: &str,
@@ -1267,10 +1325,11 @@ impl ModelRuntime {
             .models
             .login(provider_id, auth_type, interaction)
             .await?;
+        let signal = bounded_refresh_signal(interaction.signal());
         self.refresh(Some(ModelsRefreshOptions {
             allow_network: Some(self.model_network_enabled),
             force: None,
-            signal: None,
+            signal: Some(signal),
         }))
         .await;
         Ok(credential)
@@ -1278,14 +1337,16 @@ impl ModelRuntime {
 
     /// `logout` (model-runtime.ts:509-514): remove the stored credential,
     /// reset credential-dependent compatibility projections, then refresh so
-    /// the unconfigured provider is skipped by availability.
+    /// the unconfigured provider is skipped by availability (also under the
+    /// bounded refresh signal).
     pub async fn logout(&self, provider_id: &str) -> Result<(), ModelsError> {
         self.models.logout(provider_id).await?;
         self.recompose_provider(provider_id);
+        let signal = bounded_refresh_signal(None);
         self.refresh(Some(ModelsRefreshOptions {
             allow_network: Some(self.model_network_enabled),
             force: None,
-            signal: None,
+            signal: Some(signal),
         }))
         .await;
         Ok(())
@@ -1589,6 +1650,9 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
+    use pir_ai::models::ScopedModelsStore;
+    use pir_ai::models_store::ProviderModelsStore;
+
     use super::*;
 
     struct TempDir(PathBuf);
@@ -1629,6 +1693,151 @@ mod tests {
         })
         .await;
         (tmp, runtime)
+    }
+
+    /// `ModelRuntime.create` seeds every built-in provider
+    /// (model-runtime.ts:181-190, D-038 registration wave): the login
+    /// selectors and the model resolver see the official catalog without a
+    /// models.json, which then only composes overrides.
+    #[tokio::test]
+    async fn create_seeds_builtin_providers() {
+        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let providers = runtime.get_providers();
+        assert_eq!(
+            providers.len(),
+            pir_ai::providers::BUILTIN_PROVIDERS.len(),
+            "all built-in providers registered"
+        );
+        // Anthropic offers both login methods (oauth + api-key rows in the
+        // login selector); deepseek is api-key only.
+        let anthropic = runtime.get_provider("anthropic").expect("anthropic");
+        assert!(anthropic.auth().oauth.is_some());
+        assert!(anthropic.auth().api_key.is_some());
+        assert!(!anthropic.get_models().is_empty());
+        let deepseek = runtime.get_provider("deepseek").expect("deepseek");
+        assert!(deepseek.auth().oauth.is_none());
+        assert!(deepseek.auth().api_key.is_some());
+        assert!(!deepseek.get_models().is_empty());
+        // radius is a dynamic provider, not a catalog entry.
+        assert!(runtime.get_provider("radius").is_some());
+        // No composition errors with an empty models.json.
+        assert!(
+            runtime.get_error().is_none(),
+            "runtime error: {:?}",
+            runtime.get_error()
+        );
+    }
+
+    /// `catalogBaseUrl` "off" (ADR-0002 §8) registers the built-ins without
+    /// the remote-catalog overlay, so no network path exists.
+    #[tokio::test]
+    async fn catalog_off_registers_builtins_without_overlay() {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(agent_dir.join("models.json"), r#"{"providers": {}}"#)
+            .expect("write models.json");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            catalog_base_url: Some("off".to_owned()),
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
+        })
+        .await;
+        assert_eq!(
+            runtime.get_providers().len(),
+            pir_ai::providers::BUILTIN_PROVIDERS.len()
+        );
+        let store: Arc<dyn ProviderModelsStore> = Arc::new(ScopedModelsStore::new(
+            Arc::new(InMemoryModelsStore::new()),
+            "deepseek",
+        ));
+        let probe = RefreshModelsContext {
+            credential: None,
+            store,
+            allow_network: false,
+            force: false,
+            signal: None,
+        };
+        let deepseek = runtime.get_provider("deepseek").expect("deepseek");
+        assert!(
+            deepseek.refresh_models(probe).is_none(),
+            "off: built-in must not carry the remote-catalog overlay"
+        );
+    }
+
+    /// A configured catalog base URL wraps the built-ins in the overlay
+    /// (`refresh_models` present) — the `pir update --models` path.
+    #[tokio::test]
+    async fn catalog_base_url_wraps_builtins_in_overlay() {
+        let tmp = TempDir::new();
+        let agent_dir = tmp.0.join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::fs::write(agent_dir.join("models.json"), r#"{"providers": {}}"#)
+            .expect("write models.json");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            catalog_base_url: Some("https://mirror.test".to_owned()),
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
+        })
+        .await;
+        let store: Arc<dyn ProviderModelsStore> = Arc::new(ScopedModelsStore::new(
+            Arc::new(InMemoryModelsStore::new()),
+            "deepseek",
+        ));
+        let probe = RefreshModelsContext {
+            credential: None,
+            store,
+            allow_network: false,
+            force: false,
+            signal: None,
+        };
+        let deepseek = runtime.get_provider("deepseek").expect("deepseek");
+        assert!(
+            deepseek.refresh_models(probe).is_some(),
+            "configured base URL: built-in carries the remote-catalog overlay"
+        );
+        // radius stays dynamic and passes through unwrapped.
+        let radius = runtime.get_provider("radius").expect("radius");
+        assert!(radius
+            .refresh_models(RefreshModelsContext {
+                credential: None,
+                store: Arc::new(ScopedModelsStore::new(
+                    Arc::new(InMemoryModelsStore::new()),
+                    "radius",
+                )),
+                allow_network: false,
+                force: false,
+                signal: None,
+            })
+            .is_some());
+    }
+
+    /// models.json with a built-in provider id composes over the seeded base
+    /// (provider-composer): users only write overrides for official
+    /// providers — the login selectors and the model resolver pick up the
+    /// composed provider.
+    #[tokio::test]
+    async fn models_json_overlay_composes_over_builtin_base() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"deepseek": {
+                "baseUrl": "https://proxy.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "PIR_TEST_DEEPSEEK_OVERRIDE_KEY",
+                "models": [{"id": "deepseek-v4-flash", "contextWindow": 64000}]
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("deepseek").expect("deepseek composed");
+        assert_eq!(provider.base_url(), Some("https://proxy.example.com/v1"));
+        assert!(provider.auth().api_key.is_some());
+        let models = provider.get_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "deepseek-v4-flash");
+        assert!(runtime.get_error().is_none());
     }
 
     /// Upstream defaults (`modelFromJson`, provider-composer.ts:154-155):
@@ -1787,10 +1996,13 @@ mod tests {
             }}"#,
         )
         .await;
+        // Built-ins are seeded first (model-runtime.ts:181-190); the
+        // registered providers keep insertion order after them.
         let order: Vec<String> = runtime
             .get_models(None)
             .into_iter()
             .map(|model| model.provider)
+            .filter(|provider| provider == "zeta" || provider == "alpha")
             .collect();
         assert_eq!(order, vec!["zeta".to_owned(), "alpha".to_owned()]);
     }
@@ -1823,6 +2035,84 @@ mod tests {
             }
         });
         url
+    }
+
+    /// `ModelRuntime::login`'s post-login refresh runs under a bounded
+    /// signal (D-053): cancelling the interaction signal (the login dialog's
+    /// cancel) aborts a hanging remote-catalog fetch instead of freezing the
+    /// login flow forever.
+    #[tokio::test]
+    async fn login_interaction_cancel_aborts_hanging_post_login_refresh() {
+        const ENV_KEY: &str = "PIR_TEST_MODEL_RUNTIME_LOGIN_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        let url = hung_catalog_server().await;
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let inner = create_provider(CreateProviderOptions {
+            id: "login-hang-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth(
+                    "Login hang test API key",
+                    &[ENV_KEY],
+                ))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(pir_ai::api::openai_completions::OpenAiCompletions)),
+        });
+        runtime
+            .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
+                inner,
+                Some(url),
+                None,
+            ))
+            .await
+            .expect("register");
+
+        struct MockInteraction {
+            signal: CancellationToken,
+        }
+        impl AuthInteraction for MockInteraction {
+            fn signal(&self) -> Option<CancellationToken> {
+                Some(self.signal.clone())
+            }
+            fn prompt<'a>(
+                &'a self,
+                _prompt: pir_ai::auth::interaction::AuthPrompt,
+            ) -> pir_ai::auth::types::BoxFutureSend<'a, Result<String, ModelsError>> {
+                Box::pin(async move { Ok("test-key".to_owned()) })
+            }
+            fn notify(&self, _event: pir_ai::auth::interaction::AuthEvent) {}
+        }
+
+        let signal = CancellationToken::new();
+        let interaction = MockInteraction {
+            signal: signal.clone(),
+        };
+        let runtime = runtime.clone();
+        let login = tokio::spawn(async move {
+            runtime
+                .login("login-hang-test", AuthType::ApiKey, &interaction)
+                .await
+        });
+        // Let the login reach the hanging refresh (store + refresh start).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        signal.cancel();
+        let credential = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+            .await
+            .expect("interaction cancel must unblock the login")
+            .expect("login task")
+            .expect("login succeeds despite the aborted refresh");
+        assert!(matches!(credential, Credential::ApiKey(_)));
+        std::env::remove_var(ENV_KEY);
     }
 
     /// The shared refresh signal aborts a hanging catalog fetch
@@ -1941,7 +2231,11 @@ mod tests {
         let available = runtime.get_available(None).await.expect("get_available");
         assert_eq!(available.len(), 1);
         assert_eq!(available[0].id, full_catalog[0].id);
-        // The complete synchronous catalog remains intact.
-        assert_eq!(runtime.get_models(None).len(), full_catalog.len());
+        // The complete synchronous catalog remains intact (scoped to the
+        // provider — the runtime also carries the seeded built-ins).
+        assert_eq!(
+            runtime.get_models(Some("github-copilot")).len(),
+            full_catalog.len()
+        );
     }
 }

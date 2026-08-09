@@ -137,7 +137,16 @@ pub async fn create_agent_session_services(
     let model_runtime = match options.model_runtime {
         Some(runtime) => runtime,
         None => {
+            // `modelCatalogUrl` setting (pir-specific, ADR-0002 §8): the
+            // service layer is where settings are in scope; the runtime
+            // resolves env > settings > default `https://pi.dev` (a literal
+            // `off` disables the remote catalog overlay).
+            let catalog_base_url = options
+                .settings_manager
+                .as_ref()
+                .and_then(|manager| manager.get_model_catalog_url());
             ModelRuntime::create(CreateModelRuntimeOptions {
+                catalog_base_url,
                 credentials: None,
                 auth_path: Some(agent_dir.join("auth.json")),
                 models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
