@@ -533,7 +533,7 @@ rpi/src/tools/
 
 RPC 与 Interactive 共享 `AgentSessionRuntime` 方法，避免两套会话逻辑。独立入口 `rpi-rpc`（等价 `--mode rpc`）。
 
-**Rust 落地注记**（T10，D-015）：print/json 落 `crates/rpi/src/modes/print_mode.rs`，rpc 落 `crates/rpi/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`rpi-rpc` bin 为 `crates/rpi/src/bin/pir_rpc.rs`（Cargo `[[bin]] rpi-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 已接真实导出（T14-W5，D-045；in-memory 会话报上游错误）。interactive 模式在 T12。
+**Rust 落地注记**（T10，D-015）：print/json 落 `crates/rpi/src/modes/print_mode.rs`，rpc 落 `crates/rpi/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`rpi-rpc` bin 为 `crates/rpi/src/bin/rpi_rpc.rs`（Cargo `[[bin]] rpi-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 已接真实导出（T14-W5，D-045；in-memory 会话报上游错误）。interactive 模式在 T12。
 
 ### 6.7 ResourceLoader
 
@@ -618,10 +618,10 @@ Extension ui.*
 ## 8. 配置与路径
 
 ```rust
-pub struct PirConfig {
+pub struct RpiConfig {
     pub app_name: String,          // "rpi"
     pub config_dir_name: String,   // ".rpi"
-    pub env_prefix: String,        // "PIR"
+    pub env_prefix: String,        // "RPI"
 }
 // agent_dir = ~/.rpi/agent
 // project_dir = <cwd>/.rpi
@@ -776,7 +776,7 @@ gantt
 | `packages/coding-agent/src/modes/interactive/{model-search,external-editor}.ts` | `crates/rpi/src/modes/interactive/{model_search.rs → components/,external_editor.rs}` |
 | `packages/tui/src/components/markdown.ts`（marked） | `crates/rpi-tui/src/components/markdown.rs`（**comrak 0.54 替代**，D-018） |
 | `packages/coding-agent/src/cli/*` / `package-manager-cli.ts` | `crates/rpi/src/cli/*` |
-| `packages/coding-agent/src/rpc-entry.ts` | `crates/rpi/src/bin/pir_rpc.rs`（`[[bin]] rpi-rpc`） |
+| `packages/coding-agent/src/rpc-entry.ts` | `crates/rpi/src/bin/rpi_rpc.rs`（`[[bin]] rpi-rpc`） |
 | ~~`packages/coding-agent/src/migrations.ts`~~ | **不实现**（ADR-0003 §3） |
 | ~~`packages/server` / `packages/evals` / `storage/sqlite-node` / `src/bun`~~ | **不复刻**（ADR-0003） |
 

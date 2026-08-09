@@ -37,15 +37,15 @@ impl Drop for TempDir {
 /// 最小 gate guest（on tool_call → block "w7-block"）。
 const GATE_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func $strlen (param $ptr i32) (result i32)
     (local $n i32)
     (block $done
@@ -476,7 +476,7 @@ async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
                     'static,
                     Result<
                         rpi::core::agent_session_runtime::CreateAgentSessionRuntimeResult,
-                        rpi::error::PirError,
+                        rpi::error::RpiError,
                     >,
                 >
         }

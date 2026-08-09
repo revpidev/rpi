@@ -47,7 +47,7 @@ use crate::core::trust_manager::{
     default_project_trust_from_settings, has_trust_requiring_project_resources,
     resolve_project_trusted, ProjectTrustContext, ProjectTrustStore,
 };
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::modes::interactive::run_interactive_mode;
 use crate::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
 use crate::modes::rpc::run_rpc_mode;
@@ -262,9 +262,9 @@ fn validate_session_id_flags(parsed: &Args) -> Result<(), String> {
         ));
     }
     assert_valid_session_id(session_id).map_err(|error| match error {
-        // User-facing message without the `PirError` Display prefix
+        // User-facing message without the `RpiError` Display prefix
         // (main.ts:237-240 prints `error.message` raw).
-        PirError::Session(message) => message,
+        RpiError::Session(message) => message,
         other => other.to_string(),
     })
 }
@@ -1224,7 +1224,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             })
                 as futures::future::BoxFuture<
                     'static,
-                    Result<CreateAgentSessionRuntimeResult, PirError>,
+                    Result<CreateAgentSessionRuntimeResult, RpiError>,
                 >
         })
     };

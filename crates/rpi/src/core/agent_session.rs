@@ -62,7 +62,7 @@ use crate::core::settings_manager::{RetryConfig, SettingsManager};
 use crate::core::skills::strip_frontmatter;
 use crate::core::system_prompt::{build_system_prompt, BuildSystemPromptOptions};
 use crate::core::usage_totals::{add_usage_to_totals, create_usage_totals, UsageTotals};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::bash::create_local_bash_operations;
 use crate::tools::bash_executor::{execute_bash, BashExecutorOptions, BashResult};
 
@@ -1360,20 +1360,20 @@ impl AgentSession {
     // ==================================================================
 
     /// `_runAgentPrompt` (agent-session.ts:1061-1073).
-    async fn run_agent_prompt(&self, messages: Vec<AgentMessage>) -> Result<(), PirError> {
+    async fn run_agent_prompt(&self, messages: Vec<AgentMessage>) -> Result<(), RpiError> {
         self.inner.is_agent_run_active.store(true, Ordering::SeqCst);
         let result = async {
             self.inner
                 .agent
                 .prompt(messages)
                 .await
-                .map_err(agent_error_to_pir)?;
+                .map_err(agent_error_to_rpi)?;
             while self.handle_post_agent_run().await {
                 self.inner
                     .agent
                     .continue_run()
                     .await
-                    .map_err(agent_error_to_pir)?;
+                    .map_err(agent_error_to_rpi)?;
             }
             Ok(())
         }
@@ -1415,12 +1415,12 @@ impl AgentSession {
     }
 
     /// `prompt` (agent-session.ts:1114-1265).
-    pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), PirError> {
+    pub async fn prompt(&self, text: &str, options: PromptOptions) -> Result<(), RpiError> {
         let expand_prompt_templates = options.expand_prompt_templates.unwrap_or(true);
         let mut preflight_result = options.preflight_result;
         let mut images = options.images;
 
-        let result: Result<Option<Vec<AgentMessage>>, PirError> = async {
+        let result: Result<Option<Vec<AgentMessage>>, RpiError> = async {
             // Extension commands first (agent-session.ts:1121-1129) — no-op
             // runner never has commands.
             if expand_prompt_templates
@@ -1468,7 +1468,7 @@ impl AgentSession {
             // Queue while streaming (agent-session.ts:1158-1172).
             if self.is_streaming() {
                 let Some(behavior) = options.streaming_behavior else {
-                    return Err(PirError::Session(
+                    return Err(RpiError::Session(
                         "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message."
                             .to_owned(),
                     ));
@@ -1487,7 +1487,7 @@ impl AgentSession {
 
             // Validate model (agent-session.ts:1177-1195).
             let Some(model) = self.model() else {
-                return Err(PirError::Session(format_no_model_selected_message()));
+                return Err(RpiError::Session(format_no_model_selected_message()));
             };
             let has_configured_auth = self.inner.model_runtime.has_configured_auth(&model.provider)
                 || self
@@ -1495,16 +1495,16 @@ impl AgentSession {
                     .model_runtime
                     .check_auth(&model.provider)
                     .await
-                    .map_err(|error| PirError::Session(error.message))?
+                    .map_err(|error| RpiError::Session(error.message))?
                     .is_some();
             if !has_configured_auth {
                 if self.inner.model_runtime.is_using_oauth(&model.provider) {
-                    return Err(PirError::Session(format!(
+                    return Err(RpiError::Session(format!(
                         "Authentication failed for \"{}\". Credentials may have expired or network is unavailable. Run '/login {}' to re-authenticate.",
                         model.provider, model.provider
                     )));
                 }
-                return Err(PirError::Session(format_no_api_key_found_message(
+                return Err(RpiError::Session(format_no_api_key_found_message(
                     &model.provider,
                 )));
             }
@@ -1661,7 +1661,7 @@ impl AgentSession {
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         if text.starts_with('/') {
             self.throw_if_extension_command(text)?;
         }
@@ -1676,7 +1676,7 @@ impl AgentSession {
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         if text.starts_with('/') {
             self.throw_if_extension_command(text)?;
         }
@@ -1701,14 +1701,14 @@ impl AgentSession {
     }
 
     /// `_throwIfExtensionCommand` (agent-session.ts:1405-1415).
-    fn throw_if_extension_command(&self, text: &str) -> Result<(), PirError> {
+    fn throw_if_extension_command(&self, text: &str) -> Result<(), RpiError> {
         let space_index = text.find(' ');
         let command_name = match space_index {
             Some(index) => &text[1..index],
             None => &text[1..],
         };
         if self.runner().get_command(command_name).is_some() {
-            return Err(PirError::Session(format!(
+            return Err(RpiError::Session(format!(
                 "Extension command \"/{command_name}\" cannot be queued. Use prompt() or execute the command when not streaming."
             )));
         }
@@ -1724,7 +1724,7 @@ impl AgentSession {
         details: Option<serde_json::Value>,
         trigger_turn: bool,
         deliver_as: Option<CustomDeliverAs>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         let message = AgentMessage::Custom(CustomMessage {
             role: CustomRole::Custom,
             custom_type: custom_type.to_owned(),
@@ -1773,7 +1773,7 @@ impl AgentSession {
         text: &str,
         images: Option<Vec<ImageContent>>,
         deliver_as: Option<StreamingBehavior>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.prompt(
             text,
             PromptOptions {
@@ -1869,16 +1869,16 @@ impl AgentSession {
     }
 
     /// `setModel` (agent-session.ts:1578-1593).
-    pub async fn set_model(&self, model: Model) -> Result<(), PirError> {
+    pub async fn set_model(&self, model: Model) -> Result<(), RpiError> {
         if self
             .inner
             .model_runtime
             .check_auth(&model.provider)
             .await
-            .map_err(|error| PirError::Session(error.message))?
+            .map_err(|error| RpiError::Session(error.message))?
             .is_none()
         {
-            return Err(PirError::Session(format!(
+            return Err(RpiError::Session(format!(
                 "No API key for {}/{}",
                 model.provider, model.id
             )));
@@ -1929,7 +1929,7 @@ impl AgentSession {
     pub async fn cycle_model(
         &self,
         direction: CycleDirection,
-    ) -> Result<Option<ModelCycleResult>, PirError> {
+    ) -> Result<Option<ModelCycleResult>, RpiError> {
         if !lock(&self.inner.scoped_models).is_empty() {
             return self.cycle_scoped_model(direction).await;
         }
@@ -1939,7 +1939,7 @@ impl AgentSession {
     async fn cycle_scoped_model(
         &self,
         direction: CycleDirection,
-    ) -> Result<Option<ModelCycleResult>, PirError> {
+    ) -> Result<Option<ModelCycleResult>, RpiError> {
         let scoped = lock(&self.inner.scoped_models).clone();
         let mut authenticated = Vec::new();
         for scoped_model in scoped {
@@ -1948,7 +1948,7 @@ impl AgentSession {
                 .model_runtime
                 .check_auth(&scoped_model.model.provider)
                 .await
-                .map_err(|error| PirError::Session(error.message))?
+                .map_err(|error| RpiError::Session(error.message))?
                 .is_some()
             {
                 authenticated.push(scoped_model);
@@ -1995,13 +1995,13 @@ impl AgentSession {
     async fn cycle_available_model(
         &self,
         direction: CycleDirection,
-    ) -> Result<Option<ModelCycleResult>, PirError> {
+    ) -> Result<Option<ModelCycleResult>, RpiError> {
         let available = self
             .inner
             .model_runtime
             .get_available(None)
             .await
-            .map_err(|error| PirError::Session(error.message))?;
+            .map_err(|error| RpiError::Session(error.message))?;
         if available.len() <= 1 {
             return Ok(None);
         }
@@ -2183,7 +2183,7 @@ impl AgentSession {
     pub async fn compact(
         &self,
         custom_instructions: Option<&str>,
-    ) -> Result<CompactionResult, PirError> {
+    ) -> Result<CompactionResult, RpiError> {
         self.disconnect_from_agent();
         self.abort().await;
         self.sync_compaction_model();
@@ -2340,7 +2340,7 @@ impl AgentSession {
         &self,
         command: &str,
         options: ExecuteBashOptions,
-    ) -> Result<BashResult, PirError> {
+    ) -> Result<BashResult, RpiError> {
         let token = CancellationToken::new();
         let token_id = self.inner.next_listener_id.fetch_add(1, Ordering::SeqCst);
         lock(&self.inner.bash_tokens).push((token_id, token.clone()));
@@ -2393,7 +2393,7 @@ impl AgentSession {
                 self.record_bash_result(command, &result, options.exclude_from_context);
                 Ok(result)
             }
-            Err(error) => Err(PirError::Session(error.to_string())),
+            Err(error) => Err(RpiError::Session(error.to_string())),
         }
     }
 
@@ -2505,7 +2505,7 @@ impl AgentSession {
         &self,
         target_id: &str,
         options: NavigateTreeOptions,
-    ) -> Result<NavigateTreeResult, PirError> {
+    ) -> Result<NavigateTreeResult, RpiError> {
         let old_leaf_id = lock(&self.inner.session_manager)
             .get_leaf_id()
             .map(str::to_owned);
@@ -2515,7 +2515,7 @@ impl AgentSession {
         }
 
         if options.summarize && self.model().is_none() {
-            return Err(PirError::Session(
+            return Err(RpiError::Session(
                 "No model available for summarization".to_owned(),
             ));
         }
@@ -2525,7 +2525,7 @@ impl AgentSession {
             session.get_entry(target_id)
         };
         let Some(target_entry) = target_entry else {
-            return Err(PirError::Session(format!("Entry {target_id} not found")));
+            return Err(RpiError::Session(format!("Entry {target_id} not found")));
         };
 
         // Collect entries to summarize (old leaf → common ancestor).
@@ -2586,7 +2586,7 @@ impl AgentSession {
         let mut summary_usage: Option<Usage> = None;
         if options.summarize && !entries_to_summarize.is_empty() && extension_summary.is_none() {
             let model = self.model().ok_or_else(|| {
-                PirError::Session("No model available for summarization".to_owned())
+                RpiError::Session("No model available for summarization".to_owned())
             })?;
             let reserve_tokens = lock(&self.inner.resource_loader)
                 .settings_manager_mut()
@@ -2628,7 +2628,7 @@ impl AgentSession {
                 });
             }
             if let Some(error) = result.error {
-                return Err(PirError::Session(error));
+                return Err(RpiError::Session(error));
             }
             summary_text = result.summary;
             summary_usage = result.usage;
@@ -2862,7 +2862,7 @@ impl AgentSession {
     /// Upstream also builds a `ToolHtmlRenderer` for extension custom tools
     /// (agent-session.ts:3217-3222); rpi has no JS tool renderers, so
     /// `renderedTools` is never emitted (export_html.rs module header).
-    pub fn export_to_html(&self, output_path: Option<&str>) -> Result<String, PirError> {
+    pub fn export_to_html(&self, output_path: Option<&str>) -> Result<String, RpiError> {
         let configured_theme_name = self.settings_manager(|settings| settings.get_theme());
         let theme_name = configured_theme_name
             .filter(|name| crate::core::themes::get_theme_by_name(name).is_some());
@@ -2891,7 +2891,7 @@ impl AgentSession {
     }
 
     /// `exportToJsonl` (agent-session.ts:3234-3265).
-    pub fn export_to_jsonl(&self, output_path: Option<&str>) -> Result<PathBuf, PirError> {
+    pub fn export_to_jsonl(&self, output_path: Option<&str>) -> Result<PathBuf, RpiError> {
         let file_path = match output_path {
             Some(path) => crate::tools::path_utils::resolve_path(
                 path,
@@ -3257,8 +3257,8 @@ fn user_message(text: &str, images: Option<Vec<ImageContent>>) -> AgentMessage {
     })
 }
 
-fn agent_error_to_pir(error: AgentError) -> PirError {
-    PirError::Session(error.to_string())
+fn agent_error_to_rpi(error: AgentError) -> RpiError {
+    RpiError::Session(error.to_string())
 }
 
 fn now_iso8601_compact() -> String {

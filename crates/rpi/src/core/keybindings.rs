@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 use crate::config;
-use crate::error::PirError;
+use crate::error::RpiError;
 
 // ===========================================================================
 // Types
@@ -612,7 +612,7 @@ fn load_raw_config(path: &Path) -> Option<serde_json::Map<String, serde_json::Va
 
 /// Load, migrate, and type-filter a keybindings config file
 /// (keybindings.ts:363-367).
-pub fn load_keybindings_from_file(path: &Path) -> Result<HashMap<String, Vec<String>>, PirError> {
+pub fn load_keybindings_from_file(path: &Path) -> Result<HashMap<String, Vec<String>>, RpiError> {
     let raw = load_raw_config(path);
     match raw {
         None => Ok(HashMap::new()),

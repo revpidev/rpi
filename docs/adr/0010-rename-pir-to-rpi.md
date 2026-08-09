@@ -25,6 +25,7 @@ pir 是 Pi 的 Rust 移植，独立分发（ADR-0001 起已把命名从 `PI_*` �
 | 标识 | `APP_NAME`/`PACKAGE_NAME`/UA `pir/x.y.z` | `rpi` / `rpi/x.y.z` |
 | 扩展 manifest 字段 | `pirAbi` | `rpiAbi` |
 | 原生插件 ABI 符号 | `PirNativeModule` / `pir_extension_init` / `PirHostCalls` | `RpiNativeModule` / `rpi_extension_init` / `RpiHostCalls` |
+| WASM 扩展 ABI 符号 | `pir_host_call` / `pir_alloc` / `pir_dealloc` | `rpi_host_call` / `rpi_alloc` / `rpi_dealloc` |
 
 要点：
 

@@ -14,15 +14,15 @@ use serde_json::json;
 /// tool_call gate guest：on("tool_call")，dispatch 恒返回 block。
 const GATE_GUEST_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func $pack (param $ptr i32) (result i64)
     (i64.or
       (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
@@ -49,15 +49,15 @@ const GATE_GUEST_WAT: &str = r#"
 /// 工具 guest：registerTool("wasm_tool")，toolExecute 恒返回固定结果。
 const TOOL_GUEST_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func $pack (param $ptr i32) (result i64)
     (i64.or
       (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
@@ -84,15 +84,15 @@ const TOOL_GUEST_WAT: &str = r#"
 /// 能力探针 guest：init 调 registerTool 并把响应原样作为回执返回。
 const PROBE_GUEST_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func (export "rpi_extension_init") (result i64)
     ;; 直接转发 host_call 的响应作为 init 回执。
     (return (call $host_call (i32.const 16) (call $strlen (i32.const 16)))))
@@ -114,8 +114,8 @@ const PROBE_GUEST_WAT: &str = r#"
 const LOOP_GUEST_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
-  (func (export "pir_alloc") (param i32) (result i32) (i32.const 64))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_alloc") (param i32) (result i32) (i32.const 64))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func (export "rpi_extension_init") (result i64)
     (loop $spin (br $spin))
     (i64.const 0))
@@ -127,8 +127,8 @@ const LOOP_GUEST_WAT: &str = r#"
 const NO_DISPATCH_GUEST_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
-  (func (export "pir_alloc") (param i32) (result i32) (i32.const 64))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_alloc") (param i32) (result i32) (i32.const 64))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func (export "rpi_extension_init") (result i64) (i64.const 0))
 )
 "#;
@@ -314,15 +314,15 @@ async fn wasm_module_cache_reused_within_generation() {
 /// guest 在 ui.select 对话框 host call 里等待 TUI 输入）。
 const BLOCKING_EXEC_GUEST_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func $strlen (param $ptr i32) (result i32)
     (local $n i32)
     (block $done

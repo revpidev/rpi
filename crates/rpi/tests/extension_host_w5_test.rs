@@ -215,7 +215,7 @@ async fn runtime_fixture(event_log: Arc<Mutex<Vec<String>>>) -> RuntimeFixture {
                     'static,
                     Result<
                         rpi::core::agent_session_runtime::CreateAgentSessionRuntimeResult,
-                        rpi::error::PirError,
+                        rpi::error::RpiError,
                     >,
                 >
         }

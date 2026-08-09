@@ -2165,7 +2165,7 @@ fn wx_exclusive_create_fails_when_file_already_exists() {
     let err = session
         .append_message(assistant_msg("hi"))
         .expect_err("must fail");
-    assert!(matches!(err, PirError::Io(_)), "io error, got: {err}");
+    assert!(matches!(err, RpiError::Io(_)), "io error, got: {err}");
     // The stale file is untouched.
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "stale\n");
 }
@@ -2189,7 +2189,7 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
 
     assert!(
-        matches!(result, Err(PirError::Io(_))),
+        matches!(result, Err(RpiError::Io(_))),
         "io error, got: {result:?}"
     );
 }

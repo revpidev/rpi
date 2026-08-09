@@ -21,4 +21,4 @@ pub mod modes;
 pub mod sdk;
 pub mod tools;
 
-pub use error::PirError;
+pub use error::RpiError;

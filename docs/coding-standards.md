@@ -450,10 +450,10 @@ pub trait Focusable: Component {
 ### 10.1 路径解析单点
 
 ```rust
-pub struct PirConfig {
+pub struct RpiConfig {
     pub app_name: String,          // "rpi"
     pub config_dir_name: String,   // ".rpi"
-    pub env_prefix: String,        // "PIR"
+    pub env_prefix: String,        // "RPI"
 }
 // agent_dir   = ~/.rpi/agent
 // project_dir = <cwd>/.rpi

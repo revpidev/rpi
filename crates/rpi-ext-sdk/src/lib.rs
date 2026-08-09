@@ -9,14 +9,14 @@
 //! An extension defines `register(ext: &mut Extension)` and exports the ABI
 //! through [`export!`]. The host calls `rpi_extension_init` once (your
 //! registrations run there) and `rpi_dispatch` per event/tool call; guest
-//! → host requests go through `pir_host_call` as JSON (see
+//! → host requests go through `rpi_host_call` as JSON (see
 //! `docs/extension-abi.md`).
 
 use serde_json::{json, Value};
 
 #[link(wasm_import_module = "rpi")]
 extern "C" {
-    fn pir_host_call(ptr: *const u8, len: usize) -> u64;
+    fn rpi_host_call(ptr: *const u8, len: usize) -> u64;
 }
 
 // ============================================================================
@@ -27,21 +27,21 @@ extern "C" {
 ///
 /// # Safety
 /// Called by the host with a byte length; the returned region stays valid
-/// until `pir_dealloc`.
+/// until `rpi_dealloc`.
 #[no_mangle]
-pub extern "C" fn pir_alloc(len: usize) -> *mut u8 {
+pub extern "C" fn rpi_alloc(len: usize) -> *mut u8 {
     let mut buf: Vec<u8> = Vec::with_capacity(len.max(1));
     let ptr = buf.as_mut_ptr();
     std::mem::forget(buf);
     ptr
 }
 
-/// Free a region produced by [`pir_alloc`].
+/// Free a region produced by [`rpi_alloc`].
 ///
 /// # Safety
-/// `ptr`/`len` must come from `pir_alloc`.
+/// `ptr`/`len` must come from `rpi_alloc`.
 #[no_mangle]
-pub unsafe extern "C" fn pir_dealloc(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn rpi_dealloc(ptr: *mut u8, len: usize) {
     drop(unsafe { Vec::from_raw_parts(ptr, 0, len) });
 }
 
@@ -64,7 +64,7 @@ fn pack_json(value: &Value) -> u64 {
 // Host call client
 // ============================================================================
 
-/// Raw `pir_host_call`: `{"call": method, "args": {...}, "seq": N}` →
+/// Raw `rpi_host_call`: `{"call": method, "args": {...}, "seq": N}` →
 /// `{"ok": ...} | {"error": {"kind", "message"}}`.
 pub fn host_call(method: &str, args: Value) -> Result<Value, String> {
     let request = json!({
@@ -73,12 +73,12 @@ pub fn host_call(method: &str, args: Value) -> Result<Value, String> {
         "seq": next_seq(),
     });
     let bytes = serde_json::to_vec(&request).unwrap_or_default();
-    let packed = unsafe { pir_host_call(bytes.as_ptr(), bytes.len()) };
+    let packed = unsafe { rpi_host_call(bytes.as_ptr(), bytes.len()) };
     let ptr = (packed >> 32) as u32 as *mut u8;
     let len = (packed & 0xffff_ffff) as usize;
     let response: Value = serde_json::from_slice(&unpack(ptr, len))
         .map_err(|e| format!("host response JSON: {e}"))?;
-    unsafe { pir_dealloc(ptr, len) };
+    unsafe { rpi_dealloc(ptr, len) };
     match response.get("error") {
         Some(error) => Err(error
             .get("message")

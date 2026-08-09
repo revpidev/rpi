@@ -273,7 +273,7 @@ mod bash_tool_tests {
     }
 
     #[tokio::test]
-    async fn test_pir_session_env_injected() {
+    async fn test_rpi_session_env_injected() {
         let ctx = ToolContext {
             cwd: PathBuf::from("."),
             session_env: Some(std::sync::Arc::new(std::sync::RwLock::new(SessionEnv {
@@ -300,7 +300,7 @@ mod bash_tool_tests {
     }
 
     #[tokio::test]
-    async fn test_pir_env_stripped_when_no_session() {
+    async fn test_rpi_env_stripped_when_no_session() {
         // Set a RPI_ var in the process env — the tool should strip it.
         std::env::set_var("RPI_SESSION_ID", "should_be_stripped");
         std::env::set_var("RPI_MODEL", "should_be_stripped_too");

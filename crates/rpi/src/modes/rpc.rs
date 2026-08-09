@@ -36,7 +36,7 @@ use crate::core::agent_session_runtime::{AgentSessionRuntime, ForkPosition};
 use crate::core::extensions::{ExtensionMode, InputSource, StreamingBehavior};
 use crate::core::prompt_templates::PromptTemplate;
 use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
-use crate::error::PirError;
+use crate::error::RpiError;
 
 pub mod ui_bridge;
 
@@ -493,9 +493,9 @@ fn error_response_raw_command(
     Value::Object(object)
 }
 
-/// Raw error message without the `PirError` Display prefix (upstream sends
+/// Raw error message without the `RpiError` Display prefix (upstream sends
 /// `error.message` verbatim).
-fn error_message(error: &PirError) -> String {
+fn error_message(error: &RpiError) -> String {
     error.raw_message()
 }
 

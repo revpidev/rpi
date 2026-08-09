@@ -37,7 +37,7 @@ use std::sync::OnceLock;
 use regex::{Captures, Regex};
 
 use crate::config;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `PromptTemplate` (prompt-templates.ts:11-18), minus `sourceInfo` (see
@@ -248,9 +248,9 @@ fn normalize_newlines(value: &str) -> String {
 /// A frontmatter block is `---` at the very start of the (newline
 /// normalised) content, closed by the next `\n---`. The body starts one
 /// character after the closing delimiter and is trimmed. A YAML syntax
-/// error is reported as [`PirError::Resource`] (upstream: `parse` throws
+/// error is reported as [`RpiError::Resource`] (upstream: `parse` throws
 /// and the caller's `try/catch` turns it into a failed load).
-pub fn parse_frontmatter(content: &str) -> Result<ParsedFrontmatter, PirError> {
+pub fn parse_frontmatter(content: &str) -> Result<ParsedFrontmatter, RpiError> {
     let normalized = normalize_newlines(content);
 
     if !normalized.starts_with("---") {
@@ -277,7 +277,7 @@ pub fn parse_frontmatter(content: &str) -> Result<ParsedFrontmatter, PirError> {
     let body = normalized[end_index + 4..].trim().to_string();
 
     let parsed: serde_yaml::Value = serde_yaml::from_str(yaml_string)
-        .map_err(|e| PirError::Resource(format!("failed to parse frontmatter YAML: {e}")))?;
+        .map_err(|e| RpiError::Resource(format!("failed to parse frontmatter YAML: {e}")))?;
 
     let mut values = HashMap::new();
     // Upstream `parsed ?? {}`: non-mapping scalars behave like an empty

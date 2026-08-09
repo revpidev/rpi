@@ -44,7 +44,7 @@ use crate::core::trust_manager::{
     ProjectTrustStore,
 };
 use crate::core::version_check::{
-    get_latest_pir_release_with, is_newer_package_version, version_check_endpoint,
+    get_latest_rpi_release_with, is_newer_package_version, version_check_endpoint,
     LatestVersionTransport, ReqwestLatestVersionTransport, DEFAULT_VERSION_CHECK_TIMEOUT,
 };
 use std::path::Path;
@@ -317,7 +317,7 @@ async fn get_self_update_plan(
     let Some(url) = endpoint else {
         return Err(format!("Could not determine latest {APP_NAME} version."));
     };
-    let latest_release = get_latest_pir_release_with(
+    let latest_release = get_latest_rpi_release_with(
         VERSION,
         transport,
         url,

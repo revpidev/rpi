@@ -53,7 +53,7 @@ rpi 全栈事件流 —— `crates/rpi/tests/parity_headless_test.rs`（5 场景
   `session_replacement_commands`、`compact_command`、
   `steer_follow_up_abort_during_streaming`、`session_name_and_get_commands`、
   `get_commands_with_prompt_template`、`protocol_errors_and_framing`、
-  `export_html_in_memory_session_errors`、`pir_rpc_bin_end_to_end`（进程级
+  `export_html_in_memory_session_errors`、`rpi_rpc_bin_end_to_end`（进程级
   EOF 退出哨兵）、信号退出码两例。
 
 ### 1.3 扩展 UI RPC 子协议（`extension_ui_request`）

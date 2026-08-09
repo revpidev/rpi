@@ -88,7 +88,7 @@ fn load_discovered(options: &DiscoverSkillsOptions) -> rpi::core::skills::LoadSk
 // ---------------------------------------------------------------------------
 
 #[test]
-fn skills_discovery_pir_and_agents_modes_end_to_end() {
+fn skills_discovery_rpi_and_agents_modes_end_to_end() {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("project");
 

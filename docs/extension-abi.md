@@ -10,8 +10,8 @@ T15 W6 定稿。宿主实现：`crates/rpi-ext-host/src/wasm/`；guest SDK：
   | 导出 | 签名 | 用途 |
   |---|---|---|
   | `memory` | — | 线性内存，所有载荷所在 |
-  | `pir_alloc` | `(len: u32) -> u32` | host 写入响应前调用，分配 guest 内存 |
-  | `pir_dealloc` | `(ptr: u32, len: u32)` | host 读完响应后调用 |
+  | `rpi_alloc` | `(len: u32) -> u32` | host 写入响应前调用，分配 guest 内存 |
+  | `rpi_dealloc` | `(ptr: u32, len: u32)` | host 读完响应后调用 |
   | `rpi_extension_init` | `() -> u64` | 加载入口（注册发生在这里） |
   | `rpi_dispatch` | `(ptr: u32, len: u32) -> u64` | 事件/工具/命令/渲染分发 |
 
@@ -19,11 +19,11 @@ T15 W6 定稿。宿主实现：`crates/rpi-ext-host/src/wasm/`；guest SDK：
 
   | 导入 | 签名 | 用途 |
   |---|---|---|
-  | `pir_host_call` | `(ptr: u32, len: u32) -> u64` | guest → host 的 API 调用 |
+  | `rpi_host_call` | `(ptr: u32, len: u32) -> u64` | guest → host 的 API 调用 |
 
 - 载荷均为 guest 线性内存中的 UTF-8 JSON。guest→host 传 `(ptr, len)`；
   host→guest 返回 `u64 = (ptr << 32) | len`（host 调 guest 的
-  `pir_alloc` 分配、写入，guest 读完后 host 调 `pir_dealloc`）。
+  `rpi_alloc` 分配、写入，guest 读完后 host 调 `rpi_dealloc`）。
 - host 侧对 guest 返回的 `u64 = 0` 视为内部错误（分配/写入失败）。
 
 ### 1.1 L0 原生动态库插件（abi_stable，T15 W7）
@@ -43,7 +43,7 @@ wasm 之外的第二种载体：进程内动态库（`.so` / `.dll` / `.dylib`�
   - `cookie` 为 `*const c_void` 不透明上下文指针（abi_stable 不布局
     `usize`），指向宿主侧按插件持有的调用上下文，生命周期覆盖所有调用。
   - 缓冲一律 `RVec<u8>` 拥有型双向传递（借用切片会把生命周期带进 fn
-    指针类型）；无 `pir_alloc`/`pir_dealloc` 舞步。
+    指针类型）；无 `rpi_alloc`/`rpi_dealloc` 舞步。
 - 信任模型：原生代码**无沙箱**——capability 系统只管扩展 API 面，插件
   本身拥有宿主进程的全部 OS 权限（设计 §14 既定的 L0 口径）。无
   Store/线程/fuel，dispatch 在调用线程内同步执行。
@@ -52,7 +52,7 @@ wasm 之外的第二种载体：进程内动态库（`.so` / `.dll` / `.dylib`�
 
 ## 2. 两条通道
 
-### 2.1 `pir_host_call`（guest → host）
+### 2.1 `rpi_host_call`（guest → host）
 
 请求：`{"call": "<method>", "args": {...}, "seq": N}`（`seq` 为
 guest 侧自增序号，仅供日志关联）。

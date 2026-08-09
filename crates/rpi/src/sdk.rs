@@ -29,7 +29,7 @@ use crate::core::model_resolver::{
 use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
 use crate::core::session_manager::{NewSessionOptions, SessionManager};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 pub use crate::core::agent_session_runtime::{
@@ -98,7 +98,7 @@ pub struct CreateAgentSessionResult {
 /// `createAgentSession` (sdk.ts:169-398).
 pub async fn create_agent_session(
     options: CreateAgentSessionOptions,
-) -> Result<CreateAgentSessionResult, PirError> {
+) -> Result<CreateAgentSessionResult, RpiError> {
     let cwd = resolve_path(
         &options
             .cwd
@@ -249,7 +249,7 @@ pub async fn create_agent_session(
             model_runtime: &model_runtime,
         })
         .await
-        .map_err(PirError::Session)?;
+        .map_err(RpiError::Session)?;
         model = result.model;
         if model.is_none() {
             model_fallback_message = Some(format_no_models_available_message());

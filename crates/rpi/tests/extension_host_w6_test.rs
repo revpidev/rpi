@@ -48,15 +48,15 @@ impl Drop for TempDir {
 /// （注册 wasm_tool 执行返回 "gate-output"）合并为一个双能力 guest。
 const PARITY_GUEST_WAT: &str = r#"
 (module
-  (import "rpi" "pir_host_call" (func $host_call (param i32 i32) (result i64)))
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
   (memory (export "memory") 1)
   (global $heap (mut i32) (i32.const 4096))
-  (func (export "pir_alloc") (param $len i32) (result i32)
+  (func (export "rpi_alloc") (param $len i32) (result i32)
     (local $ptr i32)
     (local.set $ptr (global.get $heap))
     (global.set $heap (i32.add (global.get $heap) (local.get $len)))
     (local.get $ptr))
-  (func (export "pir_dealloc") (param i32 i32) nop)
+  (func (export "rpi_dealloc") (param i32 i32) nop)
   (func $strlen (param $ptr i32) (result i32)
     (local $n i32)
     (block $done

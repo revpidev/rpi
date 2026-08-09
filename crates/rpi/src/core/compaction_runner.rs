@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::auth_guidance::format_no_model_selected_message;
 use crate::core::session_manager::SessionManager;
-use crate::error::PirError;
+use crate::error::RpiError;
 
 /// `"manual" | "threshold" | "overflow"` (agent-session.ts:152).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -111,10 +111,10 @@ pub enum CompactionEvent {
 pub type CompactionEventSink = Arc<dyn Fn(CompactionEvent) + Send + Sync>;
 
 /// The bare error text upstream puts into `errorMessage` (`error.message`),
-/// without the `PirError` Display prefix.
-fn raw_error_message(error: &PirError) -> String {
+/// without the `RpiError` Display prefix.
+fn raw_error_message(error: &RpiError) -> String {
     match error {
-        PirError::Session(message) => message.clone(),
+        RpiError::Session(message) => message.clone(),
         other => other.to_string(),
     }
 }
@@ -309,7 +309,7 @@ impl CompactionRunner {
     pub async fn compact(
         &mut self,
         custom_instructions: Option<&str>,
-    ) -> Result<CompactionResult, PirError> {
+    ) -> Result<CompactionResult, RpiError> {
         let token = CancellationToken::new();
         *lock_abort(&self.active_token) = Some(token.clone());
         self.emit(CompactionEvent::CompactionStart {
@@ -358,7 +358,7 @@ impl CompactionRunner {
         custom_instructions: Option<&str>,
         reason: CompactionReason,
         will_retry: bool,
-    ) -> Result<Option<CompactionResult>, PirError> {
+    ) -> Result<Option<CompactionResult>, RpiError> {
         let Some(runner) = self.extension_runner() else {
             return Ok(None);
         };
@@ -367,9 +367,9 @@ impl CompactionRunner {
         }
         let event = crate::core::extensions::SessionBeforeCompactEvent {
             preparation: serde_json::to_value(preparation)
-                .map_err(|error| PirError::Session(error.to_string()))?,
+                .map_err(|error| RpiError::Session(error.to_string()))?,
             branch_entries: serde_json::to_value(path_entries)
-                .map_err(|error| PirError::Session(error.to_string()))?,
+                .map_err(|error| RpiError::Session(error.to_string()))?,
             custom_instructions: custom_instructions.map(str::to_owned),
             reason: reason.as_str().to_owned(),
             will_retry,
@@ -378,7 +378,7 @@ impl CompactionRunner {
             return Ok(None);
         };
         if result.cancel == Some(true) {
-            return Err(PirError::Session("Compaction cancelled".into()));
+            return Err(RpiError::Session("Compaction cancelled".into()));
         }
         Ok(result.compaction)
     }
@@ -387,18 +387,18 @@ impl CompactionRunner {
         &mut self,
         custom_instructions: Option<&str>,
         token: &CancellationToken,
-    ) -> Result<CompactionResult, PirError> {
+    ) -> Result<CompactionResult, RpiError> {
         // `if (!this.model) throw new Error(formatNoModelSelectedMessage())`
         // (agent-session.ts:1790-1792).
         let Some(model) = self.model.clone() else {
-            return Err(PirError::Session(format_no_model_selected_message()));
+            return Err(RpiError::Session(format_no_model_selected_message()));
         };
         let path_entries = self.path_entries();
         let preparation = prepare_compaction(&path_entries, &self.settings).ok_or_else(|| {
             // Check why we can't compact (agent-session.ts:1801-1807).
             match path_entries.last() {
-                Some(SessionEntry::Compaction(_)) => PirError::Session("Already compacted".into()),
-                _ => PirError::Session("Nothing to compact (session too small)".into()),
+                Some(SessionEntry::Compaction(_)) => RpiError::Session("Already compacted".into()),
+                _ => RpiError::Session("Nothing to compact (session too small)".into()),
             }
         })?;
 
@@ -435,12 +435,12 @@ impl CompactionRunner {
                     Some(&callbacks),
                 )
                 .await
-                .map_err(|error| PirError::Session(error.to_string()))?
+                .map_err(|error| RpiError::Session(error.to_string()))?
             }
         };
 
         if token.is_cancelled() {
-            return Err(PirError::Session("Compaction cancelled".into()));
+            return Err(RpiError::Session("Compaction cancelled".into()));
         }
 
         self.finish_compaction(result, from_extension, CompactionReason::Manual, false)
@@ -456,7 +456,7 @@ impl CompactionRunner {
         from_extension: bool,
         reason: CompactionReason,
         will_retry: bool,
-    ) -> Result<CompactionResult, PirError> {
+    ) -> Result<CompactionResult, RpiError> {
         self.session_mut().append_compaction(
             &result.summary,
             &result.first_kept_entry_id,
@@ -627,7 +627,7 @@ impl CompactionRunner {
         let mut started = false;
         let token = CancellationToken::new();
 
-        let outcome: Result<bool, PirError> = async {
+        let outcome: Result<bool, RpiError> = async {
             // `if (!this.model) return false` (agent-session.ts:2052-2054).
             let Some(model) = self.model.clone() else {
                 return Ok(false);
@@ -681,7 +681,7 @@ impl CompactionRunner {
                         self.summarization_retry_callbacks(RetrySource::Compaction { reason });
                     run_compact(&preparation, &model, None, &self.stream_fn, &args, Some(&callbacks))
                         .await
-                        .map_err(|error| PirError::Session(error.to_string()))?
+                        .map_err(|error| RpiError::Session(error.to_string()))?
                 }
             };
 

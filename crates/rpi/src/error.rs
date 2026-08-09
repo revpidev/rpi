@@ -5,7 +5,7 @@
 
 /// Error type for `rpi` lib (SDK) fallible operations.
 #[derive(Debug, thiserror::Error)]
-pub enum PirError {
+pub enum RpiError {
     #[error("session error: {0}")]
     Session(String),
 
@@ -22,14 +22,14 @@ pub enum PirError {
     Io(#[from] std::io::Error),
 }
 
-impl PirError {
+impl RpiError {
     /// Raw message without the `Display` prefix — upstream surfaces
     /// `error.message` verbatim (print/RPC error paths).
     pub fn raw_message(&self) -> String {
         match self {
-            PirError::Session(message)
-            | PirError::Settings(message)
-            | PirError::Resource(message) => message.clone(),
+            RpiError::Session(message)
+            | RpiError::Settings(message)
+            | RpiError::Resource(message) => message.clone(),
             other => other.to_string(),
         }
     }

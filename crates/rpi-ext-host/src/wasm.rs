@@ -1,17 +1,17 @@
 //! Wasm (L1) extension runtime — ABI v1 host implementation (T15 W6).
 //!
 //! ABI v1 (docs/extension-abi.md; design §13 open item 1):
-//! - guest exports: `memory`, `pir_alloc(len: u32) -> u32`,
-//!   `pir_dealloc(ptr: u32, len: u32)`, `rpi_extension_init() -> u64`,
+//! - guest exports: `memory`, `rpi_alloc(len: u32) -> u32`,
+//!   `rpi_dealloc(ptr: u32, len: u32)`, `rpi_extension_init() -> u64`,
 //!   `rpi_dispatch(ptr: u32, len: u32) -> u64`;
-//! - host import (module `rpi`): `pir_host_call(ptr: u32, len: u32) -> u64`;
+//! - host import (module `rpi`): `rpi_host_call(ptr: u32, len: u32) -> u64`;
 //! - payloads are UTF-8 JSON in guest linear memory; guest→host pass
 //!   `(ptr, len)`; host→guest return `u64 = (ptr << 32) | len` allocated via
-//!   the guest's `pir_alloc`.
+//!   the guest's `rpi_alloc`.
 //!
 //! Threading: every guest instance gets its own `Store` on a dedicated
 //! blocking thread; event dispatch is serial per extension by construction
-//! (mirrors upstream's serial handler semantics). `pir_host_call` handlers
+//! (mirrors upstream's serial handler semantics). `rpi_host_call` handlers
 //! that need async host work (exec/setModel/dialogs) spawn onto the
 //! ambient tokio runtime and block the guest thread on a std channel.
 //!
@@ -176,7 +176,7 @@ impl NativeForward {
     pub fn dispatch(&self, message: Value, command_context: bool) -> Result<Value, String> {
         let bytes = serde_json::to_vec(&message).map_err(|e| e.to_string())?;
         // Command-context rides the calling thread's flag (the plugin may
-        // re-enter `pir_host_call` from any of its own threads; a shared
+        // re-enter `rpi_host_call` from any of its own threads; a shared
         // atomic would race with concurrent dispatches).
         struct CommandGuard(bool);
         impl Drop for CommandGuard {
@@ -328,7 +328,7 @@ impl Drop for WasmGuest {
     }
 }
 
-/// State shared with the `pir_host_call` import closure.
+/// State shared with the `rpi_host_call` import closure.
 pub struct HostState {
     pub api: ExtensionApi,
     pub capabilities: HashSet<Capability>,
@@ -340,7 +340,7 @@ pub struct HostState {
     pub in_command: std::cell::Cell<bool>,
 }
 
-/// The `pir_host_call` response envelopes.
+/// The `rpi_host_call` response envelopes.
 pub(crate) fn ok_response(value: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"ok": value})).unwrap_or_else(|_| b"{\"ok\":null}".to_vec())
 }
@@ -351,7 +351,7 @@ pub(crate) fn error_response(kind: &str, message: String) -> Vec<u8> {
     })
 }
 
-/// Method dispatch for `pir_host_call` (capability check first, then the
+/// Method dispatch for `rpi_host_call` (capability check first, then the
 /// method table in `host_call`). Shared by the wasm import and the native
 /// plugin trampoline.
 pub(crate) fn handle_host_call(state: &mut HostState, request: &[u8]) -> Vec<u8> {
@@ -449,7 +449,7 @@ pub async fn instantiate_and_init(
             let response = handle_host_call(caller.data_mut(), &bytes);
             pack_response(&mut caller, response)
         };
-        if let Err(error) = linker.func_wrap("rpi", "pir_host_call", host_call) {
+        if let Err(error) = linker.func_wrap("rpi", "rpi_host_call", host_call) {
             let _ = ready_tx.send(Err(format!("linker: {error}")));
             return;
         }
@@ -476,12 +476,12 @@ pub async fn instantiate_and_init(
                 return;
             }
         };
-        if let Err(error) = instance.get_typed_func::<u32, u32>(&mut store, "pir_alloc") {
-            let _ = ready_tx.send(Err(format!("missing pir_alloc: {error}")));
+        if let Err(error) = instance.get_typed_func::<u32, u32>(&mut store, "rpi_alloc") {
+            let _ = ready_tx.send(Err(format!("missing rpi_alloc: {error}")));
             return;
         }
-        if let Err(error) = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pir_dealloc") {
-            let _ = ready_tx.send(Err(format!("missing pir_dealloc: {error}")));
+        if let Err(error) = instance.get_typed_func::<(u32, u32), ()>(&mut store, "rpi_dealloc") {
+            let _ = ready_tx.send(Err(format!("missing rpi_dealloc: {error}")));
             return;
         }
         if instance.get_memory(&mut store, "memory").is_none() {
@@ -559,14 +559,14 @@ pub async fn instantiate_and_init(
     Ok(guest)
 }
 
-/// Allocate + write guest memory via its `pir_alloc`.
+/// Allocate + write guest memory via its `rpi_alloc`.
 fn write_guest_bytes(
     store: &mut wasmtime::Store<HostState>,
     instance: &wasmtime::Instance,
     bytes: &[u8],
 ) -> Result<(u32, u32), String> {
     let alloc = instance
-        .get_typed_func::<u32, u32>(&mut *store, "pir_alloc")
+        .get_typed_func::<u32, u32>(&mut *store, "rpi_alloc")
         .map_err(|e| e.to_string())?;
     let _ = store.set_fuel(CALL_FUEL);
     let ptr = alloc
@@ -582,7 +582,7 @@ fn write_guest_bytes(
 }
 
 /// Read a packed `(ptr << 32) | len` guest string and free it via
-/// `pir_dealloc`.
+/// `rpi_dealloc`.
 fn read_packed(
     store: &mut wasmtime::Store<HostState>,
     instance: &wasmtime::Instance,
@@ -608,7 +608,7 @@ fn read_packed(
     memory
         .read(&mut *store, ptr as usize, &mut buffer)
         .map_err(|e| e.to_string())?;
-    if let Ok(dealloc) = instance.get_typed_func::<(u32, u32), ()>(&mut *store, "pir_dealloc") {
+    if let Ok(dealloc) = instance.get_typed_func::<(u32, u32), ()>(&mut *store, "rpi_dealloc") {
         let _ = store.set_fuel(CALL_FUEL);
         let _ = dealloc.call(&mut *store, (ptr, len));
     }
@@ -616,10 +616,10 @@ fn read_packed(
 }
 
 /// Pack a response into guest memory from inside the host import
-/// (`Caller` context): allocate via the guest's `pir_alloc` export.
+/// (`Caller` context): allocate via the guest's `rpi_alloc` export.
 fn pack_response(caller: &mut wasmtime::Caller<'_, HostState>, bytes: Vec<u8>) -> u64 {
     let len = bytes.len() as u32;
-    let alloc = match caller.get_export("pir_alloc") {
+    let alloc = match caller.get_export("rpi_alloc") {
         Some(wasmtime::Extern::Func(func)) => func,
         _ => return 0,
     };

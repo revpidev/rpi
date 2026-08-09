@@ -23,7 +23,7 @@
 //!   file does not exist yet, the lock open creates it empty right before
 //!   the write (proper-lockfile needs no target file); the content written
 //!   immediately after is identical.
-//! - Errors surface as `Result<_, PirError>` instead of thrown exceptions;
+//! - Errors surface as `Result<_, RpiError>` instead of thrown exceptions;
 //!   per-scope error collection (`drainErrors`) is preserved.
 //! - `randomUUID()` for the analytics `trackingId` reads `/dev/urandom`
 //!   (unix) with a time/pid/counter-mix fallback — no `rand`/`uuid` crate in
@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::core::environment;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::{normalize_path, resolve_path};
 
 /// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (http-dispatcher.ts:4).
@@ -404,12 +404,12 @@ fn js_display(value: &Value) -> String {
 fn parse_timeout_setting(
     value: Option<&Value>,
     setting_name: &str,
-) -> Result<Option<u64>, PirError> {
+) -> Result<Option<u64>, RpiError> {
     match value {
         None => Ok(None),
         Some(v) => match parse_http_idle_timeout_ms(v) {
             Some(timeout) => Ok(Some(timeout)),
-            None => Err(PirError::Settings(format!(
+            None => Err(RpiError::Settings(format!(
                 "Invalid {setting_name} setting: {}",
                 js_display(v)
             ))),
@@ -459,14 +459,14 @@ impl Default for SettingsManagerCreateOptions {
 #[derive(Debug)]
 pub struct SettingsError {
     pub scope: SettingsScope,
-    pub error: PirError,
+    pub error: RpiError,
 }
 
 /// Callback signature for [`SettingsStorage::with_lock`]: receives the
 /// current file content (`None` when the file does not exist) and returns
 /// the content to write, `Ok(None)` for a pure read, or an error to abort
 /// without writing.
-pub type WithLockCallback<'a> = dyn FnMut(Option<&str>) -> Result<Option<String>, PirError> + 'a;
+pub type WithLockCallback<'a> = dyn FnMut(Option<&str>) -> Result<Option<String>, RpiError> + 'a;
 
 /// `SettingsStorage` (settings-manager.ts:179-181).
 ///
@@ -477,7 +477,7 @@ pub trait SettingsStorage: Send + Sync {
         &mut self,
         scope: SettingsScope,
         f: &mut WithLockCallback<'_>,
-    ) -> Result<(), PirError>;
+    ) -> Result<(), RpiError>;
 }
 
 /// proper-lockfile acquisition shape (settings-manager.ts:199-224): 10
@@ -521,29 +521,29 @@ impl FileSettingsStorage {
     ///
     /// `create` opens with `O_CREAT` for the write path, where upstream
     /// locks before the file exists (proper-lockfile needs no target file).
-    fn acquire_lock_with_retry(path: &Path, create: bool) -> Result<std::fs::File, PirError> {
+    fn acquire_lock_with_retry(path: &Path, create: bool) -> Result<std::fs::File, RpiError> {
         for attempt in 1..=LOCK_MAX_ATTEMPTS {
             let mut options = std::fs::OpenOptions::new();
             options.read(true).write(true);
             if create {
                 options.create(true);
             }
-            let file = options.open(path).map_err(PirError::Io)?;
+            let file = options.open(path).map_err(RpiError::Io)?;
             match file.try_lock_exclusive() {
                 Ok(()) => return Ok(file),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if attempt == LOCK_MAX_ATTEMPTS {
-                        return Err(PirError::Settings(format!(
+                        return Err(RpiError::Settings(format!(
                             "Failed to acquire settings lock for {}: {error}",
                             path.display()
                         )));
                     }
                     std::thread::sleep(LOCK_RETRY_DELAY);
                 }
-                Err(error) => return Err(PirError::Io(error)),
+                Err(error) => return Err(RpiError::Io(error)),
             }
         }
-        Err(PirError::Settings(format!(
+        Err(RpiError::Settings(format!(
             "Failed to acquire settings lock for {}",
             path.display()
         )))
@@ -559,7 +559,7 @@ impl SettingsStorage for FileSettingsStorage {
         &mut self,
         scope: SettingsScope,
         f: &mut WithLockCallback<'_>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         let path = match scope {
             SettingsScope::Global => &self.global_settings_path,
             SettingsScope::Project => &self.project_settings_path,
@@ -628,7 +628,7 @@ impl SettingsStorage for InMemorySettingsStorage {
         &mut self,
         scope: SettingsScope,
         f: &mut WithLockCallback<'_>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         let current = match scope {
             SettingsScope::Global => self.global.as_deref(),
             SettingsScope::Project => self.project.as_deref(),
@@ -738,9 +738,9 @@ pub struct SettingsManager {
     /// Track project nested field modifications (settings-manager.ts:283).
     modified_project_nested_fields: HashMap<String, HashSet<String>>,
     /// Set when the global settings file had parse errors — blocks writes.
-    global_settings_load_error: Option<PirError>,
+    global_settings_load_error: Option<RpiError>,
     /// Set when the project settings file had parse errors — blocks writes.
-    project_settings_load_error: Option<PirError>,
+    project_settings_load_error: Option<RpiError>,
     errors: Vec<SettingsError>,
 }
 
@@ -749,8 +749,8 @@ impl SettingsManager {
         storage: Box<dyn SettingsStorage>,
         initial_global: Settings,
         initial_project: Settings,
-        global_load_error: Option<PirError>,
-        project_load_error: Option<PirError>,
+        global_load_error: Option<RpiError>,
+        project_load_error: Option<RpiError>,
         initial_errors: Vec<SettingsError>,
         project_trusted: bool,
     ) -> Self {
@@ -800,13 +800,13 @@ impl SettingsManager {
         if let Some(error) = &global_error {
             initial_errors.push(SettingsError {
                 scope: SettingsScope::Global,
-                error: PirError::Settings(error.to_string()),
+                error: RpiError::Settings(error.to_string()),
             });
         }
         if let Some(error) = &project_error {
             initial_errors.push(SettingsError {
                 scope: SettingsScope::Project,
-                error: PirError::Settings(error.to_string()),
+                error: RpiError::Settings(error.to_string()),
             });
         }
         SettingsManager::new(
@@ -841,7 +841,7 @@ impl SettingsManager {
         storage: &mut dyn SettingsStorage,
         scope: SettingsScope,
         project_trusted: bool,
-    ) -> Result<Settings, PirError> {
+    ) -> Result<Settings, RpiError> {
         if scope == SettingsScope::Project && !project_trusted {
             return Ok(Settings::new());
         }
@@ -863,7 +863,7 @@ impl SettingsManager {
             // Upstream throws a TypeError from `migrateSettings` on
             // non-object documents — same "parse error" path.
             _ => {
-                return Err(PirError::Settings(
+                return Err(RpiError::Settings(
                     "Failed to parse settings: top level is not a JSON object".to_string(),
                 ));
             }
@@ -878,7 +878,7 @@ impl SettingsManager {
         storage: &mut dyn SettingsStorage,
         scope: SettingsScope,
         project_trusted: bool,
-    ) -> (Settings, Option<PirError>) {
+    ) -> (Settings, Option<RpiError>) {
         match Self::load_from_storage(storage, scope, project_trusted) {
             Ok(settings) => (settings, None),
             Err(error) => (Settings::new(), Some(error)),
@@ -924,7 +924,7 @@ impl SettingsManager {
         if let Some(error) = &self.project_settings_load_error {
             self.errors.push(SettingsError {
                 scope: SettingsScope::Project,
-                error: PirError::Settings(error.to_string()),
+                error: RpiError::Settings(error.to_string()),
             });
         }
         self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
@@ -947,7 +947,7 @@ impl SettingsManager {
             Some(error) => {
                 self.errors.push(SettingsError {
                     scope: SettingsScope::Global,
-                    error: PirError::Settings(error.to_string()),
+                    error: RpiError::Settings(error.to_string()),
                 });
                 self.global_settings_load_error = Some(error);
             }
@@ -971,7 +971,7 @@ impl SettingsManager {
             Some(error) => {
                 self.errors.push(SettingsError {
                     scope: SettingsScope::Project,
-                    error: PirError::Settings(error.to_string()),
+                    error: RpiError::Settings(error.to_string()),
                 });
                 self.project_settings_load_error = Some(error);
             }
@@ -1009,9 +1009,9 @@ impl SettingsManager {
     }
 
     /// `assertProjectTrustedForWrite` (settings-manager.ts:534-538).
-    fn assert_project_trusted_for_write(&self) -> Result<(), PirError> {
+    fn assert_project_trusted_for_write(&self) -> Result<(), RpiError> {
         if !self.project_trusted {
-            return Err(PirError::Settings(
+            return Err(RpiError::Settings(
                 "Project is not trusted; refusing to write project settings".to_string(),
             ));
         }
@@ -1071,7 +1071,7 @@ impl SettingsManager {
         snapshot_settings: &Settings,
         modified_fields: &HashSet<String>,
         modified_nested_fields: &HashMap<String, HashSet<String>>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.storage.with_lock(scope, &mut |current| {
             let mut merged_settings = match current {
                 Some(content) if !content.is_empty() => {
@@ -1079,7 +1079,7 @@ impl SettingsManager {
                     let mut map = match value {
                         Value::Object(map) => map,
                         _ => {
-                            return Err(PirError::Settings(
+                            return Err(RpiError::Settings(
                                 "Failed to parse settings: top level is not a JSON object"
                                     .to_string(),
                             ));
@@ -1129,7 +1129,7 @@ impl SettingsManager {
 
             serde_json::to_string_pretty(&Value::Object(merged_settings))
                 .map(Some)
-                .map_err(PirError::Json)
+                .map_err(RpiError::Json)
         })
     }
 
@@ -1155,7 +1155,7 @@ impl SettingsManager {
     }
 
     /// `saveProjectSettings` (settings-manager.ts:625-640).
-    fn save_project_settings(&mut self, settings: Settings) -> Result<(), PirError> {
+    fn save_project_settings(&mut self, settings: Settings) -> Result<(), RpiError> {
         self.assert_project_trusted_for_write()?;
         self.project_settings = settings;
         self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
@@ -1181,7 +1181,7 @@ impl SettingsManager {
         &mut self,
         field: &str,
         update: impl FnOnce(&mut Settings),
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.assert_project_trusted_for_write()?;
         let mut project_settings = self.project_settings.clone();
         update(&mut project_settings);
@@ -1442,7 +1442,7 @@ impl SettingsManager {
     /// `getHttpIdleTimeoutMs` (settings-manager.ts:821-823) — default
     /// [`DEFAULT_HTTP_IDLE_TIMEOUT_MS`]; a present-but-invalid value is an
     /// error (upstream throws).
-    pub fn get_http_idle_timeout_ms(&self) -> Result<u64, PirError> {
+    pub fn get_http_idle_timeout_ms(&self) -> Result<u64, RpiError> {
         Ok(
             parse_timeout_setting(self.settings.get("httpIdleTimeoutMs"), "httpIdleTimeoutMs")?
                 .unwrap_or(DEFAULT_HTTP_IDLE_TIMEOUT_MS),
@@ -1476,7 +1476,7 @@ impl SettingsManager {
     /// `getWebSocketConnectTimeoutMs` (settings-manager.ts:842-844) — no
     /// default at this layer (docs/settings.md:172 documents 15000, applied
     /// by the SDK transport layer); a present-but-invalid value is an error.
-    pub fn get_websocket_connect_timeout_ms(&self) -> Result<Option<u64>, PirError> {
+    pub fn get_websocket_connect_timeout_ms(&self) -> Result<Option<u64>, RpiError> {
         parse_timeout_setting(
             self.settings.get("websocketConnectTimeoutMs"),
             "websocketConnectTimeoutMs",
@@ -1727,7 +1727,7 @@ impl SettingsManager {
     }
 
     /// `setProjectPackages` (settings-manager.ts:979-983).
-    pub fn set_project_packages(&mut self, packages: Vec<PackageSource>) -> Result<(), PirError> {
+    pub fn set_project_packages(&mut self, packages: Vec<PackageSource>) -> Result<(), RpiError> {
         let array = packages.iter().map(json_value).collect();
         self.update_project_settings("packages", |settings| {
             settings.set("packages", Value::Array(array));
@@ -1750,7 +1750,7 @@ impl SettingsManager {
     }
 
     /// `setProjectExtensionPaths` (settings-manager.ts:995-999).
-    pub fn set_project_extension_paths(&mut self, paths: Vec<String>) -> Result<(), PirError> {
+    pub fn set_project_extension_paths(&mut self, paths: Vec<String>) -> Result<(), RpiError> {
         self.update_project_settings("extensions", |settings| {
             settings.set(
                 "extensions",
@@ -1775,7 +1775,7 @@ impl SettingsManager {
     }
 
     /// `setProjectSkillPaths` (settings-manager.ts:1011-1015).
-    pub fn set_project_skill_paths(&mut self, paths: Vec<String>) -> Result<(), PirError> {
+    pub fn set_project_skill_paths(&mut self, paths: Vec<String>) -> Result<(), RpiError> {
         self.update_project_settings("skills", |settings| {
             settings.set(
                 "skills",
@@ -1803,7 +1803,7 @@ impl SettingsManager {
     pub fn set_project_prompt_template_paths(
         &mut self,
         paths: Vec<String>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.update_project_settings("prompts", |settings| {
             settings.set(
                 "prompts",
@@ -1828,7 +1828,7 @@ impl SettingsManager {
     }
 
     /// `setProjectThemePaths` (settings-manager.ts:1043-1047).
-    pub fn set_project_theme_paths(&mut self, paths: Vec<String>) -> Result<(), PirError> {
+    pub fn set_project_theme_paths(&mut self, paths: Vec<String>) -> Result<(), RpiError> {
         self.update_project_settings("themes", |settings| {
             settings.set(
                 "themes",
@@ -2587,7 +2587,7 @@ mod tests {
         let result =
             manager.set_project_packages(vec![PackageSource::Source("npm:new".to_string())]);
         match result {
-            Err(PirError::Settings(message)) => {
+            Err(RpiError::Settings(message)) => {
                 assert_eq!(
                     message,
                     "Project is not trusted; refusing to write project settings"
@@ -2647,7 +2647,7 @@ mod tests {
 
     // Port of "should not create .pi folder when only reading project settings".
     #[test]
-    fn test_does_not_create_pir_dir_when_only_reading() {
+    fn test_does_not_create_rpi_dir_when_only_reading() {
         let dirs = test_dirs();
         write_json(&global_path(&dirs), json!({"theme": "dark"}));
 
@@ -2661,7 +2661,7 @@ mod tests {
 
     // Port of "should create .pi folder when writing project settings".
     #[test]
-    fn test_creates_pir_dir_when_writing_project_settings() {
+    fn test_creates_rpi_dir_when_writing_project_settings() {
         let dirs = test_dirs();
         write_json(&global_path(&dirs), json!({"theme": "dark"}));
 
@@ -2717,7 +2717,7 @@ mod tests {
         let manager = create(&dirs);
 
         match manager.get_http_idle_timeout_ms() {
-            Err(PirError::Settings(message)) => {
+            Err(RpiError::Settings(message)) => {
                 assert!(
                     message.contains("Invalid httpIdleTimeoutMs setting"),
                     "{message}"

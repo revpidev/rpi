@@ -1145,7 +1145,7 @@ fn rpc_mode_sighup_exits_129() {
 }
 
 #[test]
-fn pir_rpc_bin_end_to_end() {
+fn rpi_rpc_bin_end_to_end() {
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");

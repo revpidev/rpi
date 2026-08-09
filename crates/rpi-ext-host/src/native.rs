@@ -3,7 +3,7 @@
 //!
 //! The plugin ABI mirrors the wasm ABI v1 message formats exactly
 //! (docs/extension-abi.md §2): the same JSON method table and capability
-//! checks apply (`pir_host_call` → [`PluginHostCall`], dispatch → the
+//! checks apply (`rpi_host_call` → [`PluginHostCall`], dispatch → the
 //! exported `rpi_dispatch` function). Differences from the wasm guest:
 //! in-process (no thread/Store), plugins get full host OS access (the
 //! capability system gates the extension API surface only — native code is
@@ -36,7 +36,7 @@ pub type PluginCookie = *const std::ffi::c_void;
 #[repr(C)]
 #[derive(StableAbi)]
 pub struct RpiHostCalls {
-    /// `(cookie, request JSON) -> response JSON` — the `pir_host_call`
+    /// `(cookie, request JSON) -> response JSON` — the `rpi_host_call`
     /// equivalent (docs/extension-abi.md §2.1).
     pub call: extern "C" fn(PluginCookie, RVec<u8>) -> RVec<u8>,
 }
@@ -59,8 +59,8 @@ pub struct RpiNativeModule {
 impl RootModule for RpiNativeModule_Ref {
     abi_stable::declare_root_module_statics! {RpiNativeModule_Ref}
 
-    const BASE_NAME: &'static str = "pir_native_extension";
-    const NAME: &'static str = "pir_native_extension";
+    const BASE_NAME: &'static str = "rpi_native_extension";
+    const NAME: &'static str = "rpi_native_extension";
     const VERSION_STRINGS: VersionStrings = package_version_strings!();
 }
 

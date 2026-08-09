@@ -27,7 +27,7 @@ use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, Tui};
 
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::themes::{get_available_themes, load_theme};
-use crate::error::PirError;
+use crate::error::RpiError;
 
 use super::components::extension_selector::ExtensionSelectorComponent;
 use super::components::first_time_setup::{FirstTimeSetupComponent, FirstTimeSetupResult};
@@ -92,7 +92,7 @@ impl Focusable for SetupRegion {
 }
 
 /// `showFirstTimeSetup` (startup-ui.ts:166-205) on the process terminal.
-pub(crate) async fn run_first_time_setup(runtime: &AgentSessionRuntime) -> Result<bool, PirError> {
+pub(crate) async fn run_first_time_setup(runtime: &AgentSessionRuntime) -> Result<bool, RpiError> {
     run_first_time_setup_with_terminal(runtime, Box::new(ProcessTerminal::new())).await
 }
 
@@ -102,7 +102,7 @@ pub(crate) async fn run_first_time_setup(runtime: &AgentSessionRuntime) -> Resul
 pub(crate) async fn run_first_time_setup_with_terminal(
     runtime: &AgentSessionRuntime,
     terminal: Box<dyn rpi_tui::terminal::Terminal + Send>,
-) -> Result<bool, PirError> {
+) -> Result<bool, RpiError> {
     // The dialog's input matching reads the global keybinding table
     // (startup-ui.ts:81 `setKeybindings`); reinstall so the setup works even
     // when it is invoked outside `run_interactive_mode` (tests).

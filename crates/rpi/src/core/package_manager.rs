@@ -4088,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_source_stores_project_local_relative_to_pir_dir() {
+    fn test_add_source_stores_project_local_relative_to_rpi_dir() {
         let dirs = TestDirs::new();
         let package_dir = dirs.cwd.join("project-local-pkg");
         make_local_package(&package_dir);

@@ -102,7 +102,7 @@ use crate::core::extensions::{ExtensionRunner, StreamingBehavior};
 use crate::core::settings_manager::DoubleEscapeAction;
 use crate::core::themes::{load_theme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
 use crate::modes::interactive::components::status_indicator::{
     BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason,
@@ -422,7 +422,7 @@ pub(crate) enum UiCommand {
     GitBranchChanged,
     /// Mode-internal: the startup version check found a newer release
     /// (interactive-mode.ts:843-847 → `showNewVersionNotification`).
-    NewVersionAvailable(crate::core::version_check::LatestPirRelease),
+    NewVersionAvailable(crate::core::version_check::LatestRpiRelease),
     /// `/share`: the loader's `on_abort` (interactive-mode.ts:5549-5554) —
     /// kill gh, restore the editor, clean up, "Share cancelled".
     ShareAbort,
@@ -2310,7 +2310,7 @@ impl InteractiveUi {
     /// supports hyperlinks).
     pub(crate) fn show_new_version_notification(
         &self,
-        release: &crate::core::version_check::LatestPirRelease,
+        release: &crate::core::version_check::LatestRpiRelease,
     ) {
         let theme = Arc::clone(&lock(&self.theme));
         let warning_border = |theme: &Arc<crate::core::themes::Theme>| {
@@ -3578,7 +3578,7 @@ impl InteractiveMode {
             let ui_state = Arc::clone(&self.ui_state);
             let transport = lock(&self.ui_state.latest_version_transport).clone();
             tokio::spawn(async move {
-                if let Some(release) = crate::core::version_check::check_for_new_pir_release(
+                if let Some(release) = crate::core::version_check::check_for_new_rpi_release(
                     VERSION,
                     &*transport,
                     Some(&probe_url),
@@ -4076,7 +4076,7 @@ impl InteractiveMode {
             *lock(&ui_state.compaction_queue) = msgs.to_vec();
             ui_state.update_pending_messages_display();
         };
-        let restore_queue = |ui_state: &InteractiveUi, error: &PirError| {
+        let restore_queue = |ui_state: &InteractiveUi, error: &RpiError| {
             ui_state.session().clear_queue();
             restore_messages(ui_state, &messages);
             ui_state.show_error(&format!(
@@ -4893,7 +4893,7 @@ mod tests {
         let ui = &mode.ui_state;
         let before = chat_children(ui);
         ui.push(UiCommand::NewVersionAvailable(
-            crate::core::version_check::LatestPirRelease {
+            crate::core::version_check::LatestRpiRelease {
                 version: "99.0.0".to_string(),
                 package_name: None,
                 note: Some("**breaking** changes".to_string()),
@@ -4926,7 +4926,7 @@ mod tests {
         let ui = &mode.ui_state;
         let before = chat_children(ui);
         ui.push(UiCommand::NewVersionAvailable(
-            crate::core::version_check::LatestPirRelease {
+            crate::core::version_check::LatestRpiRelease {
                 version: "99.0.0".to_string(),
                 package_name: None,
                 note: None,

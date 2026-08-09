@@ -17,7 +17,7 @@
 //!   persistence source of truth; typed views are derived for logic.
 //! - Methods that perform I/O return `Result` instead of throwing
 //!   (coding-standards §5). Append-write failures propagate as
-//!   [`PirError::Io`], never panic.
+//!   [`RpiError::Io`], never panic.
 //! - Sync `std::fs` I/O mirrors the upstream sync methods (`appendFileSync`
 //!   etc.). Async callers must wrap calls in `tokio::task::spawn_blocking`
 //!   (coding-standards §6.1).
@@ -61,7 +61,7 @@ use rpi_ai::utils::uuid::{random_uuid, uuidv7};
 use serde_json::Value;
 
 use crate::config::{get_default_session_dir, get_default_session_dir_path};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::{normalize_path, resolve_path};
 
 #[cfg(test)]
@@ -135,7 +135,7 @@ impl FileEntryRecord {
         FileEntryRecord { raw, typed }
     }
 
-    fn from_typed(typed: FileEntry) -> Result<Self, PirError> {
+    fn from_typed(typed: FileEntry) -> Result<Self, RpiError> {
         let raw = serde_json::to_value(&typed)?;
         Ok(FileEntryRecord {
             raw,
@@ -179,7 +179,7 @@ impl FileEntryRecord {
             .unwrap_or("")
     }
 
-    fn to_line(&self) -> Result<String, PirError> {
+    fn to_line(&self) -> Result<String, RpiError> {
         Ok(serde_json::to_string(&self.raw)?)
     }
 }
@@ -295,7 +295,7 @@ impl StoredEntry {
     /// `{...entry, parentId}` — returns a record with the parent re-chained
     /// from the raw object, preserving unknown extension fields
     /// (createBranchedSession, session-manager.ts:1422-1428).
-    fn with_parent_id(&self, parent_id: Option<String>) -> Result<FileEntryRecord, PirError> {
+    fn with_parent_id(&self, parent_id: Option<String>) -> Result<FileEntryRecord, RpiError> {
         let mut raw = self.raw_value().clone();
         if let Some(obj) = raw.as_object_mut() {
             obj.insert(
@@ -318,7 +318,7 @@ fn create_session_id() -> String {
 
 /// `assertValidSessionId` (session-manager.ts:212-218). Error message is
 /// byte-exact with upstream.
-pub fn assert_valid_session_id(id: &str) -> Result<(), PirError> {
+pub fn assert_valid_session_id(id: &str) -> Result<(), RpiError> {
     let bytes = id.as_bytes();
     let alnum = |b: u8| b.is_ascii_alphanumeric();
     let valid = !bytes.is_empty()
@@ -328,7 +328,7 @@ pub fn assert_valid_session_id(id: &str) -> Result<(), PirError> {
             .iter()
             .all(|&b| alnum(b) || b == b'.' || b == b'_' || b == b'-');
     if !valid {
-        return Err(PirError::Session(
+        return Err(RpiError::Session(
             "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and \
              '.', and start and end with an alphanumeric character"
                 .to_owned(),
@@ -943,7 +943,7 @@ impl SessionManager {
         persist: bool,
         options: Option<NewSessionOptions>,
         preloaded: Option<Vec<Value>>,
-    ) -> Result<Self, PirError> {
+    ) -> Result<Self, RpiError> {
         let cwd = resolve_path(&cwd.to_string_lossy(), &process_cwd());
         let session_dir = PathBuf::from(normalize_path(&session_dir.to_string_lossy()));
         if persist && !session_dir.as_os_str().is_empty() && !session_dir.exists() {
@@ -974,7 +974,7 @@ impl SessionManager {
 
     /// `setSessionFile` — switch to a different session file (resume and
     /// branching, session-manager.ts:891-893).
-    pub fn set_session_file(&mut self, session_file: &Path) -> Result<(), PirError> {
+    pub fn set_session_file(&mut self, session_file: &Path) -> Result<(), RpiError> {
         self.set_session_file_internal(session_file, None)
     }
 
@@ -982,7 +982,7 @@ impl SessionManager {
         &mut self,
         session_file: &Path,
         preloaded: Option<Vec<Value>>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         let resolved = resolve_path(&session_file.to_string_lossy(), &process_cwd());
         self.session_file = Some(resolved.clone());
         if resolved.exists() {
@@ -995,7 +995,7 @@ impl SessionManager {
                 let explicit = resolved.clone();
                 let size = std::fs::metadata(&explicit).map(|m| m.len()).unwrap_or(0);
                 if size > 0 {
-                    return Err(PirError::Session(format!(
+                    return Err(RpiError::Session(format!(
                         "Session file is not a valid pi session: {}",
                         explicit.display()
                     )));
@@ -1038,7 +1038,7 @@ impl SessionManager {
 
     /// `newSession` (session-manager.ts:930-956). Returns the new session
     /// file path (persisted sessions only).
-    pub fn new_session(&mut self, options: NewSessionOptions) -> Result<Option<PathBuf>, PirError> {
+    pub fn new_session(&mut self, options: NewSessionOptions) -> Result<Option<PathBuf>, RpiError> {
         if let Some(id) = &options.id {
             assert_valid_session_id(id)?;
         }
@@ -1143,7 +1143,7 @@ impl SessionManager {
     }
 
     /// `_rewriteFile` (session-manager.ts:979-989): truncate + write all.
-    fn rewrite_file(&self) -> Result<(), PirError> {
+    fn rewrite_file(&self) -> Result<(), RpiError> {
         if !self.persist {
             return Ok(());
         }
@@ -1166,7 +1166,7 @@ impl SessionManager {
     /// file is not created until the first assistant message (the `flushed`
     /// flag plus `wx` exclusive create); afterwards entries are appended
     /// directly. No file locking (G4 red line).
-    fn persist_appended_entry(&mut self) -> Result<(), PirError> {
+    fn persist_appended_entry(&mut self) -> Result<(), RpiError> {
         if !self.persist {
             return Ok(());
         }
@@ -1221,7 +1221,7 @@ impl SessionManager {
 
     /// `_appendEntry` (session-manager.ts:1044-1049): push, index, advance
     /// leaf, then persist the appended entry.
-    fn append_entry(&mut self, typed: FileEntry) -> Result<String, PirError> {
+    fn append_entry(&mut self, typed: FileEntry) -> Result<String, RpiError> {
         let record = FileEntryRecord::from_typed(typed)?;
         let id = record.entry_id().unwrap_or_default().to_owned();
         self.by_id.insert(id.clone(), self.records.len());
@@ -1244,10 +1244,10 @@ impl SessionManager {
     /// `CompactionSummaryMessage` / `BranchSummaryMessage` are rejected — they
     /// must be appended via `appendCompaction` / `appendBranchSummary` (the
     /// upstream doc comment; TS enforces this at the type level).
-    pub fn append_message(&mut self, message: AgentMessage) -> Result<String, PirError> {
+    pub fn append_message(&mut self, message: AgentMessage) -> Result<String, RpiError> {
         match &message {
             AgentMessage::CompactionSummary(_) | AgentMessage::BranchSummary(_) => {
-                return Err(PirError::Session(
+                return Err(RpiError::Session(
                     "compactionSummary/branchSummary messages must be appended via \
                      appendCompaction/branchWithSummary"
                         .to_owned(),
@@ -1268,7 +1268,7 @@ impl SessionManager {
     pub fn append_thinking_level_change(
         &mut self,
         thinking_level: &str,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         let entry = FileEntry::ThinkingLevelChange(ThinkingLevelChangeEntry {
             id: self.next_entry_id(),
             parent_id: self.leaf_id.clone(),
@@ -1283,7 +1283,7 @@ impl SessionManager {
         &mut self,
         provider: &str,
         model_id: &str,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         let entry = FileEntry::ModelChange(ModelChangeEntry {
             id: self.next_entry_id(),
             parent_id: self.leaf_id.clone(),
@@ -1304,7 +1304,7 @@ impl SessionManager {
         details: Option<Value>,
         from_hook: Option<bool>,
         usage: Option<Usage>,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         let entry = FileEntry::Compaction(CompactionEntry {
             id: self.next_entry_id(),
             parent_id: self.leaf_id.clone(),
@@ -1325,7 +1325,7 @@ impl SessionManager {
         &mut self,
         custom_type: &str,
         data: Option<Value>,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         let entry = FileEntry::Custom(CustomEntry {
             custom_type: custom_type.to_owned(),
             data,
@@ -1338,7 +1338,7 @@ impl SessionManager {
 
     /// `appendSessionInfo` (session-manager.ts:1136-1147): `\r\n` runs are
     /// replaced with a space and the result trimmed.
-    pub fn append_session_info(&mut self, name: &str) -> Result<String, PirError> {
+    pub fn append_session_info(&mut self, name: &str) -> Result<String, RpiError> {
         let mut sanitized = String::with_capacity(name.len());
         let mut in_run = false;
         for c in name.trim().chars() {
@@ -1388,7 +1388,7 @@ impl SessionManager {
         content: rpi_ai::types::UserContent,
         display: bool,
         details: Option<Value>,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         let entry = FileEntry::CustomMessage(CustomMessageEntry {
             custom_type: custom_type.to_owned(),
             content,
@@ -1445,9 +1445,9 @@ impl SessionManager {
         &mut self,
         target_id: &str,
         label: Option<&str>,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         if !self.by_id.contains_key(target_id) {
-            return Err(PirError::Session(format!("Entry {target_id} not found")));
+            return Err(RpiError::Session(format!("Entry {target_id} not found")));
         }
         let timestamp = now_iso8601();
         let entry = FileEntry::Label(LabelEntry {
@@ -1674,9 +1674,9 @@ impl SessionManager {
     // -----------------------------------------------------------------------
 
     /// `branch` (session-manager.ts:1360-1365): move the leaf pointer.
-    pub fn branch(&mut self, branch_from_id: &str) -> Result<(), PirError> {
+    pub fn branch(&mut self, branch_from_id: &str) -> Result<(), RpiError> {
         if !self.by_id.contains_key(branch_from_id) {
-            return Err(PirError::Session(format!(
+            return Err(RpiError::Session(format!(
                 "Entry {branch_from_id} not found"
             )));
         }
@@ -1697,10 +1697,10 @@ impl SessionManager {
         details: Option<Value>,
         from_hook: Option<bool>,
         usage: Option<Usage>,
-    ) -> Result<String, PirError> {
+    ) -> Result<String, RpiError> {
         if let Some(id) = branch_from_id {
             if !self.by_id.contains_key(id) {
-                return Err(PirError::Session(format!("Entry {id} not found")));
+                return Err(RpiError::Session(format!("Entry {id} not found")));
             }
         }
         self.leaf_id = branch_from_id.map(str::to_owned);
@@ -1721,16 +1721,16 @@ impl SessionManager {
     /// path root→leaf into a new session; label entries are filtered from the
     /// path, the path is re-chained by new parentIds, and resolved labels are
     /// re-appended at the tail. Returns the new session file (persisted only).
-    pub fn create_branched_session(&mut self, leaf_id: &str) -> Result<Option<PathBuf>, PirError> {
+    pub fn create_branched_session(&mut self, leaf_id: &str) -> Result<Option<PathBuf>, RpiError> {
         // session-manager.ts:1414-1416 — explicit lookup; unknown ids throw
         // before any branch/persist handling.
         if !self.by_id.contains_key(leaf_id) {
-            return Err(PirError::Session(format!("Entry {leaf_id} not found")));
+            return Err(RpiError::Session(format!("Entry {leaf_id} not found")));
         }
         let previous_session_file = self.session_file.clone();
         let path = self.get_branch(Some(leaf_id));
         if path.is_empty() {
-            return Err(PirError::Session(format!("Entry {leaf_id} not found")));
+            return Err(RpiError::Session(format!("Entry {leaf_id} not found")));
         }
 
         // Filter out label entries; re-chain the retained path so children of
@@ -1883,7 +1883,7 @@ impl SessionManager {
         cwd: &Path,
         session_dir: Option<&Path>,
         options: NewSessionOptions,
-    ) -> Result<Self, PirError> {
+    ) -> Result<Self, RpiError> {
         let dir = match session_dir {
             Some(dir) => PathBuf::from(normalize_path(&dir.to_string_lossy())),
             None => get_default_session_dir(cwd)?,
@@ -1899,7 +1899,7 @@ impl SessionManager {
         path: &Path,
         session_dir: Option<&Path>,
         cwd_override: Option<&Path>,
-    ) -> Result<Self, PirError> {
+    ) -> Result<Self, RpiError> {
         let resolved = resolve_path(&path.to_string_lossy(), &process_cwd());
         let mut header: Option<SessionHeader> = None;
         let mut preloaded: Option<Vec<Value>> = None;
@@ -1914,7 +1914,7 @@ impl SessionManager {
                         .filter(|v| v.get("type").and_then(Value::as_str) == Some("session"))
                         .and_then(|v| serde_json::from_value::<SessionHeader>(v.clone()).ok());
                 }
-                Err(ReadHeaderError::Io(e)) => return Err(PirError::Io(e)),
+                Err(ReadHeaderError::Io(e)) => return Err(RpiError::Io(e)),
             }
         }
         let cwd = match cwd_override {
@@ -1936,7 +1936,7 @@ impl SessionManager {
     }
 
     /// `SessionManager.continueRecent` (session-manager.ts:1557-1565).
-    pub fn continue_recent(cwd: &Path, session_dir: Option<&Path>) -> Result<Self, PirError> {
+    pub fn continue_recent(cwd: &Path, session_dir: Option<&Path>) -> Result<Self, RpiError> {
         let dir = match session_dir {
             Some(d) => PathBuf::from(normalize_path(&d.to_string_lossy())),
             None => get_default_session_dir(cwd)?,
@@ -1951,7 +1951,7 @@ impl SessionManager {
 
     /// `SessionManager.inMemory` (session-manager.ts:1568-1570) — the
     /// `--no-session` memory session.
-    pub fn in_memory(cwd: Option<&Path>, options: NewSessionOptions) -> Result<Self, PirError> {
+    pub fn in_memory(cwd: Option<&Path>, options: NewSessionOptions) -> Result<Self, RpiError> {
         let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(process_cwd);
         SessionManager::new(&cwd, Path::new(""), None, false, Some(options), None)
     }
@@ -1959,13 +1959,13 @@ impl SessionManager {
     /// `getEntriesToFork` (harness repo-utils.ts:32-51): `position: "at"`
     /// includes the target; `"before"` (default) requires a user-message
     /// target and starts from its parent.
-    fn entries_to_fork(&self, options: &ForkOptions) -> Result<Vec<StoredEntry>, PirError> {
+    fn entries_to_fork(&self, options: &ForkOptions) -> Result<Vec<StoredEntry>, RpiError> {
         let entries = self.get_entries();
         let Some(entry_id) = &options.entry_id else {
             return Ok(entries);
         };
         let Some(target) = self.get_entry(entry_id) else {
-            return Err(PirError::Session(format!("Entry {entry_id} not found")));
+            return Err(RpiError::Session(format!("Entry {entry_id} not found")));
         };
         let effective_leaf_id: Option<String> = match options.position.unwrap_or_default() {
             ForkPosition::At => Some(target.id().to_owned()),
@@ -1975,7 +1975,7 @@ impl SessionManager {
                     Some(SessionEntry::Message(m)) if matches!(m.message, AgentMessage::User(_))
                 );
                 if !is_user_message {
-                    return Err(PirError::Session(format!(
+                    return Err(RpiError::Session(format!(
                         "Entry {entry_id} is not a user message"
                     )));
                 }
@@ -1990,7 +1990,7 @@ impl SessionManager {
     pub fn get_path_to_root_or_compaction(
         &self,
         leaf_id: Option<&str>,
-    ) -> Result<Vec<StoredEntry>, PirError> {
+    ) -> Result<Vec<StoredEntry>, RpiError> {
         let entries = self.get_entries();
         path_to_root_or_compaction(&entries, leaf_id)
     }
@@ -2004,12 +2004,12 @@ impl SessionManager {
         target_cwd: &Path,
         session_dir: Option<&Path>,
         options: ForkOptions,
-    ) -> Result<Self, PirError> {
+    ) -> Result<Self, RpiError> {
         let resolved_source = resolve_path(&source_path.to_string_lossy(), &process_cwd());
         let resolved_target_cwd = resolve_path(&target_cwd.to_string_lossy(), &process_cwd());
         let source_values = load_entries_from_file(&resolved_source);
         if source_values.is_empty() {
-            return Err(PirError::Session(format!(
+            return Err(RpiError::Session(format!(
                 "Cannot fork: source session file is empty or invalid: {}",
                 resolved_source.display()
             )));
@@ -2018,7 +2018,7 @@ impl SessionManager {
             .iter()
             .any(|v| v.get("type").and_then(Value::as_str) == Some("session"));
         if !has_header {
-            return Err(PirError::Session(format!(
+            return Err(RpiError::Session(format!(
                 "Cannot fork: source session has no header: {}",
                 resolved_source.display()
             )));
@@ -2127,7 +2127,7 @@ impl SessionManager {
 
     /// Export the session as JSONL text (header + entries, one JSON object
     /// per line, trailing newline). The inverse of [`parse_session_entries`].
-    pub fn export_jsonl(&self) -> Result<String, PirError> {
+    pub fn export_jsonl(&self) -> Result<String, RpiError> {
         let mut out = String::new();
         for record in &self.records {
             out.push_str(&record.to_line()?);
@@ -2144,7 +2144,7 @@ impl SessionManager {
 pub fn path_to_root_or_compaction(
     entries: &[StoredEntry],
     leaf_id: Option<&str>,
-) -> Result<Vec<StoredEntry>, PirError> {
+) -> Result<Vec<StoredEntry>, RpiError> {
     let Some(leaf_id) = leaf_id else {
         return Ok(Vec::new());
     };
@@ -2153,7 +2153,7 @@ pub fn path_to_root_or_compaction(
     let mut stop_at_entry_id: Option<String> = None;
     let mut current: Option<&StoredEntry> = by_id.get(leaf_id).copied();
     if current.is_none() {
-        return Err(PirError::Session(format!("Entry {leaf_id} not found")));
+        return Err(RpiError::Session(format!("Entry {leaf_id} not found")));
     }
     while let Some(entry) = current {
         path.push(entry);
@@ -2172,7 +2172,7 @@ pub fn path_to_root_or_compaction(
         current = match by_id.get(parent_id) {
             Some(parent) => Some(parent),
             None => {
-                return Err(PirError::Session(format!("Entry {parent_id} not found")));
+                return Err(RpiError::Session(format!("Entry {parent_id} not found")));
             }
         };
     }

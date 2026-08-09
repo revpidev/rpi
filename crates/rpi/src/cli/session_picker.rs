@@ -24,7 +24,7 @@ use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, Tui};
 
 use crate::core::settings_manager::SettingsManager;
 use crate::core::themes::load_theme;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::modes::interactive::components::session_selector::SessionSelectorComponent;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -76,7 +76,7 @@ pub(crate) async fn select_session(
     cwd: &Path,
     session_dir: Option<&Path>,
     settings: &SettingsManager,
-) -> Result<Option<String>, PirError> {
+) -> Result<Option<String>, RpiError> {
     select_session_with_terminal(cwd, session_dir, settings, Box::new(ProcessTerminal::new())).await
 }
 
@@ -86,7 +86,7 @@ pub(crate) async fn select_session_with_terminal(
     session_dir: Option<&Path>,
     settings: &SettingsManager,
     terminal: Box<dyn rpi_tui::terminal::Terminal + Send>,
-) -> Result<Option<String>, PirError> {
+) -> Result<Option<String>, RpiError> {
     // The component's input matching reads the global keybinding tables
     // (session-picker.ts:24-25 `setKeybindings`).
     crate::modes::interactive::interactive_mode::install_global_keybindings();
@@ -96,7 +96,7 @@ pub(crate) async fn select_session_with_terminal(
     let theme_name = settings.get_theme().unwrap_or_else(|| "dark".to_string());
     let theme = load_theme(&theme_name, None)
         .or_else(|_| load_theme("dark", None))
-        .map_err(|error| PirError::Resource(error.to_string()))?;
+        .map_err(|error| RpiError::Resource(error.to_string()))?;
     let ui = Tui::with_options(
         terminal,
         Some(settings.get_show_hardware_cursor()),
@@ -154,7 +154,7 @@ pub(crate) async fn select_session_with_terminal(
                 driver_ui.pump(Some(Duration::from_millis(50)));
             }
         })
-        .map_err(PirError::Io)?;
+        .map_err(RpiError::Io)?;
 
     let selected = tokio::select! {
         path = select_rx => path.ok(),

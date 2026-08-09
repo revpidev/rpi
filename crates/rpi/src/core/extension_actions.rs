@@ -51,7 +51,7 @@ impl SessionHostActions {
     fn spawn_reporting(
         &self,
         event: &'static str,
-        future: impl std::future::Future<Output = Result<(), crate::error::PirError>> + Send + 'static,
+        future: impl std::future::Future<Output = Result<(), crate::error::RpiError>> + Send + 'static,
     ) {
         let Some(session) = self.session() else {
             return;

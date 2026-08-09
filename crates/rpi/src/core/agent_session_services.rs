@@ -12,7 +12,7 @@ use crate::config::get_agent_dir;
 use crate::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
 use crate::core::resource_loader::{DefaultResourceLoader, DefaultResourceLoaderOptions};
 use crate::core::settings_manager::SettingsManager;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `AgentSessionRuntimeDiagnostic` (agent-session-services.ts:25-28).
@@ -119,7 +119,7 @@ pub fn apply_extension_flag_values(
 /// longer reports them.
 pub async fn create_agent_session_services(
     options: CreateAgentSessionServicesOptions,
-) -> Result<AgentSessionServices, PirError> {
+) -> Result<AgentSessionServices, RpiError> {
     let cwd = resolve_path(
         &options.cwd.to_string_lossy(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),

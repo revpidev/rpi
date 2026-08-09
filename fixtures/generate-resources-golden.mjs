@@ -518,9 +518,9 @@ function generateSettings() {
 function prepareE2eTree(inputRoot, dest) {
 	cpSync(inputRoot, dest, { recursive: true });
 	for (const dir of ["repo", join("repo", "sub")]) {
-		const pirDir = join(dest, dir, ".rpi");
-		if (existsSync(pirDir)) {
-			cpSync(pirDir, join(dest, dir, ".pi"), { recursive: true });
+		const rpiDir = join(dest, dir, ".rpi");
+		if (existsSync(rpiDir)) {
+			cpSync(rpiDir, join(dest, dir, ".pi"), { recursive: true });
 		}
 	}
 	mkdirSync(join(dest, "repo", ".git"), { recursive: true });

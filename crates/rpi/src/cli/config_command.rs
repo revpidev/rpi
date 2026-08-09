@@ -31,7 +31,7 @@ use crate::core::trust_manager::{
     default_project_trust_from_settings, resolve_project_trusted, ProjectTrustContext,
     ProjectTrustStore,
 };
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::modes::interactive::components::config_selector::{
     ConfigSelectorComponent, ConfigWriteScope, ScopedResolvedPaths,
 };
@@ -321,7 +321,7 @@ pub async fn run_config_with_terminal(
 async fn select_config(
     prelude: ConfigPrelude,
     terminal: Box<dyn rpi_tui::terminal::Terminal + Send>,
-) -> Result<(), PirError> {
+) -> Result<(), RpiError> {
     // The component's input matching reads the global keybinding tables.
     crate::modes::interactive::interactive_mode::install_global_keybindings();
 
@@ -338,7 +338,7 @@ async fn select_config(
     };
     let theme = load_theme(&theme_name, None)
         .or_else(|_| load_theme("dark", None))
-        .map_err(|error| PirError::Resource(error.to_string()))?;
+        .map_err(|error| RpiError::Resource(error.to_string()))?;
     let ui = Tui::with_options(
         terminal,
         Some(show_hardware_cursor),
@@ -392,7 +392,7 @@ async fn select_config(
                 driver_ui.pump(Some(Duration::from_millis(50)));
             }
         })
-        .map_err(PirError::Io)?;
+        .map_err(RpiError::Io)?;
 
     let _ = done_rx.await;
 

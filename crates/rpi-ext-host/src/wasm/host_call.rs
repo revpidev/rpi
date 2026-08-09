@@ -1,4 +1,4 @@
-//! `pir_host_call` method dispatch (T15 W6) — the JSON method table of ABI
+//! `rpi_host_call` method dispatch (T15 W6) — the JSON method table of ABI
 //! v1 (docs/extension-abi.md). Every method maps onto the same surface the
 //! native (L0) API uses: registration → `ExtensionApi`, actions →
 //! `HostActions`, context → `ContextActions`, commands →

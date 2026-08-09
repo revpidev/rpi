@@ -16,7 +16,7 @@ use crate::core::agent_session_services::{AgentSessionRuntimeDiagnostic, AgentSe
 use crate::core::extensions::{SessionShutdownReason, SessionStartEvent, SessionStartReason};
 use crate::core::session_cwd::assert_session_cwd_exists;
 use crate::core::session_manager::{NewSessionOptions, SessionManager};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `CreateAgentSessionRuntimeResult` (agent-session-runtime.ts:23-26).
@@ -44,7 +44,7 @@ pub struct CreateRuntimeOptions {
 pub type CreateAgentSessionRuntimeFactory = Arc<
     dyn Fn(
             CreateRuntimeOptions,
-        ) -> BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, PirError>>
+        ) -> BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, RpiError>>
         + Send
         + Sync,
 >;
@@ -74,7 +74,7 @@ impl ReplacedSessionContext {
         details: Option<serde_json::Value>,
         trigger_turn: bool,
         deliver_as: Option<crate::core::agent_session::CustomDeliverAs>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.session
             .send_custom_message(
                 custom_type,
@@ -92,7 +92,7 @@ impl ReplacedSessionContext {
         text: &str,
         images: Option<Vec<rpi_ai::types::ImageContent>>,
         deliver_as: Option<crate::core::extensions::StreamingBehavior>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         self.session
             .send_user_message(text, images, deliver_as)
             .await
@@ -269,7 +269,7 @@ impl AgentSessionRuntime {
         project_trust_context_factory: Option<
             crate::core::trust_manager::ProjectTrustContextFactory,
         >,
-    ) -> Result<bool, PirError> {
+    ) -> Result<bool, RpiError> {
         if self.emit_before_switch("resume", Some(session_path)).await {
             return Ok(true);
         }
@@ -278,7 +278,7 @@ impl AgentSessionRuntime {
         let session_manager =
             SessionManager::open(Path::new(session_path), None, cwd_override.map(Path::new))?;
         assert_session_cwd_exists(&session_manager, self.cwd())
-            .map_err(|error| PirError::Session(error.to_string()))?;
+            .map_err(|error| RpiError::Session(error.to_string()))?;
         let target_file = session_manager
             .get_session_file()
             .map(|p| p.to_string_lossy().into_owned());
@@ -313,7 +313,7 @@ impl AgentSessionRuntime {
         parent_session: Option<&str>,
         setup: NewSessionSetup<'_>,
         with_session: WithSessionCallback,
-    ) -> Result<bool, PirError> {
+    ) -> Result<bool, RpiError> {
         if self.emit_before_switch("new", None).await {
             return Ok(true);
         }
@@ -378,7 +378,7 @@ impl AgentSessionRuntime {
         entry_id: &str,
         position: ForkPosition,
         with_session: WithSessionCallback,
-    ) -> Result<ForkResult, PirError> {
+    ) -> Result<ForkResult, RpiError> {
         if self.emit_before_fork(entry_id, position).await {
             return Ok(ForkResult {
                 cancelled: true,
@@ -392,7 +392,7 @@ impl AgentSessionRuntime {
             manager.get_entry(entry_id)
         };
         let Some(selected_entry) = selected_entry else {
-            return Err(PirError::Session("Invalid entry ID for forking".to_owned()));
+            return Err(RpiError::Session("Invalid entry ID for forking".to_owned()));
         };
 
         let mut selected_text: Option<String> = None;
@@ -406,7 +406,7 @@ impl AgentSessionRuntime {
                         if matches!(entry.message, rpi_agent::AgentMessage::User(_))
                 );
                 if !is_user_message {
-                    return Err(PirError::Session("Invalid entry ID for forking".to_owned()));
+                    return Err(RpiError::Session("Invalid entry ID for forking".to_owned()));
                 }
                 if let Some(rpi_agent::session::SessionEntry::Message(entry)) = known {
                     if let rpi_agent::AgentMessage::User(user) = &entry.message {
@@ -427,7 +427,7 @@ impl AgentSessionRuntime {
 
         if is_persisted {
             let current_session_file = self.session.session_file().ok_or_else(|| {
-                PirError::Session("Persisted session is missing a session file".to_owned())
+                RpiError::Session("Persisted session is missing a session file".to_owned())
             })?;
             let session_dir = {
                 let manager = self.session.session_manager();
@@ -474,7 +474,7 @@ impl AgentSessionRuntime {
             };
 
             if !current_session_file.exists() {
-                return Err(PirError::Session(
+                return Err(RpiError::Session(
                     "This session has not been saved yet. Wait for the first assistant response before cloning or forking it."
                         .to_owned(),
                 ));
@@ -483,7 +483,7 @@ impl AgentSessionRuntime {
                 SessionManager::open(&current_session_file, Some(&session_dir), None)?;
             let forked_path = session_manager.create_branched_session(&target_leaf_id)?;
             let Some(_forked_path) = forked_path else {
-                return Err(PirError::Session(
+                return Err(RpiError::Session(
                     "Failed to create forked session".to_owned(),
                 ));
             };
@@ -568,13 +568,13 @@ impl AgentSessionRuntime {
         &mut self,
         input_path: &str,
         cwd_override: Option<&str>,
-    ) -> Result<bool, PirError> {
+    ) -> Result<bool, RpiError> {
         let resolved_path = resolve_path(
             input_path,
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         );
         if !resolved_path.exists() {
-            return Err(PirError::Session(
+            return Err(RpiError::Session(
                 SessionImportFileNotFoundError(resolved_path).to_string(),
             ));
         }
@@ -591,7 +591,7 @@ impl AgentSessionRuntime {
         let destination_path = session_dir.join(
             resolved_path
                 .file_name()
-                .ok_or_else(|| PirError::Session("Invalid session file name".to_owned()))?,
+                .ok_or_else(|| RpiError::Session("Invalid session file name".to_owned()))?,
         );
         if self
             .emit_before_switch("resume", Some(&destination_path.to_string_lossy()))
@@ -611,7 +611,7 @@ impl AgentSessionRuntime {
             cwd_override.map(Path::new),
         )?;
         assert_session_cwd_exists(&session_manager, self.cwd())
-            .map_err(|error| PirError::Session(error.to_string()))?;
+            .map_err(|error| RpiError::Session(error.to_string()))?;
         let new_cwd = session_manager.get_cwd().to_path_buf();
         let target_file = session_manager
             .get_session_file()
@@ -651,14 +651,14 @@ impl AgentSessionRuntime {
 pub async fn create_agent_session_runtime(
     create_runtime: CreateAgentSessionRuntimeFactory,
     options: CreateRuntimeOptions,
-) -> Result<AgentSessionRuntime, PirError> {
+) -> Result<AgentSessionRuntime, RpiError> {
     {
         let manager = options
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         assert_session_cwd_exists(&manager, &options.cwd)
-            .map_err(|error| PirError::Session(error.to_string()))?;
+            .map_err(|error| RpiError::Session(error.to_string()))?;
     }
     let result = (create_runtime)(options).await?;
     Ok(AgentSessionRuntime::new(

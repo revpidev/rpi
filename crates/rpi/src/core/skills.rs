@@ -34,7 +34,7 @@
 //! - `format_skills_for_prompt` takes the read-tool-active flag as a
 //!   parameter; upstream the gate lives inline in system-prompt.ts
 //!   (`tools.includes("read")` / `selectedTools.includes("read")`).
-//! - `expand_skill_command` returns `Err(PirError::Resource)` when the skill
+//! - `expand_skill_command` returns `Err(RpiError::Resource)` when the skill
 //!   file cannot be read; upstream emits the error through the extension
 //!   runner and returns the original text (agent-session.ts:1316-1324).
 //!   Callers should fall back to the original text on `Err`.
@@ -51,7 +51,7 @@
 //!   absent; upstream would coerce or throw depending on the value.
 //! - Diagnostics and errors: validation/collision findings are returned as
 //!   structured [`ResourceDiagnostic`] values (never `Err`); only
-//!   `/skill:name` expansion surfaces a [`PirError`].
+//!   `/skill:name` expansion surfaces a [`RpiError`].
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 
 use crate::config;
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `MAX_NAME_LENGTH` (skills.ts:11).
@@ -1407,9 +1407,9 @@ fn escape_xml(value: &str) -> String {
 /// the input is not a skill command or the skill is unknown.
 ///
 /// On file-read failure upstream emits an extension error and returns the
-/// original text; here the failure is `Err(PirError::Resource)` and the
+/// original text; here the failure is `Err(RpiError::Resource)` and the
 /// caller decides on the fallback (use the original text for parity).
-pub fn expand_skill_command(text: &str, skills: &[Skill]) -> Result<String, PirError> {
+pub fn expand_skill_command(text: &str, skills: &[Skill]) -> Result<String, RpiError> {
     let Some(rest) = text.strip_prefix("/skill:") else {
         return Ok(text.to_string());
     };
@@ -1424,7 +1424,7 @@ pub fn expand_skill_command(text: &str, skills: &[Skill]) -> Result<String, PirE
     };
 
     let content = std::fs::read_to_string(&skill.file_path).map_err(|error| {
-        PirError::Resource(format!(
+        RpiError::Resource(format!(
             "failed to read skill file {}: {error}",
             skill.file_path.display()
         ))
@@ -1656,7 +1656,7 @@ mod tests {
     // ---- directory walking ----
 
     #[test]
-    fn test_collect_skill_entries_pir_mode_loose_md_and_skill_roots() {
+    fn test_collect_skill_entries_rpi_mode_loose_md_and_skill_roots() {
         let tmp = TempDir::new();
         let root = tmp.path().join("skills");
         write(&root.join("loose.md"), "---\ndescription: x\n---\n");

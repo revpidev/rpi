@@ -39,7 +39,7 @@
 //!   structured [`ResourceDiagnostic`]s or `tracing::warn!`.
 //! - The keybindings migration write-back keeps upstream's silent handling of
 //!   malformed content but propagates lock/write I/O failures as
-//!   `PirError::Resource` (upstream swallows them too).
+//!   `RpiError::Resource` (upstream swallows them too).
 //! - The themes "path does not exist" CLI check is intentionally *not* gated
 //!   on `isLocalPath`, mirroring the upstream inconsistency
 //!   (resource-loader.ts:459-464 vs. the gated skills/prompts loops
@@ -75,7 +75,7 @@ use crate::core::system_prompt::{
     resolve_prompt_input, ContextFile,
 };
 use crate::core::themes::{load_theme_from_path, Theme};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 // Diagnostics types are ported in `skills.rs` (diagnostics.ts); re-exported
@@ -1071,12 +1071,12 @@ fn load_theme_from_file(
         Ok(theme) => themes.push(theme),
         Err(error) => {
             // Record the bare message, like upstream `error.message` — the
-            // `PirError` Display prefix ("resource loading error: ") is not
+            // `RpiError` Display prefix ("resource loading error: ") is not
             // part of the diagnostic text.
             let message = match &error {
-                PirError::Resource(inner)
-                | PirError::Settings(inner)
-                | PirError::Session(inner) => inner.clone(),
+                RpiError::Resource(inner)
+                | RpiError::Settings(inner)
+                | RpiError::Session(inner) => inner.clone(),
                 other => other.to_string(),
             };
             diagnostics.push(resource_warning(message, path));
@@ -1429,13 +1429,13 @@ fn settings_string_array(settings: &Settings, key: &str) -> Vec<String> {
 /// flock on the file, matching the settings-manager locking discipline
 /// (coding-standards §9.2). Malformed content is ignored silently, exactly
 /// like upstream; lock and write I/O failures propagate.
-pub fn migrate_keybindings_config_file() -> Result<bool, PirError> {
+pub fn migrate_keybindings_config_file() -> Result<bool, RpiError> {
     migrate_keybindings_config_file_at(&config::get_keybindings_path())
 }
 
 /// [`migrate_keybindings_config_file`] against an explicit path (tests and
 /// custom agent dirs).
-pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, PirError> {
+pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, RpiError> {
     if !path.exists() {
         return Ok(false);
     }
@@ -1455,18 +1455,18 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, PirError>
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if attempt == LOCK_MAX_ATTEMPTS {
-                    return Err(PirError::Resource(format!(
+                    return Err(RpiError::Resource(format!(
                         "Failed to acquire keybindings lock for {}: {error}",
                         path.display()
                     )));
                 }
                 std::thread::sleep(LOCK_RETRY_DELAY);
             }
-            Err(error) => return Err(PirError::Io(error)),
+            Err(error) => return Err(RpiError::Io(error)),
         }
     }
     let Some(file) = file else {
-        return Err(PirError::Resource(format!(
+        return Err(RpiError::Resource(format!(
             "Failed to acquire keybindings lock for {}",
             path.display()
         )));
@@ -1478,7 +1478,7 @@ pub fn migrate_keybindings_config_file_at(path: &Path) -> Result<bool, PirError>
     result
 }
 
-fn migrate_locked_keybindings(path: &Path, file: &std::fs::File) -> Result<bool, PirError> {
+fn migrate_locked_keybindings(path: &Path, file: &std::fs::File) -> Result<bool, RpiError> {
     let content = std::fs::read_to_string(path)?;
     let parsed: serde_json::Value = match serde_json::from_str(&content) {
         Ok(parsed) => parsed,

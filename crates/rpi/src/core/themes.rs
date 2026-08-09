@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::config;
-use crate::error::PirError;
+use crate::error::RpiError;
 
 // ===========================================================================
 // Built-in theme JSON (verbatim values from upstream dark.json / light.json)
@@ -421,17 +421,17 @@ pub struct Theme {
 // ===========================================================================
 
 /// Parse `"#RRGGBB"` into [`Rgb`] (theme.ts:171-183).
-fn hex_to_rgb(hex: &str) -> Result<Rgb, PirError> {
+fn hex_to_rgb(hex: &str) -> Result<Rgb, RpiError> {
     let cleaned = hex.strip_prefix('#').unwrap_or(hex);
     if cleaned.len() != 6 {
-        return Err(PirError::Resource(format!("Invalid hex color: {}", hex)));
+        return Err(RpiError::Resource(format!("Invalid hex color: {}", hex)));
     }
     let r = u32::from_str_radix(&cleaned[0..2], 16)
-        .map_err(|_| PirError::Resource(format!("Invalid hex color: {}", hex)))?;
+        .map_err(|_| RpiError::Resource(format!("Invalid hex color: {}", hex)))?;
     let g = u32::from_str_radix(&cleaned[2..4], 16)
-        .map_err(|_| PirError::Resource(format!("Invalid hex color: {}", hex)))?;
+        .map_err(|_| RpiError::Resource(format!("Invalid hex color: {}", hex)))?;
     let b = u32::from_str_radix(&cleaned[4..6], 16)
-        .map_err(|_| PirError::Resource(format!("Invalid hex color: {}", hex)))?;
+        .map_err(|_| RpiError::Resource(format!("Invalid hex color: {}", hex)))?;
     Ok(Rgb { r, g, b })
 }
 
@@ -505,7 +505,7 @@ pub fn rgb_to_256(r: u32, g: u32, b: u32) -> u32 {
 }
 
 /// Convert `"#RRGGBB"` to a 256-colour index (theme.ts:258-261).
-pub fn hex_to_256(hex: &str) -> Result<u32, PirError> {
+pub fn hex_to_256(hex: &str) -> Result<u32, RpiError> {
     let rgb = hex_to_rgb(hex)?;
     Ok(rgb_to_256(rgb.r, rgb.g, rgb.b))
 }
@@ -537,7 +537,7 @@ pub fn ansi256_to_hex(index: u32) -> String {
 
 /// Generate the ANSI foreground escape for a resolved colour
 /// (theme.ts:263-276).
-fn fg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, PirError> {
+fn fg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, RpiError> {
     match color {
         ResolvedColor::Empty => Ok("\x1b[39m".to_string()),
         ResolvedColor::Index(i) => Ok(format!("\x1b[38;5;{}m", i)),
@@ -556,7 +556,7 @@ fn fg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, PirError> {
 
 /// Generate the ANSI background escape for a resolved colour
 /// (theme.ts:278-291).
-fn bg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, PirError> {
+fn bg_ansi(color: &ResolvedColor, mode: ColorMode) -> Result<String, RpiError> {
     match color {
         ResolvedColor::Empty => Ok("\x1b[49m".to_string()),
         ResolvedColor::Index(i) => Ok(format!("\x1b[48;5;{}m", i)),
@@ -583,7 +583,7 @@ fn resolve_var_refs(
     value: &ColorValue,
     vars: &HashMap<String, ColorValue>,
     visited: &mut HashSet<String>,
-) -> Result<ResolvedColor, PirError> {
+) -> Result<ResolvedColor, RpiError> {
     match value {
         ColorValue::Index(i) => Ok(ResolvedColor::Index(*i)),
         ColorValue::Str(s) => {
@@ -595,13 +595,13 @@ fn resolve_var_refs(
             }
             // Variable reference
             if visited.contains(s) {
-                return Err(PirError::Resource(format!(
+                return Err(RpiError::Resource(format!(
                     "Circular variable reference detected: {}",
                     s
                 )));
             }
             let referenced = vars.get(s).ok_or_else(|| {
-                PirError::Resource(format!("Variable reference not found: {}", s))
+                RpiError::Resource(format!("Variable reference not found: {}", s))
             })?;
             visited.insert(s.clone());
             resolve_var_refs(referenced, vars, visited)
@@ -613,7 +613,7 @@ fn resolve_var_refs(
 fn resolve_theme_colors(
     colors: &HashMap<String, ColorValue>,
     vars: &HashMap<String, ColorValue>,
-) -> Result<HashMap<String, ResolvedColor>, PirError> {
+) -> Result<HashMap<String, ResolvedColor>, RpiError> {
     let mut resolved = HashMap::new();
     for (key, value) in colors {
         let mut visited = HashSet::new();
@@ -651,9 +651,9 @@ fn is_valid_color_value(v: &serde_json::Value) -> bool {
 
 /// Validate a theme name — must not contain `/` (theme.ts:516-522,
 /// schema pattern `^[^/]+$`).
-pub fn assert_theme_name_is_valid(name: &str) -> Result<(), PirError> {
+pub fn assert_theme_name_is_valid(name: &str) -> Result<(), RpiError> {
     if name.contains('/') {
-        return Err(PirError::Resource(format!(
+        return Err(RpiError::Resource(format!(
             "Invalid theme name \"{}\": theme names cannot contain \"/\" because it is reserved for automatic light/dark theme settings.",
             name
         )));
@@ -665,7 +665,7 @@ pub fn assert_theme_name_is_valid(name: &str) -> Result<(), PirError> {
 ///
 /// Collects structured diagnostics for missing colour tokens and other schema
 /// errors, then deserialises into [`ThemeJson`].
-pub fn parse_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJson, PirError> {
+pub fn parse_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJson, RpiError> {
     let mut missing_colors: Vec<String> = Vec::new();
     let mut other_errors: Vec<String> = Vec::new();
 
@@ -783,20 +783,20 @@ pub fn parse_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJ
         if !other_errors.is_empty() {
             msg.push_str(&format!("\n\nOther errors:\n{}", other_errors.join("\n")));
         }
-        return Err(PirError::Resource(msg));
+        return Err(RpiError::Resource(msg));
     }
 
     let theme_json: ThemeJson = serde_json::from_value(value.clone())
-        .map_err(|e| PirError::Resource(format!("Invalid theme \"{}\": {}", label, e)))?;
+        .map_err(|e| RpiError::Resource(format!("Invalid theme \"{}\": {}", label, e)))?;
 
     assert_theme_name_is_valid(&theme_json.name)?;
     Ok(theme_json)
 }
 
 /// Parse theme JSON from a string (theme.ts:565-573).
-pub fn parse_theme_json_content(label: &str, content: &str) -> Result<ThemeJson, PirError> {
+pub fn parse_theme_json_content(label: &str, content: &str) -> Result<ThemeJson, RpiError> {
     let json: serde_json::Value = serde_json::from_str(content)
-        .map_err(|e| PirError::Resource(format!("Failed to parse theme {}: {}", label, e)))?;
+        .map_err(|e| RpiError::Resource(format!("Failed to parse theme {}: {}", label, e)))?;
     parse_theme_json(label, &json)
 }
 
@@ -833,7 +833,7 @@ pub fn create_theme(
     theme_json: &ThemeJson,
     mode: Option<ColorMode>,
     source_path: Option<&Path>,
-) -> Result<Theme, PirError> {
+) -> Result<Theme, RpiError> {
     let color_mode = mode.unwrap_or(ColorMode::TrueColor);
     let colors = with_thinking_max_fallback(theme_json.colors.clone());
     let resolved = resolve_theme_colors(&colors, &theme_json.vars)?;
@@ -860,9 +860,9 @@ pub fn create_theme(
 }
 
 /// Load and construct a theme from a file path (theme.ts:623-627).
-pub fn load_theme_from_path(path: &Path, mode: Option<ColorMode>) -> Result<Theme, PirError> {
+pub fn load_theme_from_path(path: &Path, mode: Option<ColorMode>) -> Result<Theme, RpiError> {
     let content = std::fs::read_to_string(path).map_err(|e| {
-        PirError::Resource(format!("Failed to read theme {}: {}", path.display(), e))
+        RpiError::Resource(format!("Failed to read theme {}: {}", path.display(), e))
     })?;
     let theme_json = parse_theme_json_content(&path.display().to_string(), &content)?;
     create_theme(&theme_json, mode, Some(path))
@@ -873,7 +873,7 @@ pub fn load_theme_from_path(path: &Path, mode: Option<ColorMode>) -> Result<Them
 ///
 /// Priority: built-in → global custom themes dir.
 /// Registered themes (packages) will be added by the resource loader (T17+).
-pub fn load_theme_json(name: &str) -> Result<ThemeJson, PirError> {
+pub fn load_theme_json(name: &str) -> Result<ThemeJson, RpiError> {
     // 1. Built-in themes
     if let Some(json) = get_builtin_themes().get(name) {
         return Ok(json.clone());
@@ -882,15 +882,15 @@ pub fn load_theme_json(name: &str) -> Result<ThemeJson, PirError> {
     // 3. Custom themes from global themes dir
     let theme_path = config::get_global_themes_dir().join(format!("{}.json", name));
     if !theme_path.exists() {
-        return Err(PirError::Resource(format!("Theme not found: {}", name)));
+        return Err(RpiError::Resource(format!("Theme not found: {}", name)));
     }
     let content = std::fs::read_to_string(&theme_path)
-        .map_err(|e| PirError::Resource(format!("Failed to read theme {}: {}", name, e)))?;
+        .map_err(|e| RpiError::Resource(format!("Failed to read theme {}: {}", name, e)))?;
     parse_theme_json_content(name, &content)
 }
 
 /// Load and construct a [`Theme`] by name (theme.ts:629-636).
-pub fn load_theme(name: &str, mode: Option<ColorMode>) -> Result<Theme, PirError> {
+pub fn load_theme(name: &str, mode: Option<ColorMode>) -> Result<Theme, RpiError> {
     let theme_json = load_theme_json(name)?;
     create_theme(&theme_json, mode, None)
 }
@@ -971,7 +971,7 @@ pub fn theme_json_value(name: &str) -> Option<serde_json::Value> {
 
 /// Resolve theme colours as CSS-compatible hex strings
 /// (theme.ts:1022-1043).
-pub fn get_resolved_theme_colors(theme_name: &str) -> Result<HashMap<String, String>, PirError> {
+pub fn get_resolved_theme_colors(theme_name: &str) -> Result<HashMap<String, String>, RpiError> {
     let is_light = theme_name == "light";
     let theme_json = load_theme_json(theme_name)?;
     let colors = with_thinking_max_fallback(theme_json.colors.clone());

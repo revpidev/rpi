@@ -29,7 +29,7 @@ pub const DEFAULT_VERSION_CHECK_TIMEOUT: Duration = Duration::from_millis(10_000
 
 /// `LatestPiRelease` (version-check.ts:7-11).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LatestPirRelease {
+pub struct LatestRpiRelease {
     pub version: String,
     pub package_name: Option<String>,
     pub note: Option<String>,
@@ -121,11 +121,11 @@ impl LatestVersionTransport for ReqwestLatestVersionTransport {
 
 /// `getLatestPiRelease` (version-check.ts:30-61) with the default URL and
 /// timeout; `RPI_OFFLINE` short-circuits to `None`.
-pub async fn get_latest_pir_release(
+pub async fn get_latest_rpi_release(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
-) -> Result<Option<LatestPirRelease>, String> {
-    get_latest_pir_release_with(
+) -> Result<Option<LatestRpiRelease>, String> {
+    get_latest_rpi_release_with(
         current_version,
         transport,
         LATEST_VERSION_URL,
@@ -135,15 +135,15 @@ pub async fn get_latest_pir_release(
     .await
 }
 
-/// [`get_latest_pir_release`] with explicit URL / timeout / offline flag
+/// [`get_latest_rpi_release`] with explicit URL / timeout / offline flag
 /// (test seam; also the W6a endpoint-override call site).
-pub async fn get_latest_pir_release_with(
+pub async fn get_latest_rpi_release_with(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
     url: &str,
     timeout: Duration,
     offline: bool,
-) -> Result<Option<LatestPirRelease>, String> {
+) -> Result<Option<LatestRpiRelease>, String> {
     if offline {
         return Ok(None);
     }
@@ -165,7 +165,7 @@ pub async fn get_latest_pir_release_with(
     let Some(version) = trimmed_non_empty("version") else {
         return Ok(None);
     };
-    Ok(Some(LatestPirRelease {
+    Ok(Some(LatestRpiRelease {
         version,
         package_name: trimmed_non_empty("packageName"),
         note: trimmed_non_empty("note"),
@@ -211,13 +211,13 @@ pub fn startup_version_check_url(settings_url: Option<&str>) -> Option<String> {
 /// reports a strictly newer version; every transport/parse failure is
 /// swallowed (upstream `try/catch`). `url` is the resolved startup probe
 /// URL — `None` disables the check with zero network traffic.
-pub async fn check_for_new_pir_release(
+pub async fn check_for_new_rpi_release(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
     url: Option<&str>,
-) -> Option<LatestPirRelease> {
+) -> Option<LatestRpiRelease> {
     let url = url?;
-    let release = get_latest_pir_release_with(
+    let release = get_latest_rpi_release_with(
         current_version,
         transport,
         url,
@@ -323,7 +323,7 @@ mod tests {
     #[tokio::test]
     async fn offline_skips_the_fetch() {
         let transport = ScriptedTransport::responds(Ok(Some("{}".to_string())));
-        let release = get_latest_pir_release_with(
+        let release = get_latest_rpi_release_with(
             "1.0.0",
             &transport,
             LATEST_VERSION_URL,
@@ -343,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn non_ok_response_yields_none() {
         let transport = ScriptedTransport::responds(Ok(None));
-        let release = get_latest_pir_release("1.0.0", &transport)
+        let release = get_latest_rpi_release("1.0.0", &transport)
             .await
             .expect("non-ok result");
         assert_eq!(release, None);
@@ -354,7 +354,7 @@ mod tests {
         let transport = ScriptedTransport::responds(Ok(Some(
             r#"{"version": " 1.2.3 ", "packageName": "rpi-next", "note": "  hi  "}"#.to_string(),
         )));
-        let release = get_latest_pir_release("1.0.0", &transport)
+        let release = get_latest_rpi_release("1.0.0", &transport)
             .await
             .expect("release")
             .expect("some release");
@@ -375,7 +375,7 @@ mod tests {
             r#"{"version": 3}"#,
         ] {
             let transport = ScriptedTransport::responds(Ok(Some(body.to_string())));
-            let release = get_latest_pir_release("1.0.0", &transport)
+            let release = get_latest_rpi_release("1.0.0", &transport)
                 .await
                 .expect("release");
             assert_eq!(release, None, "{body}");
@@ -387,7 +387,7 @@ mod tests {
         let transport = ScriptedTransport::responds(Ok(Some(
             r#"{"version": "1.2.3", "packageName": " ", "note": 42}"#.to_string(),
         )));
-        let release = get_latest_pir_release("1.0.0", &transport)
+        let release = get_latest_rpi_release("1.0.0", &transport)
             .await
             .expect("release")
             .expect("some release");
@@ -398,13 +398,13 @@ mod tests {
     #[tokio::test]
     async fn transport_and_parse_errors_propagate() {
         let transport = ScriptedTransport::responds(Err("connection refused".to_string()));
-        let error = get_latest_pir_release("1.0.0", &transport)
+        let error = get_latest_rpi_release("1.0.0", &transport)
             .await
             .expect_err("transport error");
         assert_eq!(error, "connection refused");
 
         let transport = ScriptedTransport::responds(Ok(Some("not json".to_string())));
-        assert!(get_latest_pir_release("1.0.0", &transport).await.is_err());
+        assert!(get_latest_rpi_release("1.0.0", &transport).await.is_err());
     }
 
     // ---- T14-W6a: endpoint configuration + startup check (ADR-0002 §8) ----
@@ -443,12 +443,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_for_new_pir_release_reports_only_newer_versions() {
+    async fn check_for_new_rpi_release_reports_only_newer_versions() {
         // Newer version → Some(release).
         let transport = ScriptedTransport::responds(Ok(Some(
             r#"{"version": "9.9.9", "note": "hi"}"#.to_string(),
         )));
-        let release = check_for_new_pir_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
+        let release = check_for_new_rpi_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
             .await
             .expect("newer release");
         assert_eq!(release.version, "9.9.9");
@@ -456,24 +456,24 @@ mod tests {
         let transport =
             ScriptedTransport::responds(Ok(Some(r#"{"version": "1.0.0"}"#.to_string())));
         assert!(
-            check_for_new_pir_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
+            check_for_new_rpi_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
                 .await
                 .is_none()
         );
         let transport = ScriptedTransport::responds(Err("boom".to_string()));
         assert!(
-            check_for_new_pir_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
+            check_for_new_rpi_release("1.0.0", &transport, Some(LATEST_VERSION_URL))
                 .await
                 .is_none()
         );
     }
 
     #[tokio::test]
-    async fn check_for_new_pir_release_disabled_endpoint_makes_no_request() {
+    async fn check_for_new_rpi_release_disabled_endpoint_makes_no_request() {
         // Zero-network anchor: a disabled endpoint never touches the transport.
         let transport =
             ScriptedTransport::responds(Ok(Some(r#"{"version": "9.9.9"}"#.to_string())));
-        assert!(check_for_new_pir_release("1.0.0", &transport, None)
+        assert!(check_for_new_rpi_release("1.0.0", &transport, None)
             .await
             .is_none());
         assert!(transport

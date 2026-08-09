@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::CONFIG_DIR_NAME;
 use crate::core::extensions::{ProjectTrustEventDecision, ProjectTrustEventResult};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::resolve_path;
 
 /// `TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES` (trust-manager.ts:29-37).
@@ -153,31 +153,31 @@ pub fn get_project_trust_options(
 /// `TrustFile` = `Record<string, boolean | null>` (trust-manager.ts:27).
 type TrustFile = serde_json::Map<String, serde_json::Value>;
 
-fn read_trust_file(path: &Path) -> Result<TrustFile, PirError> {
+fn read_trust_file(path: &Path) -> Result<TrustFile, RpiError> {
     if !path.exists() {
         return Ok(TrustFile::new());
     }
     let content = std::fs::read_to_string(path).map_err(|e| {
-        PirError::Settings(format!(
+        RpiError::Settings(format!(
             "Failed to read trust store {}: {e}",
             path.display()
         ))
     })?;
     let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
-        PirError::Settings(format!(
+        RpiError::Settings(format!(
             "Failed to read trust store {}: {e}",
             path.display()
         ))
     })?;
     let Some(object) = parsed.as_object() else {
-        return Err(PirError::Settings(format!(
+        return Err(RpiError::Settings(format!(
             "Invalid trust store {}: expected an object",
             path.display()
         )));
     };
     for (key, value) in object {
         if !(value.is_boolean() || value.is_null()) {
-            return Err(PirError::Settings(format!(
+            return Err(RpiError::Settings(format!(
                 "Invalid trust store {}: value for {key:?} must be true, false, or null",
                 path.display()
             )));
@@ -186,7 +186,7 @@ fn read_trust_file(path: &Path) -> Result<TrustFile, PirError> {
     Ok(object.clone())
 }
 
-fn write_trust_file(path: &Path, data: &TrustFile) -> Result<(), PirError> {
+fn write_trust_file(path: &Path, data: &TrustFile) -> Result<(), RpiError> {
     // Keys sorted ascending; values limited to true/false/null
     // (trust-manager.ts:124-134). JS `sort()` orders strings by UTF-16
     // code units (T14 review m5); Rust's `str` ordering is code-point
@@ -222,8 +222,8 @@ fn utf16_code_unit_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// 20 ms on contention (proper-lockfile shape, trust-manager.ts:136-166).
 fn with_trust_file_lock<T>(
     path: &Path,
-    f: impl FnOnce() -> Result<T, PirError>,
-) -> Result<T, PirError> {
+    f: impl FnOnce() -> Result<T, RpiError>,
+) -> Result<T, RpiError> {
     use fs2::FileExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -254,7 +254,7 @@ fn with_trust_file_lock<T>(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(error) => {
-                return Err(PirError::Settings(format!(
+                return Err(RpiError::Settings(format!(
                     "Failed to acquire trust store lock: {error}"
                 )));
             }
@@ -301,11 +301,11 @@ impl ProjectTrustStore {
 
     /// `get(cwd)`: nearest ancestor decision, `None` when unset. Lock/read
     /// failures propagate (upstream `getEntry` throws, trust-manager.ts:219-224).
-    pub fn get(&self, cwd: &Path) -> Result<Option<bool>, PirError> {
+    pub fn get(&self, cwd: &Path) -> Result<Option<bool>, RpiError> {
         Ok(self.get_entry(cwd)?.map(|(_, decision)| decision))
     }
 
-    pub fn get_entry(&self, cwd: &Path) -> Result<Option<(PathBuf, bool)>, PirError> {
+    pub fn get_entry(&self, cwd: &Path) -> Result<Option<(PathBuf, bool)>, RpiError> {
         with_trust_file_lock(&self.trust_path, || {
             let data = read_trust_file(&self.trust_path)?;
             Ok(find_nearest_trust_entry(&data, cwd))
@@ -313,11 +313,11 @@ impl ProjectTrustStore {
     }
 
     /// `set(cwd, decision)`: `None` clears the entry.
-    pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), PirError> {
+    pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), RpiError> {
         self.set_many(&[(cwd.to_path_buf(), decision)])
     }
 
-    pub fn set_many(&self, decisions: &[(PathBuf, Option<bool>)]) -> Result<(), PirError> {
+    pub fn set_many(&self, decisions: &[(PathBuf, Option<bool>)]) -> Result<(), RpiError> {
         with_trust_file_lock(&self.trust_path, || {
             let mut data = read_trust_file(&self.trust_path)?;
             for (path, decision) in decisions {
@@ -408,7 +408,7 @@ pub fn resolve_project_trusted(
     default_project_trust: DefaultProjectTrust,
     extension_event: Option<ProjectTrustEventResult>,
     context: &mut ProjectTrustContext,
-) -> Result<bool, PirError> {
+) -> Result<bool, RpiError> {
     if let Some(trust_override) = trust_override {
         return Ok(trust_override);
     }
@@ -460,7 +460,7 @@ fn apply_trust_selection(
     options: &[ProjectTrustOption],
     selected: Option<String>,
     trust_store: &ProjectTrustStore,
-) -> Result<bool, PirError> {
+) -> Result<bool, RpiError> {
     if let Some(selected) = selected {
         if let Some(option) = options.iter().find(|option| option.label == selected) {
             if !option.updates.is_empty() {
@@ -486,7 +486,7 @@ pub async fn resolve_project_trusted_async(
     default_project_trust: DefaultProjectTrust,
     extension_event: Option<ProjectTrustEventResult>,
     context: &mut ProjectTrustContext,
-) -> Result<bool, PirError> {
+) -> Result<bool, RpiError> {
     if context.select_async.is_none() {
         return resolve_project_trusted(
             cwd,

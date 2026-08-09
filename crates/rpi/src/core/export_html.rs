@@ -37,7 +37,7 @@ use serde_json::Value;
 use crate::config::APP_NAME;
 use crate::core::session_manager::SessionManager;
 use crate::core::themes::{get_default_theme, get_resolved_theme_colors, get_theme_export_colors};
-use crate::error::PirError;
+use crate::error::RpiError;
 use crate::tools::path_utils::{normalize_path, resolve_path};
 
 /// `template.html` (export-html/template.html) — byte-identical copy.
@@ -269,7 +269,7 @@ fn generate_theme_vars(theme_name: Option<&str>) -> String {
 /// `generateHtml` (index.ts:143-175): substitute the placeholders in the
 /// same order as upstream (JS `String.replace` replaces the first
 /// occurrence; `replacen(…, 1)` matches).
-fn generate_html(session_data: &SessionData, theme_name: Option<&str>) -> Result<String, PirError> {
+fn generate_html(session_data: &SessionData, theme_name: Option<&str>) -> Result<String, RpiError> {
     let name = resolve_theme_name(theme_name);
     let theme_vars = generate_theme_vars(Some(&name));
     // Unknown theme → empty map (see `generate_theme_vars` divergence
@@ -328,12 +328,12 @@ pub fn export_session_to_html(
     system_prompt: Option<String>,
     tools: Option<Vec<ExportToolInfo>>,
     options: &ExportOptions,
-) -> Result<String, PirError> {
+) -> Result<String, RpiError> {
     let session_file = sm
         .get_session_file()
-        .ok_or_else(|| PirError::Session("Cannot export in-memory session to HTML".to_string()))?;
+        .ok_or_else(|| RpiError::Session("Cannot export in-memory session to HTML".to_string()))?;
     if !session_file.exists() {
-        return Err(PirError::Session(
+        return Err(RpiError::Session(
             "Nothing to export yet - start a conversation first".to_string(),
         ));
     }
@@ -370,11 +370,11 @@ pub fn export_session_to_html(
 
 /// `exportFromFile` (index.ts:288-316): export an arbitrary session file
 /// (standalone, without agent state). Used by the `--export` CLI path.
-pub fn export_from_file(input_path: &str, options: &ExportOptions) -> Result<String, PirError> {
+pub fn export_from_file(input_path: &str, options: &ExportOptions) -> Result<String, RpiError> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     let resolved_input = resolve_path(input_path, &cwd);
     if !resolved_input.exists() {
-        return Err(PirError::Session(format!(
+        return Err(RpiError::Session(format!(
             "File not found: {}",
             resolved_input.display()
         )));

@@ -38,7 +38,7 @@ use rpi::core::themes::{
     get_resolved_theme_colors, load_theme_from_path, ColorMode, Theme, ALLOWED_COLOR_KEYS,
     BG_COLOR_KEYS,
 };
-use rpi::error::PirError;
+use rpi::error::RpiError;
 use rpi_test_support::{diff_text, Normalizer};
 use serde_json::{json, Map, Value};
 
@@ -320,7 +320,7 @@ fn parity_themes() {
                 }
                 Err(err) => {
                     let message = match &err {
-                        PirError::Resource(msg) => msg.clone(),
+                        RpiError::Resource(msg) => msg.clone(),
                         other => other.to_string(),
                     };
                     if expected_mode.get("error").is_some() {
@@ -402,7 +402,7 @@ impl SettingsStorage for PresetStorage {
         &mut self,
         scope: SettingsScope,
         f: &mut WithLockCallback<'_>,
-    ) -> Result<(), PirError> {
+    ) -> Result<(), RpiError> {
         let current = match scope {
             SettingsScope::Global => self.global.as_deref(),
             SettingsScope::Project => self.project.as_deref(),
@@ -502,9 +502,9 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 fn prepare_e2e_tree(input: &Path, dest: &Path) {
     copy_dir_all(input, dest);
     for dir in ["repo", "repo/sub"] {
-        let pir_dir = dest.join(dir).join(".rpi");
-        if pir_dir.exists() {
-            copy_dir_all(&pir_dir, &dest.join(dir).join(".pi"));
+        let rpi_dir = dest.join(dir).join(".rpi");
+        if rpi_dir.exists() {
+            copy_dir_all(&rpi_dir, &dest.join(dir).join(".pi"));
         }
     }
     std::fs::create_dir_all(dest.join("repo").join(".git")).expect("create .git marker");

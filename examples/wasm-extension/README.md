@@ -9,7 +9,7 @@ ABI v1 guest（`docs/extension-abi.md`）。行为：`tool_call` 里 block `read
 rustup target add wasm32-unknown-unknown   # 一次性
 cargo build --target wasm32-unknown-unknown --release
 mkdir -p dist
-cp ../../target/wasm32-unknown-unknown/release/pir_wasm_extension_example.wasm dist/permission_gate.wasm
+cp ../../target/wasm32-unknown-unknown/release/rpi_wasm_extension_example.wasm dist/permission_gate.wasm
 ```
 
 ## 安装

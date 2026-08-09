@@ -2473,7 +2473,7 @@ mod tests {
         .expect("create test session");
 
         let factory = {
-            use crate::PirError;
+            use crate::RpiError;
             use futures::future::BoxFuture;
             let services = services.clone();
             let cwd = cwd.clone();
@@ -2500,7 +2500,7 @@ mod tests {
                         model_fallback_message: created.model_fallback_message,
                     })
                 })
-                    as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, PirError>>
+                    as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, RpiError>>
             })
         };
 

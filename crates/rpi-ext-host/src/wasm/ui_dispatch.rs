@@ -1,5 +1,5 @@
 //! `ui.*` host-call methods (T15 W6) — the 28 `UiBridge` methods behind
-//! `pir_host_call`. Sync methods run inline; dialog methods
+//! `rpi_host_call`. Sync methods run inline; dialog methods
 //! (`select`/`confirm`/`input`/`editor`/`custom`) spawn onto the ambient
 //! runtime and block the guest thread.
 
