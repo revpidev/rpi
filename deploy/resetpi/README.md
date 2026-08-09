@@ -2,6 +2,8 @@
 
 pir 的 5 个产品端点默认值自 ADR-0009 起指向 `resetpi.com`。本目录是
 Cloudflare Pages 项目：静态目录内容 + Pages Functions，零后端。
+`index.html` 为站点首页（开源项目主页，含特性/快速开始/端点说明），
+`/` 请求直接命中。
 
 ## 端点 → 文件映射
 

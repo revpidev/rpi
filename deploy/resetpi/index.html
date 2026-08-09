@@ -1,28 +1,560 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>resetpi.com — pir product endpoints</title>
+  <title>Pir — 用 Rust 1:1 复刻的 Pi coding agent</title>
+  <meta name="description" content="Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 1:1 复刻：行为层逐字节对拍一致，四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #1a1a1a; }
-    code { background: #f0f0f0; padding: 0.1em 0.4em; border-radius: 4px; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
-    th { font-weight: 600; }
+    :root {
+      --bg: #0d1117;
+      --bg-soft: #161b22;
+      --bg-code: #0a0e14;
+      --border: #30363d;
+      --text: #f0f6fc;
+      --muted: #8b949e;
+      --green: #3fb950;
+      --green-dim: #2ea043;
+      --blue: #58a6ff;
+      --yellow: #d29922;
+      --purple: #bc8cff;
+      --red: #f85149;
+      --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: var(--mono);
+      font-size: 0.9em;
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.1em 0.35em;
+    }
+    pre {
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      line-height: 1.6;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.2rem;
+      overflow-x: auto;
+      color: #c9d1d9;
+    }
+    pre code { background: none; border: none; padding: 0; }
+    .container { max-width: 1080px; margin: 0 auto; padding: 0 1.5rem; }
+    section { padding: 4.5rem 0; }
+    section h2 {
+      font-size: 1.7rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+    section .lead { color: var(--muted); max-width: 640px; margin-bottom: 2.5rem; }
+
+    /* ---------- nav ---------- */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 56px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-weight: 700;
+      font-size: 1.1rem;
+      color: var(--text);
+    }
+    .brand:hover { text-decoration: none; }
+    .brand .logo {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, var(--green), var(--blue));
+      color: #0d1117;
+      font-weight: 800;
+      font-size: 0.85rem;
+    }
+    .nav-links { display: flex; gap: 1.4rem; font-size: 0.92rem; }
+    .nav-links a { color: var(--muted); }
+    .nav-links a:hover { color: var(--text); text-decoration: none; }
+
+    /* ---------- hero ---------- */
+    .hero { padding: 6rem 0 3rem; text-align: center; }
+    .hero h1 {
+      font-size: clamp(2.2rem, 5vw, 3.4rem);
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+    }
+    .hero h1 .accent {
+      background: linear-gradient(90deg, var(--green), var(--blue));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .hero .tagline {
+      margin: 1.2rem auto 2rem;
+      max-width: 640px;
+      color: var(--muted);
+      font-size: 1.15rem;
+    }
+    .badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; margin-bottom: 2.2rem; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-size: 0.8rem;
+      font-family: var(--mono);
+      color: var(--muted);
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0.25rem 0.75rem;
+    }
+    .badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .badge .dot.green { background: var(--green); }
+    .badge .dot.blue { background: var(--blue); }
+    .badge .dot.yellow { background: var(--yellow); }
+    .badge .dot.purple { background: var(--purple); }
+    .cta { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; }
+    .btn {
+      display: inline-block;
+      font-size: 0.98rem;
+      font-weight: 600;
+      padding: 0.65rem 1.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      transition: all 0.15s ease;
+    }
+    .btn:hover { text-decoration: none; transform: translateY(-1px); }
+    .btn-primary { background: var(--green); border-color: var(--green); color: #0d1117; }
+    .btn-primary:hover { background: var(--green-dim); }
+    .btn-secondary { background: var(--bg-soft); color: var(--text); }
+    .btn-secondary:hover { border-color: var(--muted); }
+
+    /* ---------- terminal mockup ---------- */
+    .terminal {
+      margin: 3rem auto 0;
+      max-width: 760px;
+      text-align: left;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      overflow: hidden;
+    }
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.7rem 1rem;
+      background: var(--bg-soft);
+      border-bottom: 1px solid var(--border);
+    }
+    .terminal-bar .t-dot { width: 12px; height: 12px; border-radius: 50%; }
+    .terminal-bar .t-dot:nth-child(1) { background: #ff5f56; }
+    .terminal-bar .t-dot:nth-child(2) { background: #ffbd2e; }
+    .terminal-bar .t-dot:nth-child(3) { background: #27c93f; }
+    .terminal-bar .t-title {
+      margin-left: 0.5rem;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    .terminal-body {
+      padding: 1.2rem 1.4rem;
+      font-family: var(--mono);
+      font-size: 0.84rem;
+      line-height: 1.75;
+      min-height: 300px;
+      color: #c9d1d9;
+    }
+    .t-prompt::before { content: "❯ "; color: var(--green); font-weight: 700; }
+    .t-user { color: var(--text); }
+    .t-dim { color: var(--muted); }
+    .t-green { color: var(--green); }
+    .t-blue { color: var(--blue); }
+    .t-yellow { color: var(--yellow); }
+    .t-purple { color: var(--purple); }
+    .t-red { color: var(--red); }
+    .t-caret::after {
+      content: "▋";
+      color: var(--green);
+      animation: blink 1s steps(1) infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+    .t-line { white-space: pre-wrap; word-break: break-word; min-height: 1.75em; }
+    .t-hidden { display: none; }
+    .t-thinking {
+      border-left: 2px solid var(--purple);
+      padding-left: 0.8rem;
+      color: var(--muted);
+      margin: 0.3rem 0;
+    }
+
+    /* ---------- features ---------- */
+    .features { background: var(--bg-soft); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.2rem;
+    }
+    .card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.4rem 1.5rem;
+    }
+    .card h3 { font-size: 1.05rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+    .card h3 .icon { font-size: 1.1rem; }
+    .card p { color: var(--muted); font-size: 0.93rem; }
+    .card ul { color: var(--muted); font-size: 0.93rem; padding-left: 1.1rem; }
+    .card li { margin: 0.25rem 0; }
+
+    /* ---------- quickstart ---------- */
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    .step { margin-bottom: 1.6rem; }
+    .step h3 { font-size: 1rem; margin-bottom: 0.6rem; }
+    .step h3 .num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 22px; height: 22px;
+      border-radius: 6px;
+      background: var(--green);
+      color: #0d1117;
+      font-size: 0.8rem;
+      font-weight: 800;
+      margin-right: 0.5rem;
+    }
+    .muted { color: var(--muted); font-size: 0.9rem; }
+    .muted a { color: var(--blue); }
+
+    /* ---------- endpoints ---------- */
+    .endpoints { background: var(--bg-soft); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.92rem;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td { text-align: left; padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { background: var(--bg-soft); font-weight: 600; font-size: 0.85rem; color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+    td code { white-space: nowrap; }
+    .status-ok { color: var(--green); font-weight: 600; }
+
+    /* ---------- footer ---------- */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 3rem 0;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    footer .container { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; }
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--text); }
+
+    @media (max-width: 760px) {
+      .two-col { grid-template-columns: 1fr; }
+      .nav-links { display: none; }
+      section { padding: 3rem 0; }
+      .hero { padding: 4rem 0 2rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .t-caret::after { animation: none; }
+    }
   </style>
 </head>
 <body>
-  <h1>resetpi.com</h1>
-  <p>Product endpoints for the <strong>pir</strong> coding agent (defaults since ADR-0009; every endpoint is still overridable via <code>PIR_*</code> env vars or <code>settings.json</code>).</p>
-  <table>
-    <tr><th>Endpoint</th><th>Purpose</th></tr>
-    <tr><td><code>/api/models/providers/{id}</code></td><td>Remote model catalog overlay (38 built-in providers, ETag/304 revalidation)</td></tr>
-    <tr><td><code>/api/latest-version</code></td><td>Version check: <code>{"version","packageName","note"}</code></td></tr>
-    <tr><td><code>/api/report-install</code></td><td>Install telemetry ping (GET <code>?version=</code>)</td></tr>
-    <tr><td><code>/session/#{gistId}</code></td><td>Share viewer (redirects to the GitHub gist)</td></tr>
-    <tr><td><code>/changelog</code></td><td>Changelog page shown in the update banner</td></tr>
-  </table>
-  <p>Source: <code>deploy/resetpi/</code> in the pir repository. Regenerate with <code>python3 deploy/resetpi/scripts/generate-site.py</code>, deploy with <code>npx wrangler pages deploy deploy/resetpi --project-name=resetpi</code>.</p>
+
+<header>
+  <div class="container nav">
+    <a class="brand" href="/">
+      <span class="logo">P</span> Pir
+    </a>
+    <nav class="nav-links">
+      <a href="#features">特性</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#endpoints">端点</a>
+      <a href="/changelog">Changelog</a>
+      <!-- TODO: 填写仓库地址后启用
+      <a href="https://github.com/your-org/pir">GitHub</a>
+      -->
+      <a href="#docs">文档</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+  <!-- ================= Hero ================= -->
+  <section class="hero">
+    <div class="container">
+      <h1>用 Rust 1:1 复刻的<br><span class="accent">Pi coding agent</span></h1>
+      <p class="tagline">
+        Pir 以行为层逐字节对拍为金标准，把
+        <a href="https://github.com/earendil-works/pi">Pi</a> 完整移植到 Rust：
+        终端里的全功能 AI 编程搭档，自带 TUI、工具执行、扩展宿主与 38 个内置 provider。
+      </p>
+      <div class="badges">
+        <span class="badge"><span class="dot green"></span>MIT License</span>
+        <span class="badge"><span class="dot blue"></span>Rust</span>
+        <span class="badge"><span class="dot yellow"></span>v0.1.0</span>
+        <span class="badge"><span class="dot purple"></span>Wasm + 原生扩展</span>
+        <span class="badge"><span class="dot green"></span>零遥测可配</span>
+      </div>
+      <div class="cta">
+        <a class="btn btn-primary" href="#quickstart">快速开始</a>
+        <a class="btn btn-secondary" href="#features">了解特性</a>
+      </div>
+
+      <!-- 终端演示：与 pi 的 TUI 交互形态一致 -->
+      <div class="terminal" aria-hidden="false">
+        <div class="terminal-bar">
+          <span class="t-dot"></span><span class="t-dot"></span><span class="t-dot"></span>
+          <span class="t-title">pir — ~/develop/ai/pir</span>
+        </div>
+        <div class="terminal-body" id="demo">
+          <div class="t-line t-hidden"><span class="t-prompt t-user">ls crates/</span></div>
+          <div class="t-line t-hidden"><span class="t-dim">pir&nbsp;&nbsp;&nbsp;pir-agent&nbsp;&nbsp;&nbsp;pir-ai&nbsp;&nbsp;&nbsp;pir-tui&nbsp;&nbsp;&nbsp;pir-ext-host</span></div>
+          <div class="t-line t-hidden"><span class="t-prompt t-user">分析一下本机的 CPU 和内存配置</span></div>
+          <div class="t-line t-hidden t-thinking"><span class="t-purple">⠋ thinking…</span> <span class="t-dim">(level: high · 12s)</span></div>
+          <div class="t-line t-hidden"><span class="t-blue">bash</span><span class="t-dim"> — </span>lscpu | grep -E 'Model name|Socket' &amp;&amp; free -h</div>
+          <div class="t-line t-hidden"><span class="t-green">✓ 完成</span><span class="t-dim"> · read / bash / edit 工具可用 · 16 轮上下文已压缩</span></div>
+          <div class="t-line t-hidden"><span class="t-dim">本机为 AMD Ryzen 7 8845HS（8 核 16 线程），内存 32 GB DDR5-5600（2×16 GB）。</span></div>
+          <div class="t-line t-hidden"><span class="t-prompt t-user">把这段分析写进 notes.md 并提交</span></div>
+          <div class="t-line t-hidden"><span class="t-blue">edit</span><span class="t-dim"> notes.md · +12 −0</span><span class="t-dim"> · </span><span class="t-green">git commit ✓</span></div>
+          <div class="t-line t-caret"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Features ================= -->
+  <section class="features" id="features">
+    <div class="container">
+      <h2>为什么是 Pir</h2>
+      <p class="lead">不是"兼容实现"，而是以「行为层逐字节对拍」为验收标准的 1:1 移植——协议、session 格式、扩展 API 与 TUI 渲染均有对拍证据冻结。</p>
+      <div class="grid">
+        <div class="card">
+          <h3><span class="icon">🧩</span> 四层 crate 架构</h3>
+          <p><code>pir-ai</code> provider/适配层 · <code>pir-agent</code> agent 循环与 harness · <code>pir-tui</code> 终端渲染 · <code>pir</code> 组装与 CLI。职责清晰，可独立复用。</p>
+        </div>
+        <div class="card">
+          <h3><span class="icon">🔌</span> 扩展宿主</h3>
+          <p>双通道扩展：L1 Wasm（ABI v1）+ L0 原生动态库（abi_stable），两阶段信任加载、33 事件 / 24 API / 28 UI 方法，支持 <code>/reload</code> 热更。</p>
+        </div>
+        <div class="card">
+          <h3><span class="icon">🖥️</span> 终端原生体验</h3>
+          <p>完整 TUI：会话树、slash 命令、选择器、语法高亮（syntect）、HTML export 与 gist share。交互模式与 headless / RPC 三模式并存。</p>
+        </div>
+        <div class="card">
+          <h3><span class="icon">☁️</span> 38 个内置 provider</h3>
+          <p>OpenAI、Anthropic、DeepSeek、MiniMax、Kimi、Moonshot、Google、Bedrock…开箱即用；模型目录由本站点静态下发，支持 ETag 增量更新。</p>
+        </div>
+        <div class="card">
+          <h3><span class="icon">🔒</span> 隐私优先</h3>
+          <p>全部产品端点自托管（本站即部署源）且可逐项关闭：<code>PIR_MODEL_CATALOG_URL</code>、<code>PIR_VERSION_CHECK_URL</code>、<code>PIR_TELEMETRY_URL</code> 设 <code>off</code> 即零请求；telemetry payload 仅版本号。</p>
+        </div>
+        <div class="card">
+          <h3><span class="icon">🎯</span> 对拍纪律</h3>
+          <p>上游基线钉死（<code>external/pi/</code> + UPSTREAM.md），偏离必须立 ADR 登记；Parity Checklist 冻结协议 / session / 扩展 API / TUI 四类证据。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Quickstart ================= -->
+  <section id="quickstart">
+    <div class="container">
+      <h2>快速开始</h2>
+      <p class="lead">单二进制、零运行时依赖（musl 静态构建），从源码构建或直接使用发布产物。</p>
+      <div class="two-col">
+        <div>
+          <div class="step">
+            <h3><span class="num">1</span>构建</h3>
+            <pre><code>git clone &lt;your-repo-url&gt; pir &amp;&amp; cd pir
+cargo build --release
+./target/release/pir</code></pre>
+          </div>
+          <div class="step">
+            <h3><span class="num">2</span>配置 provider</h3>
+            <pre><code># 官方 38 个 provider 已内置，只需写自定义/覆盖：
+# ~/.pir/agent/models.json（可选）
+{"providers": {"deepseek": {
+  "apiKey": "DEEPSEEK_API_KEY",
+  "models": [{"id": "deepseek-v4-flash"}]}}}</code></pre>
+          </div>
+        </div>
+        <div>
+          <div class="step">
+            <h3><span class="num">3</span>端点自托管（可选）</h3>
+            <pre><code># 默认已指向本站；自建请见 deploy/resetpi/
+export PIR_MODEL_CATALOG_URL=https://resetpi.com
+export PIR_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
+export PIR_TELEMETRY_URL=https://resetpi.com/api/report-install</code></pre>
+          </div>
+          <div class="step">
+            <h3><span class="num">4</span>开始使用</h3>
+            <pre><code>pir                     # 交互模式
+pir --print "重构这个函数"  # headless 一次问答
+pir --rpc               # RPC 服务（32 命令）</code></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= Endpoints ================= -->
+  <section class="endpoints" id="endpoints">
+    <div class="container">
+      <h2>产品端点</h2>
+      <p class="lead">本站托管 pir 的全部产品回调；静态托管 + Pages Functions，无后端。每个端点均可在客户端用 <code>PIR_*</code> 环境变量或 <code>settings.json</code> 覆盖或关闭。</p>
+      <table>
+        <thead>
+          <tr><th>端点</th><th>用途</th><th>状态</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>/api/models/providers/{id}</code></td>
+            <td>远程模型目录 overlay——38 个内置 provider 的模型清单，ETag/304 增量 revalidate</td>
+            <td><span class="status-ok">● 运行中</span></td>
+          </tr>
+          <tr>
+            <td><code>/api/latest-version</code></td>
+            <td>版本检查（<code>{"version","packageName","note"}</code>），交互模式启动时异步探测</td>
+            <td><span class="status-ok">● 运行中</span></td>
+          </tr>
+          <tr>
+            <td><code>/api/report-install</code></td>
+            <td>install telemetry 收口（GET <code>?version=</code>），payload 仅版本号</td>
+            <td><span class="status-ok">● 运行中</span></td>
+          </tr>
+          <tr>
+            <td><code>/session/#{gistId}</code></td>
+            <td>会话分享 viewer（gist id 走 URL fragment，前端渲染）</td>
+            <td><span class="status-ok">● 运行中</span></td>
+          </tr>
+          <tr>
+            <td><code>/changelog</code></td>
+            <td>更新横幅里的 changelog 页面</td>
+            <td><span class="status-ok">● 运行中</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= Docs ================= -->
+  <section id="docs">
+    <div class="container">
+      <h2>文档与参与</h2>
+      <p class="lead">完整的需求、设计与决策记录都在仓库 <code>docs/</code> 下；所有偏离均有 ADR 背书。</p>
+      <div class="grid">
+        <div class="card">
+          <h3>📖 项目文档</h3>
+          <ul>
+            <li>需求规格（<code>docs/01-requirements.md</code>）——1:1 功能与验收里程碑</li>
+            <li>架构设计（<code>docs/02-design.md</code>）——crate 划分与核心设计</li>
+            <li>Extension ABI v1（wasm / 原生动态库）</li>
+            <li>Parity Checklist——四类对拍证据冻结</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>🤝 贡献</h3>
+          <ul>
+            <li>以 <code>external/pi/</code> 为行为金标准，改动需对拍锚定</li>
+            <li>偏离上游必须登记 ADR + 偏离表（D-xxx）</li>
+            <li>测试纪律：单元测试零网络，产品端点注入 no-op transport</li>
+            <li>MIT 许可，与上游一致</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>⚙️ 部署本站</h3>
+          <ul>
+            <li>源文件：<code>deploy/resetpi/</code>（仓库内）</li>
+            <li>重新生成：<code>python3 deploy/resetpi/scripts/generate-site.py</code></li>
+            <li>发布：<code>npx wrangler pages deploy deploy/resetpi</code></li>
+            <li>发版时同步更新 <code>/api/latest-version</code> 与 <code>/changelog</code></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="container">
+    <div>
+      <strong style="color: var(--text)">Pir</strong> · 用 Rust 复刻的 Pi coding agent
+    </div>
+    <div>
+      <a href="/changelog">Changelog</a> · <a href="#endpoints">Endpoints</a> ·
+      <!-- TODO: 填写仓库地址后启用 <a href="https://github.com/your-org/pir">GitHub</a> · -->
+      <span>MIT License</span> · 上游致谢 <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // 终端演示：逐行打字机回放，prefers-reduced-motion 时直接全显。
+  (function () {
+    var demo = document.getElementById("demo");
+    var lines = Array.prototype.slice.call(demo.children);
+    if (window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      lines.forEach(function (l) { l.classList.remove("t-hidden"); });
+      return;
+    }
+    var i = 0;
+    function showNext() {
+      if (i >= lines.length) { return; }
+      lines[i].classList.remove("t-hidden");
+      i += 1;
+      // 最后一行是光标行，保留闪烁
+      if (i >= lines.length) { return; }
+      setTimeout(showNext, i === 1 ? 500 : 900 + Math.random() * 700);
+    }
+    // 等终端进入视口附近再开始
+    if ("IntersectionObserver" in window) {
+      var io = new IntersectionObserver(function (entries) {
+        if (entries[0].isIntersecting) { showNext(); io.disconnect(); }
+      }, { rootMargin: "0px 0px -10% 0px" });
+      io.observe(demo);
+    } else {
+      setTimeout(showNext, 400);
+    }
+  })();
+</script>
 </body>
 </html>
