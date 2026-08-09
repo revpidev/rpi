@@ -138,6 +138,24 @@ impl ThinkingLevel {
             ThinkingLevel::Max => ModelThinkingLevel::Max,
         }
     }
+
+    /// Inverse of [`Self::to_model_level`]: `"off"` maps to `None`
+    /// (upstream `thinkingLevel === "off" ? undefined : thinkingLevel`),
+    /// everything else back to its [`ThinkingLevel`] variant. Used where a
+    /// [`ModelThinkingLevel`] (off-inclusive, e.g. `StreamOptions.reasoning`)
+    /// is converted into [`SimpleStreamOptions`] reasoning at the
+    /// `stream_simple` boundary.
+    pub fn from_model_level(level: ModelThinkingLevel) -> Option<Self> {
+        match level {
+            ModelThinkingLevel::Off => None,
+            ModelThinkingLevel::Minimal => Some(ThinkingLevel::Minimal),
+            ModelThinkingLevel::Low => Some(ThinkingLevel::Low),
+            ModelThinkingLevel::Medium => Some(ThinkingLevel::Medium),
+            ModelThinkingLevel::High => Some(ThinkingLevel::High),
+            ModelThinkingLevel::Xhigh => Some(ThinkingLevel::Xhigh),
+            ModelThinkingLevel::Max => Some(ThinkingLevel::Max),
+        }
+    }
 }
 
 impl ModelThinkingLevel {

@@ -78,6 +78,7 @@ fn error_step(error_message: &str) -> FauxResponseStep {
 struct SessionFixture {
     session: AgentSession,
     provider: Arc<FauxProvider>,
+    ai_provider: Arc<FauxAiProvider>,
     events: Arc<Mutex<Vec<AgentSessionEvent>>>,
     _tmp: TempDir,
 }
@@ -153,8 +154,9 @@ async fn session_fixture(
         ..Default::default()
     })
     .await;
+    let ai_provider = Arc::new(FauxAiProvider::new(provider.clone()));
     model_runtime
-        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .register_native_provider(ai_provider.clone())
         .await
         .expect("register faux provider");
 
@@ -199,9 +201,108 @@ async fn session_fixture(
     SessionFixture {
         session: created.session,
         provider,
+        ai_provider,
         events,
         _tmp: tmp,
     }
+}
+
+// ---------------------------------------------------------------------------
+// thinking 级别 → provider 请求（sdk.rs stream_simple 接线回归）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn thinking_level_reaches_provider_stream_and_lands_in_transcript() {
+    // Regression: upstream routes the agent path through `streamSimple`
+    // (sdk.ts:36/312) so `reasoning` reaches the adapters' thinking mapping;
+    // pir's pinned `StreamFn` shape (design §4.4) carries plain
+    // `StreamOptions`, so sdk.rs converts `StreamOptions.reasoning` →
+    // `SimpleStreamOptions.reasoning` at the `stream_simple` boundary. Before
+    // the fix the agent path used plain `stream`, whose adapter impls drop
+    // `reasoning` (design §3.3 maps it only in `stream_simple`), so sessions
+    // recorded no thinking blocks even with a non-off thinking level.
+    let thinking_response = || {
+        faux_assistant_message(
+            vec![
+                pir_ai::types::AssistantContent::Thinking(pir_ai::types::ThinkingContent {
+                    thinking: "hmm".to_owned(),
+                    thinking_signature: Some("sig-1".to_owned()),
+                    redacted: None,
+                }),
+                pir_ai::types::AssistantContent::Text(pir_ai::types::TextContent {
+                    text: "hi there".to_owned(),
+                    text_signature: None,
+                }),
+            ],
+            FauxAssistantOptions::default(),
+        )
+        .into()
+    };
+    let fixture = session_fixture(
+        vec![thinking_response(), thinking_response()],
+        FauxProviderOptions::default(),
+        None,
+    )
+    .await;
+
+    // 默认级别（model_resolver::DEFAULT_THINKING_LEVEL = Medium）→ 请求带
+    // Some(Medium)：修复前 plain stream 丢弃 reasoning，这里收到的永远是
+    // None。
+    fixture
+        .session
+        .prompt("hello", PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+    assert_eq!(
+        fixture
+            .ai_provider
+            .reasoning_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .copied()
+            .flatten(),
+        Some(pir_ai::types::ThinkingLevel::Medium)
+    );
+
+    // set_thinking_level(High) → 下一次请求带 Some(High)，且 thinking 块落入
+    // 会话消息（持久化/展示管线可见）。
+    fixture
+        .session
+        .set_thinking_level(pir_agent::types::ThinkingLevel::High);
+    fixture
+        .session
+        .prompt("think hard", PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    assert_eq!(
+        fixture
+            .ai_provider
+            .reasoning_seen()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .copied()
+            .flatten(),
+        Some(pir_ai::types::ThinkingLevel::High)
+    );
+
+    let messages = fixture.session.messages();
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Assistant(assistant) => Some(assistant),
+            _ => None,
+        })
+        .expect("assistant message");
+    assert!(last_assistant.content.iter().any(|block| matches!(
+        block,
+        pir_ai::types::AssistantContent::Thinking(thinking) if thinking.thinking == "hmm"
+    )));
 }
 
 // ---------------------------------------------------------------------------

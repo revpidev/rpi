@@ -62,15 +62,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// (`"off"` maps to `None`, matching upstream
 /// `thinkingLevel === "off" ? undefined : thinkingLevel`).
 pub(crate) fn thinking_level_from_model_level(level: ModelThinkingLevel) -> Option<ThinkingLevel> {
-    match level {
-        ModelThinkingLevel::Off => None,
-        ModelThinkingLevel::Minimal => Some(ThinkingLevel::Minimal),
-        ModelThinkingLevel::Low => Some(ThinkingLevel::Low),
-        ModelThinkingLevel::Medium => Some(ThinkingLevel::Medium),
-        ModelThinkingLevel::High => Some(ThinkingLevel::High),
-        ModelThinkingLevel::Xhigh => Some(ThinkingLevel::Xhigh),
-        ModelThinkingLevel::Max => Some(ThinkingLevel::Max),
-    }
+    ThinkingLevel::from_model_level(level)
 }
 
 // ---------------------------------------------------------------------------

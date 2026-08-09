@@ -322,6 +322,8 @@ Agent **不**依赖具体 provider，便于测试 faux 与 proxy。StreamFn 不�
 
 > Rust 落地注记（D-010，T05 验收）：hook 的 args 回传与错误降级经返回值通道表达（`BeforeToolCallResult.args`、`AfterToolCallFn -> Result<..>`）；`BoxStream` 无 result 通道，流无终止事件时合成 error 消息收尾；reasoning 保留在 `AgentLoopConfig` 作为活值，由 `stream_assistant_response` 每轮绑定进 `StreamOptions.reasoning`（镜像上游 `{...config, apiKey, signal}` 展开，2026-08-06 修复前未绑定导致 thinking 级别从未到达请求）；`thinking_budgets` 无 `StreamOptions` 通道、仅 anthropic 适配器消费；listener 屏障为 in-process 按注册序串行 await；`continue()` 命名 `continue_run`。详见 `docs/plan/v0.1/deviations/D-010-agent-loop-rust-notes.md`。
 >
+> Rust 落地注记（2026-08-09，T17 修复）：`StreamFn` 形状钉死为裸 `StreamOptions`，但适配器仅在 `stream_simple` 层映射 reasoning（§3.3），agent 路径若走 plain `stream` 会丢弃 `StreamOptions.reasoning`——会话因此从未记录 thinking 块（最近一次会话实测：thinking_level=max/high 而消息无 thinking 内容）。sdk.rs 的 agent stream_fn 现改为在 `stream_simple` 边界转换：`StreamOptions.reasoning`（`ModelThinkingLevel`）→ `SimpleStreamOptions.reasoning`（`ThinkingLevel::from_model_level`，off→None），并同源携带 settings `thinking_budgets`（镜像上游 sdk.ts:312 `modelRuntime.streamSimple(...)`）；compaction 走同一 stream_fn 亦受益。
+>
 > Rust 落地注记（D-013，T08 验收）：`StreamOptions` 增加 `reasoning: Option<ModelThinkingLevel>` 字段——上游 summary 调用经 `SimpleStreamOptions.reasoning` 传 thinking level，而 pir-agent 的 summary 生成直接走本节的 `StreamFn`（裸 `StreamOptions`），reasoning 通道因此落在 `StreamOptions` 上；默认 `None`，既有路径行为不变。
 
 ### 4.5 Harness 层设计要点

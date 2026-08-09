@@ -838,6 +838,11 @@ impl pir_ai::auth::ApiKeyAuth for FauxApiKeyAuth {
 pub struct FauxAiProvider {
     faux: Arc<FauxProvider>,
     provider_auth: pir_ai::auth::ProviderAuth,
+    /// Reasoning levels seen at the `stream_simple` boundary (each stream
+    /// call appends `Some(level)` or `None`), in call order. Lets tests
+    /// assert the agent path forwards the session thinking level into the
+    /// provider request (sdk.rs `stream_simple` wiring).
+    reasoning_seen: Arc<Mutex<Vec<Option<pir_ai::types::ThinkingLevel>>>>,
 }
 
 impl FauxAiProvider {
@@ -850,12 +855,18 @@ impl FauxAiProvider {
                 oauth: None,
             },
             faux,
+            reasoning_seen: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// The underlying scripted provider (response queue, counters).
     pub fn faux(&self) -> &Arc<FauxProvider> {
         &self.faux
+    }
+
+    /// Reasoning levels received by [`Self::stream_simple`], in call order.
+    pub fn reasoning_seen(&self) -> &Arc<Mutex<Vec<Option<pir_ai::types::ThinkingLevel>>>> {
+        &self.reasoning_seen
     }
 }
 
@@ -912,6 +923,10 @@ impl pir_ai::models::Provider for FauxAiProvider {
         context: &Context,
         options: Option<pir_ai::types::SimpleStreamOptions>,
     ) -> pir_ai::utils::event_stream::AssistantMessageEventStream {
+        self.reasoning_seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(options.as_ref().and_then(|simple| simple.reasoning));
         self.stream(model, context, options.map(|simple| simple.stream))
     }
 }

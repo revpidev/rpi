@@ -4,7 +4,11 @@
 //!
 //! The `setDefaultStreamFn(streamSimple)` fallback (sdk.ts:36) has no pir
 //! counterpart: the assembly layer always injects a `StreamFn`
-//! (coding-standards §4.2).
+//! (coding-standards §4.2). The injected stream fn does mirror sdk.ts:312
+//! by converting the plain-`StreamOptions` shape into
+//! `SimpleStreamOptions` at the `stream_simple` boundary (reasoning +
+//! thinking_budgets), so the agent path reaches the adapters' reasoning
+//! mapping exactly like upstream `modelRuntime.streamSimple(...)`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -390,11 +394,31 @@ pub async fn create_agent_session(
                 stream_options.max_retry_delay_ms = stream_options
                     .max_retry_delay_ms
                     .or(Some(retry.max_retry_delay_ms));
-                // `stream` (not `streamSimple`): in pir the reasoning level
-                // rides `StreamOptions.reasoning` (design §4.4 / T03); the
-                // agent loop already placed it there.
-                let stream_options_with_headers = pir_ai::models::ModelsStreamOptions {
+                // Upstream routes the agent path through `streamSimple`
+                // (sdk.ts:36/312) so `reasoning` reaches the adapters'
+                // thinking mapping; the pir `StreamFn` shape (design §4.4)
+                // carries plain `StreamOptions`, so the conversion happens
+                // here: `StreamOptions.reasoning` (bound by the agent loop
+                // each turn) → `SimpleStreamOptions.reasoning`, plus the
+                // settings `thinking_budgets` (the same source that seeds
+                // `AgentOptions.thinking_budgets` below). The plain `stream`
+                // path would drop both fields — adapter reasoning mapping
+                // lives only in `stream_simple` (design §3.3), which is why
+                // sessions recorded no thinking blocks despite a non-off
+                // thinking level.
+                let thinking_budgets = {
+                    let loader = loader.lock().unwrap_or_else(|e| e.into_inner());
+                    thinking_budgets_to_ai(loader.settings_manager().get_thinking_budgets())
+                };
+                let simple = pir_ai::types::SimpleStreamOptions {
+                    reasoning: stream_options
+                        .reasoning
+                        .and_then(pir_ai::types::ThinkingLevel::from_model_level),
+                    thinking_budgets,
                     stream: stream_options,
+                };
+                let stream_options_with_headers = pir_ai::models::ModelsSimpleStreamOptions {
+                    simple,
                     transform_headers: Some(Arc::new(move |headers| {
                         let runner = crate::core::extensions::read_runner(&runner_ref);
                         Box::pin(async move {
@@ -407,8 +431,11 @@ pub async fn create_agent_session(
                             as BoxFuture<'static, pir_ai::types::ProviderHeaders>
                     })),
                 };
-                Box::pin(model_runtime.stream(&model, &context, Some(stream_options_with_headers)))
-                    as pir_agent::BoxStream<'static, pir_ai::types::StreamEvent>
+                Box::pin(model_runtime.stream_simple(
+                    &model,
+                    &context,
+                    Some(stream_options_with_headers),
+                )) as pir_agent::BoxStream<'static, pir_ai::types::StreamEvent>
             },
         )
     };
@@ -465,13 +492,7 @@ pub async fn create_agent_session(
     agent_options.steering_mode = Some(steering_mode);
     agent_options.follow_up_mode = Some(follow_up_mode);
     agent_options.transport = Some(transport);
-    agent_options.thinking_budgets =
-        thinking_budgets.map(|budgets| pir_ai::types::ThinkingBudgets {
-            minimal: budgets.minimal.map(|v| v as u32),
-            low: budgets.low.map(|v| v as u32),
-            medium: budgets.medium.map(|v| v as u32),
-            high: budgets.high.map(|v| v as u32),
-        });
+    agent_options.thinking_budgets = thinking_budgets_to_ai(thinking_budgets);
     agent_options.max_retry_delay_ms = Some(max_retry_delay_ms);
     // Tool interception + provider response hooks read the runner at
     // execution time (agent-session.ts:459-462 `_installAgentToolHooks`), so
@@ -595,6 +616,22 @@ fn filter_tool_result_image_blocks(blocks: &mut Vec<pir_ai::types::ToolResultCon
 
 fn parse_thinking_level_str(level: &str) -> ThinkingLevel {
     crate::cli::args::parse_thinking_level(level).unwrap_or(DEFAULT_THINKING_LEVEL)
+}
+
+/// Settings `ThinkingBudgetsSettings` → pi-ai `ThinkingBudgets`. Upstream
+/// passes the settings value through `Agent.thinkingBudgets` into
+/// `SimpleStreamOptions.thinkingBudgets` (sdk.ts); the agent path here uses
+/// the same source both for `AgentOptions` and for the per-call
+/// `stream_simple` conversion.
+fn thinking_budgets_to_ai(
+    budgets: Option<crate::core::settings_manager::ThinkingBudgetsSettings>,
+) -> Option<pir_ai::types::ThinkingBudgets> {
+    budgets.map(|budgets| pir_ai::types::ThinkingBudgets {
+        minimal: budgets.minimal.map(|v| v as u32),
+        low: budgets.low.map(|v| v as u32),
+        medium: budgets.medium.map(|v| v as u32),
+        high: budgets.high.map(|v| v as u32),
+    })
 }
 
 fn thinking_level_str(level: ThinkingLevel) -> &'static str {
