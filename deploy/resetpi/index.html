@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pir — 用 Rust 1:1 复刻的 Pi coding agent</title>
-  <meta name="description" content="Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 1:1 复刻：行为层逐字节对拍一致，四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
+  <title>Pir — 源于 Pi 的 Rust coding agent</title>
+  <meta name="description" content="Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
   <style>
     :root {
       --bg: #0d1117;
@@ -320,11 +320,10 @@
   <!-- ================= Hero ================= -->
   <section class="hero">
     <div class="container">
-      <h1>用 Rust 1:1 复刻的<br><span class="accent">Pi coding agent</span></h1>
+      <h1>源于 Pi 的<br><span class="accent">Rust coding agent</span></h1>
       <p class="tagline">
-        Pir 以行为层逐字节对拍为金标准，把
-        <a href="https://github.com/earendil-works/pi">Pi</a> 完整移植到 Rust：
-        终端里的全功能 AI 编程搭档，自带 TUI、工具执行、扩展宿主与 38 个内置 provider。
+        Pir 源于 <a href="https://github.com/earendil-works/pi">Pi</a>，
+        用 Rust 完整移植的终端 AI 编程搭档：自带 TUI、工具执行、扩展宿主与 38 个内置 provider。
       </p>
       <div class="badges">
         <span class="badge"><span class="dot green"></span>MIT License</span>
@@ -364,7 +363,7 @@
   <section class="features" id="features">
     <div class="container">
       <h2>为什么是 Pir</h2>
-      <p class="lead">不是"兼容实现"，而是以「行为层逐字节对拍」为验收标准的 1:1 移植——协议、session 格式、扩展 API 与 TUI 渲染均有对拍证据冻结。</p>
+      <p class="lead">Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：继承其交互形态与扩展模型，四层 crate 清晰拆分，独立演进。</p>
       <div class="grid">
         <div class="card">
           <h3><span class="icon">🧩</span> 四层 crate 架构</h3>
@@ -387,8 +386,8 @@
           <p>全部产品端点自托管（本站即部署源）且可逐项关闭：<code>PIR_MODEL_CATALOG_URL</code>、<code>PIR_VERSION_CHECK_URL</code>、<code>PIR_TELEMETRY_URL</code> 设 <code>off</code> 即零请求；telemetry payload 仅版本号。</p>
         </div>
         <div class="card">
-          <h3><span class="icon">🎯</span> 对拍纪律</h3>
-          <p>上游基线钉死（<code>external/pi/</code> + UPSTREAM.md），偏离必须立 ADR 登记；Parity Checklist 冻结协议 / session / 扩展 API / TUI 四类证据。</p>
+          <h3><span class="icon">🌱</span> 项目来源</h3>
+          <p>由 Pi（<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>）移植而来，保留 MIT 许可；上游参考实现在 <code>external/pi/</code>，设计决策记录于 <code>docs/</code> 与 ADR。</p>
         </div>
       </div>
     </div>
@@ -484,19 +483,18 @@ pir --rpc               # RPC 服务（32 命令）</code></pre>
         <div class="card">
           <h3>📖 项目文档</h3>
           <ul>
-            <li>需求规格（<code>docs/01-requirements.md</code>）——1:1 功能与验收里程碑</li>
+            <li>需求规格（<code>docs/01-requirements.md</code>）——功能与验收里程碑</li>
             <li>架构设计（<code>docs/02-design.md</code>）——crate 划分与核心设计</li>
             <li>Extension ABI v1（wasm / 原生动态库）</li>
-            <li>Parity Checklist——四类对拍证据冻结</li>
+            <li>上游参考实现对照（<code>external/pi/</code> + <code>UPSTREAM.md</code>）</li>
           </ul>
         </div>
         <div class="card">
           <h3>🤝 贡献</h3>
           <ul>
-            <li>以 <code>external/pi/</code> 为行为金标准，改动需对拍锚定</li>
-            <li>偏离上游必须登记 ADR + 偏离表（D-xxx）</li>
+            <li>以 <code>external/pi/</code> 为参考实现，设计与决策记录于 ADR</li>
             <li>测试纪律：单元测试零网络，产品端点注入 no-op transport</li>
-            <li>MIT 许可，与上游一致</li>
+            <li>MIT 许可</li>
           </ul>
         </div>
         <div class="card">
