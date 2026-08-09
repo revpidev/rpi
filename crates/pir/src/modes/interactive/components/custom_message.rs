@@ -174,6 +174,12 @@ impl Component for CustomMessageComponent {
         self.container.invalidate();
         self.rebuild();
     }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        // `setToolsExpanded` chat walk (upstream `isExpandable` duck-typing);
+        // inherent methods win on concrete receivers, so no recursion.
+        self.set_expanded(expanded);
+    }
 }
 
 #[cfg(test)]

@@ -160,6 +160,16 @@ pub trait Component: Send {
     fn shared_children(&self) -> Option<Vec<SharedComponent>> {
         None
     }
+
+    /// Expandable-state toggle, mirroring upstream's `isExpandable`
+    /// duck-typing (`"setExpanded" in component`, interactive-mode.ts:
+    /// 176-178): the mode walks the loaded-resources and chat containers for
+    /// children with expansion state (`setToolsExpanded`,
+    /// interactive-mode.ts:4033-4048). Default: no expansion state — a no-op,
+    /// exactly like upstream components without a `setExpanded` method.
+    /// (T17 extension to the frozen contract; components with expansion state
+    /// override this and forward to their inherent `set_expanded`.)
+    fn set_expanded(&mut self, _expanded: bool) {}
 }
 
 /// Components that can receive focus and display a hardware cursor.

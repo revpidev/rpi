@@ -70,6 +70,13 @@ impl Component for ExpandableText {
     }
 
     fn invalidate(&mut self) {}
+
+    fn set_expanded(&mut self, expanded: bool) {
+        // `setToolsExpanded` walk over the loaded-resources container
+        // (upstream `isExpandable` duck-typing); inherent methods win on
+        // concrete receivers, so no recursion.
+        self.set_expanded(expanded);
+    }
 }
 
 /// The startup logo line (`logo`, interactive-mode.ts:733).

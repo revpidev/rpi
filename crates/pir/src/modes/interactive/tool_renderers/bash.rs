@@ -96,9 +96,15 @@ impl Drop for TickerGuard {
     }
 }
 
-/// `formatDuration` (bash.ts:227-229): `(ms/1000).toFixed(1)`.
+/// `formatDuration` (bash.ts:227-229): `(ms/1000).toFixed(1)`. Mirrors JS
+/// exactly: the duration is truncated to whole milliseconds first
+/// (`Date.now()` deltas are integers), and the tenths digit rounds half away
+/// from zero (`toFixed` picks the larger n on ties, e.g. 1250ms → `1.3s`;
+/// Rust's `{:.1}` would round ties to even).
 fn format_duration(duration: Duration) -> String {
-    format!("{:.1}s", duration.as_secs_f64())
+    let ms = duration.as_millis() as f64;
+    let tenths = (ms / 100.0).round();
+    format!("{:.1}s", tenths / 10.0)
 }
 
 /// `formatBashCall` (bash.ts:231-237).
@@ -452,6 +458,17 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn format_duration_matches_js_to_fixed() {
+        // Integer milliseconds with JS `toFixed(1)` semantics: half-away
+        // rounding at the tenths digit (1250ms → 1.25 → "1.3", not "1.2").
+        assert_eq!(format_duration(Duration::from_millis(1250)), "1.3s");
+        assert_eq!(format_duration(Duration::from_millis(1249)), "1.2s");
+        assert_eq!(format_duration(Duration::from_millis(50)), "0.1s");
+        assert_eq!(format_duration(Duration::from_millis(0)), "0.0s");
+        assert_eq!(format_duration(Duration::from_millis(999)), "1.0s");
     }
 
     #[test]

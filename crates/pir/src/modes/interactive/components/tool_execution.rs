@@ -645,6 +645,14 @@ impl Component for ToolExecutionComponent {
         self.self_render_container.invalidate();
         self.update_display();
     }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        // Route trait-object calls (the `set_tools_expanded` chat walk,
+        // upstream `isExpandable` duck-typing) to the inherent method;
+        // inherent methods win on concrete receivers, so this does not
+        // recurse.
+        self.set_expanded(expanded);
+    }
 }
 
 /// `convertToPng` (utils/image-convert.ts:31-48): decode any image and

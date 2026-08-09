@@ -404,6 +404,12 @@ impl Component for BashExecutionComponent {
         self.content_container.invalidate();
         self.update_display();
     }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        // `setToolsExpanded` chat walk (upstream `isExpandable` duck-typing);
+        // inherent methods win on concrete receivers, so no recursion.
+        self.set_expanded(expanded);
+    }
 }
 
 #[cfg(test)]

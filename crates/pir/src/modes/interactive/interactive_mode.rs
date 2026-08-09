@@ -583,6 +583,10 @@ impl<T: Component> Component for SharedChild<T> {
     fn invalidate(&mut self) {
         lock(&self.0).invalidate();
     }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        lock(&self.0).set_expanded(expanded);
+    }
 }
 
 /// Tree entry for a shared focusable component (selectors, T12-S5a): the
@@ -2845,15 +2849,25 @@ impl InteractiveUi {
 
     pub(crate) fn set_tools_expanded(&self, expanded: bool) {
         *lock(&self.tool_output_expanded) = expanded;
-        if let Some(header) = lock(&self.built_in_header).as_ref() {
+        // `const activeHeader = this.customHeader ?? this.builtInHeader`
+        // (interactive-mode.ts:4036-4038).
+        if let Some(header) = lock(&self.custom_header).as_ref() {
+            lock(header).set_expanded(expanded);
+        } else if let Some(header) = lock(&self.built_in_header).as_ref() {
             lock(header).set_expanded(expanded);
         }
-        // Historical chat children: upstream walks the loadedResources +
-        // chat containers for expandable children (interactive-mode.ts:
-        // 3818-3824). The local assistant/user components have no expansion
-        // state; tool components are covered below.
-        for tool in lock(&self.pending_tools).values() {
-            lock(tool).set_expanded(expanded);
+        // `setToolsExpanded` (interactive-mode.ts:4033-4048): upstream walks
+        // the loadedResources + chat containers for `isExpandable` children.
+        // Tool components stay in the chat container after execution —
+        // `pending_tools` is cleared at `tool_execution_end`/`agent_end` — so
+        // the chat walk (not the pending map) is what reaches the displayed
+        // components; components without expansion state no-op via the
+        // defaulted `Component::set_expanded`.
+        for child in lock(&self.loaded_resources_container).children.iter_mut() {
+            child.set_expanded(expanded);
+        }
+        for child in lock(&self.chat_container).children.iter_mut() {
+            child.set_expanded(expanded);
         }
         self.render_handle.request_render();
     }
@@ -4647,6 +4661,66 @@ mod tests {
         lock(&tool).set_expanded(true);
         let rendered = lock(&tool).render(60).join("\n");
         assert!(rendered.contains("a.txt"), "args updated: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn set_tools_expanded_reaches_displayed_chat_tool_after_pending_cleared() {
+        // T17 回归：`setToolsExpanded` 遍历 loaded-resources + chat 容器
+        // （interactive-mode.ts:4033-4048），而非 pending_tools —— 工具执行
+        // 结束后 `pending_tools` 已被 `tool_execution_end`/`agent_end` 清空，
+        // 只遍历 pending map 会让 ctrl+o 对已展示组件失效，且标志残留污染
+        // 后续新建组件（write 不折叠）。
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let content = (1..=15)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("hi")],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageUpdate(assistant_message(
+            vec![
+                text_content("hi"),
+                AssistantContent::ToolCall(pir_ai::types::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({
+                        "path": "a.txt",
+                        "content": content,
+                    })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                    thought_signature: None,
+                }),
+            ],
+            StopReason::Pending,
+        )));
+        ui.drain_events();
+        let tool = lock(&ui.pending_tools).get("call_1").unwrap().clone();
+
+        // Collapsed by default (10-line clamp + expand hint).
+        let collapsed = lock(&tool).render(80).join("\n");
+        assert!(collapsed.contains("(5 more lines, 15 total,"));
+        assert!(!collapsed.contains("l15"));
+
+        // `agent_end` clears the pending map; the component stays displayed.
+        lock(&ui.pending_tools).clear();
+        ui.set_tools_expanded(true);
+
+        // The displayed chat component expanded despite the cleared map.
+        let expanded = lock(&tool).render(80).join("\n");
+        assert!(expanded.contains("l15"), "expanded: {expanded}");
+        assert!(!expanded.contains("more lines"));
+        assert!(*lock(&ui.tool_output_expanded));
+
+        // And collapses back.
+        ui.set_tools_expanded(false);
+        let collapsed_again = lock(&tool).render(80).join("\n");
+        assert!(collapsed_again.contains("(5 more lines, 15 total,"));
+        assert!(!collapsed_again.contains("l15"));
     }
 
     #[tokio::test]
