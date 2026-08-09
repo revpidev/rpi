@@ -1,5 +1,5 @@
 // Generate diffWords reference vectors with the vendored jsdiff 8.0.4 for
-// the Rust port's unit tests (crates/pir/src/modes/interactive/components/diff.rs).
+// the Rust port's unit tests (crates/rpi/src/modes/interactive/components/diff.rs).
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const Diff = require("../external/pi/node_modules/diff");

@@ -30,7 +30,7 @@ coding-agent 主路径的 12 条会话行为修正整体落地。核心难点是
 8. **teardown 先 abort 持久化**（R3.4.9）：先 `await session.abort()` 再发 `session_shutdown`；session 发现支持 symlink 目录
 9. **扩展事件总线退订**（R3.4.10）：`invalidate()` 统一退订
 10. **杂项**（R3.4.11/R3.4.12）：bash `PI_*` 提示软化文案；find 相对化重写（trailing separator、Windows `[/\\]`）；管理 HTTP `fetch_with_retry()`（408/425/429/5xx + 总超时预算，仅 version-check/catalog/managed-tool/package）
-11. **`AI_AGENT=pir`** 子进程环境（R3.2.5，按 APP_NAME 派生惯例）
+11. **`AI_AGENT=rpi`** 子进程环境（R3.2.5，按 APP_NAME 派生惯例）
 
 ### Out
 

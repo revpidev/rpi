@@ -1,6 +1,6 @@
-# Pir v0.11 变更需求规格说明书（对齐 Pi v0.84.1）
+# Rpi v0.11 变更需求规格说明书（对齐 Pi v0.84.1）
 
-> 本文档是 [`../01-requirements.md`](../01-requirements.md)（v0.1 基线）的**增量变更需求**，定义 pir 从 Pi v0.82.1 基线升级到 v0.84.1+ 基线所需的功能与行为变更。
+> 本文档是 [`../01-requirements.md`](../01-requirements.md)（v0.1 基线）的**增量变更需求**，定义 rpi 从 Pi v0.82.1 基线升级到 v0.84.1+ 基线所需的功能与行为变更。
 > 未在本文档出现的 v0.1 需求继续有效。
 > 对照源：`external/pi` @ `4181f66`（v0.84.1+，2026-08-08），旧基线 `2efa728`（v0.82.1）。跨度 461 commits / 655 文件（+59396/−15144 行）。
 > 上游版本节奏：v0.82.1 → v0.83.0（2026-07-29）→ v0.84.0（2026-08-06，破坏性大版本）→ v0.84.1（2026-08-07）→ 少量 Unreleased。
@@ -31,20 +31,20 @@
 |----|------|------|
 | `packages/server` 重写版 + `pi-protocol` + `pi-client` | **[DEFER]** | v0.1 已排除 server（ADR-0003）；上游 RemoteSession 尚未接入 CLI/TUI，仅是库导出。记录为缺口，待上游接入主流程后再评估 |
 | 旧 server 协议（JSON-lines IPC/spawn/supervisor/Radius） | **删除**（如已复刻） | 上游 `05bf9df65` 已全删，无兼容期 |
-| `session-backends/sqlite-node` | **[DEFER]** | v0.1 已排除 SQLite 存储；pir 仅 JSONL。v4 SQLite schema（writer lease、FTS5 trigram 等）暂不复刻 |
-| `packages/telemetry` | **[DEFER]**（保留字段占位） | pir-ai 的请求选项类型保留 `telemetryContext` 等价字段；不实现遥测管线 |
+| `session-backends/sqlite-node` | **[DEFER]** | v0.1 已排除 SQLite 存储；rpi 仅 JSONL。v4 SQLite schema（writer lease、FTS5 trigram 等）暂不复刻 |
+| `packages/telemetry` | **[DEFER]**（保留字段占位） | rpi-ai 的请求选项类型保留 `telemetryContext` 等价字段；不实现遥测管线 |
 | `packages/evals` comparative 体系 | **[DEFER]** | 评测基建非产品行为；其 session 快照归档格式可作对拍参考 |
-| harness v2 运行时（prompt/steer/abort 等） | **[VARIANT]**：pir 保持 v1 语义 | 上游 v2 运行时未实现（仅 scaffold，操作全部 reject `HarnessNotImplemented`），且设计文档明确 D0 将重写 record 契约。**当前没有可对拍的上游运行时**，pir-agent 的 harness 层以 v0.1 已实现的 v1 语义为准，待上游 H0+ 落地后再对齐 |
-| session v4 lane 存储契约 | **[DEFER]**（见 §4.3） | v4 只存在于 agent 包 harness 层；coding-agent 主路径 SessionManager JSONL 格式**未变**（v3，仅 3 行改动）。pir 主路径对拍不受影响 |
+| harness v2 运行时（prompt/steer/abort 等） | **[VARIANT]**：rpi 保持 v1 语义 | 上游 v2 运行时未实现（仅 scaffold，操作全部 reject `HarnessNotImplemented`），且设计文档明确 D0 将重写 record 契约。**当前没有可对拍的上游运行时**，rpi-agent 的 harness 层以 v0.1 已实现的 v1 语义为准，待上游 H0+ 落地后再对齐 |
+| session v4 lane 存储契约 | **[DEFER]**（见 §4.3） | v4 只存在于 agent 包 harness 层；coding-agent 主路径 SessionManager JSONL 格式**未变**（v3，仅 3 行改动）。rpi 主路径对拍不受影响 |
 
 ### 1.3 验收基线
 
 - 对拍基准以 **v0.84.1（`4181f66`）为唯一基准**，不参考中间版本（TUI fullscreen 在周期内经历过一次整体回退重做）。
-- 上游新增的对拍素材（可直接移植为 pir 测试期望）：`test/regressions/7290-json-stream-linear`、`mistral-http-transport.test.ts`、`openai-responses-terminal-event.test.ts`、`google-shared-signed-empty-blocks.test.ts`、`anthropic-sse-parsing`、`sampling-options.test.ts`、`fetch-option.test.ts`、`validation`（nullable union）、`tui-alt-screen.test.ts`（1067 行）、`latex.test.ts`（483 行）。
+- 上游新增的对拍素材（可直接移植为 rpi 测试期望）：`test/regressions/7290-json-stream-linear`、`mistral-http-transport.test.ts`、`openai-responses-terminal-event.test.ts`、`google-shared-signed-empty-blocks.test.ts`、`anthropic-sse-parsing`、`sampling-options.test.ts`、`fetch-option.test.ts`、`validation`（nullable union）、`tui-alt-screen.test.ts`（1067 行）、`latex.test.ts`（483 行）。
 
 ---
 
-## 2. pir-ai 变更需求（↔ packages/ai）
+## 2. rpi-ai 变更需求（↔ packages/ai）
 
 ### 2.1 消息与类型扩展 **[BREAKING][PARITY]**
 
@@ -56,7 +56,7 @@
 
 ### 2.2 Deferred / background 请求（上游 v0.84.0 最大新能力，DRAFT 状态）
 
-- R2.2.1 **[DEFER]**：`SimpleStreamOptions.deferred`、`fetchDeferred()/cancelDeferred()`、`DeferredHandle`（provider/modelId/api/id/expiresAt/pollAfterMs/data）、`wait` 长轮询语义、lazy 能力声明。上游尚处 DRAFT（#7339），仅 OpenAI background mode；pir v0.11 只落地 R2.1.1/R2.1.2 的类型字段与序列化兼容，不实现请求生命周期。
+- R2.2.1 **[DEFER]**：`SimpleStreamOptions.deferred`、`fetchDeferred()/cancelDeferred()`、`DeferredHandle`（provider/modelId/api/id/expiresAt/pollAfterMs/data）、`wait` 长轮询语义、lazy 能力声明。上游尚处 DRAFT（#7339），仅 OpenAI background mode；rpi v0.11 只落地 R2.1.1/R2.1.2 的类型字段与序列化兼容，不实现请求生命周期。
 - R2.2.2 faux provider 对拍面：若 v0.11 实现对拍，需覆盖 pending/ready/failed/cancelled 四态（随 R2.2.1 一并 deferred）。
 
 ### 2.3 流终止语义修正 **[PARITY]（对拍差异高发区）**
@@ -102,18 +102,18 @@
 
 ### 2.8 类型结构（非运行时）
 
-- R2.8.1 `StreamOptions` 拆分为 `ProviderRequestOptions`（signal/telemetryContext/apiKey/fetch/env/onPayload/onResponse/headers/timeoutMs/maxRetries/maxRetryDelayMs）+ `StreamOptions`；pir 对应 Rust 类型做同等分层。
+- R2.8.1 `StreamOptions` 拆分为 `ProviderRequestOptions`（signal/telemetryContext/apiKey/fetch/env/onPayload/onResponse/headers/timeoutMs/maxRetries/maxRetryDelayMs）+ `StreamOptions`；rpi 对应 Rust 类型做同等分层。
 
 ---
 
-## 3. pir 主路径变更需求（↔ packages/coding-agent）
+## 3. rpi 主路径变更需求（↔ packages/coding-agent）
 
 ### 3.1 JSON/RPC `message_update` 线格式重构 **[BREAKING][PARITY]（最高优先级）**
 
 - R3.1.1 `message_update` 事件**移除**累积 `message` 字段与 `assistantMessageEvent.partial`，只发增量 delta（`contentIndex` + `delta`）；消费方在 `message_start`/`message_end` 间自行拼装，`message_end.message` 为权威终态（`a4475344f`，修复 #7290 二次方输出）。
 - R3.1.2 实现对应 `toJsonEvent()`（print-mode 与 rpc-mode 共用同一转换）；`RpcClient` 事件类型同步为 delta 形态。
 - R3.1.3 **stdout backpressure**：print/rpc 模式写出前等待 `waitForRawStdoutBackpressure()` 等价物，防止大输出拖垮管道。
-- R3.1.4 pir 的 RPC 文档与 fixtures 同步更新；`start`/`done`/`error` delta 类型从 RPC 文档表删除。
+- R3.1.4 rpi 的 RPC 文档与 fixtures 同步更新；`start`/`done`/`error` delta 类型从 RPC 文档表删除。
 
 ### 3.2 UI 模式：fullscreen TUI **[PARITY]（周期最大工程）**
 
@@ -121,12 +121,12 @@
 - R3.2.2 运行时经 `/settings` 热切换渲染器（保留组件树重挂载 + 渲染状态 capture/restore）。
 - R3.2.3 配套设置：`fullscreenExitOutput`（`transcript`|`resume-hint`，退出打印完整 transcript 或仅 resume 提示）、`fullscreenScrollbar`（`auto`|`always`|`hidden`）、`scrollbarThumb` 主题色。
 - R3.2.4 全屏交互：sticky editor/footer dock、独立滚动 transcript、可拖拽滚动条、PageUp/Down（4 行重叠）与 Home/End 导航、OSC 133 prompt 跳转（`ctrl+shift+up/down`）、半页滚动 action、双/三击选择、堆叠式 flash 通知。
-- R3.2.5 子进程环境新增 **`AI_AGENT=pi`**（pir 侧为 `AI_AGENT=pir`，按 APP_NAME 派生惯例）。
+- R3.2.5 子进程环境新增 **`AI_AGENT=pi`**（rpi 侧为 `AI_AGENT=rpi`，按 APP_NAME 派生惯例）。
 
 ### 3.3 渲染与内容
 
-- R3.3.1 **Mermaid 渲染**：`markdown.mermaid` 设置（`off`|`final`|`streaming`，默认 streaming）。上游依赖 grok-mermaid（TS），其本身是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）`xai-grok-markdown/src/mermaid.rs` 的移植——pir 直接移植该 Rust 原作（设计 §5.6），无 [VARIANT] 缺口。
-- R3.3.2 **LaTeX 渲染**：继承 pir-tui 的 Unicode math（见 §5.4）。
+- R3.3.1 **Mermaid 渲染**：`markdown.mermaid` 设置（`off`|`final`|`streaming`，默认 streaming）。上游依赖 grok-mermaid（TS），其本身是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）`xai-grok-markdown/src/mermaid.rs` 的移植——rpi 直接移植该 Rust 原作（设计 §5.6），无 [VARIANT] 缺口。
+- R3.3.2 **LaTeX 渲染**：继承 rpi-tui 的 Unicode math（见 §5.4）。
 - R3.3.3 扩展 API `pi.registerMarkdownTransformer()`：链式、宽度感知（context 含 `messageType`/`isStreaming`/`availableWidth`），作用于 assistant/user/thinking 渲染。
 
 ### 3.4 Agent 会话行为 **[PARITY]**
@@ -157,7 +157,7 @@
 
 ### 3.7 包管理
 
-- R3.7.1 git 包安装容错：`git clean` 失败后检测缺失依赖重装；安装失败清理残留；`.pi-update-incomplete` marker 续传（pir 侧 `.pir-update-incomplete`）。
+- R3.7.1 git 包安装容错：`git clean` 失败后检测缺失依赖重装；安装失败清理残留；`.pi-update-incomplete` marker 续传（rpi 侧 `.rpi-update-incomplete`）。
 - R3.7.2 `readPiManifest()`：package.json `pi` 字段解析独立化 + 类型校验。
 
 ### 3.8 远程 session 客户端栈 **[DEFER]**
@@ -166,7 +166,7 @@
 
 ---
 
-## 4. pir-agent 变更需求（↔ packages/agent）
+## 4. rpi-agent 变更需求（↔ packages/agent）
 
 ### 4.1 Agent 循环微行为 **[PARITY]（对拍面小，全部需做）**
 
@@ -182,21 +182,21 @@
 ### 4.3 会话存储 v4（lane-based） **[DEFER，部分跟踪]**
 
 - R4.3.1 上游 v4（header `{kind:"header",version:4,...}` + 共享 seq 的 `entry|record|lane|fact` 行、7 种 Entry、9 种 LaneRecord、原子发布、torn-tail 截断恢复、id 按 cwd 作用域、`FileSystem.renameFile()` 必选）**仅属于 agent 包 harness 层**；coding-agent 主路径 SessionManager 格式未变。
-- R4.3.2 pir v0.11 决策：主路径 SessionManager 继续对拍 v3（无变化）；pir-agent harness 存储**保持 v1 语义**（上游 v2 运行时未落地，record 契约还将被 D0 重写，现在复刻等于对拍一个过渡态）。**例外**：`FileSystem` 等价 trait 预留 `rename_file()`（原子发布是确定性收益）。
-- R4.3.3 若未来跟进 v4：三后端一致性套件 `session/testing/conformance.ts`（1016 行）是对拍蓝本；注意上游 v4 repo **读不了 v3 文件**（J4/J5 归一化未实现），pir 若需读旧会话须自建迁移。
+- R4.3.2 rpi v0.11 决策：主路径 SessionManager 继续对拍 v3（无变化）；rpi-agent harness 存储**保持 v1 语义**（上游 v2 运行时未落地，record 契约还将被 D0 重写，现在复刻等于对拍一个过渡态）。**例外**：`FileSystem` 等价 trait 预留 `rename_file()`（原子发布是确定性收益）。
+- R4.3.3 若未来跟进 v4：三后端一致性套件 `session/testing/conformance.ts`（1016 行）是对拍蓝本；注意上游 v4 repo **读不了 v3 文件**（J4/J5 归一化未实现），rpi 若需读旧会话须自建迁移。
 
 ### 4.4 Harness v2 事件/遥测 **[DEFER]**
 
-- R4.4.1 `HarnessEventBus`（`run_start`/`run_end` + watch 缓冲）已落地但未从包入口导出（上游 I2 工作包保留中）；pir 待上游完成再对齐。
+- R4.4.1 `HarnessEventBus`（`run_start`/`run_end` + watch 缓冲）已落地但未从包入口导出（上游 I2 工作包保留中）；rpi 待上游完成再对齐。
 - R4.4.2 遥测 schema（`AI_TELEMETRY_SCHEMA` / `HARNESS_TELEMETRY_SCHEMA` 11 种 span）是稳定输入，但运行时插桩未落地；随 telemetry 整体 defer。
 
 ---
 
-## 5. pir-tui 变更需求（↔ packages/tui）
+## 5. rpi-tui 变更需求（↔ packages/tui）
 
 ### 5.1 渲染架构重构 **[BREAKING]**
 
-- R5.1.1 `TUI` 从具体类变为**接口 + 抽象基类 + 双渲染器**：`TuiBase`（输入分发、overlay 栈、渲染调度、颜色查询）+ `TuiMainScreen`（旧差分渲染，逐行等价已验证）+ `TuiAltScreen`（全屏渲染）。pir 对应 trait 化。
+- R5.1.1 `TUI` 从具体类变为**接口 + 抽象基类 + 双渲染器**：`TuiBase`（输入分发、overlay 栈、渲染调度、颜色查询）+ `TuiMainScreen`（旧差分渲染，逐行等价已验证）+ `TuiAltScreen`（全屏渲染）。rpi 对应 trait 化。
 - R5.1.2 `stop(options)` 参数化：`preserveScreen: true` 时 main-screen 不写光标归位序列、alt-screen 直接退出不重打文档。
 - R5.1.3 `captureRenderState()/restoreRenderState()`（main-screen 7 个渲染状态字段）支持无重放模式切换；`ViewportTUI`/`setLayoutRoot`。
 - R5.1.4 输入监听器类型更名 `InputListener` → `TuiInputListener`；`compositeTuiLine` 提升为公共函数。
@@ -213,7 +213,7 @@
 ### 5.3 既有行为修正 **[PARITY]**
 
 - R5.3.1 **键盘输入不再受 16ms 节流**：输入转发后走立即渲染路径（渲染帧时序变化，逐帧对拍基线需重录）。
-- R5.3.2 **grapheme 宽度算法更新**（#6987）：`Spacing_Mark` 减 `\u1734 \u302E \u302F` 例外 + 12 个非间距例外字符；连字簇中 mark 后 Indic 辅音、半/全宽 forms（0xFF00-0xFFEF）、泰/老挝 AM 元音逐个 +1；无基字符 spacing mark 按码点数计宽。**pir 的 wcwidth 逻辑须精确对齐例外表**（影响 truncate/换行/布局/光标列）。
+- R5.3.2 **grapheme 宽度算法更新**（#6987）：`Spacing_Mark` 减 `\u1734 \u302E \u302F` 例外 + 12 个非间距例外字符；连字簇中 mark 后 Indic 辅音、半/全宽 forms（0xFF00-0xFFEF）、泰/老挝 AM 元音逐个 +1；无基字符 spacing mark 按码点数计宽。**rpi 的 wcwidth 逻辑须精确对齐例外表**（影响 truncate/换行/布局/光标列）。
 - R5.3.3 `truncateToWidth` 截断时若前缀处于活跃超链接，省略号前插入 OSC 8 关闭序列（#7657）；纯文本前缀跳过 OSC 8 扫描。
 - R5.3.4 颜色方案报告批量解析：`^(?:\x1b\[\?997;(1|2)n)+$`。
 - R5.3.5 终端进度清除序列修正：`\x1b]9;4;0;\x07` → `\x1b]9;4;0\x07`。
@@ -229,11 +229,11 @@
 
 ### 5.5 性能
 
-- R5.5.1 整行 box 直接引用源行渲染（分配减少 9–18x，`18dee5f0a`）；以 `render-churn-bench.ts` 场景为 pir 基准参考。
+- R5.5.1 整行 box 直接引用源行渲染（分配减少 9–18x，`18dee5f0a`）；以 `render-churn-bench.ts` 场景为 rpi 基准参考。
 
 ---
 
-## 6. 扩展 API 面变更汇总 **[BREAKING]（pir-ext-sdk / pir-ext-host 同步）**
+## 6. 扩展 API 面变更汇总 **[BREAKING]（rpi-ext-sdk / rpi-ext-host 同步）**
 
 | 变更 | 说明 |
 |------|------|
@@ -249,7 +249,7 @@
 | `ResourceLoader` 新增方法 | 见 R3.5.3 |
 | 工具 system prompt 贡献外露 | bash/find/edit/read/write/grep/ls 各导出 `xxxToolSystemPromptContribution` 常量 |
 | TUI 类型面 | `new TUI()` → `TuiMainScreen`；`TuiMode`/`TuiStopOptions`/`ViewportTUI` |
-| TypeBox 1.1.38 → 1.3.7 | 移除 `Type.Base/Awaited/Promise/AsyncIterator/Iterator/Options`、`Value.Mutate`；修复 nullable 数组校验（pir 的 Wasm 扩展参数校验逻辑同步） |
+| TypeBox 1.1.38 → 1.3.7 | 移除 `Type.Base/Awaited/Promise/AsyncIterator/Iterator/Options`、`Value.Mutate`；修复 nullable 数组校验（rpi 的 Wasm 扩展参数校验逻辑同步） |
 
 ---
 

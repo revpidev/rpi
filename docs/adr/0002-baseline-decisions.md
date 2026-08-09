@@ -27,14 +27,14 @@
 
 - 本地目录 / 路径安装  
 - 可分发的包格式（Wasm 包为主；Rust 动态库为可选高级路径）  
-- 全局 `~/.pir/agent/` 与项目 `.pir/` 安装位置  
+- 全局 `~/.rpi/agent/` 与项目 `.rpi/` 安装位置  
 - 启用/禁用与发现规则  
 
 **不做**：安装并执行现有 npm TS `pi-package` 扩展代码。声明式资源（skills/prompts/themes）的包分发仍应对齐文件布局。
 
 ### 3. TUI 为交付硬性要求
 
-Interactive TUI 是产品必达能力，不是可选后期。实施上仍可 **并行** 先打通 agent/session/RPC，但 **parity / 首个完整版本** 必须包含与 Pi 同构的交互模式（`pir-tui` + interactive mode）。
+Interactive TUI 是产品必达能力，不是可选后期。实施上仍可 **并行** 先打通 agent/session/RPC，但 **parity / 首个完整版本** 必须包含与 Pi 同构的交互模式（`rpi-tui` + interactive mode）。
 
 ### 4. Token 估算与 Pi 完全一致
 
@@ -44,12 +44,12 @@ compaction、context usage、overflow 判断等使用的 token 估算，须与�
 
 - 发布物为 **单一可执行文件**（优先静态/自包含，如 musl + rustls）  
 - **Wasm 扩展运行时嵌入主二进制**（例如 wasmtime），用户无需另装 runtime  
-- 扩展 Wasm 模块本身仍可按需从 `~/.pir` 加载；runtime 不外置  
+- 扩展 Wasm 模块本身仍可按需从 `~/.rpi` 加载；runtime 不外置  
 
 ### 6. Session：不做 Pi 路径迁移
 
-- 仅使用 `~/.pir/agent/sessions/`（及配置的 sessionDir）  
-- **不提供** `~/.pi` → `~/.pir` 自动/半自动迁移工具  
+- 仅使用 `~/.rpi/agent/sessions/`（及配置的 sessionDir）  
+- **不提供** `~/.pi` → `~/.rpi` 自动/半自动迁移工具  
 - JSONL **格式**仍与 Pi 对齐（便于有需要时手工拷贝）  
 
 ### 7. 第一版存储：仅 JSONL

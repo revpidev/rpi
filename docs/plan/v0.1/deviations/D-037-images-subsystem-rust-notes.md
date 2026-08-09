@@ -12,7 +12,7 @@
 
 ## 实际实现与偏离原因
 
-移植范围：`packages/ai/src/{images,images-models,image-models,images-api-registry}.ts`、`image-models.generated.ts`、`providers/images/register-builtins.ts`、`providers/openrouter-images.ts`、`providers/all.ts` 的图像半区（`builtinImagesProviders`/`builtinImagesModels`）、`api/openrouter-images.ts`（+`.lazy.ts` 意图）、`types.ts` 图像类型。落地为 `crates/pir-ai/src/images.rs` + `images/` 目录（`generated.rs` / `image_models.rs` / `images_api_registry.rs` / `images_models.rs` / `providers.rs` + `providers/{register_builtins,openrouter_images}.rs`）、`crates/pir-ai/src/api/openrouter_images.rs`，类型入 `types.rs`。测试：`images_models.rs` / `openrouter_images.rs` 文件内单测 + `crates/pir-ai/tests/images.rs`（14 用例，loopback HTTP，覆盖 `openrouter-images.test.ts`、`images-models.test.ts` 与 `image-model-data.test.ts` 意图）。
+移植范围：`packages/ai/src/{images,images-models,image-models,images-api-registry}.ts`、`image-models.generated.ts`、`providers/images/register-builtins.ts`、`providers/openrouter-images.ts`、`providers/all.ts` 的图像半区（`builtinImagesProviders`/`builtinImagesModels`）、`api/openrouter-images.ts`（+`.lazy.ts` 意图）、`types.ts` 图像类型。落地为 `crates/rpi-ai/src/images.rs` + `images/` 目录（`generated.rs` / `image_models.rs` / `images_api_registry.rs` / `images_models.rs` / `providers.rs` + `providers/{register_builtins,openrouter_images}.rs`）、`crates/rpi-ai/src/api/openrouter_images.rs`，类型入 `types.rs`。测试：`images_models.rs` / `openrouter_images.rs` 文件内单测 + `crates/rpi-ai/tests/images.rs`（14 用例，loopback HTTP，覆盖 `openrouter-images.test.ts`、`images-models.test.ts` 与 `image-model-data.test.ts` 意图）。
 
 逐项差异：
 

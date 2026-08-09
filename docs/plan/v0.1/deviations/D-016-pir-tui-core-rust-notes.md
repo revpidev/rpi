@@ -1,4 +1,4 @@
-# D-016：pir-tui 核心引擎移植 Rust 落地差异（native 绑定缺失两功能缺口 / 定时器显式 deadline / 所有权与重入 / 组件实现细节）
+# D-016：rpi-tui 核心引擎移植 Rust 落地差异（native 绑定缺失两功能缺口 / 定时器显式 deadline / 所有权与重入 / 组件实现细节）
 
 > 复制本模板为 `D-NNN-<short-slug>.md` 并填写。登记说明见 [README.md](./README.md)。
 
@@ -9,7 +9,7 @@
 
 ## 原文档约定
 
-- 文档与章节：`docs/01-requirements.md` §8.6（TUI 引擎：渲染管线、输入、终端特例、终端自省四件套）、`docs/02-design.md` §5（pir-tui 设计：Component/Focusable、crossterm 后端、不引入 ratatui）、§12（模块映射表）、`docs/plan/v0.1/T11-pir-tui-core.md`（设计细化）
+- 文档与章节：`docs/01-requirements.md` §8.6（TUI 引擎：渲染管线、输入、终端特例、终端自省四件套）、`docs/02-design.md` §5（rpi-tui 设计：Component/Focusable、crossterm 后端、不引入 ratatui）、§12（模块映射表）、`docs/plan/v0.1/T11-rpi-tui-core.md`（设计细化）
 - 原文约定：渲染管线各步顺序锁定 + 16ms 节流 + 全量回退条件全集；键位全部来自默认表/JSON 配置无硬编码（shift+ctrl+d = /debug 为登记例外）；终端恢复是硬性正确性要求；tmux.md / terminal-setup.md 转义序列字节级对拍；终端特例框架按上游移植——Windows Terminal（Ctrl+Backspace 启发、VT input）、Apple Terminal（Shift+Enter 归一化、原生修饰键检测）、Termux、Ghostty、WezTerm 各特例。
 
 ## ⚠ 功能缺口（行为级，须立 ADR）
@@ -26,7 +26,7 @@
   `packages/tui/src/terminal.ts` 的 Apple Terminal 特例依赖它：Terminal.app 对
   `Shift+Enter` 仍发 plain `\r` 时，若本地检测到 Shift 按下，把 `\r` 归一化为
   `\x1b[13;2u`（terminal-setup.md §Apple Terminal）。
-- pir 无等价原生绑定，`native_modifiers.rs::is_native_modifier_pressed` **恒返回 false**
+- rpi 无等价原生绑定，`native_modifiers.rs::is_native_modifier_pressed` **恒返回 false**
   （= 上游 addon 不可用时的行为）。`terminal.rs::forward_input_sequence` /
   `normalize_apple_terminal_input` 已按上游接线（含 `is_apple_terminal_session`
   TERM_PROGRAM 判定），但归一化分支在 macOS 上永不触发。
@@ -41,7 +41,7 @@
 - 上游 `packages/tui/src/terminal.ts` 加载原生 helper（`win32-console-mode.node`，
   terminal.ts:338-366）设置 `ENABLE_VIRTUAL_TERMINAL_INPUT`，使 Shift+Tab 等
   修饰键以转义序列到达应用（terminal-setup.md §Windows Terminal 依赖此能力）。
-- pir 无等价原生 helper，且 crossterm raw mode 不设置该 flag，
+- rpi 无等价原生 helper，且 crossterm raw mode 不设置该 flag，
   `terminal.rs` :41-45 登记：Windows 上 Shift+Tab 仍为 plain `\t`（与 Tab 不可区分）。
 - 行为级理由：在 Windows 上，`shift+tab` 键位（如 `tui.select` 反向移动/补全反向循环）
   无法触发，与上游不一致；影响 TUI 键位行为对拍契约。
@@ -151,7 +151,7 @@
     :11-13）；Base64 用严格引擎（Node 忽略非字母表字符，脏输入返回 None，
     :14-17）；`encodeITerm2` 的 `number|string` 参数建模为 `Option<String>`
     （:18-19）。
-30. **Unicode 基元差异**：上游正则跑在 ICU 76（Node 24）上，pir 用运行时探测
+30. **Unicode 基元差异**：上游正则跑在 ICU 76（Node 24）上，rpi 用运行时探测
     + Unicode 16.0 官方文件核验生成的静态表（utils.rs :7-19）；`Intl.Segmenter`
     → `unicode-segmentation` 1.13.x（UAX #29，全语料对 ICU 76 核验，:20-25）；
     ANSI strip 按字符而非 UTF-16 码元（等价，:26-29）；宽度缓存
@@ -173,22 +173,22 @@
     cancellable_loader.rs :5-9）；Escape 取消经 `Keybinding::SelectCancel` 走
     KeybindingsManager，无硬编码键位（:10-12）。
 
-## 环境变量 `PIR_` 前缀改名（不算偏离，说明依据）
+## 环境变量 `RPI_` 前缀改名（不算偏离，说明依据）
 
-pir-tui 全部环境变量按 ADR-0001 改名（tui.rs :63-70、terminal.rs :57-62）：
+rpi-tui 全部环境变量按 ADR-0001 改名（tui.rs :63-70、terminal.rs :57-62）：
 
-| 上游 | pir | 依据 |
+| 上游 | rpi | 依据 |
 |------|-----|------|
-| `PI_HARDWARE_CURSOR` | `PIR_HARDWARE_CURSOR` | ADR-0001 §2（环境变量前缀 `PIR_*`） |
-| `PI_CLEAR_ON_SHRINK` | `PIR_CLEAR_ON_SHRINK` | 同上 |
-| `PI_DEBUG_REDRAW` | `PIR_DEBUG_REDRAW` | 同上 |
-| `PI_TUI_DEBUG` | `PIR_TUI_DEBUG` | 同上 |
-| `PI_CODING_AGENT_DIR` | `PIR_CODING_AGENT_DIR` | 同上 |
-| `PI_TUI_WRITE_LOG` | `PIR_TUI_WRITE_LOG` | 同上（terminal.rs :96，与 `pir::core::environment` 镜像，pir-tui 不依赖 pir crate） |
+| `PI_HARDWARE_CURSOR` | `RPI_HARDWARE_CURSOR` | ADR-0001 §2（环境变量前缀 `RPI_*`） |
+| `PI_CLEAR_ON_SHRINK` | `RPI_CLEAR_ON_SHRINK` | 同上 |
+| `PI_DEBUG_REDRAW` | `RPI_DEBUG_REDRAW` | 同上 |
+| `PI_TUI_DEBUG` | `RPI_TUI_DEBUG` | 同上 |
+| `PI_CODING_AGENT_DIR` | `RPI_CODING_AGENT_DIR` | 同上 |
+| `PI_TUI_WRITE_LOG` | `RPI_TUI_WRITE_LOG` | 同上（terminal.rs :96，与 `rpi::core::environment` 镜像，rpi-tui 不依赖 rpi crate） |
 
-同族路径/文件改名（同为 ADR-0001）：默认日志目录 `~/.pir/agent`（上游 `~/.pi/agent`）、
-`pir-debug.log`/`pir-crash.log`（上游 `pi-debug.log`/`pi-crash.log`）、`PIR_TUI_DEBUG`
-dump 目录 `/tmp/pir-tui`（上游 `/tmp/tui`）。terminal.rs 写日志时间戳目录名用 UTC
+同族路径/文件改名（同为 ADR-0001）：默认日志目录 `~/.rpi/agent`（上游 `~/.pi/agent`）、
+`rpi-debug.log`/`rpi-crash.log`（上游 `pi-debug.log`/`pi-crash.log`）、`RPI_TUI_DEBUG`
+dump 目录 `/tmp/rpi-tui`（上游 `/tmp/tui`）。terminal.rs 写日志时间戳目录名用 UTC
 （无本地时区 crate 依赖，terminal.rs :57-59）。
 
 ## 影响面
@@ -206,11 +206,11 @@ TUI 行为 / 无（纯内部）双类标注：
 
 - **回写位置**：`docs/01-requirements.md` §8.6（终端特例小节「native 绑定缺失」注记）、
   `docs/02-design.md` §5（§5.2 核心抽象落地：默认方法 / SharedComponent / 重入队列 /
-  定时器显式化；§5.3 调试环境变量；§5.4 `PIR_` 前缀与显式 deadline；§5.5 组件落地标注；
+  定时器显式化；§5.3 调试环境变量；§5.4 `RPI_` 前缀与显式 deadline；§5.5 组件落地标注；
   §5.6 终端状态恢复）、§12（映射表 tui.rs / terminal.rs / stdin_buffer.rs / keys.rs /
   keybindings.rs / native_modifiers.rs / terminal_colors.rs / terminal_image.rs /
   fuzzy.rs / utils.rs / recovery.rs / components 逐文件行）、`docs/coding-standards.md`
-  §8.2（trait 草图同步）、`docs/plan/v0.1/T11-pir-tui-core.md`（偏离记录表 + 自测清单）
+  §8.2（trait 草图同步）、`docs/plan/v0.1/T11-rpi-tui-core.md`（偏离记录表 + 自测清单）
 - **回写日期**：2026-08-05
 - **ADR**：行为级两条 → [ADR-0004](./adr/0004-platform-native-helper-gaps.md)（已采纳）；
   实现细节「不需要」

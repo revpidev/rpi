@@ -10,7 +10,7 @@
 （`packages/coding-agent/src/modes/interactive/interactive-mode.ts:4816/4830` @ 0.82.1）：
 resume 到**不同 cwd** 的会话时在 TUI 内弹信任选择器，选定后立即生效并重载资源。
 
-T14（W4）接线信任决策链时发现：pir 的 `switch_session` 无此参数，T12 的
+T14（W4）接线信任决策链时发现：rpi 的 `switch_session` 无此参数，T12 的
 `showSelector` 框架为 fire-and-forget，缺少「异步弹选择器并等待结果」的桥接变体。
 在 T14 内为该单点改造 T12 选择器框架超出本任务范围。
 
@@ -22,7 +22,7 @@ v0.1 接受以下降级行为（D-044 按行为级偏离登记）：
   ask→false），随后渲染既有的 untrusted warning（提示 `/trust` 并重启生效）。
 - 同 cwd 的会话重建命中 `trust_by_cwd` 缓存，行为与上游一致（不受影响）。
 - `/trust` 本身只写不重载（上游同），故降级路径的最终可用性与上游的差距仅为：
-  上游可当场弹窗当场生效，pir 需一次 `/trust` + 重启。
+  上游可当场弹窗当场生效，rpi 需一次 `/trust` + 重启。
 
 理由：
 

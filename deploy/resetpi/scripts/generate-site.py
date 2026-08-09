@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the resetpi.com static site from pir's built-in provider data.
+"""Generate the resetpi.com static site from rpi's built-in provider data.
 
 Run from the repository root:
 
@@ -8,7 +8,7 @@ Run from the repository root:
 Output (Cloudflare Pages project rooted at deploy/resetpi/):
 
 - api/models/providers/{providerId}.json — one catalog per built-in provider.
-  The pir client fetches `GET {catalogBaseUrl}/api/models/providers/{id}`
+  The rpi client fetches `GET {catalogBaseUrl}/api/models/providers/{id}`
   (remote_catalog_provider.rs): the body may be a bare array,
   `{"models": [...]}` or a keyed object of Model objects carrying `id` —
   this script emits `{"models": [...]}`. The data files are nested
@@ -28,12 +28,12 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-DATA = REPO / "crates/pir-ai/src/providers/data"
+DATA = REPO / "crates/rpi-ai/src/providers/data"
 SITE = REPO / "deploy/resetpi"
 OUT_PROVIDERS = SITE / "api/models/providers"
 OUT_VERSION = SITE / "api/latest-version.json"
 
-PACKAGE_NAME = "pir"
+PACKAGE_NAME = "rpi"
 
 
 def workspace_version() -> str:

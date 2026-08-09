@@ -27,10 +27,10 @@
 
 **Parity Freeze（v0.11 收口）：**
 
-- `docs/parity-checklist.md` 更新：本版本全部变更项的「上游锚点 → pir 测试」映射（扩展 API 88 条清单增量、JSON/RPC delta、流终止、settings 深合并、keybindings 新增 action 等）
+- `docs/parity-checklist.md` 更新：本版本全部变更项的「上游锚点 → rpi 测试」映射（扩展 API 88 条清单增量、JSON/RPC delta、流终止、settings 深合并、keybindings 新增 action 等）
 - 需求 §7 验收标准八条逐条执行并记录
 - fixtures 全量再生成 + 归一化 diff 全绿
-- session 互通终验：v0.84 上游生成的 session JSONL（v3）由 pir 加载续跑；pir 生成的由上游加载续跑
+- session 互通终验：v0.84 上游生成的 session JSONL（v3）由 rpi 加载续跑；rpi 生成的由上游加载续跑
 - release 构建 smoke（gnu/musl，沿用 v0.1 口径）与二进制大小核对
 - `README.md` 状态节、`docs/parity-checklist.md`、UPSTREAM.md 一致性核对
 

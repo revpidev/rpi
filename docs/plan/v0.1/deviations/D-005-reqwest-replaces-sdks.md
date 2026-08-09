@@ -18,7 +18,7 @@
 1. 不发送 SDK 遥测/平台头（`x-stainless-*`、SDK 默认 `User-Agent`）；
 2. 无 SDK 默认超时（调用方经 `StreamOptions::timeout_ms` 显式设置）；
 3. SSE 帧 JSON 用严格 `serde_json` 解析（SDK 用 `JSON.parse`），解析失败的消息
-   文本为 pir 自定义（如 `Could not parse OpenAI Responses SSE event: {error};
+   文本为 rpi 自定义（如 `Could not parse OpenAI Responses SSE event: {error};
    data={data}`），而非 JS `SyntaxError` 文案；
 4. OpenRouter `error.metadata.raw` 细节从 HTTP 错误响应 body 解析（上游从 SDK
    error 对象读取）；

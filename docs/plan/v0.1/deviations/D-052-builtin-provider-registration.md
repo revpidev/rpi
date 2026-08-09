@@ -19,11 +19,11 @@
 
 ## 实际实现与偏离原因
 
-T13 交付了全部原料（`pir-ai/src/providers.rs::builtin_providers()` 38 工厂、
-`crates/pir/src/core/remote_catalog_provider.rs::with_remote_catalog` 装饰器、
+T13 交付了全部原料（`rpi-ai/src/providers.rs::builtin_providers()` 38 工厂、
+`crates/rpi/src/core/remote_catalog_provider.rs::with_remote_catalog` 装饰器、
 `model_catalog_endpoint` 解析器），但 `ModelRuntime::create` 从未播种：
 `native_providers` 初始为空，唯一注册路径是扩展（llama）与测试。后果：
-`/login` 选择器、模型解析、`pir update --models` 只能看到 models.json +
+`/login` 选择器、模型解析、`rpi update --models` 只能看到 models.json +
 扩展 provider，用户必须全量手写 models.json——与上游「只写自定义配置」的
 行为契约不符（行为级影响，但属**缺口补全**而非差异，落地后与上游对齐）。
 
@@ -37,7 +37,7 @@ D-052 补齐注册波次：
    结果包 `with_remote_catalog`；字面量 `off` / 关闭时不构造 overlay（零网络
    路径，ADR-0002 §8）。
 3. services 层（`agent_session_services.rs`）读取 settings `modelCatalogUrl`
-   传入；SDK 与 `pir update --models` 走 env/默认解析（上游同——这两个路径
+   传入；SDK 与 `rpi update --models` 走 env/默认解析（上游同——这两个路径
    本就不读 settings）。
 4. `Models::refresh` 的「未配置 provider 跳过」门（models.ts:296-298）使
    启动与 `update --models` 不会对无凭据内置 provider 发起网络请求，与上游
@@ -46,8 +46,8 @@ D-052 补齐注册波次：
 ## 回写位置
 
 - `docs/02-design.md` §产品 endpoint 配置化（远程 catalog 消费点已接线）
-- `crates/pir/src/core/model_runtime.rs` 模块注记（T10 subset / W6-C notes）
-- `crates/pir/src/core/remote_catalog_provider.rs` `model_catalog_endpoint` 注记
+- `crates/rpi/src/core/model_runtime.rs` 模块注记（T10 subset / W6-C notes）
+- `crates/rpi/src/core/remote_catalog_provider.rs` `model_catalog_endpoint` 注记
 
 ## 测试
 

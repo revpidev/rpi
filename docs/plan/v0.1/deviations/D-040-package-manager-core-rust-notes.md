@@ -14,7 +14,7 @@
 
 ## 实际实现与偏离原因
 
-核心落 `crates/pir/src/core/package_manager.rs` + `core/git_url.rs` + `cli/package_command.rs`，全部契约要点就位；以下为实现层差异（不影响对拍契约的语义边界逐条列出）：
+核心落 `crates/rpi/src/core/package_manager.rs` + `core/git_url.rs` + `cli/package_command.rs`，全部契约要点就位；以下为实现层差异（不影响对拍契约的语义边界逐条列出）：
 
 1. **hosted-git-info@9.0.3 用 Rust 子集自实现**（`core/git_url.rs`）：五内置 host（github/gist/bitbucket/gitlab/sourcehut）的 `extract`、github shorthand 修正、scp-style URL 修正、`correctProtocol` 协议表全部按 `lib/from-url.js`/`parse-url.js`/`hosts.js` 移植；URL 解析用 `url` crate（同为 WHATWG URL 标准）。未实现：LRU 缓存、`fromManifest`、`browse/tarball` 等 URL 生成模板（`parseGitUrl` 不消费）。
 2. **npm semver 用 `semver` crate + 翻译层**：`||` 并集、`x/X/*` 通配、部分版本（`1.2` → `>=1.2.0 <1.3.0`）、完整版连字符范围（`a - b` → `>=a <=b`）、空格分隔交集翻译为逗号。已知语义边界：含 prerelease/build 元数据的 range 形式不翻译（视为无效 range，等价上游 `validRange(...) ?? undefined` 回退）；prerelease 匹配的 npm 特殊规则（同 tuple 预发布参与）与 Rust semver 的 req-prerelease 规则在极端输入下可能不同。pi 生态包版本基本都是精确版本或 `^`/`~` range，常见语法已逐条测试对齐。
@@ -32,7 +32,7 @@
 
 ## 影响面
 
-无（纯内部实现）：settings 线格式（`packages` 的 string/object 形状、camelCase 字段）与上游逐字段一致；安装目录布局（`~/.pir/agent/npm|git|tmp/extensions`、`.pir/npm|git`）与上游同构（`.pi`→`.pir` 为 ADR-0001 授权重命名）。
+无（纯内部实现）：settings 线格式（`packages` 的 string/object 形状、camelCase 字段）与上游逐字段一致；安装目录布局（`~/.rpi/agent/npm|git|tmp/extensions`、`.rpi/npm|git`）与上游同构（`.pi`→`.rpi` 为 ADR-0001 授权重命名）。
 
 ## 处置
 
@@ -42,15 +42,15 @@
 
 ## 终审补记（2026-08-07）
 
-14. **`PIR_OFFLINE` 判定采 `main.ts` 的 `isTruthyEnvFlag` 语义**（`1`/`true`/`yes`，
+14. **`RPI_OFFLINE` 判定采 `main.ts` 的 `isTruthyEnvFlag` 语义**（`1`/`true`/`yes`，
     大小写不敏感）：上游 `package-manager.ts:42-46` 为 `Boolean(env)`（任何非空值即离线），
-    与 `main.ts:476` 自身不一致；pir 统一走 `environment::is_truthy_env_flag`。
-    即 `PIR_OFFLINE=0` 时上游 package-manager 视为离线、pir 视为在线（实现细节级，
+    与 `main.ts:476` 自身不一致；rpi 统一走 `environment::is_truthy_env_flag`。
+    即 `RPI_OFFLINE=0` 时上游 package-manager 视为离线、rpi 视为在线（实现细节级，
     仅影响离线门判定）。
 15. **`getNpmInstallPath` 吞 trust 错误**：`get_npm_install_path` 以 `unwrap_or_default`
     吞掉 project scope 未信任错误（上游 throw）；CLI 流程不可达（未信任项目
     SettingsManager 返回空 settings），保持 `PathBuf` 返回形状，已在代码注释注明。
 16. **`CommandRequest::display()` 脱敏 URL userinfo**：上游错误前缀原样回显 argv
-    （含 `https://user:token@host`）；pir 红线禁止凭据进错误消息，display 时将
+    （含 `https://user:token@host`）；rpi 红线禁止凭据进错误消息，display 时将
     `scheme://user:pass@` 改写为 `scheme://***@`（仅当 userinfo 含 `:`；执行仍用原始
     argv；无 userinfo 时输出与上游逐字一致）。

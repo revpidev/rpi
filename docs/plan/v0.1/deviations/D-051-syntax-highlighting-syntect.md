@@ -15,7 +15,7 @@
 
 ## 实际实现与偏离原因
 
-pir 语法高亮完全未交付（`crates/pir/src/modes/interactive/theme.rs:47`
+rpi 语法高亮完全未交付（`crates/rpi/src/modes/interactive/theme.rs:47`
 `highlight_code: None`），T17 立项补齐。初始裁定逐字节对拍，调研后确认 Rust 生态无
 hljs 功能等价库：syntect（Sublime 文法）、tree-sitter 系（真解析）的 token 边界与
 hljs 10.7.3 均不一致，scope 映射层无法对齐 ANSI 分段；逐字节唯一路线为手工移植 hljs

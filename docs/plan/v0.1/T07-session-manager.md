@@ -18,7 +18,7 @@ session（v1–v3 自动迁移）」这一成功标准（需求 §1.2.2）。
 
 ### In
 
-- 统一路径模块（若 T01 未含，本任务落地）：`~/.pir/agent/sessions/`、目录编码 `--<cwd>--`（**去前导斜杠后 `/`、`\`、`:` → `-`**）、文件名 `<timestamp（:.→-）>_<uuid>.jsonl`、覆盖链 `--session-dir` / `PIR_CODING_AGENT_SESSION_DIR` / `settings.sessionDir`（编码规范 §10.1）
+- 统一路径模块（若 T01 未含，本任务落地）：`~/.rpi/agent/sessions/`、目录编码 `--<cwd>--`（**去前导斜杠后 `/`、`\`、`:` → `-`**）、文件名 `<timestamp（:.→-）>_<uuid>.jsonl`、覆盖链 `--session-dir` / `RPI_CODING_AGENT_SESSION_DIR` / `settings.sessionDir`（编码规范 §10.1）
 - session 树：`id`（8 hex，randomUUID 前 8 位、碰撞重试 100 次退回完整 UUID）、`parentId`、leaf 分支导航；`getTree` 子节点按 timestamp 排序、孤儿当根
 - Header `{type:"session", version, id(uuidv7), timestamp(ISO), cwd, parentSession?}`
 - 条目类型全集（header + 9 种，需求 §6.2）：`message` / `model_change` / `thinking_level_change` / `compaction` / `branch_summary` / `custom` / `custom_message` / `label` / `session_info`（serde camelCase，编码规范 §4.4）；`custom` 不进 LLM context、`custom_message` 进
@@ -72,7 +72,7 @@ session（v1–v3 自动迁移）」这一成功标准（需求 §1.2.2）。
 
 任务特有标准：
 
-- [x] Pi 生成的 session fixtures 加载 + 续跑（faux）对拍一致——`crates/pir/tests/parity_session_test.rs`
+- [x] Pi 生成的 session fixtures 加载 + 续跑（faux）对拍一致——`crates/rpi/tests/parity_session_test.rs`
 - [x] 需求 §6.6 三条降级策略各有测试锚点——见验收记录 G3 附表 2
 - [x] `session-format.md` 逐条对拍映射表（G3）——见验收记录 G3 附表 1
 
@@ -87,10 +87,10 @@ session（v1–v3 自动迁移）」这一成功标准（需求 §1.2.2）。
 - 验收日期：2026-08-03
 - 验收人：kimi-code（单人开发，按清单逐项自证；另经一轮独立 fresh-eyes 对拍复核，6 条应修 + 2 条边缘修正已落地，见下）
 - G1 构建/静态检查：通过（`cargo build --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 全绿，无警告）
-- G2 测试：通过（`cargo test --workspace` 27 个 test binary 全 ok，0 failed；pir crate lib 224 passed（含 `core::session_manager::tests` 118 例 + `config::tests`）、parity_session 2 例；pir-ai lib 327 passed（含 uuid 3 例与 provider_retry PRNG 回归 1 例）；无 live 测试，非 live 不访问网络）
-- G3 对拍：通过。`cargo test -p pir --test parity_session_test`：5 个 fixtures 场景（abort / length-truncation / single-turn / steering-followup / tool-calls）真实 Pi 落盘 session.jsonl 逐个 `SessionManager::open` 加载 + `export_jsonl()` 写回，经 `pir_test_support::diff::diff_jsonl`（内含 Normalizer）归一化 diff 一致（`parity_fixture_sessions_load_and_export_lossless`）；加载后续跑追加 user + faux assistant 消息，context 旧消息不变、文件恰增 2 行、重开状态完整（`parity_fixture_sessions_continue_after_load`）。`session-format.md` 逐条映射见附表 1；需求 §6.6 降级策略锚点见附表 2
-- G4 红线：通过（`external/pi` `git status --porcelain` 为空、HEAD=2efa728；无 JS/TS 执行能力；未读写 `~/.pi`/`.pi`（路径模块根为 ADR-0001 的 `~/.pir`）；Session 仅 JSONL；token 估算未触碰；非测试代码无 unwrap/expect；日志无凭据；无范围排除项引入（无 legacy 启动迁移）；无 rg/fd 下载机制；session 写入无文件锁——append 直写，与上游一致）
-- G5 线格式：通过（条目类型 camelCase serde 形状锚定在 `pir-agent/src/session.rs` T01 形状测试（header/9 种主路径条目/harness 2 种/compaction 双形态逐字段断言）；本任务新增 `StoredEntry` Raw 保留走 `serde_json::Value` 原样往返；fixtures 写回 diff 与 G3 合并执行）
+- G2 测试：通过（`cargo test --workspace` 27 个 test binary 全 ok，0 failed；rpi crate lib 224 passed（含 `core::session_manager::tests` 118 例 + `config::tests`）、parity_session 2 例；rpi-ai lib 327 passed（含 uuid 3 例与 provider_retry PRNG 回归 1 例）；无 live 测试，非 live 不访问网络）
+- G3 对拍：通过。`cargo test -p rpi --test parity_session_test`：5 个 fixtures 场景（abort / length-truncation / single-turn / steering-followup / tool-calls）真实 Pi 落盘 session.jsonl 逐个 `SessionManager::open` 加载 + `export_jsonl()` 写回，经 `pir_test_support::diff::diff_jsonl`（内含 Normalizer）归一化 diff 一致（`parity_fixture_sessions_load_and_export_lossless`）；加载后续跑追加 user + faux assistant 消息，context 旧消息不变、文件恰增 2 行、重开状态完整（`parity_fixture_sessions_continue_after_load`）。`session-format.md` 逐条映射见附表 1；需求 §6.6 降级策略锚点见附表 2
+- G4 红线：通过（`external/pi` `git status --porcelain` 为空、HEAD=2efa728；无 JS/TS 执行能力；未读写 `~/.pi`/`.pi`（路径模块根为 ADR-0001 的 `~/.rpi`）；Session 仅 JSONL；token 估算未触碰；非测试代码无 unwrap/expect；日志无凭据；无范围排除项引入（无 legacy 启动迁移）；无 rg/fd 下载机制；session 写入无文件锁——append 直写，与上游一致）
+- G5 线格式：通过（条目类型 camelCase serde 形状锚定在 `rpi-agent/src/session.rs` T01 形状测试（header/9 种主路径条目/harness 2 种/compaction 双形态逐字段断言）；本任务新增 `StoredEntry` Raw 保留走 `serde_json::Value` 原样往返；fixtures 写回 diff 与 G3 合并执行）
 - G6 文档同步：通过（移植文件均带上游路径+版本溯源注释；回写 `02-design.md` §6.3 Rust 落地注记、§8 路径模块落地说明，`01-requirements.md` §6.6 降级策略边界注记）
 - G7 偏离闭环：通过（D-012 已登记至 `deviations/` 并回写，状态「已回写」；任务内 T07-D1～D9 全部并入 D-012，无未闭环项。T07-D1 经核实不定行为级：主路径只写 firstKeptEntryId 形态、fixtures 无 compaction 条目，对拍契约不受影响）
 - 结论：通过
@@ -101,7 +101,7 @@ session（v1–v3 自动迁移）」这一成功标准（需求 §1.2.2）。
 |------------------|----------|
 | File Location（目录编码 `--<cwd>--`、文件名 `<timestamp>_<uuid>.jsonl`、覆盖链） | `config::tests`（含 Windows 盘符冒号、空串落空、覆盖优先级）；`session_file_name_replaces_colons_and_dots` |
 | Session Version（v1–v3、CURRENT_SESSION_VERSION=3） | `should_add_id_parent_id_to_v1_entries`、`should_be_idempotent_skip_already_migrated`、`converts_first_kept_entry_index_to_first_kept_entry_id`、`renames_hook_message_role_to_custom`、`migrated_v1_file_is_rewritten_on_open`、`migrate_v1_removes_float_first_kept_entry_index`、`migrate_float_version_2_0_is_not_treated_as_v1` |
-| Message Types / AgentMessage Union | T01 形状测试（`pir-agent/src/session.rs`：message/bashExecution roundtrip）+ fixtures 加载对拍 |
+| Message Types / AgentMessage Union | T01 形状测试（`rpi-agent/src/session.rs`：message/bashExecution roundtrip）+ fixtures 加载对拍 |
 | Entry Base（id/parentId/timestamp） | `append_message_creates_entry_with_correct_parent_id_chain`、`leaf_pointer_advances_after_each_append`、`entry_ids` |
 | SessionHeader | T01 `session_header_shape`（v1 无 version 键、parentSession 省略）；`reads_cwd_from_session_*` 系列 |
 | SessionMessageEntry | T01 `message_entry_shape_with_null_parent`；`append_message_creates_entry_with_correct_parent_id_chain` |
@@ -132,5 +132,5 @@ session（v1–v3 自动迁移）」这一成功标准（需求 §1.2.2）。
 
 ### 复核修正记录（验收过程中发现并已修复）
 
-- `pir-ai/src/utils/uuid.rs` 与 `provider_retry.rs` 的 xorshift 播种 bug（`compare_exchange` Ok 旧值 0 被当作种子，随机源恒零）——两处修复 + `test_random_unit_is_not_constant_zero` 回归锚点
+- `rpi-ai/src/utils/uuid.rs` 与 `provider_retry.rs` 的 xorshift 播种 bug（`compare_exchange` Ok 旧值 0 被当作种子，随机源恒零）——两处修复 + `test_random_unit_is_not_constant_zero` 回归锚点
 - 已知条目未知扩展字段在 branch/fork 路径丢失（改从 raw 出发改 parentId）；label 重放 HashMap 顺序不确定（改插入序 Vec）；`parse_session_entries` 误滤 header（删除对齐上游）；`get_branch` 未知 id 回退（改为返回空）；`fork_from` 校验先于 wx 写（不留孤儿文件）；覆盖链空串逐级落空；v1 迁移 `firstKeptEntryIndex` 任意 JSON number 均删除、浮点 version 不当 v1

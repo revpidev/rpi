@@ -1,4 +1,4 @@
-# T12：pir-tui 组件与 Interactive 模式
+# T12：rpi-tui 组件与 Interactive 模式
 
 - **状态**：已完成（2026-08-06 用户真机 smoke 人工验收通过）
 - **里程碑**：M5（TUI 为硬性交付，ADR-0002 §3）
@@ -61,31 +61,31 @@
 
 ## 设计细化记录（2026-08-05）
 
-基于三路上游/本地调研（pi-tui 组件、interactive-mode、pir 现状）收口如下。
+基于三路上游/本地调研（pi-tui 组件、interactive-mode、rpi 现状）收口如下。
 
 ### 模块映射（上游 → 本仓库）
 
-pi-tui 业务组件与支撑模块（落 `crates/pir-tui/src/`，镜像上游文件命名）：
+pi-tui 业务组件与支撑模块（落 `crates/rpi-tui/src/`，镜像上游文件命名）：
 
 | 上游 | 本仓库 |
 |------|--------|
-| `tui/src/kill-ring.ts` | `pir-tui/src/kill_ring.rs` |
-| `tui/src/undo-stack.ts` | `pir-tui/src/undo_stack.rs` |
-| `tui/src/word-navigation.ts` | `pir-tui/src/word_navigation.rs` |
-| `tui/src/autocomplete.ts` | `pir-tui/src/autocomplete.rs` |
-| `tui/src/components/{editor,input,select-list,markdown,settings-list,image}.ts` | `pir-tui/src/components/{editor,input,select_list,markdown,settings_list,image}.rs` |
-| `coding-agent/src/modes/interactive/*` | `pir/src/modes/interactive/`（`mod.rs` + `components/` 40 组件镜像命名 + `external_editor.rs` + `model_search.rs`） |
+| `tui/src/kill-ring.ts` | `rpi-tui/src/kill_ring.rs` |
+| `tui/src/undo-stack.ts` | `rpi-tui/src/undo_stack.rs` |
+| `tui/src/word-navigation.ts` | `rpi-tui/src/word_navigation.rs` |
+| `tui/src/autocomplete.ts` | `rpi-tui/src/autocomplete.rs` |
+| `tui/src/components/{editor,input,select-list,markdown,settings-list,image}.ts` | `rpi-tui/src/components/{editor,input,select_list,markdown,settings_list,image}.rs` |
+| `coding-agent/src/modes/interactive/*` | `rpi/src/modes/interactive/`（`mod.rs` + `components/` 40 组件镜像命名 + `external_editor.rs` + `model_search.rs`） |
 
-复用既有：`fuzzy.rs`（T11 已含 fuzzyFilter）、`terminal_image.rs`（能力检测矩阵 T11 已落地）、`themes`/`settings`/`keybindings`（pir 侧 core）、`AgentSession::subscribe`（同步事件，print_mode 为范本）。挂载点：`app.rs` Interactive 分支（原占位错误）；`--resume` 分支——**实际实现**（2026-08-06）为 `cli/session_picker.rs` 独立启动选择器（对齐上游 main.ts:321-333 + cli/session-picker.ts，picker 在 session manager 创建前独立起 TUI，取消打印 "No session selected" 并 exit 0），而非模式内弹窗（登记 D-019）。
+复用既有：`fuzzy.rs`（T11 已含 fuzzyFilter）、`terminal_image.rs`（能力检测矩阵 T11 已落地）、`themes`/`settings`/`keybindings`（rpi 侧 core）、`AgentSession::subscribe`（同步事件，print_mode 为范本）。挂载点：`app.rs` Interactive 分支（原占位错误）；`--resume` 分支——**实际实现**（2026-08-06）为 `cli/session_picker.rs` 独立启动选择器（对齐上游 main.ts:321-333 + cli/session-picker.ts，picker 在 session manager 创建前独立起 TUI，取消打印 "No session selected" 并 exit 0），而非模式内弹窗（登记 D-019）。
 
 ### 关键决策
 
 1. **Markdown 解析器**：`marked` → `comrak`（AST 树形结构与 marked token 树最接近，GFM 表格/删除线/任务列表齐备；`token.raw` 用 sourcepos 切片源码还原）。属依赖替代型偏离，登记 D-018，渲染行为以快照黄金 + marked 产出对拍兜底。
-2. **keybindings 双轨打通**：pir-tui `KeybindingsManager`（31 个 `tui.*`）与 pir `core/keybindings.rs`（73 条含 `app.*` 42）并存。方案：pir 侧保留定义表与 JSON 加载/迁移为唯一事实源，启动时把解析后的用户绑定灌入 pir-tui 管理器（`set_keybindings`）；`app.*` 分发在 `CustomEditor.handle_input` 与 `InteractiveMode` 层。
+2. **keybindings 双轨打通**：rpi-tui `KeybindingsManager`（31 个 `tui.*`）与 rpi `core/keybindings.rs`（73 条含 `app.*` 42）并存。方案：rpi 侧保留定义表与 JSON 加载/迁移为唯一事实源，启动时把解析后的用户绑定灌入 rpi-tui 管理器（`set_keybindings`）；`app.*` 分发在 `CustomEditor.handle_input` 与 `InteractiveMode` 层。
 3. **分段器**：grapheme 用 `unicode-segmentation`（已有依赖）；word 粒度（`isWordLike` 语义）按 T11 utils 既定口径自实现于 `word_navigation.rs`。
 4. **fd 依赖**：文件补全沿用 spawn `fd`（`std::process::Command`），与上游参数协议逐字对齐；缺 fd 时回退 `readdir` 前缀补全（同上游行为）。
 5. **回调风格**：`onSubmit`/`onChange`/`submenu(done)` 等闭包 → `Box<dyn FnMut + Send>` 字段，沿用 T11 组件约定；锁契约（组件回调内不得锁其他组件）继续适用。
-6. **VT 测试**：`tui.rs` 内 `VirtualTerminal` 测试模拟器外提为 `pir-tui` 的 `#[cfg(test)]`/test-support 公共件（或复制到各测试目标），队列/快捷键行为用 VT 驱动；不引入 pty 依赖。
+6. **VT 测试**：`tui.rs` 内 `VirtualTerminal` 测试模拟器外提为 `rpi-tui` 的 `#[cfg(test)]`/test-support 公共件（或复制到各测试目标），队列/快捷键行为用 VT 驱动；不引入 pty 依赖。
 
 ### 实现子阶段
 
@@ -138,22 +138,22 @@ pi-tui 业务组件与支撑模块（落 `crates/pir-tui/src/`，镜像上游文
 - 验收日期：2026-08-05（脚本化自测）/ 2026-08-06（真机 smoke 人工确认）
 - 验收人：用户（真机 smoke 人工验证，2026-08-06 确认）
 - G1 构建/静态检查：通过——`cargo clippy --workspace --all-targets -D warnings` 通过（0 警告）；`cargo fmt --all -- --check` 通过；`cargo check --workspace` 通过
-- G2 测试：通过——`cargo test --workspace` 2608 passed, 0 failed（`cargo test -p pir` 1282、`cargo test -p pir-tui` 854，含 lib/集成/快照全目标）；live 测试跳过（无 API key）。备注：一次全量并行运行出现 1 例失败未捕获名称，随后针对性重跑 6 轮（interactive 模块 5 轮、pir-tui 3 轮、集成 2 轮）均未复现，疑似并行负载下时序敏感，持续观察
+- G2 测试：通过——`cargo test --workspace` 2608 passed, 0 failed（`cargo test -p rpi` 1282、`cargo test -p rpi-tui` 854，含 lib/集成/快照全目标）；live 测试跳过（无 API key）。备注：一次全量并行运行出现 1 例失败未捕获名称，随后针对性重跑 6 轮（interactive 模块 5 轮、rpi-tui 3 轮、集成 2 轮）均未复现，疑似并行负载下时序敏感，持续观察
 - G3 对拍：通过——`T12-keybindings-mapping.md` 73 条默认键逐条核对一致；`T12-requirements-8-mapping.md` §8 全章 46 条映射（40 ✅ 4 挂点 1 DEFER 1 挂点，均注 T13/T14/T15 遗留）；渲染快照黄金文件全过（Editor/SelectList/Markdown/SettingsList/Autocomplete）
-- G4 红线：通过——未改 `external/pi/`；未引入 JS/TS 执行能力（无 Node/Deno 嵌入）；未默认读写 `~/.pi`/`.pi`（仅 `~/.pir`，ADR-0001）；session 存储仍 JSONL（无 SQLite）；token 估算未引入新算法；可恢复错误无 panic（测试除外）；日志无凭据输出
+- G4 红线：通过——未改 `external/pi/`；未引入 JS/TS 执行能力（无 Node/Deno 嵌入）；未默认读写 `~/.pi`/`.pi`（仅 `~/.rpi`，ADR-0001）；session 存储仍 JSONL（无 SQLite）；token 估算未引入新算法；可恢复错误无 panic（测试除外）；日志无凭据输出
 - G5 线格式：通过——session JSONL/RPC 线格式未变（T12 无线格式改动；扩展 UI 协议层留 T15）
 - G6 文档同步：通过——回写位置：`02-design.md` §5.5/§5.6/§12（T12 状态与映射行）、`01-requirements.md` §8.6（comrak 注记）、`T12-interactive-mode.md`（进度/自测清单/偏离记录/本记录）、`deviations/README.md`（D-018/D-019 登记）
 - G7 偏离闭环：D-018/D-019 已登记并已回写（README 表与本文偏离记录状态均置「已回写」）；D-016/D-017 已关闭
 - 脚本化 smoke（本环境无 tty，真机人工 smoke 留给用户）：
-  1. `cargo run -p pir -- --help` 正常输出；无 tty 降级 Print 模式验证（`echo hi | pir` 不触 TUI）
+  1. `cargo run -p rpi -- --help` 正常输出；无 tty 降级 Print 模式验证（`echo hi | rpi` 不触 TUI）
   2. 进程内 VT 端到端（测试基建）：a) 启动→布局树组装→bash `!` 执行→/tree 选择→/name→/quit 信号→shutdown 恢复——`interactive_mode.rs` 集成测试（init/分发链/tree/队列共 60+）；b) **run loop 全路径**：启动→bash 提问→Ctrl+C 清空→Ctrl+D 退出→终端恢复——`run_loop_end_to_end_vt_smoke`（真实 session + 事件循环，见验收记录 G2 测试数）
   3. tmux 可用性：`which tmux` 待真机环境确认（本容器无 tmux）
-- 结论：**已完成**——2026-08-06 用户在有 tty 的真机环境完成验收：`cargo run -p pir` 启动 → 提问 → streaming → abort → 快捷键 → Ctrl+C/Ctrl+D 退出 → 终端状态恢复，本机 + tmux 至少两种环境人工验证通过。
+- 结论：**已完成**——2026-08-06 用户在有 tty 的真机环境完成验收：`cargo run -p rpi` 启动 → 提问 → streaming → abort → 快捷键 → Ctrl+C/Ctrl+D 退出 → 终端状态恢复，本机 + tmux 至少两种环境人工验证通过。
 
 ### 2026-08-06 修复记录（验收后追加）
 
 - **阶段 A（会话切换与恢复）**：`InteractiveUi.session` 改为 `RwLock` 可替换；新增 `rebind_session_ui`（对齐上游 `rebindCurrentSession`）做全量 rebind——注销旧订阅、换 session、`apply_runtime_settings`、清容器、`render_initial_messages`、重新订阅；/new、/resume、/clone、/fork、/import 统一走此路径（D-019「会话切换不重订阅」条目关闭）。/resume、/fork 选择器回调经 `EditorInput::ResumeSession`/`ForkFrom` 路由到 run loop 执行（`handle_resume_command` / `handle_fork_command`，fork 用 `runtime.fork(entry_id, ForkPosition::Before, None)` + 编辑器文本回填）。--resume CLI 落地为 `cli/session_picker.rs` 独立启动选择器（对齐上游 main.ts:321-333，取消 exit 0），`app.rs` resume 分支接线。unsubscribe 存字段、shutdown 调用；`flush_compaction_queue` 两个 shutdown 分支恢复队列。新支撑：`FooterDataProvider.set_cwd`、`output_pad` 转 AtomicUsize、`CustomEditor.set_padding_x`/`set_autocomplete_max_visible`
 - **阶段 B（settings 热应用 + git branch）**：/settings 六项热应用全部接线（`apply_settings_change`）：Theme（含 auto 明暗对探测）、HideThinkingBlock/ShowCacheMissNotices（rebuild chat）、EditorPaddingX、OutputPad（streaming 就地更新，否则 rebuild）、AutocompleteMaxVisible。git branch watcher 落地（`git_branch_watcher.rs`，100ms 轮询 .git/HEAD，worktree 支持，cwd 跟随 set_cwd），footer 分支真正显示
-- **阶段 C（文档/注释收尾）**：crates 内 `TODO(S5/S6/S5b)` 残留全部清理（已解决的删或改事实陈述；未解决的明确归属 TODO(T13/T14/T15)，无认领的标 `TODO(unassigned)`）；D-019 修订（条目 22→25）；本任务文件与两张映射表同步；footer `xp` 实验标记接线 `experimental_enabled`（一行，PIR_EXPERIMENTAL=1 生效）；修复 resume 测试把 fixture 写进 crate 目录的问题（该写 harness 临时目录）
+- **阶段 C（文档/注释收尾）**：crates 内 `TODO(S5/S6/S5b)` 残留全部清理（已解决的删或改事实陈述；未解决的明确归属 TODO(T13/T14/T15)，无认领的标 `TODO(unassigned)`）；D-019 修订（条目 22→25）；本任务文件与两张映射表同步；footer `xp` 实验标记接线 `experimental_enabled`（一行，RPI_EXPERIMENTAL=1 生效）；修复 resume 测试把 fixture 写进 crate 目录的问题（该写 harness 临时目录）
 - **仍开放的挂点**：/debug 全量渲染行段（无认领，v0.1 挂起）、willRetry 冲刷接线（无认领，v0.1 挂起）、OutputPad streaming 历史 child 不更新（D-019 已知差异）、cache-miss/cache-waste（T14）、/share 与 HTML 导出（T14）、/login /logout 执行（T13）、/tree 摘要询问循环与标签写回（无认领）
 - 本日改动为注释/文档 + 已验收功能的缺口补齐；`cargo build --workspace` 与 `cargo clippy --workspace --all-targets` 通过（0 警告）、`cargo fmt --all -- --check` 通过、`cargo test --workspace` 全绿。flaky 观察：全量首轮曾出现 1 例未捕获名称的失败（G2 同类现象第三次），随后全量 4 轮 + interactive 模块 8 轮连跑均全绿未复现，维持 G2「并行负载下时序敏感，持续观察」的结论

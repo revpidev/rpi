@@ -1,4 +1,4 @@
-# T03：pir-ai 核心协议（Anthropic + OpenAI 系）
+# T03：rpi-ai 核心协议（Anthropic + OpenAI 系）
 
 - **状态**：已完成
 - **里程碑**：M1
@@ -11,7 +11,7 @@
 
 ## 目标
 
-实现 `pir-ai` 的类型层完备化、首批 3 个 API 适配器与横切基础设施，
+实现 `rpi-ai` 的类型层完备化、首批 3 个 API 适配器与横切基础设施，
 打通「Context → 协议流式事件」的核心链路，供 M2 的 agent loop 与后续 headless 模式使用。
 
 ## 范围
@@ -29,7 +29,7 @@
 - `clamp_max_tokens_to_context`（contextWindow − 估算 − 4096 安全余量，下限 1）
 - usage / cost / cache 统计：`calculateCost`（cost.tiers 阶梯、cacheWrite1h 2× 费率）；totalTokens 分量合成
 - 工具参数 JSON Schema 校验 + **宽松类型强转**（null→0、"123"→123）；`sanitize_surrogates`
-- 横切基础设施（`pir-ai/src/utils/`，设计文档 §3.6）：
+- 横切基础设施（`rpi-ai/src/utils/`，设计文档 §3.6）：
   - `transform_messages.rs`（孤儿 tool call 合成 "No result provided"、error/aborted 不回放、非 vision 图片占位符、跨模型 thinking 转文本、id 归一化回填）
   - `provider_retry.rs` + `retry.rs`（两层重试：`x-should-retry`/retry-after/60s 上限立即失败；外层错误分类 regex 表）
   - `overflow.rs`（三分支：pattern 表 / silent / 截断式）
@@ -52,7 +52,7 @@
 - compat 检测矩阵用表驱动表达（设计文档 §13 开放项），T03 先落 anthropic/openai/deepseek 等本任务所需子集，结构须支持 T13 全量扩展
 - 每个适配器文件头部标注溯源注释（编码规范 §14.3）
 - HTTP 用 `reqwest`（rustls）；SSE 解析与上游帧边界语义对齐（含 `parseJsonWithRepair`）
-- live 测试用 `PIR_LIVE_TEST=1` 门禁，默认跳过（编码规范 §12.6）
+- live 测试用 `RPI_LIVE_TEST=1` 门禁，默认跳过（编码规范 §12.6）
 
 ## 进度跟踪
 
@@ -65,7 +65,7 @@
 ## 自测清单
 
 - [x] 上游 `packages/ai` 相关 vitest 用例意图移植为同名 Rust 测试并通过
-- [x] 三适配器契约测试：固定请求 → 期望事件序列（录制/构造的 SSE 流驱动）——`crates/pir-ai/tests/contract_adapters.rs`（脚本化本地 HTTP 服务器 + 录制 SSE）
+- [x] 三适配器契约测试：固定请求 → 期望事件序列（录制/构造的 SSE 流驱动）——`crates/rpi-ai/tests/contract_adapters.rs`（脚本化本地 HTTP 服务器 + 录制 SSE）
 - [x] content_index 交错事件：消费者按 index 正确关联（非连续 block 顺序）——`test_responses_interleaved_content_index`
 - [x] stream 不抛出：HTTP 错误 / 流中断 / abort / 校验失败 → 全部 Error 事件 + stopReason，无 panic、无 Err——`test_stream_does_not_throw_on_http_error` + 各适配器 `stream_simple_missing_auth_is_stream_error`、处理器错误事件单测
 - [x] partial tool-call JSON：分片任意切分下累积结果一致；非法 JSON 结束时按上游语义报错——`utils/json_parse.rs` 与各处理器单测
@@ -83,7 +83,7 @@
 任务特有标准：
 
 - [x] 3 个适配器契约测试全过，事件类型序列与上游测试语义一致——`contract_adapters.rs`：`test_anthropic_messages_contract` / `test_openai_completions_contract` / `test_openai_responses_contract`（请求方法/路径/头/body + 事件类型序列双向断言）
-- [x] live smoke：豁免——本环境无 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`；`tests/live_smoke.rs` 已实现 `PIR_LIVE_TEST=1` 门禁（未设时即时返回通过），模型/基址可用 `PIR_LIVE_*_MODEL` / `PIR_LIVE_*_BASE_URL` 覆盖
+- [x] live smoke：豁免——本环境无 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`；`tests/live_smoke.rs` 已实现 `RPI_LIVE_TEST=1` 门禁（未设时即时返回通过），模型/基址可用 `RPI_LIVE_*_MODEL` / `RPI_LIVE_*_BASE_URL` 覆盖
 - [x] `Models::stream` 按 `model.api` 正确分发，未注册 api 报明确错误——`models.rs`：`test_models_stream_unknown_provider_stream_error`、`test_create_provider_missing_api_stream_error`
 - [x] 需求 §5.5 横切条目（本任务范围内）逐条核对有测试锚点——见 §自测清单 各行锚点；范围外条目（Codex WS/代理/transport/image generation/Faux）归 T02/T13
 
@@ -101,7 +101,7 @@
 - 验收日期：2026-07-30
 - 验收人：实现者自验（单人开发，按 gates.md §1 逐项自证）
 - G1 构建/静态检查：通过（`cargo build --workspace`、`cargo clippy --workspace --all-targets -- -D warnings` 无警告、`cargo fmt --all -- --check` 干净）
-- G2 测试：通过（`cargo test --workspace` 16 个测试目标全绿；pir-ai 242 lib + 7 contract + 3 live；live 未设 `PIR_LIVE_TEST=1` 默认跳过且通过；非 live 测试不访问真实网络——契约测试用 127.0.0.1 脚本化服务器）
+- G2 测试：通过（`cargo test --workspace` 16 个测试目标全绿；rpi-ai 242 lib + 7 contract + 3 live；live 未设 `RPI_LIVE_TEST=1` 默认跳过且通过；非 live 测试不访问真实网络——契约测试用 127.0.0.1 脚本化服务器）
 - G3 对拍：部分适用——本任务不涉及 session JSONL / RPC / compaction / keybindings / tmux 等逐条对拍级基准（需求 §11.1），无 fixtures 对拍对象；事件序与线格式契约以「上游 vitest 意图移植 + 录制 SSE 契约测试」锚定（`tests/contract_adapters.rs` 7 例），错误文案不参与对拍（fixtures/README §2 粒度）
 - G4 红线：通过（`external/pi` `git status --porcelain` 为空、HEAD=2efa728；无 JS 执行能力；未读写 `~/.pi`/`.pi`；仅 JSONL；token 估算 chars/4 未偏离；非测试代码 unwrap/expect 均带 invariant 注释；凭据不进 Debug（`StreamOptions` 手动 Debug 脱敏）/日志；无范围排除项引入；无外部 rg/fd；session 写入无文件锁）
 - G5 线格式：通过（types/models.json 全部 `rename_all = "camelCase"` 或逐字段 rename；`Model`/`StreamEvent`/compat 形状有 serde 快照单测；契约测试断言请求 body 键序与键名）

@@ -1,9 +1,9 @@
-# Pir 对拍 Fixtures
+# Rpi 对拍 Fixtures
 
 > 设计文档 §10.2 / 需求 §11.1 / 编码规范 §12.3 的落地目录。
 > 上游对照：`external/pi` @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（0.82.1），钉死，见 `UPSTREAM.md`。
 >
-> **归一化与 diff 的共享实现**在 `pir-test-support`（`normalize.rs` / `diff.rs`）。
+> **归一化与 diff 的共享实现**在 `rpi-test-support`（`normalize.rs` / `diff.rs`）。
 > 此外各 parity 测试在 diff 前还会剥离数值型键（`usage`/`details` 等，键表见各测试文件
 > 顶部的 `STRIPPED_KEYS`——目前为各测试文件内的局部实现，共三处）。
 > fixtures 保存**原始字节**；timestamp / uuid / session id / cwd 的剥离在 diff 时进行，不在生成时进行。
@@ -51,7 +51,7 @@ fixtures diff 应为空：
 ```bash
 cp -r fixtures/generated/single-turn /tmp/single-turn-before
 node fixtures/generate-fixtures.mjs single-turn
-cargo run -p pir-test-support --example normalize-diff -- \
+cargo run -p rpi-test-support --example normalize-diff -- \
   /tmp/single-turn-before/session.jsonl fixtures/generated/single-turn/session.jsonl
 ```
 
@@ -61,7 +61,7 @@ cargo run -p pir-test-support --example normalize-diff -- \
 > provider 用 `Math.random` 切 delta（`faux.ts` `splitStringByTokenSize`），
 > 每次运行的 delta 边界与数量不同。`events.jsonl` 的对拍粒度是**事件类型
 > 序列 + 终止消息内容**（delta 边界不入契约，也不会落盘进 session JSONL）；
-> pir 侧 faux 为确定性切块（`pir-test-support/src/faux.rs` 文件头有偏离说明）。
+> rpi 侧 faux 为确定性切块（`rpi-test-support/src/faux.rs` 文件头有偏离说明）。
 
 **纪律**：fixtures 变更必须与行为变更同 commit 提交，并在提交信息中说明（编码规范 §12.3）。
 
@@ -78,8 +78,8 @@ cargo run -p pir-test-support --example normalize-diff -- \
 | `compaction-overflow` | 16384 窗口：overflow error（"prompt is too long"）→ 恢复压缩 → 重试成功 | overflow 恢复路径、willRetry=true 事件序、恢复预算一次后重置 |
 
 补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 覆盖随 **T10**
-交付——采用进程内 32 命令逐条契约测试（`crates/pir/tests/rpc_mode_test.rs`，
-锚定 `docs/rpc.md`）+ 上表场景的三模式对拍（`crates/pir/tests/parity_headless_test.rs`），
+交付——采用进程内 32 命令逐条契约测试（`crates/rpi/tests/rpc_mode_test.rs`，
+锚定 `docs/rpc.md`）+ 上表场景的三模式对拍（`crates/rpi/tests/parity_headless_test.rs`），
 不另录 RPC transcript fixtures（32 命令线协议由契约测试全枚举，transcript
 不增加覆盖面）。
 
@@ -87,8 +87,8 @@ cargo run -p pir-test-support --example normalize-diff -- \
 
 `fixtures/generated/resources/`：上游真实模块（skills/prompt-templates/theme/
 keybindings/settings-manager/resource-loader，dist 构建）产出的黄金 JSON，
-Rust 侧对拍测试为 `crates/pir/tests/parity_resources_test.rs`（归一化 diff
-复用 pir-test-support，黄金中绝对路径已在生成时替换为 `<path>`，Rust 侧用
+Rust 侧对拍测试为 `crates/rpi/tests/parity_resources_test.rs`（归一化 diff
+复用 rpi-test-support，黄金中绝对路径已在生成时替换为 `<path>`，Rust 侧用
 `Normalizer::with_path` 做同一替换）。
 
 生成（在本仓库根目录）：
@@ -105,11 +105,11 @@ node fixtures/generate-resources-golden.mjs themes settings  # 单组
 | `themes` | 脚本内嵌自定义主题 JSON 11 例 + 内置 dark/light | `loadThemeFromPath` 双色彩模式（truecolor/256color）解析后 ANSI 颜色表：vars 引用、256 色整数、`""` 默认值、thinkingMax 回退、非法值诊断；内置主题解析后颜色表快照 |
 | `keybindings` | 脚本内嵌旧键名配置 5 例 | `migrateKeybindingsConfig`：旧名迁移、新旧冲突新名胜、定义序+extras 字母序、原始值透传 |
 | `settings` | 脚本内嵌 deepMerge 5 例 + 迁移 8 例 | `deepMergeSettings`（嵌套单层浅合并/深度≥2 替换/数组与标量替换，经 `SettingsManager.fromStorage` getter 面观察）+ 4 条旧格式迁移（queueMode/websockets/skills 对象/retry.maxDelayMs） |
-| `resource-loader-e2e` | `input/` 多级目录树（home `.agents/skills`、全局 agentDir、git repo 内 `.agents/skills`、cwd `.pir`、settings 声明路径、CLI 路径、非法主题 JSON、repo 外隔离用例） | `DefaultResourceLoader` 全管线：rank 序（project settings > project auto > user settings > user auto > CLI 附加）、同名冲突先到先得、git repo root 祖先扫描上界、context files 全局→根→叶序、主题/提示词冲突与非法主题 warning 诊断全文本 |
+| `resource-loader-e2e` | `input/` 多级目录树（home `.agents/skills`、全局 agentDir、git repo 内 `.agents/skills`、cwd `.rpi`、settings 声明路径、CLI 路径、非法主题 JSON、repo 外隔离用例） | `DefaultResourceLoader` 全管线：rank 序（project settings > project auto > user settings > user auto > CLI 附加）、同名冲突先到先得、git repo root 祖先扫描上界、context files 全局→根→叶序、主题/提示词冲突与非法主题 warning 诊断全文本 |
 
 e2e 目录树的准备由脚本与 Rust 测试各自重复同一流程（`prepareE2eTree`）：
-复制 `input/` → 临时目录，把每个 `.pir/` 复制出 `.pi/` 孪生（上游读 `.pi`、
-pir 读 `.pir`，需求 §1.4 有意改名；黄金统一记录为 `.pir` 拼写），并创建
+复制 `input/` → 临时目录，把每个 `.rpi/` 复制出 `.pi/` 孪生（上游读 `.pi`、
+rpi 读 `.rpi`，需求 §1.4 有意改名；黄金统一记录为 `.rpi` 拼写），并创建
 git 无法跟踪的 `repo/.git` 标记目录。
 
 **引擎相关排除**（黄金只钉稳定部分，详见生成脚本注释）：`invalid-yaml`
@@ -121,7 +121,7 @@ serde_json 错误文本）。
 ## 4. 归一化 / diff 用法
 
 ```rust
-use pir_test_support::{diff_jsonl, diff_event_sequence, Normalizer};
+use rpi_test_support::{diff_jsonl, diff_event_sequence, Normalizer};
 
 // session JSONL 对拍（含行序）：
 diff_jsonl(expected_fixture, actual_output)?;
@@ -130,10 +130,10 @@ diff_jsonl(expected_fixture, actual_output)?;
 diff_event_sequence(expected_events, actual_events)?;
 ```
 
-CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example normalize-diff -- <expected> <actual>`
+CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example normalize-diff -- <expected> <actual>`
 —— 各自归一化后 diff，输出首个差异定位（行号 + 上下文）。
 
-归一化规则（`pir-test-support/src/normalize.rs`）：
+归一化规则（`rpi-test-support/src/normalize.rs`）：
 
 - `timestamp` 键 → 类型保留常量（数字 → `0`，字符串 → `"<ts>"`）
 - id 键（`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/`sessionId`/`responseId`/`parentSession`）
@@ -146,7 +146,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p pir-test-support --example
 `parity_headless_test.rs` 剥 `usage`/`details`，`parity_compaction_test.rs` 剥
 `usage`/`tokensBefore`/`estimatedTokensAfter`，`parity_tools_test.rs` 剥
 `usage`/`willRetry`/`details`）——token 记账数值不参与对拍；该剥离逻辑目前分散在三个
-测试文件内（未下沉 pir-test-support）。
+测试文件内（未下沉 rpi-test-support）。
 
 ## 5. 逐条对拍级基准清单（需求 §11.1）
 

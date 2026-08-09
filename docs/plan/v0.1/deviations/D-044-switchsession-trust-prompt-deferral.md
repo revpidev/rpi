@@ -14,7 +14,7 @@
 
 ## 实际实现与偏离原因
 
-pir 的 `switch_session` 无 `projectTrustContextFactory` 对应参数；T12 的
+rpi 的 `switch_session` 无 `projectTrustContextFactory` 对应参数；T12 的
 `showSelector` 框架为 fire-and-forget，缺「异步弹选择器并等待结果」的桥接。
 当前行为：异 cwd resume 走 headless 信任链（ask→false），渲染既有 untrusted
 warning；用户经 `/trust` 写盘 + 重启后生效。同 cwd 重建命中 `trust_by_cwd`
@@ -42,12 +42,12 @@ project_trust_context` 口子已留）。
 
 - `ProjectTrustContext` 新增 `select_async` 槽位与
   `resolve_project_trusted_async`（决策链与同步版相同，尾部抽公共的
-  `apply_trust_selection`）；`crates/pir/src/core/trust_manager.rs`。
+  `apply_trust_selection`）；`crates/rpi/src/core/trust_manager.rs`。
 - `AgentSessionRuntime::switch_session` 增加
   `project_trust_context_factory` 参数（`Option<Arc<dyn Fn(&Path) -> ProjectTrustContext>>`），
-  仅异 cwd 时调用（`crates/pir/src/core/agent_session_runtime.rs`）。
+  仅异 cwd 时调用（`crates/rpi/src/core/agent_session_runtime.rs`）。
 - interactive `handle_resume_command` 构造桥接
   `InteractiveUiBridge.select` 的 factory（`commands_selectors.rs`），
   TUI 内弹信任选择器、选定当场生效。
-- 证据测试：`crates/pir/tests/extension_host_w7_test.rs` 的
+- 证据测试：`crates/rpi/tests/extension_host_w7_test.rs` 的
   `w7_switch_session_cross_cwd_uses_async_trust_selector` 等。

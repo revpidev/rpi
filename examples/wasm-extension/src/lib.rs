@@ -1,11 +1,11 @@
 //! Permission-gate example extension (wasm guest, ABI v1).
 //!
 //! Behavior (matches the native inline variant used in
-//! `crates/pir/tests/extension_host_w6_test.rs`):
+//! `crates/rpi/tests/extension_host_w6_test.rs`):
 //! - blocks the `read` tool with a reason (`tool_call` handler),
 //! - registers a custom `gate_tool` that returns fixed output.
 
-use pir_ext_sdk::{export, Extension};
+use rpi_ext_sdk::{export, Extension};
 use serde_json::{json, Value};
 
 fn register(ext: &mut Extension) {

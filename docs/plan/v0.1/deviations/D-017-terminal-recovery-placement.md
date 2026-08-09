@@ -1,4 +1,4 @@
-# D-017：终端状态恢复落位 pir-tui `recovery.rs`（上游在 coding-agent interactive-mode 层）
+# D-017：终端状态恢复落位 rpi-tui `recovery.rs`（上游在 coding-agent interactive-mode 层）
 
 - **状态**：已关闭
 - **关联任务**：T11
@@ -7,7 +7,7 @@
 
 ## 原文档约定
 
-- 文档与章节：`docs/02-design.md` §5（pir-tui 设计）、`docs/coding-standards.md` §8.5
+- 文档与章节：`docs/02-design.md` §5（rpi-tui 设计）、`docs/coding-standards.md` §8.5
   （终端状态恢复：进入 TUI 时保存终端状态，退出 / panic / 收到信号时**必须恢复**；
   安装 panic hook 先恢复终端再走默认 panic 输出）
 - 原文约定：终端恢复是硬性正确性要求；语义来自上游
@@ -16,12 +16,12 @@
 
 ## 实际实现与偏离原因
 
-终端恢复语义落位 `crates/pir-tui/src/recovery.rs`（`install_panic_hook` /
+终端恢复语义落位 `crates/rpi-tui/src/recovery.rs`（`install_panic_hook` /
 `restore_terminal` / `spawn_signal_restore`），而非上游所在的 coding-agent
 interactive-mode 层：
 
 1. **放置差异**：上游把信号/异常恢复接线在 coding-agent 层，因为 Node 的
-   signal/exception handler 是注册在事件循环旁的进程级回调；pir 将恢复归 pir-tui——
+   signal/exception handler 是注册在事件循环旁的进程级回调；rpi 将恢复归 rpi-tui——
    编码规范 §8.5 把终端恢复指派给 TUI 层，且 Rust panic hook 是进程级状态，
    必须捕获 live `Tui` 句柄。graceful-shutdown 编排（扩展清理、`drainInput`、
    session 关闭事件）仍留 interactive mode（T12），与上游拆分一致。

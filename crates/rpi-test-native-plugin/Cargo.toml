@@ -1,0 +1,14 @@
+[package]
+name = "rpi-test-native-plugin"
+description = "Test fixture: native (abi_stable) rpi extension plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde_json.workspace = true

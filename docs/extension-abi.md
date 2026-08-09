@@ -1,7 +1,7 @@
-# pir Extension ABI v1（wasm 扩展宿主）
+# rpi Extension ABI v1（wasm 扩展宿主）
 
-T15 W6 定稿。宿主实现：`crates/pir-ext-host/src/wasm/`；guest SDK：
-`crates/pir-ext-sdk`；示例：`examples/wasm-extension/`。
+T15 W6 定稿。宿主实现：`crates/rpi-ext-host/src/wasm/`；guest SDK：
+`crates/rpi-ext-sdk`；示例：`examples/wasm-extension/`。
 
 ## 1. 内存模型与字节布局
 
@@ -12,10 +12,10 @@ T15 W6 定稿。宿主实现：`crates/pir-ext-host/src/wasm/`；guest SDK：
   | `memory` | — | 线性内存，所有载荷所在 |
   | `pir_alloc` | `(len: u32) -> u32` | host 写入响应前调用，分配 guest 内存 |
   | `pir_dealloc` | `(ptr: u32, len: u32)` | host 读完响应后调用 |
-  | `pir_extension_init` | `() -> u64` | 加载入口（注册发生在这里） |
-  | `pir_dispatch` | `(ptr: u32, len: u32) -> u64` | 事件/工具/命令/渲染分发 |
+  | `rpi_extension_init` | `() -> u64` | 加载入口（注册发生在这里） |
+  | `rpi_dispatch` | `(ptr: u32, len: u32) -> u64` | 事件/工具/命令/渲染分发 |
 
-- host 导入（模块名 `pir`）：
+- host 导入（模块名 `rpi`）：
 
   | 导入 | 签名 | 用途 |
   |---|---|---|
@@ -29,15 +29,15 @@ T15 W6 定稿。宿主实现：`crates/pir-ext-host/src/wasm/`；guest SDK：
 ### 1.1 L0 原生动态库插件（abi_stable，T15 W7）
 
 wasm 之外的第二种载体：进程内动态库（`.so` / `.dll` / `.dylib`，cdylib）。
-宿主侧实现 `crates/pir-ext-host/src/native.rs`；参考插件
-`crates/pir-test-native-plugin`。
+宿主侧实现 `crates/rpi-ext-host/src/native.rs`；参考插件
+`crates/rpi-test-native-plugin`。
 
 - 消息格式与 wasm ABI 完全一致：同一 JSON method 表（§2/§3）、同一
   capability 强制（§3）、同一错误 kind 表（§4）。差别只在字节怎么过边界：
-  - 插件用 `#[export_root_module]` 导出 `PirNativeModule`（prefix 模块），
-    两个 extern "C" 字段：`pir_extension_init(PirHostCalls, cookie)`
-    与 `pir_dispatch(cookie, RVec<u8>) -> RVec<u8>`。
-  - host-call 句柄**按值**打包进 `repr(C)` 的 `PirHostCalls` 结构体传给
+  - 插件用 `#[export_root_module]` 导出 `RpiNativeModule`（prefix 模块），
+    两个 extern "C" 字段：`rpi_extension_init(RpiHostCalls, cookie)`
+    与 `rpi_dispatch(cookie, RVec<u8>) -> RVec<u8>`。
+  - host-call 句柄**按值**打包进 `repr(C)` 的 `RpiHostCalls` 结构体传给
     init——abi_stable 无法为「以 fn 指针为参数的 fn 指针」派生 StableAbi，
     故句柄不能作参数，只能乘结构体。
   - `cookie` 为 `*const c_void` 不透明上下文指针（abi_stable 不布局
@@ -58,7 +58,7 @@ wasm 之外的第二种载体：进程内动态库（`.so` / `.dll` / `.dylib`�
 guest 侧自增序号，仅供日志关联）。
 响应：`{"ok": <value>}` 或 `{"error": {"kind": "<kind>", "message": "..."}}`。
 
-### 2.2 `pir_dispatch`（host → guest）
+### 2.2 `rpi_dispatch`（host → guest）
 
 消息：`{"kind": "event", "event": "<name>", "payload": {...}}` → 返回
 handler 结果 JSON（`null` = undefined）。其余 kind：
@@ -107,7 +107,7 @@ flag 值——注册表元数据）。逐 host call 强制；拒绝返回
 guest 端 trap（含 fuel 耗尽）→ 加载错误（init）或 handler 错误
 （dispatch，经 `emit_error` 收集，agent 继续——与 native 一致）。
 
-## 5. manifest（`pir-extension.json`，目录级）
+## 5. manifest（`rpi-extension.json`，目录级）
 
 ```json
 {
@@ -116,11 +116,11 @@ guest 端 trap（含 fuel 耗尽）→ 加载错误（init）或 handler 错误
   "description": "...",
   "wasm": "dist/my_ext.wasm",
   "capabilities": ["tools", "commands", "ui", "session", "exec", "provider", "events"],
-  "pirAbi": 1
+  "rpiAbi": 1
 }
 ```
 
-- `pirAbi != 1` → 加载错误；未知 capability 字符串 → 加载错误。
+- `rpiAbi != 1` → 加载错误；未知 capability 字符串 → 加载错误。
 - `native`（可选）：L0 原生插件动态库的包相对路径（§1.1），与 `wasm`
   互斥——两者并存时 `wasm` 优先（`native` 被忽略）。
 - 裸 `.wasm` / 裸动态库（一层目录内的散文件）→ `capabilities = []`。
@@ -139,10 +139,10 @@ guest 端 trap（含 fuel 耗尽）→ 加载错误（init）或 handler 错误
 
 ## 7. 组件树
 
-渲染类返回 ComponentTree v1（`pir_ext_host::types::COMPONENT_TREE_SCHEMA_V1`
-常量；映射器在 `pir::modes::interactive::component_tree`）。
+渲染类返回 ComponentTree v1（`rpi_ext_host::types::COMPONENT_TREE_SCHEMA_V1`
+常量；映射器在 `rpi::modes::interactive::component_tree`）。
 
 ## 8. 版本治理
 
-`pirAbi` 为主版本号：宿主拒绝不认识的版本。ABI 演进（新
-method/kind）向后兼容追加，不兼容变更升 pirAbi 并在本文件记变更史。
+`rpiAbi` 为主版本号：宿主拒绝不认识的版本。ABI 演进（新
+method/kind）向后兼容追加，不兼容变更升 rpiAbi 并在本文件记变更史。

@@ -21,8 +21,8 @@
 - 扩展 reload 资源后保留 skills/prompts/themes 的 package source 元数据（#6968）
 - 嵌套 worktree 上下文文件去重：`find_shadowed_context_file()` 用 git commonDir/mainRepoRoot 判定影子文件，避免 AGENTS.md 加载两次
 - `ResourceLoader` 接口补 `get_system_prompt_source`/`get_append_system_prompt_sources`（v0.83.0 继承项，v0.1 未覆盖则补齐）
-- git 包安装容错：`git clean` 失败后检测缺失依赖并重装；安装失败清理残留目录；`.pir-update-incomplete` marker 续传语义
-- `read_pi_manifest()` 独立化：package.json `pi` 字段解析从 package-manager 抽出 + 类型校验（pir 侧读 `pir` 字段的等价物，沿用 v0.1 包格式决策）
+- git 包安装容错：`git clean` 失败后检测缺失依赖并重装；安装失败清理残留目录；`.rpi-update-incomplete` marker 续传语义
+- `read_pi_manifest()` 独立化：package.json `pi` 字段解析从 package-manager 抽出 + 类型校验（rpi 侧读 `rpi` 字段的等价物，沿用 v0.1 包格式决策）
 
 ### Out
 
@@ -33,7 +33,7 @@
 
 - 候选链顺序是对拍契约，golden 用例覆盖五候选优先级与 override 覆盖
 - worktree 去重需要构造嵌套 worktree fixture（git worktree + 子模块场景）
-- `.pir-update-incomplete` 命名沿用 APP_NAME 派生惯例（上游 `.pi-update-incomplete`）
+- `.rpi-update-incomplete` 命名沿用 APP_NAME 派生惯例（上游 `.pi-update-incomplete`）
 
 ## 进度跟踪
 

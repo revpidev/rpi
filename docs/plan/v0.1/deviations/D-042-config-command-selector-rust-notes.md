@@ -3,18 +3,18 @@
 > 复制本模板为 `D-NNN-<short-slug>.md` 并填写。登记说明见 [README.md](./README.md)。
 
 - **状态**：已关闭
-- **关联任务**：T14（W3：`pir config` 子命令）
+- **关联任务**：T14（W3：`rpi config` 子命令）
 - **级别**：实现细节偏离
 - **发现日期**：2026-08-06
 
 ## 原文档约定
 
 - 文档与章节：`docs/01-requirements.md` §3.2（子命令：config TUI Tab 切 scope；`-l` 要求 trust）；`docs/plan/v0.1/T14-packages-trust-export.md` W3 契约要点
-- 原文约定：`pir config` 打开资源配置 TUI，Tab 切 User/Project scope，编辑 settings 项；`-l` 直接进 project 写 scope 且要求项目信任
+- 原文约定：`rpi config` 打开资源配置 TUI，Tab 切 User/Project scope，编辑 settings 项；`-l` 直接进 project 写 scope 且要求项目信任
 
 ## 实际实现与偏离原因
 
-T12 交付的 `config_selector.rs` 以 `LoadedResources` 为输入、toggle 走内存态 + 写钩子（组件头注释自承「settings 写入是缺口，由 T14 接线」）。W3 将该组件重写为上游数据模型并补齐持久化，`pir config` 落 `crates/pir/src/cli/config_command.rs`：
+T12 交付的 `config_selector.rs` 以 `LoadedResources` 为输入、toggle 走内存态 + 写钩子（组件头注释自承「settings 写入是缺口，由 T14 接线」）。W3 将该组件重写为上游数据模型并补齐持久化，`rpi config` 落 `crates/rpi/src/cli/config_command.rs`：
 
 1. **输入换成 `ScopedResolvedPaths`**（package manager 全量 `resolve_all` 输出：package + top-level settings 条目 + auto-discovered，含 `enabled` 与完整 `PathMetadata`），取代 T12 的 `LoadedResources` + 路径位置推断元数据。T12 的推断分支（`infer_metadata`）删除。
 2. **持久化逐函数移植**（config-selector.ts:516-863）：global toggle 写 settings 数组的 `+/-pattern`（top-level）或包条目 object 化 + filter 数组（package）；project scope 三态循环（inherit/load/unload）按上游 `setProjectTopLevelOverride` / `setProjectPackageOverride` 写 project settings，含 `autoload:false` 占位条目的创建与回收。组件直接持有 `Arc<Mutex<SettingsManager>>`（上游同步读写同一实例）。
@@ -37,7 +37,7 @@ TUI 行为：与上游一致（含上述死代码 quirk）。settings 线格式�
 ## 审查修复补记（2026-08-07 审查修复波次）
 
 1. **项目 scope 写错误表面化**：`set_top_level_paths` / `write_packages` 原以
-   `let _ =` 吞掉项目 setter 错误（trust 门禁内理论上不可达，但 `.pir/settings.json`
+   `let _ =` 吞掉项目 setter 错误（trust 门禁内理论上不可达，但 `.rpi/settings.json`
    已损坏或存储 IO 失败时 toggle 会静默不持久化）。现两函数返回 `Result`，项目写失败
    时 `eprintln!` 一行诊断并返回 false——toggle 不翻转、内存态与落盘一致（沿用既有
    `None` 语义，等价上游 throw）。用户 scope 写恒不可失败，语义不变。

@@ -1,6 +1,6 @@
-# resetpi.com — pir 产品端点部署（Cloudflare Pages）
+# resetpi.com — rpi 产品端点部署（Cloudflare Pages）
 
-pir 的 5 个产品端点默认值自 ADR-0009 起指向 `resetpi.com`。本目录是
+rpi 的 5 个产品端点默认值自 ADR-0009 起指向 `resetpi.com`。本目录是
 Cloudflare Pages 项目：静态目录内容 + Pages Functions，零后端。
 `index.html` 为站点首页（开源项目主页，含特性/快速开始/端点说明），
 `/` 请求直接命中。
@@ -18,7 +18,7 @@ Cloudflare Pages 项目：静态目录内容 + Pages Functions，零后端。
 ## 生成 + 部署
 
 ```bash
-# 1. 生成 catalog 与 latest-version（在 pir 仓库根运行；版本默认取 workspace Cargo.toml）
+# 1. 生成 catalog 与 latest-version（在 rpi 仓库根运行；版本默认取 workspace Cargo.toml）
 python3 deploy/resetpi/scripts/generate-site.py
 #    发版时：python3 deploy/resetpi/scripts/generate-site.py --version 0.2.0 --note "..."
 
@@ -41,11 +41,11 @@ npx wrangler kv namespace create ANALYTICS   # 把 id 填入 wrangler.toml 后�
 默认端点已在代码里改为 resetpi.com（ADR-0009）。仍可逐项覆盖：
 
 ```bash
-PIR_MODEL_CATALOG_URL=https://resetpi.com        # 或 settings.json modelCatalogUrl
-PIR_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
-PIR_TELEMETRY_URL=https://resetpi.com/api/report-install
-PIR_SHARE_VIEWER_URL=https://resetpi.com/session
-# 字面量 off 关闭对应端点；PIR_OFFLINE 全局关闭
+RPI_MODEL_CATALOG_URL=https://resetpi.com        # 或 settings.json modelCatalogUrl
+RPI_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
+RPI_TELEMETRY_URL=https://resetpi.com/api/report-install
+RPI_SHARE_VIEWER_URL=https://resetpi.com/session
+# 字面量 off 关闭对应端点；RPI_OFFLINE 全局关闭
 ```
 
 ## 兼容性注意
@@ -56,5 +56,5 @@ PIR_SHARE_VIEWER_URL=https://resetpi.com/session
 - **radius 不在 catalog 内**：radius 是动态 gateway provider（默认
   `https://radius.pi.dev`，上游托管服务，非静态内容），`/api/models/providers/radius`
   返回 404 即"overlay 不可用"语义，radius 用户不受影响。
-- **数据源**：catalog 由 `crates/pir-ai/src/providers/data/*.json` 生成，
-  与 pir 发版同步更新。
+- **数据源**：catalog 由 `crates/rpi-ai/src/providers/data/*.json` 生成，
+  与 rpi 发版同步更新。

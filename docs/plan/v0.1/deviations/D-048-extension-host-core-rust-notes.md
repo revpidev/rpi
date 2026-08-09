@@ -16,27 +16,27 @@
 
 1. **tool_call 跨 handler 改参经结果穿线**：上游把同一个可变 `event` 对象依次传给
    各 handler，改参靠原地改共享对象（runner.ts:919-940）；JSON/wasm 边界无共享
-   引用，pir 改为 handler 结果 `input` 字段穿线——后续 handler 看到改后参数，
-   最终结果合并改后 `input`（`crates/pir-ext-host/src/runner.rs:640-663`）。
+   引用，rpi 改为 handler 结果 `input` 字段穿线——后续 handler 看到改后参数，
+   最终结果合并改后 `input`（`crates/rpi-ext-host/src/runner.rs:640-663`）。
    对规范使用（返回改后参数）的扩展行为等价；`block` 短路语义一致。
 2. **（行为级，ADR-0007）`user_bash` 的 `operations` 不支持**：上游
    `UserBashEventResult.operations` 为自定义 bash 执行后端的闭包束，不可序列化；
-   pir 丢弃该字段并回退内置执行（`crates/pir-ext-host/src/types.rs:674` 注释；
+   rpi 丢弃该字段并回退内置执行（`crates/rpi-ext-host/src/types.rs:674` 注释；
    测试 `w2_user_bash_operations_only_and_no_handler_fall_back`）。
 3. **`registerProvider` 的闭包子项显式拒绝**：`ProviderConfig` 的
    `streamSimple` / `oauth` / `refreshModels` 为闭包字段，无法跨 JSON 边界；
-   pir 大声报错而非静默丢弃（`crates/pir/src/core/extension_actions.rs:262-265`）。
+   rpi 大声报错而非静默丢弃（`crates/rpi/src/core/extension_actions.rs:262-265`）。
    Rust 侧 provider 走 `register_native_provider`（持 trait 对象，无序列化问题）。
 4. **`newSession` 的 `setup` 回调省略**：上游 setup 接收 `SessionManager` 实例，
    不可跨宿主边界表达；v1 以 `withSession`（接收替换后会话的扩展上下文）替代
-   （`crates/pir-ext-host/src/api.rs:591-596` 注释）。
+   （`crates/rpi-ext-host/src/api.rs:591-596` 注释）。
 5. **`exec` 超时直接 SIGKILL**：上游 SIGTERM + 5s 后 SIGKILL 升级
-   （exec.ts:50-58）；pir 超时直接按 pid SIGKILL
-   （`crates/pir/src/core/extension_actions.rs:369-372` 注释登记；bash 工具的
+   （exec.ts:50-58）；rpi 超时直接按 pid SIGKILL
+   （`crates/rpi/src/core/extension_actions.rs:369-372` 注释登记；bash 工具的
    libc kill 助手为先例）。超时进程无缓冲冲刷机会，输出可能少于上游。
 6. **（行为级，ADR-0007）非 RPC 模式 `ctx.command.*` 未绑定**：上游
-   `bindCommandContext` 全模式接真实现（agent-session.ts:2309）；pir 仅 RPC 模式
-   绑定（`crates/pir/src/modes/rpc.rs:707`），interactive / print 走未绑定默认值
+   `bindCommandContext` 全模式接真实现（agent-session.ts:2309）；rpi 仅 RPC 模式
+   绑定（`crates/rpi/src/modes/rpc.rs:707`），interactive / print 走未绑定默认值
    （`{cancelled: false}` / no-op，对齐上游 runner.ts:421-427 默认）。真实现
    `RuntimeCommandActions` 已就位（`core/extension_context.rs`），interactive
    绑定留后续版本。

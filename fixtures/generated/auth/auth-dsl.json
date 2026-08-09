@@ -1,7 +1,7 @@
 {
   "anthropic": {
     "type": "api_key",
-    "key": "$PIR_FIXTURE_API_KEY"
+    "key": "$RPI_FIXTURE_API_KEY"
   },
   "openai": {
     "type": "api_key",

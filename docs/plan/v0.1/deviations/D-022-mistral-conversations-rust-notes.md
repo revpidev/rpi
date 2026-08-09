@@ -14,16 +14,16 @@
 
 ## 实际实现与偏离原因
 
-`crates/pir-ai/src/api/mistral_conversations.rs` 完整移植上游 `mistral-conversations.ts`（`mistral-conversations.lazy.ts` 为动态 import 包装，pir 静态链接无对应物）。行为锚点（promptMode vs reasoningEffort 分流、tool-call id 9 字符归一化、`x-affinity`/`promptCacheKey`、cached tokens 6 字段变体钳制）均逐条对齐。落地差异：
+`crates/rpi-ai/src/api/mistral_conversations.rs` 完整移植上游 `mistral-conversations.ts`（`mistral-conversations.lazy.ts` 为动态 import 包装，rpi 静态链接无对应物）。行为锚点（promptMode vs reasoningEffort 分流、tool-call id 9 字符归一化、`x-affinity`/`promptCacheKey`、cached tokens 6 字段变体钳制）均逐条对齐。落地差异：
 
 1. **HTTP 为 reqwest 直连**，不经过 `@mistralai/mistralai` SDK：SDK 的 `user-agent`（speakeasy 标识）与遥测头不发送，无 SDK 默认超时（调用方设 `StreamOptions::timeout_ms`）。请求 URL/方法/体（`POST {baseUrl}/v1/chat/completions`，snake_case 体、`Accept: text/event-stream`、`Authorization: Bearer`、`data: [DONE]` 终止）已从 SDK 源码核对一致（SDK 0.x `chatStream.ts`、各 component zod schema）。
-2. **`on_payload` 见 wire（snake_case）JSON**，而非 SDK 的 camelCase 请求对象（与 pir 其他适配器一致）。
+2. **`on_payload` 见 wire（snake_case）JSON**，而非 SDK 的 camelCase 请求对象（与 rpi 其他适配器一致）。
 3. **SSE 解析差异**：chunk 用严格 `serde_json` 反序列化（SDK 用 zod schema），解析失败文案为 `Could not parse Mistral SSE chunk: {error}; data={data}`（SDK 为 `SDKValidationError` 文案）；内容 chunk 以 JSON 值检视，未知 chunk 类型忽略而非报错（SDK discriminated union 产 `Unknown` 项，适配器同样跳过，语义等价）。
 4. **错误格式化边界**：保留上游 `Mistral API error ({status}): {body 截断 4000}` 形状；body 为空时 fallback 为 `Request failed with status {status}`（SDK 会插入其 `SDKError` 自身 message，含 Content-Type/Body 回显）；传输层错误带 reqwest message（SDK 为 fetch `TypeError` 文案）。
-5. **`x-affinity` 覆盖检查大小写不敏感**：上游在合并后的 plain record 上查精确小写键 `x-affinity`；pir 经 `merge_headers_chain` 合并后按 ASCII 大小写不敏感判定（调用方显式提供的 `X-Affinity` 亦视为已提供）。
+5. **`x-affinity` 覆盖检查大小写不敏感**：上游在合并后的 plain record 上查精确小写键 `x-affinity`；rpi 经 `merge_headers_chain` 合并后按 ASCII 大小写不敏感判定（调用方显式提供的 `X-Affinity` 亦视为已提供）。
 6. **`stripSymbolKeys` 不移植**：`serde_json::Value` 不可能携带 TypeBox symbol 键，Rust 侧为恒等（mistral-tool-schema.test.ts 的意图由 strict 序列化契约测试覆盖）。
-7. **`partialArgs` 暂存于处理器侧 scratch map**：pir `ToolCall` 无 `partialArgs` 字段；上游在 block 上挂暂存字段并在 finish 前删除，Rust 侧等价地不使其离开处理器。
-8. **`retries: {strategy: "none"}` 的对应**：上游显式关闭 SDK 重试；pir 走共享 `retry_provider_request`，`max_retries` 默认 0（等价），调用方显式设置时可启用重试（与其他 pir 适配器一致）。
+7. **`partialArgs` 暂存于处理器侧 scratch map**：rpi `ToolCall` 无 `partialArgs` 字段；上游在 block 上挂暂存字段并在 finish 前删除，Rust 侧等价地不使其离开处理器。
+8. **`retries: {strategy: "none"}` 的对应**：上游显式关闭 SDK 重试；rpi 走共享 `retry_provider_request`，`max_retries` 默认 0（等价），调用方显式设置时可启用重试（与其他 rpi 适配器一致）。
 
 ## 影响面
 

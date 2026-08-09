@@ -13,19 +13,19 @@ T15 扩展宿主（L0 native + L1 wasm）落地后，扩展 API 面与上游
 
 1. **`user_bash` 的 `operations` 自定义执行后端不支持**：上游
    `UserBashEventResult.operations` 允许扩展返回一组文件操作闭包来替换内置 bash
-   执行后端；闭包束不可序列化，pir 收到后丢弃并回退内置执行
-   （`crates/pir-ext-host/src/types.rs:674` 注释、W2 测试
+   执行后端；闭包束不可序列化，rpi 收到后丢弃并回退内置执行
+   （`crates/rpi-ext-host/src/types.rs:674` 注释、W2 测试
    `w2_user_bash_operations_only_and_no_handler_fall_back` 钉死）。
 2. **非 RPC 模式 `ctx.command.*` 未绑定**：上游
    `runner.bindCommandContext` 在 `agent-session.ts:2309` 无条件接线（全模式真实现）；
-   pir 仅在 RPC 模式绑定（`crates/pir/src/modes/rpc.rs:707`），interactive / print
+   rpi 仅在 RPC 模式绑定（`crates/rpi/src/modes/rpc.rs:707`），interactive / print
    模式走未绑定默认值（对齐上游 `runner.ts:421-427` 的默认：
    `{cancelled: false}` / no-op）。即扩展命令在交互模式内调
    `ctx.newSession()/fork()/switchSession()/reload()` 不产生效果。
 3. **`ctx.ui.custom()` 声明式 v1 无交互回传**：上游 `custom()` 挂载获得键盘焦点的
-   交互组件并以 `done(result)` 值 resolve；pir 的声明式组件树（ComponentTree v1）
+   交互组件并以 `done(result)` 值 resolve；rpi 的声明式组件树（ComponentTree v1）
    没有交互通道，W4 实现为「展示后立即 resolve `undefined`」
-   （`crates/pir/src/modes/interactive/interactive_mode/ui_bridge.rs:413` 注释）。
+   （`crates/rpi/src/modes/interactive/interactive_mode/ui_bridge.rs:413` 注释）。
 
 ## 决策
 
@@ -35,7 +35,7 @@ v0.1 接受上述三处缺口（按行为级偏离登记于 D-048 / D-049）：
   声明式组件协议）天然无法传闭包与有状态交互组件；要支持需引入回调句柄协议
   （host 侧注册回调、guest 侧持句柄触发），复杂度与 v0.1 范围不匹配。
 - 缺口 2 是接线范围决策：T15 的 command actions 真实现
-  （`RuntimeCommandActions`，`crates/pir/src/core/extension_context.rs`）依赖
+  （`RuntimeCommandActions`，`crates/rpi/src/core/extension_context.rs`）依赖
   `AgentSessionRuntime` 持有权，RPC 模式已接线；interactive 模式的绑定需解决
   与 TUI 事件泵的重入时序，留待后续版本（不影响内置命令与 `/llama` 等已迁移
   扩展——它们不经 `ctx.command.*`）。

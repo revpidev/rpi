@@ -19,11 +19,11 @@
 ### In
 
 - workspace `Cargo.toml` + `rustfmt.toml` + release profile（编码规范 §15.4）
-- 六个 crate 骨架：`pir-ai`、`pir-agent`、`pir-tui`、`pir`（bin + lib）、`pir-ext-host`、`pir-test-support`，依赖方向按设计文档 §2.2
-- `pir-ai` 核心类型：`Role` / `Message` / `Context` / `Tool`（含 `constrained_sampling`）/ `Model`（含 `thinkingLevelMap` 三态、cost.tiers、headers、compat）/ `ApiKind` / `AssistantMessage`（含 `stopReason` 全集 `stop|length|toolUse|error|aborted`、`pending` 仅瞬时不入 JSONL；`api/provider/model/responseModel?/responseId?/diagnostics?/usage/errorMessage/timestamp`）
+- 六个 crate 骨架：`rpi-ai`、`rpi-agent`、`rpi-tui`、`rpi`（bin + lib）、`rpi-ext-host`、`rpi-test-support`，依赖方向按设计文档 §2.2
+- `rpi-ai` 核心类型：`Role` / `Message` / `Context` / `Tool`（含 `constrained_sampling`）/ `Model`（含 `thinkingLevelMap` 三态、cost.tiers、headers、compat）/ `ApiKind` / `AssistantMessage`（含 `stopReason` 全集 `stop|length|toolUse|error|aborted`、`pending` 仅瞬时不入 JSONL；`api/provider/model/responseModel?/responseId?/diagnostics?/usage/errorMessage/timestamp`）
 - 签名与诊断字段：`ToolCall.thought_signature?`、`TextContent.text_signature?`、`ThinkingContent.thinking_signature?/redacted?`、`Usage.cache_write1h?/reasoning?`
-- `pir-ai` `StreamEvent` 枚举完整定义（M0 锁定，见编码规范 §4.1）：**变体携带 `content_index`，不同 block 事件可交错**
-- `pir-agent` `AgentEvent`（10 种，**含载荷**：`turn_end{message, toolResults}`、`agent_end{messages}`、`message_update{assistantMessageEvent}` 等）/ `AgentTool`（含 `execution_mode`、`prepare_arguments`）/ `AgentMessage` 联合类型（含 `bashExecution` / `custom` / `branchSummary` / `compactionSummary` 全字段，`ToolResultMessage.details/usage/addedToolNames/isError`）
+- `rpi-ai` `StreamEvent` 枚举完整定义（M0 锁定，见编码规范 §4.1）：**变体携带 `content_index`，不同 block 事件可交错**
+- `rpi-agent` `AgentEvent`（10 种，**含载荷**：`turn_end{message, toolResults}`、`agent_end{messages}`、`message_update{assistantMessageEvent}` 等）/ `AgentTool`（含 `execution_mode`、`prepare_arguments`）/ `AgentMessage` 联合类型（含 `bashExecution` / `custom` / `branchSummary` / `compactionSummary` 全字段，`ToolResultMessage.details/usage/addedToolNames/isError`）
 - 扩展消息 → LLM 文本格式常量：`COMPACTION_SUMMARY_PREFIX/SUFFIX`、`BRANCH_SUMMARY_PREFIX/SUFFIX`（逐字移植）
 - session 条目类型 serde 骨架：header + 9 种主路径条目 + compaction 两形态（`firstKeptEntryId` / `retainedTail`）+ harness 独有 `active_tools_change` / `leaf`（需求 §6.2）
 - `StreamFn` 类型别名与 `BoxStream` 定义（设计文档 §4.4）
@@ -56,7 +56,7 @@
 - [x] `cargo build --workspace` / `clippy -D warnings` / `fmt --check` 通过
 - [x] 类型单测：`StreamEvent` / `AgentEvent` / session 条目序列化形状快照测试（含 compaction 两形态、签名字段）——30 例全过
 - [x] pin 校验脚本在正确 commit 上通过；人为切到错误 commit 时失败（验证脚本有效性后切回）
-- [x] 依赖方向检查：`pir-agent` 不依赖 provider 实现、`pir-tui` 不依赖 `pir-ai`/`pir-agent`（已用 `cargo tree` 核对，内部边：pir → {pir-ai, pir-agent, pir-tui, pir-ext-host}，pir-agent → {pir-ai}，其余无内部依赖）
+- [x] 依赖方向检查：`rpi-agent` 不依赖 provider 实现、`rpi-tui` 不依赖 `rpi-ai`/`rpi-agent`（已用 `cargo tree` 核对，内部边：rpi → {rpi-ai, rpi-agent, rpi-tui, rpi-ext-host}，rpi-agent → {rpi-ai}，其余无内部依赖）
 
 ## 门禁验收
 
@@ -73,7 +73,7 @@
 
 | 偏离 ID | 摘要 | 状态 |
 |---------|------|------|
-| D-001 | session 条目类型单一来源化（`pir-agent::session`，合并 coding-agent 与 harness 两套定义） | 已回写 |
+| D-001 | session 条目类型单一来源化（`rpi-agent::session`，合并 coding-agent 与 harness 两套定义） | 已回写 |
 | D-002 | TS 类型系统特性的 Rust 表达（声明合并折叠、compat 条件类型合并、AgentTool trait 化、Api 开放联合 newtype 化） | 已回写 |
 
 ## 验收记录
@@ -91,9 +91,9 @@
 
 ### 附：`StreamEvent` / `AgentEvent` 与上游 TS 逐项核对清单
 
-`StreamEvent`（上游 `AssistantMessageEvent`，`packages/ai/src/types.ts`）→ `crates/pir-ai/src/types.rs`：
+`StreamEvent`（上游 `AssistantMessageEvent`，`packages/ai/src/types.ts`）→ `crates/rpi-ai/src/types.rs`：
 
-| 上游变体 | Pir 变体 | 载荷核对 |
+| 上游变体 | Rpi 变体 | 载荷核对 |
 |----------|----------|----------|
 | `start{partial}` | `Start{partial}` | ✅ partial 含 `role:"assistant"` 标签 |
 | `text_start{contentIndex,partial}` | `TextStart{content_index,partial}` | ✅ contentIndex 驼峰 |
@@ -106,9 +106,9 @@
 | `done{reason:stop\|length\|toolUse,message}` | `Done{reason:DoneReason,message}` | ✅ reason 收窄为独立枚举 |
 | `error{reason:aborted\|error,error}` | `Error{reason:ErrorReason,error}` | ✅ 同上 |
 
-`AgentEvent`（`packages/agent/src/types.ts`）→ `crates/pir-agent/src/types.rs`：
+`AgentEvent`（`packages/agent/src/types.ts`）→ `crates/rpi-agent/src/types.rs`：
 
-| 上游变体 | Pir 变体 | 载荷核对 |
+| 上游变体 | Rpi 变体 | 载荷核对 |
 |----------|----------|----------|
 | `agent_start` | `AgentStart` | ✅ 无载荷 |
 | `agent_end{messages}` | `AgentEnd{messages: Vec<AgentMessage>}` | ✅ |

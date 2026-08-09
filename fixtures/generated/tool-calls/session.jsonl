@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"019fb0ca-61a5-7e76-b92a-dcb8cb795982","timestamp":"2026-07-30T02:11:21.125Z","cwd":"/tmp/pir-fixture-tool-calls-KVdtVC/workspace"}
+{"type":"session","version":3,"id":"019fb0ca-61a5-7e76-b92a-dcb8cb795982","timestamp":"2026-07-30T02:11:21.125Z","cwd":"/tmp/rpi-fixture-tool-calls-KVdtVC/workspace"}
 {"type":"model_change","id":"947b970f","parentId":null,"timestamp":"2026-07-30T02:11:21.125Z","provider":"faux","modelId":"faux-1"}
 {"type":"thinking_level_change","id":"45bd8702","parentId":"947b970f","timestamp":"2026-07-30T02:11:21.125Z","thinkingLevel":"off"}
 {"type":"message","id":"32e40a0f","parentId":"45bd8702","timestamp":"2026-07-30T02:11:21.125Z","message":{"role":"user","content":[{"type":"text","text":"Read note.txt and run the echo command."}],"timestamp":1785377481125}}

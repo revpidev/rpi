@@ -8,8 +8,8 @@
 
 ## 背景
 
-T17（内置工具渲染钩子）核查发现 pir 语法高亮完全未交付：交互模式 Markdown 主题
-`highlight_code: None`（`crates/pir/src/modes/interactive/theme.rs:47`），write/read
+T17（内置工具渲染钩子）核查发现 rpi 语法高亮完全未交付：交互模式 Markdown 主题
+`highlight_code: None`（`crates/rpi/src/modes/interactive/theme.rs:47`），write/read
 渲染器的高亮分支与 Markdown 代码块高亮（需求 §8.6）均缺位。上游实现为自研
 `utils/syntax-highlight.ts`（hljs `<span>` HTML → ANSI 渲染器）+ highlight.js 10.7.3
 （coding-agent package.json:57，`theme.ts:1160-1179` `highlightCode`）。
@@ -38,10 +38,10 @@ D-051）：
   tree-sitter 系（含 arborium）因每语言 grammar 编译进二进制的体积风险（个别语法源文
   件达数十 MB 级）与 arborium 项目过新（2025-11 发布，API churn 风险）排除。
 - **应用面**：write/read 渲染器高亮分支（write.ts:151-154、read.ts:184-190 对位）、
-  Markdown 代码块（pir-tui `highlight_code` 槽位实装）、write 增量高亮缓存。
+  Markdown 代码块（rpi-tui `highlight_code` 槽位实装）、write 增量高亮缓存。
 - **对拍口径**：T17 其余维度不变——渲染结构、文案、钳制行数、计时器、流式增量行为仍
   逐字对拍；仅「代码着色的 ANSI token 分段与逐 token 配色」不与上游 diff。
-- **配色意图对齐**：syntect scope → pir `Theme` 的映射锚定上游 `getCliHighlightTheme`
+- **配色意图对齐**：syntect scope → rpi `Theme` 的映射锚定上游 `getCliHighlightTheme`
   （theme.ts:1140-1154）使用的同一组 theme 键，保持「同类 token 同色系」的视觉一致。
 - **语言支持语义**：`supportsLanguage` 对位改为「syntect 语法集可识别」；覆盖目标 ≥
   上游 `getLanguageFromPath` 可达的 39 语言（theme.ts:1184-1250）。**语法集用 bat 的

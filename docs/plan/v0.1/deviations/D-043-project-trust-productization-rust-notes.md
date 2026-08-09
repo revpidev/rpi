@@ -21,7 +21,7 @@ T10 已移植 trust-manager + 非交互半边，W4 补齐优先级链与启动�
 3. **启动信任弹窗**（`showStartupSelector`，startup-ui.ts:134-164）落 `modes/interactive/startup_ui.rs::run_startup_selector`：复用 T12 的 `ExtensionSelectorComponent`，同步阻塞等结果通道 + 泵线程驱动（信任存储调用方同步，见上）；包来源启动主题（loadStartupThemes）不移植（首启 setup 同例）；`clearStartupTui` 的 25ms 重绘延迟省略；主题经 `resolve_theme_setting` + env 检测，无 OSC 二次探测。hasUI 判定对齐 main.ts:608/654：`isInitialRuntime && appMode == interactive && !help && list_models.is_none()`。
 4. **弹窗阻塞 tokio worker**：同步 select 闭包在用户决策期间阻塞当前执行线程；启动流程顺序执行、无并发依赖，可接受。
 5. **`getProjectTrustOptions` 落核心层**（trust-manager.ts:59-95 五选项+updates）：新增 `get_project_trust_options` / `get_project_trust_parent_path` / `ProjectTrustOption{,Update}`；T12 的 `commands_selectors.rs::build_trust_options` 自有选项组装保留不动（标签与上游逐字一致，value 编码差异属 T12 既有形态），启动弹窗走核心层端口。
-6. **弹窗文案品牌替换**：`formatProjectTrustPrompt` 的 "This allows pi to load…" → "pir"（与既有 warning 文案的 pir 自称一致）。
+6. **弹窗文案品牌替换**：`formatProjectTrustPrompt` 的 "This allows pi to load…" → "rpi"（与既有 warning 文案的 rpi 自称一致）。
 
 **遗留（已析出为 D-044，行为级，ADR-0006）**：上游 `switchSession` 的 `projectTrustContextFactory`（interactive-mode.ts:4816/4830）未接线——交互模式内 resume 到**不同 cwd** 的会话时信任判定走 headless（ask→false，随后渲染既有的 untrusted warning）；同 cwd 重建命中 `trust_by_cwd` 缓存与上游一致。`CreateRuntimeOptions.project_trust_context` 字段已留口子，T15 接线后关闭 D-044。
 

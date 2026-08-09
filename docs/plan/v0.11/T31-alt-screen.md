@@ -36,7 +36,7 @@ Kitty 图片管理、退出重打。验收蓝本为上游 1067 行 30+ 场景测
 
 ## 开发要点
 
-- 以 `tui-alt-screen.test.ts` 30+ 场景为移植主干：先 VT 测试架（pir-test-support 的 VirtualTerminal/RecordingTerminal 等价物扩充鼠标/OSC 序列注入），再逐场景实现
+- 以 `tui-alt-screen.test.ts` 30+ 场景为移植主干：先 VT 测试架（rpi-test-support 的 VirtualTerminal/RecordingTerminal 等价物扩充鼠标/OSC 序列注入），再逐场景实现
 - Kitty 缓存/裁剪/回收是独立子模块（`kitty_registry`），单元测试先行
 - 鼠标解析状态机（SGR/X10/残片消费）单独黄金化
 - 本任务期间 main-screen 行为不得变化（T28 基线保持绿）
@@ -64,7 +64,7 @@ Kitty 图片管理、退出重打。验收蓝本为上游 1067 行 30+ 场景测
 任务特有标准：
 
 - [ ] 需求 R5.2 五条逐条核对表
-- [ ] 30+ 场景移植清单（上游场景 → pir 测试锚点）
+- [ ] 30+ 场景移植清单（上游场景 → rpi 测试锚点）
 
 ## 偏离记录
 

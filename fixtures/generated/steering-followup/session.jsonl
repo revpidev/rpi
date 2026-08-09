@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"019fb0d5-660a-7a94-a189-3d3d7d5c56f7","timestamp":"2026-07-30T02:23:23.146Z","cwd":"/tmp/pir-fixture-steering-followup-48bI2d/workspace"}
+{"type":"session","version":3,"id":"019fb0d5-660a-7a94-a189-3d3d7d5c56f7","timestamp":"2026-07-30T02:23:23.146Z","cwd":"/tmp/rpi-fixture-steering-followup-48bI2d/workspace"}
 {"type":"model_change","id":"b619e74d","parentId":null,"timestamp":"2026-07-30T02:23:23.148Z","provider":"faux","modelId":"faux-1"}
 {"type":"thinking_level_change","id":"aa438f20","parentId":"b619e74d","timestamp":"2026-07-30T02:23:23.148Z","thinkingLevel":"off"}
 {"type":"message","id":"d1dbf151","parentId":"aa438f20","timestamp":"2026-07-30T02:23:23.152Z","message":{"role":"user","content":[{"type":"text","text":"Start the first answer."}],"timestamp":1785378203151}}

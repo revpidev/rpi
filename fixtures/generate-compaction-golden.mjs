@@ -13,7 +13,7 @@
  *     captured from the real upstream call sites (history initial / update,
  *     turn prefix, branch summary, system prompt, split-turn merged summary)
  *
- * The Rust side (crates/pir-agent/tests/compaction_golden_test.rs) replays
+ * The Rust side (crates/rpi-agent/tests/compaction_golden_test.rs) replays
  * every case and asserts byte/value equality — do not edit the outputs by
  * hand; regenerate with:
  *

@@ -1,6 +1,6 @@
 // Probe which sequences ICU 76's \p{RGI_Emoji} matches, for all candidates
 // from the Unicode 16.0 emoji sequence files plus the 7 extra single cps.
-// Part of the pir-tui utils.rs Unicode table generation chain
+// Part of the rpi-tui utils.rs Unicode table generation chain
 // (scripts/gen-tui-unicode-data.py). Run with:
 //   node scripts/icu-probe3.mjs [ucd-dir] [out-dir]
 // (ucd-dir holds u16-emoji-sequences.txt / u16-emoji-zwj-sequences.txt from

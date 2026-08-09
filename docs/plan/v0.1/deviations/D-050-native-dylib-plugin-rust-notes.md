@@ -13,21 +13,21 @@
 
 ## 实际实现与偏离原因
 
-abi_stable 0.11.3 动态库插件按设计落地（`crates/pir-ext-host/src/native.rs`；
-参考插件 `crates/pir-test-native-plugin`，cdylib），消息格式与 wasm ABI v1
+abi_stable 0.11.3 动态库插件按设计落地（`crates/rpi-ext-host/src/native.rs`；
+参考插件 `crates/rpi-test-native-plugin`，cdylib），消息格式与 wasm ABI v1
 完全一致（同一 JSON method 表 / capability 强制 / 错误 kind 表）。落地细节
 相对设计稿的补充与收敛：
 
 1. **ABI 形状受 abi_stable 约束收敛**：fn 指针不能作 fn 参数（嵌套 fn ptr
-   无 StableAbi 派生）→ host-call 句柄打包为 `repr(C)` 的 `PirHostCalls`
-   结构体**按值**传入 `pir_extension_init`；`usize` 无 StableAbi → 上下文
+   无 StableAbi 派生）→ host-call 句柄打包为 `repr(C)` 的 `RpiHostCalls`
+   结构体**按值**传入 `rpi_extension_init`；`usize` 无 StableAbi → 上下文
    cookie 用 `*const c_void`；借用切片会把生命周期带进 fn 指针类型 → 缓冲
    一律 `RVec<u8>` 拥有型双向传递（无 wasm 的 alloc/dealloc 舞步）。
 2. **无沙箱信任模型明示**：原生插件在宿主进程内运行，拥有全部 OS 权限；
    capability 系统只管扩展 API 面（host call 层强制与 wasm 相同），不构成
    安全边界。此为 L0 载体的固有属性，已在 extension-abi.md §1.1 与
    native.rs 模块头明示，供扩展安装者决策。
-3. **manifest 新增 `native` 字段**：`pir-extension.json` 的包相对动态库路径，
+3. **manifest 新增 `native` 字段**：`rpi-extension.json` 的包相对动态库路径，
    与 `wasm` 互斥（并存时 `wasm` 优先）；裸 `.so`/`.dll`/`.dylib` 散文件
    `capabilities = []`（extension-abi.md §5）。
 4. **无 fuel/Store/专属线程**：dispatch 在调用线程内同步执行，死循环插件可

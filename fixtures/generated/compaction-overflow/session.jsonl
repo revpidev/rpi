@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"019fc56d-027b-738b-9d45-20bcc6834f52","timestamp":"2026-08-03T02:21:23.451Z","cwd":"/tmp/pir-fixture-compaction-overflow-5jzr2b/workspace"}
+{"type":"session","version":3,"id":"019fc56d-027b-738b-9d45-20bcc6834f52","timestamp":"2026-08-03T02:21:23.451Z","cwd":"/tmp/rpi-fixture-compaction-overflow-5jzr2b/workspace"}
 {"type":"model_change","id":"08c394c3","parentId":null,"timestamp":"2026-08-03T02:21:23.451Z","provider":"faux","modelId":"faux-1"}
 {"type":"thinking_level_change","id":"3ffa2300","parentId":"08c394c3","timestamp":"2026-08-03T02:21:23.451Z","thinkingLevel":"off"}
 {"type":"message","id":"2f3ec841","parentId":"3ffa2300","timestamp":"2026-08-03T02:21:23.453Z","message":{"role":"user","content":[{"type":"text","text":"Question one."}],"timestamp":1785723683452}}

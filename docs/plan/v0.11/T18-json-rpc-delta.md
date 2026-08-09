@@ -19,10 +19,10 @@ JSON/RPC 模式的 `message_update` 事件改为 delta-only（去除累积 `mess
 
 ### In
 
-- 新增 `pir::modes::json_event`（对应 `json-event.ts` 的 `toJsonEvent()`）：print-mode 与 rpc-mode 共用的唯一转换点
+- 新增 `rpi::modes::json_event`（对应 `json-event.ts` 的 `toJsonEvent()`）：print-mode 与 rpc-mode 共用的唯一转换点
 - `message_update` 只发 `assistantMessageEvent` 增量 delta（`contentIndex` + `delta`）；删除累积 `message` 与 `partial` 字段
 - 契约文档同步：`message_start` 给初始消息、`message_end.message` 为权威终态；`start`/`done`/`error` delta 类型从 RPC 文档表删除
-- `RpcClient`（pir-rpc）事件类型同步为 delta 形态；`collect_events`/`prompt_and_wait` 等辅助按上游调整
+- `RpcClient`（rpi-rpc）事件类型同步为 delta 形态；`collect_events`/`prompt_and_wait` 等辅助按上游调整
 - **stdout 背压**：事件订阅写出路径统一经 `wait_for_raw_stdout_backpressure` 等价物（print/rpc 两模式）
 - fixtures 重新生成：`fixtures/generate-fixtures.mjs` 对新版上游（`4181f66`）重跑 print/json/rpc 场景；`fixtures/README.md` 口径更新
 - RPC 32 命令契约测试的 `message_update` 期望全部改写为 delta 形态
@@ -35,8 +35,8 @@ JSON/RPC 模式的 `message_update` 事件改为 delta-only（去除累积 `mess
 ## 开发要点
 
 - 先改转换层与测试期望，再重新生成 fixtures；两步分开提交，便于审查「期望改写」是否都有上游依据
-- 背压实现注意 pir 的写出路径（tokio AsyncWrite 水位 / 同步写缓冲），语义对齐上游「等待可写再发下一事件」而非丢弃/合并事件
-- 上游回归 `7290-json-stream-linear`（线性输出量断言）移植为 pir 集成测试
+- 背压实现注意 rpi 的写出路径（tokio AsyncWrite 水位 / 同步写缓冲），语义对齐上游「等待可写再发下一事件」而非丢弃/合并事件
+- 上游回归 `7290-json-stream-linear`（线性输出量断言）移植为 rpi 集成测试
 
 ## 进度跟踪
 
@@ -61,7 +61,7 @@ JSON/RPC 模式的 `message_update` 事件改为 delta-only（去除累积 `mess
 任务特有标准：
 
 - [ ] 「旧期望 → 新期望 + 上游 commit 依据」清单（G2 回归红线豁免的唯一合法路径）
-- [ ] `docs/json.md`/`docs/rpc.md`（上游新版）条目 → pir 测试锚点映射表
+- [ ] `docs/json.md`/`docs/rpc.md`（上游新版）条目 → rpi 测试锚点映射表
 
 ## 偏离记录
 

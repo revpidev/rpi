@@ -14,7 +14,7 @@
 
 ## 实际实现与偏离原因
 
-`crates/pir-ai/src/api/google_vertex.rs` + `google_adc.rs` 以 reqwest 直连实现，复用 W1 的 `google_shared.rs`（D-023 口径延续）。反推依据：钉死的 `@google/genai` 1.52.0（`ApiClient` 构造器 / `getRequestUrlInternal` / `shouldPrependVertexProjectPath` / `tModel` / `generateContentParametersToVertex` / `NodeAuth`）与 `google-auth-library` 10.6.2（`GoogleAuth` ADC 链 / `gtoken` JWT-bearer / `oauth2client` refresh grant / `Compute` metadata）。
+`crates/rpi-ai/src/api/google_vertex.rs` + `google_adc.rs` 以 reqwest 直连实现，复用 W1 的 `google_shared.rs`（D-023 口径延续）。反推依据：钉死的 `@google/genai` 1.52.0（`ApiClient` 构造器 / `getRequestUrlInternal` / `shouldPrependVertexProjectPath` / `tModel` / `generateContentParametersToVertex` / `NodeAuth`）与 `google-auth-library` 10.6.2（`GoogleAuth` ADC 链 / `gtoken` JWT-bearer / `oauth2client` refresh grant / `Compute` metadata）。
 
 反推得出的 vertex 线格式（对拍已按此 mock）：
 
@@ -32,14 +32,14 @@
 6. metadata token 请求兼作 GCE 可用性探测（3s 超时，对齐 `gcp-metadata.isAvailable`；上游为独立 probe + 无超时 token 请求两跳）。
 7. token 端点失败文案：body 含 `error` 字段时对齐 gtoken `{error}: {error_description}`，否则 HTTP 状态概述（gaxios 错误面近似，同 D-009「错误明细近似」口径）。
 8. 测试缝（同 D-009 口径）：`AdcEndpoints`（`#[doc(hidden)]`，覆盖 token/metadata/well-known 路径）与 `google_vertex::resolve_request_url`（`#[doc(hidden)]`，端点选择矩阵断言）；上游对应值为库内常量。
-9. token 按次获取：pi 每次 `stream()` 新建 `GoogleGenAI`/`GoogleAuth`，凭据缓存不跨调用，pir 同样每次流调用解析一次 token。
-10. 新增 workspace 依赖 `ring`（RS256 签名）与 `base64`（JWT 编码；此前仅 pir crate 使用）进 pir-ai 依赖链——两者均已在 Cargo.lock（ring 由 rustls 传递引入），不改变发布依赖闭包。
+9. token 按次获取：pi 每次 `stream()` 新建 `GoogleGenAI`/`GoogleAuth`，凭据缓存不跨调用，rpi 同样每次流调用解析一次 token。
+10. 新增 workspace 依赖 `ring`（RS256 签名）与 `base64`（JWT 编码；此前仅 rpi crate 使用）进 rpi-ai 依赖链——两者均已在 Cargo.lock（ring 由 rustls 传递引入），不改变发布依赖闭包。
 11. vertex 变体的 thinking 配置表与 Gemini API 适配器不同已逐行核对：无 Gemma 4 分支、`getGoogleBudget` 无 `2.5-flash-lite` 行（2.5-flash 高阶 24576）；`stream_simple` 不做 API key 预检（缺 key 即合法 ADC 路径，与上游一致，区别于 google-generative-ai 的 eager error）。
 12. `google-vertex.lazy.ts` 仅做动态 import 延迟加载，Rust 无对应物（同 D-021/D-022 口径）。
 
 ## 影响面
 
-协议（仅对 Google Vertex API 的出站请求头集合、token 端点交互与错误文案；线格式请求体/路径/语义与 SDK 一致）+ 依赖基线（ring/base64 进 pir-ai）
+协议（仅对 Google Vertex API 的出站请求头集合、token 端点交互与错误文案；线格式请求体/路径/语义与 SDK 一致）+ 依赖基线（ring/base64 进 rpi-ai）
 
 ## 处置
 

@@ -1,4 +1,4 @@
-// Telemetry sink for pir's install ping (telemetry.rs):
+// Telemetry sink for rpi's install ping (telemetry.rs):
 // `GET /api/report-install?version={version}` — fire-and-forget, the client
 // ignores the response entirely. Returns 204 so Pages bills no egress body.
 // Optionally record into a KV namespace ("ANALYTICS" binding in

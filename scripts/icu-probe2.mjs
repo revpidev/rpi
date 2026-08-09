@@ -1,6 +1,6 @@
 // Probe the actual Unicode property behavior of the runtime (Node 24 / ICU 76)
 // for every code point, and dump bitsets for the properties used by utils.ts.
-// Part of the pir-tui utils.rs Unicode table generation chain
+// Part of the rpi-tui utils.rs Unicode table generation chain
 // (scripts/gen-tui-unicode-data.py). Run with `node scripts/icu-probe2.mjs`.
 import fs from 'node:fs';
 import path from 'node:path';

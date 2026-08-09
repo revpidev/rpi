@@ -14,7 +14,7 @@ T11 移植 pi-tui 时发现上游两处依赖 **Node 原生 addon / 平台原生
 2. **Windows VT input**（`packages/tui/src/terminal.ts` 加载 `win32-console-mode.node`）：
    设置 `ENABLE_VIRTUAL_TERMINAL_INPUT`，使 Windows 上 Shift+Tab 等组合以转义序列到达。
 
-pir 的技术边界（编码规范 §8.1）只允许 crossterm 做终端 I/O，不引入 Node 原生绑定体系；
+rpi 的技术边界（编码规范 §8.1）只允许 crossterm 做终端 I/O，不引入 Node 原生绑定体系；
 为这两个平台特性各写一个 Rust 原生助手（macOS CGEvent / Windows console mode）超出
 v0.1 范围。
 

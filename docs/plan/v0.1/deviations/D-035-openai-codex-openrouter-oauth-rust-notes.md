@@ -17,7 +17,7 @@
 
 ## 实际实现与偏离原因
 
-两流程落 `pir-ai/src/auth/oauth/{openai_codex,openrouter}.rs`（工厂接线见
+两流程落 `rpi-ai/src/auth/oauth/{openai_codex,openrouter}.rs`（工厂接线见
 D-030 关闭记录与 D-032 第 2 项）。实现差异：
 
 1. **测试缝**：上游 `vi.stubGlobal("fetch")` 打桩 + 绑定固定端口；Rust 侧为

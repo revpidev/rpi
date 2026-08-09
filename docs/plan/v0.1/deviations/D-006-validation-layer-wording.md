@@ -19,7 +19,7 @@
    「TypeBox symbol 前奏」路径无对应物；校验失败措辞来自 jsonschema（路径/
    关键字文案与 TypeBox 不同）。强转表（null→0、"123"→123、bool→1/0 等）与
    组合递归规则按上游逐条移植并有测试锚点。
-2. models.json 校验（`pir-ai/src/models_json.rs`）：serde 派生 + 手工
+2. models.json 校验（`rpi-ai/src/models_json.rs`）：serde 派生 + 手工
    `minLength:1`/`oauth` 字面量 pass 替代 TypeBox；错误路径格式对齐
    （`providers.<id>.models.<n>.id`），措辞不同。上游 per-API compat 三选一
    union 用平铺 `ModelCompat` 验证（D-002 的同一合并结构），比 TypeBox union

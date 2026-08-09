@@ -11,7 +11,7 @@
 
 ## 目标
 
-打通启动管线与三种 headless 运行模式，交付可脚本化使用的 `pir`：
+打通启动管线与三种 headless 运行模式，交付可脚本化使用的 `rpi`：
 print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同时沉淀 Rust SDK 表面。
 
 ## 范围
@@ -24,7 +24,7 @@ print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同�
   - `--session` 三级解析（路径 → 本项目 id → 全局跨项目 + 交互确认 fork）；`--session-id` 正则校验与「不存在则新建」；`--fork`/`--session-id` 互斥矩阵
   - **未知 `--flag` 收集为扩展标志**（`extensionFlagValues` 透传，help 动态段）；单 `-x` 未知为 error diagnostic
   - diagnostics 体系（warning/error，error exit 1；非法 thinking level 仅 warning）
-- 启动管线（设计文档 §6.1）：`--offline` → 同时设 `PIR_SKIP_VERSION_CHECK`；模式解析 rpc > json > print（-p 或**非 TTY 自动**，含 interactive + piped stdin 降级）→ SettingsManager → trust gate（非交互不提示）→ services → SessionManager（含 header cwd 缺失处理）→ AgentSession → mode 分发；**不实现** migrations.ts（ADR-0003 §3）
+- 启动管线（设计文档 §6.1）：`--offline` → 同时设 `RPI_SKIP_VERSION_CHECK`；模式解析 rpc > json > print（-p 或**非 TTY 自动**，含 interactive + piped stdin 降级）→ SettingsManager → trust gate（非交互不提示）→ services → SessionManager（含 header cwd 缺失处理）→ AgentSession → mode 分发；**不实现** migrations.ts（ADR-0003 §3）
 - `AgentSession` / `AgentSessionRuntime`：prompt / steer / follow_up / abort、compaction 接入（双路触发）、事件映射 `AgentSessionEvent`（全集，需求 §2.3）、JSONL 持久化接线（延迟落盘）
 - print 模式：初始 prompt（含 piped stdin 合并）→ **依次发送全部消息** → 打印最后 assistant **text 块** → 退出；**error/aborted → stderr + exit 1**；SIGTERM/SIGHUP → 143/129
 - json 模式：**原样 session header 行** + `AgentSessionEvent` JSONL 单向流
@@ -35,7 +35,7 @@ print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同�
   - 关闭语义：stdin EOF 退；`ctx.shutdown()` 等 `agent_settled`；SIGTERM=143/SIGHUP=129
   - session 替换（new/fork/switch/clone）后 rebind 扩展与事件订阅
   - 扩展 UI 协议层预留（9 方法 + 降级清单；T15 接线）
-  - 独立入口 `pir-rpc` bin（等价 `--mode rpc`）
+  - 独立入口 `rpi-rpc` bin（等价 `--mode rpc`）
 - Rust SDK 表面：`create_agent_session` / `create_agent_session_runtime` / `SessionManager` / `ModelRuntime` / `ResourceLoader` 公开 API
 
 ### Out
@@ -58,42 +58,42 @@ print 打印最终文本、json 输出事件流、rpc 提供 32 命令环，同�
 
 | 上游（pi 0.82.1 @ 2efa728） | Rust 落地 | 说明 |
 |---|---|---|
-| `cli/args.ts` | `pir/src/cli/args.rs` | **手写解析器**（与上游同构；clap 无法表达 -p 吞噬、未知 `--flag` 收集、互斥诊断矩阵，见偏离登记） |
-| `cli/args.ts` diagnostics | `pir/src/cli/diagnostics.rs` | `Diagnostic{level, scope, message}`，error exit 1 |
-| `cli/file-processor.ts` | `pir/src/cli/file_processor.rs` | `@file` 文本/图片处理 |
-| `core/agent-session.ts` | `pir/src/core/agent_session.rs` | AgentSession + AgentSessionEvent 全集（需求 §2.3） |
-| `core/agent-session-runtime.ts` | `pir/src/core/agent_session_runtime.rs` | 会话替换（new/fork/switch/import）+ rebind |
-| `core/agent-session-services.ts` | `pir/src/core/agent_session_services.rs` | cwd 绑定服务 + 扩展标志应用 |
-| `core/model-runtime.ts` | `pir/src/core/model_runtime.rs` | ModelRuntime（auth.json + models.json + stream_simple） |
-| `core/model-resolver.ts` | `pir/src/core/model_resolver.rs` | findInitialModel / `--model` / `--models` scope 解析 |
-| `core/session-cwd.ts` | `pir/src/core/session_cwd.rs` | header cwd 缺失（非交互直接 error） |
-| `core/usage-totals.ts` | `pir/src/core/usage_totals.rs` | SessionStats 聚合 |
-| `core/extensions/*`（seam） | `pir/src/core/extensions.rs` | **ExtensionRunner no-op seam**（真实宿主 T15）；RPC UI 9 方法 + 降级清单协议层预留 |
-| `modes/print-mode.ts` | `pir/src/modes/print_mode.rs` | |
-| `main.ts` json 段 + `docs/json.md` | `pir/src/modes/json_mode.rs` | |
-| `modes/rpc/{rpc-mode,rpc-types,jsonl}.ts` + `docs/rpc.md` | `pir/src/modes/rpc.rs` | 32 命令逐条契约 |
-| `main.ts` 启动管线 | `pir/src/app.rs` + `main.rs` | 模式分发 rpc>json>print(-p/非 TTY)；子命令分流留 T14 占位 |
-| `rpc-entry.ts` | `pir/src/bin/pir_rpc.rs`（`[[bin]] pir-rpc`） | 等价 `--mode rpc` |
-| `sdk.ts` | `pir/src/sdk.rs` + lib.rs re-export | create_agent_session / create_agent_session_runtime |
+| `cli/args.ts` | `rpi/src/cli/args.rs` | **手写解析器**（与上游同构；clap 无法表达 -p 吞噬、未知 `--flag` 收集、互斥诊断矩阵，见偏离登记） |
+| `cli/args.ts` diagnostics | `rpi/src/cli/diagnostics.rs` | `Diagnostic{level, scope, message}`，error exit 1 |
+| `cli/file-processor.ts` | `rpi/src/cli/file_processor.rs` | `@file` 文本/图片处理 |
+| `core/agent-session.ts` | `rpi/src/core/agent_session.rs` | AgentSession + AgentSessionEvent 全集（需求 §2.3） |
+| `core/agent-session-runtime.ts` | `rpi/src/core/agent_session_runtime.rs` | 会话替换（new/fork/switch/import）+ rebind |
+| `core/agent-session-services.ts` | `rpi/src/core/agent_session_services.rs` | cwd 绑定服务 + 扩展标志应用 |
+| `core/model-runtime.ts` | `rpi/src/core/model_runtime.rs` | ModelRuntime（auth.json + models.json + stream_simple） |
+| `core/model-resolver.ts` | `rpi/src/core/model_resolver.rs` | findInitialModel / `--model` / `--models` scope 解析 |
+| `core/session-cwd.ts` | `rpi/src/core/session_cwd.rs` | header cwd 缺失（非交互直接 error） |
+| `core/usage-totals.ts` | `rpi/src/core/usage_totals.rs` | SessionStats 聚合 |
+| `core/extensions/*`（seam） | `rpi/src/core/extensions.rs` | **ExtensionRunner no-op seam**（真实宿主 T15）；RPC UI 9 方法 + 降级清单协议层预留 |
+| `modes/print-mode.ts` | `rpi/src/modes/print_mode.rs` | |
+| `main.ts` json 段 + `docs/json.md` | `rpi/src/modes/json_mode.rs` | |
+| `modes/rpc/{rpc-mode,rpc-types,jsonl}.ts` + `docs/rpc.md` | `rpi/src/modes/rpc.rs` | 32 命令逐条契约 |
+| `main.ts` 启动管线 | `rpi/src/app.rs` + `main.rs` | 模式分发 rpc>json>print(-p/非 TTY)；子命令分流留 T14 占位 |
+| `rpc-entry.ts` | `rpi/src/bin/pir_rpc.rs`（`[[bin]] rpi-rpc`） | 等价 `--mode rpc` |
+| `sdk.ts` | `rpi/src/sdk.rs` + lib.rs re-export | create_agent_session / create_agent_session_runtime |
 
 ### 关键结构决策
 
-1. **事件模型**：`Agent`（pir-agent，Arc 共享）listener 为 async 且按序 await —— AgentSession 内部 listener 做持久化（message_end 先写 session 再转发听众），与上游 `_handleAgentEvent` 对齐；`AgentSessionEvent` 听众为同步回调 Vec（同上游 `_emit`）。
+1. **事件模型**：`Agent`（rpi-agent，Arc 共享）listener 为 async 且按序 await —— AgentSession 内部 listener 做持久化（message_end 先写 session 再转发听众），与上游 `_handleAgentEvent` 对齐；`AgentSessionEvent` 听众为同步回调 Vec（同上游 `_emit`）。
 2. **Compaction**：复用 T08 `CompactionRunner`（持有 SessionManager）。T10 接线补丁：`model` 改 `Option<Model>`（无模型时 compact 报 no-model、check_compaction 直接 false，行为等价上游 `_runAutoCompaction` 的 `!this.model` 早退）+ `set_model/set_settings/set_retry/set_thinking_level` setter（模型/设置变更时同步）。
 3. **扩展 seam**：AgentSession 所有扩展调用经 `core/extensions.rs` 的 no-op `ExtensionRunner`（has_handlers→false、emit→默认、get_command→None、flag_values/invalidate/on_error 齐备）；`bind_extensions(mode)` 保留签名与事件发射点，T15 替换实现。RPC 的 `extension_ui_request` 帧类型、9 方法名与降级清单以常量/类型形式预留。
-4. **ModelRuntime**：组合 pir-ai `Models` + auth 凭据存储（`{agentDir}/auth.json`）+ `JsonFileModelsStore`（`models.json`）；提供 `get_auth/has_configured_auth/check_auth/is_using_oauth/get_available/refresh/stream_simple/register_provider`。
+4. **ModelRuntime**：组合 rpi-ai `Models` + auth 凭据存储（`{agentDir}/auth.json`）+ `JsonFileModelsStore`（`models.json`）；提供 `get_auth/has_configured_auth/check_auth/is_using_oauth/get_available/refresh/stream_simple/register_provider`。
 5. **trust gate**：headless 不提示——`--approve/-a` 信任、`--no-approve/-na` 忽略项目本地、否则 `settings.defaultProjectTrust`（默认 untrusted）；interactive 提示留 T12。
 6. **子命令分流**（install/remove/list/update/config）属 T14；T10 仅在 app 入口留分流占位与「未实现」诊断。
 7. **首次运行 setup**（主题选择 + analytics opt-in）属 T12；headless 模式不触发。
 8. **信号**：SIGTERM→143、SIGHUP→129（print/rpc；杀 detached 子进程经 T06 bash 取消语义）。
-9. **测试策略**：单元测试逐模块（args 全标志矩阵、file_processor、model_resolver、rpc 32 命令契约、LF 帧）；对拍走 `pir-test-support` FauxProvider + `fixtures/generated/{single-turn,tool-calls,steering-followup,abort,length-truncation,compaction*}` 场景驱动 print/json 模式归一化 diff；SDK 外部调用示例测试。
+9. **测试策略**：单元测试逐模块（args 全标志矩阵、file_processor、model_resolver、rpc 32 命令契约、LF 帧）；对拍走 `rpi-test-support` FauxProvider + `fixtures/generated/{single-turn,tool-calls,steering-followup,abort,length-truncation,compaction*}` 场景驱动 print/json 模式归一化 diff；SDK 外部调用示例测试。
 
 ## 完成摘要（2026-08-04）
 
 T10 全部交付并验收通过：CLI 解析（手写解析器，args.test.ts 移植测试 75 个：上游 72 + 3 补充）、
 ModelRuntime/ModelResolver、AgentSession 体系、启动管线（`app.rs`）、
 print/json 模式（`modes/print_mode.rs`）、rpc 模式（`modes/rpc.rs`，32 命令
-逐条契约 + 严格 LF 帧 + 关闭语义 + session 替换 rebind）、`pir-rpc` bin、
+逐条契约 + 严格 LF 帧 + 关闭语义 + session 替换 rebind）、`rpi-rpc` bin、
 SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.rs` 5、
 `parity_headless_test.rs` 9（5 场景 fixtures 归一化 diff + print 模式四例）、
 `sdk_example_test.rs` 1。偏离 D-015 登记并回写（`02-design.md` §6.1/§6.3/§6.6/§12）。
@@ -145,7 +145,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
   - 归一化口径（沿用既有先例）：`message_update`/`tool_execution_update` 整类排除（delta/分块边界非确定）；`usage`/`details` 键剥离；session 头 cwd 占位；`tool_execution_end` 连续块按 (toolCallId, toolName) 排序（并行完成序非确定）
   - RPC 逐条对拍级基准映射（`docs/rpc.md` → 测试锚点，32/32）：
 
-    | rpc.md 命令 | 测试锚点（`crates/pir/tests/rpc_mode_test.rs`，除注明外） |
+    | rpc.md 命令 | 测试锚点（`crates/rpi/tests/rpc_mode_test.rs`，除注明外） |
     |---|---|
     | prompt | `prompt_lifecycle_messages_state_stats`（接受/事件流）、`steer_follow_up_abort_during_streaming`（streamingBehavior 排队/缺失拒绝） |
     | steer | `steer_follow_up_abort_during_streaming` |
@@ -190,7 +190,7 @@ SDK 表面（`sdk.rs`）。测试：`rpc_mode_test.rs` 17、`agent_session_test.
     | §2.5 SDK | `sdk_example_test.rs`（Quick Start 等价） |
     | §3.1 标志全集 | `cli/args.rs` 75 移植测试（注：`app.rs` 启动管线目前无测试锚点） |
     | §3.2 子命令 | T14 占位诊断（D-015；`app.rs::PLACEHOLDER_SUBCOMMANDS`） |
-    | §3.3 环境变量（bash PIR_* 动态注入） | `agent_session_test` + bash 工具测试（session_env 动态 cell，D-015） |
+    | §3.3 环境变量（bash RPI_* 动态注入） | `agent_session_test` + bash 工具测试（session_env 动态 cell，D-015） |
 - G4 红线：通过。`external/pi` 无改动（HEAD `2efa728`）；无 JS/TS 执行能力；未读写 `~/.pi`；session 仅 JSONL；token 估算未动；新增非测试代码无 `unwrap`/`expect`（`rpc.rs` 锁中毒走 `unwrap_or_else(into_inner)` 既有模式）；日志/响应无凭据；范围排除项未引入；session 写入无锁
 - G5 线格式：通过。RPC 请求/响应/事件、SourceInfo、BashResult、get_state、树/条目均为 camelCase 并与上游 serde 形状逐条核对（契约测试锚定）
 - G6 文档同步：通过。溯源注释齐备（rpc.rs/print_mode.rs/app.rs 文件头）；回写 `02-design.md` §6.1/§6.3/§6.6/§12；`fixtures/README.md` 补齐计划口径更新

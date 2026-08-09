@@ -17,24 +17,24 @@
 上游（pi 0.82.1 @ 2efa728）把三个产品 endpoint 全部硬编码在 `https://pi.dev`
 （version-check.ts:4、interactive-mode.ts:1028、remote-catalog-provider.ts:5），仅
 `model-runtime.ts:69 catalogBaseUrl` 是内部选项，无 settings/env 覆盖。ADR-0002 §8 要求
-pir 增加配置面，以下为落地差异（均为新增配置面，不改变任何默认行为）：
+rpi 增加配置面，以下为落地差异（均为新增配置面，不改变任何默认行为）：
 
 1. **统一解析器 `config::resolve_endpoint` / `endpoint_from_env`**：三类 endpoint 共用
    「env > settings > 默认值」优先级；任一级为空串落空到下一级（沿用上游 `||` 语义先例，
    config.ts:506）；任一级取字面量 `off`（trim + ASCII 大小写不敏感）即整体关闭，关闭后
    **不产生任何网络请求**（解析返回 `None`，调用点不发起请求）。优先级口径沿用上游唯一
    先例 `PI_TELEMETRY` 覆盖 `enableInstallTelemetry`（telemetry.ts:10-12）。
-2. **新增 env / settings 字段（pir 专有，上游无对应物）**：`PIR_VERSION_CHECK_URL` /
-   `PIR_TELEMETRY_URL` / `PIR_MODEL_CATALOG_URL` 与 settings 键 `versionCheckUrl` /
+2. **新增 env / settings 字段（rpi 专有，上游无对应物）**：`RPI_VERSION_CHECK_URL` /
+   `RPI_TELEMETRY_URL` / `RPI_MODEL_CATALOG_URL` 与 settings 键 `versionCheckUrl` /
    `telemetryUrl` / `modelCatalogUrl`（camelCase，G5；settings 形状核对过上游
    settings-manager.ts:83-129，无同名字段冲突）。
 3. **版本检查接线**：`update --self`/`--all` 流程（package-manager-cli.ts:475-501 对应物）
    在 settings manager 移交包管理器前解析 endpoint 并传入；endpoint 关闭时与上游
-   「endpoint 不可达」同结局（报 `Could not determine latest pir version.` 退出 1），且不发
+   「endpoint 不可达」同结局（报 `Could not determine latest rpi version.` 退出 1），且不发
    请求。交互模式启动版本检查（interactive-mode.ts:843-847 的 `checkForNewPiVersion` →
    `showNewVersionNotification`）本波次接线：tokio 任务探测、结果经
    `UiCommand::NewVersionAvailable` 入 drain 渲染（与 ThemeChanged/GitBranchChanged/
-   ShareCompleted 同模式）；`PIR_SKIP_VERSION_CHECK` / `PIR_OFFLINE` / endpoint `off` 均在
+   ShareCompleted 同模式）；`RPI_SKIP_VERSION_CHECK` / `RPI_OFFLINE` / endpoint `off` 均在
    发起前短路。
 4. **install telemetry 移植**（telemetry.ts + interactive-mode.ts:1017-1036）：新增
    `core/telemetry.rs`。`report_install` 为 fire-and-forget GET
@@ -47,7 +47,7 @@ pir 增加配置面，以下为落地差异（均为新增配置面，不改变�
    反向（同版本新条目）不发生于发布流程；T15 落地 `getChangelogForDisplay` 时以真实条目
    判定替换。
 5. **`enableAnalytics`（默认 false，opt-in）**：上游 0.82.1 无任何 analytics 发送通道
-   （`getEnableAnalytics`/`getTrackingId` 仅被 settings 与首次设置向导消费），故 pir 同样
+   （`getEnableAnalytics`/`getTrackingId` 仅被 settings 与首次设置向导消费），故 rpi 同样
    只持久化不发送——「关闭时零请求」按构造成立（开启时同样零请求，与上游一致）。
    startup_ui.rs 的遗留注释已同步更正。
 6. **远程 catalog**：`model_catalog_endpoint()` 解析器就位（含 `off` 关闭）。运行时消费者
@@ -56,9 +56,9 @@ pir 增加配置面，以下为落地差异（均为新增配置面，不改变�
    `ModelRuntime` 加无消费者的字段。catalog 的零网络锚点沿用既有
    `offline_refresh_restores_stored_overlay_without_network`（`allowNetwork: false` 只恢复
    缓存不抓取）。
-7. **帮助文本**：`--help` env 段新增 `PIR_SKIP_VERSION_CHECK`（上游存在但未写入帮助）与
+7. **帮助文本**：`--help` env 段新增 `RPI_SKIP_VERSION_CHECK`（上游存在但未写入帮助）与
    三条 endpoint 覆盖变量说明——上游帮助文本的可见增行。
-8. **测试纪律**：`PIR_*` 进程环境在测试中只读不写（写仅 `core::environment` 既有测试一处，
+8. **测试纪律**：`RPI_*` 进程环境在测试中只读不写（写仅 `core::environment` 既有测试一处，
    有其私有锁）；env 覆盖逻辑由纯函数 `resolve_endpoint` 承载测试，endpoint 包装函数只测
    默认值/设置值/关闭三条路径，避免并行测试的 env 竞争 flake。
 
@@ -66,7 +66,7 @@ pir 增加配置面，以下为落地差异（均为新增配置面，不改变�
 
 无（纯内部）：不改协议 / session 格式 / 扩展 API / TUI 既有行为。默认配置下（无 env、无
 settings 字段）三个 endpoint 与上游逐字节同 URL、同触发条件（第 4 条近似除外）、同
-payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游有、pir 此前缺口的补齐）与
+payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游有、rpi 此前缺口的补齐）与
 帮助文本增行。
 
 ## 处置
@@ -82,7 +82,7 @@ payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游
 `deploy/resetpi/`）：`DEFAULT_CATALOG_BASE_URL`、`LATEST_VERSION_URL`、
 `DEFAULT_REPORT_INSTALL_URL`、`DEFAULT_SHARE_VIEWER_URL`、changelog 链接五处。
 第 1 条「不改变任何默认行为」随之失效——**默认配置下端点 URL 与上游不同**
-（行为级偏离，由 ADR-0009 记录）；覆盖链（env > settings > `off` > `PIR_OFFLINE`）
+（行为级偏离，由 ADR-0009 记录）；覆盖链（env > settings > `off` > `RPI_OFFLINE`）
 与全部零网络语义不变，显式配置的旧值继续生效。radius 默认 gateway
 （`https://radius.pi.dev`，上游托管服务）不迁移。
 
@@ -95,4 +95,4 @@ payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游
    （`set_share_runner` 同模式），测试 harness 统一经
    `test_support::install_noop_product_transports` 换 no-op；新增
    `init_and_run_make_no_product_network_requests` 锚点（计数 0..=1，兼容
-   `PIR_OFFLINE`/`PIR_SKIP_VERSION_CHECK` 环境门禁）。生产路径默认值不变。
+   `RPI_OFFLINE`/`RPI_SKIP_VERSION_CHECK` 环境门禁）。生产路径默认值不变。

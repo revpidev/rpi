@@ -9,25 +9,25 @@
     "skills": [
       {
         "name": "colliding",
-        "description": "Colliding skill from project .pir/skills (wins over CLI)",
-        "filePath": "<path>/repo/sub/.pir/skills/colliding/SKILL.md",
-        "baseDir": "<path>/repo/sub/.pir/skills/colliding",
+        "description": "Colliding skill from project .rpi/skills (wins over CLI)",
+        "filePath": "<path>/repo/sub/.rpi/skills/colliding/SKILL.md",
+        "baseDir": "<path>/repo/sub/.rpi/skills/colliding",
         "disableModelInvocation": false,
         "source": "auto",
         "scope": "project",
         "origin": "top-level",
-        "sourceBaseDir": "<path>/repo/sub/.pir"
+        "sourceBaseDir": "<path>/repo/sub/.rpi"
       },
       {
         "name": "repo-skill",
-        "description": "Skill from project .pir/skills",
-        "filePath": "<path>/repo/sub/.pir/skills/repo-skill/SKILL.md",
-        "baseDir": "<path>/repo/sub/.pir/skills/repo-skill",
+        "description": "Skill from project .rpi/skills",
+        "filePath": "<path>/repo/sub/.rpi/skills/repo-skill/SKILL.md",
+        "baseDir": "<path>/repo/sub/.rpi/skills/repo-skill",
         "disableModelInvocation": false,
         "source": "auto",
         "scope": "project",
         "origin": "top-level",
-        "sourceBaseDir": "<path>/repo/sub/.pir"
+        "sourceBaseDir": "<path>/repo/sub/.rpi"
       },
       {
         "name": "sub-skill",
@@ -104,7 +104,7 @@
         "collision": {
           "resourceType": "skill",
           "name": "colliding",
-          "winnerPath": "<path>/repo/sub/.pir/skills/colliding/SKILL.md",
+          "winnerPath": "<path>/repo/sub/.rpi/skills/colliding/SKILL.md",
           "loserPath": "<path>/cli/cli-skill/SKILL.md",
           "winnerSource": null,
           "loserSource": null
@@ -116,19 +116,19 @@
         "name": "sub-declared",
         "description": "Sub declared prompt body.",
         "argumentHint": null,
-        "filePath": "<path>/repo/sub/.pir/sub-declared-prompts/sub-declared.md"
+        "filePath": "<path>/repo/sub/.rpi/sub-declared-prompts/sub-declared.md"
       },
       {
         "name": "project-prompt",
         "description": "Project prompt template",
         "argumentHint": "<topic>",
-        "filePath": "<path>/repo/sub/.pir/prompts/project-prompt.md"
+        "filePath": "<path>/repo/sub/.rpi/prompts/project-prompt.md"
       },
       {
         "name": "sub-prompt",
         "description": "Sub-project prompt body.",
         "argumentHint": null,
-        "filePath": "<path>/repo/sub/.pir/prompts/sub-prompt.md"
+        "filePath": "<path>/repo/sub/.rpi/prompts/sub-prompt.md"
       },
       {
         "name": "declared-prompt",
@@ -147,14 +147,14 @@
     "themes": [
       {
         "name": "declared-theme",
-        "sourcePath": "<path>/repo/sub/.pir/extra-themes/extra-theme.json"
+        "sourcePath": "<path>/repo/sub/.rpi/extra-themes/extra-theme.json"
       }
     ],
     "themeDiagnostics": [
       {
         "type": "warning",
-        "message": "Invalid theme \"<path>/repo/sub/.pir/extra-themes/broken-theme.json\":\n\nMissing required color tokens:\n  - accent\n  - bashMode\n  - border\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values.",
-        "path": "<path>/repo/sub/.pir/extra-themes/broken-theme.json",
+        "message": "Invalid theme \"<path>/repo/sub/.rpi/extra-themes/broken-theme.json\":\n\nMissing required color tokens:\n  - accent\n  - bashMode\n  - border\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values.",
+        "path": "<path>/repo/sub/.rpi/extra-themes/broken-theme.json",
         "collision": null
       },
       {
@@ -164,7 +164,7 @@
         "collision": {
           "resourceType": "theme",
           "name": "declared-theme",
-          "winnerPath": "<path>/repo/sub/.pir/extra-themes/extra-theme.json",
+          "winnerPath": "<path>/repo/sub/.rpi/extra-themes/extra-theme.json",
           "loserPath": "<path>/agent/global-declared-themes/declared-theme.json",
           "winnerSource": null,
           "loserSource": null

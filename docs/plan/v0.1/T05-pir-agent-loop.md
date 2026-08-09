@@ -1,4 +1,4 @@
-# T05：pir-agent — agent_loop 与 Agent
+# T05：rpi-agent — agent_loop 与 Agent
 
 - **状态**：已完成
 - **里程碑**：M2
@@ -49,7 +49,7 @@
 
 ## 开发要点
 
-- `StreamFn` 注入边界不得破坏：agent 内禁止 `use pir_ai::providers`（编码规范 §4.2）
+- `StreamFn` 注入边界不得破坏：agent 内禁止 `use rpi_ai::providers`（编码规范 §4.2）
 - 事件序是对拍契约的核心：每个语义点都要有确定性 faux 驱动的黄金测试
 - 移植上游 `agent-loop.test.ts` / `agent.test.ts` 用例意图，同名 Rust 测试
 - 不在锁内 `.await`；后台 spawn 任务必须有取消路径（编码规范 §6.4/§6.5）
@@ -96,9 +96,9 @@
 - 验收日期：2026-08-01
 - 验收人：kimi-code（T05 执行代理）
 - G1 构建/静态检查：通过（`cargo build --workspace` Finished；`cargo clippy --workspace --all-targets -- -D warnings` exit=0；`cargo fmt --all -- --check` FMT-OK）
-- G2 测试：通过（`cargo test --workspace` 450 passed, 0 failed；其中 pir-agent 83：既有 17 + agent_loop 27 + agent 19 + messages 15 + parity 5；无 live 测试；测试不触网，faux provider 驱动）
+- G2 测试：通过（`cargo test --workspace` 450 passed, 0 failed；其中 rpi-agent 83：既有 17 + agent_loop 27 + agent 19 + messages 15 + parity 5；无 live 测试；测试不触网，faux provider 驱动）
 - G3 对拍：通过（parity_events_test.rs 5 场景——single-turn / tool-calls / steering-followup / abort / length-truncation——Agent 事件序列与 `fixtures/generated/<scenario>/events.jsonl` 归一化内容级 diff（`diff_jsonl`，行序敏感）一致；预处理剔除 message_update（delta 边界不入契约，fixtures/README §2）与 AgentSession 层事件（queue_update/agent_settled/willRetry，T16 产物），剥离 usage/details（分别依赖 T07/T16 与 T13 真实工具实现），测试文件头有注释说明）
-- G4 红线：通过（`external/pi` HEAD=2efa728d2 且 porcelain 为空；pir-agent 无 `use pir_ai::providers`、无 broadcast、无 ~/.pi 访问；非测试代码无 unwrap/expect（src 内残留 expect 均在 #[cfg(test)] 或带不变式注释的 serde 测试辅助）；新增依赖仅 tokio/tracing（workspace 已有版本））
+- G4 红线：通过（`external/pi` HEAD=2efa728d2 且 porcelain 为空；rpi-agent 无 `use rpi_ai::providers`、无 broadcast、无 ~/.pi 访问；非测试代码无 unwrap/expect（src 内残留 expect 均在 #[cfg(test)] 或带不变式注释的 serde 测试辅助）；新增依赖仅 tokio/tracing（workspace 已有版本））
 - G5 线格式：通过（AgentEvent/AgentMessage/扩展消息 serde 形状 T01 已锁并有 roundtrip 测试；toolResult 消息 addedToolNames 仅 len>0 挂载、details null 省略对齐上游；扩展消息文本格式 15 个字节级测试锚定）
 - G6 文档同步：通过（agent_loop.rs/agent.rs/messages.rs 头部溯源注释含上游路径+commit 2efa728；D-010 回写 `02-design.md` §4.4）
 - G7 偏离闭环：通过（D-010 已登记 + 已回写）

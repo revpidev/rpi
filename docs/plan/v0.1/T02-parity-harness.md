@@ -18,7 +18,7 @@
 
 ### In
 
-- `pir-test-support`：
+- `rpi-test-support`：
   - faux provider（确定性 stream 事件脚本驱动，编码规范 §12.4）：脚本化响应队列 + 响应工厂、`tokensPerSecond`、usage 4 字符/token 估算、cache 模拟（sessionId 且 cacheRetention≠none）、队列空固定错误文案、`state.callCount`
   - 归一化器：剥离 timestamp / uuid / session id / cwd，其余字节保留（**全项目唯一实现**）
   - diff 工具：归一化后比对事件序列 / JSONL 结构（含**行序**）/ RPC transcript
@@ -38,7 +38,7 @@
 
 - 归一化规则集中一处实现，后续任务一律复用，禁止各写各的（编码规范 §12.3）
 - fixtures 生成必须可重复：固定 commit + 固定脚本 + runbook 记录每一步
-- spike 代码放 `pir-ext-host` 的 examples 或独立 bin，验证后保留为后续开发的参考
+- spike 代码放 `rpi-ext-host` 的 examples 或独立 bin，验证后保留为后续开发的参考
 - 体积实测用 musl + rustls 目标（ADR-0002 §5），结果记录在验收记录中
 
 ## 进度跟踪
@@ -64,7 +64,7 @@
 任务特有标准：
 
 - [x] `fixtures/` 下有首批样例且 `fixtures/README.md` runbook 完整可重复
-- [x] 归一化 + diff 为 `pir-test-support` 单一实现
+- [x] 归一化 + diff 为 `rpi-test-support` 单一实现
 - [x] Wasm ABI spike 闭环演示通过（工具注册 + dialog + 组件描述）
 - [x] 二进制体积实测数据记录（是否 < 50MB；超标则登记偏离并评估）
 
@@ -78,19 +78,19 @@
 
 - 验收日期：2026-07-30
 - 验收人：实现者自证（单人开发，按 gates.md §1 逐项自证）
-- G1 构建/静态检查：通过。`cargo fmt --all -- --check` FMT-OK；`cargo build --workspace` Finished；`cargo clippy --workspace --all-targets -- -D warnings` exit=0（工具链：`.tooling/` 内 1.97.1，与系统 rustc 同版本，见 `crates/pir-ext-host/examples/wasm-spike/README.md` 工具链说明）
-- G2 测试：通过（`cargo test --workspace`：63 passed, 0 failed；pir-agent 17 + pir-ai 13 + pir-test-support 27 + fixtures_smoke 6；无 live 测试，非 live 测试不访问网络）
+- G1 构建/静态检查：通过。`cargo fmt --all -- --check` FMT-OK；`cargo build --workspace` Finished；`cargo clippy --workspace --all-targets -- -D warnings` exit=0（工具链：`.tooling/` 内 1.97.1，与系统 rustc 同版本，见 `crates/rpi-ext-host/examples/wasm-spike/README.md` 工具链说明）
+- G2 测试：通过（`cargo test --workspace`：63 passed, 0 failed；rpi-agent 17 + rpi-ai 13 + rpi-test-support 27 + fixtures_smoke 6；无 live 测试，非 live 测试不访问网络）
 - G3 对拍：通过（本任务交付对拍工具本身，以归一化/diff 自测替代）。证据：
   - 归一化幂等 / id 一致映射 / uuid·cwd·timestamp 剥离：normalize.rs 6 单测 + fixtures_smoke 6 测全过；
-  - runbook 可重复性抽验：`node fixtures/generate-fixtures.mjs single-turn` 重生成后 `cargo run -p pir-test-support --example normalize-diff -- <before> <after>` 输出 `OK: inputs are equal after normalization`，exit=0；
+  - runbook 可重复性抽验：`node fixtures/generate-fixtures.mjs single-turn` 重生成后 `cargo run -p rpi-test-support --example normalize-diff -- <before> <after>` 输出 `OK: inputs are equal after normalization`，exit=0；
   - events.jsonl 对拍粒度说明（上游 delta 切块非确定）已登记：`fixtures/README.md` §2、D-003
 - G4 红线：通过。`external/pi` HEAD=2efa728、`git status --porcelain` 为空（npm ci 的 node_modules 与 dist 均 gitignored）；未引入 JS/TS 执行能力（wasmtime 为 Wasm runtime）；未读写 `~/.pi`/`.pi`（fixtures 生成全程临时目录）；无 SQLite；token 估算 4 字符/token（D-003 注明 chars/4，BMP 等价）；非测试代码仅 3 处 expect 均有不变式注释（normalize.rs ×2、vt.rs ×1、faux.rs mutex ×1）；无凭据日志；无范围排除项；grep/find 未涉及；无 session 写代码
-- G5 线格式：不适用（本任务未新增线格式类型；fixtures 为上游自身产出格式，faux 复用 T01 已验收的 `pir-ai` 类型）
-- G6 文档同步：通过。回写位置：`02-design.md` §3.7（faux 确定性化）、`fixtures/README.md`（runbook + 逐条对拍基准清单 + events.jsonl 粒度）、`crates/pir-ext-host/examples/wasm-spike/README.md`（spike runbook + musl 实测方法）、溯源注释（faux.rs / normalize.rs / 各新模块文件头）
+- G5 线格式：不适用（本任务未新增线格式类型；fixtures 为上游自身产出格式，faux 复用 T01 已验收的 `rpi-ai` 类型）
+- G6 文档同步：通过。回写位置：`02-design.md` §3.7（faux 确定性化）、`fixtures/README.md`（runbook + 逐条对拍基准清单 + events.jsonl 粒度）、`crates/rpi-ext-host/examples/wasm-spike/README.md`（spike runbook + musl 实测方法）、溯源注释（faux.rs / normalize.rs / 各新模块文件头）
 - G7 偏离闭环：通过（D-003 已登记并回写，状态「已回写」；无行为级偏离）
 - 任务特有标准：
   - fixtures 首批 5 场景（single-turn / tool-calls / steering-followup / abort / length-truncation）+ runbook ✅
-  - 归一化 + diff 单一实现于 `pir-test-support`（normalize.rs / diff.rs，lib.rs 文件头声明禁止另写）✅
-  - Wasm ABI spike 闭环：`cargo run -p pir-ext-host --example wasm_spike` 输出 `WASM SPIKE OK`，exit=0（registerTool + dialog + 声明式组件渲染两帧往返）✅
-  - 二进制体积实测：**12.4MB（13,001,728 字节）< 50MB** ✅。`CC_x86_64_unknown_linux_musl=gcc RUSTFLAGS="-C linker=rust-lld" cargo build --release -p pir --target x86_64-unknown-linux-musl`，wasmtime 47.0.2（默认 features，`--wasm-smoke` 钩子强制链入），musl 静态二进制运行 `--wasm-smoke` 输出 `wasmtime engine ok` ✅
+  - 归一化 + diff 单一实现于 `rpi-test-support`（normalize.rs / diff.rs，lib.rs 文件头声明禁止另写）✅
+  - Wasm ABI spike 闭环：`cargo run -p rpi-ext-host --example wasm_spike` 输出 `WASM SPIKE OK`，exit=0（registerTool + dialog + 声明式组件渲染两帧往返）✅
+  - 二进制体积实测：**12.4MB（13,001,728 字节）< 50MB** ✅。`CC_x86_64_unknown_linux_musl=gcc RUSTFLAGS="-C linker=rust-lld" cargo build --release -p rpi --target x86_64-unknown-linux-musl`，wasmtime 47.0.2（默认 features，`--wasm-smoke` 钩子强制链入），musl 静态二进制运行 `--wasm-smoke` 输出 `wasmtime engine ok` ✅
 - 结论：**通过**

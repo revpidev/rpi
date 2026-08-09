@@ -18,12 +18,12 @@
 
 ### In
 
-- `SettingsManager`：全局 `~/.pir/agent/settings.json` + 项目覆盖；**全键清单与默认值**（需求 §7.7，40+ 键）；合并语义（嵌套对象单层浅合并（深度≥2 整体替换）、**数组与原始值整体替换**）；字段级写持久化（只写 session 内改过的字段）+ `fs2` 锁；旧格式迁移 4 条（queueMode→steeringMode、websockets→transport、旧 skills 对象、retry.maxDelayMs→provider.maxRetryDelayMs）；trust=false 时项目 settings 视为空且拒写；parse 错误按 scope 诊断并阻止覆写
-- 环境变量模块（需求 §3.3）：进程级 `PIR_*` 全集 + bash 会话注入 5 变量（与 T06 接线）
+- `SettingsManager`：全局 `~/.rpi/agent/settings.json` + 项目覆盖；**全键清单与默认值**（需求 §7.7，40+ 键）；合并语义（嵌套对象单层浅合并（深度≥2 整体替换）、**数组与原始值整体替换**）；字段级写持久化（只写 session 内改过的字段）+ `fs2` 锁；旧格式迁移 4 条（queueMode→steeringMode、websockets→transport、旧 skills 对象、retry.maxDelayMs→provider.maxRetryDelayMs）；trust=false 时项目 settings 视为空且拒写；parse 错误按 scope 诊断并阻止覆写
+- 环境变量模块（需求 §3.3）：进程级 `RPI_*` 全集 + bash 会话注入 5 变量（与 T06 接线）
 - `ResourceLoader` 统一发现：全局 → 项目（trust 门控）→ settings 路径 → CLI flags → packages，输出 `LoadedResources { extensions, skills, prompts, themes, context_files, diagnostics }`（设计文档 §6.7）；同名冲突先到先得 + collision 诊断；**资源优先级 rank**（project settings > project auto > user settings > user auto > package）
 - Context files：候选优先级 `AGENTS.md` > `AGENTS.MD` > `CLAUDE.md` > `CLAUDE.MD`；全局一份 + cwd 到**文件系统根**祖先链（不以 git root 为界）；`<project_context>`/`<project_instructions path>` 注入格式；**无论 trust 与否都加载**
 - `SYSTEM.md` / `APPEND_SYSTEM.md`：项目版需 trust 且优先于全局；`--system-prompt`/`--append-system-prompt` 文件路径 vs 内联文本解析
-- Skills：**发现路径全集**（`~/.pir/agent/skills`、`~/.agents/skills`、`.pir/skills`、祖先 `.agents/skills` 上界 **git repo root**、packages、settings 数组、CLI）；**两种发现模式**（pi 目录根级散 `.md` 算 skill；`.agents` 只认 SKILL.md）；ignore 文件链（`.gitignore`/`.ignore`/`.fdignore`）、dotdir/node_modules 跳过、符号链接跟随；frontmatter（name 校验仅警告、description 缺失**不加载**、disable-model-invocation）；渐进披露（`<available_skills>` XML，**仅 read 工具激活时注入**）；`/skill:name` 展开格式（`<skill name location>` + References 行 + args 原样追加）；`enableSkillCommands`
+- Skills：**发现路径全集**（`~/.rpi/agent/skills`、`~/.agents/skills`、`.rpi/skills`、祖先 `.agents/skills` 上界 **git repo root**、packages、settings 数组、CLI）；**两种发现模式**（pi 目录根级散 `.md` 算 skill；`.agents` 只认 SKILL.md）；ignore 文件链（`.gitignore`/`.ignore`/`.fdignore`）、dotdir/node_modules 跳过、符号链接跟随；frontmatter（name 校验仅警告、description 缺失**不加载**、disable-model-invocation）；渐进披露（`<available_skills>` XML，**仅 read 工具激活时注入**）；`/skill:name` 展开格式（`<skill name location>` + References 行 + args 原样追加）；`enableSkillCommands`
 - Prompt templates：**非递归** `*.md`；frontmatter（description 缺省首行截 60+`...`、argument-hint）；**展开 DSL 全集**（`$1..$N`、`$@`、`$ARGUMENTS`、`${N:-default}`、`${@:-default}`、`${ARGUMENTS:-default}`、`${@:N}`、`${@:N:L}`；引号感知解析；不递归；缺位空串）
 - Themes：内置 dark/light；JSON schema（`name`、`vars`、`colors` **51 必填 + `thinkingMax` 可选回退 thinkingXhigh**、`export` 段，theme-schema.json:38-90）；ColorValue 三形态（hex / 0-255 整数 / `""`）；热重载**仅 watch 全局当前主题文件**；theme 值 `light/dark` 为 auto 配对（`parseAutoThemeSetting`）、主题名正则 `^[^/]+$`；终端配色检测链 OSC 11→COLORFGBG→fallback、动态切换；终端自省 OSC 11 / CSI ?996n / CSI 16t / OSC 9;4（1s keepalive）
 - Keybindings：**仅全局** `keybindings.json`；命名空间 id（`tui.editor.*`/`tui.input.*`/`tui.select.*`/`app.*`）；**旧键名迁移表 60+ 项**（ADR-0003 §3 保留项）；平台差异默认值（win32 无 ctrl+z、贴图 alt+v、macOS tree 方向键）
@@ -81,7 +81,7 @@
 - 验收人：单人开发，按 gates.md §1 清单逐项自证
 - G1 构建/静态检查：通过（`cargo build --workspace`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all -- --check` 全部无警告）
 - G2 测试：通过（`cargo test --workspace`：1193 passed, 0 failed；live 测试默认跳过；非 live 不访问网络）
-- G3 对拍：通过。`fixtures/generated/resources/` 6 组黄金（生成脚本 `fixtures/generate-resources-golden.mjs`，钉死上游 2efa728 dist 驱动，连跑两次 `diff -r` 为空）；`cargo test -p pir --test parity_resources_test` 7/7 通过（skills-battery 13+1 上游 fixture 目录、prompt-dsl 21 对、themes 11+2、keybindings 5、settings 5+8、resource-loader-e2e 全树）。逐条对拍基准映射表见下（`docs/keybindings.md` 默认绑定表逐条锚点含在 keybindings_test.rs）
+- G3 对拍：通过。`fixtures/generated/resources/` 6 组黄金（生成脚本 `fixtures/generate-resources-golden.mjs`，钉死上游 2efa728 dist 驱动，连跑两次 `diff -r` 为空）；`cargo test -p rpi --test parity_resources_test` 7/7 通过（skills-battery 13+1 上游 fixture 目录、prompt-dsl 21 对、themes 11+2、keybindings 5、settings 5+8、resource-loader-e2e 全树）。逐条对拍基准映射表见下（`docs/keybindings.md` 默认绑定表逐条锚点含在 keybindings_test.rs）
 - G4 红线：通过（`external/pi` HEAD=2efa728 且 `git status --porcelain` 为空；无 JS/TS 执行能力引入——fixtures 生成脚本属既有 fixtures 纪律；未读写 `~/.pi`；锁仅 settings/keybindings 迁移写回（fs2），session 无锁；非测试代码无 unwrap/expect）
 - G5 线格式：通过（settings/themes/keybindings JSON serde 形状与上游核对，camelCase；`serde_json/preserve_order` 保持 JS 对象插入序；对拍随 G3 全过）
 - G6 文档同步：通过（全部移植文件有 `Port of ... @ pi 0.82.1 (2efa728)` 溯源注释；回写：`02-design.md` §6.7 Rust 落地注记、§12 映射表 resource-loader 行；`fixtures/README.md` §3.1 resources 用例组与引擎级排除口径、§5.3 settings 接线状态 ✅）
@@ -94,8 +94,8 @@
 
 | 条目 | 锚点 |
 |------|------|
-| 进程级 `PIR_*` 全集（marker/PACKAGE_DIR/OFFLINE/SKIP_VERSION_CHECK/TELEMETRY/CACHE_RETENTION/SHARE_VIEWER_URL/STARTUP_BENCHMARK/TUI_WRITE_LOG/VISUAL/EDITOR 等） | `core/environment.rs` 内测 13 例（`test_coding_agent_marker` / `test_package_dir_override` / `test_is_offline_truthy_flag` / `test_skip_version_check_any_non_empty` / `test_telemetry_enabled_override` / `test_cache_retention_long_exact_match` / `test_share_viewer_base_url_fallback` / `test_startup_benchmark_truthy_flag` / `test_tui_write_log_path` / `test_external_editor_from_env_precedence` 等） |
-| bash 会话注入 5 变量（每次命令启动解析、模型切换即时生效、未启用删除继承） | `pir/tests/bash_tool_test.rs::test_pir_session_env_injected` / `test_pir_env_stripped_when_no_session` / `test_expose_session_env_false` / `test_session_env_resolved_per_command_start` |
+| 进程级 `RPI_*` 全集（marker/PACKAGE_DIR/OFFLINE/SKIP_VERSION_CHECK/TELEMETRY/CACHE_RETENTION/SHARE_VIEWER_URL/STARTUP_BENCHMARK/TUI_WRITE_LOG/VISUAL/EDITOR 等） | `core/environment.rs` 内测 13 例（`test_coding_agent_marker` / `test_package_dir_override` / `test_is_offline_truthy_flag` / `test_skip_version_check_any_non_empty` / `test_telemetry_enabled_override` / `test_cache_retention_long_exact_match` / `test_share_viewer_base_url_fallback` / `test_startup_benchmark_truthy_flag` / `test_tui_write_log_path` / `test_external_editor_from_env_precedence` 等） |
+| bash 会话注入 5 变量（每次命令启动解析、模型切换即时生效、未启用删除继承） | `rpi/tests/bash_tool_test.rs::test_pir_session_env_injected` / `test_pir_env_stripped_when_no_session` / `test_expose_session_env_false` / `test_session_env_resolved_per_command_start` |
 
 **§7.1 Context files**
 

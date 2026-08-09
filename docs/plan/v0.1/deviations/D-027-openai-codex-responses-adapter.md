@@ -14,7 +14,7 @@
 
 ## 实际实现与偏离原因
 
-适配器落为 `crates/pir-ai/src/api/openai_codex_responses.rs` + `crates/pir-ai/src/api/codex_ws.rs`（连接状态机）+ `crates/pir-ai/src/api/codex_ws/cache.rs`（连接缓存/TTL/debug stats/回退表）+ `crates/pir-ai/src/session_resources.rs`（`session-resources.ts` 移植）。共享逻辑复用 `openai_responses_shared.rs`（`ResponsesStreamProcessor` 新增 `resolve_service_tier` 钩子承载 `resolveCodexServiceTier`）与 `openai_responses.rs` 的 service-tier 价格乘数。与上游的有意差异：
+适配器落为 `crates/rpi-ai/src/api/openai_codex_responses.rs` + `crates/rpi-ai/src/api/codex_ws.rs`（连接状态机）+ `crates/rpi-ai/src/api/codex_ws/cache.rs`（连接缓存/TTL/debug stats/回退表）+ `crates/rpi-ai/src/session_resources.rs`（`session-resources.ts` 移植）。共享逻辑复用 `openai_responses_shared.rs`（`ResponsesStreamProcessor` 新增 `resolve_service_tier` 钩子承载 `resolveCodexServiceTier`）与 `openai_responses.rs` 的 service-tier 价格乘数。与上游的有意差异：
 
 1. **WS 状态机的 Rust 表达**（§13 开放项定稿）：socket 在 busy 期间移出 cache entry（所有权随请求，上游是共享对象 + busy 标志）；5min 空闲 TTL 用 spawn 定时任务 + 代际计数（上游 `setTimeout`/`clearTimeout`）；`readyState` 可复用性检查用非阻塞 poll 探针替代，意外到达的数据帧存入 `entry.pending` 交付下次读取（上游读 readyState，不会消费帧）。连接缓存 TTL、per-session SSE 永久回退、两类一次重试、缓存续传 delta 语义与上游一致。
 2. **传输层直连**：HTTP 用 reqwest（非 fetch）、WS 用 tokio-tungstenite（rustls + webpki-roots，与 reqwest 的 rustls-tls 一致，服务单文件 musl 目标）；无浏览器/bun 分支（proxy env、globalThis.WebSocket 探测等运行时探测不移植）。`combineAbortSignals` 不移植：头超时 deadline 与用户取消令牌直接 select。SSE body 阶段超时消息为 `Request was aborted`（上游为 Node `AbortError` 文案，上游无测试钉死该文案）。
@@ -24,11 +24,11 @@
 6. **错误分类**：上游靠 `instanceof CodexApiError/CodexProtocolError/WebSocketCloseError` 分类重试/回退控制流；Rust 落为 `CodexError` 枚举（Api/Protocol/Close/Transport/RetryDelayExceeded/Aborted/Other + 内部 `RetryScheduled` 哨兵），谓词一一对应。
 7. **session-resources**：注册表回调为不可失败的 `fn` 指针（上游可 throw 聚合为 AggregateError）；同步清理包装在无运行时句柄时退化为 drop socket（关闭 TCP，不发 close 帧）。
 8. **SSE 解析**：复用共享 `SseDecoder`（`data:` 行去一个前导空格；上游 codex 自行 trim 每个 data 行）——与 D-005 家族同类。
-9. **`stream_simple` 缺 API key 进事件流**（上游同步 throw），与其他 pir 适配器一致；`on_payload` 见 snake_case wire JSON（同 D-021..D-026）。
-10. **`openai-codex-responses.lazy.ts` 无对应物**：pir-ai 静态链接，`lazyApi` 动态 import 不存在（同 D-021..D-026）。
+9. **`stream_simple` 缺 API key 进事件流**（上游同步 throw），与其他 rpi 适配器一致；`on_payload` 见 snake_case wire JSON（同 D-021..D-026）。
+10. **`openai-codex-responses.lazy.ts` 无对应物**：rpi-ai 静态链接，`lazyApi` 动态 import 不存在（同 D-021..D-026）。
 11. **bug-compatible 保留**：上游 `connectWebSocket` 中 `delete wsHeaders["OpenAI-Beta"]` 因大小写不匹配是 no-op，`openai-beta: responses_websockets=2026-02-06` 实际随握手发送——Rust 侧保留该行为并注释。
 12. **测试缝**：TTL 经 `set_codex_websocket_ttls_for_tests` 参数化（上游用 fake timers）；`codex-websocket-cached-probe.ts` 为手工探针工具，其意图由 debug stats 断言覆盖，不单独移植。
-13. **新增依赖**：`tokio-tungstenite`（0.26，default-features=false + connect/handshake/rustls-tls-webpki-roots）、`zstd`（0.13）、`libc` 进入 pir-ai（设计文档 §14 已预定前两者）。
+13. **新增依赖**：`tokio-tungstenite`（0.26，default-features=false + connect/handshake/rustls-tls-webpki-roots）、`zstd`（0.13）、`libc` 进入 rpi-ai（设计文档 §14 已预定前两者）。
 
 ## 影响面
 

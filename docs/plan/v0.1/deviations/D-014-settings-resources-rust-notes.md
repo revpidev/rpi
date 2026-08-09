@@ -38,7 +38,7 @@
    （skills 侧按 `findSourceInfoForPath` 前缀匹配实现，prompts/themes 侧留 getter
    给 T15）。
 8. **system prompt 文档段落**：上游 `getReadmePath/getDocsPath/getExamplesPath` 锚在
-   pi 的 package dir；pir 无捆绑 package docs 目录，改为
+   pi 的 package dir；rpi 无捆绑 package docs 目录，改为
    `BuildSystemPromptOptions::doc_paths` 参数，`None` 时整段省略（T10 决定来源）。
 9. **themes/keybindings 的 TUI 件下沉 T11/T12**：`detectCapabilities`/`matchesKey`
    （Kitty 协议解析）/全局 theme、keybindings 单例/`getMarkdownTheme` 等 helper、热
@@ -50,9 +50,9 @@
     替换）；packages 为输入端口（`PackageResourcePaths`，安装加载在 T14）；SDK
     override 钩子与 inline factories 未移植（T15）；上游 CLI 缺失路径诊断的不一致
     （skills/prompts 门控 `is_local_path`、themes 不门控）照原样移植。
-11. **环境变量模块拆分**：`PIR_CODING_AGENT_DIR`/`PIR_CODING_AGENT_SESSION_DIR` 常量
+11. **环境变量模块拆分**：`RPI_CODING_AGENT_DIR`/`RPI_CODING_AGENT_SESSION_DIR` 常量
     保留在 `config.rs`（§10.1 单点路径解析），`core/environment.rs` 持有其余进程级
-    `PIR_*` 常量与读取辅助；bash 5 变量注入沿用 T06 既有接线。
+    `RPI_*` 常量与读取辅助；bash 5 变量注入沿用 T06 既有接线。
 
 ## 影响面
 

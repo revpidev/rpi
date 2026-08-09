@@ -8,7 +8,7 @@
 ## 原文档约定
 
 - 文档与章节：`docs/01-requirements.md` §4.5（可选工具行为锚点）、ADR-0003 §2
-  （`pir/src/tools/` 原生实现，ignore/globset，不引入 rg/fd 下载）；
+  （`rpi/src/tools/` 原生实现，ignore/globset，不引入 rg/fd 下载）；
   上游基准 `packages/coding-agent/src/core/tools/{grep,find,ls}.ts` @ 0.82.1 (2efa728)。
 - 原文约定：grep 等价 `rg --json --line-number --color=never --hidden`；
   find 等价 `fd --glob --color=never --hidden`（repo 外 `--no-require-git`）；

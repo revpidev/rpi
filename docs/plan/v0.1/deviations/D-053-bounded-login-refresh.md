@@ -34,7 +34,7 @@ overlay 拉取（`{catalogBaseUrl}/api/models/providers/{id}`）。端点不可�
 
 ## 回写位置
 
-- `crates/pir/src/core/model_runtime.rs` `login`/`logout` 文档注记
+- `crates/rpi/src/core/model_runtime.rs` `login`/`logout` 文档注记
   （`bounded_refresh_signal`）
 
 ## 测试

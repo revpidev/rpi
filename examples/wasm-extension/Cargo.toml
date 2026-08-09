@@ -1,6 +1,6 @@
 [package]
-name = "pir-wasm-extension-example"
-description = "Example pir wasm extension (permission gate): ABI v1 guest"
+name = "rpi-wasm-extension-example"
+description = "Example rpi wasm extension (permission gate): ABI v1 guest"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -13,7 +13,7 @@ license = "MIT"
 crate-type = ["cdylib"]
 
 [dependencies]
-pir-ext-sdk = { path = "../../crates/pir-ext-sdk" }
+rpi-ext-sdk = { path = "../../crates/rpi-ext-sdk" }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [profile.release]

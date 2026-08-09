@@ -1,6 +1,6 @@
-# Pir v0.11 架构设计文档（对齐 Pi v0.84.1）
+# Rpi v0.11 架构设计文档（对齐 Pi v0.84.1）
 
-> 本文档是 [`../02-design.md`](../02-design.md)（v0.1 基线）的**增量设计**，描述 pir 从 Pi v0.82.1 升级到 v0.84.1+ 基线的架构变更。
+> 本文档是 [`../02-design.md`](../02-design.md)（v0.1 基线）的**增量设计**，描述 rpi 从 Pi v0.82.1 升级到 v0.84.1+ 基线的架构变更。
 > 对照源：`external/pi` @ `4181f66`。需求条目引用 [`01-requirements.md`](./01-requirements.md) 的 R 编号。
 > 设计原则沿用 v0.1 §1；上游钉死更新为 `4181f66`（见 [`UPSTREAM.md`](../../UPSTREAM.md)）。
 
@@ -12,22 +12,22 @@
 
 1. **基准唯一**：以 `4181f66`（v0.84.1+）为唯一对拍基准。上游在周期内回退重做过 fullscreen（`b70c0f5b4` revert），中间版本一律不参考。
 2. **顺序：先协议后表现**：先落地线格式/消息类型变更（R2.1、R3.1）恢复对拍绿，再做行为修正（R2.3/R2.4、R3.4），最后做 fullscreen TUI 大工程（R3.2、R5.2）。
-3. **不追过渡态**：上游 harness v2 运行时未实现且 record 契约将被 D0 重写——pir-agent harness 保持 v1 语义，不为 scaffold 写代码（需求 §1.2）。
+3. **不追过渡态**：上游 harness v2 运行时未实现且 record 契约将被 D0 重写——rpi-agent harness 保持 v1 语义，不为 scaffold 写代码（需求 §1.2）。
 4. **渲染基线重录前置**：R5.3.1（输入即时渲染）使逐帧黄金文件失效，在 TUI 动工第一天统一重录，避免新旧基线混杂。
 
 ### 1.2 变更- crate 映射总览
 
 | crate | 主要变更 | 需求条目 | 风险 |
 |-------|----------|----------|------|
-| `pir-ai` | 类型字段扩展、流终止语义、provider 修复、models refresh 事务化、OAuth 行为、2 个新 provider | R2.1–R2.8 | 中（点状多、无架构变化） |
-| `pir-agent` | Agent 循环 4 项微行为、CompactResult 契约、proxy 帧 | R4.1–R4.2 | 低 |
-| `pir-tui` | **渲染器 trait 化重构** + 全屏子系统 + 布局引擎 + LaTeX + 宽度算法 | R5.1–R5.5 | **高（本版本最大工程）** |
-| `pir` | JSON/RPC 线格式 + backpressure、会话行为簇、auth 命令、settings 深合并、资源/包管理 | R3.1–R3.7 | 中 |
-| `pir-ext-sdk` / `pir-ext-host` | 扩展 API 面 12 项同步 | 需求 §6 | 中（ABI 兼容决策） |
+| `rpi-ai` | 类型字段扩展、流终止语义、provider 修复、models refresh 事务化、OAuth 行为、2 个新 provider | R2.1–R2.8 | 中（点状多、无架构变化） |
+| `rpi-agent` | Agent 循环 4 项微行为、CompactResult 契约、proxy 帧 | R4.1–R4.2 | 低 |
+| `rpi-tui` | **渲染器 trait 化重构** + 全屏子系统 + 布局引擎 + LaTeX + 宽度算法 | R5.1–R5.5 | **高（本版本最大工程）** |
+| `rpi` | JSON/RPC 线格式 + backpressure、会话行为簇、auth 命令、settings 深合并、资源/包管理 | R3.1–R3.7 | 中 |
+| `rpi-ext-sdk` / `rpi-ext-host` | 扩展 API 面 12 项同步 | 需求 §6 | 中（ABI 兼容决策） |
 
 ---
 
-## 2. pir-ai 设计（R2.1–R2.8）
+## 2. rpi-ai 设计（R2.1–R2.8）
 
 ### 2.1 类型扩展（`types.rs`）
 
@@ -49,7 +49,7 @@ struct ToolCall { /* ... */ namespace: Option<String> }
 
 - `DeferredHandle` 按上游形状定义（provider/model_id/api/id/expires_at/poll_after_ms/data），`data` 为 `serde_json::Value`。不实现 fetch/cancel 生命周期（R2.2.1 [DEFER]）。
 - `Model`/`StreamOptions` 新增 `sampling_params: Option<Map<String, Value>>`，请求体组装**最后一步** `merge`（键覆盖命名参数），仅 OpenAI-compatible 适配器消费。
-- `StreamOptions` 拆分为 `ProviderRequestOptions`（signal 等价物用 `CancellationToken`、telemetry_context 占位、api_key、自定义 fetch、headers、timeout、retry）+ `StreamOptions`（R2.8.1）。pir 已有 `CancellationToken` 惯例，无 signal 概念问题。
+- `StreamOptions` 拆分为 `ProviderRequestOptions`（signal 等价物用 `CancellationToken`、telemetry_context 占位、api_key、自定义 fetch、headers、timeout、retry）+ `StreamOptions`（R2.8.1）。rpi 已有 `CancellationToken` 惯例，无 signal 概念问题。
 
 ### 2.2 流终止语义（providers/*）
 
@@ -60,7 +60,7 @@ struct ToolCall { /* ... */ namespace: Option<String> }
 
 ### 2.3 Mistral 原生传输
 
-- 删除对 mistral SDK 等价物的依赖，直接基于 pir 既有 SSE 解析基建实现 `mistral` 模块：自解析 `data:`/`[DONE]`/多行 JSON；`to_mistral_wire_payload()` 做 camelCase→snake_case 映射；保留 `x-affinity` 头逻辑。以 `mistral-http-transport.test.ts`（427 行）为对拍蓝本。
+- 删除对 mistral SDK 等价物的依赖，直接基于 rpi 既有 SSE 解析基建实现 `mistral` 模块：自解析 `data:`/`[DONE]`/多行 JSON；`to_mistral_wire_payload()` 做 camelCase→snake_case 映射；保留 `x-affinity` 头逻辑。以 `mistral-http-transport.test.ts`（427 行）为对拍蓝本。
 
 ### 2.4 Models refresh 事务化（`models.rs` / `models_store.rs`）
 
@@ -81,7 +81,7 @@ struct ToolCall { /* ... */ namespace: Option<String> }
 
 ---
 
-## 3. pir-agent 设计（R4.1–R4.2）
+## 3. rpi-agent 设计（R4.1–R4.2）
 
 ### 3.1 Agent 循环微行为（`agent.rs` / `agent_loop.rs`）
 
@@ -101,14 +101,14 @@ struct ToolCall { /* ... */ namespace: Option<String> }
 
 ---
 
-## 4. pir-tui 设计（R5.1–R5.5，本版本最大工程）
+## 4. rpi-tui 设计（R5.1–R5.5，本版本最大工程）
 
 ### 4.1 渲染器 trait 化重构
 
 现有 `tui.rs` 单一大 struct 拆为：
 
 ```
-crates/pir-tui/src/
+crates/rpi-tui/src/
 ├── tui.rs              # Tui trait（type-level 接口面）+ TuiMode + TuiStopOptions
 ├── tui_base.rs         # TuiBase：输入分发、overlay 栈、渲染调度、颜色查询（共有逻辑）
 ├── tui_main_screen.rs  # TuiMainScreen：现有差分渲染整体迁入（行为冻结，逐行等价）
@@ -120,7 +120,7 @@ crates/pir-tui/src/
 
 - `Tui` 在 Rust 用 trait object（`Box<dyn Tui>`）或泛型；`TuiBase` 以**基类复用**而非 trait 默认方法实现（字段共享：overlay 栈、渲染状态），与上游抽象基类同构。
 - 运行时切换：`capture_render_state()/restore_render_state()`（main-screen 7 个状态字段）+ `TuiStopOptions { preserve_screen }`；`ViewportTui` trait（`set_layout_root`）。
-- 上游已验证 `TuiMainScreen.doRender` 与旧 `TUI.doRender` 逐行等价——pir 迁移时**不允许**顺手改渲染逻辑，迁移后先跑旧黄金文件（重录基线前）确认等价。
+- 上游已验证 `TuiMainScreen.doRender` 与旧 `TUI.doRender` 逐行等价——rpi 迁移时**不允许**顺手改渲染逻辑，迁移后先跑旧黄金文件（重录基线前）确认等价。
 
 ### 4.2 布局引擎
 
@@ -132,9 +132,9 @@ crates/pir-tui/src/
 ### 4.3 全屏渲染器
 
 - 终端控制序列、鼠标解析（SGR/X10）、多路复用器 button-motion 降级、OSC 52 复制、OSC 133 prompt 导航、多击选择状态机（`DOUBLE_CLICK_INTERVAL_MS=500`、grapheme 边界吸附、边缘自动滚动 50ms）——按上游 `tui-alt-screen.ts`（1047 行）逐块移植。
-- Kitty 图片：全局元数据注册表（LRU 1000 条）、placement-only 重发、像素级裁剪、离屏缓存（16 张/32MB/64MB 上限）。pir-tui 已有 `terminal_image.rs`，新增 `kitty_registry` 子模块。
+- Kitty 图片：全局元数据注册表（LRU 1000 条）、placement-only 重发、像素级裁剪、离屏缓存（16 张/32MB/64MB 上限）。rpi-tui 已有 `terminal_image.rs`，新增 `kitty_registry` 子模块。
 - 退出重打：逐行 `\r\x1b[2K` 写主屏（剥 OSC 133 前缀）。
-- 验收蓝本：`tui-alt-screen.test.ts` 30+ 场景 + `VirtualTerminal`/`RecordingTerminal` 等价的 pir-test-support VT 助手。
+- 验收蓝本：`tui-alt-screen.test.ts` 30+ 场景 + `VirtualTerminal`/`RecordingTerminal` 等价的 rpi-test-support VT 助手。
 
 ### 4.4 宽度算法与既有行为修正（`utils.rs`）
 
@@ -151,7 +151,7 @@ crates/pir-tui/src/
 
 ---
 
-## 5. pir 主路径设计（R3.1–R3.7）
+## 5. rpi 主路径设计（R3.1–R3.7）
 
 ### 5.1 JSON/RPC 线格式（`modes/json_event.rs`，新）
 
@@ -184,18 +184,18 @@ pub fn to_json_event(ev: &AgentSessionEvent) -> Option<JsonAgentSessionEvent>
 
 ### 5.4 auth 命令（`cli/auth_command.rs` 等）
 
-- `pir auth print-api-key` / `print-bearer-token`（`--min-expiry`，默认 5 分钟阈值）、`pir auth check`（退出码 0/1/2）——薄 CLI 层，逻辑复用 pir-ai 的 R2.6 能力。
+- `rpi auth print-api-key` / `print-bearer-token`（`--min-expiry`，默认 5 分钟阈值）、`rpi auth check`（退出码 0/1/2）——薄 CLI 层，逻辑复用 rpi-ai 的 R2.6 能力。
 
 ### 5.5 资源与包管理
 
 - `resource-loader`：`AGENTS.override.md` 插入候选链首位；reload 保留 package source 元数据；`find_shadowed_context_file()` 用 git commonDir/mainRepoRoot 判影子。
-- `package-manager`：git 安装容错（clean 失败检测依赖缺失重装、失败清理、`.pir-update-incomplete` marker）；`read_pi_manifest()` 独立化。
+- `package-manager`：git 安装容错（clean 失败检测依赖缺失重装、失败清理、`.rpi-update-incomplete` marker）；`read_pi_manifest()` 独立化。
 
 ### 5.6 Mermaid 决策（R3.3.1）
 
-上游用 grok-mermaid（TS）。**grok-mermaid 本身是 Rust 移植品**：源头是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）的 `crates/codegen/xai-grok-markdown/src/mermaid.rs`——单文件 5237 行的自包含终端 Mermaid 渲染器（graph/flowchart、sequenceDiagram、stateDiagram → Unicode box-drawing，不支持的图类型回退带框原文）。因此 pir 不需要自绘，也不需要 JS 引擎：
+上游用 grok-mermaid（TS）。**grok-mermaid 本身是 Rust 移植品**：源头是 [xai-org/grok-build](https://github.com/xai-org/grok-build)（Apache-2.0）的 `crates/codegen/xai-grok-markdown/src/mermaid.rs`——单文件 5237 行的自包含终端 Mermaid 渲染器（graph/flowchart、sequenceDiagram、stateDiagram → Unicode box-drawing，不支持的图类型回退带框原文）。因此 rpi 不需要自绘，也不需要 JS 引擎：
 
-- **方案：移植 Rust 原作**。以 `mermaid.rs` 为蓝本移植到 `pir-tui/src/mermaid.rs`（或独立子模块）。原作的对外接触面很小：`render(src, styles) -> Option<MermaidArt>`（行 + span 结构），唯二需要适配的是 `ratatui::style::Style`/`Line`/`Span` 与 `unicode-width`——前者映射到 pir-tui 自有样式模型，后者 pir-tui 已有等价物。
+- **方案：移植 Rust 原作**。以 `mermaid.rs` 为蓝本移植到 `rpi-tui/src/mermaid.rs`（或独立子模块）。原作的对外接触面很小：`render(src, styles) -> Option<MermaidArt>`（行 + span 结构），唯二需要适配的是 `ratatui::style::Style`/`Line`/`Span` 与 `unicode-width`——前者映射到 rpi-tui 自有样式模型，后者 rpi-tui 已有等价物。
 - **对拍基线**：pi 侧渲染结果即 grok-mermaid 输出，与 Rust 原作同算法；移植后可用上游 `mermaid.ts` 组件的测试用例 + grok-mermaid 的 fixtures 双向校验。
 - **署名**：Apache-2.0，保留源文件头部出处声明与 LICENSE 归因（NOTICE 或文件头注释）。
 - 未发布到 crates.io，采用移植而非依赖；上游 grok-build 持续同步 xAI monorepo，移植后把源文件 commit 哈希记入代码注释便于日后追更新。
@@ -204,12 +204,12 @@ pub fn to_json_event(ev: &AgentSessionEvent) -> Option<JsonAgentSessionEvent>
 
 ---
 
-## 6. 扩展面设计（pir-ext-sdk / pir-ext-host，需求 §6）
+## 6. 扩展面设计（rpi-ext-sdk / rpi-ext-host，需求 §6）
 
 - SDK：`scoped_models` 只读快照、`tool_call` 返回 `terminate`、`register_markdown_transformer`、`model_registry.complete/find/has_configured_auth`、async `set_runtime_api_key`、`get_api_key_and_headers` 返回 `Option<String>` 值（null 删除标记原样透传）。
 - `refresh_models` context 重构直接影响 **Wasm ABI**：`stored` 快照 + `publish` 事务替代 `store` 读写——ABI v1 需加版本化新 host function 集（旧函数保留一个周期并标记 deprecated），更新 `docs/extension-abi.md` 与 ADR-0007 的缺口清单。
 - 工具 system prompt 贡献常量外露到 SDK。
-- TUI 类型面（`TuiMainScreen` 等）随 pir-tui trait 化同步进 SDK 的 UI 方法面。
+- TUI 类型面（`TuiMainScreen` 等）随 rpi-tui trait 化同步进 SDK 的 UI 方法面。
 
 ---
 

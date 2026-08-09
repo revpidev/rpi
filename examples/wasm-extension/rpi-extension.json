@@ -1,0 +1,8 @@
+{
+  "name": "permission-gate",
+  "version": "0.1.0",
+  "description": "Example wasm extension: block a tool + register a custom tool",
+  "wasm": "dist/permission_gate.wasm",
+  "capabilities": ["tools", "session"],
+  "rpiAbi": 1
+}

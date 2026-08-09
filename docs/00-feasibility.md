@@ -1,7 +1,7 @@
-# Pir 可行性分析：用 Rust 1:1 复刻 Pi Agent Harness
+# Rpi 可行性分析：用 Rust 1:1 复刻 Pi Agent Harness
 
 > 分析对象：`external/pi`（[@earendil-works/pi](https://github.com/earendil-works/pi)，v0.82.1）  
-> 目标产品：`pir`（Pi in Rust）——功能 1:1、架构同构（「1:1」的三层边界定义见 [`01-requirements.md`](./01-requirements.md) §1.5）  
+> 目标产品：`rpi`（Pi in Rust）——功能 1:1、架构同构（「1:1」的三层边界定义见 [`01-requirements.md`](./01-requirements.md) §1.5）  
 > 日期：2026-07-27
 
 ---
@@ -13,7 +13,7 @@
 | **整体可行性** | **可行**，但属于大型工程，不是库移植 |
 | **纯 Rust 行为级 1:1** | 核心循环 / Session / Tools / RPC / Skills / Providers：**可行** |
 | **扩展策略（已决策）** | **Rust / Wasm API 同构** + **安装计划**；不跑 TS pi-package（[ADR-0001](./adr/0001-extension-and-config-dir.md)、[ADR-0002](./adr/0002-baseline-decisions.md)） |
-| **配置目录（已决策）** | 默认 **`~/.pir/agent`** 与项目 **`.pir`** |
+| **配置目录（已决策）** | 默认 **`~/.rpi/agent`** 与项目 **`.rpi`** |
 | **上游（已决策）** | 钉死 **0.82.1 / `2efa728`**（[`UPSTREAM.md`](../UPSTREAM.md)） |
 | **粗估工作量** | 约 **23–33 人月**核心工程（含 TUI 与扩展安装；另计 20–30% 持续开销，全量约 28–43 人月；不含 TS 运行时） |
 
@@ -66,7 +66,7 @@ Pi 自称 **minimal terminal coding harness**：
 
 ## 3. 分模块可行性
 
-### 3.1 `pi-ai` → `pir-ai`（高可行，工作量大）
+### 3.1 `pi-ai` → `rpi-ai`（高可行，工作量大）
 
 | 能力 | 难度 | 说明 |
 |------|------|------|
@@ -82,7 +82,7 @@ Pi 自称 **minimal terminal coding harness**：
 
 **风险**：协议细节与边界用例极多；必须以 pi 的 vitest 行为与真实 provider 流量为金标准，而非「看起来像」。
 
-### 3.2 `pi-agent-core` → `pir-agent`（高可行）
+### 3.2 `pi-agent-core` → `rpi-agent`（高可行）
 
 核心资产是 **事件序确定的 tool-use 状态机**：
 
@@ -95,7 +95,7 @@ Pi 自称 **minimal terminal coding harness**：
 
 这些是纯逻辑，Rust `async` + channel/broadcast 可 1:1。应优先移植并用事件序测试锁死。
 
-### 3.3 `pi-tui` → `pir-tui`（可行，勿误用 ratatui 当 1:1）
+### 3.3 `pi-tui` → `rpi-tui`（可行，勿误用 ratatui 当 1:1）
 
 Pi TUI **不是** ratatui 同类：
 
@@ -108,7 +108,7 @@ Pi TUI **不是** ratatui 同类：
 
 粗估 TUI+Interactive：**8–11 人月**。
 
-### 3.4 `pi-coding-agent` → `pir` CLI（可行，扩展除外）
+### 3.4 `pi-coding-agent` → `rpi` CLI（可行，扩展除外）
 
 | 子系统 | 1:1 难度 | 备注 |
 |--------|----------|------|
@@ -184,7 +184,7 @@ export default function (pi: ExtensionAPI) { ... }
 
 用户要求「架构也类似」。下列同构点均可在 Rust workspace 实现：
 
-1. 四个 crate 对应四个包：`pir-ai` / `pir-agent` / `pir-tui` / `pir`（coding-agent）
+1. 四个 crate 对应四个包：`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`（coding-agent）
 2. `StreamFn` 注入，agent 不绑死 provider
 3. `AgentMessage` 可扩展，LLM 边界 `convert_to_llm`
 4. Session JSONL 树 + compaction 条目语义
@@ -199,11 +199,11 @@ export default function (pi: ExtensionAPI) { ... }
 | 阶段 | 内容 | 人月 |
 |------|------|------|
 | M0 | 工程骨架、类型、事件契约、faux provider、对拍 harness、Wasm ABI spike | 1–1.5 |
-| M1 | `pir-ai` 核心协议（Anthropic + OpenAI 系）+ Auth 基础 | 3–4 |
-| M2 | `pir-agent` loop + 工具 + 并行执行 | 1.5–2 |
+| M1 | `rpi-ai` 核心协议（Anthropic + OpenAI 系）+ Auth 基础 | 3–4 |
+| M2 | `rpi-agent` loop + 工具 + 并行执行 | 1.5–2 |
 | M3 | Session / Compaction / Settings / Skills / Prompts | 2–3 |
 | M4 | Print / JSON / RPC | 1.5–2 |
-| M5 | `pir-tui` + Interactive | 8–11 |
+| M5 | `rpi-tui` + Interactive | 8–11 |
 | M6 | 剩余 Providers + OAuth 全家桶 | 3–4 |
 | M7 | Packages / Trust / Update / Export / llama.cpp | 1.5–2 |
 | M8 | 扩展宿主（Rust + Wasm ABI） | 1.5–3 |

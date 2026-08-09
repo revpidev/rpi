@@ -1,6 +1,6 @@
-# Pir 项目编码规范（Rust Workspace）
+# Rpi 项目编码规范（Rust Workspace）
 
-> 本规范基于 Pir 项目（Rust workspace 同构复刻 Pi agent harness）的架构设计
+> 本规范基于 Rpi 项目（Rust workspace 同构复刻 Pi agent harness）的架构设计
 > 与工程实践制定，适用于本仓库 `crates/` 下全部 Rust 代码。
 >
 > 配套文档：[`02-design.md`](./02-design.md)（crate 划分与核心设计）、
@@ -38,8 +38,8 @@
 
 ### 1.1 适用范围
 
-本规范适用于 Pir workspace 内的所有 crate（`pir-ai`、`pir-agent`、`pir-tui`、
-`pir`、`pir-ext-host`、`pir-test-support`）。Pir 的工程目标是：
+本规范适用于 Rpi workspace 内的所有 crate（`rpi-ai`、`rpi-agent`、`rpi-tui`、
+`rpi`、`rpi-ext-host`、`rpi-test-support`）。Rpi 的工程目标是：
 
 - 用 Rust **同构复刻** Pi agent harness，行为层 1:1 对拍一致
 - 交付**单一可执行文件**（Wasm runtime 嵌入主二进制）
@@ -73,15 +73,15 @@
 ### 2.1 Crate 划分
 
 ```
-pir/
+rpi/
 ├── Cargo.toml                 # workspace 定义
 ├── crates/
-│   ├── pir-ai/                # ↔ @earendil-works/pi-ai：类型、流事件、API 适配、provider、auth
-│   ├── pir-agent/             # ↔ @earendil-works/pi-agent-core：agent loop、状态、事件
-│   ├── pir-tui/               # ↔ @earendil-works/pi-tui：组件、差分渲染、键位
-│   ├── pir/                   # ↔ @earendil-works/pi-coding-agent：bin + lib SDK
-│   ├── pir-ext-host/          # Rust + Wasm 扩展宿主（无 JS，本项目新增）
-│   └── pir-test-support/      # faux provider、黄金 JSONL、归一化/diff、VT 助手
+│   ├── rpi-ai/                # ↔ @earendil-works/pi-ai：类型、流事件、API 适配、provider、auth
+│   ├── rpi-agent/             # ↔ @earendil-works/pi-agent-core：agent loop、状态、事件
+│   ├── rpi-tui/               # ↔ @earendil-works/pi-tui：组件、差分渲染、键位
+│   ├── rpi/                   # ↔ @earendil-works/pi-coding-agent：bin + lib SDK
+│   ├── rpi-ext-host/          # Rust + Wasm 扩展宿主（无 JS，本项目新增）
+│   └── rpi-test-support/      # faux provider、黄金 JSONL、归一化/diff、VT 助手
 ├── external/pi/               # 上游只读对照（钉死 commit，见 UPSTREAM.md）
 └── fixtures/                  # 从 Pi 导出的 session / RPC 样例
 ```
@@ -90,34 +90,34 @@ pir/
 
 ```
                  ┌──────────┐
-                 │ pir (bin)│
+                 │ rpi (bin)│
                  └────┬─────┘
         ┌─────────┬───┼───────────┬──────────────┐
         ▼         ▼   ▼           ▼              ▼
-    pir-agent  pir-ai  pir-tui  pir-ext-host  pir-test-support(dev)
+    rpi-agent  rpi-ai  rpi-tui  rpi-ext-host  rpi-test-support(dev)
         └─────────┘
-        （pir-agent 依赖 pir-ai 的类型：Model / Context / StreamEvent）
+        （rpi-agent 依赖 rpi-ai 的类型：Model / Context / StreamEvent）
 ```
 
-- `pir-ai` **不依赖**任何其他内部 crate，可独立使用
-- `pir-agent` 只依赖 `pir-ai` 的**类型层**，不依赖具体 provider 实现
+- `rpi-ai` **不依赖**任何其他内部 crate，可独立使用
+- `rpi-agent` 只依赖 `rpi-ai` 的**类型层**，不依赖具体 provider 实现
   （`StreamFn` 由调用方注入，见 [§4.2](#42-streamfn-注入)）
-- `pir-tui` 不依赖 `pir-ai` / `pir-agent`，终端 I/O 只用 `crossterm`
-- `pir`（coding-agent）是**唯一的组装点**：定义 `ExtensionHost` trait，
-  绑定 `pir-ext-host` 实现，把 `pir-ai` 的 `Models::stream` 注入为 `StreamFn`
-- `pir-test-support` 只作为 **dev-dependency** 被引用，不得进入发布依赖链
+- `rpi-tui` 不依赖 `rpi-ai` / `rpi-agent`，终端 I/O 只用 `crossterm`
+- `rpi`（coding-agent）是**唯一的组装点**：定义 `ExtensionHost` trait，
+  绑定 `rpi-ext-host` 实现，把 `rpi-ai` 的 `Models::stream` 注入为 `StreamFn`
+- `rpi-test-support` 只作为 **dev-dependency** 被引用，不得进入发布依赖链
 - 依赖单向，禁止成环；新增跨 crate 依赖须先核对设计文档 §2.1 依赖图
 
 ### 2.3 与上游的模块映射
 
 移植代码时**保持文件级对应关系**，命名取上游文件名的 snake_case：
 
-| Pi 路径 | Pir 路径 |
+| Pi 路径 | Rpi 路径 |
 |---------|----------|
-| `packages/ai/src/api/anthropic-messages.ts` | `crates/pir-ai/src/api/anthropic_messages.rs` |
-| `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
-| `packages/tui/src/components/editor.ts` | `crates/pir-tui/src/components/editor.rs` |
-| `packages/coding-agent/src/core/session-manager.ts` | `crates/pir/src/core/session_manager.rs` |
+| `packages/ai/src/api/anthropic-messages.ts` | `crates/rpi-ai/src/api/anthropic_messages.rs` |
+| `packages/agent/src/agent-loop.ts` | `crates/rpi-agent/src/agent_loop.rs` |
+| `packages/tui/src/components/editor.ts` | `crates/rpi-tui/src/components/editor.rs` |
+| `packages/coding-agent/src/core/session-manager.ts` | `crates/rpi/src/core/session_manager.rs` |
 
 完整映射表见设计文档 §12。规则：
 
@@ -135,7 +135,7 @@ pir/
 采用 Rust 2018+ 模块规范，**不使用 `mod.rs`**。目录模块的声明放在同名 `.rs` 文件中。
 
 ```
-crates/pir-ai/src/
+crates/rpi-ai/src/
 ├── lib.rs
 ├── api.rs              # 声明 api/ 下的子模块
 ├── api/
@@ -150,7 +150,7 @@ crates/pir-ai/src/
 
 ### 3.2 生成代码
 
-- 模型目录等生成产物（`build.rs` 或 `pir update --models` 产出）**禁止手工编辑**，
+- 模型目录等生成产物（`build.rs` 或 `rpi update --models` 产出）**禁止手工编辑**，
   修改生成器后重新生成
 - 生成文件头部必须带 `// @generated ... DO NOT EDIT` 标记
 - 启动时对生成数据**只读**；写路径只在显式 update 命令中
@@ -166,7 +166,7 @@ crates/pir-ai/src/
 
 ### 4.1 事件枚举锁定
 
-`StreamEvent`（pir-ai）与 `AgentEvent`（pir-agent）是跨 crate 的行为契约，
+`StreamEvent`（rpi-ai）与 `AgentEvent`（rpi-agent）是跨 crate 的行为契约，
 在 M0 锁定后，**变体增删改必须同时更新对拍 fixtures**：
 
 ```rust
@@ -191,7 +191,7 @@ pub enum StreamEvent {
 
 ### 4.2 StreamFn 注入
 
-`pir-agent` 的 Agent **不**直接依赖 provider，流式能力通过函数注入：
+`rpi-agent` 的 Agent **不**直接依赖 provider，流式能力通过函数注入：
 
 ```rust
 pub type StreamFn = Arc<
@@ -199,12 +199,12 @@ pub type StreamFn = Arc<
 >;
 ```
 
-- 测试注入 faux stream（`pir-test-support`），生产注入 `pir-ai` 的 `Models::stream`
+- 测试注入 faux stream（`rpi-test-support`），生产注入 `rpi-ai` 的 `Models::stream`
 - 新增 agent 能力时保持这一边界：需要 provider 行为的测试一律走 faux，不打真实网络
 
 ### 4.3 ExtensionHost trait
 
-核心（`pir` crate）只依赖 trait，实现（Rust 内置 / Wasm）在 `pir-ext-host`：
+核心（`rpi` crate）只依赖 trait，实现（Rust 内置 / Wasm）在 `rpi-ext-host`：
 
 ```rust
 #[async_trait]
@@ -250,8 +250,8 @@ pub struct SessionHeader {
 
 | 位置 | 错误类型 | 说明 |
 |------|---------|------|
-| 库 crate（pir-ai、pir-agent、pir-tui、pir-ext-host） | `thiserror` 派生的具体错误（`AiError`、`AgentError`、`ExtError` 等） | 每 crate 一个主错误枚举，必要时按模块拆分 |
-| bin / 组装边界（pir 的 main、modes 入口） | `anyhow::Result` | 只在最外层聚合并附加上下文 |
+| 库 crate（rpi-ai、rpi-agent、rpi-tui、rpi-ext-host） | `thiserror` 派生的具体错误（`AiError`、`AgentError`、`ExtError` 等） | 每 crate 一个主错误枚举，必要时按模块拆分 |
+| bin / 组装边界（rpi 的 main、modes 入口） | `anyhow::Result` | 只在最外层聚合并附加上下文 |
 | 流式路径 | **不是异常**——转为 `StreamEvent::Error` + `stopReason` | 与 Pi 一致，见 §5.2 |
 
 ```rust
@@ -271,7 +271,7 @@ pub enum AiError {
 
 provider 调用、HTTP、流解析的失败**不得**向上抛穿 agent loop：
 
-- 在 `pir-ai` 边界把 `AiError` 转为 `StreamEvent::Error`，assistant 消息携带
+- 在 `rpi-ai` 边界把 `AiError` 转为 `StreamEvent::Error`，assistant 消息携带
   对应 `stopReason`（`error` / `aborted` 等，与上游枚举一致）
 - agent loop 把错误事件当作正常事件继续 emit，由 UI / RPC 层呈现
 - `Result` 只用于**调用方必须立即处理**的失败（加载 session 损坏、配置非法、
@@ -421,7 +421,7 @@ pub trait Focusable: Component {
 
 ### 9.1 存储后端
 
-- **仅 JSONL**（ADR-0002 §7）；路径默认 `~/.pir/agent/sessions/`
+- **仅 JSONL**（ADR-0002 §7）；路径默认 `~/.rpi/agent/sessions/`
 - JSONL 记录格式与钉死版 Pi 对齐（字段 camelCase，见 [§4.4](#44-线格式与持久化类型的-serde-约定)），保证可手工拷贝互通
 - 加载迁移 v1–v3 的逻辑移植上游，迁移规则变更须有 fixtures 覆盖
 
@@ -451,22 +451,22 @@ pub trait Focusable: Component {
 
 ```rust
 pub struct PirConfig {
-    pub app_name: String,          // "pir"
-    pub config_dir_name: String,   // ".pir"
+    pub app_name: String,          // "rpi"
+    pub config_dir_name: String,   // ".rpi"
     pub env_prefix: String,        // "PIR"
 }
-// agent_dir   = ~/.pir/agent
-// project_dir = <cwd>/.pir
+// agent_dir   = ~/.rpi/agent
+// project_dir = <cwd>/.rpi
 ```
 
 - 所有路径解析集中在单一模块（对齐上游 `config.ts`），**禁止**在业务代码里
-  各自拼 `home_dir()` / `join(".pir")`
-- 环境变量统一 `PIR_` 前缀，读取也集中在配置模块
+  各自拼 `home_dir()` / `join(".rpi")`
+- 环境变量统一 `RPI_` 前缀，读取也集中在配置模块
 - 不读 `~/.pi` / `.pi`（ADR-0001 §2）
 
 ### 10.2 资源发现
 
-`ResourceLoader` 统一发现顺序：全局 `~/.pir/agent` → 项目 `.pir` → settings 指定路径
+`ResourceLoader` 统一发现顺序：全局 `~/.rpi/agent` → 项目 `.rpi` → settings 指定路径
 → CLI flags → packages。新增资源类型时挂到这一管线，不另起发现逻辑。
 
 ### 10.3 可配置 Endpoint
@@ -513,9 +513,9 @@ pub struct PirConfig {
 |------|------|------|
 | 纯逻辑单测 | loop 事件序、工具排序、session 树、compaction 切点 | 与被测代码同文件 `#[cfg(test)]` |
 | 契约测试 | RPC 命令/响应、session JSONL schema | 各 crate `tests/` |
-| 黄金文件对拍 | fixtures diff（归一化后） | `fixtures/` + `pir-test-support` |
-| Faux provider 场景 | 确定性 tool-call 脚本驱动的端到端 | `pir` crate `tests/` |
-| Live 测试 | 真实 provider | `PIR_LIVE_TEST=1` + API keys 才启用 |
+| 黄金文件对拍 | fixtures diff（归一化后） | `fixtures/` + `rpi-test-support` |
+| Faux provider 场景 | 确定性 tool-call 脚本驱动的端到端 | `rpi` crate `tests/` |
+| Live 测试 | 真实 provider | `RPI_LIVE_TEST=1` + API keys 才启用 |
 
 ### 12.2 测试意图移植
 
@@ -527,14 +527,14 @@ pub struct PirConfig {
 
 - fixtures 生成 runbook 见设计文档 §10.2；生成必须可重复（钉死 commit + 固定脚本）
 - 归一化规则：剥离 timestamp / uuid / session id / cwd，其余字节保留；
-  归一化与 diff 脚本归属 `pir-test-support`，**只有一处实现**
+  归一化与 diff 脚本归属 `rpi-test-support`，**只有一处实现**
 - 对拍断言：事件类型序列、工具调用序列、session JSONL 结构必须一致
 - fixtures 变更与行为变更同 PR 提交，并在提交信息中说明
 
 ### 12.4 Faux provider
 
 - 所有非 live 测试一律用 faux provider / fake stream，**禁止**测试打真实网络
-- faux 脚本（确定性的 stream 事件序列 + tool-call 序列）放 `pir-test-support`，
+- faux 脚本（确定性的 stream 事件序列 + tool-call 序列）放 `rpi-test-support`，
   场景可复用
 
 ### 12.5 TUI 测试
@@ -548,7 +548,7 @@ pub struct PirConfig {
 - 命名：`test_<被测行为>_<场景>` 或移植上游用例名（snake_case）
 - 一个测试验证一个行为；测试数据用工厂函数构造
 - 新增/修改测试必须本地跑过再提交
-- live 测试默认跳过，未设置 `PIR_LIVE_TEST=1` 时不得失败
+- live 测试默认跳过，未设置 `RPI_LIVE_TEST=1` 时不得失败
 
 ---
 
@@ -706,7 +706,7 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 
 - 结构化字段（`tracing::info!(session_id = %id, "session created")`），不字符串拼接
 - 循环/流式热路径不用 `INFO` 及以上级别
-- 默认 `INFO`，`PIR_LOG` / `RUST_LOG` 环境变量调整
+- 默认 `INFO`，`RPI_LOG` / `RUST_LOG` 环境变量调整
 - provider payload debug 默认关闭，开关语义与上游对齐
 
 ---
@@ -726,7 +726,7 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 | 线格式 | serde camelCase 字节级对齐 + fixtures 对拍 | session/RPC 与 Pi 互通 |
 | Session 存储 | 仅 JSONL + fs2 文件锁 | ADR-0002 §7 |
 | token 估算 | 逐字节移植 Pi chars/4 启发式 | ADR-0002 §4 |
-| 路径解析 | 单一模块，`~/.pir` / `.pir` / `PIR_` 前缀 | ADR-0001 §2 |
+| 路径解析 | 单一模块，`~/.rpi` / `.rpi` / `RPI_` 前缀 | ADR-0001 §2 |
 | TUI | 移植 pi-tui 算法 + crossterm；不用 ratatui | 设计文档 §5.1 |
 | 终端恢复 | panic hook + 全部退出路径恢复 | §8.5 硬性要求 |
 | 日志 | tracing；TUI 下不写 stderr | §16 |
@@ -777,8 +777,8 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 | **流式失败上抛 panic** | `stream.next().await.unwrap()` | 转为 `StreamEvent::Error` + `stopReason` |
 | **线格式顺手 snake_case** | `#[serde(rename_all = "snake_case")]` 出 JSONL | camelCase + fixtures 对拍（§4.4） |
 | **事件并发乱序** | 工具结果按完成序 emit | 按 toolCall 源序组装（§6.3） |
-| **绕过 StreamFn 直连 provider** | agent 内 `use pir_ai::providers::*` | 组装层注入 `StreamFn`（§4.2） |
-| **业务代码拼配置路径** | `home_dir().join(".pir/agent")` 散落各处 | 单一路径模块（§10.1） |
+| **绕过 StreamFn 直连 provider** | agent 内 `use rpi_ai::providers::*` | 组装层注入 `StreamFn`（§4.2） |
+| **业务代码拼配置路径** | `home_dir().join(".rpi/agent")` 散落各处 | 单一路径模块（§10.1） |
 | **硬编码键位** | `if key == "ctrl+x"` | 默认 keybindings 表，可配置（§8.4） |
 | **TUI 直接写终端** | 组件内 `execute!(stdout(), ...)` | 组件只产 ANSI 行，`Tui` 统一写（§8.2） |
 | **测试打真实网络** | 单测里起 reqwest 调 api.anthropic.com | faux provider；live 测试加 env 门禁（§12.4） |

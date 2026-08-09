@@ -14,7 +14,7 @@
 
 ## 实际实现与偏离原因
 
-1. **clap → 手写解析器**（`pir/src/cli/args.rs`）：clap 无法表达上游 `args.ts` 的三类语义——
+1. **clap → 手写解析器**（`rpi/src/cli/args.rs`）：clap 无法表达上游 `args.ts` 的三类语义——
    `-p` 值吞噬规则、未知 `--flag` 收集为扩展标志透传（`extensionFlagValues` + help 动态段）、
    互斥诊断矩阵（`--fork`/`--session-id` 等）。改为与上游同构的手写扫描器，
    `args.test.ts` 移植测试锚定行为（上游 72 个 `test(` + 3 个补充 = 75；本文档早前
@@ -26,10 +26,10 @@
    子命令分流（T14）、`--export` HTML 实现（T14）均留占位——app 入口可识别并给出
    「未实现」诊断，参数形状已锁定。
 4. **docs 路径 = 可执行文件目录**：上游 `getDocsPath` 锚在 pi 的 package dir（npm 包随捆
-   用户文档）；pir 无捆绑 package docs，system prompt 的 docs 段取 exe dir 探测，
+   用户文档）；rpi 无捆绑 package docs，system prompt 的 docs 段取 exe dir 探测，
    缺失时整段省略（延续 D-014 §8 的 `doc_paths` 参数口径）。
 5. **`ToolContext.session_env` 动态 cell**：改为 `Option<Arc<RwLock<SessionEnv>>>`，
-   bash 工具的 `PIR_*` 环境变量在每次 spawn 时动态解析（需求 §3.3 要求 session 切换后
+   bash 工具的 `RPI_*` 环境变量在每次 spawn 时动态解析（需求 §3.3 要求 session 切换后
    新值生效），而非 T06 最初的快照注入。
 6. **资源枚举确定性排序**：skills/prompts 的资源枚举按路径排序——JS `fs.readdir` 序
    在 Linux 上不稳定，导致 `parity_resources_test` e2e 偶发失败；排序后输出确定性
@@ -43,7 +43,7 @@
 T10 复审（5 路并行对拍）发现的偏离已修复；以下为修复后**仍然保留**的已知偏离，
 补登备查：
 
-8. **`--wasm-smoke`**（`pir/src/main.rs`）：Rust 独有的 wasmtime 冒烟钩子（T02 测量用，
+8. **`--wasm-smoke`**（`rpi/src/main.rs`）：Rust 独有的 wasmtime 冒烟钩子（T02 测量用，
    注释标明 T15 移除）；上游无此标志。参数解析前拦截，任意位置出现即生效。
 9. **stdin 阻塞读取**（`app.rs::read_piped_stdin`）：在 async 上下文中同步
    `read_to_string`；上游为事件驱动。multi-thread runtime 下只阻塞当前 worker，
@@ -97,6 +97,6 @@ CancellationToken 在 in-flight 时仍生效；`is_context_overflow` 对 0 窗�
 `get_provider_login_help()` 与上游 `auth-guidance.ts` 同构，**无条件**将
 `{packageDir}/docs/providers.md`、`models.md` 两个路径拼进登录帮助文案（不像
 system prompt 的 docs 段那样探测存在性、缺失整段省略）。上游 npm 包随捆 docs/
-目录故该路径恒有效；pir 单文件发布形态下 exe 旁无 docs/，打印的路径无效。
+目录故该路径恒有效；rpi 单文件发布形态下 exe 旁无 docs/，打印的路径无效。
 判定：实现细节偏离，同一根因（无捆绑 package docs）已由本文件第 4 项登记；
 不影响功能（仅提示文案中的路径不可直接打开），不单列新偏离条目。

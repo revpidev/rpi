@@ -21,7 +21,7 @@
 T15（扩展宿主 L0+L1）未开始，扩展注册/自定义 UI/命令表等宿主机制缺位。本波次按「最小侵入
 等价物」接线，差异如下（均不改变产品行为契约）：
 
-1. **内置 hidden 扩展登记表替代扩展宿主**：`crates/pir/src/extensions/mod.rs` 的
+1. **内置 hidden 扩展登记表替代扩展宿主**：`crates/rpi/src/extensions/mod.rs` 的
    `BUILT_IN_EXTENSION_COMMANDS`（对应 `extensions/index.ts` 的 `builtInExtensions`）。
    `/llama` 在交互模式 `dispatch_slash_command` 的内置命令未命中分支查表分发；上游是落入
    `session.prompt` 的扩展命令路径（interactive-mode.ts:4017 `isExtensionCommand`）由
@@ -29,27 +29,27 @@ T15（扩展宿主 L0+L1）未开始，扩展注册/自定义 UI/命令表等宿
    直供（hidden 内置扩展无 source tag，description 不加前缀）。T15 就位后此表应迁移到真
    正的扩展命令注册。
 2. **provider 进程级共享实例**：上游扩展工厂闭包持有 `createLlamaProvider()` 实例
-   （`setCatalog` 控制器随扩展加载唯一）；pir 以 `OnceLock` 进程级单例
+   （`setCatalog` 控制器随扩展加载唯一）；rpi 以 `OnceLock` 进程级单例
    （`shared_llama_provider()`）替代，注册点固定在 `create_agent_session_services`（对应
    agent-session-services.ts:166-178 的 `pendingNativeProviderRegistrations` drain），
    `/llama` 命令处理器共享同一实例。目录内容始终来自同一路由器，语义等价。
-3. **`/llama` TUI 挂载**：上游 `ctx.ui.custom(...)` 挂载自定义组件（T15 宿主钩子）；pir
+3. **`/llama` TUI 挂载**：上游 `ctx.ui.custom(...)` 挂载自定义组件（T15 宿主钩子）；rpi
    复用 selector 挂载机制（`show_selector` + `FocusableRegion`），组件与异步流程经
    `Arc<Mutex<LlamaViewState>>` + 每请求 oneshot 通道通信（`LlamaViewComponent` /
    `LlamaViewUi` 两半）。`showLlamaUi` 的错误边界 = 流程返回 `Err` 时 notify + 卸载。
 4. **取消/并发原语**：`AbortSignal` → `CancellationToken`；15s `AbortSignal.timeout` →
    reqwest client 级 timeout；`runWithProgress` 的 settled 轮询 → `tokio::select!` 循环
-   （进度重绘经通道转发——上游在进度回调里同步调 `updateProgress`，pir 的回调跑在 watcher
+   （进度重绘经通道转发——上游在进度回调里同步调 `updateProgress`，rpi 的回调跑在 watcher
    任务上）；HF 搜索 500ms `setTimeout` debounce → spawn 任务 + generation 计数（陈旧结果
    丢弃规则与上游 `this.query !== query` 一致）。
 5. **连接错误分类**：上游按 undici 错误文案匹配（`fetch failed`/`timeout`/`network`，
-   index.ts:11-15）；pir 用 reqwest 的 `is_connect`/`is_timeout` 分类（`LlamaError.
+   index.ts:11-15）；rpi 用 reqwest 的 `is_connect`/`is_timeout` 分类（`LlamaError.
    connection`），并保留文案子串检查兜底。
 6. **`/login` api-key 通路接线**（T13 遗留 stub 的补完，interactive-mode.ts:4888-5312）：
    - `Models::login`/`logout`（models.ts:431-452）与 `ModelRuntime::login`/`logout`
      （model-runtime.ts:503-514）移植；`Models::get_provider_auth(provider_id)` 补齐
      `getAuth` 的 string 重载臂（llama `configuredClient` 所需）。
-   - 「方法存在性」检查（上游 `method?.login`）无法直接表达——pir 的 `ApiKeyAuth::login`
+   - 「方法存在性」检查（上游 `method?.login`）无法直接表达——rpi 的 `ApiKeyAuth::login`
      有默认错误实现，故 trait 增加 `supports_login()`（默认 `false`，覆盖 `login` 的实现
      必须返回 `true`）。已核对全部覆盖 `login` 的实现（anthropic/cloudflare/helpers/
      bedrock/vertex/llama）均正确覆盖。
@@ -79,7 +79,7 @@ T15 扩展宿主就位后：迁移 `/llama` 到真正的扩展命令注册与 `c
 
 ## 终审补记（2026-08-07）
 
-- **HF 搜索缓存不跨进入存活**：上游 `searchCache` 挂在 view 实例上；pir 的缓存读自
+- **HF 搜索缓存不跨进入存活**：上游 `searchCache` 挂在 view 实例上；rpi 的缓存读自
   `state.content` 的 `Search` 变体，而进入搜索前 `show_models` 恒将 content 置为
   `Models`，故缓存实际每次为空——重复搜索会重新请求网络（行为正确，纯性能差异；
   独立抽查结论：无阻断/应修项，HF_TOKEN 仅进 Authorization header、删除/卸载均有
@@ -108,7 +108,7 @@ T15 扩展宿主就位后：迁移 `/llama` 到真正的扩展命令注册与 `c
 关闭条件兑现：llama.cpp 已迁移为经真扩展宿主加载的内置 hidden 扩展，
 本文件第 1/2/3 条描述的临时机制全部移除：
 
-1. `BUILT_IN_EXTENSION_COMMANDS` 直供表删除；`crates/pir/src/extensions/
+1. `BUILT_IN_EXTENSION_COMMANDS` 直供表删除；`crates/rpi/src/extensions/
    llama/mod.rs` 新增 `inline_extension()`——`Named { name: "llama.cpp",
    hidden: true }` 的内联扩展，factory 内经宿主 API
    `register_native_provider` + `register_command("llama")` 注册，两阶段

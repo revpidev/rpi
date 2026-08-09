@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-r"""Generate Rust Unicode tables for pir-tui utils.rs.
+r"""Generate Rust Unicode tables for rpi-tui utils.rs.
 
 Data sources — the GROUND TRUTH is the pinned upstream runtime's behavior:
 the regexes in utils.ts (`\p{Default_Ignorable_Code_Point}`, `\p{Mark}`,

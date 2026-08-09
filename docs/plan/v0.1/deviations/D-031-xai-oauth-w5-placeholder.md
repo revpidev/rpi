@@ -14,12 +14,12 @@
 ## 实际实现与偏离原因
 
 T13 波次划分把 6 个 OAuth 流程（含 xai）划给 W5（`docs/plan/v0.1/T13-providers-oauth.md`
-W5 行），W4 阶段 2 只移植工厂本体。因此 `pir-ai/src/providers/xai.rs`
+W5 行），W4 阶段 2 只移植工厂本体。因此 `rpi-ai/src/providers/xai.rs`
 的 `xai_provider()` 以 `ProviderAuth { api_key: Some(...), oauth: None }`
 落地：`ProviderAuth.oauth` 槽即 W5 接线点，文件头注释与
 `tests/providers_group_d.rs::xai_oauth_is_w5_scope_placeholder` 固化该占位。
 `lazyOAuth` 本身是为浏览器 bundle 分割存在的上游技巧（`auth/helpers.ts`
-端口注记已述），pir 为原生二进制，W5 直接构造 OAuth 实现填入即可（同 D-029
+端口注记已述），rpi 为原生二进制，W5 直接构造 OAuth 实现填入即可（同 D-029
 kimi-coding 的处置模式）。
 
 影响是阶段性的：W5 落地前 xai 仅支持 `XAI_API_KEY` api-key 登录，无
@@ -31,7 +31,7 @@ SuperGrok / X Premium 订阅 OAuth 入口。W5 完成后本偏离可关闭。
 
 ## 关闭说明（2026-08-06）
 
-T13 W5 已接线：`crates/pir-ai/src/auth/oauth/xai.rs` 移植上游 `xai.ts`
+T13 W5 已接线：`crates/rpi-ai/src/auth/oauth/xai.rs` 移植上游 `xai.ts`
 （RFC 8628 device code，refresh 不轮换时保留旧 token、缺 `expires_in` 默认
 1h、5 分钟过期前移，`toAuth` 为 api key），`providers/xai.rs` 的
 `ProviderAuth.oauth` 槽填入 `Some(xai_oauth())`；`load.ts` 对应物

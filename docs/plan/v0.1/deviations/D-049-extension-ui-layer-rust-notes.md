@@ -16,18 +16,18 @@
 
 1. **（行为级，ADR-0007）`ctx.ui.custom()` 声明式 v1 无交互回传**：上游
    `custom()` 挂载获得键盘焦点的交互组件，resolve 值为组件的
-   `done(result)`；pir 的 ComponentTree 是纯 JSON 描述符、无交互通道，
+   `done(result)`；rpi 的 ComponentTree 是纯 JSON 描述符、无交互通道，
    W4 实现为「树映射成 TUI 组件挂到 editor region 展示，随后立即 resolve
-   `undefined`」（`crates/pir/src/modes/interactive/interactive_mode/
+   `undefined`」（`crates/rpi/src/modes/interactive/interactive_mode/
    ui_bridge.rs:413-425` 注释）。需要交互回传的扩展（如 llama.cpp 的
    LlamaView）走原生 `UiBridge::as_any` downcast 口子（W7），不经过声明式
    协议。
-2. **ComponentTree schema v1 无 `row`**：pir-tui 无横向容器组件，v1 冻结为
+2. **ComponentTree schema v1 无 `row`**：rpi-tui 无横向容器组件，v1 冻结为
    `text / spacer / box / column` 四种节点（垂直堆叠）；横向组合出 v1 范围。
    未知 `type` 渲染为含 JSON 原文的 text 节点（fail-visible 不静默）
-   （`crates/pir-ext-host/src/types.rs:786-801`
+   （`crates/rpi-ext-host/src/types.rs:786-801`
    `COMPONENT_TREE_SCHEMA_V1` 注释；映射器
-   `pir::modes::interactive::component_tree`）。
+   `rpi::modes::interactive::component_tree`）。
 
 ## 影响面
 

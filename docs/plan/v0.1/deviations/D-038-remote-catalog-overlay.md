@@ -1,4 +1,4 @@
-# D-038：远程模型目录 overlay 与 Models::refresh Rust 落地差异（remote-catalog-provider / ModelsStore 完整化 / radius refreshModels / pir update --models）
+# D-038：远程模型目录 overlay 与 Models::refresh Rust 落地差异（remote-catalog-provider / ModelsStore 完整化 / radius refreshModels / rpi update --models）
 
 - **状态**：已回写
 - **关联任务**：T13（W6-C）
@@ -31,9 +31,9 @@
    「方法可选」；默认 `None` = 无动态 overlay，`Models::refresh` 先以不轮询的 probe
    调用判定（与上游 `refreshModels !== undefined` 过滤等价），非可刷新 provider 不
    做任何凭据解析（避免过期 OAuth 触发无谓刷新）。
-3. **`withRemoteCatalog` 落 `crates/pir/src/core/remote_catalog_provider.rs`**（按
-   §2.3 文件映射；上游在 coding-agent）。需要 `pir` 新增 `reqwest`/`httpdate`/`url`
-   依赖（workspace 基线已有版本）。UA 按 ADR-0001 命名为 `pir/{VERSION} ({os};
+3. **`withRemoteCatalog` 落 `crates/rpi/src/core/remote_catalog_provider.rs`**（按
+   §2.3 文件映射；上游在 coding-agent）。需要 `rpi` 新增 `reqwest`/`httpdate`/`url`
+   依赖（workspace 基线已有版本）。UA 按 ADR-0001 命名为 `rpi/{VERSION} ({os};
    rust; {arch})`——上游 `node/{version}` runtime 分量无对应物，以 `rust` 标记
    （`pi-user-agent.ts`）；其余头/URL/状态处理逐行对齐。
 4. **`parseCatalog` 丢弃 serde 不可表达条目**：上游按 `"id" in entry` 过滤后以
@@ -43,7 +43,7 @@
    refresh 路径统一 `map_err` 为 `ModelsError("model_source", …)`（上游对非
    `Error` rejection 同码包装）。
 6. **模型目录 `models-store.json` 损坏回退内存存储**：上游 `FileModelsStore` 惰性
-   构造、读时 `JSON.parse` 抛错进 refresh 错误集；pir `JsonFileModelsStore::load`
+   构造、读时 `JSON.parse` 抛错进 refresh 错误集；rpi `JsonFileModelsStore::load`
    急切加载，`ModelRuntime::create` 遇损坏文件 warn + 回退 `InMemoryModelsStore`
    （内部缓存文件，降级可接受）。
 7. **`ModelRuntime` 未注册内置 provider**：T10 边界（38 工厂运行时注册属后续波次），
@@ -53,12 +53,12 @@
    对齐 provider-composer.ts:475-478）。
 8. **`refresh()` 相关调用点语义**：`register_native_provider`/`register_provider`/
    `unregister_provider` 显式 `allow_network:false`（上游同）；`set_runtime_api_key`
-   默认 `model_network_enabled`（= `PIR_OFFLINE` 未设）；`update --models` 显式
-   `allow_network:true` 即使 `PIR_OFFLINE` 也强制拉取（上游 refreshModelCatalogs
+   默认 `model_network_enabled`（= `RPI_OFFLINE` 未设）；`update --models` 显式
+   `allow_network:true` 即使 `RPI_OFFLINE` 也强制拉取（上游 refreshModelCatalogs
    同）。
-9. **测试基建**：上游 `vi.spyOn(globalThis, "fetch")` → pir-ai 沿用既有 loopback
-   axum mock（radius），pir 侧手写 tokio TCP HTTP/1.1 脚本化响应服务器
-   （`MockCatalogServer`，避免给 pir 增 axum dev 依赖）。上游 `remote-catalog-provider
+9. **测试基建**：上游 `vi.spyOn(globalThis, "fetch")` → rpi-ai 沿用既有 loopback
+   axum mock（radius），rpi 侧手写 tokio TCP HTTP/1.1 脚本化响应服务器
+   （`MockCatalogServer`，避免给 rpi 增 axum dev 依赖）。上游 `remote-catalog-provider
    .test.ts` 六用例全部移植（键值目录 + UA/TTL/force、generatedAt 新旧、ETag 复验 +
    304、501 丢 etag、429 保留 etag + 重验、501 无 overlay）；另补 4h 常量断言、
    离线恢复、inflight 去重、abort 竞态、目录三形状、URL 编码等。

@@ -1,6 +1,6 @@
 # 任务门禁验收标准（Gates）
 
-> 本文档是 Pir 开发计划 v0.1 所有任务共用的门禁验收文档。
+> 本文档是 Rpi 开发计划 v0.1 所有任务共用的门禁验收文档。
 > 每个任务完成后，必须按本文档逐条验收并填写验收记录，方可标记为 `已完成`。
 > 任务特有验收标准在各任务文件的「门禁验收」一节，与本文档叠加生效。
 
@@ -34,14 +34,14 @@ cargo fmt --all -- --check
 cargo test --workspace
 ```
 
-- 全部通过；live 测试在未设 `PIR_LIVE_TEST=1` 时默认跳过且不得失败。
+- 全部通过；live 测试在未设 `RPI_LIVE_TEST=1` 时默认跳过且不得失败。
 - 任务新增的行为逻辑有对应测试；移植上游的测试意图用例命名与上游对应（编码规范 §12.2）。
 - 非 live 测试不得访问真实网络（faux provider）。
 
 ### G3 对拍门禁（行为类任务强制）
 
 - 涉及行为契约的任务（事件序、线格式、session JSONL、compaction、RPC、TUI 渲染）必须跑归一化 diff 对拍：
-  - fixtures 与归一化脚本来自 `pir-test-support` / `fixtures/`（T02 交付物）；
+  - fixtures 与归一化脚本来自 `rpi-test-support` / `fixtures/`（T02 交付物）；
   - 对拍结果（命令 + 输出摘要）附在任务验收记录中。
 - **逐条对拍级基准**（需求 §11.1）：`session-format.md`、`rpc.md`、`compaction.md`、`keybindings.md`、`tmux.md`/`terminal-setup.md`——涉及这些领域的任务须附「文档条目 → 测试锚点」映射表。
 - 纯基建 / 内部重构类任务若不触碰行为契约，需在验收记录中说明「G3 不适用」的理由。

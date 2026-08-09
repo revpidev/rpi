@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"019fb0ca-6399-735d-80e0-e87016b2b102","timestamp":"2026-07-30T02:11:21.625Z","cwd":"/tmp/pir-fixture-length-truncation-x00qXx/workspace"}
+{"type":"session","version":3,"id":"019fb0ca-6399-735d-80e0-e87016b2b102","timestamp":"2026-07-30T02:11:21.625Z","cwd":"/tmp/rpi-fixture-length-truncation-x00qXx/workspace"}
 {"type":"model_change","id":"38439df7","parentId":null,"timestamp":"2026-07-30T02:11:21.625Z","provider":"faux","modelId":"faux-1"}
 {"type":"thinking_level_change","id":"a35f710a","parentId":"38439df7","timestamp":"2026-07-30T02:11:21.625Z","thinkingLevel":"off"}
 {"type":"message","id":"f2fc2e31","parentId":"a35f710a","timestamp":"2026-07-30T02:11:21.626Z","message":{"role":"user","content":[{"type":"text","text":"Answer until you run out of tokens."}],"timestamp":1785377481626}}

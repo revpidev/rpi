@@ -16,7 +16,7 @@
 #      a read-only reference and must stay unmodified.)
 #   2. Run this script to re-vendor the resulting JSONs + .manifest.json.
 #   3. Re-run the catalog tests; update the pinned `generatedAt` expectation in
-#      crates/pir-ai/tests/model_catalog.rs.
+#      crates/rpi-ai/tests/model_catalog.rs.
 #
 # Usage: scripts/refresh-model-catalog.sh [upstream-data-dir]
 set -euo pipefail
@@ -24,7 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SRC="${1:-external/pi/packages/ai/src/providers/data}"
-DST="crates/pir-ai/src/providers/data"
+DST="crates/rpi-ai/src/providers/data"
 
 if [[ ! -f "$SRC/.manifest.json" ]]; then
     echo "error: $SRC/.manifest.json not found (upstream data dir?)" >&2
@@ -54,4 +54,4 @@ if bad:
 print(f"ok: {len(manifest['files'])} files match manifest sha256 (generatedAt {manifest['generatedAt']})")
 EOF
 
-echo "next: cargo test -p pir-ai --test model_catalog --test compat_matrix"
+echo "next: cargo test -p rpi-ai --test model_catalog --test compat_matrix"

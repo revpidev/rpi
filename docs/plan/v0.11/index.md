@@ -1,4 +1,4 @@
-# Pir 开发计划 v0.11 — 任务索引
+# Rpi 开发计划 v0.11 — 任务索引
 
 > 本计划基于 [`../../v0.11/01-requirements.md`](../../v0.11/01-requirements.md)、
 > [`../../v0.11/02-design.md`](../../v0.11/02-design.md) 制定，是 v0.1 计划（[`../v0.1/`](../v0.1/)）的增量升级计划。
@@ -27,18 +27,18 @@
 
 | ID | 任务 | 里程碑 | 依赖 | 状态 | 验收日期 |
 |----|------|--------|------|------|----------|
-| T17 | [pir-ai 消息类型与请求选项扩展](./T17-pir-ai-types.md) | M1 | — | 未开始 | |
+| T17 | [rpi-ai 消息类型与请求选项扩展](./T17-rpi-ai-types.md) | M1 | — | 未开始 | |
 | T18 | [JSON/RPC delta 线格式与 stdout 背压](./T18-json-rpc-delta.md) | M1 | T17 | 未开始 | |
 | T19 | [流终止语义与通用流修复](./T19-stream-termination.md) | M2 | T17 | 未开始 | |
 | T20 | [Provider 适配器修复与 compat 扩展](./T20-provider-fixes.md) | M2 | T17 | 未开始 | |
 | T21 | [Models refresh 事务化与 OAuth 行为](./T21-models-refresh-oauth.md) | M2 | T17 | 未开始 | |
-| T22 | [pir-agent 循环微行为与 compaction 契约](./T22-agent-loop-compaction.md) | M2 | T17 | 未开始 | |
+| T22 | [rpi-agent 循环微行为与 compaction 契约](./T22-agent-loop-compaction.md) | M2 | T17 | 未开始 | |
 | T23 | [主路径会话行为簇](./T23-session-behaviors.md) | M2 | T18、T19、T22 | 未开始 | |
 | T24 | [资源加载与包管理](./T24-resources-packages.md) | M2 | — | 未开始 | |
 | T25 | [auth 命令族](./T25-auth-commands.md) | M3 | T21 | 未开始 | |
 | T26 | [新 provider 与模型目录更新](./T26-new-providers.md) | M3 | T20、T21 | 未开始 | |
 | T27 | [扩展 API 面同步与 Wasm ABI 版本化](./T27-extension-api.md) | M3 | T21、T23 | 未开始 | |
-| T28 | [pir-tui 渲染器 trait 化与行为修正](./T28-tui-refactor.md) | M4 | T17 | 未开始 | |
+| T28 | [rpi-tui 渲染器 trait 化与行为修正](./T28-tui-refactor.md) | M4 | T17 | 未开始 | |
 | T29 | [LaTeX 与 Mermaid 渲染](./T29-latex-mermaid.md) | M4 | T28、T27 | 未开始 | |
 | T30 | [布局引擎](./T30-layout-engine.md) | M5 | T28 | 未开始 | |
 | T31 | [全屏渲染器](./T31-alt-screen.md) | M5 | T30 | 未开始 | |

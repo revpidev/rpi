@@ -1,4 +1,4 @@
-{"type":"session","version":3,"id":"019fc56d-00c1-7593-ad7d-feddbebd54e9","timestamp":"2026-08-03T02:21:23.009Z","cwd":"/tmp/pir-fixture-compaction-threshold-TrRW6D/workspace"}
+{"type":"session","version":3,"id":"019fc56d-00c1-7593-ad7d-feddbebd54e9","timestamp":"2026-08-03T02:21:23.009Z","cwd":"/tmp/rpi-fixture-compaction-threshold-TrRW6D/workspace"}
 {"type":"model_change","id":"d7643576","parentId":null,"timestamp":"2026-08-03T02:21:23.012Z","provider":"faux","modelId":"faux-1"}
 {"type":"thinking_level_change","id":"c33c8654","parentId":"d7643576","timestamp":"2026-08-03T02:21:23.012Z","thinkingLevel":"off"}
 {"type":"message","id":"23242f33","parentId":"c33c8654","timestamp":"2026-08-03T02:21:23.021Z","message":{"role":"user","content":[{"type":"text","text":"First question about the alpha topic."}],"timestamp":1785723683019}}

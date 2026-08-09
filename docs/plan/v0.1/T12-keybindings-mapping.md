@@ -1,25 +1,25 @@
 # T12 keybindings 逐条映射核对表
 
 > 基准：`external/pi/packages/coding-agent/docs/keybindings.md`（198 行，~80 动作）@ pi 0.82.1 (2efa728)。
-> 本地定义表：`crates/pir/src/core/keybindings.rs`（73 条 = 31 `tui.*` + 42 `app.*`，S4b 已全量核对默认键一致）。
+> 本地定义表：`crates/rpi/src/core/keybindings.rs`（73 条 = 31 `tui.*` + 42 `app.*`，S4b 已全量核对默认键一致）。
 > 接线状态列：**wired** = 已接线（T12-S5b）；**hook** = 挂点/提示；**internal** = 组件内部处理（S5a 选择器局部键）；**n/a** = 无默认绑定或平台不适用。
 
 ## tui.*（31 条，编辑器/输入/选择器内部处理 — internal）
 
 | id | 默认键 | 处理位置 |
 |---|---|---|
-| tui.editor.cursorUp / cursorDown / cursorLeft / cursorRight | up / down / left,ctrl+b / right,ctrl+f | pir-tui Editor（internal） |
-| tui.editor.cursorWordLeft / cursorWordRight | alt+left,ctrl+left,alt+b / alt+right,ctrl+right,alt+f | pir-tui Editor（internal） |
-| tui.editor.cursorLineStart / cursorLineEnd | home,ctrl+a / end,ctrl+e | pir-tui Editor（internal） |
-| tui.editor.jumpForward / jumpBackward | ctrl+] / ctrl+alt+] | pir-tui Editor（internal） |
-| tui.editor.pageUp / pageDown | pageUp / pageDown | pir-tui Editor（internal） |
-| tui.editor.deleteCharBackward / deleteCharForward | backspace / delete,ctrl+d | pir-tui Editor（internal） |
-| tui.editor.deleteWordBackward / deleteWordForward | ctrl+w,alt+backspace / alt+d,alt+delete | pir-tui Editor（internal） |
-| tui.editor.deleteToLineStart / deleteToLineEnd | ctrl+u / ctrl+k | pir-tui Editor（internal） |
-| tui.editor.yank / yankPop / undo | ctrl+y / alt+y / ctrl+- | pir-tui Editor（internal） |
-| tui.input.newLine / submit / tab | shift+enter,ctrl+j / enter / tab | pir-tui Editor（internal；submit → on_submit → 分发链） |
-| tui.input.copy | ctrl+c | pir-tui Editor（internal；编辑器非空时由 CustomEditor 的 app.clear 拦截，见下） |
-| tui.select.up / down / pageUp / pageDown / confirm / cancel | up / down / pageUp / pageDown / enter / escape,ctrl+c | pir-tui SelectList + 各选择器 handle_input（internal） |
+| tui.editor.cursorUp / cursorDown / cursorLeft / cursorRight | up / down / left,ctrl+b / right,ctrl+f | rpi-tui Editor（internal） |
+| tui.editor.cursorWordLeft / cursorWordRight | alt+left,ctrl+left,alt+b / alt+right,ctrl+right,alt+f | rpi-tui Editor（internal） |
+| tui.editor.cursorLineStart / cursorLineEnd | home,ctrl+a / end,ctrl+e | rpi-tui Editor（internal） |
+| tui.editor.jumpForward / jumpBackward | ctrl+] / ctrl+alt+] | rpi-tui Editor（internal） |
+| tui.editor.pageUp / pageDown | pageUp / pageDown | rpi-tui Editor（internal） |
+| tui.editor.deleteCharBackward / deleteCharForward | backspace / delete,ctrl+d | rpi-tui Editor（internal） |
+| tui.editor.deleteWordBackward / deleteWordForward | ctrl+w,alt+backspace / alt+d,alt+delete | rpi-tui Editor（internal） |
+| tui.editor.deleteToLineStart / deleteToLineEnd | ctrl+u / ctrl+k | rpi-tui Editor（internal） |
+| tui.editor.yank / yankPop / undo | ctrl+y / alt+y / ctrl+- | rpi-tui Editor（internal） |
+| tui.input.newLine / submit / tab | shift+enter,ctrl+j / enter / tab | rpi-tui Editor（internal；submit → on_submit → 分发链） |
+| tui.input.copy | ctrl+c | rpi-tui Editor（internal；编辑器非空时由 CustomEditor 的 app.clear 拦截，见下） |
+| tui.select.up / down / pageUp / pageDown / confirm / cancel | up / down / pageUp / pageDown / enter / escape,ctrl+c | rpi-tui SelectList + 各选择器 handle_input（internal） |
 
 ## app.*（42 条）
 

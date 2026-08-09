@@ -14,12 +14,12 @@
 ## 实际实现与偏离原因
 
 T13 波次划分把 6 个 OAuth 流程（含 kimi-coding）划给 W5（`docs/plan/v0.1/T13-providers-oauth.md`
-W5 行），W4 阶段 2 只移植工厂本体。因此 `pir-ai/src/providers/kimi_coding.rs`
+W5 行），W4 阶段 2 只移植工厂本体。因此 `rpi-ai/src/providers/kimi_coding.rs`
 的 `kimi_coding_provider()` 以 `ProviderAuth { api_key: Some(...), oauth: None }`
 落地：`ProviderAuth.oauth` 槽即 W5 接线点，文件头注释与
 `tests/providers_group_c.rs::kimi_coding_oauth_slot_awaits_w5` 固化该占位。
 `lazyOAuth` 本身是为浏览器 bundle 分割存在的上游技巧（`auth/helpers.ts`
-端口注记已述），pir 为原生二进制，W5 直接构造 OAuth 实现填入即可。
+端口注记已述），rpi 为原生二进制，W5 直接构造 OAuth 实现填入即可。
 
 影响是阶段性的：W5 落地前 kimi-coding 仅支持 `KIMI_API_KEY` api-key 登录，
 无订阅 OAuth 入口。W5 完成后本偏离可关闭。
@@ -30,7 +30,7 @@ W5 行），W4 阶段 2 只移植工厂本体。因此 `pir-ai/src/providers/kim
 
 ## 关闭说明（2026-08-06）
 
-T13 W5 已接线：`crates/pir-ai/src/auth/oauth/kimi_coding.rs` 移植上游
+T13 W5 已接线：`crates/rpi-ai/src/auth/oauth/kimi_coding.rs` 移植上游
 `kimi-coding.ts`（RFC 8628 device code，`KIMI_CODE_OAUTH_HOST` /
 `KIMI_OAUTH_HOST` 环境覆盖，refresh 指数退避重试 ≤3 次，`toAuth` 为 Bearer
 头），`providers/kimi_coding.rs` 的 `ProviderAuth.oauth` 槽填入

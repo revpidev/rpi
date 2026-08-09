@@ -13,7 +13,7 @@
 
 ## 实际实现与偏离原因
 
-实现为 `pir_ai::models::ProviderStreams`：`fn stream(...) -> AssistantMessageEventStream`
+实现为 `rpi_ai::models::ProviderStreams`：`fn stream(...) -> AssistantMessageEventStream`
 与 `fn stream_simple(...) -> AssistantMessageEventStream` 两个同步方法，直接返回推送式
 事件流句柄（对齐上游 `StreamFunction` 签名——上游 stream 同样不是 async fn，而是立即
 返回 `AssistantMessageEventStream` 后在后台驱动 I/O）。async-trait + boxed stream

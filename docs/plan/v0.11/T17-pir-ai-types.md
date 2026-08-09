@@ -1,4 +1,4 @@
-# T17：pir-ai 消息类型与请求选项扩展
+# T17：rpi-ai 消息类型与请求选项扩展
 
 - **状态**：未开始
 - **里程碑**：M1
@@ -11,7 +11,7 @@
 
 ## 目标
 
-把上游 v0.84 的消息/工具调用/选项类型扩展同步进 pir-ai 与 pir-agent 的序列化契约，
+把上游 v0.84 的消息/工具调用/选项类型扩展同步进 rpi-ai 与 rpi-agent 的序列化契约，
 为 M1–M3 所有后续任务解锁类型基础。**只加字段与类型，不改任何运行时行为。**
 
 ## 范围
@@ -25,7 +25,7 @@
 - `OAuthAuth` 新增 `is_subscription` 元数据字段
 - `StreamOptions` 拆分为 `ProviderRequestOptions`（取消令牌/telemetry_context 占位/api_key/自定义 fetch 通道/headers/timeout/retry）+ `StreamOptions`（R2.8.1）；`telemetry_context` 仅占位，不实现管线（G4 红线）
 - proxy `toolcall_end` 事件帧携带完整 `ToolCall` 对象并合并回 partial（R4.1.4，`02bd2d1c6`）
-- pir-ext-sdk/host 的对应类型同步（仅类型面；行为接线属 T27）
+- rpi-ext-sdk/host 的对应类型同步（仅类型面；行为接线属 T27）
 
 ### Out
 
@@ -61,7 +61,7 @@
 
 任务特有标准：
 
-- [ ] 上游 `types.ts` @ `4181f66` 的字段清单 → pir 类型「逐字段映射表」附验收记录
+- [ ] 上游 `types.ts` @ `4181f66` 的字段清单 → rpi 类型「逐字段映射表」附验收记录
 - [ ] 既有测试零失败、零期望修改（本任务不应改变任何行为）
 
 ## 偏离记录

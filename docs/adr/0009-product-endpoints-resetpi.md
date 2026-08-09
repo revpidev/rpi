@@ -8,7 +8,7 @@
 
 ## 背景
 
-pir 的 5 个产品端点默认值全部指向上游 `pi.dev`（earendil-works/pi 运营）：
+rpi 的 5 个产品端点默认值全部指向上游 `pi.dev`（earendil-works/pi 运营）：
 
 | 端点 | 默认（改前） | 用途 |
 |---|---|---|
@@ -18,7 +18,7 @@ pir 的 5 个产品端点默认值全部指向上游 `pi.dev`（earendil-works/p
 | share viewer | `https://pi.dev/session/` | /share 输出链接 |
 | changelog | `https://pi.dev/changelog` | 更新横幅链接 |
 
-pir 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 迁移到 PIR_*），
+rpi 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 迁移到 RPI_*），
 把产品回调用在自托管域名上与原上游解耦：内容可控、统计归己、不受上游端点
 策略影响。端点自 T14（D-046）起已全部可配置（env > settings > 默认），本次
 只改默认值，覆盖链不变。
@@ -28,7 +28,7 @@ pir 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 
 5 个端点默认值改为 `resetpi.com`（`https://resetpi.com` 为 base），内容用
 **Cloudflare Pages 静态托管 + Pages Functions** 部署（`deploy/resetpi/`）：
 
-- 模型目录：37 个静态 JSON（构建脚本从 `crates/pir-ai/src/providers/data/*.json`
+- 模型目录：37 个静态 JSON（构建脚本从 `crates/rpi-ai/src/providers/data/*.json`
   生成，`{"models":[...]}` 平铺）；Pages 静态资产自带 ETag/Last-Modified，
   客户端 `If-None-Match` 4h revalidate 语义不变；未收录 provider 的 404 =
   "overlay 不可用"语义。
@@ -44,7 +44,7 @@ pir 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 
 ## 影响与回退
 
 - 影响面：4 个常量 + changelog 链接 + `--help` 文本 + 相关测试断言；
-  覆盖链（env/settings/`off`/`PIR_OFFLINE`）不变，旧配置的显式覆盖继续生效。
+  覆盖链（env/settings/`off`/`RPI_OFFLINE`）不变，旧配置的显式覆盖继续生效。
 - 与上游对拍：默认值不再与上游一致（行为级偏离，随 D-046 端点可配置性
   已有覆盖机制，不另立偏离表）。
-- 回退：恢复常量默认值或设置 `PIR_*_URL=https://pi.dev/...` 即可。
+- 回退：恢复常量默认值或设置 `RPI_*_URL=https://pi.dev/...` 即可。

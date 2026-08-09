@@ -63,7 +63,7 @@
 
 任务特有标准：
 
-- [ ] 上游 `rawStopReason` commit 链（7 个）与修复 commit（4 个）逐条有 pir 测试锚点
+- [ ] 上游 `rawStopReason` commit 链（7 个）与修复 commit（4 个）逐条有 rpi 测试锚点
 - [ ] 需求 R2.3/R2.4.5–R2.4.7 逐条核对表
 
 ## 偏离记录

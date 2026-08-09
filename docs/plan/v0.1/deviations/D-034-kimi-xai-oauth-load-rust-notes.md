@@ -18,8 +18,8 @@
 
 ## 实际实现与偏离原因
 
-两流程落 `pir-ai/src/auth/oauth/{kimi_coding,xai}.rs`（同 D-033 模式），
-`load.ts` 对应物落 `pir-ai/src/auth/oauth/load.rs`：
+两流程落 `rpi-ai/src/auth/oauth/{kimi_coding,xai}.rs`（同 D-033 模式），
+`load.ts` 对应物落 `rpi-ai/src/auth/oauth/load.rs`：
 
 - **测试缝**：上游 `vi.stubGlobal("fetch")` + `vi.stubEnv`；Rust 侧 kimi 为
   构造字段 `with_oauth_host`（env 覆盖链单独以 `EnvGuard` 单测钉住，避免进程级
@@ -41,7 +41,7 @@
   object|array 均保留原值用于错误回显（其余类型 → `null`）
 - kimi `DeviceAuthorization.verification_uri` 仅做信任校验、不存储（上游登录只
   上报 complete URI，字段在流内无用）
-- **`load.ts` 对应物**：pir 为静态链接，动态 import 无对应物，落
+- **`load.ts` 对应物**：rpi 为静态链接，动态 import 无对应物，落
   `auth/oauth/load.rs` registry 函数表——`OAuthFlowLoader` = 零参构造器函数
   指针，provider id → loader 表（`load_oauth_flow` 查找）+ 具名
   `loadXxxOAuth`（上游函数名保留）；带参的 radius 不入表（用

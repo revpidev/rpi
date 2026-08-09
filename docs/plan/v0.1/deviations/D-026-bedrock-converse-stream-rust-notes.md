@@ -18,7 +18,7 @@
 
 上游 `bedrock-converse-stream.ts` 委托 `@aws-sdk/client-bedrock-runtime` + `@smithy`，
 传输层在 TS 源码中不可考（来源空白，设计文档 §3.3）。本次按钉死版 node_modules 内的
-SDK 源码反推并落地于 `crates/pir-ai/src/api/bedrock_converse_stream.rs`（+ `api/bedrock/`
+SDK 源码反推并落地于 `crates/rpi-ai/src/api/bedrock_converse_stream.rs`（+ `api/bedrock/`
 子模块 `sigv4.rs` / `event_stream.rs`）。反推定案：
 
 - 请求线格式（`client-bedrock-runtime` schemas_0.js + `@smithy/core` HttpBindingProtocol +
@@ -40,8 +40,8 @@ SDK 源码反推并落地于 `crates/pir-ai/src/api/bedrock_converse_stream.rs`�
 1. **HTTP 层 reqwest 直连**：SDK 的 `amz-sdk-invocation-id` / `amz-sdk-request` /
    SDK `user-agent` 头不发送。
 2. **重试**：上游由 SDK standard 模式默认重试（2 次额外尝试，且不读 `maxRetries`）；
-   pir 走共享 `retry_provider_request`，`StreamOptions::max_retries` 未设置时同样
-   默认 2 次额外尝试（W7 审查补漏前默认 0）；显式设置 `max_retries` 时 pir 生效
+   rpi 走共享 `retry_provider_request`，`StreamOptions::max_retries` 未设置时同样
+   默认 2 次额外尝试（W7 审查补漏前默认 0）；显式设置 `max_retries` 时 rpi 生效
    而上游忽略——此为残留差异。
 2a. **错误文本**：非 2xx 响应的原始 body 经 `format_bedrock_error` 以
    `{status}: {body}` 形式 surfaced（对齐上游 `formatBedrockError` 经
@@ -53,20 +53,20 @@ SDK 源码反推并落地于 `crates/pir-ai/src/api/bedrock_converse_stream.rs`�
    仅为对齐上游形状而保留、不参与凭据解析。无可用 SigV4 凭据时报
    `Could not load credentials from any providers`。
 4. **region 兜底**：上游在「ambient AWS_PROFILE 且无显式 region」时把 region 交给 SDK
-   profile 链；pir 不读 profile 配置，回退 `us-east-1`（与上游非 Node 兜底分支一致）。
+   profile 链；rpi 不读 profile 配置，回退 `us-east-1`（与上游非 Node 兜底分支一致）。
    endpoint 推导由 SDK endpoint ruleset 收敛为
    `bedrock-runtime.{region}.amazonaws.com`（`cn-*` 为 `.amazonaws.com.cn`），
    FIPS/dualstack 变体不推导。
 5. **proxy / HTTP1 开关**：`resolveHttpProxyUrlForTarget` 代理 agent 与
    `AWS_BEDROCK_FORCE_HTTP1` 是 Node SDK request-handler 旋钮，未移植。
-6. **on_payload 形状**：与其他 pir 适配器一致，见 camelCase wire JSON；但保留 `modelId`
+6. **on_payload 形状**：与其他 rpi 适配器一致，见 camelCase wire JSON；但保留 `modelId`
    字段（对应 SDK command input），其被消费为 path label 后从 body 剥离——经
    `on_payload` 替换 `modelId` 的能力与上游一致。
-7. **图像块 base64 直通**：上游 `atob` 解码后 SDK 再编码（线上恒等）；pir 直接透传，
+7. **图像块 base64 直通**：上游 `atob` 解码后 SDK 再编码（线上恒等）；rpi 直接透传，
    非法 base64 变为服务端报错而非本地 `atob` 抛错。
-8. **`PI_CACHE_RETENTION` → `PIR_CACHE_RETENTION`**（沿用 D-021 钉死的 env 前缀约定），
+8. **`PI_CACHE_RETENTION` → `RPI_CACHE_RETENTION`**（沿用 D-021 钉死的 env 前缀约定），
    `resolve_cache_retention` 复用 anthropic 适配器同款 helper。
-9. **`bedrock-converse-stream.lazy.ts` 无对应物**（pir 适配器静态链接）。
+9. **`bedrock-converse-stream.lazy.ts` 无对应物**（rpi 适配器静态链接）。
 10. 新增依赖 `sha2` / `hmac`（手写 SigV4 的 HMAC-SHA256/SHA256，见
     `coding-standards.md` 附录 A 新增行）；event-stream 的 CRC32 为模块内自实现，未引 crate。
 

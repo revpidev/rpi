@@ -16,7 +16,7 @@
 
 1. **device code 时钟抽象**：`Date.now()` 改为单调时钟 `DeviceFlowClock` trait（生产 `TokioClock`），测试注入 FakeClock 替代 vitest 假定时器；轮询参数与三条文案逐字对齐。
 2. **测试缝**：`TOKEN_URL` / `CALLBACK_PORT` 由常量变为构造器字段（默认值逐字不变）——Rust 测试并行，串行绑真端口不可行；上游靠 mock fetch + 串行测试。`REDIRECT_URI` 常量保持逐字。
-3. **回调服务**：无 500 catch-all 分支（axum handler 无可失败操作）；anthropic 文案经 `CallbackPageCopy` 参数化传入（耦合层级与上游调用点一致）；host 覆盖变量为 `PIR_OAUTH_CALLBACK_HOST`（ADR-0001 §2 统一 `PIR_` 前缀，对应上游 `PI_OAUTH_CALLBACK_HOST`）。
+3. **回调服务**：无 500 catch-all 分支（axum handler 无可失败操作）；anthropic 文案经 `CallbackPageCopy` 参数化传入（耦合层级与上游调用点一致）；host 覆盖变量为 `RPI_OAUTH_CALLBACK_HOST`（ADR-0001 §2 统一 `RPI_` 前缀，对应上游 `PI_OAUTH_CALLBACK_HOST`）。
 4. **`formatErrorDetails` 近似**：reqwest 错误映射为 `TimeoutError|ConnectionError|Error: msg; cause=...`（沿 source 链），无 `errno`/`stack` 对应物。
 5. **token 响应 JSON 严格化**：`access_token`/`refresh_token`/`expires_in` 缺失即解析失败（上游 `JSON.parse`+cast 容忍成 `undefined`）；多余 `scope` 字段照常忽略。
 6. **竞速实现**：`tokio::select!` 替代 promise 图，settle 语义相同（任一落定即取消另一方）。

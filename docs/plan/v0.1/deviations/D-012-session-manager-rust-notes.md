@@ -14,10 +14,10 @@
 
 ## 实际实现与偏离原因
 
-T07 落地 `crates/pir/src/core/session_manager.rs`（行为）+ `crates/pir/src/config.rs`（路径模块）+ `crates/pir-ai/src/utils/uuid.rs`（id 生成）+ `crates/pir-agent/src/harness.rs`（SessionStorage trait 设计，T16 用）。与原文档/上游钉死版的差异逐项如下（任务书偏离表 T07-D1～D9 合并登记为本条）：
+T07 落地 `crates/rpi/src/core/session_manager.rs`（行为）+ `crates/rpi/src/config.rs`（路径模块）+ `crates/rpi-ai/src/utils/uuid.rs`（id 生成）+ `crates/rpi-agent/src/harness.rs`（SessionStorage trait 设计，T16 用）。与原文档/上游钉死版的差异逐项如下（任务书偏离表 T07-D1～D9 合并登记为本条）：
 
 1. **retainedTail 形态展开进 context**（任务书 T07-D1）：compaction 转 context 消息时，`retainedTail` 形态展开为保留消息——采用上游自有基准文档 `docs/session-format.md`:327-342（"acts as a self-contained checkpoint"）与 harness `session.ts:123-127` 的行为；coding-agent 钉死版 `session-manager.ts` 的 `buildContextEntries` 只认 `firstKeptEntryId`，不展开。**不定行为级的理由**：主路径只写 `firstKeptEntryId` 形态（写纪律未变），`retainedTail` 仅出现在 harness 产物中（ADR-0003 §1 已定读取兼容）；fixtures 对拍语料无 compaction 条目，对拍契约不受影响。这是 D-001 单一来源化后 harness 形态必须选择一种读取语义时的自洽选择。
-2. **随机源自实现**（T07-D2）：不引 `rand`/`uuid` crate（附录 A 基线外），`pir-ai/src/utils/uuid.rs` 自实现 uuidv7（与上游 `uuid.ts` 逐字节同构：48bit 大端时间戳、版本/变体位、同 ms 序列自增）/ uuidv4 + xorshift64* 非安全 PRNG（时间+pid 播种，遵循 `provider_retry.rs` 先例）。id 仅为标识符非凭据，会话内唯一性由 100 次碰撞重试兜底。
+2. **随机源自实现**（T07-D2）：不引 `rand`/`uuid` crate（附录 A 基线外），`rpi-ai/src/utils/uuid.rs` 自实现 uuidv7（与上游 `uuid.ts` 逐字节同构：48bit 大端时间戳、版本/变体位、同 ms 序列自增）/ uuidv4 + xorshift64* 非安全 PRNG（时间+pid 播种，遵循 `provider_retry.rs` 先例）。id 仅为标识符非凭据，会话内唯一性由 100 次碰撞重试兜底。
 3. **字段级 serde 修正**（T07-D3）：`SessionHeader.cwd` 加 `#[serde(default)]`（古董 session 无 cwd）；`CustomMessageEntry.content` 加 `#[serde(default)]`（上游 `content ?? []`）。
 4. **范围裁剪**（T07-D4）：`list`/`listAll`（session 发现列举，/resume UI 用）留 T12；上游 >512MB 文件测试未移植（V8 string 上限无 Rust 对应，流式读已由扫描上限/畸形行测试覆盖）。
 5. **合法 JSON 非对象行加载即丢弃**（T07-D5）：如 `42`、`"s"`、`[...]` 行。上游 `JSON.parse` 成功即保留、迁移重写时写回；Rust typed 联合体无法表达，永久丢弃。仅影响人为损坏文件。

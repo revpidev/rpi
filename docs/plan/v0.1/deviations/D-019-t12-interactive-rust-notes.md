@@ -15,7 +15,7 @@
 
 （汇总型偏离：逐条收集自各模块头部注释的「Intentional differences」清单，均已在代码内登记。标注档位：**无行为差异** / **行为等价**（实现路径不同、观察行为一致）/ **已知差异**（影响面见条目）。）
 
-### pir-tui 组件层（S1-S3）
+### rpi-tui 组件层（S1-S3）
 
 | 条目 | 位置 | 档位 |
 |------|------|------|
@@ -39,7 +39,7 @@
 | 主题热重载用轮询 watcher（100ms，免 notify 依赖）替代 fs.watch | `theme_watcher.rs` | 行为等价（延迟 ≤100ms） |
 | git 分支 watcher 用 100ms 内容轮询 `.git/HEAD` 替代 fs.watch + 500ms 防抖；reftable watchers 与 WSL `watchFile` 回退未移植（轮询 HEAD 已涵盖分支切换；`commondir` 不解析因 reftable 未移植）；支持 worktree（`gitdir:` 文件） | `git_branch_watcher.rs` | 行为等价（延迟 ≤100ms；footer 分支随切换真正刷新，2026-08-06 接线） |
 | flushCompactionQueue `willRetry` 分支为死代码（compaction_end 的 willRetry 未传到 run loop），注释保留 | `interactive_mode.rs` | 已知差异（retry 轮冲刷未接线；无认领任务，v0.1 内挂起） |
-| 首启 setup 判定 = `PIR_EXPERIMENTAL=1` + 无全局 settings.json（上游文件存在语义）；挂在 runtime 创建之后 | `startup_ui.rs` | 已知差异（时序与判定口径，上游 main.ts 之前） |
+| 首启 setup 判定 = `RPI_EXPERIMENTAL=1` + 无全局 settings.json（上游文件存在语义）；挂在 runtime 创建之后 | `startup_ui.rs` | 已知差异（时序与判定口径，上游 main.ts 之前） |
 | ~~会话切换（/new /resume /import）不重订阅 session 事件~~ | `commands_selectors.rs` | **已修复（2026-08-06）**：`InteractiveUi.session` 改 `RwLock` 可替换，`rebind_session_ui`（对上游 `rebindCurrentSession`，interactive-mode.ts:1732-1758）做全量 rebind——注销旧订阅、换 session、`apply_runtime_settings`、清容器、`render_initial_messages`、重新订阅；/new、/resume、/clone、/fork、/import 全走此路径 |
 | `--resume` CLI 走独立启动选择器 `cli/session_picker.rs`（对齐上游 main.ts:321-333 + cli/session-picker.ts；取消时打印 "No session selected" 并 exit 0），而非 T12 原设计细化的「--resume 分支接模式内选择器」挂载点 | `cli/session_picker.rs` + `app.rs` | 行为等价（实现路径不同：picker 在 session manager 创建前独立起 TUI，与上游一致） |
 | OutputPad 设置热应用：streaming 中只就地更新活动 streaming 组件，历史 chat child 保持旧 padding（无组件 downcast，无法走上游 `chatContainer.children` 遍历，interactive-mode.ts:4274-4282）；非 streaming 时 rebuild | `commands_selectors.rs` | 已知差异（streaming 中历史消息 padding 不更新） |

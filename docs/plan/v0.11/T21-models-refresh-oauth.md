@@ -28,7 +28,7 @@ Models refresh 重构为「两阶段 + generation 守卫 + 事务化发布」，
 
 ### Out
 
-- `pir auth check`/`print-api-key` CLI 接线（T25）
+- `rpi auth check`/`print-api-key` CLI 接线（T25）
 - ModelRuntime 可用性刷新代际序列化（coding-agent 侧，T23）
 - 扩展 `refreshModels` context 的 ABI 面（T27）
 - llama 扩展按新 context 重写（T27 随 ABI 一并）
@@ -36,7 +36,7 @@ Models refresh 重构为「两阶段 + generation 守卫 + 事务化发布」，
 ## 开发要点
 
 - 时序是行为契约：「restore 先于 auth 解析」「发布按 provider 串行」用确定性测试锁死（上游 `models-runtime.test.ts` +478 行是蓝本）
-- pir 无 AbortSignal，统一用 `CancellationToken`；注意「必选」语义的类型表达（按值接收而非 Option）
+- rpi 无 AbortSignal，统一用 `CancellationToken`；注意「必选」语义的类型表达（按值接收而非 Option）
 - 15s 超时与调用方取消的组合：`tokio::select!` 语义对齐 `AbortSignal.any`
 
 ## 进度跟踪
@@ -61,7 +61,7 @@ Models refresh 重构为「两阶段 + generation 守卫 + 事务化发布」，
 
 任务特有标准：
 
-- [ ] `RefreshModelsContext` 新旧 API 对照表（上游 CHANGELOG before/after → pir 等价）
+- [ ] `RefreshModelsContext` 新旧 API 对照表（上游 CHANGELOG before/after → rpi 等价）
 - [ ] auth 操作取消令牌全覆盖清单（上游接口清单逐条核对）
 
 ## 偏离记录

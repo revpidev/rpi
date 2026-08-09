@@ -1,4 +1,4 @@
-# T04：pir-ai Auth 基础
+# T04：rpi-ai Auth 基础
 
 - **状态**：已完成
 - **里程碑**：M1
@@ -51,7 +51,7 @@ T03 已交付：`resolve_provider_auth` 解析链（显式 key → store 命中�
 `options.env` 覆盖、anthropic-messages 适配器侧的 Claude Code 伪装头与
 `to/from_claude_code_name` 工具名映射。本任务在其上补齐：
 
-模块划分（均在 `pir-ai`，文件名镜像上游，无 `mod.rs`）：
+模块划分（均在 `rpi-ai`，文件名镜像上游，无 `mod.rs`）：
 
 - `auth/config_value.rs` — 移植 `packages/coding-agent/src/core/resolve-config-value.ts`：
   `!cmd`（`/bin/sh -c`，10s 超时，stdout trim，空/失败 → `None`，进程级结果缓存）、
@@ -63,7 +63,7 @@ T03 已交付：`resolve_provider_auth` 解析链（显式 key → store 命中�
   父目录 0700、`fs2` 跨进程排他锁（10 次指数回退重试 100ms→10s，对齐 proper-lockfile
   retries；stale 检测 fs2 无对应物，编码规范 §9.2 已钉死 fs2，不算偏离）、进程内按
   provider 互斥串行、内存快照（reload 失败保留旧快照）、`read()` 对 `api_key.key`
-  跑 DSL 解析、`list()` 只读元数据绝不执行 `!cmd`。默认路径解析（`~/.pir/agent/auth.json`）
+  跑 DSL 解析、`list()` 只读元数据绝不执行 `!cmd`。默认路径解析（`~/.rpi/agent/auth.json`）
   属统一路径模块（T09），本任务 store 仅接受显式路径。
 - `auth/env_keys.rs` — 移植 `env-api-keys.ts`：静态 env 映射表整表数据级移植（T13 复用）
   + anthropic 三变量特例；`find_env_keys` / `get_env_api_key`；vertex ADC / bedrock
@@ -79,8 +79,8 @@ T03 已交付：`resolve_provider_auth` 解析链（显式 key → store 命中�
   优先用服务端 interval 否则 +5s、下限 1s、WSL 时钟漂移文案逐字、`CancellationToken`
   取消文案 "Login cancelled"。
 - `auth/oauth/callback_page.rs` — `oauth-page.ts` HTML 逐字移植 + axum 一次性回调服务
-  （`127.0.0.1:53692/callback`；host 可由 `PIR_OAUTH_CALLBACK_HOST` 覆盖——ADR-0001 §2
-  统一 `PIR_` 前缀，非偏离）；404/400/state mismatch/成功四种响应与上游一致。
+  （`127.0.0.1:53692/callback`；host 可由 `RPI_OAUTH_CALLBACK_HOST` 覆盖——ADR-0001 §2
+  统一 `RPI_` 前缀，非偏离）；404/400/state mismatch/成功四种响应与上游一致。
 - `auth/oauth/anthropic.rs` — 移植 `auth/oauth/anthropic.ts`：常量逐字（CLIENT_ID 为
   base64 串解码、AUTHORIZE_URL/TOKEN_URL/CALLBACK_PORT 53692/SCOPES）、`state=verifier`、
   `expires = now + expires_in*1000 - 5min`、manual_code 与回调竞速（回调赢则取消

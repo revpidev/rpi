@@ -29,7 +29,7 @@
   - OAuth `refresh_token(credentials, token)` 取消令牌必选 + `is_subscription`
   - 工具 system prompt 贡献常量外露（bash/find/edit/read/write/grep/ls 各一）
 - `ResourceLoader` 新方法（T24 落地）的扩展面暴露
-- 内置 llama 扩展按新 `refreshModels` context 重写（上游 `extensions/llama/provider.ts` 已迁，pir 同步）
+- 内置 llama 扩展按新 `refreshModels` context 重写（上游 `extensions/llama/provider.ts` 已迁，rpi 同步）
 - 类型面同步：TUI 相关类型（`TuiMainScreen` 等）待 T28 后接线，本任务预留 SDK 类型占位
 
 ### Out

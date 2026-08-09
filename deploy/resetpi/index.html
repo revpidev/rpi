@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pir — 源于 Pi 的 Rust coding agent</title>
-  <meta name="description" content="Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
+  <title>Rpi — 源于 Pi 的 Rust coding agent</title>
+  <meta name="description" content="Rpi 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
   <style>
     :root {
       --bg: #0d1117;
@@ -300,7 +300,7 @@
 <header>
   <div class="container nav">
     <a class="brand" href="/">
-      <span class="logo">P</span> Pir
+      <span class="logo">P</span> Rpi
     </a>
     <nav class="nav-links">
       <a href="#features">特性</a>
@@ -308,7 +308,7 @@
       <a href="#endpoints">端点</a>
       <a href="/changelog">Changelog</a>
       <!-- TODO: 填写仓库地址后启用
-      <a href="https://github.com/your-org/pir">GitHub</a>
+      <a href="https://github.com/your-org/rpi">GitHub</a>
       -->
       <a href="#docs">文档</a>
     </nav>
@@ -322,7 +322,7 @@
     <div class="container">
       <h1>源于 Pi 的<br><span class="accent">Rust coding agent</span></h1>
       <p class="tagline">
-        Pir 源于 <a href="https://github.com/earendil-works/pi">Pi</a>，
+        Rpi 源于 <a href="https://github.com/earendil-works/pi">Pi</a>，
         用 Rust 完整移植的终端 AI 编程搭档：自带 TUI、工具执行、扩展宿主与 38 个内置 provider。
       </p>
       <div class="badges">
@@ -341,11 +341,11 @@
       <div class="terminal" aria-hidden="false">
         <div class="terminal-bar">
           <span class="t-dot"></span><span class="t-dot"></span><span class="t-dot"></span>
-          <span class="t-title">pir — ~/develop/ai/pir</span>
+          <span class="t-title">rpi — ~/develop/ai/rpi</span>
         </div>
         <div class="terminal-body" id="demo">
           <div class="t-line t-hidden"><span class="t-prompt t-user">ls crates/</span></div>
-          <div class="t-line t-hidden"><span class="t-dim">pir&nbsp;&nbsp;&nbsp;pir-agent&nbsp;&nbsp;&nbsp;pir-ai&nbsp;&nbsp;&nbsp;pir-tui&nbsp;&nbsp;&nbsp;pir-ext-host</span></div>
+          <div class="t-line t-hidden"><span class="t-dim">rpi&nbsp;&nbsp;&nbsp;rpi-agent&nbsp;&nbsp;&nbsp;rpi-ai&nbsp;&nbsp;&nbsp;rpi-tui&nbsp;&nbsp;&nbsp;rpi-ext-host</span></div>
           <div class="t-line t-hidden"><span class="t-prompt t-user">分析一下本机的 CPU 和内存配置</span></div>
           <div class="t-line t-hidden t-thinking"><span class="t-purple">⠋ thinking…</span> <span class="t-dim">(level: high · 12s)</span></div>
           <div class="t-line t-hidden"><span class="t-blue">bash</span><span class="t-dim"> — </span>lscpu | grep -E 'Model name|Socket' &amp;&amp; free -h</div>
@@ -362,12 +362,12 @@
   <!-- ================= Features ================= -->
   <section class="features" id="features">
     <div class="container">
-      <h2>为什么是 Pir</h2>
-      <p class="lead">Pir 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：继承其交互形态与扩展模型，四层 crate 清晰拆分，独立演进。</p>
+      <h2>为什么是 Rpi</h2>
+      <p class="lead">Rpi 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：继承其交互形态与扩展模型，四层 crate 清晰拆分，独立演进。</p>
       <div class="grid">
         <div class="card">
           <h3><span class="icon">🧩</span> 四层 crate 架构</h3>
-          <p><code>pir-ai</code> provider/适配层 · <code>pir-agent</code> agent 循环与 harness · <code>pir-tui</code> 终端渲染 · <code>pir</code> 组装与 CLI。职责清晰，可独立复用。</p>
+          <p><code>rpi-ai</code> provider/适配层 · <code>rpi-agent</code> agent 循环与 harness · <code>rpi-tui</code> 终端渲染 · <code>rpi</code> 组装与 CLI。职责清晰，可独立复用。</p>
         </div>
         <div class="card">
           <h3><span class="icon">🔌</span> 扩展宿主</h3>
@@ -383,7 +383,7 @@
         </div>
         <div class="card">
           <h3><span class="icon">🔒</span> 隐私优先</h3>
-          <p>全部产品端点自托管（本站即部署源）且可逐项关闭：<code>PIR_MODEL_CATALOG_URL</code>、<code>PIR_VERSION_CHECK_URL</code>、<code>PIR_TELEMETRY_URL</code> 设 <code>off</code> 即零请求；telemetry payload 仅版本号。</p>
+          <p>全部产品端点自托管（本站即部署源）且可逐项关闭：<code>RPI_MODEL_CATALOG_URL</code>、<code>RPI_VERSION_CHECK_URL</code>、<code>RPI_TELEMETRY_URL</code> 设 <code>off</code> 即零请求；telemetry payload 仅版本号。</p>
         </div>
         <div class="card">
           <h3><span class="icon">🌱</span> 项目来源</h3>
@@ -402,14 +402,14 @@
         <div>
           <div class="step">
             <h3><span class="num">1</span>构建</h3>
-            <pre><code>git clone &lt;your-repo-url&gt; pir &amp;&amp; cd pir
+            <pre><code>git clone &lt;your-repo-url&gt; rpi &amp;&amp; cd rpi
 cargo build --release
-./target/release/pir</code></pre>
+./target/release/rpi</code></pre>
           </div>
           <div class="step">
             <h3><span class="num">2</span>配置 provider</h3>
             <pre><code># 官方 38 个 provider 已内置，只需写自定义/覆盖：
-# ~/.pir/agent/models.json（可选）
+# ~/.rpi/agent/models.json（可选）
 {"providers": {"deepseek": {
   "apiKey": "DEEPSEEK_API_KEY",
   "models": [{"id": "deepseek-v4-flash"}]}}}</code></pre>
@@ -419,15 +419,15 @@ cargo build --release
           <div class="step">
             <h3><span class="num">3</span>端点自托管（可选）</h3>
             <pre><code># 默认已指向本站；自建请见 deploy/resetpi/
-export PIR_MODEL_CATALOG_URL=https://resetpi.com
-export PIR_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
-export PIR_TELEMETRY_URL=https://resetpi.com/api/report-install</code></pre>
+export RPI_MODEL_CATALOG_URL=https://resetpi.com
+export RPI_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
+export RPI_TELEMETRY_URL=https://resetpi.com/api/report-install</code></pre>
           </div>
           <div class="step">
             <h3><span class="num">4</span>开始使用</h3>
-            <pre><code>pir                     # 交互模式
-pir --print "重构这个函数"  # headless 一次问答
-pir --rpc               # RPC 服务（32 命令）</code></pre>
+            <pre><code>rpi                     # 交互模式
+rpi --print "重构这个函数"  # headless 一次问答
+rpi --rpc               # RPC 服务（32 命令）</code></pre>
           </div>
         </div>
       </div>
@@ -438,7 +438,7 @@ pir --rpc               # RPC 服务（32 命令）</code></pre>
   <section class="endpoints" id="endpoints">
     <div class="container">
       <h2>产品端点</h2>
-      <p class="lead">本站托管 pir 的全部产品回调；静态托管 + Pages Functions，无后端。每个端点均可在客户端用 <code>PIR_*</code> 环境变量或 <code>settings.json</code> 覆盖或关闭。</p>
+      <p class="lead">本站托管 rpi 的全部产品回调；静态托管 + Pages Functions，无后端。每个端点均可在客户端用 <code>RPI_*</code> 环境变量或 <code>settings.json</code> 覆盖或关闭。</p>
       <table>
         <thead>
           <tr><th>端点</th><th>用途</th><th>状态</th></tr>
@@ -515,11 +515,11 @@ pir --rpc               # RPC 服务（32 命令）</code></pre>
 <footer>
   <div class="container">
     <div>
-      <strong style="color: var(--text)">Pir</strong> · 用 Rust 复刻的 Pi coding agent
+      <strong style="color: var(--text)">Rpi</strong> · 用 Rust 复刻的 Pi coding agent
     </div>
     <div>
       <a href="/changelog">Changelog</a> · <a href="#endpoints">Endpoints</a> ·
-      <!-- TODO: 填写仓库地址后启用 <a href="https://github.com/your-org/pir">GitHub</a> · -->
+      <!-- TODO: 填写仓库地址后启用 <a href="https://github.com/your-org/rpi">GitHub</a> · -->
       <span>MIT License</span> · 上游致谢 <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>
     </div>
   </div>

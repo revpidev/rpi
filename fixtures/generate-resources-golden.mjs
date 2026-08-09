@@ -29,14 +29,14 @@
  *     multi-level tree (global agentDir + project config + settings paths +
  *     CLI paths + ancestor `.agents/skills` + git-repo boundary). The tree
  *     is copied to a temp dir; `repo/.git` (untrackable) and the `.pi` twin
- *     of `.pir` (upstream reads `.pi`, pir reads `.pir` — requirements §1.4)
+ *     of `.rpi` (upstream reads `.pi`, rpi reads `.rpi` — requirements §1.4)
  *     are created by the script; the Rust test repeats the same prep.
  *
  * Absolute paths in goldens are rewritten to `<path>` at generation time
- * (the pir-test-support Normalizer path placeholder); the Rust side applies
+ * (the rpi-test-support Normalizer path placeholder); the Rust side applies
  * `Normalizer::with_path(root)` for the same rewrite before diffing.
  *
- * The Rust side (crates/pir/tests/parity_resources_test.rs) replays every
+ * The Rust side (crates/rpi/tests/parity_resources_test.rs) replays every
  * case — do not edit the outputs by hand; regenerate with:
  *
  *   node fixtures/generate-resources-golden.mjs
@@ -76,15 +76,15 @@ function stripRoot(value, root) {
 }
 
 /**
- * Canonicalize the intentional `.pi` → `.pir` rename (requirements §1.4,
- * ADR-0001) in path strings: upstream discovers `cwd/.pi`, pir discovers
- * `cwd/.pir`; goldens are recorded in the pir spelling so the Rust side
+ * Canonicalize the intentional `.pi` → `.rpi` rename (requirements §1.4,
+ * ADR-0001) in path strings: upstream discovers `cwd/.pi`, rpi discovers
+ * `cwd/.rpi`; goldens are recorded in the rpi spelling so the Rust side
  * needs no per-test compensation. Only path-segment occurrences are
  * rewritten (`/.pi/` or a trailing `/.pi`).
  */
 function renamePiConfigDir(value) {
 	if (typeof value === "string") {
-		return value.replace(/\/\.pi(?=\/|$)/g, "/.pir");
+		return value.replace(/\/\.pi(?=\/|$)/g, "/.rpi");
 	}
 	if (Array.isArray(value)) {
 		return value.map((v) => renamePiConfigDir(v));
@@ -341,7 +341,7 @@ const THEME_CASES = [
 ];
 
 function generateThemes() {
-	const root = mkdtempSync(join(tmpdir(), "pir-golden-themes-"));
+	const root = mkdtempSync(join(tmpdir(), "rpi-golden-themes-"));
 	try {
 		const cases = [];
 		for (const c of THEME_CASES) {
@@ -512,13 +512,13 @@ function generateSettings() {
 
 /**
  * Prepare a runnable copy of the committed input tree (mirrored by the Rust
- * test): copy to `dest`, duplicate every `.pir` dir as `.pi` (upstream reads
- * `.pi`, pir reads `.pir`), create the untrackable `repo/.git` marker.
+ * test): copy to `dest`, duplicate every `.rpi` dir as `.pi` (upstream reads
+ * `.pi`, rpi reads `.rpi`), create the untrackable `repo/.git` marker.
  */
 function prepareE2eTree(inputRoot, dest) {
 	cpSync(inputRoot, dest, { recursive: true });
 	for (const dir of ["repo", join("repo", "sub")]) {
-		const pirDir = join(dest, dir, ".pir");
+		const pirDir = join(dest, dir, ".rpi");
 		if (existsSync(pirDir)) {
 			cpSync(pirDir, join(dest, dir, ".pi"), { recursive: true });
 		}
@@ -528,7 +528,7 @@ function prepareE2eTree(inputRoot, dest) {
 
 async function generateResourceLoaderE2e() {
 	const inputRoot = join(resourcesDir, "resource-loader-e2e", "input");
-	const root = mkdtempSync(join(tmpdir(), "pir-golden-e2e-"));
+	const root = mkdtempSync(join(tmpdir(), "rpi-golden-e2e-"));
 	try {
 		prepareE2eTree(inputRoot, root);
 		const cwd = join(root, "repo", "sub");

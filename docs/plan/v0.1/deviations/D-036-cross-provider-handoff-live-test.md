@@ -11,7 +11,7 @@
 
 ## 实际实现与偏离原因
 
-上游 `packages/ai/test/cross-provider-handoff.test.ts` 是 live 测试：`describe.skipIf(!hasAnyApiKey())`，须用真实 provider API keys 在 `beforeAll` 中为每个 provider/model 生成 context（真实 tool call id 与 thinking 块），再交叉拼接喂给目标 provider 断言成功。pir 不移植该 live 测试，其意图（一个 provider/model 生成的上下文可被另一 provider 消费：tool call id 格式、thinking 块转换、消息格式兼容）由以下纯函数测试覆盖：
+上游 `packages/ai/test/cross-provider-handoff.test.ts` 是 live 测试：`describe.skipIf(!hasAnyApiKey())`，须用真实 provider API keys 在 `beforeAll` 中为每个 provider/model 生成 context（真实 tool call id 与 thinking 块），再交叉拼接喂给目标 provider 断言成功。rpi 不移植该 live 测试，其意图（一个 provider/model 生成的上下文可被另一 provider 消费：tool call id 格式、thinking 块转换、消息格式兼容）由以下纯函数测试覆盖：
 
 - `utils/transform_messages.rs` 全规则：非 vision 图片占位符、thinking 跨模型转文本、redacted 丢弃、thoughtSignature 剥离、toolCallId 归一 + toolResult 回填、孤儿 tool call 合成 error 结果、error/aborted 消息不回放、多调用仅缺结果者合成
 - 六个适配器的 normalize 回调：anthropic / bedrock `[^a-zA-Z0-9_-]→_` + 64 上限、google 按模型条件化、mistral 专用 normalizer、openai-completions pipe 拆分 + 40 上限 + shortHash 回填、openai-responses pipe 拆分 + `fc_` 前缀 + shortHash

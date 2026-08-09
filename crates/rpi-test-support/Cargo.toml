@@ -1,0 +1,16 @@
+[package]
+name = "rpi-test-support"
+description = "Test infrastructure: faux provider, golden JSONL fixtures, normalize/diff, VT helpers (dev-dependency only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rpi-ai.workspace = true
+rpi-agent.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true

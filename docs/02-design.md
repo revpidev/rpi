@@ -1,4 +1,4 @@
-# Pir 架构设计文档
+# Rpi 架构设计文档
 
 > 目标：用 Rust workspace **同构复刻** Pi agent harness。
 > 对照版本：`external/pi` @ v0.82.1（`2efa728`）
@@ -15,24 +15,24 @@
 4. **行为金标准**：`external/pi` **钉死 commit 的代码**（非其设计文档——harness 层自述仍在硬化中）；禁止「自以为合理」的语义漂移。上游文档与代码冲突时以代码为准（已发现案例：`/skill:name` 参数追加格式）。
 5. **扩展解耦**：核心只依赖 `ExtensionHost` trait；实现为 **Rust + Wasm**（不做 JS 宿主）。见 [ADR-0001](./adr/0001-extension-and-config-dir.md)。
 6. **TUI 必达**：可并行先打通 headless/RPC 作对拍，但完整版本必须含 Interactive TUI（[ADR-0002](./adr/0002-baseline-decisions.md)）。
-7. **配置根目录**：全局 `~/.pir/agent`，项目 `.pir`（不读 `~/.pi`，不做迁移）。
+7. **配置根目录**：全局 `~/.rpi/agent`，项目 `.rpi`（不读 `~/.pi`，不做迁移）。
 8. **上游钉死**：`external/pi` @ `2efa728` / 0.82.1（见 [`UPSTREAM.md`](../UPSTREAM.md)）。
-9. **工具行为基准**：内置工具以 **coding-agent 实现**为对拍基准（ADR-0003 §2）；harness 自带工具工厂作为 `pir-agent` 可选层存在。
+9. **工具行为基准**：内置工具以 **coding-agent 实现**为对拍基准（ADR-0003 §2）；harness 自带工具工厂作为 `rpi-agent` 可选层存在。
 
 ---
 
 ## 2. Workspace 结构
 
 ```
-pir/
+rpi/
 ├── Cargo.toml                 # workspace
 ├── crates/
-│   ├── pir-ai/                # ↔ @earendil-works/pi-ai（纯库，无 bin；ADR-0003 §4）
-│   ├── pir-agent/             # ↔ @earendil-works/pi-agent-core（含 harness 层）
-│   ├── pir-tui/               # ↔ @earendil-works/pi-tui
-│   ├── pir/                   # ↔ @earendil-works/pi-coding-agent（bin + lib SDK）
-│   ├── pir-ext-host/          # Rust + Wasm 扩展宿主（无 JS）
-│   └── pir-test-support/      # faux provider、黄金 JSONL、VT 助手
+│   ├── rpi-ai/                # ↔ @earendil-works/pi-ai（纯库，无 bin；ADR-0003 §4）
+│   ├── rpi-agent/             # ↔ @earendil-works/pi-agent-core（含 harness 层）
+│   ├── rpi-tui/               # ↔ @earendil-works/pi-tui
+│   ├── rpi/                   # ↔ @earendil-works/pi-coding-agent（bin + lib SDK）
+│   ├── rpi-ext-host/          # Rust + Wasm 扩展宿主（无 JS）
+│   └── rpi-test-support/      # faux provider、黄金 JSONL、VT 助手
 ├── docs/
 ├── external/pi/               # 上游只读对照（git submodule）
 └── fixtures/                  # 从 Pi 导出的 session / RPC 样例
@@ -44,11 +44,11 @@ pir/
 
 ```mermaid
 flowchart TB
-  subgraph bins["pir binary"]
-    CLI[pir CLI]
+  subgraph bins["rpi binary"]
+    CLI[rpi CLI]
   end
 
-  subgraph coding["pir crate"]
+  subgraph coding["rpi crate"]
     Modes[modes: interactive/print/json/rpc]
     Session[AgentSession / Runtime]
     Resources[ResourceLoader]
@@ -56,26 +56,26 @@ flowchart TB
     Settings[Settings / Trust / Packages]
   end
 
-  subgraph core["pir-agent"]
+  subgraph core["rpi-agent"]
     Agent[Agent]
     Loop[agent_loop]
     Harness[harness: AgentHarness + SessionStorage]
   end
 
-  subgraph ai["pir-ai"]
+  subgraph ai["rpi-ai"]
     Models[Models + ModelsStore]
     Providers[Providers（38 工厂）]
     Api[Api adapters（10）]
     Auth[Auth / OAuth（7 flows）]
   end
 
-  subgraph tui["pir-tui"]
+  subgraph tui["rpi-tui"]
     Tui[Tui + Diff]
     Editor[Editor]
     Widgets[Markdown/Select/Image...]
   end
 
-  subgraph ext["pir-ext-host"]
+  subgraph ext["rpi-ext-host"]
     Host[Extension Host]
   end
 
@@ -98,7 +98,7 @@ flowchart TB
 
 ---
 
-## 3. `pir-ai` 设计
+## 3. `rpi-ai` 设计
 
 ### 3.1 职责
 
@@ -108,7 +108,7 @@ flowchart TB
 
 ```rust
 // 示意
-pub enum Role { User, Assistant, ToolResult, /* app roles live in pir-agent */ }
+pub enum Role { User, Assistant, ToolResult, /* app roles live in rpi-agent */ }
 
 pub struct Context {
     pub system_prompt: Option<String>,
@@ -145,7 +145,7 @@ pub enum StreamEvent {
 ### 3.3 Api 适配层
 
 ```
-pir-ai/src/api/
+rpi-ai/src/api/
   openai_completions.rs        # 含 compat URL 自动检测矩阵（detect_compat）
   openai_responses.rs          # + openai_responses_shared.rs
   azure_openai_responses.rs
@@ -179,8 +179,8 @@ pub trait ProviderStreams: Send + Sync {
 ### 3.4 Provider 层
 
 - `Provider` trait：模型列表、默认 base URL、auth 解析、`filter_models?`、`refresh_models?`、stream/streamSimple
-- 38 个内置工厂（需求 §5.3 清单）；`create_provider` 支持单 API 或按 `model.api` 分发的混合 map；动态 overlay 与 baseline 按 id 合并；`inflight_refresh` 去重。**注册表骨架已落**（T13 W4，`pir-ai/src/providers.rs`：`BUILTIN_PROVIDERS` 静态 spec 表含全部 38 工厂 id，上游 `all.ts` `builtinProviders()` 注册序逐条核对，纯动态 provider `radius` 无 catalog 条目）；工厂实现为 W4 后续波次（每 provider 一文件 `src/providers/<id>.rs`，工厂签名 `fn() -> Arc<dyn Provider>`，填入 spec 表 `factory` 槽），完成前 `builtin_providers()` 只产出已移植子集
-- 模型目录为**生成物**：`build.rs` 生成内置 catalog。**数据管线已正式化**（T13 W4）：上游 `providers/data/*.json`（37 份 + `.manifest.json`，修正规则——compat delta、thinkingLevelMap、定价 tiers、Kimi 隐含成本等——由 `generate-models.ts` 在生成期全部烘焙进 JSON；上游 `*.models.ts` 经核为纯 `flattenModelCatalog` re-export，Rust 侧无需重放修正）逐字节 vendored 至 `pir-ai/src/providers/data/`（只读，sha256 与 manifest 对拍），`build.rs` 生成 `include_str!` 嵌入表，`generated.rs` 运行时 serde 惰性解析（`OnceLock`；目录访问 API 镜像 `all.ts`：`get_builtin_providers`/`get_builtin_models`/`get_builtin_model`/`get_builtin_model_data_generated_at`）；手动刷新走 `scripts/refresh-model-catalog.sh`（离线，构建期不联网）；**`pir update --models` 远程 overlay 已落**（T13 W6-C：`with_remote_catalog` 装饰器在 `crates/pir/src/core/remote_catalog_provider.rs`（对齐 coding-agent `remote-catalog-provider.ts`，ETag/If-None-Match 复验、4h 新鲜度、generatedAt 比对、inflight 去重，15s 超时在 `model_runtime`/CLI 层），`Models::refresh` 移植 models.ts 276-328（`allow_network` 默认 true、`force`、signal、失败后 `allow_network:false` 离线恢复、未配置 provider 跳过），`createProvider.fetchModels` 钩子延后至 T15 provider-composer 扩展接线）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag，T03 已交付内存与 JSON 文件两实现；W6-C 接入 `ModelRuntime`（models.json 同目录 `models-store.json`，损坏回退内存存储））。落地差异见 D-038用户 `models.json` 加载移植自 coding-agent `model-config.ts`，落 `pir-ai/src/models_json.rs`（JSONC stripJsonComments、serde+手工校验 pass，措辞差异见 D-006）。落地差异见 D-028
+- 38 个内置工厂（需求 §5.3 清单）；`create_provider` 支持单 API 或按 `model.api` 分发的混合 map；动态 overlay 与 baseline 按 id 合并；`inflight_refresh` 去重。**注册表骨架已落**（T13 W4，`rpi-ai/src/providers.rs`：`BUILTIN_PROVIDERS` 静态 spec 表含全部 38 工厂 id，上游 `all.ts` `builtinProviders()` 注册序逐条核对，纯动态 provider `radius` 无 catalog 条目）；工厂实现为 W4 后续波次（每 provider 一文件 `src/providers/<id>.rs`，工厂签名 `fn() -> Arc<dyn Provider>`，填入 spec 表 `factory` 槽），完成前 `builtin_providers()` 只产出已移植子集
+- 模型目录为**生成物**：`build.rs` 生成内置 catalog。**数据管线已正式化**（T13 W4）：上游 `providers/data/*.json`（37 份 + `.manifest.json`，修正规则——compat delta、thinkingLevelMap、定价 tiers、Kimi 隐含成本等——由 `generate-models.ts` 在生成期全部烘焙进 JSON；上游 `*.models.ts` 经核为纯 `flattenModelCatalog` re-export，Rust 侧无需重放修正）逐字节 vendored 至 `rpi-ai/src/providers/data/`（只读，sha256 与 manifest 对拍），`build.rs` 生成 `include_str!` 嵌入表，`generated.rs` 运行时 serde 惰性解析（`OnceLock`；目录访问 API 镜像 `all.ts`：`get_builtin_providers`/`get_builtin_models`/`get_builtin_model`/`get_builtin_model_data_generated_at`）；手动刷新走 `scripts/refresh-model-catalog.sh`（离线，构建期不联网）；**`rpi update --models` 远程 overlay 已落**（T13 W6-C：`with_remote_catalog` 装饰器在 `crates/rpi/src/core/remote_catalog_provider.rs`（对齐 coding-agent `remote-catalog-provider.ts`，ETag/If-None-Match 复验、4h 新鲜度、generatedAt 比对、inflight 去重，15s 超时在 `model_runtime`/CLI 层），`Models::refresh` 移植 models.ts 276-328（`allow_network` 默认 true、`force`、signal、失败后 `allow_network:false` 离线恢复、未配置 provider 跳过），`createProvider.fetchModels` 钩子延后至 T15 provider-composer 扩展接线）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag，T03 已交付内存与 JSON 文件两实现；W6-C 接入 `ModelRuntime`（models.json 同目录 `models-store.json`，损坏回退内存存储））。落地差异见 D-038用户 `models.json` 加载移植自 coding-agent `model-config.ts`，落 `rpi-ai/src/models_json.rs`（JSONC stripJsonComments、serde+手工校验 pass，措辞差异见 D-006）。落地差异见 D-028
 - 应用可按需只注册子集：per-id factory 槽 + `get_builtin_provider_spec`（不引入 cargo feature flags，未引用工厂由链接期死代码消除；D-028）
 - W4 波次注记：工厂按波次分组移植（每组一个 `tests/providers_group_*.rs`）；kimi-coding 的 OAuth（上游构造期 `lazyOAuth` Kimi Code 订阅登录）属 W5 范围，W4 阶段以 `oauth: None` 占位、`ProviderAuth.oauth` 槽为接线点（D-029）；openai-codex 上游为纯 OAuth 工厂（无 api-key 通道），W4 阶段以空 `ProviderAuth` 占位——工厂/目录/适配器接线就位但 auth 恒未配置，W5 填入 OAuth 闭环（D-030）；xai 的 OAuth（SuperGrok / X Premium 订阅登录）同属 W5，W4 阶段同样以 `oauth: None` 占位、仅 `XAI_API_KEY` api-key 通道可用（D-031）；group B（github-copilot / openrouter / vercel-ai-gateway / cloudflare 两家 / opencode / opencode-go / radius）落地注记：`filterModels` 落 `Provider::filter_models` 默认方法（github-copilot 以装饰器覆盖；消费者为 model runtime 的 availability refresh，W7 审查补漏已在 `refresh_availability_inner` 接线并补 runtime 路径测试）；copilot/openrouter/radius 的 OAuth 在 W4 用具名 `PendingOAuth` stub 占位（保留上游 display name，操作报 W5 错误）；**W5 已落地 github-copilot 与 radius 两流程**（`auth/oauth/github_copilot.rs` RFC 8628 device code + enterprise 域名 + 登录后逐模型 policy-enable + per-account baseUrl/`availableModelIds`，`auth/oauth/radius.rs` browser PKCE/1456 回调 + device code，gateway 经 `radius_config` 规范化接线）；cloudflare 两家的 auth helper 落 `src/auth/cloudflare_auth.rs`（ai-gateway 经 `cf-aig-authorization` 头 + 抑制默认 `Authorization`/`x-api-key`），baseUrl 占位符物化落 `src/providers/cloudflare_stream.rs`；radius 为 `create_provider` 核心 + `RadiusProvider` 装饰器（持有规范化 gateway；**W6-C 已落地 `refreshModels` 动态 overlay**——store 恢复、legacy `gatewayConfig` 导入、`{gateway}/v1/config` 拉取 + `models`/`inflightRefresh` 闭包状态，D-032 第 5 项闭环，差异见 D-038），`radius-config.ts` 落 `src/providers/radius_config.rs`（D-032；W5 流程落地差异见 D-033）；**W5 再落地 kimi-coding 与 xai 两流程**（`auth/oauth/kimi_coding.rs` RFC 8628 device code + `KIMI_CODE_OAUTH_HOST`/`KIMI_OAUTH_HOST` 覆盖 + refresh 指数退避重试 + `toAuth` Bearer 头；`auth/oauth/xai.rs` RFC 8628 device code + refresh 不轮换保留旧 token + 5min 过期前移 + `toAuth` api key；`load.ts` 对应物落 `auth/oauth/load.rs` registry 函数表），两工厂 `ProviderAuth.oauth` 槽接线（D-029 / D-031 关闭），落地差异见 D-034；**W5 最后落地 openai-codex 与 openrouter 两流程**（`auth/oauth/openai_codex.rs` PKCE + `id_token_add_organizations`/`codex_cli_simplified_flow`/originator + **deviceauth 旁路** `/api/accounts/deviceauth/usercode|token`、验证 URI `/codex/device`、1455 `/auth/callback` 回调；`auth/oauth/openrouter.rs` PKCE 换永久 key（`Number.MAX_SAFE_INTEGER` 过期）、refresh no-op、临时端口随机路径回调 + 5min 登录超时），openai-codex 工厂 OAuth 槽接线（D-030 关闭）、openrouter 工厂 OAuth 槽接线且 `PendingOAuth` 占位删除（D-032 第 2 项整体解决），落地差异见 D-035
 
@@ -204,12 +204,12 @@ OAuth flows (7)：anthropic / openai-codex / github-copilot(device) /
 - 交互协议：`AuthInteraction` trait（prompt: text/secret/select/manual_code，per-prompt signal 竞速取消；notify: links/auth_url/device_code/progress）——各模式提供实现（TUI 对话框 / RPC 协议 / print 报错）
 - `options.env` 每请求环境覆盖；代理变量（`HTTP_PROXY/HTTPS_PROXY/no_proxy`）解析
 - Rust 落地注记（T04）：文件锁 fs2 无 stale/onCompromised 对应物、`!cmd` 仅 unix `/bin/sh -c`、快照用 `serde_json::Map` 保序做字节对拍、device code 时钟抽象与 OAuth 测试缝等实现差异——见偏离 D-008 / D-009
-- Rust 落地注记（T13 W5）：github-copilot（device code + enterprise 域名 + policy-enable + per-account baseUrl/`availableModelIds`）与 radius（browser PKCE/127.0.0.1:1456 回调 + device code，gateway 经 `normalize_radius_gateway_url` 规范化）两流程落 `pir-ai/src/auth/oauth/{github_copilot,radius}.rs` 并接入 W4 工厂占位（D-032 对应项已解决）；实现差异（URL 重写测试缝、ring UUIDv4、poll 错误通道等）见 D-033；kimi-coding 与 xai 两流程亦已落地（`auth/oauth/{kimi_coding,xai}.rs`，均 RFC 8628 device code：kimi 带 env host 覆盖与 refresh 重试、xai refresh 保留未轮换 token，接入两工厂占位，D-029 / D-031 关闭；差异见 D-034）；openai-codex 与 openrouter 两流程已落地（`auth/oauth/{openai_codex,openrouter}.rs`：codex 为 PKCE + `id_token_add_organizations`/`codex_cli_simplified_flow`/originator + **deviceauth 旁路**（`/api/accounts/deviceauth/usercode|token`，验证 URI `/codex/device`）+ 1455 `/auth/callback` 回调与 refresh；openrouter 为 PKCE 换**永久 key**（`expires = Number.MAX_SAFE_INTEGER`）、refresh no-op、临时端口随机路径回调 + 5min 登录超时/30s 交换超时），接入两工厂 OAuth 槽（D-030 关闭、D-032 第 2 项整体解决、`PendingOAuth` 删除）；差异见 D-035
+- Rust 落地注记（T13 W5）：github-copilot（device code + enterprise 域名 + policy-enable + per-account baseUrl/`availableModelIds`）与 radius（browser PKCE/127.0.0.1:1456 回调 + device code，gateway 经 `normalize_radius_gateway_url` 规范化）两流程落 `rpi-ai/src/auth/oauth/{github_copilot,radius}.rs` 并接入 W4 工厂占位（D-032 对应项已解决）；实现差异（URL 重写测试缝、ring UUIDv4、poll 错误通道等）见 D-033；kimi-coding 与 xai 两流程亦已落地（`auth/oauth/{kimi_coding,xai}.rs`，均 RFC 8628 device code：kimi 带 env host 覆盖与 refresh 重试、xai refresh 保留未轮换 token，接入两工厂占位，D-029 / D-031 关闭；差异见 D-034）；openai-codex 与 openrouter 两流程已落地（`auth/oauth/{openai_codex,openrouter}.rs`：codex 为 PKCE + `id_token_add_organizations`/`codex_cli_simplified_flow`/originator + **deviceauth 旁路**（`/api/accounts/deviceauth/usercode|token`，验证 URI `/codex/device`）+ 1455 `/auth/callback` 回调与 refresh；openrouter 为 PKCE 换**永久 key**（`expires = Number.MAX_SAFE_INTEGER`）、refresh no-op、临时端口随机路径回调 + 5min 登录超时/30s 交换超时），接入两工厂 OAuth 槽（D-030 关闭、D-032 第 2 项整体解决、`PendingOAuth` 删除）；差异见 D-035
 
 ### 3.6 横切模块
 
 ```
-pir-ai/src/utils/
+rpi-ai/src/utils/
   transform_messages.rs   # handoff：孤儿 tool call 合成、error/aborted 不回放、
                           # 图片占位符、thinking 跨模型转文本、id 归一化回填
   retry.rs                # 外层 retryAssistantCall + 错误分类 regex 表
@@ -231,7 +231,7 @@ pir-ai/src/utils/
   uuid.rs                 # uuidv7 / randomUUID（session 与 entry id，§6.1）
 ```
 
-图像子系统独立：`ImagesModels` / `ImagesProvider`（OpenRouter images，chat completions `modalities` 非流式，永不 reject）。**T13 W6 已落地**（D-037）：`images.ts`（dispatch）/ `images-models.ts`（`ImagesModels` 集合 + `createImagesModels` / `createImagesProvider`，镜像 `models.rs` 的 `Models`，含 refresh 在飞去重）/ `image-models.ts` + `image-models.generated.ts`（目录访问器 + 40 模型静态目录，node 转写）/ `images-api-registry.ts`（api 实现注册表）/ `providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区（`builtinImagesProviders` / `builtinImagesModels`，openrouter 工厂含 api-key + OAuth 双通道）落 `crates/pir-ai/src/images.rs` + `images/*`；适配器 `api/openrouter-images.ts`（+`.lazy.ts` 意图）落 `crates/pir-ai/src/api/openrouter_images.rs`（非流式 `POST {baseUrl}/chat/completions`，`modalities: ["image"]` 或 `["image","text"]`，`data:` URL 图像进 `output`，usage 缓存切分，错误以 `stopReason: "error"`/`"aborted"` 正常返回形态表达）；图像类型（`ImagesApiKind` / `ImagesModel` / `ImagesOptions` / `ImagesContext` / `AssistantImages` 等）入 `types.rs`。测试：`tests/images.rs`（14 用例，loopback HTTP 契约：请求形状/modalities/永不 reject/abort/on_payload/on_response/目录与集合）+ 文件内单测。
+图像子系统独立：`ImagesModels` / `ImagesProvider`（OpenRouter images，chat completions `modalities` 非流式，永不 reject）。**T13 W6 已落地**（D-037）：`images.ts`（dispatch）/ `images-models.ts`（`ImagesModels` 集合 + `createImagesModels` / `createImagesProvider`，镜像 `models.rs` 的 `Models`，含 refresh 在飞去重）/ `image-models.ts` + `image-models.generated.ts`（目录访问器 + 40 模型静态目录，node 转写）/ `images-api-registry.ts`（api 实现注册表）/ `providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区（`builtinImagesProviders` / `builtinImagesModels`，openrouter 工厂含 api-key + OAuth 双通道）落 `crates/rpi-ai/src/images.rs` + `images/*`；适配器 `api/openrouter-images.ts`（+`.lazy.ts` 意图）落 `crates/rpi-ai/src/api/openrouter_images.rs`（非流式 `POST {baseUrl}/chat/completions`，`modalities: ["image"]` 或 `["image","text"]`，`data:` URL 图像进 `output`，usage 缓存切分，错误以 `stopReason: "error"`/`"aborted"` 正常返回形态表达）；图像类型（`ImagesApiKind` / `ImagesModel` / `ImagesOptions` / `ImagesContext` / `AssistantImages` 等）入 `types.rs`。测试：`tests/images.rs`（14 用例，loopback HTTP 契约：请求形状/modalities/永不 reject/abort/on_payload/on_response/目录与集合）+ 文件内单测。
 
 Rust 落地注记（T13 W6-B 横切能力收尾）：`transform_messages` / `splitDeferredTools` /
 transport 偏好 / usage 兜底四组与上游钉死版逐一比对一致，无行为级差异：
@@ -256,11 +256,11 @@ transport 偏好 / usage 兜底四组与上游钉死版逐一比对一致，无�
 
 脚本化响应队列 + 响应工厂 + `tokensPerSecond` + usage 4 字符/token 估算 + cache 模拟（sessionId 且 cacheRetention≠none）+ `state.callCount`；队列空固定错误文案。对拍基建的核心（§10）。
 
-实现位于 `pir-test-support/src/faux.rs`（T02）。为可重复性做了确定性化（偏离 D-003）：delta 切块 min..=max 循环替代 `Math.random`、默认 id 用线程局部计数器、默认 timestamp=0、响应工厂为同步闭包；usage 估算按 chars/4（BMP 与上游 UTF-16/4 等价）。这些只影响测试基建内部，delta 边界不入对拍契约（fixtures 锚点粒度见 `fixtures/README.md` §2）。
+实现位于 `rpi-test-support/src/faux.rs`（T02）。为可重复性做了确定性化（偏离 D-003）：delta 切块 min..=max 循环替代 `Math.random`、默认 id 用线程局部计数器、默认 timestamp=0、响应工厂为同步闭包；usage 估算按 chars/4（BMP 与上游 UTF-16/4 等价）。这些只影响测试基建内部，delta 边界不入对拍契约（fixtures 锚点粒度见 `fixtures/README.md` §2）。
 
 ---
 
-## 4. `pir-agent` 设计
+## 4. `rpi-agent` 设计
 
 ### 4.1 分层
 
@@ -269,10 +269,10 @@ transport 偏好 / usage 兜底四组与上游钉死版逐一比对一致，无�
 | `agent_loop` | `agent-loop.ts` | 无状态循环，emit 事件；observational EventStream（无屏障） |
 | `agent` | `agent.ts` | 状态、全事件订阅屏障、队列、互斥 run |
 | `types` | `types.ts` | AgentEvent / AgentTool / AgentMessage（含扩展消息文本格式常量；D-002：声明合并折叠进 `messages.rs`，AgentTool 为 `async_trait`） |
-| `session` | `session-manager.ts`（条目类型）+ `harness/types.ts`（SessionTreeEntry） | session 条目 serde 类型单一来源（D-001，T01 落地）；行为逻辑仍在 T07（pir）/ T16（harness） |
+| `session` | `session-manager.ts`（条目类型）+ `harness/types.ts`（SessionTreeEntry） | session 条目 serde 类型单一来源（D-001，T01 落地）；行为逻辑仍在 T07（rpi）/ T16（harness） |
 | `harness` | `harness/*` | **完整移植**（ADR-0003 §1）：AgentHarness、SessionStorage/Repo 抽象、JSONL+InMemory、compaction/branch-summary/skills/prompt-templates/默认工具工厂、`stream_proxy` |
 
-`pir`（coding-agent 对应 crate）**不使用** harness——它有自己的 AgentSession/SessionManager/tools（与 Pi 一致）；harness 作为 `pir-agent` 的公共可选层，供 SDK 嵌入方与对拍使用。harness 与 coding-agent 实现的行为差异以 coding-agent 为对拍基准。
+`rpi`（coding-agent 对应 crate）**不使用** harness——它有自己的 AgentSession/SessionManager/tools（与 Pi 一致）；harness 作为 `rpi-agent` 的公共可选层，供 SDK 嵌入方与对拍使用。harness 与 coding-agent 实现的行为差异以 coding-agent 为对拍基准。
 
 ### 4.2 `agent_loop` 伪代码
 
@@ -324,19 +324,19 @@ Agent **不**依赖具体 provider，便于测试 faux 与 proxy。StreamFn 不�
 >
 > Rust 落地注记（2026-08-09，T17 修复）：`StreamFn` 形状钉死为裸 `StreamOptions`，但适配器仅在 `stream_simple` 层映射 reasoning（§3.3），agent 路径若走 plain `stream` 会丢弃 `StreamOptions.reasoning`——会话因此从未记录 thinking 块（最近一次会话实测：thinking_level=max/high 而消息无 thinking 内容）。sdk.rs 的 agent stream_fn 现改为在 `stream_simple` 边界转换：`StreamOptions.reasoning`（`ModelThinkingLevel`）→ `SimpleStreamOptions.reasoning`（`ThinkingLevel::from_model_level`，off→None），并同源携带 settings `thinking_budgets`（镜像上游 sdk.ts:312 `modelRuntime.streamSimple(...)`）；compaction 走同一 stream_fn 亦受益。
 >
-> Rust 落地注记（D-013，T08 验收）：`StreamOptions` 增加 `reasoning: Option<ModelThinkingLevel>` 字段——上游 summary 调用经 `SimpleStreamOptions.reasoning` 传 thinking level，而 pir-agent 的 summary 生成直接走本节的 `StreamFn`（裸 `StreamOptions`），reasoning 通道因此落在 `StreamOptions` 上；默认 `None`，既有路径行为不变。
+> Rust 落地注记（D-013，T08 验收）：`StreamOptions` 增加 `reasoning: Option<ModelThinkingLevel>` 字段——上游 summary 调用经 `SimpleStreamOptions.reasoning` 传 thinking level，而 rpi-agent 的 summary 生成直接走本节的 `StreamFn`（裸 `StreamOptions`），reasoning 通道因此落在 `StreamOptions` 上；默认 `None`，既有路径行为不变。
 
 ### 4.5 Harness 层设计要点
 
 - `AgentHarness`：phase 状态机（idle/turn/compaction/branch_summary/retry）；turn snapshot vs config 分离；三队列（steer/followUp/nextTurn）；22 种事件与 hook 结果映射（需求 §4.4）；双订阅模型——`subscribe` 纯观察（支持 `*` 通配），`on` 为带返回值 hook（多 handler 顺序执行、最后非 `undefined` 胜出；patch 型 hook 依次归约）；`entryTransforms`/`entryProjectors` 扩展点（写入/读出两侧变换）；session 树为 leaf 追加 + 重放重建语义
 - **持久化屏障**：`message_end` 先写 session 再发事件；busy 期间写入进 `pending_session_writes`；`turn_end` flush 后 `save_point`；`agent_end` flush + `settled`——决定 JSONL 行序。屏障写入在 loop 事件回调内 `await`，失败路径：持久化失败使 loop reject → `emitRunFailure` 合成失败消息并重放完整事件序列（失败消息同样走持久化，二次失败聚合为 `AgentHarnessError`）；`executeTurn` 末尾 finally flush 失败则直接抛出，不经 `emitRunFailure`
 - `SessionStorage`/`SessionRepo` trait + `JsonlSessionStorage`（header version: 3，entry id=uuidv7 后 8 位碰撞重试；支持 `firstKeptEntryId` 与 **`retainedTail`** 两形态 + `active_tools_change`/`leaf` 条目）+ `InMemory*`；SQLite 不做（trait 同构预留）
-- compaction/branch-summary/skills/prompt-templates/默认工具工厂：与 coding-agent 对应模块**共享算法常量**（token 估算、prompt 模板、截断常数），实现上抽到 `pir-agent` 公共模块供两处复用，行为差异以 coding-agent 为准记录
+- compaction/branch-summary/skills/prompt-templates/默认工具工厂：与 coding-agent 对应模块**共享算法常量**（token 估算、prompt 模板、截断常数），实现上抽到 `rpi-agent` 公共模块供两处复用，行为差异以 coding-agent 为准记录
 - `stream_proxy`：SSE 客户端协议（POST `/api/stream`，服务端剥离 partial、客户端 `parseStreamingJson` 重建）；12 种事件类型：`start, text_start, text_delta, text_end, thinking_start, thinking_delta, thinking_end, toolcall_start, toolcall_delta, toolcall_end, done, error`
 
 ---
 
-## 5. `pir-tui` 设计
+## 5. `rpi-tui` 设计
 
 ### 5.1 为何不直接用 ratatui
 
@@ -393,9 +393,9 @@ pub trait Focusable: Component {
 4. 节流 16ms
 5. 行尾 SGR + OSC 8 reset
 6. Kitty 图像行范围 expand + delete
-7. 调试通道：`PIR_DEBUG_REDRAW`（记录全量重绘原因）、`PIR_TUI_WRITE_LOG`（终端写日志）、
-   `PIR_TUI_DEBUG`（debug dump）、`PIR_HARDWARE_CURSOR`（硬件光标）、`PIR_CLEAR_ON_SHRINK`
-   （收缩清屏回退开关）——均依 ADR-0001 改 `PIR_` 前缀
+7. 调试通道：`RPI_DEBUG_REDRAW`（记录全量重绘原因）、`RPI_TUI_WRITE_LOG`（终端写日志）、
+   `RPI_TUI_DEBUG`（debug dump）、`RPI_HARDWARE_CURSOR`（硬件光标）、`RPI_CLEAR_ON_SHRINK`
+   （收缩清屏回退开关）——均依 ADR-0001 改 `RPI_` 前缀
 
 ### 5.4 输入
 
@@ -403,7 +403,7 @@ pub trait Focusable: Component {
 
 `KeybindingsManager` 读 JSON，映射到 editor/action 枚举（与 Pi token 名一致，含旧键名迁移表 60+ 项，便于配置互通）。**键位判断永不硬编码**（例外：shift+ctrl+d = /debug）。
 
-输入相关环境变量同上依 ADR-0001 统一 `PIR_` 前缀；协议缓冲 flush / keepalive 采用
+输入相关环境变量同上依 ADR-0001 统一 `RPI_` 前缀；协议缓冲 flush / keepalive 采用
 显式 deadline 语义（§5.2），输入到达会重排 flush 截止时间。
 
 ### 5.5 组件移植清单（12 个，全量；标注落地状态）
@@ -415,7 +415,7 @@ pub trait Focusable: Component {
 4. **T12 已落地**：Image（Kitty + iTerm2 + 能力检测矩阵）/ SettingsList
 5. **T11 已落地**：Utils——grapheme 宽度（`unicode-width` + ANSI 感知包装）
 
-coding-agent 侧 40 个交互组件在 `pir` crate 的 interactive mode 内实现（需求 §8.6 清单）：
+coding-agent 侧 40 个交互组件在 `rpi` crate 的 interactive mode 内实现（需求 §8.6 清单）：
 消息渲染族 13（assistant/user/tool-execution/diff/bash-execution/branch-summary/
 compaction-summary/skill-invocation/custom-message/custom-entry/footer/custom-editor/
 keybinding-hints 等）与选择器/对话框族 20（tree/session(+search)/config/settings/
@@ -433,20 +433,20 @@ first-time-setup/status-indicator/countdown-timer/dynamic-border/visual-truncate
 避免死锁）、`spawn_signal_restore`（SIGTERM/SIGHUP 恢复后 exit 0，对齐上游
 `shutdown({fromSignal:true})`）。语义来自上游 coding-agent interactive-mode.ts 的
 `uncaughtCrash` / `registerSignalHandlers`（见 D-017）：上游在 coding-agent 层接线
-（Node 信号/异常回调是进程级注册），pir 因编码规范 §8.5 将终端恢复归 TUI 层且 Rust
-panic hook 为进程级状态，故落位 pir-tui；graceful-shutdown 编排（扩展清理、drainInput、
+（Node 信号/异常回调是进程级注册），rpi 因编码规范 §8.5 将终端恢复归 TUI 层且 Rust
+panic hook 为进程级状态，故落位 rpi-tui；graceful-shutdown 编排（扩展清理、drainInput、
 session 关闭事件）仍留 interactive mode（T12），与上游拆分一致。
 
 ---
 
-## 6. `pir`（coding-agent）设计
+## 6. `rpi`（coding-agent）设计
 
 ### 6.1 启动管线
 
 ```text
 parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值吞噬、未知
   --flag 收集为扩展标志、互斥诊断矩阵 clap 无法表达，D-015）
-  → resolve agent_dir / cwd / offline（--offline 同时设 PIR_SKIP_VERSION_CHECK）
+  → resolve agent_dir / cwd / offline（--offline 同时设 RPI_SKIP_VERSION_CHECK）
   → SettingsManager (global, projectTrusted=false) + http proxy
   → 子命令分流（package/config，先于主 parseArgs）
   → resolve app mode: rpc > json > print（-p 或非 TTY）> interactive
@@ -465,7 +465,7 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 
 与 Pi `main.ts` / `createAgentSessionRuntime` 对齐，保证 `/new`、切 cwd、resume 时 **重建 cwd 绑定服务**。**不实现** Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3）。
 
-**Rust 落地注记**（T10，D-015）：实现于 `crates/pir/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker 已落地（2026-08-06，`crates/pir/src/cli/session_picker.rs` 独立启动选择器，D-019）；install/remove/list 子命令（T14-W2，D-040）与 `--export`（T14-W5，D-045）已落地；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（pir 无 npm 包随捆 docs）；进程标记环境变量 `PIR_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
+**Rust 落地注记**（T10，D-015）：实现于 `crates/rpi/src/app.rs`（main.ts 全管线）+ `main.rs`。差异要点：CLI 解析为 `cli/args.rs` 手写扫描器（`args.test.ts` 84 测试全量移植）；provider-composer / 远程 catalog / 38 内置 provider 工厂为 T13 子集（ModelRuntime 提供 `register_provider` 组合点）；`--resume` 交互 picker 已落地（2026-08-06，`crates/rpi/src/cli/session_picker.rs` 独立启动选择器，D-019）；install/remove/list 子命令（T14-W2，D-040）与 `--export`（T14-W5，D-045）已落地；system prompt 文档段落的 docs 路径取可执行文件目录探测、缺失整段省略（rpi 无 npm 包随捆 docs）；进程标记环境变量 `RPI_CODING_AGENT=true` 在两个 bin 入口设置（对齐 cli.ts/rpc-entry.ts）。详见 `docs/plan/v0.1/deviations/D-015-headless-modes-rust-notes.md`。
 
 ### 6.2 `AgentSession`
 
@@ -487,9 +487,9 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 - 读取健壮性：1MB 流式读跳畸形行；header 4KB/1MB 扫描上限回退全量
 - **无文件锁**（与 Pi 一致；锁仅 auth/settings/trust，用 `fs2`）
 
-**存储**：仅 JSONL。路径默认 `~/.pir/agent/sessions/`（`--<cwd>--` 编码：去前导斜杠，`/\:`→`-`）。格式对齐钉死版 Pi；**不做** `~/.pi` 迁移工具。
+**存储**：仅 JSONL。路径默认 `~/.rpi/agent/sessions/`（`--<cwd>--` 编码：去前导斜杠，`/\:`→`-`）。格式对齐钉死版 Pi；**不做** `~/.pi` 迁移工具。
 
-**Rust 落地注记**（T07，D-012）：实现于 `crates/pir/src/core/session_manager.rs`（同步 IO，调用方自行 `spawn_blocking`），条目类型单一来源在 `pir-agent::session`（D-001）。差异要点：`retainedTail` 形态读取时按上游 `docs/session-format.md`（self-contained checkpoint）与 harness 行为展开进 context（coding-agent 钉死版不展开；主路径只写 `firstKeptEntryId` 形态，不影响对拍契约）；id/uuidv7 由 `pir-ai/src/utils/uuid.rs` 自实现（不引 `rand`/`uuid` crate）；typed 联合体的固有降级边界（合法 JSON 非对象行丢弃、形状不合法的已知条目降级 Raw、header 发现需完整 typed header、数字格式化 `1e2` 级微差）逐条见 D-012；`list`/`listAll` 已于 T10 提前实现（`--session` 三级解析需要，D-015）。
+**Rust 落地注记**（T07，D-012）：实现于 `crates/rpi/src/core/session_manager.rs`（同步 IO，调用方自行 `spawn_blocking`），条目类型单一来源在 `rpi-agent::session`（D-001）。差异要点：`retainedTail` 形态读取时按上游 `docs/session-format.md`（self-contained checkpoint）与 harness 行为展开进 context（coding-agent 钉死版不展开；主路径只写 `firstKeptEntryId` 形态，不影响对拍契约）；id/uuidv7 由 `rpi-ai/src/utils/uuid.rs` 自实现（不引 `rand`/`uuid` crate）；typed 联合体的固有降级边界（合法 JSON 非对象行丢弃、形状不合法的已知条目降级 Raw、header 发现需完整 typed header、数字格式化 `1e2` 级微差）逐条见 D-012；`list`/`listAll` 已于 T10 提前实现（`--session` 三级解析需要，D-015）。
 
 ### 6.4 Compaction
 
@@ -501,14 +501,14 @@ parse args（手写解析器，与上游 args.ts 同构——非 clap：-p 值�
 - 文件操作跟踪 → `<read-files>`/`<modified-files>` + `details.{readFiles,modifiedFiles}` 累积
 - 请求隔离：`cacheRetention:"none"` + 新 routing session id（uuidv7）+ 复用 `settings.retry`
 
-**Rust 落地注记**（T08，D-013）：算法层（估算/切点/prompt/summary 生成/branch 装填）落 `crates/pir-agent/src/compaction.rs`（+ `compaction/utils.rs`、`compaction/branch_summarization.rs`），供 coding-agent 与 T16 harness 复用（§4.5）；coding-agent 侧触发接线（双路 `_checkCompaction`、overflow 一次恢复、`_runAutoCompaction`、compaction 事件发射）落 `crates/pir/src/core/compaction_runner.rs`。`parse_iso8601_ms` / `session_entry_to_context_messages` / `get_latest_compaction_entry` / `build_context_messages` 单一来源在 `pir-agent::session`，`pir::core::session_manager` re-export（D-001 延伸）。`estimatedTokensAfter` 按上游 `agent-session.ts` 语义=压缩后 context 消息的纯 `estimateTokens` 求和（非 `estimate.ts` 的 usage 锚点版）。
+**Rust 落地注记**（T08，D-013）：算法层（估算/切点/prompt/summary 生成/branch 装填）落 `crates/rpi-agent/src/compaction.rs`（+ `compaction/utils.rs`、`compaction/branch_summarization.rs`），供 coding-agent 与 T16 harness 复用（§4.5）；coding-agent 侧触发接线（双路 `_checkCompaction`、overflow 一次恢复、`_runAutoCompaction`、compaction 事件发射）落 `crates/rpi/src/core/compaction_runner.rs`。`parse_iso8601_ms` / `session_entry_to_context_messages` / `get_latest_compaction_entry` / `build_context_messages` 单一来源在 `rpi-agent::session`，`rpi::core::session_manager` re-export（D-001 延伸）。`estimatedTokensAfter` 按上游 `agent-session.ts` 语义=压缩后 context 消息的纯 `estimateTokens` 求和（非 `estimate.ts` 的 usage 锚点版）。
 
-**T16 勘误补记**（D-020）：本节「供 coding-agent 与 T16 harness 复用」仅对 LLM 调用/估算/切点/文件操作成立——实测钉死源码后确认上游 harness `compaction.ts` 的 `prepareCompaction` 与 coding-agent 版**不同变体**（空 summarize 集不提前返回、准备结果带 `retainedTail`），harness 变体 `prepare_harness_compaction` 移植于 `crates/pir-agent/src/harness/agent_harness.rs`（harness/compaction.ts:640-713），不复用 T08 的 `prepare_compaction`。
+**T16 勘误补记**（D-020）：本节「供 coding-agent 与 T16 harness 复用」仅对 LLM 调用/估算/切点/文件操作成立——实测钉死源码后确认上游 harness `compaction.ts` 的 `prepareCompaction` 与 coding-agent 版**不同变体**（空 summarize 集不提前返回、准备结果带 `retainedTail`），harness 变体 `prepare_harness_compaction` 移植于 `crates/rpi-agent/src/harness/agent_harness.rs`（harness/compaction.ts:640-713），不复用 T08 的 `prepare_compaction`。
 
 ### 6.5 工具模块（coding-agent 基准）
 
 ```
-pir/src/tools/
+rpi/src/tools/
   read.rs write.rs edit.rs edit_diff.rs bash.rs
   grep.rs find.rs ls.rs
   truncate.rs file_mutation_queue.rs path_utils.rs
@@ -531,16 +531,16 @@ pir/src/tools/
 | rpc | 命令分发器（32 命令）+ 严格 `\n` 帧（自实现行读取，不用按 U+2028/2029 拆分的 reader）；UI 请求/响应状态机（9 方法 + 降级清单）；session 替换后 rebind |
 | interactive | 组件树绑定 session 事件；选择器与 slash 路由（四类命令来源） |
 
-RPC 与 Interactive 共享 `AgentSessionRuntime` 方法，避免两套会话逻辑。独立入口 `pir-rpc`（等价 `--mode rpc`）。
+RPC 与 Interactive 共享 `AgentSessionRuntime` 方法，避免两套会话逻辑。独立入口 `rpi-rpc`（等价 `--mode rpc`）。
 
-**Rust 落地注记**（T10，D-015）：print/json 落 `crates/pir/src/modes/print_mode.rs`，rpc 落 `crates/pir/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`pir-rpc` bin 为 `crates/pir/src/bin/pir_rpc.rs`（Cargo `[[bin]] pir-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 已接真实导出（T14-W5，D-045；in-memory 会话报上游错误）。interactive 模式在 T12。
+**Rust 落地注记**（T10，D-015）：print/json 落 `crates/rpi/src/modes/print_mode.rs`，rpc 落 `crates/rpi/src/modes/rpc.rs`（32 命令逐条契约测试锚定 `docs/rpc.md`；命令逐任务 spawn，`abort`/`abort_bash` 可在 bash/prompt 在途时落地，与上游 `void handleInputLine` 同构；输出经单 writer 通道保序）。`rpi-rpc` bin 为 `crates/rpi/src/bin/pir_rpc.rs`（Cargo `[[bin]] rpi-rpc`）。RPC 扩展 UI 协议层（9 方法名 + 降级清单常量、`extension_ui_response` 路由）已预留，真实扩展 UI 往返待 T15；`export_html` 已接真实导出（T14-W5，D-045；in-memory 会话报上游错误）。interactive 模式在 T12。
 
 ### 6.7 ResourceLoader
 
 统一发现：
 
 ```text
-global ~/.pir/agent + project .pir（trust 门控）+ settings paths + CLI flags + packages
+global ~/.rpi/agent + project .rpi（trust 门控）+ settings paths + CLI flags + packages
 + ~/.agents/skills 与祖先 .agents/skills（git root 上界）
 ```
 
@@ -549,7 +549,7 @@ global ~/.pir/agent + project .pir（trust 门控）+ settings paths + CLI flags
 
 Skills → system prompt XML 注入（仅 read 工具激活时）；Prompt templates → slash 展开器；`resources_discover` 事件可补充路径。
 
-> Rust 落地注记（D-014，T09 验收）：实现为 `core/settings_manager.rs`（同步写盘 + fs2 flock 直接锁目标文件，Settings 为保序 map、畸形值 getter 回落默认）、`core/environment.rs`（进程级 `PIR_*`，agent/session dir 常量留 `config.rs`）、`core/skills.rs`（ignore crate walker）、`core/prompt_templates.rs` + `core/system_prompt.rs`（context files/SYSTEM.md/注入格式；文档段落走 `doc_paths` 参数）、`core/themes.rs` + `core/keybindings.rs`（纯数据/解析/检测逻辑；detectCapabilities/matchesKey/热重载 watcher/TUI helper 下沉 T11/T12）、`core/resource_loader.rs`（统一管线 + dedupePrompts/themes + keybindings 迁移写回 fs2 锁；extensions 仅占位、packages 为 `PackageResourcePaths` 输入口、SDK override 留 T15）。serde_yaml/TypeBox/SyntaxError 引擎级错误文案差异在 fixtures/README.md §3.1 登记排除口径。详见 `docs/plan/v0.1/deviations/D-014-settings-resources-rust-notes.md`。
+> Rust 落地注记（D-014，T09 验收）：实现为 `core/settings_manager.rs`（同步写盘 + fs2 flock 直接锁目标文件，Settings 为保序 map、畸形值 getter 回落默认）、`core/environment.rs`（进程级 `RPI_*`，agent/session dir 常量留 `config.rs`）、`core/skills.rs`（ignore crate walker）、`core/prompt_templates.rs` + `core/system_prompt.rs`（context files/SYSTEM.md/注入格式；文档段落走 `doc_paths` 参数）、`core/themes.rs` + `core/keybindings.rs`（纯数据/解析/检测逻辑；detectCapabilities/matchesKey/热重载 watcher/TUI helper 下沉 T11/T12）、`core/resource_loader.rs`（统一管线 + dedupePrompts/themes + keybindings 迁移写回 fs2 锁；extensions 仅占位、packages 为 `PackageResourcePaths` 输入口、SDK override 留 T15）。serde_yaml/TypeBox/SyntaxError 引擎级错误文案差异在 fixtures/README.md §3.1 登记排除口径。详见 `docs/plan/v0.1/deviations/D-014-settings-resources-rust-notes.md`。
 
 ---
 
@@ -573,7 +573,7 @@ pub trait ExtensionApi: Send + Sync {
 }
 ```
 
-`pir` 在 tool_call / session_* 等点调用 `emit`，合并 block/transform 结果（事件可变语义见需求 §9.1）。
+`rpi` 在 tool_call / session_* 等点调用 `emit`，合并 block/transform 结果（事件可变语义见需求 §9.1）。
 
 **能力面规模提示**：33 事件 + 24 API 方法（+ `events` 属性）+ 28 UI 方法 + 三级 Context（补 `ReplacedSessionContext`）。UI 的组件工厂类方法（setWidget/setFooter/setHeader/custom/setEditorComponent）携带 TUI Component 类型——Rust/Wasm 化采用**声明式组件描述 + 协议往返**（M0 spike 验证形状，不追求类型级同构）。
 
@@ -585,8 +585,8 @@ pub trait ExtensionApi: Send + Sync {
 - 动态库插件（`abi_stable`，已决策，见 §14）
 
 > **T15 落地注记（2026-08-08）**：L0 动态库插件已按 abi_stable 0.11.3 落地
-> （`crates/pir-ext-host/src/native.rs`），ABI 形状受 StableAbi 约束收敛
-> （host-call 句柄按值打包 `PirHostCalls`、cookie 为 `*const c_void`、缓冲
+> （`crates/rpi-ext-host/src/native.rs`），ABI 形状受 StableAbi 约束收敛
+> （host-call 句柄按值打包 `RpiHostCalls`、cookie 为 `*const c_void`、缓冲
 > 一律 `RVec<u8>` 拥有型）；无沙箱信任模型明示。核心动作/事件层差异
 > （tool_call 改参穿线、user_bash operations、ProviderConfig 闭包拒绝、
 > newSession setup、exec SIGKILL、非 RPC 模式 command.* 未绑）逐条见偏离
@@ -599,7 +599,7 @@ pub trait ExtensionApi: Send + Sync {
 
 **明确不做**：`JsExtensionHost`、Node sidecar、jiti/TS 扩展加载。
 
-**安装（列入计划，ADR-0002）**：本地路径 + 可分发 Wasm 包；`install`/`remove`/`list`/`update`/`config`；落盘 `~/.pir/agent/` 或 `.pir/`。声明式 skills/prompts/themes 包布局对齐 Pi。
+**安装（列入计划，ADR-0002）**：本地路径 + 可分发 Wasm 包；`install`/`remove`/`list`/`update`/`config`；落盘 `~/.rpi/agent/` 或 `.rpi/`。声明式 skills/prompts/themes 包布局对齐 Pi。
 
 扩展作者：按 ExtensionAPI 用 Rust/Wasm 重写；提供示例与 ABI 文档。Wasm **runtime 打进主二进制**。
 
@@ -619,18 +619,18 @@ Extension ui.*
 
 ```rust
 pub struct PirConfig {
-    pub app_name: String,          // "pir"
-    pub config_dir_name: String,   // ".pir"
+    pub app_name: String,          // "rpi"
+    pub config_dir_name: String,   // ".rpi"
     pub env_prefix: String,        // "PIR"
 }
-// agent_dir = ~/.pir/agent
-// project_dir = <cwd>/.pir
-// 环境变量名由 env_prefix 派生（PIR_CODING_AGENT_DIR 等）
+// agent_dir = ~/.rpi/agent
+// project_dir = <cwd>/.rpi
+// 环境变量名由 env_prefix 派生（RPI_CODING_AGENT_DIR 等）
 ```
 
-路径解析单一模块（对齐 Pi `config.ts`），禁止各处拼 `__dirname`。T07 已落地 `crates/pir/src/config.rs`（agent_dir、sessions 目录与 `--<cwd>--` 编码、`--session-dir` / `PIR_CODING_AGENT_SESSION_DIR` / settings / 默认覆盖链，空串逐级落空对齐上游 falsy 语义）。
+路径解析单一模块（对齐 Pi `config.ts`），禁止各处拼 `__dirname`。T07 已落地 `crates/rpi/src/config.rs`（agent_dir、sessions 目录与 `--<cwd>--` 编码、`--session-dir` / `RPI_CODING_AGENT_SESSION_DIR` / settings / 默认覆盖链，空串逐级落空对齐上游 falsy 语义）。
 
-**产品 endpoint 配置化**（ADR-0002 §8，T14-W6a，D-046）：版本检查 / install telemetry / 远程模型目录三类产品 HTTP 回调的 endpoint 在 settings 与 `PIR_*` env 可配置、可整体关闭。统一解析器 `config::resolve_endpoint`：env（`PIR_VERSION_CHECK_URL` / `PIR_TELEMETRY_URL` / `PIR_MODEL_CATALOG_URL`）> settings（`versionCheckUrl` / `telemetryUrl` / `modelCatalogUrl`，camelCase）> 内置默认（`https://resetpi.com`，与上游硬编码值 `https://pi.dev` 不同——ADR-0009 独立分发决策）；任一级取字面量 `off` 即关闭，关闭后不产生任何网络请求。消费点：`update --self/--all` 的版本探测、交互模式启动版本检查通知（`UiCommand::NewVersionAvailable`）、install telemetry ping（`core/telemetry.rs`，默认开、`PIR_TELEMETRY`/`enableInstallTelemetry` 可关、payload 仅版本号）；远程 catalog 的运行时消费随内置 provider 注册波次接线（D-038，2026-08-09 D-052 补齐：`ModelRuntime::create` 播种 38 内置 provider，静态目录类逐个包 `with_remote_catalog`（radius 原样），settings `modelCatalogUrl` 经 services 层传入，SDK/`update --models` 走 env/默认；字面量 `off` 不构造 overlay、零请求）。`enableAnalytics` 默认 false 且上游 0.82.1 无发送通道，按构造零请求。
+**产品 endpoint 配置化**（ADR-0002 §8，T14-W6a，D-046）：版本检查 / install telemetry / 远程模型目录三类产品 HTTP 回调的 endpoint 在 settings 与 `RPI_*` env 可配置、可整体关闭。统一解析器 `config::resolve_endpoint`：env（`RPI_VERSION_CHECK_URL` / `RPI_TELEMETRY_URL` / `RPI_MODEL_CATALOG_URL`）> settings（`versionCheckUrl` / `telemetryUrl` / `modelCatalogUrl`，camelCase）> 内置默认（`https://resetpi.com`，与上游硬编码值 `https://pi.dev` 不同——ADR-0009 独立分发决策）；任一级取字面量 `off` 即关闭，关闭后不产生任何网络请求。消费点：`update --self/--all` 的版本探测、交互模式启动版本检查通知（`UiCommand::NewVersionAvailable`）、install telemetry ping（`core/telemetry.rs`，默认开、`RPI_TELEMETRY`/`enableInstallTelemetry` 可关、payload 仅版本号）；远程 catalog 的运行时消费随内置 provider 注册波次接线（D-038，2026-08-09 D-052 补齐：`ModelRuntime::create` 播种 38 内置 provider，静态目录类逐个包 `with_remote_catalog`（radius 原样），settings `modelCatalogUrl` 经 services 层传入，SDK/`update --models` 走 env/默认；字面量 `off` 不构造 overlay、零请求）。`enableAnalytics` 默认 false 且上游 0.82.1 无发送通道，按构造零请求。
 
 ---
 
@@ -638,7 +638,7 @@ pub struct PirConfig {
 
 - 库：`thiserror`；边界：`anyhow`（bin）；能力层（fs/shell/session）结构化错误枚举，**不 panic**（对齐 Pi「错误走 Result」契约与错误码全集）
 - 结构化 tracing（`tracing` + 可选 JSON）
-- `/debug`（shift+ctrl+d）：环形缓冲最近渲染行（ANSI）+ 最近 LLM context 快照，写 `~/.pir/agent/pir-debug.log`
+- `/debug`（shift+ctrl+d）：环形缓冲最近渲染行（ANSI）+ 最近 LLM context 快照，写 `~/.rpi/agent/rpi-debug.log`
 - Provider payload debug：`on_payload`/`on_response` 钩子 + Codex WS debug stats
 
 ---
@@ -651,7 +651,7 @@ pub struct PirConfig {
 2. **契约测**：RPC 32 命令 + 扩展 UI 子协议、session JSONL schema
 3. **黄金文件**：从 Pi 跑出的 fixtures diff（忽略 timestamp/id）
 4. **Faux provider**：确定性 tool-call 脚本
-5. **可选 live**：`PIR_LIVE_TEST=1` + API keys
+5. **可选 live**：`RPI_LIVE_TEST=1` + API keys
 
 ### 10.2 对拍流程（M0 交付）
 
@@ -663,8 +663,8 @@ pub struct PirConfig {
 
 **对拍执行（CI）**：
 
-4. `pir` 以相同场景跑 print / json / rpc，输出经同一归一化后与 fixtures diff。
-5. 事件类型序列、工具调用序列、session JSONL 结构（含**行序**，由持久化屏障决定）必须一致；归一化与 diff 脚本归属 `pir-test-support`。
+4. `rpi` 以相同场景跑 print / json / rpc，输出经同一归一化后与 fixtures diff。
+5. 事件类型序列、工具调用序列、session JSONL 结构（含**行序**，由持久化屏障决定）必须一致；归一化与 diff 脚本归属 `rpi-test-support`。
 
 **逐条对拍级基准**：`session-format.md`、`rpc.md`、`compaction.md`、`keybindings.md`、`tmux.md`/`terminal-setup.md`。
 
@@ -680,16 +680,16 @@ pub struct PirConfig {
 
 ```mermaid
 gantt
-  title Pir 实施阶段
+  title Rpi 实施阶段
   dateFormat  YYYY-MM
   section Foundation
   M0 骨架与类型契约           :m0, 2026-08, 1M
-  M1 pir-ai 核心协议+Auth基础 :m1, after m0, 3M
-  M2 pir-agent loop+四工具    :m2, after m0, 2M
+  M1 rpi-ai 核心协议+Auth基础 :m1, after m0, 3M
+  M2 rpi-agent loop+四工具    :m2, after m0, 2M
   section Product
   M3 Session/Compaction/Settings/Harness :m3, after m2, 3M
   M4 Print/JSON/RPC           :m4, after m3, 2M
-  M5 pir-tui + Interactive    :m5, after m4, 4M
+  M5 rpi-tui + Interactive    :m5, after m4, 4M
   section Parity
   M6 全 Provider/OAuth        :m6, after m1, 3M
   M7 Packages/Trust/Export/llama :m7, after m4, 2M
@@ -705,7 +705,7 @@ gantt
 | 里程碑 | 可演示结果 |
 |--------|------------|
 | M0 | workspace 编译；faux stream；事件枚举锁定；上游 commit 校验；对拍 harness（fixtures 生成 + 归一化 diff）；Wasm ABI spike（wasmtime 宿主 + `registerTool` + 一个 dialog 往返 + 一个声明式组件渲染往返）并实测二进制体积 |
-| M1–M2 | `pir -p` 调 Anthropic/OpenAI 完成 read/bash 任务 |
+| M1–M2 | `rpi -p` 调 Anthropic/OpenAI 完成 read/bash 任务 |
 | M3–M4 | JSONL session 续跑（含 v1–v3 迁移与 Pi 产物互通）；harness 层与主路径双向互通对拍；RPC 32 命令；token 估算对拍 |
 | M5 | **Interactive TUI** 可用（必达） |
 | M6–M7 | 38 Provider / 7 OAuth；可配置产品 endpoint；单文件发布 |
@@ -722,61 +722,61 @@ gantt
 
 ## 12. 关键模块映射表
 
-| Pi 路径 | Pir 路径 |
+| Pi 路径 | Rpi 路径 |
 |---------|----------|
-| `packages/ai/src/api/*` | `crates/pir-ai/src/api/*` |
-| `packages/ai/src/providers/*`（含 `all.ts` 注册表、`data/*.json` vendored） | `crates/pir-ai/src/providers.rs`（注册表）+ `crates/pir-ai/src/providers/*`（T13 W4，D-028） |
-| `packages/ai/src/auth/*` | `crates/pir-ai/src/auth/*` |
-| `packages/ai/src/utils/*`（transform/retry/overflow/estimate/…） | `crates/pir-ai/src/utils/*` |
-| `packages/ai/src/models.ts` / `models-store.ts` | `crates/pir-ai/src/models.rs` / `models_store.rs` |
-| `packages/ai/src/images.ts` / `images-models.ts` / `image-models.ts` / `images-api-registry.ts` / `image-models.generated.ts` | `crates/pir-ai/src/images.rs` + `crates/pir-ai/src/images/*`（T13 W6，D-037） |
-| `packages/ai/src/providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区 | `crates/pir-ai/src/images/providers/*`（T13 W6，D-037） |
-| `packages/ai/src/api/openrouter-images.ts`（+`.lazy.ts` 意图） | `crates/pir-ai/src/api/openrouter_images.rs`（T13 W6，D-037） |
-| `packages/ai/test/openrouter-images.test.ts` / `images-models.test.ts` / `image-model-data.test.ts` | `crates/pir-ai/tests/images.rs`（T13 W6；`images.test.ts` 为 live 测试不移植） |
-| `packages/coding-agent/src/core/model-config.ts`（models.json 加载） | `crates/pir-ai/src/models_json.rs`（D-006：serde 校验替代 TypeBox） |
-| `packages/ai/scripts/generate-models.ts` | `crates/pir-ai/build.rs`（嵌入 vendored 数据）+ `scripts/refresh-model-catalog.sh`（手动刷新）+ `pir update --models`（远程，W6）（D-028） |
-| `packages/agent/src/agent-loop.ts` | `crates/pir-agent/src/agent_loop.rs` |
-| `packages/agent/src/agent.ts` | `crates/pir-agent/src/agent.rs` |
-| `packages/agent/src/harness/*` | `crates/pir-agent/src/harness/*`（条目类型除外，见下行 D-001；T16 已落地，D-020：compaction/messages 复用 crate 根模块、session 门面 + 四存储实现 + env/tools/resources/utils + `src/proxy.rs` ← `packages/agent/src/proxy.ts`） |
-| `packages/coding-agent/src/core/session-manager.ts`（条目类型）+ `packages/agent/src/harness/types.ts`（SessionTreeEntry） | `crates/pir-agent/src/session.rs`（D-001：单一 serde 来源，T07/T16 共用） |
-| `packages/tui/src/tui.ts` | `crates/pir-tui/src/tui.rs`（T11 已落地） |
-| `packages/tui/src/terminal.ts` | `crates/pir-tui/src/terminal.rs`（T11 已落地） |
-| `packages/tui/src/stdin-buffer.ts` | `crates/pir-tui/src/stdin_buffer.rs`（T11 已落地） |
-| `packages/tui/src/keys.ts` | `crates/pir-tui/src/keys.rs`（T11 已落地） |
-| `packages/tui/src/keybindings.ts` | `crates/pir-tui/src/keybindings.rs`（T11 已落地） |
-| `packages/tui/src/native-modifiers.ts` | `crates/pir-tui/src/native_modifiers.rs`（T11 已落地；恒 false 缺口见 ADR-0004） |
-| `packages/tui/src/terminal-colors.ts` | `crates/pir-tui/src/terminal_colors.rs`（T11 已落地） |
-| `packages/tui/src/terminal-image.ts` | `crates/pir-tui/src/terminal_image.rs`（T11 已落地） |
-| `packages/tui/src/fuzzy.ts` | `crates/pir-tui/src/fuzzy.rs`（T11 已落地） |
-| `packages/tui/src/utils.ts` | `crates/pir-tui/src/utils.rs`（T11 已落地） |
-| `packages/tui/src/components/{text,spacer,truncated-text,box,loader,cancellable-loader}.ts` | `crates/pir-tui/src/components/{text,spacer,truncated_text,box,loader,cancellable_loader}.rs`（T11 已落地） |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（终端恢复 `uncaughtCrash` / `registerSignalHandlers`） | `crates/pir-tui/src/recovery.rs`（T11 已落地，D-017） |
-| `packages/tui/src/components/{select-list,input,editor,markdown,image,settings-list}.ts` | `crates/pir-tui/src/components/*`（T12） |
-| `packages/tui/src/{kill-ring,undo-stack,word-navigation,editor-component,autocomplete}.ts` | `crates/pir-tui/src/*`（T12） |
-| `packages/coding-agent/src/core/session-manager.ts` | `crates/pir/src/core/session_manager.rs` |
-| `packages/coding-agent/src/core/export-html/index.ts`（+ 模板资产） | `crates/pir/src/core/export_html.rs`（+ `export_html/` 逐字节 vendored 模板；T14-W5，D-045） |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（`handleShareCommand` 的 gh 调用切片） | `crates/pir/src/core/share.rs`（`ShareRunner` 注入；T14-W5，D-045） |
-| `packages/coding-agent/src/core/agent-session*.ts` | `crates/pir/src/core/agent_session*.rs` |
-| `packages/coding-agent/src/core/compaction/*` | 算法层 `crates/pir-agent/src/compaction*.rs` + 触发接线 `crates/pir/src/core/compaction_runner.rs`（D-013，T08） |
-| `packages/coding-agent/src/core/extensions/*` | `crates/pir/src/core/extensions/*` + `pir-ext-host` |
-| `packages/coding-agent/src/core/tools/*`（基准） | `crates/pir/src/tools/*` |
-| `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/pir/src/tools/bash_executor.rs` |
-| `packages/coding-agent/src/core/settings-manager.ts` / `trust-manager.ts` / `keybindings.ts` | `crates/pir/src/core/settings_manager.rs` / `trust_manager.rs` / `keybindings.rs` |
-| `packages/coding-agent/src/core/resource-loader.ts` / `skills.ts` / `prompt-templates.ts` / `system-prompt.ts` / theme 相关（`themes/*`、`theme-schema.json`） | `crates/pir/src/core/resource_loader.rs` / `skills.rs` / `prompt_templates.rs` / `system_prompt.rs` / `themes.rs`（D-014，T09） |
-| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/pir/src/core/remote_catalog_provider.rs`（配合 pir-ai ModelsStore；T13 W6-C，D-038；endpoint 解析 `model_catalog_endpoint` T14-W6a，D-046） |
-| `packages/coding-agent/src/utils/version-check.ts` | `crates/pir/src/core/version_check.rs`（T14-W3；endpoint 配置 + `checkForNewPiVersion` 启动检查 T14-W6a，D-046） |
-| `packages/coding-agent/src/core/telemetry.ts` + `interactive-mode.ts` 的 `reportInstallTelemetry` / `showNewVersionNotification` 切片 | `crates/pir/src/core/telemetry.rs` + `interactive_mode.rs`（T14-W6a，D-046） |
-| `packages/coding-agent/src/main.ts`（启动管线） | `crates/pir/src/app.rs` + `main.rs`（D-015，T10） |
-| `packages/coding-agent/src/core/sdk.ts` | `crates/pir/src/sdk.rs` |
-| `packages/coding-agent/src/core/model-runtime.ts` / `model-resolver.ts` | `crates/pir/src/core/model_runtime.rs` / `model_resolver.rs` |
-| `packages/coding-agent/src/modes/*` | `crates/pir/src/modes/*`（`print_mode.rs`、`rpc.rs`、`interactive/interactive_mode.rs` + `interactive/commands.rs` + `interactive/autocomplete.rs` + `interactive/theme_watcher.rs` + `interactive/git_branch_watcher.rs` + `interactive/startup_ui.rs` + `interactive/external_editor.rs` + `interactive/interactive_mode/commands_selectors.rs`） |
-| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | `crates/pir/src/modes/interactive/interactive_mode.rs`（S4b-S7a 落地） |
-| `packages/coding-agent/src/modes/interactive/components/*`（40 个） | `crates/pir/src/modes/interactive/components/*`（消息族 13 + 选择器/对话框族 20，snake_case；彩蛋 [DEFER]） |
-| `packages/coding-agent/src/core/{slash-commands,cache-stats}.ts` | `crates/pir/src/core/slash_commands.rs`（cache-stats 挂点，T14） |
-| `packages/coding-agent/src/modes/interactive/{model-search,external-editor}.ts` | `crates/pir/src/modes/interactive/{model_search.rs → components/,external_editor.rs}` |
-| `packages/tui/src/components/markdown.ts`（marked） | `crates/pir-tui/src/components/markdown.rs`（**comrak 0.54 替代**，D-018） |
-| `packages/coding-agent/src/cli/*` / `package-manager-cli.ts` | `crates/pir/src/cli/*` |
-| `packages/coding-agent/src/rpc-entry.ts` | `crates/pir/src/bin/pir_rpc.rs`（`[[bin]] pir-rpc`） |
+| `packages/ai/src/api/*` | `crates/rpi-ai/src/api/*` |
+| `packages/ai/src/providers/*`（含 `all.ts` 注册表、`data/*.json` vendored） | `crates/rpi-ai/src/providers.rs`（注册表）+ `crates/rpi-ai/src/providers/*`（T13 W4，D-028） |
+| `packages/ai/src/auth/*` | `crates/rpi-ai/src/auth/*` |
+| `packages/ai/src/utils/*`（transform/retry/overflow/estimate/…） | `crates/rpi-ai/src/utils/*` |
+| `packages/ai/src/models.ts` / `models-store.ts` | `crates/rpi-ai/src/models.rs` / `models_store.rs` |
+| `packages/ai/src/images.ts` / `images-models.ts` / `image-models.ts` / `images-api-registry.ts` / `image-models.generated.ts` | `crates/rpi-ai/src/images.rs` + `crates/rpi-ai/src/images/*`（T13 W6，D-037） |
+| `packages/ai/src/providers/openrouter-images.ts` + `providers/images/register-builtins.ts` + `all.ts` 图像半区 | `crates/rpi-ai/src/images/providers/*`（T13 W6，D-037） |
+| `packages/ai/src/api/openrouter-images.ts`（+`.lazy.ts` 意图） | `crates/rpi-ai/src/api/openrouter_images.rs`（T13 W6，D-037） |
+| `packages/ai/test/openrouter-images.test.ts` / `images-models.test.ts` / `image-model-data.test.ts` | `crates/rpi-ai/tests/images.rs`（T13 W6；`images.test.ts` 为 live 测试不移植） |
+| `packages/coding-agent/src/core/model-config.ts`（models.json 加载） | `crates/rpi-ai/src/models_json.rs`（D-006：serde 校验替代 TypeBox） |
+| `packages/ai/scripts/generate-models.ts` | `crates/rpi-ai/build.rs`（嵌入 vendored 数据）+ `scripts/refresh-model-catalog.sh`（手动刷新）+ `rpi update --models`（远程，W6）（D-028） |
+| `packages/agent/src/agent-loop.ts` | `crates/rpi-agent/src/agent_loop.rs` |
+| `packages/agent/src/agent.ts` | `crates/rpi-agent/src/agent.rs` |
+| `packages/agent/src/harness/*` | `crates/rpi-agent/src/harness/*`（条目类型除外，见下行 D-001；T16 已落地，D-020：compaction/messages 复用 crate 根模块、session 门面 + 四存储实现 + env/tools/resources/utils + `src/proxy.rs` ← `packages/agent/src/proxy.ts`） |
+| `packages/coding-agent/src/core/session-manager.ts`（条目类型）+ `packages/agent/src/harness/types.ts`（SessionTreeEntry） | `crates/rpi-agent/src/session.rs`（D-001：单一 serde 来源，T07/T16 共用） |
+| `packages/tui/src/tui.ts` | `crates/rpi-tui/src/tui.rs`（T11 已落地） |
+| `packages/tui/src/terminal.ts` | `crates/rpi-tui/src/terminal.rs`（T11 已落地） |
+| `packages/tui/src/stdin-buffer.ts` | `crates/rpi-tui/src/stdin_buffer.rs`（T11 已落地） |
+| `packages/tui/src/keys.ts` | `crates/rpi-tui/src/keys.rs`（T11 已落地） |
+| `packages/tui/src/keybindings.ts` | `crates/rpi-tui/src/keybindings.rs`（T11 已落地） |
+| `packages/tui/src/native-modifiers.ts` | `crates/rpi-tui/src/native_modifiers.rs`（T11 已落地；恒 false 缺口见 ADR-0004） |
+| `packages/tui/src/terminal-colors.ts` | `crates/rpi-tui/src/terminal_colors.rs`（T11 已落地） |
+| `packages/tui/src/terminal-image.ts` | `crates/rpi-tui/src/terminal_image.rs`（T11 已落地） |
+| `packages/tui/src/fuzzy.ts` | `crates/rpi-tui/src/fuzzy.rs`（T11 已落地） |
+| `packages/tui/src/utils.ts` | `crates/rpi-tui/src/utils.rs`（T11 已落地） |
+| `packages/tui/src/components/{text,spacer,truncated-text,box,loader,cancellable-loader}.ts` | `crates/rpi-tui/src/components/{text,spacer,truncated_text,box,loader,cancellable_loader}.rs`（T11 已落地） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（终端恢复 `uncaughtCrash` / `registerSignalHandlers`） | `crates/rpi-tui/src/recovery.rs`（T11 已落地，D-017） |
+| `packages/tui/src/components/{select-list,input,editor,markdown,image,settings-list}.ts` | `crates/rpi-tui/src/components/*`（T12） |
+| `packages/tui/src/{kill-ring,undo-stack,word-navigation,editor-component,autocomplete}.ts` | `crates/rpi-tui/src/*`（T12） |
+| `packages/coding-agent/src/core/session-manager.ts` | `crates/rpi/src/core/session_manager.rs` |
+| `packages/coding-agent/src/core/export-html/index.ts`（+ 模板资产） | `crates/rpi/src/core/export_html.rs`（+ `export_html/` 逐字节 vendored 模板；T14-W5，D-045） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts`（`handleShareCommand` 的 gh 调用切片） | `crates/rpi/src/core/share.rs`（`ShareRunner` 注入；T14-W5，D-045） |
+| `packages/coding-agent/src/core/agent-session*.ts` | `crates/rpi/src/core/agent_session*.rs` |
+| `packages/coding-agent/src/core/compaction/*` | 算法层 `crates/rpi-agent/src/compaction*.rs` + 触发接线 `crates/rpi/src/core/compaction_runner.rs`（D-013，T08） |
+| `packages/coding-agent/src/core/extensions/*` | `crates/rpi/src/core/extensions/*` + `rpi-ext-host` |
+| `packages/coding-agent/src/core/tools/*`（基准） | `crates/rpi/src/tools/*` |
+| `packages/coding-agent/src/core/tools/bash-executor.ts` | `crates/rpi/src/tools/bash_executor.rs` |
+| `packages/coding-agent/src/core/settings-manager.ts` / `trust-manager.ts` / `keybindings.ts` | `crates/rpi/src/core/settings_manager.rs` / `trust_manager.rs` / `keybindings.rs` |
+| `packages/coding-agent/src/core/resource-loader.ts` / `skills.ts` / `prompt-templates.ts` / `system-prompt.ts` / theme 相关（`themes/*`、`theme-schema.json`） | `crates/rpi/src/core/resource_loader.rs` / `skills.rs` / `prompt_templates.rs` / `system_prompt.rs` / `themes.rs`（D-014，T09） |
+| `packages/coding-agent/src/core/remote-catalog-provider.ts` | `crates/rpi/src/core/remote_catalog_provider.rs`（配合 rpi-ai ModelsStore；T13 W6-C，D-038；endpoint 解析 `model_catalog_endpoint` T14-W6a，D-046） |
+| `packages/coding-agent/src/utils/version-check.ts` | `crates/rpi/src/core/version_check.rs`（T14-W3；endpoint 配置 + `checkForNewPiVersion` 启动检查 T14-W6a，D-046） |
+| `packages/coding-agent/src/core/telemetry.ts` + `interactive-mode.ts` 的 `reportInstallTelemetry` / `showNewVersionNotification` 切片 | `crates/rpi/src/core/telemetry.rs` + `interactive_mode.rs`（T14-W6a，D-046） |
+| `packages/coding-agent/src/main.ts`（启动管线） | `crates/rpi/src/app.rs` + `main.rs`（D-015，T10） |
+| `packages/coding-agent/src/core/sdk.ts` | `crates/rpi/src/sdk.rs` |
+| `packages/coding-agent/src/core/model-runtime.ts` / `model-resolver.ts` | `crates/rpi/src/core/model_runtime.rs` / `model_resolver.rs` |
+| `packages/coding-agent/src/modes/*` | `crates/rpi/src/modes/*`（`print_mode.rs`、`rpc.rs`、`interactive/interactive_mode.rs` + `interactive/commands.rs` + `interactive/autocomplete.rs` + `interactive/theme_watcher.rs` + `interactive/git_branch_watcher.rs` + `interactive/startup_ui.rs` + `interactive/external_editor.rs` + `interactive/interactive_mode/commands_selectors.rs`） |
+| `packages/coding-agent/src/modes/interactive/interactive-mode.ts` | `crates/rpi/src/modes/interactive/interactive_mode.rs`（S4b-S7a 落地） |
+| `packages/coding-agent/src/modes/interactive/components/*`（40 个） | `crates/rpi/src/modes/interactive/components/*`（消息族 13 + 选择器/对话框族 20，snake_case；彩蛋 [DEFER]） |
+| `packages/coding-agent/src/core/{slash-commands,cache-stats}.ts` | `crates/rpi/src/core/slash_commands.rs`（cache-stats 挂点，T14） |
+| `packages/coding-agent/src/modes/interactive/{model-search,external-editor}.ts` | `crates/rpi/src/modes/interactive/{model_search.rs → components/,external_editor.rs}` |
+| `packages/tui/src/components/markdown.ts`（marked） | `crates/rpi-tui/src/components/markdown.rs`（**comrak 0.54 替代**，D-018） |
+| `packages/coding-agent/src/cli/*` / `package-manager-cli.ts` | `crates/rpi/src/cli/*` |
+| `packages/coding-agent/src/rpc-entry.ts` | `crates/rpi/src/bin/pir_rpc.rs`（`[[bin]] rpi-rpc`） |
 | ~~`packages/coding-agent/src/migrations.ts`~~ | **不实现**（ADR-0003 §3） |
 | ~~`packages/server` / `packages/evals` / `storage/sqlite-node` / `src/bun`~~ | **不复刻**（ADR-0003） |
 
@@ -786,7 +786,7 @@ gantt
 
 ### 已决策
 
-- [ADR-0001](./adr/0001-extension-and-config-dir.md)：扩展 = Rust/Wasm；配置 = `~/.pir`
+- [ADR-0001](./adr/0001-extension-and-config-dir.md)：扩展 = Rust/Wasm；配置 = `~/.rpi`
 - [ADR-0002](./adr/0002-baseline-decisions.md)：上游钉死 `2efa728` / 0.82.1；扩展安装列入计划；TUI 必达；token 与 Pi 一致；单文件 + Wasm 打进主包；无 session 路径迁移；仅 JSONL；可配置自有 endpoint；MIT
 - [ADR-0003](./adr/0003-coverage-review-scope-decisions.md)：harness 完整移植（含 retainedTail）；工具以 coding-agent 为基准（grep/find 原生实现）；不做 legacy 启动迁移；不做 pi-ai CLI；排除 server/evals/bun/sqlite-node
 
@@ -795,7 +795,7 @@ gantt
 实现期细节在模块设计中细化，收敛为两项（M0 spike 实测后定）：
 
 1. **Wasm ABI 字节布局**（含 UI 组件描述协议形状）——**已定稿（T15 W6/W7）**：`docs/extension-abi.md`（wasm ABI v1 + §1.1 原生动态库插件段）
-2. **扩展包 manifest 字段**——**已定稿（T15 W6/W7）**：`pir-extension.json`（`name`/`version`/`description`/`wasm`/`native`/`capabilities`/`pirAbi`），见 `docs/extension-abi.md` §5
+2. **扩展包 manifest 字段**——**已定稿（T15 W6/W7）**：`rpi-extension.json`（`name`/`version`/`description`/`wasm`/`native`/`capabilities`/`rpiAbi`），见 `docs/extension-abi.md` §5
 
 2026-07-29 覆盖度审查后新增的实现期细化项（不阻塞开工，随模块设计定稿）：
 
@@ -804,7 +804,7 @@ gantt
 
 ### Codex WebSocket 状态机（2026-08-06 定稿，T13-W3）
 
-落地于 `crates/pir-ai/src/api/codex_ws.rs`（模块文档内有同构图示）：
+落地于 `crates/rpi-ai/src/api/codex_ws.rs`（模块文档内有同构图示）：
 
 ```text
 Disconnected ──connect(握手, 默认 15s 超时)──► Open ──acquire──► Busy(在途 response.create)
@@ -820,7 +820,7 @@ Disconnected ──connect(握手, 默认 15s 超时)──► Open ──acquir
 - **可复用性探针**：tungstenite 无 `readyState`，acquire 复用前做一次非阻塞 poll（Pending=存活；Close/EOF/错误=死亡则关闭换新；意外到达的数据帧存入 entry.pending 交付下次读取）。
 - **per-session SSE 永久回退**（单向）：流开始前发生传输失败即把 session 记入回退集合，后续请求直接走 SSE；流开始后的失败直接报错。两类一次重试：`websocket_connection_limit_reached`（流开始前）重连一次、`previous_response_not_found` 重试一次（continuation 已清除，重试发全量上下文）。
 - **缓存续传**：entry 内保存 `{lastRequestBody, lastResponseId, lastResponseItems}`，基线前缀校验（JSON.stringify 序敏感比较）通过后发送 `{previous_response_id, input: delta}`。
-- debug stats 与 session 资源清理经 `pir-ai::session_resources` 注册表（`session-resources.ts` 的移植）挂载。
+- debug stats 与 session 资源清理经 `rpi-ai::session_resources` 注册表（`session-resources.ts` 的移植）挂载。
 
 ---
 
@@ -852,11 +852,11 @@ Disconnected ──connect(握手, 默认 15s 超时)──► Open ──acquir
 | 动态库插件 ABI | abi_stable（L0 Rust 插件；不手写 C ABI） |
 | Wasm 扩展 | **wasmtime 嵌入主二进制** + host ABI |
 | Token 估算 | **与钉死版 Pi 同一算法**（chars/4、image=4800 等常量逐字节移植） |
-| 模型目录 | build.rs 生成（models.dev 数据源）+ `pir update --models` 远程 overlay（`remote-catalog-provider.ts` → `crates/pir/src/core/remote_catalog_provider.rs`，T13 W6-C，D-038） |
+| 模型目录 | build.rs 生成（models.dev 数据源）+ `rpi update --models` 远程 overlay（`remote-catalog-provider.ts` → `crates/rpi/src/core/remote_catalog_provider.rs`，T13 W6-C，D-038） |
 | 产品 Endpoint | settings / env 可配置（更新检查、telemetry、远程 catalog） |
 | 许可证 | **MIT** |
 | TS 嵌入 | **不做** |
 
 ---
 
-**设计收束**：Pir 按钉死版 Pi 的包边界与事件契约做同构移植；harness 层完整纳入；工具以 coding-agent 为行为基准；扩展为 Rust/Wasm（含安装计划）；TUI 必达。见 ADR-0001 / ADR-0002 / ADR-0003。
+**设计收束**：Rpi 按钉死版 Pi 的包边界与事件契约做同构移植；harness 层完整纳入；工具以 coding-agent 为行为基准；扩展为 Rust/Wasm（含安装计划）；TUI 必达。见 ADR-0001 / ADR-0002 / ADR-0003。

@@ -17,11 +17,11 @@
 T13 波次划分把 OAuth 流程（含 openai-codex）划给 W5（`docs/plan/v0.1/T13-providers-oauth.md`
 W5 行），W4 阶段 2 只移植工厂本体。与 D-029（kimi-coding 有 api-key 通道、`oauth: None`
 占位）不同，openai-codex 上游无 api-key 通道，因此
-`pir-ai/src/providers/openai_codex.rs` 的 `openai_codex_provider()` 以
+`rpi-ai/src/providers/openai_codex.rs` 的 `openai_codex_provider()` 以
 `ProviderAuth::default()`（api_key/oauth 皆 `None`）落地：工厂、目录模型、
 `openai-codex-responses` 适配器接线均已就位，但 auth 解析恒为未配置，
 W5 填入 OAuth 实现即闭环。`lazyOAuth` 本身是为浏览器 bundle 分割存在的上游技巧
-（`auth/helpers.rs` 端口注记已述），pir 为原生二进制，W5 直接构造填入即可。
+（`auth/helpers.rs` 端口注记已述），rpi 为原生二进制，W5 直接构造填入即可。
 文件头注释与 `tests/providers_group_a.rs::test_openai_codex_factory_config`
 固化该占位。
 

@@ -2,8 +2,8 @@
 
 > 门禁 G3（逐条对拍级基准）：`external/pi/packages/coding-agent/docs/tmux.md` 与
 > `external/pi/packages/coding-agent/docs/terminal-setup.md`（上游 2efa728 / v0.82.1）
-> 的逐条映射——文档条目 → 字节序列（原样）→ pir-tui 实现位置 → 测试锚点。
-> 实现代码位于 `crates/pir-tui/src/`，行号以本表制作时（2026-08-05）为准。
+> 的逐条映射——文档条目 → 字节序列（原样）→ rpi-tui 实现位置 → 测试锚点。
+> 实现代码位于 `crates/rpi-tui/src/`，行号以本表制作时（2026-08-05）为准。
 
 ## 统计
 
@@ -17,7 +17,7 @@
 
 ## 一、tmux.md
 
-| # | 文档条目（小节） | 字节序列（原样） | 行为要求 | pir-tui 实现位置 | 测试锚点 |
+| # | 文档条目（小节） | 字节序列（原样） | 行为要求 | rpi-tui 实现位置 | 测试锚点 |
 |---|------------------|------------------|----------|------------------|----------|
 | T1 | §Recommended Configuration | `\x1b[>7u\x1b[?u\x1b[c` | Kitty 键盘协议不可用时请求 extended key reporting（tmux `extended-keys on` 依赖此请求转发）；DA 应答无 Kitty flags 立即回退 modifyOtherKeys，无超时等待 | `terminal.rs` `ProcessTerminal::query_and_enable_kitty_protocol`（:357-366）、`parse_keyboard_protocol_negotiation_sequence`（:108） | `queries_kitty_mode_before_enabling_modify_other_keys_fallback`（terminal.rs:1149，断言首写 `\x1b[>7u\x1b[?u\x1b[c`）；`activates_kitty_mode_for_non_zero_negotiated_flags`（:1159）；`falls_back_to_modify_other_keys_for_zero_kitty_flags`（:1180）；`falls_back_to_modify_other_keys_for_device_attributes_without_kitty_flags`（:1206）；`parse_keyboard_protocol_negotiation_sequence_matches_upstream_regexes`（:1306） |
 | T2 | §Why csi-u Is Recommended（xterm 格式） | `\x1b[27;5;99~` | Ctrl+C（tmux `extended-keys-format xterm` 转发，modifyOtherKeys 格式）解析为 `ctrl+c` | `keys.rs` `parse_modify_other_keys_sequence`（:840）、`matches_modify_other_keys`（:864），经 `matches_key`/`parse_key` 分发 | `matches_xterm_modify_other_keys_ctrl_c`（keys.rs:1902，含 `parse_key` 断言） |
@@ -38,7 +38,7 @@
 
 ## 二、terminal-setup.md
 
-| # | 文档条目（小节） | 字节序列（原样） | 行为要求 | pir-tui 实现位置 | 测试锚点 |
+| # | 文档条目（小节） | 字节序列（原样） | 行为要求 | rpi-tui 实现位置 | 测试锚点 |
 |---|------------------|------------------|----------|------------------|----------|
 | S1 | §Kitty, iTerm2 | —（Kitty 键盘协议整体） | 开箱即用：协议协商启用 + CSI-u/flags 解析 | `terminal.rs` `query_and_enable_kitty_protocol`（:357）；`keys.rs` `parse_csi_u_sequence`（:607）、`parse_arrow_sequence`（:647）、`parse_functional_sequence`（:681）、`parse_home_end_sequence`（:720）、`is_key_release`/`is_key_repeat`（:505/:529） | 协商：T1 所列 5 个；解析：`matches_arrow_keys`（keys.rs:2216）、`parses_arrow_keys`（:2370）、`matches_legacy_function_keys_and_clear`（:2236）、`is_key_release_and_is_key_repeat_detect_event_suffixes`（:2410）等 |
 | S2 | §Apple Terminal | `\x1b[>4;2m` / `\x1b[>4;0m` | 可用时启用 enhanced key reporting（modifyOtherKeys mode 2），停用/退出时关闭 | `terminal.rs` `enable_modify_other_keys`（:592-598）/`disable_modify_other_keys`（:601-607），stop 路径（:673-674, :721-724） | `queries_kitty_mode_before_enabling_modify_other_keys_fallback`（:1149，断言 `\x1b[>4;2m` 不先于探测出现）；`falls_back_to_modify_other_keys_for_zero_kitty_flags`（:1180）；`activates_kitty_mode_for_non_zero_negotiated_flags`（:1159，断言不写 `\x1b[>4;2m`） |
@@ -49,13 +49,13 @@
 | S7 | §Ghostty | `ctrl+j` | Pi 绑定 Ctrl+J 为默认 newline alias，tmux 下 Shift+Enter 经此 remap 保持可用 | `keybindings.rs` 默认表 `tui.input.newLine` = `["shift+enter","ctrl+j"]`（:522-526） | `binds_ctrl_j_as_a_default_newline_alias`（keybindings.rs:783） |
 | S8 | §WezTerm | `\x1b[13;3u` | Option+Enter（`wezterm.action.SendString('\x1b[13;3u')` 全屏覆盖）解析为 `alt+enter` | `keys.rs` enter 分支（同 T10） | 无直接测试（同 T10） |
 | S9 | §WezTerm | `\x1b\x1b[27;…u` | `enable_kitty_keyboard` 下 Escape 按下为裸 `\x1b`、release 为 CSI-u，拼接为 `\x1b\x1b[27;…u`；缓冲层须拆分为独立 ESC + CSI-u，防 `\x1b\x1b` 被当作 meta 键 | `stdin_buffer.rs` `is_complete_sequence` 拆分逻辑（:282-306） | `split_esc_esc_csi_into_standalone_esc_and_csi_sequence`（stdin_buffer.rs:810）；`split_esc_esc_csi_with_no_modifier`（:823）；`still_emit_esc_esc_as_single_sequence_when_not_followed_by_new_escape`（:832） |
-| S10 | §WezTerm（WSL IME）/ §IntelliJ IDEA | `PIR_HARDWARE_CURSOR=1`（上游 `PI_HARDWARE_CURSOR`，ADR-0001 改名） | 硬件光标可见（默认隐藏），IME 候选窗定位 | `tui.rs` `ENV_HARDWARE_CURSOR`（:530-531）、`showHardwareCursor` 路径（:722）、`CURSOR_MARKER`（:108）定位与剥离（:2426） | `show_hardware_cursor_makes_cursor_visible`（tui.rs:7190）；`cursor_marker_positions_hardware_cursor_and_is_stripped`（:7154） |
+| S10 | §WezTerm（WSL IME）/ §IntelliJ IDEA | `RPI_HARDWARE_CURSOR=1`（上游 `PI_HARDWARE_CURSOR`，ADR-0001 改名） | 硬件光标可见（默认隐藏），IME 候选窗定位 | `tui.rs` `ENV_HARDWARE_CURSOR`（:530-531）、`showHardwareCursor` 路径（:722）、`CURSOR_MARKER`（:108）定位与剥离（:2426） | `show_hardware_cursor_makes_cursor_visible`（tui.rs:7190）；`cursor_marker_positions_hardware_cursor_and_is_stripped`（:7154） |
 | S11 | §Alacritty | `\u001b[13;3u`（= `\x1b[13;3u`） | Option+Enter 重映射（macOS 下 Alacritty 发 plain Enter 的替代）解析为 `alt+enter` | `keys.rs` enter 分支（同 T10） | 无直接测试（同 T10） |
 | S12 | §VS Code | `\u001b[13;2u`（= `\x1b[13;2u`） | 1.109.5 以下版本需显式 keybinding 发送 Shift+Enter 序列，解析为 `shift+enter` | `keys.rs` enter 分支（同 T9） | 无直接测试（同 T9） |
 | S13 | §Windows Terminal | `\u001b[13;2u` / `\u001b[13;3u` | `sendInput` 转发 Shift+Enter / Alt+Enter 键弦 | `keys.rs` enter 分支（同 T9/T10） | 无直接测试（同 T9/T10） |
 | S14 | §Windows Terminal | —（VT input） | `ENABLE_VIRTUAL_TERMINAL_INPUT` 使 Shift+Tab 等到达应用 | `terminal.rs`（:41-45 注释）：crossterm raw mode 不置该 flag、无原生 helper 绑定 | 无测试——**功能缺口**：Windows 上 Shift+Tab 仍为 `\t`（见 D-016 §功能缺口） |
 | S15 | §xfce4-terminal, terminator | — | 行为说明：有限序列支持，修饰 Enter 不可区分 | 无实现需求（依赖终端侧能力） | —（不适用） |
-| S16 | §IntelliJ IDEA | `PIR_HARDWARE_CURSOR=1` | 同 S10（硬件光标可见） | 同 S10 | 同 S10 |
+| S16 | §IntelliJ IDEA | `RPI_HARDWARE_CURSOR=1` | 同 S10（硬件光标可见） | 同 S10 | 同 S10 |
 | S17 | §Kitty, iTerm2（补充） | —（OSC 8 探测：`probeTmuxHyperlinks`） | 能力探测：tmux 客户端是否转发 OSC 8 超链接；tmux 下图像协议禁用 | `terminal_image.rs` `probe_tmux_hyperlinks`（:126，250ms 预算 + `try_wait` 轮询）、`detect_capabilities`（:177-191） | `test_detect_capabilities_enables_hyperlinks_under_tmux_when_client_forwards_them`（terminal_image.rs:981）；`test_detect_capabilities_disables_hyperlinks_under_tmux_when_client_does_not_forward`（:996）；`test_detect_capabilities_checks_tmux_capability_when_term_starts_with_tmux`（:1011） |
 
 ---

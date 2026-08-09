@@ -1,0 +1,29 @@
+[package]
+name = "rpi-ext-host"
+description = "Rust + Wasm extension host (no JS execution; ADR-0001)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+# CancellationToken for extension tool execution signals (mirrors the
+# AbortSignal parameter of upstream ToolDefinition.execute).
+tokio-util.workspace = true
+# T15 W6 wasm host: oneshot + runtime handle for the guest-thread bridge.
+tokio.workspace = true
+rpi-ai.workspace = true
+rpi-agent.workspace = true
+# Wasm (L1) extension runtime, embedded into the single release binary
+# (design §7.2; coding-standards appendix A). The T15 W6 host lives in
+# `src/wasm/` (ABI v1, docs/extension-abi.md).
+wasmtime = "47"
+# L0 dynamic-library plugins (design §14 pinned abi_stable; T15 W7).
+abi_stable = "0.11"
+
+[dev-dependencies]
+serde_json.workspace = true

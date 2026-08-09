@@ -1,14 +1,14 @@
-# Pir workspace — Rust isomorphic reimplementation of Pi (see docs/02-design.md §2).
+# Rpi workspace — Rust reimplementation of Pi (see docs/02-design.md §2).
 [workspace]
 resolver = "2"
 members = [
-    "crates/pir-ai",
-    "crates/pir-agent",
-    "crates/pir-tui",
-    "crates/pir",
-    "crates/pir-ext-host",
-    "crates/pir-test-native-plugin",
-    "crates/pir-test-support",
+    "crates/rpi-ai",
+    "crates/rpi-agent",
+    "crates/rpi-tui",
+    "crates/rpi",
+    "crates/rpi-ext-host",
+    "crates/rpi-test-native-plugin",
+    "crates/rpi-test-support",
 ]
 
 [workspace.package]
@@ -18,11 +18,11 @@ license = "MIT"
 
 [workspace.dependencies]
 # Internal crates (dependency rules: docs/02-design.md §2.1, coding-standards §2.2).
-pir-ai = { path = "crates/pir-ai" }
-pir-agent = { path = "crates/pir-agent" }
-pir-tui = { path = "crates/pir-tui" }
-pir-ext-host = { path = "crates/pir-ext-host" }
-pir-test-support = { path = "crates/pir-test-support" }
+rpi-ai = { path = "crates/rpi-ai" }
+rpi-agent = { path = "crates/rpi-agent" }
+rpi-tui = { path = "crates/rpi-tui" }
+rpi-ext-host = { path = "crates/rpi-ext-host" }
+rpi-test-support = { path = "crates/rpi-test-support" }
 
 # External baseline (coding-standards appendix A).
 serde = { version = "1", features = ["derive"] }
@@ -55,7 +55,7 @@ hmac = "0.12"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 zstd = "0.13"
 
-# T06 built-in tools (pir/src/tools/).
+# T06 built-in tools (rpi/src/tools/).
 unicode-normalization = "0.1"   # NFKC/NFD for edit fuzzy matching + read path variants
 libc = "0.2"                    # unix process-group kill (bash kill tree)
 base64 = "0.22"                 # read tool image attachments; google-vertex ADC JWT encoding (T13)
@@ -64,7 +64,7 @@ ring = "0.17"                   # RS256 signing for google-vertex ADC service-ac
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 kamadak-exif = "0.6"            # EXIF orientation auto-correct on image resize
 
-# T09 settings & resources (pir/src/core/).
+# T09 settings & resources (rpi/src/core/).
 serde_yaml = "0.9"              # YAML frontmatter (skills / prompt templates)
 # Directory walk with .gitignore/.ignore/.fdignore chain, dotdir skip and
 # symlink following for skills/prompts discovery (upstream walker semantics).
@@ -79,18 +79,18 @@ semver = "1"
 # highlight.js 10.7.3. default-features = false + regex-fancy: pure-Rust
 # fancy-regex backend, no oniguruma C dependency (musl static target).
 # The syntax set is bat's curated set, filtered and re-dumped compressed by
-# crates/pir/build.rs; the runtime crate only loads the embedded dump.
+# crates/rpi/build.rs; the runtime crate only loads the embedded dump.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "dump-load", "regex-fancy"] }
 # Build-time asset source only: bat's ~200-syntax set (syntect-assets embeds
 # its own syntect copy, unified to 5.3 via the caret range).
 syntect-assets = { version = "0.23.6", default-features = false }
 
-# T11 pir-tui core engine (coding-standards appendix A).
+# T11 rpi-tui core engine (coding-standards appendix A).
 crossterm = "0.29"              # terminal I/O only (raw mode / read-write / size); no ratatui
 unicode-width = "0.2"           # grapheme width
 unicode-segmentation = "1"      # grapheme clusters
 # T12-S3 markdown component: comrak replaces upstream's `marked` (see
-# crates/pir-tui/src/components/markdown.rs header for the deviation record).
+# crates/rpi-tui/src/components/markdown.rs header for the deviation record).
 # default-features = false: only the parser/AST are used, no HTML rendering.
 comrak = { version = "0.54", default-features = false }
 

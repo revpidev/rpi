@@ -1939,153 +1939,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
-name = "pir"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "fs2",
- "futures",
- "globset",
- "httpdate",
- "ignore",
- "image",
- "kamadak-exif",
- "libc",
- "pir-agent",
- "pir-ai",
- "pir-ext-host",
- "pir-test-support",
- "pir-tui",
- "regex",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "syntect",
- "syntect-assets",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "unicode-normalization",
- "url",
-]
-
-[[package]]
-name = "pir-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "futures",
- "ignore",
- "libc",
- "pir-ai",
- "pir-test-support",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
- "tracing",
- "unicode-normalization",
-]
-
-[[package]]
-name = "pir-ai"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "fs2",
- "futures",
- "hmac",
- "httpdate",
- "jsonschema",
- "libc",
- "oauth2",
- "regex",
- "reqwest",
- "ring",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "url",
- "zstd",
-]
-
-[[package]]
-name = "pir-ext-host"
-version = "0.1.0"
-dependencies = [
- "abi_stable",
- "async-trait",
- "pir-agent",
- "pir-ai",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
- "tracing",
- "wasmtime",
-]
-
-[[package]]
-name = "pir-test-native-plugin"
-version = "0.1.0"
-dependencies = [
- "abi_stable",
- "pir-ext-host",
- "serde_json",
-]
-
-[[package]]
-name = "pir-test-support"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "pir-agent",
- "pir-ai",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
-name = "pir-tui"
-version = "0.1.0"
-dependencies = [
- "base64",
- "comrak",
- "crossterm",
- "pir-test-support",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tracing",
- "unicode-segmentation",
- "unicode-width",
-]
-
-[[package]]
 name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2521,6 +2374,153 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "fs2",
+ "futures",
+ "globset",
+ "httpdate",
+ "ignore",
+ "image",
+ "kamadak-exif",
+ "libc",
+ "regex",
+ "reqwest",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-ext-host",
+ "rpi-test-support",
+ "rpi-tui",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "syntect",
+ "syntect-assets",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "url",
+]
+
+[[package]]
+name = "rpi-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures",
+ "ignore",
+ "libc",
+ "reqwest",
+ "rpi-ai",
+ "rpi-test-support",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "rpi-ai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "fs2",
+ "futures",
+ "hmac",
+ "httpdate",
+ "jsonschema",
+ "libc",
+ "oauth2",
+ "regex",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "url",
+ "zstd",
+]
+
+[[package]]
+name = "rpi-ext-host"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "async-trait",
+ "rpi-agent",
+ "rpi-ai",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "wasmtime",
+]
+
+[[package]]
+name = "rpi-test-native-plugin"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "rpi-ext-host",
+ "serde_json",
+]
+
+[[package]]
+name = "rpi-test-support"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "rpi-agent",
+ "rpi-ai",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "rpi-tui"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "comrak",
+ "crossterm",
+ "regex",
+ "rpi-test-support",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Pir fixtures generator (runbook step: design doc §10.2).
+ * Rpi fixtures generator (runbook step: design doc §10.2).
  *
  * Runs the pinned upstream Pi (@ pi 0.82.1, external/pi @ 2efa728) with the
  * faux provider and fixed prompt scripts over the SDK (`createAgentSession`),
@@ -17,7 +17,7 @@
  * Usage:  node fixtures/generate-fixtures.mjs [scenario ...]
  * Default: regenerate all scenarios. Deterministic: fixed scripts, fixed faux
  * ids, temp dirs; volatile fields (timestamps/ids/paths) are stripped by the
- * pir-test-support normalizer at diff time, not here.
+ * rpi-test-support normalizer at diff time, not here.
  */
 
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -233,7 +233,7 @@ function eventReplacer(_key, value) {
 }
 
 async function runScenario(name, scenario) {
-	const root = mkdtempSync(join(tmpdir(), `pir-fixture-${name}-`));
+	const root = mkdtempSync(join(tmpdir(), `rpi-fixture-${name}-`));
 	const workspace = join(root, "workspace");
 	const agentDir = join(root, "agent");
 	mkdirSync(workspace, { recursive: true });

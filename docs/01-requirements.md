@@ -1,6 +1,6 @@
-# Pir 需求规格说明书（1:1 对齐 Pi v0.82.1）
+# Rpi 需求规格说明书（1:1 对齐 Pi v0.82.1）
 
-> 本文档定义 `pir` 必须达到的功能与行为。除非标注 **[DEFER]** 或 **[VARIANT]**，均要求与 Pi 行为一致。
+> 本文档定义 `rpi` 必须达到的功能与行为。除非标注 **[DEFER]** 或 **[VARIANT]**，均要求与 Pi 行为一致。
 > 对照源：`external/pi/packages/{ai,agent,tui,coding-agent}` @ `2efa728`（v0.82.1）
 > 范围决策：[ADR-0003](./adr/0003-coverage-review-scope-decisions.md)
 
@@ -16,7 +16,7 @@
 
 1. **行为对拍**：同一配置下，print/json/rpc 模式对同一 prompt 的工具调用序列、session JSONL 结构、事件类型与 Pi 一致（允许时间戳/随机 ID 差异）。
 2. **会话互通**：能加载并续跑 Pi 生成的 session JSONL（v1–v3 自动迁移仅限主路径 SessionManager；agent harness 的 JsonlSessionStorage 硬性要求 v3，见 §6.1）。
-3. **资源互通**：Skills / Prompt Templates / Themes / Settings / Keybindings / `models.json` 文件格式兼容；Auth 凭据存储（credential store）JSON 结构与 Pi 兼容（仅路径在 `~/.pir` 下，可手动拷贝迁移登录态）。
+3. **资源互通**：Skills / Prompt Templates / Themes / Settings / Keybindings / `models.json` 文件格式兼容；Auth 凭据存储（credential store）JSON 结构与 Pi 兼容（仅路径在 `~/.rpi` 下，可手动拷贝迁移登录态）。
 4. **架构同构**：四层 crate 边界与 Pi 四包对应。
 5. **扩展**：ExtensionAPI **形状同构**，实现为 **Rust / Wasm**（见 [ADR-0001](./adr/0001-extension-and-config-dir.md)）。**不要求**兼容现有 TypeScript / jiti pi-package 扩展。
 
@@ -28,14 +28,14 @@
 
 ### 1.4 命名与路径（已决策）
 
-| 项 | Pi | Pir（默认） |
+| 项 | Pi | Rpi（默认） |
 |----|-----|-------------|
-| CLI | `pi` | `pir` |
-| 全局配置 | `~/.pi/agent` | **`~/.pir/agent`** |
-| 项目配置 | `.pi` | **`.pir`** |
-| 环境变量前缀 | `PI_*` | **`PIR_*`** |
+| CLI | `pi` | `rpi` |
+| 全局配置 | `~/.pi/agent` | **`~/.rpi/agent`** |
+| 项目配置 | `.pi` | **`.rpi`** |
+| 环境变量前缀 | `PI_*` | **`RPI_*`** |
 
-子目录布局镜像 Pi（`sessions/`、`settings.json`、`extensions/`、`skills/` 等），仅根目录名不同。环境变量名按 APP_NAME 派生（如 `PI_CODING_AGENT_DIR` → `PIR_CODING_AGENT_DIR`）。详见 [ADR-0001](./adr/0001-extension-and-config-dir.md)。
+子目录布局镜像 Pi（`sessions/`、`settings.json`、`extensions/`、`skills/` 等），仅根目录名不同。环境变量名按 APP_NAME 派生（如 `PI_CODING_AGENT_DIR` → `RPI_CODING_AGENT_DIR`）。详见 [ADR-0001](./adr/0001-extension-and-config-dir.md)。
 
 不默认读写 `~/.pi` / `.pi`，**不提供**路径迁移工具。Session **文件格式**与钉死版 Pi JSONL 对齐。对照版本见 [`UPSTREAM.md`](../UPSTREAM.md) / [ADR-0002](./adr/0002-baseline-decisions.md)。
 
@@ -45,7 +45,7 @@
 
 1. **行为 1:1（对拍保证）**：事件序、session JSONL 格式与 v1–v3 迁移、KnownApi 协议适配、compaction 与 token 估算、CLI 标志与 slash 命令、声明式资源格式（Skills / Prompts / Themes / Settings / Keybindings / `models.json` / 凭据存储）、TUI 行为与渲染、RPC 帧语义。以 fixtures 对拍与黄金文件验收（见 §11）。
 2. **API 形状同构（实现重写）**：扩展系统。ExtensionAPI 的形状、事件语义与能力面对齐，但扩展须以 Rust/Wasm 重写；**不兼容**现有 TS / jiti pi-package（[ADR-0001](./adr/0001-extension-and-config-dir.md)）。
-3. **有意差异（ADR 钉死）**：CLI 名 `pir`、配置根 `~/.pir`、环境变量前缀 `PIR_*`（§1.4）；扩展包格式（Wasm 包替代 npm pi-package）；Rust SDK 替代 Node SDK；仅 JSONL 存储；无 `~/.pi` 迁移工具；范围排除项（§15）。（ADR-0001 / [ADR-0002](./adr/0002-baseline-decisions.md) / [ADR-0003](./adr/0003-coverage-review-scope-decisions.md)）
+3. **有意差异（ADR 钉死）**：CLI 名 `rpi`、配置根 `~/.rpi`、环境变量前缀 `RPI_*`（§1.4）；扩展包格式（Wasm 包替代 npm pi-package）；Rust SDK 替代 Node SDK；仅 JSONL 存储；无 `~/.pi` 迁移工具；范围排除项（§15）。（ADR-0001 / [ADR-0002](./adr/0002-baseline-decisions.md) / [ADR-0003](./adr/0003-coverage-review-scope-decisions.md)）
 
 约束：新增行为级偏差只能通过新 ADR 进入第 3 层；不允许以「Rust 实现差异」为由放宽第 1 层。
 
@@ -75,7 +75,7 @@
 - 单向事件流，无命令环；同样先 `bindExtensions(mode: "json")`、支持多条顺序 prompt
 - 事件全集：`AgentEvent` 基类 + `agent_end{willRetry}` / `agent_settled` / `queue_update` / `compaction_start|end` / `entry_appended` / `session_info_changed` / `thinking_level_changed` / `auto_retry_start|end` / `summarization_retry_*` / `bash_execution_update` / `extension_error`
 
-### 2.4 RPC（`--mode rpc` 及独立入口 `pir-rpc`）
+### 2.4 RPC（`--mode rpc` 及独立入口 `rpi-rpc`）
 
 - stdin/stdout **严格 LF** JSONL：只按 `\n` 分帧（容忍行尾 `\r`），**不得**用按 Unicode 行分隔符（U+2028/U+2029）拆分的 reader
 - 命令 + `type:"response"` + 异步 events；`prompt` 的成功响应在 preflight 通过后异步发出，失败走 error 响应；JSON 解析失败回 `command:"parse"` 错误
@@ -133,11 +133,11 @@
 | `--list-models [search]` | 列出模型（provider/model/context/max-out/thinking/images 表格），可选模糊搜索 |
 | `--approve` / `-a`，`--no-approve` / `-na` | 本次运行信任 / 忽略项目本地文件（project trust） |
 | `--verbose` | 覆盖 `quietStartup` 设置 |
-| `--offline` / `-h` / `-v` | 离线（同时设 `PIR_SKIP_VERSION_CHECK`）/ 帮助 / 版本 |
+| `--offline` / `-h` / `-v` | 离线（同时设 `RPI_SKIP_VERSION_CHECK`）/ 帮助 / 版本 |
 | `@file` 位置参数（可多个） | 文本包 `<file name=...>` 标签；图片转 ImageContent（autoResize 2000×2000，空文件跳过，不存在 exit 1）；RPC 模式禁止 |
 | **未知 `--flag`** | 收集为扩展标志（`extensionFlagValues`）透传扩展；help 动态追加 "Extension CLI Flags" 段；单个 `-x` 未知短选项为 error diagnostic |
 
-诊断体系：args/settings 解析产生 warning/error diagnostics（带 scope 前缀），有 error 即 exit 1；扩展加载失败附 `pir -ne` 提示。
+诊断体系：args/settings 解析产生 warning/error diagnostics（带 scope 前缀），有 error 即 exit 1；扩展加载失败附 `rpi -ne` 提示。
 
 首次运行（interactive）：主题选择 + analytics opt-in。
 
@@ -145,11 +145,11 @@
 
 | 命令 | 行为 |
 |------|------|
-| `pir install <source> [-l]` | source 类型：`npm:`（`name@version`，精确版本=pinned）、`git:`（`github.com/u/r`、`git@host:u/r` 简写）、`https://`、`ssh://`、本地路径；**裸名按本地路径解析**。安装后写入 settings；`-l` 写项目级 `.pir/settings.json` |
-| `pir remove` / `uninstall <source> [-l]` | 卸载包（alias）；无匹配 exit 1 |
-| `pir list` | User/Project 分组、`(filtered)` 标记、安装路径 |
-| `pir update` | 裸命令 = 仅 self + 打印 "Extensions are skipped" 提示；`--self`/`pi`（alias，`--force` 强制重装，release `note` Markdown 渲染）、`--all`、`--extensions`、`--models`（刷新模型 catalog，15s 超时，互斥）、`--extension <source>`（仅一次）；互斥矩阵对齐 `package-manager-cli.ts`；`update` 只使用已保存 trust，永不弹窗 |
-| `pir config [-l]` | TUI（Tab 切 global/project scope）启用/禁用 extensions、skills、prompts、themes；`-l` 要求项目已信任 |
+| `rpi install <source> [-l]` | source 类型：`npm:`（`name@version`，精确版本=pinned）、`git:`（`github.com/u/r`、`git@host:u/r` 简写）、`https://`、`ssh://`、本地路径；**裸名按本地路径解析**。安装后写入 settings；`-l` 写项目级 `.rpi/settings.json` |
+| `rpi remove` / `uninstall <source> [-l]` | 卸载包（alias）；无匹配 exit 1 |
+| `rpi list` | User/Project 分组、`(filtered)` 标记、安装路径 |
+| `rpi update` | 裸命令 = 仅 self + 打印 "Extensions are skipped" 提示；`--self`/`pi`（alias，`--force` 强制重装，release `note` Markdown 渲染）、`--all`、`--extensions`、`--models`（刷新模型 catalog，15s 超时，互斥）、`--extension <source>`（仅一次）；互斥矩阵对齐 `package-manager-cli.ts`；`update` 只使用已保存 trust，永不弹窗 |
+| `rpi config [-l]` | TUI（Tab 切 global/project scope）启用/禁用 extensions、skills、prompts、themes；`-l` 要求项目已信任 |
 
 所有子命令在 `parseArgs` 之前分流处理；各支持 `-a/-na` trust 覆盖与独立 `--help`。
 
@@ -160,11 +160,11 @@
 
 ### 3.3 环境变量
 
-进程级（文档级对齐 `docs/environment-variables.md`，名前綴 `PI_` → `PIR_`）：
-`PIR_CODING_AGENT`（进程标记，SDK 嵌入不设）、`PIR_CODING_AGENT_DIR`、`PIR_CODING_AGENT_SESSION_DIR`、`PIR_PACKAGE_DIR`、`PIR_OFFLINE`、`PIR_SKIP_VERSION_CHECK`、`PIR_TELEMETRY`、`PIR_CACHE_RETENTION`、`PIR_SHARE_VIEWER_URL`、`PIR_HARDWARE_CURSOR`、`PIR_CLEAR_ON_SHRINK`、`PIR_EXPERIMENTAL`、`PIR_TIMING`、`PIR_STARTUP_BENCHMARK`、`PIR_DEBUG_REDRAW`、`PIR_TUI_WRITE_LOG`、`VISUAL`/`EDITOR`、`HTTP_PROXY`/`HTTPS_PROXY`/`no_proxy`、`GIT_TERMINAL_PROMPT`/`GIT_SSH_COMMAND`，及各 provider API key 变量（见 §5.6）。
+进程级（文档级对齐 `docs/environment-variables.md`，名前綴 `PI_` → `RPI_`）：
+`RPI_CODING_AGENT`（进程标记，SDK 嵌入不设）、`RPI_CODING_AGENT_DIR`、`RPI_CODING_AGENT_SESSION_DIR`、`RPI_PACKAGE_DIR`、`RPI_OFFLINE`、`RPI_SKIP_VERSION_CHECK`、`RPI_TELEMETRY`、`RPI_CACHE_RETENTION`、`RPI_SHARE_VIEWER_URL`、`RPI_HARDWARE_CURSOR`、`RPI_CLEAR_ON_SHRINK`、`RPI_EXPERIMENTAL`、`RPI_TIMING`、`RPI_STARTUP_BENCHMARK`、`RPI_DEBUG_REDRAW`、`RPI_TUI_WRITE_LOG`、`VISUAL`/`EDITOR`、`HTTP_PROXY`/`HTTPS_PROXY`/`no_proxy`、`GIT_TERMINAL_PROMPT`/`GIT_SSH_COMMAND`，及各 provider API key 变量（见 §5.6）。
 
-bash 工具会话注入（仅 LLM bash 工具，**不注入**用户 `!`/`!!`；spawnHook 之前注入；未启用时删除继承的 `PIR_*` 防串味）：
-`PIR_SESSION_ID`、`PIR_SESSION_FILE`、`PIR_PROVIDER`、`PIR_MODEL`、`PIR_REASONING_LEVEL`——每次命令启动时解析，模型切换即时生效。
+bash 工具会话注入（仅 LLM bash 工具，**不注入**用户 `!`/`!!`；spawnHook 之前注入；未启用时删除继承的 `RPI_*` 防串味）：
+`RPI_SESSION_ID`、`RPI_SESSION_FILE`、`RPI_PROVIDER`、`RPI_MODEL`、`RPI_REASONING_LEVEL`——每次命令启动时解析，模型切换即时生效。
 
 ### 3.4 平台文档级需求
 
@@ -229,7 +229,7 @@ Agent 事件 10 种，**载荷结构同为契约**：
 
 ### 4.4 Harness 层（完整移植，ADR-0003 §1）
 
-对齐 `packages/agent/src/harness/`，作为 `pir-agent` 的可选层（`pir` CLI 主路径不经过它，但行为须可对拍）：
+对齐 `packages/agent/src/harness/`，作为 `rpi-agent` 的可选层（`rpi` CLI 主路径不经过它，但行为须可对拍）：
 
 - `AgentHarness`：phase 状态机（idle/turn/compaction/branch_summary/retry）；turn snapshot vs config 分离（setters 立即生效但只影响下一 turn）；三队列（steer/followUp/**nextTurn**，nextTurn 于下次 prompt 并入头部）；错误归一化（`AgentHarnessError` 等结构化错误码，**能力层不抛异常、错误走 Result**）
 - harness 事件 22 种：`queue_update` / `save_point` / `abort` / `settled` / `before_agent_start` / `context` / `before_provider_request` / `before_provider_payload` / `after_provider_response` / `tool_call` / `tool_result` / `session_before_compact` / `session_compact` / `session_before_tree` / `session_tree` / `retry_scheduled` / `retry_attempt_start` / `retry_finished` / `model_update` / `thinking_level_update` / `tools_update` / `resources_update`；subscribe/on 双订阅模型——`subscribe` 为纯观察 listener（支持 `*` 通配、无返回值），`on(type, handler)` 为带返回值的 hook；多 handler 顺序执行、最后一个非 undefined 结果胜出；`before_provider_request` 类 patch 型 hook 则把各 handler 的 patch 依次归约
@@ -255,7 +255,7 @@ Agent 事件 10 种，**载荷结构同为契约**：
 
 公共：截断常数 `DEFAULT_MAX_LINES=2000`、`DEFAULT_MAX_BYTES=50KB`、`GREP_MAX_LINE_LENGTH=500`；truncateHead 不截整行（首行超限返回 firstLineExceedsLimit）；truncateTail 末行可部分截断（UTF-8 边界感知）；write/edit 经 file mutation queue 按 **realpath** 串行化（ENOENT 退化 resolve 路径；abort 不在事件回调里 reject）；工具可插拔 operations（ReadOperations/BashOperations 等，供扩展/沙箱改道）。
 
-用户 `!`/`!!` bash 走**独立 bash-executor 路径**（非工具）：滚动缓冲 2×50KB、超 50KB 开临时文件；stripAnsi + 二进制清洗 + 去 `\r`；无超时参数；**不注入 `PIR_*` 会话变量**；`!!` 置 `excludeFromContext`；结果存 `bashExecution` 消息，流式期间挂起、agent_end 时 flush（保 tool_use/tool_result 顺序）。
+用户 `!`/`!!` bash 走**独立 bash-executor 路径**（非工具）：滚动缓冲 2×50KB、超 50KB 开临时文件；stripAnsi + 二进制清洗 + 去 `\r`；无超时参数；**不注入 `RPI_*` 会话变量**；`!!` 置 `excludeFromContext`；结果存 `bashExecution` 消息，流式期间挂起、agent_end 时 flush（保 tool_use/tool_result 顺序）。
 
 工具控制：`--tools/-t` allowlist、`--exclude-tools/-xt` denylist（deny 后于 allow）、`--no-tools/-nt` 全禁、`--no-builtin-tools/-nbt` 只禁内置；扩展工具可同名覆盖内置（`Map.set` 语义）。
 
@@ -280,7 +280,7 @@ Agent 事件 10 种，**载荷结构同为契约**：
 
 - **openai-completions**：**compat URL 自动检测矩阵**（zai/together/moonshot/openrouter/cloudflare/nvidia/ant-ling/cerebras/xai/chutes/deepseek/opencode 等 → `supportsStore/developerRole/reasoningEffort/maxTokensField/strictMode/thinkingFormat/sessionAffinityFormat/longCacheRetention` 默认值；`model.compat` 部分覆盖时未设置字段回落检测值）；10 种 `thinkingFormat`；`prompt_cache_key`（sessionId 截 64）与 `prompt_cache_retention:"24h"`；`store:false`；`stream_options.include_usage`；usage 兜底读 `choice.usage`（Moonshot）；OpenRouter 路由偏好全字段 + `cacheControlFormat:"anthropic"` + `x-session-id`；grammar tools（lark 优先于 regex，单调增量校验）；`zaiToolStream`；Kimi deferred tools 序列化；session affinity 三格式；compat 字段全集 21 个：supportsStore, supportsDeveloperRole, supportsReasoningEffort, supportsUsageInStreaming, maxTokensField, requiresToolResultName, requiresAssistantAfterToolResult, requiresThinkingAsText, requiresReasoningContentOnAssistantMessages, thinkingFormat, chatTemplateKwargs, openRouterRouting, vercelGatewayRouting, zaiToolStream, supportsOpenAIGrammarTools, supportsStrictMode, cacheControlFormat, sendSessionAffinityHeaders, deferredToolsMode, sessionAffinityFormat, supportsLongCacheRetention；`thinkingFormat` 10 个取值：openai, openrouter, deepseek, together, zai, qwen, chat-template, qwen-chat-template, string-thinking, ant-ling
 - **openai-responses**：encrypted reasoning 持久化（终态回填缺失字段）；`TextSignatureV1`（item id + phase）；tool_search 延迟工具；`prompt_cache_options`；`max_output_tokens` 下限 16；tool call id 为 `call_id|item_id` 复合格式，跨模型（foreign）item id 以 `fc_<shortHash>` 重建（截 64）并强制 `fc_` 前缀；compat 结构 7 字段：supportsDeveloperRole（默认 true）、sessionAffinityFormat（openai/openai-nosession/openrouter）、supportsLongCacheRetention（默认 true，控制 `prompt_cache_retention:"24h"`）、supportsStrictMode、supportsOpenAIGrammarTools、supportsToolSearch、supportsExplicitPromptCacheMode（后三默认 false）；azure-openai-responses 与 openai-codex-responses 复用同一 compat 类型
-- **openai-codex-responses**：WebSocket 传输（按 sessionId 连接缓存：5min 空闲 TTL / 55min 最大年龄；WS 失败该 session 永久回退 SSE；连接数超限与 `previous_response_not_found` 各重试一次）；SSE 路径 **zstd 压缩请求体**（level 3，`Content-Encoding: zstd`）；`chatgpt-account-id`（从 JWT claim 解析）；`originator: "pi"`（**字节级对齐，实现时不得写成 `pir`**）；User-Agent 同样以 `pi (` 开头（`pi (<platform> <release>; <arch>)`）；`store:false` + `instructions` + `include:["reasoning.encrypted_content"]` + `text.verbosity:"low"`；service tier 价格乘数（flex ×0.5、priority ×2/×2.5）；WebSocket 缓存续传机制——以 lastRequestBody.input + lastResponseItems 为基线做前缀校验后计算 input delta，有效且有 lastResponseId 时发送 `{previous_response_id, input: delta}`
+- **openai-codex-responses**：WebSocket 传输（按 sessionId 连接缓存：5min 空闲 TTL / 55min 最大年龄；WS 失败该 session 永久回退 SSE；连接数超限与 `previous_response_not_found` 各重试一次）；SSE 路径 **zstd 压缩请求体**（level 3，`Content-Encoding: zstd`）；`chatgpt-account-id`（从 JWT claim 解析）；`originator: "pi"`（**字节级对齐，实现时不得写成 `rpi`**）；User-Agent 同样以 `pi (` 开头（`pi (<platform> <release>; <arch>)`）；`store:false` + `instructions` + `include:["reasoning.encrypted_content"]` + `text.verbosity:"low"`；service tier 价格乘数（flex ×0.5、priority ×2/×2.5）；WebSocket 缓存续传机制——以 lastRequestBody.input + lastResponseItems 为基线做前缀校验后计算 input delta，有效且有 lastResponseId 时发送 `{previous_response_id, input: delta}`
 - **azure-openai-responses**：`AZURE_OPENAI_BASE_URL` 归一化（自动补 `/openai/v1`）/ `AZURE_OPENAI_RESOURCE_NAME`；`AZURE_OPENAI_API_VERSION` 默认 `v1`；`AZURE_OPENAI_DEPLOYMENT_NAME_MAP`；options 新增 6 字段（reasoningEffort/reasoningSummary + Azure 专属 azureApiVersion/azureResourceName/azureBaseUrl/azureDeploymentName）；Azure host 按 3 后缀识别（`.openai.azure.com`/`.cognitiveservices.azure.com`/`.ai.azure.com`），命中且路径为空/`/`/`/openai`/`/openai/v1/responses` 时归一化为 `/openai/v1`
 - **anthropic-messages**：OAuth token（含 `sk-ant-oat`）走 **Claude Code 身份伪装**（system 前缀注入、`user-agent: claude-cli/…`、`x-app: cli`、beta 头）+ **工具名 canonical 大小写映射表**；自适应 thinking（`output_config.effort`）vs 预算 thinking（`budget_tokens`）双轨；`thinkingDisplay` 默认 `"summarized"`；interleaved/fine-grained beta 头；`cache_control: ephemeral`（long → `ttl:"1h"`）；`x-session-affinity`；usage 从 `message_start` 即捕获（abort 也有 input 计数）；stop 映射含 `refusal`（→error）/`pause_turn`（→stop）；tool call id 归一化（白名单字符、截 64）；deferred tools 用 `tool_reference`（默认规则：仅一方 Anthropic 模型、排除 Haiku 与 <4.5）；伪装字面值：Claude Code 版本 `2.1.75`（UA `claude-cli/2.1.75`）、beta 头 `claude-code-20250219` 与 `oauth-2025-04-20`、OAuth token 时注入的 system 前缀字面值 "You are Claude Code, Anthropic's official CLI for Claude."；工具名 canonical 映射 17 条（lowercase→canonical 双向）：Read, Write, Edit, Bash, Grep, Glob, AskUserQuestion, EnterPlanMode, ExitPlanMode, KillShell, NotebookEdit, Skill, Task, TaskOutput, TodoWrite, WebFetch, WebSearch
 - **google-generative-ai**：thinking 按模型族分流（Gemini 3 Pro/Flash、Gemma 4 用 `thinkingLevel` 且**无法真正关闭**——关时用最低 level 不带 `includeThoughts`；其余用 `thinkingBudget`，-1 动态）；`thoughtSignature` 保留；budget 档位表（minimal/low/medium/high）：2.5-pro=128/2048/8192/32768、2.5-flash-lite=512/2048/8192/24576、2.5-flash=128/2048/8192/24576、其余 -1（动态），options.thinkingBudgets 覆盖优先；usage 映射 input=promptTokenCount−cachedContentTokenCount、output=candidatesTokenCount+thoughtsTokenCount、cacheRead=cachedContentTokenCount、cacheWrite=0、reasoning=thoughtsTokenCount、totalTokens=totalTokenCount；function calling `VALIDATED` 模式；不支持函数调用流式（单个 toolcall_delta 给全量）；tool call id 自增生成
@@ -298,14 +298,14 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - **混合 API provider** 按 `model.api` 分发（github-copilot 3 API + `filterModels` 按 OAuth 侧 `availableModelIds` 过滤；opencode 4 API；opencode-go/xai/fireworks 各 2–3 API）
 - `createProvider` 动态 catalog 机制（radius 纯动态；llama.cpp 为 coding-agent 扩展，见 §9）；动态 overlay 与 baseline 按 id 合并；`refreshModels` 并发去重
 - cloudflare baseUrl 占位符（`{CLOUDFLARE_ACCOUNT_ID}` 等）分发前物化；AI Gateway 用 `cf-aig-authorization` 并删除 `Authorization`/`x-api-key`
-- 内置模型目录为**生成物**（数据源 models.dev）：`build.rs` 生成内置 + `pir update --models` 远程 overlay（`https://<endpoint>/api/models/providers/<id>`，ETag/If-None-Match、4 小时新鲜度、本地 generatedAt 比对）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag），`refresh({allowNetwork:false})` 离线恢复、`force` 跳过新鲜度
+- 内置模型目录为**生成物**（数据源 models.dev）：`build.rs` 生成内置 + `rpi update --models` 远程 overlay（`https://<endpoint>/api/models/providers/<id>`，ETag/If-None-Match、4 小时新鲜度、本地 generatedAt 比对）；`ModelsStore` 持久化（models/lastModified/checkedAt/etag），`refresh({allowNetwork:false})` 离线恢复、`force` 跳过新鲜度
 - 远程 catalog endpoint 可配置（ADR-0002 §8）
 
 ### 5.4 Auth
 
 - **解析顺序**：显式 `options.apiKey` → **credential store（命中即停，拥有 provider）** → ambient（env var / AWS profile / ADC）。OAuth 是 credential 的一种类型；过期时在 `modify` 锁内双重检查刷新；**刷新失败抛错且绝不静默回退 env key**
 - CredentialStore 契约：`read/list/modify/delete`；`modify` 是唯一写路径（按 provider 串行化 read-modify-write + 跨进程文件锁）；`list()` 只返回 `{providerId,type}` 不解析密钥；credential 判别式 `{type:"api_key",key?,env?} | {type:"oauth",refresh,access,expires,...}` 与 Pi `auth.json` 兼容（0600）
-- env 变量表逐 provider 对齐（`docs/providers.md` 33 家对照表，上游 pi 仓库文档；pir 侧权威对照表为 `env_keys.rs` 全表）；Anthropic 三变量优先级 `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY`（`ANTHROPIC_AUTH_TOKEN` 命中时产生 `Authorization: Bearer <token>` 头，`ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` 走 apiKey（x-api-key）路径）
+- env 变量表逐 provider 对齐（`docs/providers.md` 33 家对照表，上游 pi 仓库文档；rpi 侧权威对照表为 `env_keys.rs` 全表）；Anthropic 三变量优先级 `ANTHROPIC_AUTH_TOKEN` > `ANTHROPIC_OAUTH_TOKEN` > `ANTHROPIC_API_KEY`（`ANTHROPIC_AUTH_TOKEN` 命中时产生 `Authorization: Bearer <token>` 头，`ANTHROPIC_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` 走 apiKey（x-api-key）路径）
 - **key 值解析 DSL**（auth.json 与 models.json 通用）：`!cmd` 执行命令取 stdout、`$VAR`/`${VAR}` 插值、`$$`/`$!` 转义
 - **OAuth 流程 7 个**：anthropic（PKCE + 本地回调与 manual_code 竞速）、openai-codex（PKCE、`id_token_add_organizations`、originator）、github-copilot（**device code**，enterprise 域名、per-account baseUrl、登录时拉 `availableModelIds`；登录成功后对每个已知模型 POST `${baseUrl}/models/{id}/policy`（body `{state:"enabled"}`，头 `openai-intent: chat-policy`）做 policy-enable，缺失会导致 Claude/Grok 等模型首次登录后不可用）、openrouter（PKCE 换**永久 API key**，refresh no-op）、kimi-coding、xai、radius；device code 流程实际覆盖 5 个 provider——github-copilot、kimi-coding、xai、radius（均为 RFC 8628 device_code grant）+ openai-codex（OpenAI 私有 deviceauth 端点变体，`/api/accounts/deviceauth/usercode|token`，验证 URI `/codex/device`）；device 轮询遵循 RFC 8628（默认 5s、slow_down +5s、下限 1s、WSL 时钟漂移错误信息）
 - provider 自有 login：Bedrock（bearer-token/aws-profile/credential-chain）、Vertex（api-key/adc/service-account）、Cloudflare（多字段 prompt 存 `credential.env`）
@@ -325,7 +325,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - Token / cost / cache 统计：`calculateCost` 支持 `cost.tiers` 阶梯定价（tier 匹配口径 inputTokens = input + cacheRead + cacheWrite（**不含 output**），取满足 inputTokens > inputTokensAbove 的最高阈值 tier，命中 tier 的全套费率 request-wide 应用）；cacheWrite 拆分——长时档 cacheWrite1h（仅 Anthropic 上报，`ephemeral_1h_input_tokens`）按 2× input 基础费率（硬编码），短时档 = cacheWrite − cacheWrite1h 按 cacheWrite 费率，cost.cacheWrite = (rates.cacheWrite·short + rates.input·2·long)/1e6；Codex service tier 乘数；totalTokens 由分量合成
 - **overflow 检测三分支**：错误文本 pattern 表（含非溢出排除表）/ z.ai 静默溢出（stop 但 input+cacheRead > window）/ Xiaomi 截断式（length + output=0 + input≥99% window）
 - `sessionId` 选项：驱动 prompt_cache_key、session affinity headers、Codex WS 连接复用、faux cache 模拟
-- `cacheRetention`（`none|short|long`，默认 short）：Anthropic ephemeral/1h、OpenAI 24h、Bedrock cachePoint、Mistral promptCacheKey；`PIR_CACHE_RETENTION=long` 遗留 env
+- `cacheRetention`（`none|short|long`，默认 short）：Anthropic ephemeral/1h、OpenAI 24h、Bedrock cachePoint、Mistral promptCacheKey；`RPI_CACHE_RETENTION=long` 遗留 env
 - Transport 偏好：`sse|websocket|websocket-cached|auto`（设置项；仅 openai-codex-responses 实现 WebSocket，其余静默忽略）
 - 钩子：`onPayload`（可替换 payload）/ `onResponse` / `transformHeaders`（Models 层分发前剥离）；header 大小写不敏感合并、`null` 值删除低层默认
 - 校验：工具参数 JSON Schema 运行时校验双路径——schema 带 TypeBox symbol 时只做 Value.Convert 前奏 + Compile 校验，纯 JSON-Schema 时额外递归自定义强转；强转表：number←{null→0, 非空数字字符串→Number, bool→1/0}；integer←同 number 但仅接受整数值（isInteger vs isFinite）；boolean←{null→false, "true"/"false", 1/0}；string←{null→"", number/bool→String}；null←{""/0/false→null}；组合递归：allOf 逐支、anyOf/oneOf 取首个校验通过分支（clone 尝试）、type 数组按序取首个可转、object 按 properties/additionalProperties、array 按 items（tuple 对位）；流式 partial JSON 解析 + repair（控制字符转义、非法反斜杠加倍）；`sanitizeSurrogates` 去孤立 surrogate（Rust 落地注记：jsonschema 单路径替代 TypeBox 双路径、校验措辞差异、sanitize 恒等——见偏离 D-006 / D-007）
@@ -337,7 +337,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 
 ### 5.6 Provider 环境变量
 
-逐 provider 对齐 `docs/providers.md` 对照表（上游 pi 仓库文档，未随 `external/pi` vendored 子集落地；pir 侧权威对照表为 `crates/pir-ai/src/auth/env_keys.rs` 全表）与 `env-api-keys.ts`（含各区域变体：`QWEN_TOKEN_PLAN_API_KEY`/`_CN_`、`ZAI_API_KEY`/`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`/`MINIMAX_CN_API_KEY`、Xiaomi 四端点等；Moonshot 双 provider 共用 `MOONSHOT_API_KEY`）。
+逐 provider 对齐 `docs/providers.md` 对照表（上游 pi 仓库文档，未随 `external/pi` vendored 子集落地；rpi 侧权威对照表为 `crates/rpi-ai/src/auth/env_keys.rs` 全表）与 `env-api-keys.ts`（含各区域变体：`QWEN_TOKEN_PLAN_API_KEY`/`_CN_`、`ZAI_API_KEY`/`ZAI_CODING_CN_API_KEY`、`MINIMAX_API_KEY`/`MINIMAX_CN_API_KEY`、Xiaomi 四端点等；Moonshot 双 provider 共用 `MOONSHOT_API_KEY`）。
 
 ---
 
@@ -346,8 +346,8 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 ### 6.1 存储
 
 - 第一版 **仅 JSONL**（不做 SQLite；存储抽象同构预留，ADR-0003）
-- 路径：`~/.pir/agent/sessions/--<cwd>--/<timestamp>_<uuid>.jsonl`；目录编码 = **去前导斜杠后**把 `/`、`\`、`:` 全部替换为 `-`；文件名 timestamp 的 `:`/`.` → `-`
-- 可覆盖：`--session-dir` / `PIR_CODING_AGENT_SESSION_DIR` / `settings.sessionDir`
+- 路径：`~/.rpi/agent/sessions/--<cwd>--/<timestamp>_<uuid>.jsonl`；目录编码 = **去前导斜杠后**把 `/`、`\`、`:` 全部替换为 `-`；文件名 timestamp 的 `:`/`.` → `-`
+- 可覆盖：`--session-dir` / `RPI_CODING_AGENT_SESSION_DIR` / `settings.sessionDir`
 - 版本迁移：v1 → v2（加 id/parentId；compaction 的 `firstKeptEntryIndex` 数字下标 → `firstKeptEntryId`）→ v3（message role `hookMessage` → `custom`）；加载时自动迁移并**整文件重写**；**分叉点**——「v1–v3 自动迁移」仅是主路径 SessionManager 的行为，harness 的 JsonlSessionStorage 硬性要求 header version === 3，非 v3 直接抛 invalid_session，不做 v1/v2 迁移
 - session id = uuidv7；entry id = randomUUID 前 8 位（hex），碰撞重试 100 次退回完整 UUID
 - Header：`{type:"session", version, id, timestamp(ISO), cwd, parentSession?}`
@@ -355,7 +355,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - **无文件锁**（append 直写，`wx` 首次创建保护）；锁仅用于 auth.json/settings/trust（proper-lockfile 等价物）
 - 读取健壮性：1MB 缓冲流式读、跳过畸形行；header 专用 4KB 缓冲/1MB 扫描上限（超限回退全量加载）
 - `--no-session` 内存会话
-- **不做** `~/.pi` → `~/.pir` 迁移工具；**不实现** Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3）
+- **不做** `~/.pi` → `~/.rpi` 迁移工具；**不实现** Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3）
 
 ### 6.2 条目类型（header + 9 种，另有 harness 独有 2 种）
 
@@ -378,7 +378,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 继续 / 恢复 / 按 id 打开（`--session` 三级解析，§3.1）
 - `/tree` 原地分支导航 + 可选 branch summarization；选中行为：选 user/custom_message → leaf 移到 **parentId** 且文本回填编辑器；选 assistant 等 → 移 leaf 留空编辑器；选根 user → 重置 leaf
 - `/fork`（position=before，返回 selectedText）、`/clone`（fork leaf, position=at）、CLI `--fork`
-- `/new`、import/export JSONL、HTML export、gist share（shell 调 `gh gist create --public=false` + `PIR_SHARE_VIEWER_URL` 拼接，默认 `https://resetpi.com/session/` 可配，ADR-0009）
+- `/new`、import/export JSONL、HTML export、gist share（shell 调 `gh gist create --public=false` + `RPI_SHARE_VIEWER_URL` 拼接，默认 `https://resetpi.com/session/` 可配，ADR-0009）
 - `/name`（写 `session_info` 条目，`\r\n`→空格 sanitize）、label/bookmark（空值清除）
 - `/resume` 选择器内 Ctrl+D 删除（优先 `trash` CLI）
 
@@ -418,13 +418,13 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 加载顺序：全局 agentDir 一份 → 从 cwd 到**文件系统根**的完整祖先链（根侧在前，**不以 git repo root 为界**），按路径去重
 - 注入格式：system prompt 尾部 `<project_context>` 内每文件包 `<project_instructions path="...">`
 - `-nc` 禁用；SDK 有 override；**无论 trust 与否都加载**
-- `.pir/SYSTEM.md` / `APPEND_SYSTEM.md`：覆盖/追加系统提示；**项目版需 trust 通过且优先于全局**；CLI `--system-prompt`/`--append-system-prompt` 支持文件路径或内联文本
+- `.rpi/SYSTEM.md` / `APPEND_SYSTEM.md`：覆盖/追加系统提示；**项目版需 trust 通过且优先于全局**；CLI `--system-prompt`/`--append-system-prompt` 支持文件路径或内联文本
 
 ### 7.2 Skills
 
 - Agent Skills 标准（Pi 宽松规则：name 可≠目录名，**仅 warning 不拒绝**）
-- **发现路径全集**：`~/.pir/agent/skills/`、`~/.agents/skills/`、`.pir/skills/`（trust 门控）、cwd 及祖先 `.agents/skills/`（**上界为 git repo root**，无 repo 到文件系统根；trust 门控；`~/.agents/skills` 从祖先扫描排除）、packages、settings `skills` 数组（glob/`!`/`+`/`-`）、CLI `--skill`
-- **两种发现模式**：pi 目录（`~/.pir/agent/skills`、`.pir/skills`、settings 路径）根级散放 `.md` 也算 skill；`.agents/skills` 忽略根级散放 `.md`，只认 `SKILL.md` 目录
+- **发现路径全集**：`~/.rpi/agent/skills/`、`~/.agents/skills/`、`.rpi/skills/`（trust 门控）、cwd 及祖先 `.agents/skills/`（**上界为 git repo root**，无 repo 到文件系统根；trust 门控；`~/.agents/skills` 从祖先扫描排除）、packages、settings `skills` 数组（glob/`!`/`+`/`-`）、CLI `--skill`
+- **两种发现模式**：pi 目录（`~/.rpi/agent/skills`、`.rpi/skills`、settings 路径）根级散放 `.md` 也算 skill；`.agents/skills` 忽略根级散放 `.md`，只认 `SKILL.md` 目录
 - 目录含 `SKILL.md` 即 skill root 不再递归；跳过 `.` 开头目录与 node_modules；遵守 `.gitignore`/`.ignore`/`.fdignore`；跟随符号链接
 - frontmatter：代码读 `name`（≤64、`^[a-z0-9-]+$`、不连续连字符、不首尾连字符；违规仅警告仍加载）、`description`（≤1024，**缺失则不加载**）、`disable-model-invocation`；spec 其余字段（license/compatibility/metadata/allowed-tools）解析但忽略
 - 渐进披露：system prompt 仅 `<available_skills>` XML（name/description/location），**且仅当 read 工具激活时注入**；`disable-model-invocation: true` 不进 prompt
@@ -434,7 +434,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 ### 7.3 Prompt Templates
 
 - `*.md` → `/name`（文件名去 `.md`）；**非递归**、跟随符号链接
-- 路径：`~/.pir/agent/prompts/`、`.pir/prompts/`（trust）、packages、settings、CLI `--prompt-template`
+- 路径：`~/.rpi/agent/prompts/`、`.rpi/prompts/`（trust）、packages、settings、CLI `--prompt-template`
 - frontmatter：`description`（缺省取正文首个非空行截 60 字符 + `...`）、`argument-hint`（`<>`/`[]` 语义）
 - 参数展开 DSL（引号感知 bash 风格解析；替换不递归；缺位 `$N` 展开为空串）：`$1..$N`、`$@`、`$ARGUMENTS`、`${N:-default}`、`${@:-default}`、`${ARGUMENTS:-default}`、切片 `${@:N}`、`${@:N:L}`（1-indexed）
 
@@ -443,12 +443,12 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 内置 dark/light；首次运行按终端背景自动选择；theme 设置值可为 `light/dark` 配对（parseAutoThemeSetting 拆分），终端配色检测链为 OSC 11 背景查询 → COLORFGBG → fallback，终端配色变化时动态切换
 - 自定义 JSON schema：`name`、`vars`（变量引用表）、`colors`（**51 必填 + `thinkingMax` 可选**，缺省回退 `thinkingXhigh`）、`export`（pageBg/cardBg/infoBg，HTML 导出用）
 - ColorValue 三形态：hex 字符串 / 0-255 整数（256 色）/ `""`（默认）
-- 路径：`~/.pir/agent/themes/`、`.pir/themes/`（trust）、packages、settings、CLI `--theme`；settings `theme` 值中 `/` 是 auto light/dark 分隔符（如 `light/dark`，parseAutoThemeSetting 拆分），主题 name 正则 `^[^/]+$` 禁止含 `/`，**无「按路径处理」分支**
-- 热重载：fs watcher **只 watch 全局 `~/.pir/agent/themes/<当前主题>.json`**，项目主题不 watch
+- 路径：`~/.rpi/agent/themes/`、`.rpi/themes/`（trust）、packages、settings、CLI `--theme`；settings `theme` 值中 `/` 是 auto light/dark 分隔符（如 `light/dark`，parseAutoThemeSetting 拆分），主题 name 正则 `^[^/]+$` 禁止含 `/`，**无「按路径处理」分支**
+- 热重载：fs watcher **只 watch 全局 `~/.rpi/agent/themes/<当前主题>.json`**，项目主题不 watch
 
 ### 7.5 Keybindings
 
-- **仅全局** `~/.pir/agent/keybindings.json`（无项目级）；值为 string 或 string[]
+- **仅全局** `~/.rpi/agent/keybindings.json`（无项目级）；值为 string 或 string[]
 - 命名空间 id：`tui.editor.*`/`tui.input.*`/`tui.select.*` + `app.*`；**旧键名自动迁移表 60+ 项**（保留，ADR-0003 §3）
 - 默认表 = pi-tui `TUI_KEYBINDINGS` + 42 个 `app.*`；平台差异默认值（win32 无 ctrl+z suspend、粘贴图片 win32 为 alt+v、macOS tree 方向键顺序不同）
 - 完整默认绑定表对齐 `docs/keybindings.md`（约 80 个动作，逐条对拍）；`/hotkeys` 查看；`/reload` 热应用
@@ -457,16 +457,16 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 ### 7.6 Packages
 
 - source 解析顺序：`npm:` 前缀 → 本地路径判定 → git URL（`git:` 简写两种；无前缀只认 `https?/ssh/git://`）→ 回退本地路径
-- npm：`name@version`，精确版本=pinned（更新跳过），range 用 semver maxSatisfying；安装到 `~/.pir/agent/npm/` / `.pir/npm/`；`npmCommand` argv wrapper 时 git 包依赖安装退化裸 `install`
-- git：克隆到 `~/.pir/agent/git/<host>/<path>` / `.pir/git/...`；**pinned ref 不移动但 update 会 reconcile 已有克隆到配置 ref**（reset+clean+必要时 install 依赖）；temporary scope 未 pin 且非离线时启动刷新
-- `-e` 临时加载：npm/git 装到 `~/.pir/agent/tmp/extensions`（0700）
+- npm：`name@version`，精确版本=pinned（更新跳过），range 用 semver maxSatisfying；安装到 `~/.rpi/agent/npm/` / `.rpi/npm/`；`npmCommand` argv wrapper 时 git 包依赖安装退化裸 `install`
+- git：克隆到 `~/.rpi/agent/git/<host>/<path>` / `.rpi/git/...`；**pinned ref 不移动但 update 会 reconcile 已有克隆到配置 ref**（reset+clean+必要时 install 依赖）；temporary scope 未 pin 且非离线时启动刷新
+- `-e` 临时加载：npm/git 装到 `~/.rpi/agent/tmp/extensions`（0700）
 - settings `packages`：string 或 object（`autoload:false` 时对 user 同名包做 delta）；过滤语法 glob / `!`排除 / `+`强制含 / `-`强制排除（SKILL.md 可按父目录名匹配）
 - 身份去重：npm 按包名、git 按 host/path（无 ref URL）、local 按绝对路径；project 覆盖 user
 - 资源优先级 rank：project settings > project auto > user settings > user auto > package
 - 离线跳过安装/更新；网络超时 10s；更新检查并发 4
 - 核心包须列 `peerDependencies:"*"`（声明式资源包布局对齐）
 
-> 实现注记（T14-W2，详见偏离 D-040）：落地于 `crates/pir/src/core/package_manager.rs` +
+> 实现注记（T14-W2，详见偏离 D-040）：落地于 `crates/rpi/src/core/package_manager.rs` +
 > `core/git_url.rs` + `cli/package_command.rs`。hosted-git-info 以五 host 子集自实现；
 > npm semver 用 `semver` crate + range 翻译层（`||`/`x` 通配/部分版本/完整版连字符范围，
 > prerelease range 等极端形式视为无效 range 回退）；glob 复用内置 matcher（`{a,b}`/`[abc]`
@@ -478,12 +478,12 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 > 并发 4 worker pool）、版本检查（`core/version_check.rs`，HTTP 经 `LatestVersionTransport`
 > 注入，endpoint 集中常量 `LATEST_VERSION_URL` 留 W6 配置化口子）与自更新
 >（`config.rs` self-update 段：install-method 检测、各包管理器命令构造、可写性检查）落地；
-> pir 恒为原生二进制，非包管理器安装按上游 bun-binary 结局打印 releases 页提示
->（`SELF_UPDATE_DOWNLOAD_URL` 常量）；release note 经 pir-tui Markdown identity 主题渲染。
+> rpi 恒为原生二进制，非包管理器安装按上游 bun-binary 结局打印 releases 页提示
+>（`SELF_UPDATE_DOWNLOAD_URL` 常量）；release note 经 rpi-tui Markdown identity 主题渲染。
 
 ### 7.7 Settings
 
-完整对齐 `docs/settings.md`（全局 `~/.pir/agent/settings.json` + 项目 `.pir/settings.json`）。全键清单（默认值）：
+完整对齐 `docs/settings.md`（全局 `~/.rpi/agent/settings.json` + 项目 `.rpi/settings.json`）。全键清单（默认值）：
 
 `lastChangelogVersion`、`defaultProvider`、`defaultModel`、`defaultThinkingLevel`(off)、`transport`(auto)、`steeringMode`/`followUpMode`(one-at-a-time)、`theme`、`compaction.{enabled:true,reserveTokens:16384,keepRecentTokens:20000}`、`branchSummary.{reserveTokens:16384,skipPrompt:false}`、`retry.{enabled:true,maxRetries:3,baseDelayMs:2000,provider.{timeoutMs,maxRetries:0,maxRetryDelayMs:60000}}`、`hideThinkingBlock`(false)、`showCacheMissNotices`(false)、`externalEditor`（>VISUAL>EDITOR>notepad/nano）、`shellPath`、`shellCommandPrefix`、`quietStartup`(false)、`defaultProjectTrust`(ask，仅全局)、`npmCommand`、`collapseChangelog`(false)、`enableInstallTelemetry`(true)、`enableAnalytics`(false)、`trackingId`（opt-in 生成 UUID）、`packages`、`extensions`、`skills`、`prompts`、`themes`、`enableSkillCommands`(true)、`terminal.{showImages:true,imageWidthCells:60,clearOnShrink:false,showTerminalProgress:false}`、`images.{autoResize:true,blockImages:false}`、`enabledModels`、`doubleEscapeAction`(tree)、`treeFilterMode`、`thinkingBudgets.{minimal,low,medium,high}`、`editorPaddingX`(0，0-3)、`outputPad`(1)、`autocompleteMaxVisible`(5，3-20)、`showHardwareCursor`、`markdown.codeBlockIndent`("  ")、`warnings.anthropicExtraUsage`(true)、`sessionDir`、`httpProxy`（仅全局）、`httpIdleTimeoutMs`(300000)、`websocketConnectTimeoutMs`(15000)。
 
@@ -493,11 +493,11 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 
 - `trust.json`（agentDir）：`{规范化绝对路径: true|false}`，null 删除；按 key 排序写盘 + 目录级 lockfile
 - 决策查找沿**父目录链向上取最近条目**
-- 触发条件 `hasTrustRequiringProjectResources`：`.pir/` 下存在 settings.json/extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md 任一，或 cwd/祖先存在 `.agents/skills`（`~/.agents/skills` 豁免）；裸 `.pir/` 目录不算；无此类资源直接 trusted
+- 触发条件 `hasTrustRequiringProjectResources`：`.rpi/` 下存在 settings.json/extensions/skills/prompts/themes/SYSTEM.md/APPEND_SYSTEM.md 任一，或 cwd/祖先存在 `.agents/skills`（`~/.agents/skills` 豁免）；裸 `.rpi/` 目录不算；无此类资源直接 trusted
 - 解析优先级链：`--approve`/`--no-approve` override → 扩展 `project_trust` 事件（yes/no/undecided，首个 yes/no 胜，`remember:true` 持久化）→ trust.json → `defaultProjectTrust`（always→true、never→false、ask→有 UI 弹窗、**无 UI 返回 false**）
 - 交互弹窗 5 选项：Trust / Trust parent folder (path) / Trust (this session only) / Do not trust / Do not trust (this session only)
 - **两阶段加载**：信任前仅 context 文件 + 全局/CLI/inline 扩展（可处理 `project_trust` 事件，handler ctx 为受限子集）；信任后 setProjectTrusted 并完整 reload
-- `/trust` 只写 trust.json、不重载当前会话；`pir config`/包管理命令同流程；`pir update` 永不提示
+- `/trust` 只写 trust.json、不重载当前会话；`rpi config`/包管理命令同流程；`rpi update` 永不提示
 
 > 实现注记（T14-W4，D-043）：决策链落 `core/trust_manager.rs::resolve_project_trusted`（同步；扩展事件经 `extension_event` 参数预发射，`ExtensionRunner::emit_project_trust` 默认 None 待 T15 接通）；启动弹窗落 `modes/interactive/startup_ui.rs::run_startup_selector`（复用 ExtensionSelectorComponent，hasUI=初始 runtime 且 interactive 且非 help/--list-models）；两阶段接线在 `app.rs` create_runtime（未信任建 services → 判定 → set_project_trusted + reload），差集锚点 `tests/resource_loader_test.rs::set_project_trusted_loads_second_phase_resources`。遗留：交互模式 resume 到异 cwd 的信任提示（上游 switchSession projectTrustContextFactory）未接线，`CreateRuntimeOptions.project_trust_context` 已留口子。
 
@@ -511,7 +511,7 @@ Startup header → messages → editor → footer。
 
 - **Footer 行 1**：`cwd（home 缩写 ~） (git branch) • session name`
 - **Footer 行 2**（左）：`↑input ↓output R<cacheRead> W<cacheWrite> CH<命中率>% $cost[ (sub)] <context%>/<window>[ (auto)] [• xp]`；context >70% 黄、>90% 红；（右）`[(provider)] model[ • thinking level]`；宽度不足逐级截断；第三行扩展 status（按 key 字母序单行截断）
-- **Header**：logo `pir v<version>` + 快捷键提示（紧凑/展开两态，**随 Ctrl+O 与工具展开联动**）+ onboarding 行 + changelog；`quietStartup` 时为空；扩展可 `setHeader` 整体替换
+- **Header**：logo `rpi v<version>` + 快捷键提示（紧凑/展开两态，**随 Ctrl+O 与工具展开联动**）+ onboarding 行 + changelog；`quietStartup` 时为空；扩展可 `setHeader` 整体替换
 
 ### 8.2 Editor
 
@@ -541,7 +541,7 @@ Startup header → messages → editor → footer。
 
 **隐藏/特殊**：`/debug`（写 debug log 到文件，无 autocomplete）；`/llama`（**内置 hidden 扩展注册**，非内置命令）；彩蛋 `/arminsayshi` `/dementedelves`（可 [DEFER]）。
 
-> 实现注记（T14-W6b，详见偏离 D-047）：llama.cpp 集成落 `crates/pir/src/extensions/llama/`（client/huggingface/provider/编排流）+ TUI `modes/interactive/components/llama_view.rs`。T15 宿主缺位期的等价接线：命令表 `extensions/mod.rs::BUILT_IN_EXTENSION_COMMANDS` + dispatch fall-through + autocomplete 直供；provider 进程级单例于 `create_agent_session_services` 注册（`register_native_provider`）。`/login` 的 api-key 通路（含 bare `/login` 的 auth-type 预选择器、`/login <provider>` 精确匹配直进、`Models/ModelRuntime::login/logout`）同波次接线；OAuth 对话框流仍为 stub（T13 遗留）。
+> 实现注记（T14-W6b，详见偏离 D-047）：llama.cpp 集成落 `crates/rpi/src/extensions/llama/`（client/huggingface/provider/编排流）+ TUI `modes/interactive/components/llama_view.rs`。T15 宿主缺位期的等价接线：命令表 `extensions/mod.rs::BUILT_IN_EXTENSION_COMMANDS` + dispatch fall-through + autocomplete 直供；provider 进程级单例于 `create_agent_session_services` 注册（`register_native_provider`）。`/login` 的 api-key 通路（含 bare `/login` 的 auth-type 预选择器、`/login <provider>` 精确匹配直进、`Models/ModelRuntime::login/logout`）同波次接线；OAuth 对话框流仍为 stub（T13 遗留）。
 
 **带参数形式**：`/model <模糊词>`（provider/id fuzzy）、`/export <path.html|jsonl>`、`/import <file.jsonl>`、`/name <名字>`、`/compact <自定义指令>`、`/login <provider>`（fuzzy）。
 
@@ -560,12 +560,12 @@ Startup header → messages → editor → footer。
 
 - **渲染**：CSI 2026 synchronized output 包裹；首次全量（不清屏）/ 全量清屏（`\x1b[2J\x1b[H\x1b[3J`）/ 行差分（含 append 快路径、纯删除快路径、无变化只移硬件光标）；**全量回退条件**：宽度变化、高度变化（**Termux 例外**）、clearOnShrink 收缩、`firstChanged < viewportTop`、删除行数超终端高度、`requestRender(force)`；16ms 节流；viewport 概念；行尾 SGR + OSC 8 reset；Kitty 图像差分区间扩展 + 先删旧图像
 - **输入**：stdin 分块重组（CSI/OSC/DCS/APC/鼠标跨 chunk）；bracketed paste 缓冲；Kitty keyboard（flags=7，**含 key release/repeat**，组件可声明 `wantsKeyRelease`）+ legacy 全表；DA 探测无 Kitty 应答立即回退 modifyOtherKeys（无超时等待）；退出前 drainInput 防序列泄漏
-- **Overlay/Focus/IME**：overlay 栈合成后差分；9 种 anchor + offset/百分比/min/max/margin/`visible()`；OverlayHandle（focus/unfocus/setHidden/hide）；focus 恢复状态机；`CURSOR_MARKER` 零宽 APC 序列定位硬件光标（默认隐藏，`showHardwareCursor`/`PIR_HARDWARE_CURSOR=1`）；容器组件传播 focused
+- **Overlay/Focus/IME**：overlay 栈合成后差分；9 种 anchor + offset/百分比/min/max/margin/`visible()`；OverlayHandle（focus/unfocus/setHidden/hide）；focus 恢复状态机；`CURSOR_MARKER` 零宽 APC 序列定位硬件光标（默认隐藏，`showHardwareCursor`/`RPI_HARDWARE_CURSOR=1`）；容器组件传播 focused
 - **组件（pi-tui 12 个）**：Text、Box、Container、Spacer、Markdown、Image、SelectList、Input、Editor、Loader、CancellableLoader、TruncatedText、SettingsList
 - **coding-agent 交互组件 40 个**：assistant-message、user-message、tool-execution、diff、bash-execution、branch-summary-message、compaction-summary-message、skill-invocation-message、custom-message、custom-entry、footer、custom-editor、extension-editor、extension-input、model-selector、scoped-models-selector、settings-selector、theme-selector、thinking-selector、login-dialog、oauth-selector、config-selector、session-selector(+search)、tree-selector、user-message-selector、trust-selector、extension-selector、show-images-selector、first-time-setup、bordered-loader、countdown-timer、status-indicator、keybinding-hints、dynamic-border、visual-truncate 等（彩蛋组件可 [DEFER]）
 - **Markdown**：marked 等价解析（Rust 落地为 **comrak 0.54** 替代 marked@18.0.5，AST 对应与 2 条残留边缘差异见偏离 D-018）；`trimPartialClosingFences()` 流式 fence 稳定（防代码块闪烁）；code block border + indent；主题 20+ 样式函数；语法高亮（**T17 落地，syntect 替代上游 hljs 10.7.3——高亮 ANSI 分段不与上游逐字节对拍，行为级偏离 D-051 / ADR-0008**）
 - **Image**：Kitty（`\x1b_G`，图像 ID 分配/删除/占位行）+ iTerm2（`\x1b]1337;File=`）；能力检测：kitty/ghostty/wezterm/warp → kitty 协议；iTerm2 → iterm2；**tmux/screen → 禁用图像**（tmux 探测 OSC 8 转发）；Windows Terminal/VSCode/Alacritty → 无图像有 hyperlink；JetBrains → 无 hyperlink；未知终端保守回退 `text (url)`；不支持时 `imageFallback`
-- **终端特例**：Windows Terminal（Ctrl+Backspace 启发、VT input 开启）、tmux（modifyOtherKeys 兼容、图像禁用）、Apple Terminal（Shift+Enter 归一化、原生修饰键检测）、Termux（高度变化不全量重绘）、Ghostty（`shift+enter=\n`）、WezTerm（kitty_keyboard Escape 特例）、screen/VSCode/Alacritty/JetBrains（能力层）（Rust 落地注记：Windows VT input（Shift+Tab 归一化）与 Apple Terminal Shift+Enter 归一化所依赖的**原生修饰键检测**为已知平台缺口——pir 无原生绑定，依 [ADR-0004](./adr/0004-platform-native-helper-gaps.md) 恒定走上游 addon 缺失回退路径；macOS / Windows 上对应键位与上游（有绑定时）不一致，Linux 行为与上游一致；见偏离 D-016）
+- **终端特例**：Windows Terminal（Ctrl+Backspace 启发、VT input 开启）、tmux（modifyOtherKeys 兼容、图像禁用）、Apple Terminal（Shift+Enter 归一化、原生修饰键检测）、Termux（高度变化不全量重绘）、Ghostty（`shift+enter=\n`）、WezTerm（kitty_keyboard Escape 特例）、screen/VSCode/Alacritty/JetBrains（能力层）（Rust 落地注记：Windows VT input（Shift+Tab 归一化）与 Apple Terminal Shift+Enter 归一化所依赖的**原生修饰键检测**为已知平台缺口——rpi 无原生绑定，依 [ADR-0004](./adr/0004-platform-native-helper-gaps.md) 恒定走上游 addon 缺失回退路径；macOS / Windows 上对应键位与上游（有绑定时）不一致，Linux 行为与上游一致；见偏离 D-016）
 - **终端自省四件套**：OSC 11 背景色查询（`\x1b]11;?\x07`）、CSI ?996n 配色模式查询（`\x1b[?996n`）、CSI 16t 像元查询（`\x1b[16t`）、OSC 9;4 任务栏进度上报（`\x1b]9;4;3\x07` indeterminate / `\x1b]9;4;0;\x07` clear，含 1s keepalive `TERMINAL_PROGRESS_KEEPALIVE_MS=1000`；对应 `terminal.showTerminalProgress` 设置）
 
 ---
@@ -574,11 +574,11 @@ Startup header → messages → editor → footer。
 
 ### 9.1 能力清单（API 形状 1:1）
 
-**加载**：jiti 等价机制不复制（TS 加载不做）；发现路径 `~/.pir/agent/extensions` 与 `.pir/extensions`（一层：散文件 + 子目录 index/manifest）、packages、CLI `-e`、inline factory（可 named/hidden）；模块缓存按 cwd+generation；同名冲突分项规则——工具/flag 首注册胜 + 有诊断；renderer 首注册胜且静默；命令（command）全部保留、重名加 `:N` 后缀（invocationName = `name:occurrence`），扩展间重名无诊断（仅与内置命令冲突时有诊断）；shortcut 为 last-wins + 诊断；`/reload`；内置 hidden llama.cpp 扩展。
+**加载**：jiti 等价机制不复制（TS 加载不做）；发现路径 `~/.rpi/agent/extensions` 与 `.rpi/extensions`（一层：散文件 + 子目录 index/manifest）、packages、CLI `-e`、inline factory（可 named/hidden）；模块缓存按 cwd+generation；同名冲突分项规则——工具/flag 首注册胜 + 有诊断；renderer 首注册胜且静默；命令（command）全部保留、重名加 `:N` 后缀（invocationName = `name:occurrence`），扩展间重名无诊断（仅与内置命令冲突时有诊断）；shortcut 为 last-wins + 诊断；`/reload`；内置 hidden llama.cpp 扩展。
 
 **事件全集 33 个**：`project_trust`、`resources_discover`（可补充 skill/prompt/theme 路径，reason: startup|reload）、`session_start`、`session_info_changed`、`session_before_switch`、`session_before_fork`、`session_before_compact`、`session_compact`、`session_shutdown`、`session_before_tree`、`session_tree`、`context`、`before_provider_request`、`before_provider_headers`、`after_provider_response`、`before_agent_start`、`agent_start`、`agent_end`、`agent_settled`、`turn_start`、`turn_end`、`message_start`、`message_update`、`message_end`、`tool_execution_start`、`tool_execution_update`、`tool_execution_end`、`model_select`、`thinking_level_select`、`user_bash`、`input`、`tool_call`、`tool_result`（对齐 `extensions.md` 生命周期图逐序列对拍）。
 
-**事件可变语义**：`tool_call` 原地改参或 block+reason；`tool_result` 改 content/details/isError/usage；`input` 三态（continue/transform/handled）；`user_bash` 换 operations 或整替 result；`before_agent_start` 注入 custom message + 链式替换 systemPrompt；`session_before_*` 字段级语义——`session_before_compact` 返回 {cancel?, compaction?}，compaction 提供完整 CompactionResult（summary/firstKeptEntryId/tokensBefore/estimatedTokensAfter?/usage?/details?）即整体接管并打 fromHook 标记；`session_before_tree` 返回 {cancel?, summary?, customInstructions?, replaceInstructions?, label?}，summary 仅在 summarize 模式下采用，后三者覆盖 preparation 同名字段；`session_before_fork` 声明 {cancel?, skipConversationRestore?} 但上游仅 cancel 生效（skipConversationRestore 为 reserved 字段）——pir 只实现 cancel 并登记该差异；`before_provider_request`（coding-agent 扩展层）handler 返回值**整体替换**请求 payload（unknown，非合并），多 handler 按注册顺序链式传递，返回 undefined 表示不替换；`before_provider_headers` handler 原地 mutate headers（Record<string, string|null>），返回值被忽略，值设为 null 删除该 header，在 attribution header 合并之后执行；`message_end` 可替换消息（保 role）；`context` 可替换 messages。
+**事件可变语义**：`tool_call` 原地改参或 block+reason；`tool_result` 改 content/details/isError/usage；`input` 三态（continue/transform/handled）；`user_bash` 换 operations 或整替 result；`before_agent_start` 注入 custom message + 链式替换 systemPrompt；`session_before_*` 字段级语义——`session_before_compact` 返回 {cancel?, compaction?}，compaction 提供完整 CompactionResult（summary/firstKeptEntryId/tokensBefore/estimatedTokensAfter?/usage?/details?）即整体接管并打 fromHook 标记；`session_before_tree` 返回 {cancel?, summary?, customInstructions?, replaceInstructions?, label?}，summary 仅在 summarize 模式下采用，后三者覆盖 preparation 同名字段；`session_before_fork` 声明 {cancel?, skipConversationRestore?} 但上游仅 cancel 生效（skipConversationRestore 为 reserved 字段）——rpi 只实现 cancel 并登记该差异；`before_provider_request`（coding-agent 扩展层）handler 返回值**整体替换**请求 payload（unknown，非合并），多 handler 按注册顺序链式传递，返回 undefined 表示不替换；`before_provider_headers` handler 原地 mutate headers（Record<string, string|null>），返回值被忽略，值设为 null 删除该 header，在 attribution header 合并之后执行；`message_end` 可替换消息（保 role）；`context` 可替换 messages。
 
 **API 方法全集（24 方法 + `events` 属性）**：`on()` + `registerTool` / `registerCommand` / `registerShortcut`（与内置键冲突按 `restrictOverride`）/ `registerFlag` + `getFlag` / `registerMessageRenderer` / `registerEntryRenderer` / `sendMessage`（deliverAs steer|followUp|nextTurn、triggerTurn）/ `sendUserMessage` / `appendEntry` / `setSessionName` / `getSessionName` / `setLabel` / `exec` / `getActiveTools` / `getAllTools` / `setActiveTools` / `getCommands` / `setModel` / `getThinkingLevel` / `setThinkingLevel` / `registerProvider`（双签名）/ `unregisterProvider` / `events`（共享 EventBus）。
 
@@ -609,7 +609,7 @@ Startup header → messages → editor → footer。
 - 扩展/包/skills 以用户权限运行；文档警告对齐（`docs/security.md`）
 - Containerization 文档三种模式可移植说明（Gondolin micro-VM 扩展 / 纯 Docker / OpenShell）
 - **单文件部署**：发布单一可执行文件；Wasm 扩展 runtime 打进主包
-- 版本检查 / telemetry：**支持配置自有 endpoint**（settings / `PIR_*`，默认 `resetpi.com` 可改，ADR-0009）；可关闭；`enableInstallTelemetry`/`enableAnalytics`（opt-in）
+- 版本检查 / telemetry：**支持配置自有 endpoint**（settings / `RPI_*`，默认 `resetpi.com` 可改，ADR-0009）；可关闭；`enableInstallTelemetry`/`enableAnalytics`（opt-in）
 - `/debug`（及 shift+ctrl+d）写调试日志：最近渲染行（ANSI）+ 最近发给 LLM 的消息
 - Provider payload debug：对齐 Pi 的调试开关（`onPayload`/`onResponse`、Codex WS debug stats）
 
@@ -625,7 +625,7 @@ Startup header → messages → editor → footer。
 
 - 单元：agent loop 事件序、工具序、session 迁移、compaction 切点、edit fuzzy 匹配、prompt template 展开、settings 合并
 - 契约：RPC 32 命令 + 扩展 UI 子协议 / session JSONL schema / 黄金 JSONL
-- Provider：faux + 可选集成测试（有 key 时，`PIR_LIVE_TEST=1`）
+- Provider：faux + 可选集成测试（有 key 时，`RPI_LIVE_TEST=1`）
 - TUI：
   - 关键 ANSI 序列子集 diff（去 CSI 2026 同步输出抖动后，与 Pi 虚拟终端输出比对）
   - 组件级渲染快照黄金文件（Editor / SelectList / Markdown / SettingsList 等）
@@ -699,6 +699,6 @@ Startup header → messages → editor → footer。
 - `packages/evals`：private 行为评估包（其 `pi-harness.ts` 可作为对拍 harness 参考实现）
 - `coding-agent/src/bun`：Bun 单文件打包入口（Rust 原生单二进制无对应物；其 `restore-sandbox-env` 提示沙箱下环境变量可用性验收点）
 - `packages/storage/sqlite-node`：harness 可选 SQLite 后端（仅 JSONL，ADR-0002 §7）
-- pi-ai 包级 CLI（`login` 写 CWD/auth.json）：凭据统一走 `pir` 主 CLI（ADR-0003 §4）
+- pi-ai 包级 CLI（`login` 写 CWD/auth.json）：凭据统一走 `rpi` 主 CLI（ADR-0003 §4）
 - Pi migrations.ts 的 legacy 启动迁移（ADR-0003 §3；keybindings 旧键名迁移表除外）
 - 兼容现有 TS / jiti pi-package 扩展（ADR-0001）

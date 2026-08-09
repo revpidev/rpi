@@ -1,4 +1,4 @@
-# pir wasm extension example: permission-gate
+# rpi wasm extension example: permission-gate
 
 ABI v1 guest（`docs/extension-abi.md`）。行为：`tool_call` 里 block `read`
 工具；注册自定义 `gate_tool`。
@@ -15,8 +15,8 @@ cp ../../target/wasm32-unknown-unknown/release/pir_wasm_extension_example.wasm d
 ## 安装
 
 把整个 `examples/wasm-extension/` 目录拷贝（或链接）到
-`~/.pir/agent/extensions/permission-gate/`（或项目的 `.pir/extensions/`），
-pir 启动时按一层目录发现规则加载 `pir-extension.json`。
+`~/.rpi/agent/extensions/permission-gate/`（或项目的 `.rpi/extensions/`），
+rpi 启动时按一层目录发现规则加载 `rpi-extension.json`。
 
 裸 `.wasm` 文件（无 manifest）也可直接放入扩展目录，此时
 `capabilities = []`（仅 `on` 订阅），本例的 `registerTool` 会被

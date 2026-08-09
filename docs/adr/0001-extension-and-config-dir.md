@@ -20,15 +20,15 @@ Pi 的扩展生态基于 TypeScript + jiti 动态加载。纯 Rust 无法直接�
 - **允许的差异**：扩展需用 Rust/Wasm 重写；**不要求** `jiti` / TS `package.json#pi.extensions` 入口兼容。分发与安装见 [ADR-0002](./0002-baseline-decisions.md)（列入正式计划）。
 - **仍应对齐**：Skills / Prompt Templates / Themes 等**声明式资源**的文件格式与发现规则（与扩展代码执行无关）。
 
-### 2. 配置目录：默认 `~/.pir`
+### 2. 配置目录：默认 `~/.rpi`
 
 | 用途 | 路径 |
 |------|------|
-| 全局 agent 目录 | `~/.pir/agent/` |
-| 项目本地 | `<cwd>/.pir/` |
-| 环境变量前缀 | `PIR_*` |
+| 全局 agent 目录 | `~/.rpi/agent/` |
+| 项目本地 | `<cwd>/.rpi/` |
+| 环境变量前缀 | `RPI_*` |
 
-- Session、settings、auth、skills、extensions、themes、packages 等均落在上述树下（布局镜像 Pi 的 `agent/` 子结构，仅根名改为 `pir`）。
+- Session、settings、auth、skills、extensions、themes、packages 等均落在上述树下（布局镜像 Pi 的 `agent/` 子结构，仅根名改为 `rpi`）。
 - **不**默认读写 `~/.pi` / `.pi`。若未来需要迁移工具，另开 ADR，不作为运行时默认行为。
 
 ## 后果
@@ -40,4 +40,4 @@ Pi 的扩展生态基于 TypeScript + jiti 动态加载。纯 Rust 无法直接�
 ## 否决的备选
 
 - L2 嵌入 JS 跑 TS 扩展（复杂度高，非当前目标）
-- 默认兼容 `~/.pi`（易与官方 Pi 互相踩配置；用户已选定 `~/.pir`）
+- 默认兼容 `~/.pi`（易与官方 Pi 互相踩配置；用户已选定 `~/.rpi`）

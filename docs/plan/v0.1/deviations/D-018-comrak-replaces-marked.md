@@ -13,7 +13,7 @@
 ## 实际实现与偏离原因
 
 - 解析器为 **comrak 0.54**（`default-features=false` + GFM 扩展），替代上游 `marked@18.0.5`（无 Deno/Node 嵌入，ADR-0001 红线；comrak AST 树形结构与 marked token 树最接近，GFM 表格/删除线/任务列表齐备）。
-- AST 对应方案（`crates/pir-tui/src/components/markdown.rs` 头部注释）：
+- AST 对应方案（`crates/rpi-tui/src/components/markdown.rs` 头部注释）：
   - `token.raw` 由 comrak `sourcepos` 字节区间**切片源码**还原（marked 的 raw 语义）；
   - marked 的 `space` token（块间空行）由源码空隙**合成**（CommonMark AST 丢弃空行）；
   - 严格删除线语义与 marked `StrictStrikethroughTokenizer` 对拍验证（`~~ foo~~`、`~~foo ~~`、`~~foo~~~`、`~~~foo~~~`、`a~~b~~c` 等），`is_marked_strikethrough` 校验对齐 marked 正则；

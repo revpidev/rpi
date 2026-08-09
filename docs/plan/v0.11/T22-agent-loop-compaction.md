@@ -1,4 +1,4 @@
-# T22：pir-agent 循环微行为与 compaction 契约
+# T22：rpi-agent 循环微行为与 compaction 契约
 
 - **状态**：未开始
 - **里程碑**：M2
@@ -23,7 +23,7 @@ Agent 循环四项微行为与 compaction 契约收紧；harness 层明确不动
 - `Agent::reset()` 活跃 run 期间返回错误（原静默清状态）
 - `CompactionResult` → `CompactResult`：删 `first_kept_entry_id`；`retained_tail` 必填；`extract_file_operations` 去掉 `from_hook` 检查；cut-point 只认 `branch_summary`；branch summary 函数 timestamp 接受 `number|string` 等价（Rust：epoch ms 或 ISO 字符串）
 - `FileSystem` 等价抽象新增 `rename_file()`（原子发布预留；唯一跟进的 v4 元素）
-- `harness/` 模块文档标注：上游 v2 为 scaffold，pir 保持 v1 语义（引用 `harness-v2.md` §20）
+- `harness/` 模块文档标注：上游 v2 为 scaffold，rpi 保持 v1 语义（引用 `harness-v2.md` §20）
 
 ### Out
 

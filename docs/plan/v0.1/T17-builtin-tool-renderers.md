@@ -11,10 +11,10 @@
 
 ## 起因
 
-2026-08-09 v0.1 测试发现：同一 `lscpu` 调用，上游 pi 渲染为 `$ lscpu` + 原始输出 + `Took 0.0s`，pir 渲染为 `bash\n{ "command": "lscpu" }` 且无时
-长行；write 调用上游渲染 `write <path>` + 前 10 行真实换行预览，pir 渲染原始 JSON 转储。根因：pir 只实现了内置工具的 `execute`（T06/T14），
+2026-08-09 v0.1 测试发现：同一 `lscpu` 调用，上游 pi 渲染为 `$ lscpu` + 原始输出 + `Took 0.0s`，rpi 渲染为 `bash\n{ "command": "lscpu" }` 且无时
+长行；write 调用上游渲染 `write <path>` + 前 10 行真实换行预览，rpi 渲染原始 JSON 转储。根因：rpi 只实现了内置工具的 `execute`（T06/T14），
 未实现内置工具的 `renderCall`/`renderResult` 渲染钩子，七个内置工具全部落 `formatToolExecution` 默认回退
-（`crates/pir/src/modes/interactive/components/tool_execution.rs:521-534`）；`tool_definition` 只从扩展宿主取
+（`crates/rpi/src/modes/interactive/components/tool_execution.rs:521-534`）；`tool_definition` 只从扩展宿主取
 （`interactive_mode.rs:1762` → `extension_renderers.rs:69-82`），内置工具恒 `None`。流式刷新接线（增量 parse → 每 delta MessageUpdate →
 update_args/update_result → request_render）经逐段核查与上游一致，观感差异同样归于渲染层缺口。
 
@@ -23,7 +23,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
 
 **2026-08-09 两次范围决策（用户裁定）**：
 
-1. 核查发现语法高亮为隐性依赖且全项目零登记——pir 交互模式 `highlight_code: None`（`crates/pir/src/modes/interactive/theme.rs:47`），
+1. 核查发现语法高亮为隐性依赖且全项目零登记——rpi 交互模式 `highlight_code: None`（`crates/rpi/src/modes/interactive/theme.rs:47`），
    write/read 高亮分支与 Markdown 代码块高亮均未交付（需求 §8.6）。裁定：T17 扩大范围包含语法高亮。
 2. 高亮路线调研确认 Rust 生态无 hljs 功能等价库（syntect/tree-sitter token 边界均与 hljs 10.7.3 不同；逐字节只能手工移植 hljs 文法，数
    月级且 G4 禁 JS 执行；hljs 正则近似质量反低于 syntect）。裁定：**以 syntect 替代，高亮 ANSI 分段不与上游对拍**——立
@@ -49,11 +49,11 @@ update_args/update_result → request_render）经逐段核查与上游一致，
      （tool-execution.ts:105-113，扩展 `"self"` 优先）。
    - `ToolRenderContext` 补齐两块原 defer 项（`tool_execution.rs` 模块注释）：
      - **`lastComponent` 等效机制**：上游渲染器靠 `context.lastComponent` 复用组件实例并原地 `setText`（如 read.ts:335、edit.ts:427）；
-       pir 组件为 `Box<dyn Component>` 所有权模型，需设计组件复用/内部可变方案（设计细化阶段定稿）。
+       rpi 组件为 `Box<dyn Component>` 所有权模型，需设计组件复用/内部可变方案（设计细化阶段定稿）。
      - **渲染器可变 state**：上游 `state` 为每工具调用一份的任意对象（`BashRenderState{startedAt,endedAt,interval}`、edit 的
-       `callComponent` 引用等）；pir 现为 `serde_json::Value`，需承载类型化状态（trait 方法为 `&self`，考虑内部可变性）。
+       `callComponent` 引用等）；rpi 现为 `serde_json::Value`，需承载类型化状态（trait 方法为 `&self`，考虑内部可变性）。
    - **invalidate 桥与定时器**：bash 渲染器 partial 期间 1s `setInterval(() => context.invalidate(), 1000)`（bash.ts:474-476），完成/出
-     错清定时器（bash.ts:477-483）；pir 侧经 `RenderHandle` 触发重绘，定时器生命周期随组件/结果终结回收。edit 的异步 diff 预览
+     错清定时器（bash.ts:477-483）；rpi 侧经 `RenderHandle` 触发重绘，定时器生命周期随组件/结果终结回收。edit 的异步 diff 预览
      （`computeEditsDiff(...).then(... context.invalidate())`，edit.ts:381-389）同理，需 tokio 任务 + `RenderHandle`，并保留
      `requestKey` 竞态防护。
 2. **bash 渲染器**（bash.ts:231-237 formatBashCall、239-319 rebuildBashResultRenderComponent、462-496 两钩子）：
@@ -93,7 +93,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
 
 - 扩展工具与自定义工具的渲染（T15 已交付，`w4_tool_render_override_and_inheritance` 等）。
 - HTML 导出侧渲染（`renderedTools`/`ToolHtmlRenderer` 不移植，D-045 已登记关闭）。
-- 工具执行逻辑本身（T06/T14 已交付，本任务零改动 `crates/pir/src/tools/` 执行路径）。
+- 工具执行逻辑本身（T06/T14 已交付，本任务零改动 `crates/rpi/src/tools/` 执行路径）。
 - 未知工具（无内置定义且无扩展 hook）的 `formatToolExecution` 回退——保留现状，与上游一致。
 - hljs 10.7.3 文法移植与高亮 ANSI 逐字节对拍——**明确不做**（ADR-0008；未来若有诉求须回写 ADR 另立任务）。
 
@@ -109,7 +109,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
   位小数、`... (N earlier lines, …)` 与 `... (N more lines, M total, …)` 提示、`[Full output: … . Truncated: …]` 两种文案、read 紧凑分
   类文案、edit/write/grep/find/ls 各 helper 文案——全部锚定上游行号进验收附表。
 - **可复用件已就位**：`visual_truncate.rs`（truncateToVisualLines 对位）、`keybinding_hints.rs`（keyHint 对位）、`RenderHandle`
-  （invalidate/request_render）、`Container`/`Text`/`Spacer` 组件、`pir-tui` Markdown 的 `highlight_code: Option<HighlightFn>` 槽位
+  （invalidate/request_render）、`Container`/`Text`/`Spacer` 组件、`rpi-tui` Markdown 的 `highlight_code: Option<HighlightFn>` 槽位
   （markdown.rs:91）。bash 输出清洗走 `get_text_output` 既有路径（sanitize/strip-ANSI，render-utils.ts 对位已在组件内）。
 - **定时器与 tokio**：Elapsed 刷新与 edit 异步预览都在渲染线程外完成计算、经 `RenderHandle` 回到 TUI 重绘；注意 abort/完成后不再触发重
   绘（上游 clearInterval/`previewArgsKey` 失配丢弃两语义）。
@@ -153,7 +153,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
   以「结构/文案逐字 + 着色存在性」为口径，D-051）
 - [x] 语法高亮：声明语言覆盖表（≥ 39 语言锚）逐语言有断言；scope→Theme 映射与回退语义测试全绿
 - [x] 扩展覆盖继承回归：`w4_tool_render_override_and_inheritance` 全绿 + 新增「缺 hook 继承内置」用例
-- [ ] 真机 smoke：`lscpu` 与 write `/tmp/pir.txt` 两案例（本任务起因场景）渲染与上游一致——**留用户复核**（已有 VT 级等效用例覆盖，见验收记录 G3）
+- [ ] 真机 smoke：`lscpu` 与 write `/tmp/rpi.txt` 两案例（本任务起因场景）渲染与上游一致——**留用户复核**（已有 VT 级等效用例覆盖，见验收记录 G3）
 
 ## 偏离记录
 
@@ -177,16 +177,16 @@ update_args/update_result → request_render）经逐段核查与上游一致，
     2. `interactive_mode.rs::tests::tool_execution_start_update_end_lifecycle` —— 同上改 `custom-tool`；`read` 折叠成功结果渲染为空本是上游三态语义（read.ts:178-179）。
     3. `interactive_mode.rs::tests::render_initial_messages_builds_chat_from_entries` —— 同上。
     4. `snapshots.rs::tool_execution_fallback` + 黄金 `tests/snapshots/tool_execution_fallback.snap` —— 工具名改 `custom-tool` 后
-       `PIR_UPDATE_SNAPSHOTS=1` 再生；黄金 diff 仅标题行 `read`→`custom-tool`，回退 JSON 形状不变。
+       `RPI_UPDATE_SNAPSHOTS=1` 再生；黄金 diff 仅标题行 `read`→`custom-tool`，回退 JSON 形状不变。
     5. `write.rs::tests::result_error_renders_error_text`（本任务新增，初版断言 `starts_with('\n')`）——`Text` 组件行补空格到全宽，
        前导 `\n` 渲染为空格填充的空行；断言修为「首行 trim 后为空」。
     6. `tool_renderers_test.rs::bash_elapsed_ticker_ticks_during_partial_and_settles`（本任务新增）——sleep 1.3s 后结算时长为
        `Took 1.Xs`，初版误断言 `Took 0.`，修为 `Took 1.`。
-    7. 六处 SGR-only 的测试 `strip_ansi`（bash/edit/find/grep/write/tool_execution）与 `pir-test-support::vt::strip_ansi` —— 补 OSC 8
+    7. 六处 SGR-only 的测试 `strip_ansi`（bash/edit/find/grep/write/tool_execution）与 `rpi-test-support::vt::strip_ansi` —— 补 OSC 8
        剥离，消除 `ls` 超链接能力用例对并行用例的进程级污染（capability cache 全局可变）。
 - G3 对拍：通过（TUI 渲染行为类）——常数/文案逐值核对表（锚定上游行号，均已进各渲染器测试逐字断言）：
 
-  | 项 | 上游锚 | pir 位置 |
+  | 项 | 上游锚 | rpi 位置 |
   |----|--------|----------|
   | `BASH_PREVIEW_LINES=5` | bash.ts:204 | `tool_renderers/bash.rs:44` |
   | `formatDuration`=`(ms/1000).toFixed(1)s`、`Elapsed`/`Took` | bash.ts:228,315 | `bash.rs` `format_duration`/`render`:245 |
@@ -199,7 +199,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
   | read 紧凑分类资源文件名集 | read.ts:42（4181f66） | `read.rs:43-47`（含 `AGENTS.override.md`） |
 
   基线说明：T17 立项锚 `2efa728`，当前 `external/pi` HEAD 为 v0.11 基线 `4181f66`；逐文件 diff 确认七个工具的 `renderCall`/
-  `renderResult` 在两锚间唯一实质差异为 read 紧凑分类新增 `AGENTS.override.md`（pir 与新基线一致），其余为 system-prompt 重构
+  `renderResult` 在两锚间唯一实质差异为 read 紧凑分类新增 `AGENTS.override.md`（rpi 与新基线一致），其余为 system-prompt 重构
   （渲染无关）。起因两场景已有 VT 级等效用例：`tool_renderers_test.rs::bash_lscpu_case_matches_upstream_shape`（`$ lscpu` 调用
   行 + 原始输出 + `Took X.Xs`，无 JSON 转储）与 `write_streaming_preview_grows_but_stays_clamped`（流式增量、钳制 10 行、无字面
   `\n`、成功不渲染 `Successfully wrote`）；真机 smoke 留用户复核。
@@ -220,7 +220,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
 
 1. **M1：`LANGUAGE_ALIASES` 与 vendored hljs 10.7.3 事实不符**——原表仅 6 语言 12 别名且注释/测试断言「`ts` 不是
    typescript 别名」，实际 vendored 全量语言包约 90 语言带别名（`typescript.js:691 aliases:['ts','tsx']` 等）。影响：Markdown
-   围栏 ```ts/```js/```sh/```rs 等在上游高亮、pir 落 `mdCodeBlock` 平色。修复：拆为 `CANONICAL_NAME_REDIRECTS`（6 条）+
+   围栏 ```ts/```js/```sh/```rs 等在上游高亮、rpi 落 `mdCodeBlock` 平色。修复：拆为 `CANONICAL_NAME_REDIRECTS`（6 条）+
    `LANGUAGE_ALIASES`（补齐至 105 条，逐条对照 vendored `aliases` 数组，目标语法名对照 bat 198 语法集全名清单）；`tsx`→
    `TypeScriptReact`、`jsp`→`Java Server Page (JSP)`、`html/xhtml`→`HTML`（hljs 无 `html` 注册名，经 xml 别名解析语义一致）、
    `toml` 保留直解 `TOML`（hljs 映射 ini，D-051 范围内取舍）；无 bat 对应物的语言（haxe/smalltalk/brainfuck 等）与 fancy 不
@@ -231,7 +231,7 @@ update_args/update_result → request_render）经逐段核查与上游一致，
    `undefined`），合并修正为 `ext ?? builtin ?? "default"`：扩展显式 `"default"` 也赢（旧实现仅 `"self"` 赢，扩展对 edit 显式
    default 会错误落回内置 self 壳）。六个无 `renderShell` 的内置定义改返 `None`，edit 返 `Some(Self_)`；新增
    `render_shell_merge_follows_upstream_nullish_chain` 用例。
-3. **L2：edit 空 path 预览**——上游 `if (!path) return null`（edit.ts:189，空串 falsy），pir 原接受空串（注释与上游相反）。
+3. **L2：edit 空 path 预览**——上游 `if (!path) return null`（edit.ts:189，空串 falsy），rpi 原接受空串（注释与上游相反）。
    修复为空串返回 `None` 并反转对应断言。
 
 未修（审查已确认可留）：L3 `formatDuration` 平局舍入（JS `toFixed` 取大 vs Rust `{:.1}` 取偶；`Instant` 亚毫秒测量下恰落

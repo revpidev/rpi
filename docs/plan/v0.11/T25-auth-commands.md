@@ -11,14 +11,14 @@
 
 ## 目标
 
-落地 `pir auth` 三个子命令，逻辑复用 T21 的 OAuth/凭证能力，CLI 层为薄壳。
+落地 `rpi auth` 三个子命令，逻辑复用 T21 的 OAuth/凭证能力，CLI 层为薄壳。
 
 ## 范围
 
 ### In
 
-- `pir auth print-api-key` / `pir auth print-bearer-token`：导出凭证给外部客户端；自动 OAuth 刷新；`--min-expiry <duration>`（默认 5 分钟最小有效期，复用 T21 的 `min_oauth_validity_ms`）
-- `pir auth check`：provider/model 认证预检；`--json` / `--credentials` / `--no-refresh`；**退出码 ready=0 / not_ready=1 / invalid=2**
+- `rpi auth print-api-key` / `rpi auth print-bearer-token`：导出凭证给外部客户端；自动 OAuth 刷新；`--min-expiry <duration>`（默认 5 分钟最小有效期，复用 T21 的 `min_oauth_validity_ms`）
+- `rpi auth check`：provider/model 认证预检；`--json` / `--credentials` / `--no-refresh`；**退出码 ready=0 / not_ready=1 / invalid=2**
 - CLI 解析器（v0.1 手写解析器）新增子命令路由；帮助文本对齐上游
 - 输出脱敏检查：print 类命令的 stdout 即凭据本体（合法），但日志/错误消息不得夹带（G4）
 
