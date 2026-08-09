@@ -14,9 +14,10 @@
 //!   `getCapabilities`) is not ported — it depends on the TUI runtime (T12).
 //!   [`ColorMode`] is passed explicitly by the caller.
 //! - The `Theme` struct's TUI helpers (`getMarkdownTheme`, `getEditorTheme`,
-//!   `getSelectListTheme`, `getSettingsListTheme`, `highlightCode`,
-//!   `getLanguageFromPath`) are not ported — they depend on TUI types from
-//!   `pi-tui` that are not yet implemented (T11/T12).
+//!   `getSelectListTheme`, `getSettingsListTheme`) are not ported — they
+//!   depend on TUI types from `pi-tui` that are not yet implemented (T11/T12).
+//!   `highlightCode` / `getLanguageFromPath` are ported separately in
+//!   `core::highlight` (syntect, T17-W2 / ADR-0008).
 //! - Registered themes (`setRegisteredThemes` / `registeredThemes` Map) are
 //!   not implemented — package/project theme registration comes from the
 //!   resource loader (T17+). The load-priority chain still has a placeholder

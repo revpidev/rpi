@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use pir_tui::components::markdown::{MarkdownTheme, ThemeTextFn};
+use pir_tui::components::markdown::{HighlightFn, MarkdownTheme, ThemeTextFn};
 
 use crate::core::themes::Theme;
 
@@ -19,15 +19,20 @@ use crate::core::themes::Theme;
 /// callbacks resolve through the given `Theme`.
 ///
 /// Intentional differences:
-/// - `highlightCode` is not ported: pir has no syntax highlighter yet, so the
-///   hook is left `None`, which makes the Markdown component fall back to the
-///   `mdCodeBlock` color — identical to upstream's "no valid language" path
-///   (theme.ts:1251-1255). A highlighter can be attached here later.
+/// - `highlightCode` (theme.ts:1230-1255) is ported in
+///   `crate::core::highlight` (syntect instead of highlight.js, ADR-0008 /
+///   D-051); the hook is attached here so fenced code blocks render colored.
 /// - The theme is passed explicitly instead of read from a global.
 pub fn markdown_theme(theme: &Theme) -> Arc<MarkdownTheme> {
     let fg = |color: &'static str| -> ThemeTextFn {
         let theme = theme.clone();
         Box::new(move |text: &str| theme.fg(color, text))
+    };
+    let highlight_code: HighlightFn = {
+        let theme = theme.clone();
+        Box::new(move |code: &str, lang: Option<&str>| -> Vec<String> {
+            crate::core::highlight::highlight_code(code, lang, &theme)
+        })
     };
     Arc::new(MarkdownTheme {
         heading: fg("mdHeading"),
@@ -44,7 +49,7 @@ pub fn markdown_theme(theme: &Theme) -> Arc<MarkdownTheme> {
         italic: Box::new(|text: &str| Theme::italic(text)),
         strikethrough: Box::new(|text: &str| Theme::strikethrough(text)),
         underline: Box::new(|text: &str| Theme::underline(text)),
-        highlight_code: None,
+        highlight_code: Some(highlight_code),
         code_block_indent: None,
     })
 }
@@ -70,6 +75,15 @@ mod tests {
         assert_eq!((md.italic)("x"), "\x1b[3mx\x1b[23m");
         assert_eq!((md.strikethrough)("x"), "\x1b[9mx\x1b[29m");
         assert_eq!((md.underline)("x"), "\x1b[4mx\x1b[24m");
-        assert!(md.highlight_code.is_none());
+        // The syntax-highlighting hook is wired (T17-W2, ADR-0008): valid
+        // languages produce ANSI-colored lines, invalid ones fall back to the
+        // mdCodeBlock color (theme.ts:1166-1168).
+        let highlight = md.highlight_code.as_ref().expect("highlight hook wired");
+        let rust_lines = highlight("fn main() {}", Some("rust"));
+        assert!(rust_lines.len() == 1 && rust_lines[0].contains("\x1b["));
+        let fallback = highlight("plain text", Some("notalang"));
+        assert_eq!(fallback[0], theme().fg("mdCodeBlock", "plain text"));
+        let no_lang = highlight("plain text", None);
+        assert_eq!(no_lang[0], theme().fg("mdCodeBlock", "plain text"));
     }
 }

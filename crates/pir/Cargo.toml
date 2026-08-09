@@ -44,6 +44,14 @@ sha2.workspace = true
 reqwest.workspace = true
 httpdate.workspace = true
 url.workspace = true
+# T17-W2 syntax highlighting (ADR-0008): syntect replaces upstream hljs.
+syntect.workspace = true
+
+[build-dependencies]
+# T17-W2: build.rs filters bat's syntax set and writes the compressed dump
+# embedded into the binary (see crates/pir/build.rs).
+syntect.workspace = true
+syntect-assets.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

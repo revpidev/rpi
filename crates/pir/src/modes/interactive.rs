@@ -24,6 +24,7 @@ pub mod interactive_mode;
 pub(crate) mod startup_ui;
 pub mod theme;
 pub(crate) mod theme_watcher;
+pub mod tool_renderers;
 
 pub use interactive_mode::{run_interactive_mode, InteractiveMode, InteractiveModeOptions};
 

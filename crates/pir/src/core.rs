@@ -12,6 +12,7 @@ pub mod extension_context;
 pub mod extension_host_adapter;
 pub mod extensions;
 pub mod git_url;
+pub mod highlight;
 pub mod keybindings;
 pub mod model_resolver;
 pub mod model_runtime;

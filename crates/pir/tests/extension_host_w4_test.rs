@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use pir::modes::rpc::ui_bridge::{new_pending_ui_table, PendingUiTable, RpcUiBridge};
 use pir_ext_host::api::{NotifyType, UiBridge, UiDialogOptions, WidgetContent};
+use pir_tui::tui::Component as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
@@ -413,7 +414,7 @@ async fn w4_tool_render_override_and_inheritance() {
         args: json!({}),
         tool_call_id: "call-9".to_owned(),
         render_handle: pir_tui::tui::RenderHandle::new(|| {}),
-        state: Value::Null,
+        state: pir::modes::interactive::components::tool_execution::RendererStateSlot::default(),
         cwd: "/w4-cwd".to_owned(),
         execution_started: true,
         args_complete: true,
@@ -443,6 +444,129 @@ async fn w4_tool_render_override_and_inheritance() {
             &context,
         )
         .is_none());
+}
+
+/// T17：组件级按 hook 合并——扩展缺 hook 时继承内置渲染器
+/// （tool-execution.ts:81-99）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w4_extension_missing_hook_inherits_builtin_renderer() {
+    use pir::modes::interactive::components::tool_execution::{
+        ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
+    };
+
+    // 方向一：扩展只给 renderCall → renderResult 继承内置 bash 渲染器。
+    let call_only_ext = pir_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
+        api.register_tool(pir_ext_host::types::ToolDefinition {
+            name: "bash".to_owned(),
+            label: "bash".to_owned(),
+            description: "overridden bash".to_owned(),
+            prompt_snippet: None,
+            prompt_guidelines: None,
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+            render_shell: None,
+            prepare_arguments: None,
+            execution_mode: None,
+            execute: Arc::new(|_req, _ctx| {
+                Box::pin(async { Ok(pir_agent::types::AgentToolResult::default()) })
+            }),
+            render_call: Some(Arc::new(|ctx| {
+                let text = format!("EXT-CALL:{}", ctx.tool_call_id);
+                Ok(json!({"type": "text", "props": {"text": text}}))
+            })),
+            render_result: None,
+        })
+        .expect("tool");
+        Box::pin(async { Ok(()) })
+    }));
+    let host = pir_ext_host::host::NativeExtensionHost::new("/w4-cwd");
+    assert!(host.load_inline(&[call_only_ext]).await.is_empty());
+    let (session, _tmp) = w4_session_with_host(host).await;
+    let definition =
+        pir::modes::interactive::extension_renderers::host_tool_definition(&session, "bash")
+            .expect("render definition");
+    let theme = Arc::new(pir::core::themes::get_theme_by_name("dark").expect("dark"));
+    let mut component = ToolExecutionComponent::new(
+        "bash",
+        "call-ext-1",
+        json!({"command": "lscpu"}),
+        ToolExecutionOptions::default(),
+        Some(definition),
+        theme,
+        pir_tui::tui::RenderHandle::new(|| {}),
+        "/w4-cwd",
+    );
+    component.mark_execution_started();
+    component.update_result(
+        ToolResultState {
+            content: vec![ToolResultContentLoose::text("total output")],
+            is_error: false,
+            details: None,
+        },
+        false,
+    );
+    let out = pir_test_support::vt::strip_ansi(&component.render(80).join("\n"));
+    assert!(out.contains("EXT-CALL:call-ext-1"), "out: {out}");
+    // 内置 bash 结果渲染：输出行。无 Took 计时行——startedAt 由内置
+    // render_call 设置（bash.rs render_call 的 execution_started 分支，
+    // bash.ts:463-467），扩展覆盖 renderCall 后计时不启动。
+    assert!(out.contains("total output"), "out: {out}");
+    assert!(!out.contains("Took"), "out: {out}");
+
+    // 方向二：扩展只给 renderResult → renderCall 继承内置 `$ <command>`。
+    let result_only_ext = pir_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
+        api.register_tool(pir_ext_host::types::ToolDefinition {
+            name: "bash".to_owned(),
+            label: "bash".to_owned(),
+            description: "overridden bash".to_owned(),
+            prompt_snippet: None,
+            prompt_guidelines: None,
+            parameters: json!({"type": "object"}),
+            constrained_sampling: None,
+            render_shell: None,
+            prepare_arguments: None,
+            execution_mode: None,
+            execute: Arc::new(|_req, _ctx| {
+                Box::pin(async { Ok(pir_agent::types::AgentToolResult::default()) })
+            }),
+            render_call: None,
+            render_result: Some(Arc::new(|_result, _options, ctx| {
+                let text = format!("EXT-RESULT:{}", ctx.tool_call_id);
+                Ok(json!({"type": "text", "props": {"text": text}}))
+            })),
+        })
+        .expect("tool");
+        Box::pin(async { Ok(()) })
+    }));
+    let host = pir_ext_host::host::NativeExtensionHost::new("/w4-cwd");
+    assert!(host.load_inline(&[result_only_ext]).await.is_empty());
+    let (session, _tmp) = w4_session_with_host(host).await;
+    let definition =
+        pir::modes::interactive::extension_renderers::host_tool_definition(&session, "bash")
+            .expect("render definition");
+    let theme = Arc::new(pir::core::themes::get_theme_by_name("dark").expect("dark"));
+    let mut component = ToolExecutionComponent::new(
+        "bash",
+        "call-ext-2",
+        json!({"command": "lscpu"}),
+        ToolExecutionOptions::default(),
+        Some(definition),
+        theme,
+        pir_tui::tui::RenderHandle::new(|| {}),
+        "/w4-cwd",
+    );
+    component.mark_execution_started();
+    component.update_result(
+        ToolResultState {
+            content: vec![ToolResultContentLoose::text("anything")],
+            is_error: false,
+            details: None,
+        },
+        false,
+    );
+    let out = pir_test_support::vt::strip_ansi(&component.render(80).join("\n"));
+    assert!(out.contains("$ lscpu"), "out: {out}");
+    assert!(out.contains("EXT-RESULT:call-ext-2"), "out: {out}");
 }
 
 /// 带真宿主的会话（W3 fixture 的 W4 版）。

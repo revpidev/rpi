@@ -282,8 +282,10 @@ fn bash_execution_error() {
 
 #[test]
 fn tool_execution_fallback() {
+    // A tool with no built-in render definition (T17) exercises the generic
+    // `formatToolExecution` fallback snapshot.
     let mut component = ToolExecutionComponent::new(
-        "read",
+        "custom-tool",
         "call_1",
         serde_json::json!({"path": "src/main.rs"}),
         ToolExecutionOptions::default(),

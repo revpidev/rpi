@@ -79,8 +79,10 @@ pub fn sanitize_frame(frame: &str) -> String {
     frame.replace(SYNC_BEGIN, "").replace(SYNC_END, "")
 }
 
-/// Strip ANSI escape sequences (CSI and simple two-byte escapes). OSC and
-/// other multi-byte sequences are out of scope for component snapshot tests.
+/// Strip ANSI escape sequences (CSI, OSC, and simple two-byte escapes). OSC
+/// spans (`ESC]…BEL` or `ESC]…ESC\`, e.g. OSC 8 hyperlinks) are removed as
+/// well, so assertions are independent of the process-global terminal
+/// capability cache.
 pub fn strip_ansi(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -95,6 +97,23 @@ pub fn strip_ansi(input: &str) -> String {
                         j += 1;
                     }
                     i = (j + 1).min(bytes.len());
+                    continue;
+                }
+                Some(b']') => {
+                    // OSC: ESC ] … terminated by BEL or ESC\
+                    let mut j = i + 2;
+                    while j < bytes.len() {
+                        if bytes[j] == 0x07 {
+                            j += 1;
+                            break;
+                        }
+                        if bytes[j] == 0x1b && bytes.get(j + 1) == Some(&b'\\') {
+                            j += 2;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    i = j.min(bytes.len());
                     continue;
                 }
                 Some(_) => {

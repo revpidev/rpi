@@ -765,6 +765,7 @@ TUI 模式下日志写文件或 ring buffer（`/debug` 可查），**不直接�
 | （不引 aws-sdk） | Bedrock 手写 SigV4 + reqwest + 自实现 event-stream 解码 |
 | `tokio-tungstenite` | openai-codex-responses WebSocket 传输（rustls + webpki-roots，T13，D-027） |
 | `zstd` | openai-codex-responses SSE 请求体压缩（T13，D-027） |
+| `syntect`（fancy-regex 后端，default-features=false，无 onig） | 语法高亮，替代上游 highlight.js 10.7.3（T17-W2，ADR-0008，D-051；文法集来自 build 期 `syntect-assets`，压缩 dump 内嵌 ≤2MB） |
 
 > 具体版本以 workspace `Cargo.toml` 为准；升级须评估对钉死行为的影响并重新对拍。
 

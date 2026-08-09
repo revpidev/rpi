@@ -271,6 +271,7 @@ trait：`crates/pir-ext-host/src/api.rs:412-516`（`UiBridge`）。三桥：
 | ComponentTree v1 无 `row` | 不需要 | D-049（2） |
 | L0 动态库无沙箱信任模型 / manifest `native` 字段 | 不需要（ADR-0002 已决策 abi_stable） | D-050 |
 | renderedTools/ToolHtmlRenderer 不移植（W7 复核维持） | 不需要 | D-045 |
+| 语法高亮 syntect 替代 hljs 10.7.3：高亮 ANSI token 分段与逐 token 配色不与上游对拍（同类 token 同色系，scope 锚定同组 theme 键）；结构/文案/钳制/计时仍逐字 | ADR-0008 | D-051（T17 落地） |
 | 其余任务级实现细节差异 | 见各 D 文件 | D-001~D-047（deviations/README.md 登记表） |
 
 ---

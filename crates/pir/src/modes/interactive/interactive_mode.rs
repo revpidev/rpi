@@ -4725,7 +4725,9 @@ mod tests {
         let ui = &mode.ui_state;
         ui.push(UiCommand::ToolExecutionStart {
             tool_call_id: "call_1".to_string(),
-            tool_name: "read".to_string(),
+            // No built-in render definition (T17) → the fallback path keeps
+            // the partial/final result text visible.
+            tool_name: "custom-tool".to_string(),
             args: serde_json::json!({ "path": "a.txt" }),
         });
         ui.drain_events();
@@ -5089,7 +5091,7 @@ mod tests {
                 .append_message(assistant_message(
                     vec![
                         text_content("first answer"),
-                        tool_call_content("call_1", "read"),
+                        tool_call_content("call_1", "custom-tool"),
                     ],
                     StopReason::Stop,
                 ))
@@ -5099,7 +5101,9 @@ mod tests {
                     pir_ai::types::ToolResultMessage {
                         role: pir_ai::types::ToolResultRole::ToolResult,
                         tool_call_id: "call_1".to_string(),
-                        tool_name: "read".to_string(),
+                        // No built-in render definition (T17): the fallback
+                        // result path keeps the result text visible.
+                        tool_name: "custom-tool".to_string(),
                         content: vec![pir_ai::types::ToolResultContent::Text(
                             pir_ai::types::TextContent {
                                 text: "the file".to_string(),

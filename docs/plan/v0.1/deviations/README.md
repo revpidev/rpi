@@ -78,6 +78,7 @@
 | D-048 | T15 | 第 2、6 条行为级 / 余实现细节 | 扩展宿主核心动作与事件落地差异（汇总型 6 条：tool_call 改参经结果 `input` 穿线替代共享可变 event；**user_bash `operations` 闭包束不支持丢弃回退**；registerProvider 闭包子项 streamSimple/oauth/refreshModels 显式拒绝；newSession `setup` 回调省略以 withSession 替代；exec 超时直接 SIGKILL 无 SIGTERM 升级；**非 RPC 模式 ctx.command.* 未绑走上游默认值**） | `02-design.md` §7.2、`extension-abi.md` §3、T15 偏离表 | ADR-0007（第 2、6 条） | 已回写 |
 | D-049 | T15 | 第 1 条行为级 / 余实现细节 | 扩展 UI/渲染层落地差异（**custom() 声明式 v1 无交互回传、展示后立即 resolve undefined**——交互需求走 UiBridge::as_any 原生口子；ComponentTree schema v1 无 `row` 横向容器、未知 type fail-visible 渲染） | `02-design.md` §13、`extension-abi.md` §7、T15 偏离表 | ADR-0007（第 1 条） | 已回写 |
 | D-050 | T15 | 实现细节 | L0 原生动态库插件（abi_stable 0.11.3）落地差异（ABI 形状收敛：PirHostCalls 结构体按值传 host-call 句柄、cookie=*const c_void、RVec<u8> 拥有型缓冲；无沙箱信任模型明示——capability 只管扩展 API 面；manifest 新增 `native` 字段与 wasm 互斥、wasm 优先；无 fuel/Store/专属线程） | `extension-abi.md` §1.1/§5、`02-design.md` §7.2、T15 偏离表 | 不需要 | 已回写 |
+| D-051 | T17 | 行为级 | 语法高亮以 syntect 替代 hljs 10.7.3（无 Rust 等价库，逐字节须手工移植 hljs 文法数月级且 G4 禁 JS 执行；hljs 正则近似质量低于 syntect）。write/read 高亮分支、Markdown 代码块、write 增量缓存均走 syntect；**高亮 ANSI token 分段与逐 token 配色不与上游对拍**（scope→Theme 锚定上游同组 theme 键保持同色系）；结构/文案/钳制/计时仍逐字对拍 | T17 任务文件、`01-requirements.md` §8.6、`parity-checklist.md` §5 | ADR-0008 | 已关闭 |
 
 ## 4. 状态定义
 

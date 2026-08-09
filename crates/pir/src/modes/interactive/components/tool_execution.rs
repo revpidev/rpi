@@ -6,15 +6,20 @@
 //! - The theme is passed explicitly (`Arc<Theme>`) instead of read from the
 //!   global `theme` getter (theme.ts:799-816).
 //! - Built-in tool definitions (`createAllToolDefinitions(cwd)[toolName]`,
-//!   tool-execution.ts:57) do not exist in pir yet (T15). The renderer hook
-//!   is [`ToolDefinition`]; while `None`, the component uses the generic
-//!   fallback path (`contentText` + `formatToolExecution`,
-//!   tool-execution.ts:315-319, 365-376) exactly like upstream does for
-//!   unknown tools.
+//!   tool-execution.ts:57) live in
+//!   [`crate::modes::interactive::tool_renderers`] (T17): one
+//!   [`ToolDefinition`] per built-in tool, looked up by tool name in the
+//!   constructor. Renderer selection merges the extension definition and the
+//!   built-in definition per hook — extension hook wins, a missing/failed
+//!   hook falls through to the built-in one (tool-execution.ts:81-99); the
+//!   generic fallback (`contentText` + `formatToolExecution`,
+//!   tool-execution.ts:315-319, 365-376) remains for tools with neither.
 //! - Upstream catches renderer exceptions and falls back
 //!   (tool-execution.ts:274-283, 295-311); Rust has no safe cross-component
 //!   catch, so [`ToolDefinition`] methods signal failure via
-//!   `Option<Component>` return instead (documented T15 contract).
+//!   `Option<Component>` return instead — `None` falls through to the
+//!   built-in definition, then to the generic fallback (documented T15
+//!   contract).
 //! - `maybeConvertImagesForKitty` converts non-PNG images to PNG
 //!   synchronously (upstream is async via photon/sharp,
 //!   tool-execution.ts:178-199 + utils/image-convert.ts); the rendered
@@ -23,14 +28,20 @@
 //!   typical tool-captured images).
 //! - `invalidate()` in the render context is replaced by a [`RenderHandle`]:
 //!   upstream `invalidate: () => { this.invalidate(); this.ui.requestRender(); }`
-//!   (tool-execution.ts:118-122) needs `&mut self` access; the extension-host
-//!   design (T15) will decide how renderers trigger component invalidation.
+//!   (tool-execution.ts:118-122) needs `&mut self` access; built-in renderers
+//!   instead recompute their dynamic parts (bash Elapsed line) at `render()`
+//!   time from shared state and only need `request_render` (T17).
 //! - The renderer state (`rendererState: any`, tool-execution.ts:19) is a
-//!   `serde_json::Value`.
+//!   typed, lazily-initialized [`RendererStateSlot`] (T17): the renderer
+//!   downcasts to its own state type instead of upstream's shared `any`
+//!   object. `lastComponent` (tool-execution.ts:117, 124) has no equivalent —
+//!   components are rebuilt from state on every update; renderers keep
+//!   cross-render state in the slot.
 
+use std::any::Any;
 use std::boxed::Box as StdBox;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pir_tui::components::image::{Image, ImageOptions, ImageTheme};
 use pir_tui::components::r#box::Box as TuiBox;
@@ -58,6 +69,38 @@ impl Default for ToolExecutionOptions {
             show_images: true,
             image_width_cells: 60,
         }
+    }
+}
+
+/// Lock a mutex, recovering from poisoning (same pattern as
+/// `interactive_mode.rs`'s `lock`).
+pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Typed per-component renderer state (`rendererState: any`,
+/// tool-execution.ts:19) — T17. The slot is empty until the tool's renderer
+/// initializes it with its own state type via [`RendererStateSlot::get_or_init`];
+/// shared by every render context handed to the renderer, so `renderCall` and
+/// `renderResult` see the same state across updates.
+#[derive(Debug, Clone, Default)]
+pub struct RendererStateSlot {
+    inner: Arc<Mutex<Option<Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl RendererStateSlot {
+    /// Get the renderer's typed state, lazily initializing it on first use.
+    ///
+    /// One component has at most one tool definition, so at most one state
+    /// type ever lands in a slot; the downcast cannot fail.
+    pub fn get_or_init<T: Default + Send + Sync + 'static>(&self) -> Arc<T> {
+        let mut guard = lock_recover(&self.inner);
+        let slot = guard.get_or_insert_with(|| Arc::new(T::default()));
+        Arc::clone(slot)
+            .downcast::<T>()
+            .expect("renderer state type is stable per component")
     }
 }
 
@@ -110,14 +153,15 @@ pub enum RenderShell {
 /// Render context passed to tool renderers (`ToolRenderContext`,
 /// extensions/types.ts) — see the module doc for the `invalidate` note.
 ///
-/// `lastComponent` (tool-execution.ts:117, 124) is deferred to T15: renderers
-/// that need cross-render state keep it in `state`.
+/// `lastComponent` (tool-execution.ts:117, 124) has no equivalent: renderers
+/// keep cross-render state in `state` and are rebuilt from it on every
+/// update (T17).
 #[derive(Debug, Clone)]
 pub struct ToolRenderContext {
     pub args: Value,
     pub tool_call_id: String,
     pub render_handle: RenderHandle,
-    pub state: Value,
+    pub state: RendererStateSlot,
     pub cwd: String,
     pub execution_started: bool,
     pub args_complete: bool,
@@ -157,8 +201,10 @@ pub trait ToolDefinition: Send + Sync {
         context: &ToolRenderContext,
     ) -> Option<StdBox<dyn Component>>;
 
-    /// `renderShell` (tool-execution.ts:105-113).
-    fn render_shell(&self) -> RenderShell;
+    /// `renderShell` (tool-execution.ts:105-113): `None` when the definition
+    /// does not provide one (upstream `undefined`), so the merge can tell
+    /// "absent" apart from an explicit `"default"`.
+    fn render_shell(&self) -> Option<RenderShell>;
 }
 
 /// Component that renders a tool call and its result
@@ -169,7 +215,7 @@ pub struct ToolExecutionComponent {
     content_box: TuiBox,
     content_text: Text,
     self_render_container: Container,
-    renderer_state: Value,
+    renderer_state: RendererStateSlot,
     image_components: Vec<Image>,
     image_spacers: Vec<Spacer>,
     tool_name: String,
@@ -180,6 +226,7 @@ pub struct ToolExecutionComponent {
     image_width_cells: usize,
     is_partial: bool,
     tool_definition: Option<Arc<dyn ToolDefinition>>,
+    built_in_tool_definition: Option<Arc<dyn ToolDefinition>>,
     render_handle: RenderHandle,
     cwd: String,
     execution_started: bool,
@@ -202,14 +249,19 @@ impl ToolExecutionComponent {
         render_handle: RenderHandle,
         cwd: impl Into<String>,
     ) -> Self {
+        let tool_name = tool_name.into();
+        // `builtInToolDefinition = createAllToolDefinitions(cwd)[toolName]`
+        // (tool-execution.ts:57) — T17 registry, render hooks only.
+        let built_in_tool_definition =
+            crate::modes::interactive::tool_renderers::builtin_tool_definition(&tool_name);
         let mut component = Self {
             content_box: TuiBox::new(0, 0, None),
             content_text: Text::new("", 0, 0, None),
             self_render_container: Container::new(),
-            renderer_state: Value::Null,
+            renderer_state: RendererStateSlot::default(),
             image_components: Vec::new(),
             image_spacers: Vec::new(),
-            tool_name: tool_name.into(),
+            tool_name,
             tool_call_id: tool_call_id.into(),
             args,
             expanded: false,
@@ -217,6 +269,7 @@ impl ToolExecutionComponent {
             image_width_cells: options.image_width_cells,
             is_partial: true,
             tool_definition,
+            built_in_tool_definition,
             render_handle,
             cwd: cwd.into(),
             execution_started: false,
@@ -355,66 +408,71 @@ impl ToolExecutionComponent {
         self.update_display();
     }
 
-    /// `getCallRenderer` (tool-execution.ts:81-89): the tool definition is
-    /// the single source until pir grows built-in definitions (T15).
-    fn get_call_renderer(&self) -> Option<&dyn ToolDefinition> {
-        self.tool_definition.as_deref()
-    }
-
-    /// `getResultRenderer` (tool-execution.ts:91-99).
-    fn get_result_renderer(&self) -> Option<&dyn ToolDefinition> {
-        self.tool_definition.as_deref()
-    }
-
-    /// `hasRendererDefinition` (tool-execution.ts:101-103).
+    /// `hasRendererDefinition` (tool-execution.ts:101-103): either the
+    /// extension-registered definition or the built-in one (T17) counts.
     fn has_renderer_definition(&self) -> bool {
-        self.tool_definition.is_some()
+        self.tool_definition.is_some() || self.built_in_tool_definition.is_some()
     }
 
-    /// `getRenderShell` (tool-execution.ts:105-113).
+    /// `getRenderShell` (tool-execution.ts:105-113):
+    /// `ext.renderShell ?? builtin.renderShell ?? "default"` — any explicit
+    /// extension value wins, including `"default"`.
     fn get_render_shell(&self) -> RenderShell {
         self.tool_definition
             .as_ref()
-            .map(|def| def.render_shell())
+            .and_then(|def| def.render_shell())
+            .or_else(|| {
+                self.built_in_tool_definition
+                    .as_ref()
+                    .and_then(|def| def.render_shell())
+            })
             .unwrap_or(RenderShell::Default)
     }
 
     /// The renderer-produced component for the call part
-    /// (tool-execution.ts:269-284): the definition's `renderCall`, falling
-    /// back to the bold tool title when there is no definition or the
-    /// renderer returns `None`.
+    /// (tool-execution.ts:81-89, 269-284): the extension definition's
+    /// `renderCall` wins; a missing definition or a `None` (failed/absent
+    /// hook) falls through to the built-in definition's `renderCall`, then
+    /// to the bold-tool-title fallback.
     fn render_call_component(&self) -> StdBox<dyn Component> {
-        if let Some(def) = self.get_call_renderer() {
-            let context = self.get_render_context();
-            def.render_call(&self.args, &self.theme, &context)
-                .unwrap_or_else(|| StdBox::new(self.create_call_fallback()))
-        } else {
-            StdBox::new(self.create_call_fallback())
+        let context = self.get_render_context();
+        if let Some(def) = &self.tool_definition {
+            if let Some(component) = def.render_call(&self.args, &self.theme, &context) {
+                return component;
+            }
         }
+        if let Some(def) = &self.built_in_tool_definition {
+            if let Some(component) = def.render_call(&self.args, &self.theme, &context) {
+                return component;
+            }
+        }
+        StdBox::new(self.create_call_fallback())
     }
 
     /// The renderer-produced component for the result part
-    /// (tool-execution.ts:286-314): the definition's `renderResult`, or the
-    /// text-output fallback when there is no definition; `None` when there
-    /// is no result output at all.
+    /// (tool-execution.ts:91-99, 286-314): same per-hook merge as the call
+    /// part — extension `renderResult`, then the built-in one, then the
+    /// text-output fallback; `None` when there is no result output at all.
     fn render_result_component(&self) -> Option<StdBox<dyn Component>> {
         self.result.as_ref()?;
-        if let Some(def) = self.get_result_renderer() {
-            let context = self.get_render_context();
-            let result = self.result.clone().expect("checked above");
-            def.render_result(
-                &result,
-                ResultRenderOptions {
-                    expanded: self.expanded,
-                    is_partial: self.is_partial,
-                },
-                &self.theme,
-                &context,
-            )
-        } else {
-            self.create_result_fallback()
-                .map(|text| StdBox::new(text) as StdBox<dyn Component>)
+        let context = self.get_render_context();
+        let result = self.result.clone().expect("checked above");
+        let options = ResultRenderOptions {
+            expanded: self.expanded,
+            is_partial: self.is_partial,
+        };
+        if let Some(def) = &self.tool_definition {
+            if let Some(component) = def.render_result(&result, options, &self.theme, &context) {
+                return Some(component);
+            }
         }
+        if let Some(def) = &self.built_in_tool_definition {
+            if let Some(component) = def.render_result(&result, options, &self.theme, &context) {
+                return Some(component);
+            }
+        }
+        self.create_result_fallback()
+            .map(|text| StdBox::new(text) as StdBox<dyn Component>)
     }
 
     /// `updateDisplay` (tool-execution.ts:253-359).
@@ -615,8 +673,9 @@ fn convert_to_png(base64_data: &str, mime_type: &str) -> Option<(String, String)
     ))
 }
 
-/// `getTextOutput` (core/tools/render-utils.ts:38-60).
-fn get_text_output(result: Option<&ToolResultState>, show_images: bool) -> String {
+/// `getTextOutput` (core/tools/render-utils.ts:38-60). `pub(crate)` for the
+/// built-in tool renderers (`tool_renderers/`, T17).
+pub(crate) fn get_text_output(result: Option<&ToolResultState>, show_images: bool) -> String {
     let Some(result) = result else {
         return String::new();
     };
@@ -680,8 +739,10 @@ mod tests {
     }
 
     fn make_component() -> ToolExecutionComponent {
+        // A tool with no built-in render definition (T17): these tests
+        // exercise the generic `formatToolExecution` fallback path.
         ToolExecutionComponent::new(
-            "read",
+            "custom-tool",
             "call_1",
             serde_json::json!({"path": "src/main.rs"}),
             ToolExecutionOptions::default(),
@@ -696,15 +757,28 @@ mod tests {
         let mut out = String::with_capacity(input.len());
         let mut chars = input.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '\u{1b}' && chars.peek() == Some(&'[') {
-                chars.next();
-                for c in chars.by_ref() {
-                    if c == 'm' {
-                        break;
+            match c {
+                '\u{1b}' if chars.peek() == Some(&'[') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == 'm' {
+                            break;
+                        }
                     }
                 }
-            } else {
-                out.push(c);
+                // OSC 8 hyperlink (`ESC]8;;..ESC\`): strip it too, so exact
+                // assertions are independent of the process-global terminal
+                // capability cache that other tests mutate.
+                '\u{1b}' if chars.peek() == Some(&']') => {
+                    chars.next();
+                    for c in chars.by_ref() {
+                        if c == '\u{1b}' {
+                            chars.next(); // `\` of the `ESC\` terminator
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(c),
             }
         }
         out
@@ -715,7 +789,7 @@ mod tests {
         let component = make_component();
         let lines = component.render(60);
         let stripped = strip_ansi(&lines.join("\n"));
-        assert!(stripped.contains("read"));
+        assert!(stripped.contains("custom-tool"));
         assert!(stripped.contains("src/main.rs"));
         // Pending bg while partial.
         assert!(lines.iter().any(|l| l.contains("\u{1b}[48;")));
@@ -822,5 +896,71 @@ mod tests {
             false,
         );
         let _ = component.render(60);
+    }
+
+    /// A stub render definition with no hooks and a configurable shell.
+    struct ShellStub(Option<RenderShell>);
+
+    impl ToolDefinition for ShellStub {
+        fn render_call(
+            &self,
+            _args: &Value,
+            _theme: &Theme,
+            _context: &ToolRenderContext,
+        ) -> Option<StdBox<dyn Component>> {
+            None
+        }
+
+        fn render_result(
+            &self,
+            _result: &ToolResultState,
+            _options: ResultRenderOptions,
+            _theme: &Theme,
+            _context: &ToolRenderContext,
+        ) -> Option<StdBox<dyn Component>> {
+            None
+        }
+
+        fn render_shell(&self) -> Option<RenderShell> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn render_shell_merge_follows_upstream_nullish_chain() {
+        // tool-execution.ts:110: `ext.renderShell ?? builtin.renderShell ??
+        // "default"` — any explicit extension value wins, including
+        // `"default"`; an absent one inherits the built-in shell (edit's is
+        // `"self"`).
+        let with_shell = |shell: Option<RenderShell>| {
+            ToolExecutionComponent::new(
+                "edit",
+                "call_1",
+                serde_json::json!({"path": "a.txt"}),
+                ToolExecutionOptions::default(),
+                Some(Arc::new(ShellStub(shell))),
+                theme(),
+                RenderHandle::new(|| {}),
+                "/cwd",
+            )
+        };
+        assert_eq!(
+            with_shell(Some(RenderShell::Default)).get_render_shell(),
+            RenderShell::Default,
+            "explicit extension \"default\" beats the built-in \"self\""
+        );
+        assert_eq!(
+            with_shell(Some(RenderShell::Self_)).get_render_shell(),
+            RenderShell::Self_
+        );
+        assert_eq!(
+            with_shell(None).get_render_shell(),
+            RenderShell::Self_,
+            "absent extension shell inherits the built-in one"
+        );
+        // No extension definition at all → the built-in shell; an unknown
+        // tool with no definition at all → the default box.
+        assert_eq!(with_shell(None).get_render_shell(), RenderShell::Self_);
+        assert_eq!(make_component().get_render_shell(), RenderShell::Default);
     }
 }

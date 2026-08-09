@@ -156,10 +156,14 @@ impl ToolDefinition for HostToolRenderDefinition {
         Some(component_from_tree(&tree, &Arc::new(theme.clone())))
     }
 
-    fn render_shell(&self) -> RenderShell {
+    fn render_shell(&self) -> Option<RenderShell> {
+        // Upstream `renderShell?: "default" | "self"` — `undefined` (and any
+        // unrecognized value) means "not provided", an explicit `"default"`
+        // is a real value that wins over the built-in shell.
         match self.render_shell.as_deref() {
-            Some("self") => RenderShell::Self_,
-            _ => RenderShell::Default,
+            Some("self") => Some(RenderShell::Self_),
+            Some("default") => Some(RenderShell::Default),
+            _ => None,
         }
     }
 }

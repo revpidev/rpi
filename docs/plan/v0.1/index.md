@@ -54,6 +54,7 @@
 | T13 | [全量 Provider 与 OAuth](./T13-providers-oauth.md) | M6 | T03、T04 | 已完成 | 2026-08-07 |
 | T14 | [可选工具 / Packages / Trust / Export / llama / 更新](./T14-packages-trust-export.md) | M7 | T09、T10 | 已完成 | 2026-08-07 |
 | T15 | [扩展宿主 L0+L1 与 Parity Freeze](./T15-extension-host.md) | M8 | T02（spike）、T10、T12 | 已完成 | 2026-08-09 |
+| T17 | [内置工具渲染钩子（renderCall/renderResult）与语法高亮](./T17-builtin-tool-renderers.md) | M8 | T12、T15 | 已完成 | 2026-08-09 |
 
 ## 4. 里程碑映射与并行建议
 
@@ -67,6 +68,7 @@ M5: T11 → T12          （TUI 为硬性交付，ADR-0002 §3，不可压后）
 M6: T13                （与 M3–M5 并行）
 M7: T14
 M8: T15                （Parity Freeze）
+    T17                （冻结后补漏：内置工具渲染钩子）
 ```
 
 并行口径沿用设计文档 §11：T03∥T05；T07–T10 与 T11–T12 尽早重叠；T13∥T07–T12；T16 在 T07/T08 就绪后插入，可与 T09 并行。
@@ -80,13 +82,18 @@ docs/plan/v0.1/
 ├── deviations/         # 偏离登记目录（一事一记 + 登记表）
 │   ├── README.md       # 偏离管理流程
 │   └── TEMPLATE.md     # 偏离记录模板
-└── TNN-*.md            # 任务文件（T01–T16）
+└── TNN-*.md            # 任务文件（T01–T17）
 ```
 
 ## 6. 变更记录
 
 | 日期 | 变更 | 说明 |
 |------|------|------|
+| 2026-08-09 | T17 审查修复 | 全面审查复核 G1–G7 通过，另修 3 项移植缺陷（实现 bug，非偏离）：M1 `LANGUAGE_ALIASES` 与 vendored hljs 10.7.3 事实不符（原 12 别名且「ts 非别名」断言错误；vendored 全量包约 90 语言带别名）——拆 `CANONICAL_NAME_REDIRECTS`(6) + `LANGUAGE_ALIASES`(105，逐条对照 vendored aliases 数组，目标名对照 bat 198 语法集 dump 校准；tsx→TypeScriptReact、jsp→JSP、html/xhtml→HTML、toml 保留直解 TOML），Markdown 围栏 ```ts/```sh/```rs 等恢复高亮；L1 `render_shell` trait Option 化，`get_render_shell` 修正为上游 `ext ?? builtin ?? "default"`（扩展显式 default 也赢）；L2 edit 空 path 不渲染预览（edit.ts:189 falsy）；新增自校验/合并语义用例 2 个；L3（toFixed 平局舍入，不可达）/N3（T15 既有契约）留待；测试 3902 passed / 0 failed |
+| 2026-08-09 | T17 验收完成 | 内置工具渲染钩子与语法高亮完成（W1–W9）：渲染基础设施（内置定义注册表、扩展/内置按 hook 双源合并、`RendererStateSlot` 类型化状态、invalidate 桥 + bash 1s Elapsed ticker、edit 异步 diff 预览）；七渲染器移植（bash `$ cmd`+`Took X.Xs`/5 行预览/截断 warning 两文案，read 三态+紧凑分类，edit diff 预览+renderShell self，write 10 行钳制+增量高亮缓存+成功不渲染，grep/find/ls 折叠 15/20/20）；syntect 高亮子系统（bat 198 语法集 fancy-regex 纯 Rust、build.rs 预编译校验 + zlib 内嵌 792KiB、58 扩展名映射、Markdown 代码块接线）；验收修复：write 测试 Mutex 自死锁、OSC 8 超链接 strip 六处 + vt::strip_ansi（消 capability cache 并行污染）、5 个旧回退用例改 `custom-tool`（read 获内置渲染器后回退路径需具名未知工具）；基线核对：七工具渲染钩子 `2efa728`→`4181f66` 唯一实质差异为 read 紧凑分类 `AGENTS.override.md`（已与新基线一致）；测试 3900 passed / 0 failed（84 目标）；gnu release 34,035,032B ≈32.5MiB < 50MB（musl 复测跳过，工具链缺 target，用户裁定）；偏离 D-051 置「已关闭」（ADR-0008）；真机 smoke 两案例留用户复核 |
+| 2026-08-09 | T17 高亮路线定稿 | 高亮移植调研：Rust 生态无 hljs 功能等价库（syntect/tree-sitter token 边界均异），逐字节只能手工移植 hljs 10.7.3 文法（数月级、G4 禁 JS 执行、hljs 正则近似质量反低）。裁定 syntect 替代（fancy-regex 纯 Rust、musl 兼容、体积 ≤2MB），高亮 ANSI 分段不对拍——立 ADR-0008、登记 D-051（行为级，已回写）；T17 预估下调至 0.25–0.35 人月 |
+| 2026-08-09 | T17 扩大范围 | 核查发现语法高亮为 T17 隐性依赖且全项目零登记：pir 交互模式 `highlight_code: None`（`theme.rs:47`），write/read 高亮分支与 Markdown 代码块高亮（需求 §8.6）均未交付；上游实为自研 `syntax-highlight.ts` + hljs 10.7.3（非 cli-highlight）。裁定：T17 扩范围含高亮移植，ANSI 输出逐字节对拍（声明语言矩阵内）；hljs 语法 Rust 重实现（G4 禁 JS 执行），fixtures 黄金分波；预估上调至 0.4–0.6 人月 |
+| 2026-08-09 | 新增 T17 | v0.1 测试发现内置工具渲染缺口：`lscpu` 调用上游渲染 `$ lscpu` + `Took 0.0s`，pir 渲染 `bash\n{json}` 无时长行——pir 未实现七内置工具（bash/read/edit/write/grep/find/ls）的 `renderCall`/`renderResult`，全部走 `formatToolExecution` 回退；原挂 T15 的注释（`tool_execution.rs:8-13`）实为 Parity Freeze 漏项（T15 范围为扩展渲染三桥）。裁定非合理偏差、不登记偏离，立 T17 补齐（M8，依赖 T12/T15） |
 | 2026-08-09 | T15 验收完成 | 扩展宿主 L0+L1 与 Parity Freeze 完成（W1–W8 八波次）：`pir-ext-host` 宿主核心（注册表同名冲突规则全量/发现加载/串行 emit/错误总线）、33 事件全接线（含 tool_call 改参穿线、before_provider_request/headers 链式、user_bash、project_trust、resources_discover）、24 API 动作绑定、28 UI 方法三桥（Interactive/Rpc 9+18 降级/Null）、三级 Context 与 stale 失效、L1 wasmtime 宿主（ABI v1 + capability 沙箱 + fuel）与 `pir-ext-sdk`、L0 abi_stable 动态库插件（`native` manifest 字段）、安装管理 e2e 与启动管线 packages→loader 接线、llama 迁移真扩展（D-047 关闭）、switchSession 异步信任选择器（ADR-0006/D-044 关闭）、`--wasm-smoke` 钩子移除；Parity Freeze：`docs/parity-checklist.md` 四类清单（扩展 API 88 条逐条锚点）+ session 互通终验补全栈 faux 续跑测试 + 需求 §1.2 五条总核对全过；gnu release 复测 32,125,208B ≈30.6MiB < 50MB；偏离 D-048~D-050 登记回写（行为级三缺口 → ADR-0007）、`02-design.md` §7.2/§13 定稿回写、README 状态节同步；测试 3815 passed / 0 failed |
 | 2026-08-07 | T14 验收完成 | 可选工具 / Packages / Trust / Export / llama / 更新完成（W1–W7 七波次）：grep/find/ls Rust 原生实现（ignore/globset，rg 15/fd 10.4 实机交叉验证）；package-manager 核心 + install/remove/list 子命令；update 全目标（互斥矩阵/--force/release note/self 更新/并发 4）+ config 子命令；trust 产品化（完整优先级链 + 启动弹窗 + 两阶段加载）；HTML/JSONL export（模板资产逐字节内嵌对拍）+ gist share；endpoint/telemetry 配置化（三个 PIR_*_URL + settings 三键 + "off" 零请求）；llama.cpp 集成（/llama + /login llama.cpp + HF 搜索下载）；gnu release 29MB 发布物 smoke 全过（musl 本次豁免，用户决策）；终审修复 7 项（edit 测试目录竞态、display() 凭据脱敏、/share 临时文件串号等）；偏离 D-039~D-047 登记回写（D-039 第 1 条 → ADR-0005、D-044 → ADR-0006 留 T15 关闭，其余验收后置「已关闭」）；`01-requirements.md` §3.2/§4.5/§7.6/§7.8/§10、`02-design.md` §6.1/§8/§12 同步 |
 | 2026-08-07 | T13 验收完成 | 全量 Provider 与 OAuth 完成（W1–W7 七波次）：7 个新适配器（pi-messages/mistral/google-generative-ai+google-shared/azure/google-vertex+ADC/bedrock 手写 SigV4+event-stream/codex WS 含缓存续传与 zstd）、38 工厂 + 目录生成管线（37 份 vendored JSON、1153 模型、compat 全量）、6 OAuth 流程 + load registry、images 子系统、handoff/deferred tools 收尾（修复 last-wins 语义偏差）、远程 catalog overlay + `pir update --models`；需求 §5 映射表 55 条、上游测试移植清单 114 文件逐条标注、live smoke 无 key 全豁免；偏离 D-021~D-038 登记回写（D-029/030/031 已关闭）；`02-design.md` §3.3–3.6/§12/§13 同步（WS 状态机开放项定稿） |
