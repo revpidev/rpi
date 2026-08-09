@@ -29,7 +29,7 @@
 //!   [`remote_catalog_provider::with_remote_catalog`] at `create()` time
 //!   (radius passes through), resolved through
 //!   [`remote_catalog_provider::model_catalog_endpoint`] (env > settings >
-//!   `https://pi.dev`, literal `off` disables the overlay) — the
+//!   `https://resetpi.com` (ADR-0009), literal `off` disables the overlay) — the
 //!   `pir update --models` consumer path (model-runtime.ts:144-150, D-038).
 //! - A corrupt `models-store.json` falls back to an in-memory store with a
 //!   warning (upstream surfaces per-read `JSON.parse` errors into the
@@ -265,7 +265,7 @@ pub const DEFAULT_MODEL_REFRESH_TIMEOUT_MS: u64 = 15_000;
 pub struct CreateModelRuntimeOptions {
     /// `catalogBaseUrl` (model-runtime.ts:77): remote model-catalog overlay
     /// base URL. `None` resolves `PIR_MODEL_CATALOG_URL` env > default
-    /// `https://pi.dev` through [`model_catalog_endpoint`]; the literal
+    /// `https://resetpi.com` through [`model_catalog_endpoint`]; the literal
     /// `off` disables the overlay entirely (ADR-0002 §8) — built-in
     /// providers are then registered without the remote-catalog decorator.
     pub catalog_base_url: Option<String>,

@@ -28,7 +28,7 @@ use crate::core::version_check::pir_user_agent;
 
 /// The install-telemetry endpoint (interactive-mode.ts:1028). Default;
 /// override via [`report_install_endpoint`] (ADR-0002 §8).
-pub const DEFAULT_REPORT_INSTALL_URL: &str = "https://pi.dev/api/report-install";
+pub const DEFAULT_REPORT_INSTALL_URL: &str = "https://resetpi.com/api/report-install";
 
 /// `AbortSignal.timeout(5000)` (interactive-mode.ts:1031).
 pub const REPORT_INSTALL_TIMEOUT: Duration = Duration::from_millis(5_000);

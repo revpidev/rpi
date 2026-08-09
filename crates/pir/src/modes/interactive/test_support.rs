@@ -201,7 +201,7 @@ pub(crate) struct TestSession {
 // No-op product-endpoint transports (T14 review M1)
 // ---------------------------------------------------------------------------
 //
-// Unit tests must never emit real requests to product endpoints (pi.dev
+// Unit tests must never emit real requests to product endpoints (resetpi.com
 // install telemetry / version checks). Every mode test harness swaps the
 // production transports for these no-ops via
 // [`install_noop_product_transports`]; the optional counters let a test

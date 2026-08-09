@@ -378,7 +378,7 @@ amazon-bedrock、ant-ling、anthropic、azure-openai-responses、cerebras、clou
 - 继续 / 恢复 / 按 id 打开（`--session` 三级解析，§3.1）
 - `/tree` 原地分支导航 + 可选 branch summarization；选中行为：选 user/custom_message → leaf 移到 **parentId** 且文本回填编辑器；选 assistant 等 → 移 leaf 留空编辑器；选根 user → 重置 leaf
 - `/fork`（position=before，返回 selectedText）、`/clone`（fork leaf, position=at）、CLI `--fork`
-- `/new`、import/export JSONL、HTML export、gist share（shell 调 `gh gist create --public=false` + `PIR_SHARE_VIEWER_URL` 拼接，默认 `https://pi.dev/session/` 可配）
+- `/new`、import/export JSONL、HTML export、gist share（shell 调 `gh gist create --public=false` + `PIR_SHARE_VIEWER_URL` 拼接，默认 `https://resetpi.com/session/` 可配，ADR-0009）
 - `/name`（写 `session_info` 条目，`\r\n`→空格 sanitize）、label/bookmark（空值清除）
 - `/resume` 选择器内 Ctrl+D 删除（优先 `trash` CLI）
 
@@ -609,7 +609,7 @@ Startup header → messages → editor → footer。
 - 扩展/包/skills 以用户权限运行；文档警告对齐（`docs/security.md`）
 - Containerization 文档三种模式可移植说明（Gondolin micro-VM 扩展 / 纯 Docker / OpenShell）
 - **单文件部署**：发布单一可执行文件；Wasm 扩展 runtime 打进主包
-- 版本检查 / telemetry：**支持配置自有 endpoint**（settings / `PIR_*`，默认 `pi.dev` 可改）；可关闭；`enableInstallTelemetry`/`enableAnalytics`（opt-in）
+- 版本检查 / telemetry：**支持配置自有 endpoint**（settings / `PIR_*`，默认 `resetpi.com` 可改，ADR-0009）；可关闭；`enableInstallTelemetry`/`enableAnalytics`（opt-in）
 - `/debug`（及 shift+ctrl+d）写调试日志：最近渲染行（ANSI）+ 最近发给 LLM 的消息
 - Provider payload debug：对齐 Pi 的调试开关（`onPayload`/`onResponse`、Codex WS debug stats）
 

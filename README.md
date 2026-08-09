@@ -12,6 +12,7 @@
 | [UPSTREAM](./UPSTREAM.md) | 钉死的 Pi commit（0.82.1 / `2efa728`） |
 | [ADR-0001](./docs/adr/0001-extension-and-config-dir.md) | 扩展=Rust/Wasm；配置=`~/.pir` |
 | [ADR-0002](./docs/adr/0002-baseline-decisions.md) | 版本钉死、TUI、token、单文件、JSONL、endpoint、MIT |
+| [ADR-0009](./docs/adr/0009-product-endpoints-resetpi.md) | 产品端点默认值迁移 resetpi.com（Cloudflare Pages 自部署，`deploy/resetpi/`） |
 | [Extension ABI](./docs/extension-abi.md) | wasm（L1）/ 原生动态库（L0）扩展 ABI v1 |
 | [Parity Checklist](./docs/parity-checklist.md) | 协议 / session 格式 / 扩展 API / TUI 四类对拍证据（T15 冻结） |
 

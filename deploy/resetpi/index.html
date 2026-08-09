@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>resetpi.com — pir product endpoints</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 3rem auto; padding: 0 1rem; line-height: 1.6; color: #1a1a1a; }
+    code { background: #f0f0f0; padding: 0.1em 0.4em; border-radius: 4px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
+    th { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>resetpi.com</h1>
+  <p>Product endpoints for the <strong>pir</strong> coding agent (defaults since ADR-0009; every endpoint is still overridable via <code>PIR_*</code> env vars or <code>settings.json</code>).</p>
+  <table>
+    <tr><th>Endpoint</th><th>Purpose</th></tr>
+    <tr><td><code>/api/models/providers/{id}</code></td><td>Remote model catalog overlay (38 built-in providers, ETag/304 revalidation)</td></tr>
+    <tr><td><code>/api/latest-version</code></td><td>Version check: <code>{"version","packageName","note"}</code></td></tr>
+    <tr><td><code>/api/report-install</code></td><td>Install telemetry ping (GET <code>?version=</code>)</td></tr>
+    <tr><td><code>/session/#{gistId}</code></td><td>Share viewer (redirects to the GitHub gist)</td></tr>
+    <tr><td><code>/changelog</code></td><td>Changelog page shown in the update banner</td></tr>
+  </table>
+  <p>Source: <code>deploy/resetpi/</code> in the pir repository. Regenerate with <code>python3 deploy/resetpi/scripts/generate-site.py</code>, deploy with <code>npx wrangler pages deploy deploy/resetpi --project-name=resetpi</code>.</p>
+</body>
+</html>

@@ -76,6 +76,16 @@ payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游
 - **回写日期**：2026-08-07
 - **ADR**：不需要（配置面由 ADR-0002 §8 直接授权）
 
+## 补记（2026-08-09，ADR-0009）
+
+默认值自 ADR-0009 起迁移到 `resetpi.com`（Cloudflare Pages 自部署，见
+`deploy/resetpi/`）：`DEFAULT_CATALOG_BASE_URL`、`LATEST_VERSION_URL`、
+`DEFAULT_REPORT_INSTALL_URL`、`DEFAULT_SHARE_VIEWER_URL`、changelog 链接五处。
+第 1 条「不改变任何默认行为」随之失效——**默认配置下端点 URL 与上游不同**
+（行为级偏离，由 ADR-0009 记录）；覆盖链（env > settings > `off` > `PIR_OFFLINE`）
+与全部零网络语义不变，显式配置的旧值继续生效。radius 默认 gateway
+（`https://radius.pi.dev`，上游托管服务）不迁移。
+
 ## 审查修复补记（2026-08-07 审查修复波次）
 
 1. **交互模式测试零网络（M1）**：`init()` 的 install telemetry 与 `run()` 的启动版本

@@ -563,10 +563,10 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
   PIR_OFFLINE                      - Disable startup network operations when set to 1/true/yes
   PIR_SKIP_VERSION_CHECK           - Disable the version update check when set to any non-empty value
   PIR_TELEMETRY                    - Override install telemetry when set to 1/true/yes or 0/false/no
-  PIR_SHARE_VIEWER_URL             - Base URL for /share command (default: https://pi.dev/session/)
-  PIR_VERSION_CHECK_URL            - Version check endpoint (default: https://pi.dev; "off" disables)
-  PIR_TELEMETRY_URL                - Install telemetry endpoint (default: https://pi.dev; "off" disables)
-  PIR_MODEL_CATALOG_URL            - Remote model catalog base URL (default: https://pi.dev; "off" disables)
+  PIR_SHARE_VIEWER_URL             - Base URL for /share command (default: https://resetpi.com/session/)
+  PIR_VERSION_CHECK_URL            - Version check endpoint (default: https://resetpi.com/api/latest-version; "off" disables)
+  PIR_TELEMETRY_URL                - Install telemetry endpoint (default: https://resetpi.com/api/report-install; "off" disables)
+  PIR_MODEL_CATALOG_URL            - Remote model catalog base URL (default: https://resetpi.com; "off" disables)
 
 {tools_bold}
   read   - Read file contents

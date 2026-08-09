@@ -1096,7 +1096,7 @@ mod tests {
         ui.handle_share_command();
         let rendered = drain_until(ui, |r| r.contains("Share URL:"));
         assert!(
-            rendered.contains("Share URL: https://pi.dev/session/#abc123"),
+            rendered.contains("Share URL: https://resetpi.com/session/#abc123"),
             "rendered: {rendered}"
         );
         assert!(
