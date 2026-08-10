@@ -7,3 +7,6 @@
 .DS_Store
 .tooling/
 .pi-subagents/
+
+# Cloudflare wrangler 缓存
+.wrangler/

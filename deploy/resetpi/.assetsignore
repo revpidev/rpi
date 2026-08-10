@@ -1,0 +1,5 @@
+# 部署为静态资产时排除仓库内部文件（Pages 部署忽略清单）
+README.md
+wrangler.toml
+.assetsignore
+scripts/

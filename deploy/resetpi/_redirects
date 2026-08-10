@@ -1,0 +1,6 @@
+# Pages 路由规则（Cloudflare Pages；最后匹配生效）
+# 客户端请求不带 .json 后缀（version_check.rs），这里把无后缀路径重写到
+# 实际静态文件；未收录 provider 与内部文件屏蔽由 Functions 层处理
+# （functions/api/models/providers/[id].json.js 等），SPA fallback 会把
+# 未匹配路径回落到 index.html，函数层兜底返回真 404。
+/api/latest-version  /api/latest-version.json  200
