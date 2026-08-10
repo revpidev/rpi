@@ -412,6 +412,7 @@
       <span class="logo">π</span> Rpi
     </a>
     <nav class="nav-links">
+      <a href="/"><span class="l-zh">首页</span><span class="l-en">Home</span></a>
       <a href="#features"><span class="l-zh">特性</span><span class="l-en">Features</span></a>
       <a href="#quickstart"><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></a>
       <a href="/docs"><span class="l-zh">文档</span><span class="l-en">Docs</span></a>
@@ -665,12 +666,14 @@
     var links = {};
     Array.prototype.forEach.call(document.querySelectorAll(".nav-links a"), function (a) {
       var href = a.getAttribute("href");
-      if (href === "#features") { links.features = a; }
+      if (href === "/") { links.home = a; }
+      else if (href === "#features") { links.features = a; }
       else if (href === "#quickstart") { links.quickstart = a; }
       else if (href === "/docs") { links.docs = a; }
     });
     var order = ["features", "quickstart", "docs"];
     function setActive(id) {
+      if (links.home) { links.home.classList.toggle("active", !id); }
       order.forEach(function (k) {
         if (links[k]) { links[k].classList.toggle("active", k === id); }
       });
