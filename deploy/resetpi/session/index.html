@@ -21,7 +21,7 @@
     const id = location.hash.slice(1);
     if (!id) {
       document.getElementById("status").textContent =
-        "No gist id in the URL fragment. Expected https://resetpi.com/session/#{gistId}";
+        "No gist id in the URL fragment. Expected https://revpi.dev/session/#{gistId}";
     } else {
       fetch(`https://gist.githubusercontent.com/${id}/raw`)
         .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`HTTP ${r.status}`))))

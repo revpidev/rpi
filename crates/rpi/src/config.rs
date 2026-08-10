@@ -131,7 +131,7 @@ pub fn expand_tilde_path(path: &str) -> PathBuf {
 }
 
 /// `DEFAULT_SHARE_VIEWER_URL` (config.ts:502).
-pub const DEFAULT_SHARE_VIEWER_URL: &str = "https://resetpi.com/session/";
+pub const DEFAULT_SHARE_VIEWER_URL: &str = "https://revpi.dev/session/";
 
 /// `getShareViewerUrl` (config.ts:505-508): `{base}#{gistId}` with the
 /// `RPI_SHARE_VIEWER_URL` override (empty falls back to the default, like the
@@ -959,7 +959,7 @@ pub fn get_project_themes_dir(cwd: &Path) -> PathBuf {
 //
 // The three product HTTP callbacks — version check, install telemetry, and
 // the remote model catalog — resolve their endpoint from the environment
-// first, then settings, then the built-in default (`https://resetpi.com`). Any
+// first, then settings, then the built-in default (`https://revpi.dev`). Any
 // level set to the literal `off` (ASCII case-insensitive, trimmed) disables
 // the endpoint entirely: a disabled endpoint must produce **no** network
 // request. These env vars and the `versionCheckUrl` / `telemetryUrl` /
@@ -1102,13 +1102,13 @@ mod tests {
     #[test]
     fn test_resolve_endpoint_defaults_without_overrides() {
         assert_eq!(
-            resolve_endpoint(None, None, "https://resetpi.com/api"),
-            Some("https://resetpi.com/api".to_string())
+            resolve_endpoint(None, None, "https://revpi.dev/api"),
+            Some("https://revpi.dev/api".to_string())
         );
         // Empty strings fall through to the next level (JS `||` semantics).
         assert_eq!(
-            resolve_endpoint(Some(""), Some(""), "https://resetpi.com/api"),
-            Some("https://resetpi.com/api".to_string())
+            resolve_endpoint(Some(""), Some(""), "https://revpi.dev/api"),
+            Some("https://revpi.dev/api".to_string())
         );
     }
 
@@ -1366,7 +1366,7 @@ mod self_update_tests {
         std::env::remove_var(ENV_SHARE_VIEWER_URL);
         assert_eq!(
             get_share_viewer_url("abc123"),
-            "https://resetpi.com/session/#abc123"
+            "https://revpi.dev/session/#abc123"
         );
         std::env::set_var(ENV_SHARE_VIEWER_URL, "https://viewer.example.com/s/");
         assert_eq!(
@@ -1377,7 +1377,7 @@ mod self_update_tests {
         std::env::set_var(ENV_SHARE_VIEWER_URL, "");
         assert_eq!(
             get_share_viewer_url("abc123"),
-            "https://resetpi.com/session/#abc123"
+            "https://revpi.dev/session/#abc123"
         );
         std::env::remove_var(ENV_SHARE_VIEWER_URL);
     }

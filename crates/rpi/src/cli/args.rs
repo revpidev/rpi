@@ -563,10 +563,10 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
   RPI_OFFLINE                      - Disable startup network operations when set to 1/true/yes
   RPI_SKIP_VERSION_CHECK           - Disable the version update check when set to any non-empty value
   RPI_TELEMETRY                    - Override install telemetry when set to 1/true/yes or 0/false/no
-  RPI_SHARE_VIEWER_URL             - Base URL for /share command (default: https://resetpi.com/session/)
-  RPI_VERSION_CHECK_URL            - Version check endpoint (default: https://resetpi.com/api/latest-version; "off" disables)
-  RPI_TELEMETRY_URL                - Install telemetry endpoint (default: https://resetpi.com/api/report-install; "off" disables)
-  RPI_MODEL_CATALOG_URL            - Remote model catalog base URL (default: https://resetpi.com; "off" disables)
+  RPI_SHARE_VIEWER_URL             - Base URL for /share command (default: https://revpi.dev/session/)
+  RPI_VERSION_CHECK_URL            - Version check endpoint (default: https://revpi.dev/api/latest-version; "off" disables)
+  RPI_TELEMETRY_URL                - Install telemetry endpoint (default: https://revpi.dev/api/report-install; "off" disables)
+  RPI_MODEL_CATALOG_URL            - Remote model catalog base URL (default: https://revpi.dev; "off" disables)
 
 {tools_bold}
   read   - Read file contents

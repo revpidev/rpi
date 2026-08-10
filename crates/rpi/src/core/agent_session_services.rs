@@ -139,7 +139,7 @@ pub async fn create_agent_session_services(
         None => {
             // `modelCatalogUrl` setting (rpi-specific, ADR-0002 §8): the
             // service layer is where settings are in scope; the runtime
-            // resolves env > settings > default `https://resetpi.com` (a literal
+            // resolves env > settings > default `https://revpi.dev` (a literal
             // `off` disables the remote catalog overlay).
             let catalog_base_url = options
                 .settings_manager

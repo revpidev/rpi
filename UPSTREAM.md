@@ -16,7 +16,7 @@
 
 历史基线：v0.1 钉死 `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（v0.82.1，2026-07-27），决策记录 [ADR-0002](./docs/adr/0002-baseline-decisions.md)。
 
-已立 ADR 的有意差异（不在金标准范围内）：产品端点默认值迁移 `resetpi.com`（[ADR-0009](./docs/adr/0009-product-endpoints-resetpi.md)，含 `deploy/resetpi/` Cloudflare Pages 部署）；覆盖链与上游端点可配置语义不变。
+已立 ADR 的有意差异（不在金标准范围内）：产品端点默认值迁移 `revpi.dev`（[ADR-0009](./docs/adr/0009-product-endpoints-resetpi.md)，含 `deploy/resetpi/` Cloudflare Pages 部署）；覆盖链与上游端点可配置语义不变。
 
 校验：
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the resetpi.com static site from rpi's built-in provider data.
+"""Generate the revpi.dev static site from rpi's built-in provider data.
 
 Run from the repository root:
 
@@ -92,7 +92,7 @@ def main() -> int:
     generate_latest_version(version, args.note)
     print(f"catalogs: {len(generated)} providers under {OUT_PROVIDERS.relative_to(REPO)}")
     print(f"version:  {OUT_VERSION.relative_to(REPO)} -> v{version}")
-    print("deploy:   npx wrangler pages deploy deploy/resetpi --project-name=resetpi")
+    print("deploy:   cd deploy/resetpi && npx wrangler pages deploy . --project-name=revpi --branch main")
     return 0
 
 

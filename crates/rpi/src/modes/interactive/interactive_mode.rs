@@ -2323,7 +2323,7 @@ impl InteractiveUi {
             "muted",
             &format!("New version {} is available. Run ", release.version),
         ) + &action;
-        let changelog_url = "https://resetpi.com/changelog";
+        let changelog_url = "https://revpi.dev/changelog";
         let styled_url = theme.fg("accent", changelog_url);
         let changelog_link = if rpi_tui::terminal_image::get_capabilities().hyperlinks {
             rpi_tui::terminal_image::hyperlink(&styled_url, changelog_url)
@@ -4298,7 +4298,7 @@ mod tests {
     /// check) must go through the injectable transports — with the no-op
     /// transports installed, a full init + run sequence performs zero real
     /// product requests (previously every test run emitted real anonymous
-    /// pings to resetpi.com). Counters are 0 when the env gates the ping closed
+    /// pings to revpi.dev). Counters are 0 when the env gates the ping closed
     /// (e.g. `RPI_OFFLINE`/`RPI_SKIP_VERSION_CHECK` in the dev env) and 1
     /// when armed — either way no network is touched.
     #[tokio::test]
@@ -4915,7 +4915,7 @@ mod tests {
         assert!(rendered.contains("rpi update"), "rendered: {rendered}");
         assert!(rendered.contains("breaking"), "rendered: {rendered}");
         assert!(
-            rendered.contains("https://resetpi.com/changelog"),
+            rendered.contains("https://revpi.dev/changelog"),
             "rendered: {rendered}"
         );
     }

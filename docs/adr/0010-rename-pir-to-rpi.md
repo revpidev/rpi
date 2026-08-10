@@ -2,7 +2,7 @@
 
 - **状态**：已采纳
 - **日期**：2026-08-09
-- **关联**：ADR-0001（命名决策）、ADR-0009（端点域名 resetpi.com）、
+- **关联**：ADR-0001（命名决策）、ADR-0009（端点域名 resetpi.com，已由 ADR-0011 更新为 revpi.dev）、
   扩展 ABI 文档 `docs/extension-abi.md`
 
 ## 背景

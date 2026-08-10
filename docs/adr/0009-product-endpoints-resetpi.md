@@ -1,6 +1,6 @@
 # ADR-0009：产品端点默认值迁移到 resetpi.com（Cloudflare Pages 自部署）
 
-- **状态**：已采纳
+- **状态**：已采纳（端点域名部分已被 [ADR-0011](./0011-product-endpoints-revpi-dev.md) 取代为 revpi.dev）
 - **日期**：2026-08-09
 - **关联**：[`01-requirements.md`](../01-requirements.md) §8（产品 endpoint）、
   [D-046](../plan/v0.1/deviations/D-046-product-endpoints-telemetry-rust-notes.md)、

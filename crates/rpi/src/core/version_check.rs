@@ -22,7 +22,7 @@ use serde_json::Value;
 
 /// `LATEST_VERSION_URL` (version-check.ts:4). Default endpoint; override via
 /// [`version_check_endpoint`] (ADR-0002 §8).
-pub const LATEST_VERSION_URL: &str = "https://resetpi.com/api/latest-version";
+pub const LATEST_VERSION_URL: &str = "https://revpi.dev/api/latest-version";
 
 /// `DEFAULT_VERSION_CHECK_TIMEOUT_MS` (version-check.ts:5).
 pub const DEFAULT_VERSION_CHECK_TIMEOUT: Duration = Duration::from_millis(10_000);
@@ -411,10 +411,10 @@ mod tests {
 
     #[test]
     fn startup_probe_url_composes_the_gates() {
-        let endpoint = Some("https://resetpi.com/api/latest-version".to_string());
+        let endpoint = Some("https://revpi.dev/api/latest-version".to_string());
         assert_eq!(
             startup_probe_url(false, false, endpoint.clone()).as_deref(),
-            Some("https://resetpi.com/api/latest-version")
+            Some("https://revpi.dev/api/latest-version")
         );
         // Skip flag, offline, and a disabled endpoint each suppress the probe.
         assert_eq!(startup_probe_url(true, false, endpoint.clone()), None);

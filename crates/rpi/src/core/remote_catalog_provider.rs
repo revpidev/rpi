@@ -14,7 +14,7 @@
 //!   and the `update --models` command (upstream applies it there too via
 //!   `modelRefreshTimeoutMs` / the CLI AbortController); the provider honors
 //!   the shared `signal` for every network step.
-//! - The `catalogBaseUrl` default is `https://resetpi.com` (ADR-0009); settings/env
+//! - The `catalogBaseUrl` default is `https://revpi.dev` (ADR-0009); settings/env
 //!   configurability is T14 (ADR-0002 §8).
 
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,7 @@ use crate::config::VERSION;
 pub const REMOTE_CATALOG_REFRESH_INTERVAL_MS: i64 = 4 * 60 * 60 * 1000;
 
 /// `DEFAULT_CATALOG_BASE_URL` (remote-catalog-provider.ts:5).
-pub const DEFAULT_CATALOG_BASE_URL: &str = "https://resetpi.com";
+pub const DEFAULT_CATALOG_BASE_URL: &str = "https://revpi.dev";
 
 /// Resolve the remote catalog base URL (ADR-0002 §8, T14-W6a):
 /// `RPI_MODEL_CATALOG_URL` env > `modelCatalogUrl` setting >
