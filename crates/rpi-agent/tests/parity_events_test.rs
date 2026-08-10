@@ -417,8 +417,9 @@ async fn parity_length_truncation() {
         .expect("must not hang");
 }
 
-/// steering-followup：fixture 含 `queue_update`（AgentSession 层）事件，
-/// 过滤后 Agent 层事件序列与载荷仍可做到归一化内容级一致。
+/// steering-followup: the fixture contains `queue_update` (AgentSession layer)
+/// events; after filtering, the Agent-layer event sequence and payloads still match
+/// at normalized content level.
 #[tokio::test]
 async fn parity_steering_followup() {
     async fn scenario() {

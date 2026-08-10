@@ -1028,7 +1028,7 @@ mod tests {
     #[test]
     fn test_encode_cwd_dir_name_windows_drive_colon() {
         // Windows drive-letter colon and backslashes are replaced (self-check
-        // list: 目录编码规则含 Windows 盘符冒号).
+        // list: the directory encoding rule covers the Windows drive-letter colon).
         assert_eq!(
             encode_cwd_dir_name("C:\\Users\\dev\\repo"),
             "--C--Users-dev-repo--"

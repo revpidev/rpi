@@ -84,7 +84,7 @@ impl Drop for TempDir {
 }
 
 // ---------------------------------------------------------------------------
-// 归一化准备（文件头注释的口径）
+// Normalization preparation (per the header-note convention)
 // ---------------------------------------------------------------------------
 
 const STRIPPED_KEYS: &[&str] = &["usage", "details"];
@@ -125,9 +125,10 @@ fn prepare_session_lines(text: &str) -> String {
 }
 
 fn prepare_event_lines(text: &str) -> String {
-    // 先按类型过滤 + 剥键，再把连续 `tool_execution_end` 块内按
-    // (toolCallId, toolName) 排序：上游工具并行执行，完成序是时序非确定
-    // 的（本次实录 bash 先于 read），不入契约。
+    // First filter by type and strip keys, then sort consecutive `tool_execution_end`
+    // blocks by (toolCallId, toolName): upstream runs tools in parallel, so completion
+    // order is timing-nondeterministic (this recording has bash before read) and is not
+    // part of the contract.
     let mut prepared: Vec<Value> = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -258,9 +259,10 @@ async fn start_scenario(
     }
 }
 
-/// 等自 `since` 起第一个 `message_update` 事件（steer/followUp/abort 的
-/// 时序锚点，对应生成器的 `waitForEvent("message_update")`；`since` 用调用
-/// 时的事件总数，避免吃到上一个 prompt 的存量事件）。
+/// waits for the first `message_update` event from `since` onward (the timing anchor for
+/// steer/followUp/abort, mirroring the generator's `waitForEvent("message_update")`;
+/// `since` uses the event count at call time to avoid consuming events left over from the
+/// previous prompt).
 async fn wait_for_message_update(events: &Arc<Mutex<Vec<AgentSessionEvent>>>, since: usize) {
     let deadline = Instant::now() + TEST_TIMEOUT;
     loop {
@@ -303,7 +305,7 @@ fn compare_with_fixture(scenario: &str, run: &ScenarioRun) {
     )
     .unwrap_or_else(|f| panic!("{scenario}: session parity diff:\n{f}"));
 
-    // Event stream parity (json 模式同款事件形状)。
+    // Event stream parity (same event shape as json mode).
     let mut actual_events = String::new();
     for event in run.events.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         actual_events.push_str(&serde_json::to_string(event).expect("serialize event"));
@@ -320,7 +322,7 @@ fn compare_with_fixture(scenario: &str, run: &ScenarioRun) {
 }
 
 // ---------------------------------------------------------------------------
-// 场景（脚本逐条移植自 generate-fixtures.mjs）
+// Scenarios (scripts ported one-by-one from generate-fixtures.mjs)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -548,7 +550,7 @@ async fn parity_length_truncation() {
 }
 
 // ---------------------------------------------------------------------------
-// print / json 模式（run_print_mode 直接驱动）
+// print / json modes (driven directly via run_print_mode)
 // ---------------------------------------------------------------------------
 
 async fn build_runtime(
@@ -643,7 +645,7 @@ async fn build_runtime(
     (runtime, tmp)
 }
 
-/// print 模式（text）：打印最后 assistant 的 text 块，exit 0。
+/// print mode (text): prints the last assistant's text block, exit 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn print_mode_text_output() {
     let (mut runtime, _tmp) = build_runtime(
@@ -676,7 +678,7 @@ async fn print_mode_text_output() {
     );
 }
 
-/// json 模式：session header 行 + 事件序列（agent_start → agent_settled）。
+/// json mode: session header line + event sequence (agent_start → agent_settled).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn print_mode_json_event_stream() {
     let (mut runtime, _tmp) = build_runtime(
@@ -708,7 +710,7 @@ async fn print_mode_json_event_stream() {
         .lines()
         .map(|line| serde_json::from_str(line).expect("json line"))
         .collect();
-    // 首行是 session header（print-mode.ts:112-117）。
+    // First line is the session header (print-mode.ts:112-117).
     assert_eq!(lines[0]["type"], "session");
     assert_eq!(lines[0]["version"], 3);
     assert!(lines[0]["id"].as_str().is_some());
@@ -734,8 +736,8 @@ async fn print_mode_json_event_stream() {
     }
 }
 
-/// print 模式：多条消息依次发送（print-mode.ts:120-128），输出最后一轮的
-/// assistant 文本。
+/// print mode: multiple messages sent in order (print-mode.ts:120-128); prints the last
+/// round's assistant text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn print_mode_sends_all_messages_in_order() {
     let (mut runtime, _tmp) = build_runtime(
@@ -777,7 +779,7 @@ async fn print_mode_sends_all_messages_in_order() {
     assert_eq!(user_texts, vec!["first", "second", "third"]);
 }
 
-/// print 模式：error / aborted 的最后 assistant → stderr + exit 1
+/// print mode: error / aborted final assistant → stderr + exit 1
 ///（print-mode.ts:129-146）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn print_mode_error_and_aborted_exit_1() {

@@ -1185,7 +1185,7 @@ impl AgentSession {
     }
 
     /// Refresh the shared `RPI_*` session env cell (requirements §3.3: bash
-    /// 工具每次命令启动时解析，模型切换即时生效).
+    /// resolves the tools' env per command spawn; model switches take effect immediately).
     fn sync_session_env(&self) {
         let model = self.model();
         let mut cell = self

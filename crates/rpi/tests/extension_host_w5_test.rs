@@ -26,7 +26,7 @@ use rpi_test_support::faux::{
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
-// Fixture helpers（沿用 W2/W3 模式）
+// Fixture helpers (following the W2/W3 pattern)
 // ---------------------------------------------------------------------------
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -250,7 +250,7 @@ async fn runtime_fixture(event_log: Arc<Mutex<Vec<String>>>) -> RuntimeFixture {
 }
 
 // ---------------------------------------------------------------------------
-// ExtensionContext 补全（types.ts:324-341）
+// ExtensionContext completion (types.ts:324-341)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -268,9 +268,9 @@ async fn w5_context_base_accessors() {
     assert!(!ctx.has_pending_messages().unwrap());
     assert!(ctx.signal().unwrap().is_none(), "no signal while idle");
     assert!(ctx.model().unwrap().is_some(), "faux model present");
-    // getSystemPrompt：当前生效 prompt（非空）。
+    // getSystemPrompt: the currently effective prompt (non-empty).
     assert!(!ctx.get_system_prompt().unwrap().is_empty());
-    // getContextUsage：无 usage 数据 → tokens None（三态之一）。
+    // getContextUsage: no usage data → tokens None (one of three states).
     let usage = ctx.get_context_usage().unwrap();
     if let Some(usage) = usage {
         assert!(usage.context_window > 0);
@@ -306,7 +306,8 @@ async fn w5_context_compact_fires_and_forgets_with_callback() {
     let fixture = runtime_fixture(event_log).await;
     let session = fixture.runtime.session().clone();
 
-    // 铺三轮对话（超过 keep_recent 阈值）使压缩有内容。
+    // Lay down three conversation rounds (past the keep_recent threshold) so
+    // compaction has content.
     {
         let manager = session.session_manager();
         let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
@@ -339,7 +340,7 @@ async fn w5_context_compact_fires_and_forgets_with_callback() {
         drop(manager);
         session.agent().set_messages(messages);
     }
-    // faux 提供摘要响应。
+    // faux provides the summary response.
     let host = fixture.hosts.lock().unwrap()[0].clone();
     let ctx = host.core().create_context();
 
@@ -377,7 +378,7 @@ async fn w5_context_compact_fires_and_forgets_with_callback() {
 }
 
 // ---------------------------------------------------------------------------
-// session 替换：时序 + stale + withSession（agent-session-runtime.ts:133-215）
+// Session replacement: timing + stale + withSession (agent-session-runtime.ts:133-215)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -385,7 +386,7 @@ async fn w5_new_session_replacement_sequence_and_stale() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let mut fixture = runtime_fixture(event_log.clone()).await;
 
-    // rebind：新 session bind_extensions（发 session_start）。
+    // rebind: the new session bind_extensions (sends session_start).
     fixture.runtime.set_rebind_session(Some(Box::new(|session| {
         Box::pin(async move {
             session
@@ -406,8 +407,8 @@ async fn w5_new_session_replacement_sequence_and_stale() {
     let marker = with_session_ran.clone();
     let runtime = Arc::new(tokio::sync::Mutex::new(fixture.runtime));
     let actions = RuntimeCommandActions::new(&runtime);
-    // 注意：RuntimeCommandActions 经 Weak 持有 runtime——本测试此后经
-    // actions 操作。
+    // Note: RuntimeCommandActions holds the runtime via Weak — the rest of this test
+    // operates through actions.
     let cancelled = actions
         .new_session(
             None,
@@ -415,7 +416,7 @@ async fn w5_new_session_replacement_sequence_and_stale() {
                 let marker = marker.clone();
                 Box::pin(async move {
                     *marker.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                    // withSession 绑定新 session：发消息进新会话。
+                    // withSession binds a new session: messages go into the new session.
                     ctx.send_message(
                         json!({"customType": "post-replace", "display": false}),
                         None,
@@ -427,7 +428,7 @@ async fn w5_new_session_replacement_sequence_and_stale() {
         .await;
     assert!(!cancelled);
 
-    // 时序：旧 shutdown(new) → 新 start(new) → withSession。
+    // Timing: old shutdown(new) → new start(new) → withSession.
     let log = event_log.lock().unwrap().clone();
     let shutdown_pos = log
         .iter()
@@ -438,7 +439,7 @@ async fn w5_new_session_replacement_sequence_and_stale() {
     assert!(*with_session_ran.lock().unwrap());
     assert!(matches!(log.last().map(String::as_str), Some("start:new")));
 
-    // 旧 ctx/api stale（loader.ts:175-179 + runner.ts:539-552）。
+    // Old ctx/api are stale (loader.ts:175-179 + runner.ts:539-552).
     assert!(old_host.runtime().is_stale());
     match old_api.get_session_name() {
         Err(ExtError::Stale(_)) => {}
@@ -449,9 +450,10 @@ async fn w5_new_session_replacement_sequence_and_stale() {
         other => panic!("expected Stale ctx, got {other:?}"),
     }
 
-    // withSession 发送的消息在新 session（需要运行时取回——从 actions 借用
-    // 不可能，改用 hosts[1] 的 runtime 侧效果：直接查新 host 无报错即可；
-    // 消息内容经新 session 的 messages 验证放在下方）。
+    // Messages sent via withSession go to the new session (fetching them back at
+    // runtime is impossible — can't borrow from actions — so use the hosts[1] runtime
+    // side effect instead: querying the new host without error suffices; message
+    // content is verified below through the new session's messages).
     let _ = old_session_id;
 }
 
@@ -460,7 +462,7 @@ async fn w5_session_before_switch_cancel_blocks_replacement() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let mut fixture = runtime_fixture(event_log).await;
 
-    // 给当前（唯一）host 追加一个取消 handler。
+    // Append a cancel handler to the current (only) host.
     let host = fixture.hosts.lock().unwrap()[0].clone();
     let canceller = InlineExtension::Anonymous(Arc::new(|api| {
         on_json(&api, ext::EVENT_SESSION_BEFORE_SWITCH, |_| {
@@ -488,9 +490,9 @@ async fn w5_session_before_switch_cancel_blocks_replacement() {
     let actions = RuntimeCommandActions::new(&runtime);
     let cancelled = actions.new_session(None, None).await;
     assert!(cancelled, "session_before_switch cancel blocks newSession");
-    // 无替换：未创建新 host、旧 runtime 未 stale。
+    // No replacement: no new host created, old runtime not stale.
     drop(actions);
-    // （runtime 被 actions 拿走；用 hosts 计数验证。）
+    // (The runtime was taken by actions; verified via the hosts count.)
     assert_eq!(fixture.hosts.lock().unwrap().len(), hosts_before);
     assert!(!fixture.hosts.lock().unwrap()[0].runtime().is_stale());
 }
@@ -501,7 +503,8 @@ async fn w5_navigate_tree_cancel_branch() {
     let fixture = runtime_fixture(event_log).await;
     let session = fixture.runtime.session().clone();
 
-    // 铺两个 entry；目标是第一个（导航到当前 leaf 会提前返回，不发事件）。
+    // Lay two entries; target the first (navigating to the current leaf returns early
+    // and emits no event).
     let target_id = {
         let manager = session.session_manager();
         let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
@@ -571,7 +574,7 @@ async fn w5_reload_reruns_factories_preserves_flags_and_stales_old() {
     assert!(errors.is_empty());
     assert_eq!(runs.load(Ordering::Relaxed), 1);
 
-    // CLI 写入 flag 值。
+    // CLI writes the flag value.
     host.runtime()
         .set_flag_value("my-flag", ext::FlagValue::String("cli".to_owned()));
 
@@ -579,16 +582,17 @@ async fn w5_reload_reruns_factories_preserves_flags_and_stales_old() {
     let errors = host.reload().await;
     assert!(errors.is_empty());
     assert_eq!(runs.load(Ordering::Relaxed), 2, "factory re-ran on reload");
-    // flag 值保留（resource-loader reload 语义）。
+    // Flag value preserved (resource-loader reload semantics).
     assert_eq!(
         host.runtime().get_flag_value("my-flag"),
         Some(ext::FlagValue::String("cli".to_owned()))
     );
-    // 旧 runtime stale。
+    // Old runtime is stale.
     assert!(old_runtime.is_stale());
     assert!(!host.runtime().is_stale());
-    // 模块缓存 generation 递增（clearExtensionCache, loader.ts:151-155）。
-    // 由 loader 单测覆盖 clear() 语义；这里验证 reload 后注册表重建。
+    // Module-cache generation increments (clearExtensionCache, loader.ts:151-155).
+    // The loader unit tests cover clear() semantics; here we verify the registry is
+    // rebuilt after reload.
     assert_eq!(
         host.get_flags().get("my-flag").map(|f| f.name.as_str()),
         Some("my-flag")
@@ -600,7 +604,7 @@ async fn w5_session_reload_event_sequence() {
     let event_log = Arc::new(Mutex::new(Vec::new()));
     let fixture = runtime_fixture(event_log.clone()).await;
 
-    // resources_discover 记录 reason。
+    // resources_discover records the reason.
     let host = fixture.hosts.lock().unwrap()[0].clone();
     let log = event_log.clone();
     let discover = InlineExtension::Anonymous(Arc::new(move |api| {

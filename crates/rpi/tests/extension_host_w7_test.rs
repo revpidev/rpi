@@ -34,7 +34,7 @@ impl Drop for TempDir {
     }
 }
 
-/// 最小 gate guest（on tool_call → block "w7-block"）。
+/// Minimal gate guest (on tool_call → block "w7-block").
 const GATE_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -69,7 +69,7 @@ const GATE_WAT: &str = r#"
 )
 "#;
 
-/// 写一个 wasm 扩展包目录（rpi-extension.json + dist/guest.wasm）。
+/// Writes a wasm extension package directory (rpi-extension.json + dist/guest.wasm).
 fn write_wasm_package(root: &Path, name: &str) -> PathBuf {
     let pkg = root.join(name);
     std::fs::create_dir_all(pkg.join("dist")).expect("dist");
@@ -111,7 +111,7 @@ fn resolve_extensions(cwd: &Path, agent_dir: &Path) -> Vec<(PathBuf, bool)> {
 }
 
 // ---------------------------------------------------------------------------
-// 安装管理 e2e（本地 wasm 包）
+// Install management e2e (local wasm package)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -123,7 +123,7 @@ async fn w7_install_list_disable_enable_remove_wasm_package() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let _pkg = write_wasm_package(&cwd, "gate-pkg");
 
-    // install（本地路径，manifest 校验经 resolve_extension_entries）。
+    // install (local path; manifest validation via resolve_extension_entries).
     let parsed = rpi::cli::package_command::parse_package_command(&[
         "install".to_owned(),
         "./gate-pkg".to_owned(),
@@ -143,7 +143,8 @@ async fn w7_install_list_disable_enable_remove_wasm_package() {
         "settings: {settings}"
     );
 
-    // resolve → 包目录条目启用（上游目录形语义；wasm 入口在 host 侧解析）。
+    // resolve → package-dir entries enabled (upstream directory-form semantics; the
+    // wasm entry is resolved on the host side).
     let entries = resolve_extensions(&cwd, &agent_dir);
     assert!(
         entries
@@ -152,15 +153,16 @@ async fn w7_install_list_disable_enable_remove_wasm_package() {
         "resolved entries: {entries:?}"
     );
 
-    // list 输出含该包。
+    // list output includes the package.
     let parsed =
         rpi::cli::package_command::parse_package_command(&["list".to_owned()]).expect("parse list");
     let code = rpi::cli::package_command::run_package_command_in(&parsed, &cwd, &agent_dir, None);
     assert_eq!(code, 0);
 
-    // config（禁用/启用）：config TUI 的 toggle 落盘为 settings 对象形
-    // 条目 + `-pattern` 过滤（config-selector.ts:580-637）；集成层直接
-    // 写该线格式验证 discovery 过滤语义。
+    // config (disable/enable): the config TUI's toggle persists as a settings
+    // object-form entry + `-pattern` filtering (config-selector.ts:580-637); the
+    // integration layer writes that wire format directly to verify discovery-filter
+    // semantics.
     let settings_path = agent_dir.join("settings.json");
     let settings: Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
@@ -181,7 +183,7 @@ async fn w7_install_list_disable_enable_remove_wasm_package() {
             .all(|(path, enabled)| !(path.ends_with("gate-pkg") && *enabled)),
         "disabled after override (absent or disabled): {entries:?}"
     );
-    // 重新启用（回到字符串形 = 无过滤）。
+    // Re-enable (back to string form = no filtering).
     std::fs::write(
         &settings_path,
         serde_json::to_string_pretty(&json!({ "packages": [source] })).expect("write"),
@@ -218,7 +220,8 @@ async fn w7_install_list_disable_enable_remove_wasm_package() {
     );
 }
 
-/// 安装后的 wasm 包经启动链路（resolve → package paths → host 加载）生效。
+/// An installed wasm package takes effect through the startup chain (resolve → package
+/// paths → host load).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w7_installed_wasm_package_loads_and_blocks() {
     let tmp = TempDir::new("load");
@@ -238,7 +241,7 @@ async fn w7_installed_wasm_package_loads_and_blocks() {
         0
     );
 
-    // 启动链路：resolve → enabled extension paths → host final load。
+    // Startup chain: resolve → enabled extension paths → host final load.
     let package_paths: Vec<String> = resolve_extensions(&cwd, &agent_dir)
         .into_iter()
         .filter(|(_, enabled)| *enabled)
@@ -270,7 +273,7 @@ async fn w7_installed_wasm_package_loads_and_blocks() {
 }
 
 // ---------------------------------------------------------------------------
-// switchSession 异 cwd 信任选择器（ADR-0006/D-044）
+// switchSession cross-cwd trust selector (ADR-0006/D-044)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -283,7 +286,7 @@ async fn w7_async_trust_selector_resolves_and_persists() {
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let trust_store = rpi::core::trust_manager::ProjectTrustStore::new(&agent_dir);
 
-    // 选择 "Trust"（第一个选项）→ trusted + 持久化。
+    // Choose "Trust" (first option) → trusted + persisted.
     let mut context = rpi::core::trust_manager::ProjectTrustContext {
         has_ui: true,
         select: None,
@@ -304,7 +307,7 @@ async fn w7_async_trust_selector_resolves_and_persists() {
     assert!(trusted, "async selector trust");
     assert_eq!(trust_store.get(&cwd).expect("store"), Some(true));
 
-    // 取消（None）→ 不信任。
+    // Cancel (None) → not trusted.
     let cwd2 = tmp.path().join("other");
     std::fs::create_dir_all(cwd2.join(".rpi")).expect(".rpi");
     std::fs::write(cwd2.join(".rpi/settings.json"), "{}").expect("settings");
@@ -326,7 +329,8 @@ async fn w7_async_trust_selector_resolves_and_persists() {
     assert!(!trusted, "cancelled selection stays untrusted");
 }
 
-/// 全链路：switch_session 到异 cwd，工厂注入的 async 选择器被消费。
+/// Full chain: switch_session to a different cwd consumes the factory-injected async
+/// selector.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
     use rpi_test_support::faux::{
@@ -340,10 +344,10 @@ async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
     for dir in [&cwd_a, &cwd_b, &agent_dir] {
         std::fs::create_dir_all(dir).expect("dir");
     }
-    // B 有信任门控资源。
+    // B has trust-gated resources.
     std::fs::create_dir_all(cwd_b.join(".rpi")).expect("b/.rpi");
     std::fs::write(cwd_b.join(".rpi/settings.json"), "{}").expect("b settings");
-    // B 的会话文件：手写最小合法 JSONL（header 带 cwd）。
+    // B's session file: a handwritten minimal valid JSONL (header carries cwd).
     let b_session_file = tmp.path().join("b-sessions/b.jsonl");
     std::fs::create_dir_all(b_session_file.parent().unwrap()).expect("b dir");
     std::fs::write(
@@ -378,7 +382,7 @@ async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
         }
     });
 
-    // 初始 runtime（A cwd）。
+    // Initial runtime (A cwd).
     let provider = FauxProvider::new(FauxProviderOptions {
         models: Some(vec![FauxModelDefinition {
             id: "faux-1".to_owned(),
@@ -426,8 +430,8 @@ async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
                     },
                 )
                 .await?;
-                // app.rs 的异 cwd 信任判定（ADR-0006 关闭路径）：async
-                // 选择器决议 → 可信则翻转并 reload。
+                // app.rs's cross-cwd trust decision (ADR-0006 closed path): the async
+                // selector's resolution → if trusted, flip and reload.
                 if let Some(mut trust_context) = options.project_trust_context {
                     let trust_store = rpi::core::trust_manager::ProjectTrustStore::new(&agent_dir);
                     let trusted = rpi::core::trust_manager::resolve_project_trusted_async(
@@ -522,7 +526,8 @@ async fn w7_switch_session_cross_cwd_uses_async_trust_selector() {
 }
 
 // ---------------------------------------------------------------------------
-// llama 内置扩展（D-047）：经真宿主注册后的命令分发路径
+// llama built-in extension (D-047): command dispatch path after registering through
+// the real host
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -573,7 +578,7 @@ async fn w7_llama_command_dispatches_through_prompt_path() {
         .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
         .await
         .expect("faux");
-    // 模拟 app.rs 的 pre-session 冲刷：llama provider 进 model runtime。
+    // Mimic app.rs's pre-session flush: llama provider enters the model runtime.
     let host = Arc::new(host);
     for registration in host.runtime().take_pending_native_provider_registrations() {
         model_runtime
@@ -619,8 +624,8 @@ async fn w7_llama_command_dispatches_through_prompt_path() {
     .expect("create session");
     rpi::core::extension_actions::bind_session_actions(&host, &created.session).await;
 
-    // /llama 经 prompt 的扩展命令路径执行：print 模式（非 TUI）下 handler
-    // notify 并返回，不触发 LLM 调用。
+    // /llama executes through the prompt's extension-command path: in print mode
+    // (non-TUI) the handler notifies and returns without triggering an LLM call.
     created
         .session
         .prompt("/llama", rpi::core::agent_session::PromptOptions::default())

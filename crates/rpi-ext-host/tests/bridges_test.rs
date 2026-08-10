@@ -27,7 +27,7 @@ async fn null_bridge_matches_noop_ui_context() {
     assert!(!set_theme.success);
     assert_eq!(set_theme.error.as_deref(), Some("UI not available"));
 
-    // no-op 方法可调用且不产出任何效果（不 panic）。
+    // no-op methods are callable and produce no effect (no panic).
     bridge.notify("m", rpi_ext_host::api::NotifyType::Info);
     bridge.set_status("k", Some("v"));
     bridge.set_working_message(Some("m"));
@@ -45,21 +45,21 @@ async fn null_bridge_matches_noop_ui_context() {
     bridge.set_tools_expanded(true);
     let _unsub = bridge.on_terminal_input(Arc::new(|_| None));
 
-    // theme getter 返回构造时注入的默认主题（runner.ts:256-258）。
+    // the theme getter returns the default theme injected at construction (runner.ts:256-258).
     assert_eq!(bridge.theme(), json!({"name": "dark"}));
     assert!(bridge.is_noop());
 }
 
 #[tokio::test]
 async fn unbound_ui_falls_back_to_null_bridge_and_has_ui_false() {
-    // runner.ts:269 + :438-440：未绑定时 ui 是 noOp 而非抛错，hasUI=false。
+    // runner.ts:269 + :438-440: when unbound, ui is a noOp rather than an error, hasUI=false.
     let host = rpi_ext_host::host::NativeExtensionHost::new("/bridges-cwd");
     let ctx = host.core().create_context();
     let bridge = ctx.ui().expect("null fallback, not an error");
     assert!(bridge.select("t", &[], None).await.is_none());
     assert!(!ctx.has_ui().unwrap());
 
-    // 绑了 Null 桥同样 hasUI=false（runner.ts:439 的 identity 检查语义）。
+    // Binding a Null bridge also yields hasUI=false (the identity-check semantics of runner.ts:439).
     host.runtime().set_ui_bridge(
         Some(Arc::new(NullUiBridge::default())),
         rpi_ext_host::types::ExtensionMode::Print,

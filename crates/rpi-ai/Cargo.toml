@@ -31,9 +31,9 @@ zstd.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-# PKCE 单测的独立 sha256/base64url 交叉校验（challenge == base64url(sha256(verifier))）。
+# Independent sha256/base64url cross-check for PKCE unit tests (challenge == base64url(sha256(verifier))).
 sha2 = "0.10"
 base64 = "0.22"
-# Codex 契约测试：mock WS server 与 zstd 请求体解码。
+# Codex contract tests: mock WS server and zstd request-body decoding.
 tokio-tungstenite = "0.26"
 zstd = "0.13"

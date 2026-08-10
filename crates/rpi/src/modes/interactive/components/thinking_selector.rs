@@ -30,8 +30,8 @@ const THINKING_SELECT_LIST_LAYOUT: SelectListLayoutOptions = SelectListLayoutOpt
 
 /// `LEVEL_DESCRIPTIONS` (thinking-selector.ts:11-19): value string and
 /// description per level. The upstream `Record` has 7 entries (`off` through
-/// `max`); the T12-S5a task brief said "8 档", the pinned upstream file has
-/// 7.
+/// `max`); the T12-S5a task brief said "8 levels", but the pinned upstream
+/// file has 7.
 pub const THINKING_LEVEL_DESCRIPTIONS: [(&str, &str); 7] = [
     ("off", "No reasoning"),
     ("minimal", "Very brief reasoning (~1k tokens)"),

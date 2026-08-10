@@ -366,7 +366,7 @@ impl InteractiveUi {
         }
 
         // `path.join(os.tmpdir(), "session.html")` (interactive-mode.ts:5526).
-        // Divergence (D-045 补记): the file lives in a per-invocation unique
+        // Divergence (D-045 addendum): the file lives in a per-invocation unique
         // subdirectory so two concurrent rpi instances cannot overwrite each
         // other's export (which would publish the wrong session). The
         // basename stays `session.html` — gh uses it as the gist file name.

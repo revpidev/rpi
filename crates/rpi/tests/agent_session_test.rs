@@ -195,7 +195,8 @@ async fn session_fixture(
             .unwrap_or_else(|e| e.into_inner())
             .push(event);
     }));
-    // 测试期间订阅一直存活：unsubscribe 句柄泄漏到 fixture 生命周期结束。
+    // The subscription stays alive for the whole test: the unsubscribe handle leaks
+    // until the fixture's lifetime ends.
     std::mem::forget(_unsubscribe);
 
     SessionFixture {
@@ -208,7 +209,7 @@ async fn session_fixture(
 }
 
 // ---------------------------------------------------------------------------
-// thinking 级别 → provider 请求（sdk.rs stream_simple 接线回归）
+// thinking level → provider request (sdk.rs stream_simple wiring regression)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -245,8 +246,9 @@ async fn thinking_level_reaches_provider_stream_and_lands_in_transcript() {
     )
     .await;
 
-    // 默认级别（model_resolver::DEFAULT_THINKING_LEVEL = Medium）→ 请求带
-    // Some(Medium)：修复前 plain stream 丢弃 reasoning，这里收到的永远是
+    // Default level (model_resolver::DEFAULT_THINKING_LEVEL = Medium) → the request
+    // carries Some(Medium): before the fix the plain stream dropped reasoning, so this
+    // always received
     // None。
     fixture
         .session
@@ -266,8 +268,8 @@ async fn thinking_level_reaches_provider_stream_and_lands_in_transcript() {
         Some(rpi_ai::types::ThinkingLevel::Medium)
     );
 
-    // set_thinking_level(High) → 下一次请求带 Some(High)，且 thinking 块落入
-    // 会话消息（持久化/展示管线可见）。
+    // set_thinking_level(High) → the next request carries Some(High), and the thinking
+    // block lands in the session messages (visible to the persistence/display pipeline).
     fixture
         .session
         .set_thinking_level(rpi_agent::types::ThinkingLevel::High);
@@ -306,7 +308,7 @@ async fn thinking_level_reaches_provider_stream_and_lands_in_transcript() {
 }
 
 // ---------------------------------------------------------------------------
-// prompt 生命周期：事件序 + 消息 + session 持久化
+// prompt lifecycle: event order + messages + session persistence
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -325,7 +327,7 @@ async fn prompt_lifecycle_events_and_persistence() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // 事件序：agent_start 最先、agent_settled 最后，中间含 turn/message 面。
+    // Event order: agent_start first, agent_settled last, with turn/message surface in between.
     let types = fixture.event_types();
     assert_eq!(types.first().map(String::as_str), Some("agent_start"));
     assert_eq!(types.last().map(String::as_str), Some("agent_settled"));
@@ -343,14 +345,14 @@ async fn prompt_lifecycle_events_and_persistence() {
         );
     }
 
-    // agent_end 带 willRetry:false（rpc.md §agent_end）。
+    // agent_end carries willRetry:false (rpc.md §agent_end).
     let agent_end = fixture.events_of_type("agent_end");
     assert_eq!(agent_end.len(), 1);
     let value = serde_json::to_value(&agent_end[0]).expect("serialize");
     assert_eq!(value["willRetry"], false);
     assert_eq!(value["messages"].as_array().expect("messages").len(), 2);
 
-    // 消息状态：user + assistant。
+    // Message state: user + assistant.
     let messages = fixture.session.messages();
     assert_eq!(messages.len(), 2);
     assert!(matches!(messages[0], AgentMessage::User(_)));
@@ -360,7 +362,8 @@ async fn prompt_lifecycle_events_and_persistence() {
         Some("hi there")
     );
 
-    // session 持久化（message_end 先写 session 再转发听众，agent-session.ts:752）。
+    // Session persistence (message_end writes the session before forwarding to
+    // listeners, agent-session.ts:752).
     let entries = {
         let manager = fixture.session.session_manager();
         let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,7 +378,7 @@ async fn prompt_lifecycle_events_and_persistence() {
 }
 
 // ---------------------------------------------------------------------------
-// queue_update：steer/follow_up 入队、消费与计数
+// queue_update: steer/follow_up enqueue, consumption, and counting
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -395,7 +398,7 @@ async fn queue_update_lifecycle() {
     )
     .await;
 
-    // prompt 在后台运行；流式期间 steer + follow_up 入队。
+    // The prompt runs in the background; steer + follow_up enqueue mid-stream.
     let session = fixture.session.clone();
     let prompt_task =
         tokio::spawn(async move { session.prompt("start", Default::default()).await });
@@ -417,7 +420,7 @@ async fn queue_update_lifecycle() {
     assert_eq!(fixture.session.get_follow_up_messages(), vec!["later"]);
     assert_eq!(fixture.session.pending_message_count(), 2);
 
-    // queue_update 事件内容（依次入队）。
+    // queue_update event content (enqueued in order).
     let queue_updates: Vec<Value> = fixture
         .events_of_type("queue_update")
         .iter()
@@ -441,7 +444,7 @@ async fn queue_update_lifecycle() {
     prompt_task.await.expect("prompt task").expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // 全部消费完毕；消息含 steering 与 follow-up 的用户消息。
+    // All consumed; messages include the steering and follow-up user messages.
     assert_eq!(fixture.session.pending_message_count(), 0);
     let texts: Vec<String> = fixture
         .session
@@ -458,7 +461,7 @@ async fn queue_update_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
-// auto-retry：瞬态错误 → auto_retry_start/end → 成功
+// auto-retry: transient error → auto_retry_start/end → success
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -501,7 +504,7 @@ async fn auto_retry_recovers_from_transient_error() {
     assert_eq!(fixture.provider.call_count(), 2);
 }
 
-/// auto-retry 用尽的最终失败：auto_retry_end success:false + finalError。
+/// Final failure after auto-retry is exhausted: auto_retry_end success:false + finalError.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auto_retry_exhausted_reports_final_error() {
     let fixture = session_fixture(
@@ -536,7 +539,8 @@ async fn auto_retry_exhausted_reports_final_error() {
 }
 
 // ---------------------------------------------------------------------------
-// bash：流式期间暂存 pending，下个 prompt 前 flush（agent-session.ts:2851）
+// bash: staged as pending during streaming, flushed before the next prompt
+// (agent-session.ts:2851)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -557,7 +561,7 @@ async fn bash_result_flushes_before_next_prompt() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(fixture.session.is_streaming());
 
-    // 流式期间执行 bash：结果进 pending 队列，不进消息状态。
+    // bash executed mid-stream: the result goes into the pending queue, not message state.
     let result = fixture
         .session
         .execute_bash("printf 'bash-out'", Default::default())
@@ -577,8 +581,8 @@ async fn bash_result_flushes_before_next_prompt() {
     prompt_task.await.expect("prompt task").expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // run 结束的 finally 即 flush（agent-session.ts:1068-1072）：pending 清空、
-    // bashExecution 进入消息状态，且位于第二个 user 消息之前。
+    // The run's finally is the flush point (agent-session.ts:1068-1072): pending is
+    // drained and the bashExecution enters message state, before the second user message.
     assert!(!fixture.session.has_pending_bash_messages());
 
     fixture

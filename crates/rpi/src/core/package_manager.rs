@@ -77,7 +77,7 @@ pub const GIT_UPDATE_CONCURRENCY: usize = 4;
 /// value is offline), but `main.ts:476` gates the same flag through
 /// `isTruthyEnvFlag` — upstream is internally inconsistent. We follow the
 /// `main.ts` semantics (`1`/`true`/`yes`, case-insensitive) via the shared
-/// [`environment::is_truthy_env_flag`] helper. (D-040 补记)
+/// [`environment::is_truthy_env_flag`] helper. (D-040 addendum)
 pub fn is_offline_mode_enabled() -> bool {
     crate::core::environment::is_truthy_env_flag(std::env::var(config::ENV_OFFLINE).ok().as_deref())
 }
@@ -1449,7 +1449,7 @@ impl DefaultPackageManager {
     /// instead of propagating (upstream throws). Practically unreachable —
     /// the CLI never resolves project-scope npm paths for untrusted projects
     /// because SettingsManager yields empty settings there — so the function
-    /// keeps its infallible `PathBuf` return shape. (D-040 补记)
+    /// keeps its infallible `PathBuf` return shape. (D-040 addendum)
     fn get_npm_install_path(&self, source: &NpmSource, scope: SourceScope) -> PathBuf {
         let managed = self
             .get_managed_npm_install_path(source, scope)

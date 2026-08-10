@@ -57,8 +57,9 @@ async fn sdk_quick_start_one_faux_round() {
     std::fs::create_dir_all(&cwd).expect("cwd");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
 
-    // Provider 注入：外部调用方的等价物是 registerNativeProvider /
-    // registerProvider（此处用 FauxProvider 脚本化一轮对话）。
+    // Provider injection: the external caller's equivalent is
+    // registerNativeProvider / registerProvider (here FauxProvider scripts one
+    // conversation round).
     let provider = FauxProvider::new(FauxProviderOptions::default());
     provider.set_responses(vec![faux_assistant_message(
         "There are 3 files in the current directory.",
@@ -104,7 +105,7 @@ async fn sdk_quick_start_one_faux_round() {
     let session = created.session;
     assert!(created.model_fallback_message.is_none());
 
-    // subscribe: 事件流（Quick Start 里的 text_delta 打印环）。
+    // subscribe: event stream (the text_delta print loop from Quick Start).
     let events: Arc<Mutex<Vec<AgentSessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let collector = events.clone();
     let _unsubscribe = session.subscribe(Arc::new(move |event| {

@@ -101,7 +101,7 @@ async fn session_fixture(
     session_fixture_full(responses, host, provider_options, None).await
 }
 
-/// `models_json` 可选写入 agent_dir/models.json（provider 覆盖/恢复测试）。
+/// `models_json` optionally writes agent_dir/models.json (provider override/restore tests).
 async fn session_fixture_full(
     responses: Vec<FauxResponseStep>,
     host: NativeExtensionHost,
@@ -223,7 +223,7 @@ async fn w3_send_message_idle_without_trigger_turn_appends_only() {
             None,
         )
         .expect("send_message");
-    // spawn 调度的动作跑完（无 triggerTurn → 不产生 LLM 调用）。
+    // Spawn-scheduled actions run to completion (no triggerTurn → no LLM call).
     wait_until(|| {
         fixture
             .session
@@ -270,7 +270,7 @@ async fn w3_send_message_next_turn_queues_for_next_prompt() {
             }),
         )
         .expect("send_message");
-    // nextTurn：不入当前消息流。
+    // nextTurn: not part of the current message stream.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert!(fixture
         .session
@@ -285,7 +285,7 @@ async fn w3_send_message_next_turn_queues_for_next_prompt() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // 下轮 prompt 时入列（agent-session.ts:1435-1437 + :1219-1220）。
+    // Queued on the next prompt (agent-session.ts:1435-1437 + :1219-1220).
     let has_aside = fixture.session.messages().iter().any(|m| {
         serde_json::to_value(m)
             .map(|v| v["customType"] == "aside")
@@ -296,7 +296,7 @@ async fn w3_send_message_next_turn_queues_for_next_prompt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w3_send_message_streaming_follow_up_queues_into_run() {
-    // 慢响应制造 streaming 窗口。
+    // A slow response creates a streaming window.
     let long_text = "x".repeat(800);
     let (host, slot) = host_with_api(Vec::new()).await;
     let fixture = session_fixture(
@@ -331,7 +331,7 @@ async fn w3_send_message_streaming_follow_up_queues_into_run() {
     prompt_task.await.expect("prompt task").expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // followUp 分支：消息进 agent 队列并触发第二轮 LLM 调用。
+    // followUp branch: the message enters the agent queue and triggers a second LLM call.
     let has_mid_run = fixture.session.messages().iter().any(|m| {
         serde_json::to_value(m)
             .map(|v| v["customType"] == "mid-run")
@@ -384,7 +384,7 @@ async fn w3_send_user_message_streaming_without_deliver_as_errors() {
     })
     .await;
 
-    // 中止慢响应，让 prompt_task 收尾。
+    // Abort the slow response so prompt_task winds down.
     fixture.session.abort().await;
     let _ = prompt_task.await;
 
@@ -411,9 +411,9 @@ async fn w3_set_active_tools_ignores_unknown_and_rebuilds_prompt() {
     api.set_active_tools(vec!["read".to_owned(), "bogus".to_owned()])
         .expect("set_active_tools");
 
-    // 未注册名静默忽略（agent-session.ts:930-936）。
+    // Unregistered names are silently ignored (agent-session.ts:930-936).
     assert_eq!(api.get_active_tools().unwrap(), ["read"]);
-    // system prompt 重建：bash 的 guideline 退出、read 的 snippet 保留。
+    // System prompt rebuild: bash's guideline leaves, read's snippet stays.
     let after = fixture.session.system_prompt();
     assert_ne!(before, after);
     assert!(after.contains("Read file contents"));
@@ -422,7 +422,7 @@ async fn w3_set_active_tools_ignores_unknown_and_rebuilds_prompt() {
         "bash snippet must leave the prompt"
     );
 
-    // getAllTools：全部注册工具（含未激活的），带 sourceInfo。
+    // getAllTools: all registered tools (including inactive ones), with sourceInfo.
     let all = api.get_all_tools().unwrap();
     let read = all.iter().find(|t| t["name"] == "read").expect("read tool");
     assert_eq!(read["sourceInfo"]["source"], "builtin");
@@ -472,9 +472,9 @@ fn tool_result_json(session: &AgentSession) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w3_added_tool_names_pure_addition_branch() {
     let (host, slot) = host_with_api(Vec::new()).await;
-    // activator 在执行期间注册 extra：registerTool 的 refresh 把新名加入
-    // active 集（agent-session.ts:2536-2541 的 new-names 分支），构成
-    // wrapper.ts:28-34 的纯增量场景。
+    // The activator registers extra during execution: registerTool's refresh adds the
+    // new name to the active set (the new-names branch of agent-session.ts:2536-2541),
+    // forming wrapper.ts:28-34's purely-additive scenario.
     let host = host;
     let slot2 = slot.clone();
     let errors = host
@@ -529,7 +529,7 @@ async fn w3_added_tool_names_pure_addition_branch() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // 纯增量：addedToolNames 带 extra（wrapper.ts:28-34）。
+    // Purely additive: addedToolNames carries extra (wrapper.ts:28-34).
     let result = tool_result_json(&fixture.session);
     assert_eq!(result["addedToolNames"], json!(["extra"]));
     assert!(fixture
@@ -557,7 +557,7 @@ async fn w3_added_tool_names_suppressed_when_tools_removed() {
                             .unwrap_or_else(|e| e.into_inner())
                             .clone()
                             .expect("api");
-                        // 有移除（read 被拿掉）的集合变更 → 不附加 addedToolNames
+                        // A set change that removes (read dropped) → do not attach addedToolNames
                         //（wrapper.ts:26-27）。
                         api.set_active_tools(vec!["swapper".to_owned(), "other".to_owned()])
                             .expect("set_active_tools");
@@ -605,7 +605,7 @@ async fn w3_added_tool_names_suppressed_when_tools_removed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w3_register_provider_queue_flush_runtime_and_unregister() {
-    // 加载期（pre-bind）注册排队。
+    // Load-time (pre-bind) registrations are queued.
     let queued = InlineExtension::Anonymous(Arc::new(|api| {
         Box::pin(async move {
             api.register_provider(
@@ -631,7 +631,7 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
         })
     }));
     let (host, slot) = host_with_api(vec![queued]).await;
-    // models.json 定义的 base-p 扮演「内建」provider（覆盖/恢复用例）。
+    // The base-p defined in models.json plays the "built-in" provider (override/restore case).
     let fixture = session_fixture_full(
         Vec::new(),
         host,
@@ -643,13 +643,13 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
     .await;
     let runtime = fixture.session.model_runtime().clone();
 
-    // bind 冲刷：模型立即可见。
+    // bind flush: the model is immediately visible.
     assert!(
         runtime.get_model("ext-proxy", "proxy-1").is_some(),
         "queued provider flushed on bind"
     );
 
-    // 运行期注册立即生效（runner.ts:387-393）。
+    // Runtime registration takes effect immediately (runner.ts:387-393).
     slot_api(&slot)
         .register_provider(
             "ext-proxy-2",
@@ -672,7 +672,7 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
         .expect("runtime registration");
     assert!(runtime.get_model("ext-proxy-2", "proxy-2").is_some());
 
-    // unregister：移除动态模型（custom-provider.md:190-217）。
+    // unregister: removes a dynamic model (custom-provider.md:190-217).
     slot_api(&slot)
         .unregister_provider("ext-proxy-2")
         .await
@@ -680,8 +680,8 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
     assert!(runtime.get_model("ext-proxy-2", "proxy-2").is_none());
     assert!(runtime.get_model("ext-proxy", "proxy-1").is_some());
 
-    // 覆盖 models.json 定义的 provider：models 全量替换（types.ts:1437）；
-    // unregister 后恢复内建（custom-provider.md:190-217）。
+    // Overriding a models.json-defined provider: models fully replaced (types.ts:1437);
+    // unregister restores the built-in (custom-provider.md:190-217).
     assert!(runtime.get_model("base-p", "base-1").is_some());
     slot_api(&slot)
         .register_provider(
@@ -720,7 +720,7 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
 }
 
 // ---------------------------------------------------------------------------
-// flags（agent-session-services.ts:81-127 → rpi 侧 helper）
+// flags (agent-session-services.ts:81-127 → rpi-side helper)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -730,7 +730,7 @@ async fn w3_flag_values_registered_applied_unknown_errors() {
     let errors = host.load_inline(&[flags_ext]).await;
     assert!(errors.is_empty());
 
-    // 已注册：boolean 置 true（忽略给定值），string 写入值。
+    // Registered: boolean sets true (ignores the given value), string writes the value.
     let diagnostics = rpi::core::agent_session_services::apply_extension_flag_values(
         &host,
         &[
@@ -754,7 +754,7 @@ async fn w3_flag_values_registered_applied_unknown_errors() {
         Some(ext::FlagValue::String("file.json".to_owned()))
     );
 
-    // string flag 缺值 → 报错；未注册 → Unknown option(s)。
+    // String flag without a value → error; unregistered → Unknown option(s).
     let diagnostics = rpi::core::agent_session_services::apply_extension_flag_values(
         &host,
         &[
@@ -794,7 +794,7 @@ fn inline_with_flags() -> InlineExtension {
 }
 
 // ---------------------------------------------------------------------------
-// 覆盖内置工具（agent-session.ts:2454-2545 的 Map.set 覆盖序）
+// Overriding built-in tools (the Map.set override order of agent-session.ts:2454-2545)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -827,12 +827,14 @@ async fn w3_extension_tool_overrides_builtin_definition_and_execution() {
 
     let fixture = session_fixture(Vec::new(), host, FauxProviderOptions::default()).await;
 
-    // 定义覆盖：getAllTools 的 read 来自扩展（source 非 builtin、描述替换）。
+    // Definition override: getAllTools' read comes from the extension (source not
+    // builtin, description replaced).
     let all = fixture.session.get_all_tools();
     let read = all.iter().find(|t| t["name"] == "read").expect("read");
     assert_eq!(read["description"], "read tool");
     assert_eq!(read["sourceInfo"]["source"], "inline");
-    // promptSnippet 不继承内置（覆盖且无 snippet → prompt 不含内置片段）。
+    // promptSnippet does not inherit the built-in (overridden and no snippet → the
+    // prompt contains no built-in fragment).
     assert!(
         !fixture
             .session
@@ -841,7 +843,7 @@ async fn w3_extension_tool_overrides_builtin_definition_and_execution() {
         "builtin snippet must not be inherited by the override"
     );
 
-    // 执行覆盖：LLM 调 read → 扩展实现运行。
+    // Execution override: the LLM calls read → the extension implementation runs.
     fixture.provider.set_responses(vec![
         tool_call_step("read", json!({"path": "x"})),
         text_step("done"),
@@ -857,7 +859,7 @@ async fn w3_extension_tool_overrides_builtin_definition_and_execution() {
 }
 
 // ---------------------------------------------------------------------------
-// events 总线（跨扩展 pub/sub）
+// events bus (cross-extension pub/sub)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -866,7 +868,7 @@ async fn w3_events_bus_cross_extension_pub_sub() {
     let sink = received.clone();
     let listener = InlineExtension::Anonymous(Arc::new(move |api| {
         let sink = sink.clone();
-        // 退订句柄不调用即保持订阅。
+        // An unsubscribe handle that is never called keeps the subscription.
         let _unsub = api.events().on(
             "my-channel",
             Arc::new(move |data| {
@@ -896,7 +898,7 @@ async fn w3_events_bus_cross_extension_pub_sub() {
 }
 
 // ---------------------------------------------------------------------------
-// getCommands 顺序 + 扩展命令执行
+// getCommands order + extension command execution
 // （agent-session.ts:2332-2355 / :1267-1294）
 // ---------------------------------------------------------------------------
 
@@ -904,7 +906,8 @@ async fn w3_events_bus_cross_extension_pub_sub() {
 async fn w3_get_commands_orders_extension_first_with_suffixes() {
     let cmd_handler =
         || -> ext::CommandHandlerFn { Arc::new(|_args, _ctx| Box::pin(async { Ok(()) })) };
-    // 同名冲突来自两个扩展（同扩展内 registerCommand 是 Map.set 覆盖，
+    // Same-name conflicts come from two extensions (within one extension
+    // registerCommand is a Map.set override,
     // loader.ts:254-261）。
     let commands_a = InlineExtension::Anonymous(Arc::new(move |api| {
         api.register_command("dup", Some("first".to_owned()), cmd_handler())
@@ -923,7 +926,7 @@ async fn w3_get_commands_orders_extension_first_with_suffixes() {
 
     let commands = fixture.session.get_commands_info();
     let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
-    // 扩展命令在最前（runner.ts:595-629 的 :N 后缀）。
+    // Extension commands come first (the :N suffix of runner.ts:595-629).
     assert_eq!(&names[..3], ["dup:1", "dup:2", "solo"]);
     assert_eq!(commands[0]["source"], "extension");
 }
@@ -949,7 +952,7 @@ async fn w3_extension_command_executes_via_prompt() {
         Box::pin(async { Ok(()) })
     }));
     let (host, _slot) = host_with_api(vec![command_ext]).await;
-    // 无脚本响应：命令路径不应触发 LLM 调用。
+    // No scripted response: the command path must not trigger an LLM call.
     let fixture = session_fixture(Vec::new(), host, FauxProviderOptions::default()).await;
 
     fixture
@@ -1001,7 +1004,7 @@ async fn w3_exec_runs_command_and_reports_timeout() {
         .expect("exec timeout");
     assert!(result.killed);
 
-    // 不存在的命令：code 1（exec.ts:98-103 catch 分支）。
+    // Nonexistent command: code 1 (the exec.ts:98-103 catch branch).
     let result = api
         .exec("definitely-not-a-real-binary", &[], None)
         .await

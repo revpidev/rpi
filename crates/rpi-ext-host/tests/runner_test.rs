@@ -1299,9 +1299,10 @@ async fn runner_invalidate_marks_stale_first_message_wins() {
 
 #[tokio::test]
 async fn runner_tool_call_input_threads_through_handlers() {
-    // 偏离实现（runner.rs emit_tool_call 头注）：上游原地改 event.input；
-    // rpi handler 经结果的 "input" 字段穿线，后续 handler 看到更新值，
-    // 最终 input 随结果返回（不改参时结果不带 "input" 键）。
+    // Divergent implementation (runner.rs emit_tool_call header note): upstream mutates
+    // event.input in place; the rpi handler threads the changed value through the result's
+    // "input" field, so later handlers see the updated value, and the final input returns
+    // with the result (an unchanged-args result carries no "input" key).
     let host = host_with(vec![
         inline_ext("ext-a", |api| {
             api.on(
@@ -1334,7 +1335,7 @@ async fn runner_tool_call_input_threads_through_handlers() {
         .unwrap();
     assert_eq!(result["input"], json!({"a": "patched"}));
 
-    // 无改参：结果不带 "input"。
+    // Unchanged args: the result carries no "input".
     let host2 = host_with(vec![inline_ext("ext-a", |api| {
         api.on(
             ext::EVENT_TOOL_CALL,

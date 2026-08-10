@@ -72,8 +72,9 @@ impl Drop for TestDir {
     }
 }
 
-/// 定长填充系统提示（~1000 tokens）：触发阈值需要与上游相当的整体用量，
-/// 但具体文本不属于契约（usage 数值剥离）。
+/// Fixed-length padding system prompt (~1000 tokens): triggering the threshold needs
+/// overall usage comparable to upstream, but the concrete text is not part of the
+/// contract (usage numbers are stripped).
 fn filler_system_prompt() -> String {
     "fixture system prompt filler. ".repeat(140)
 }
@@ -85,12 +86,15 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// 脚本响应：调用时刻的新鲜时间戳（上游工厂响应语义）。固定/0 时间戳会被
-/// stale-usage 守卫拦下（agent-session.ts:1974），压缩链将静默断掉。
+/// Scripted responses: fresh timestamps at call time (upstream factory-response
+/// semantics). Fixed/zero timestamps would be stopped by the stale-usage guard
+/// (agent-session.ts:1974), silently breaking the compaction chain.
 ///
-/// 防并列：毫秒级时钟下，压缩条目写入（真实时钟）与下一条脚本响应若落在
-/// 同一毫秒，`assistantMessage.timestamp <= compactionTs` 守卫会误杀后续
-/// 检查（并行测试放大此窗口）。工厂先让出 5ms 再取严格递增时间戳。
+/// Anti-collision: under a millisecond clock, if a compaction entry write (real clock)
+/// and the next scripted response land in the same millisecond, the
+/// `assistantMessage.timestamp <= compactionTs` guard would wrongly kill subsequent
+/// checks (parallel tests widen this window). The factory yields 5ms first, then takes
+/// strictly increasing timestamps.
 fn scripted(content: impl Into<String>) -> FauxResponseStep {
     static LAST_TS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let content = content.into();
@@ -136,7 +140,7 @@ fn scripted_overflow_error() -> FauxResponseStep {
 }
 
 // ---------------------------------------------------------------------------
-// Harness：agent-session 最小接线的复刻
+// Harness: a replica of the minimal agent-session wiring
 // ---------------------------------------------------------------------------
 
 struct Harness {
@@ -144,7 +148,8 @@ struct Harness {
     runner: CompactionRunner,
     agent_events: Arc<Mutex<Vec<AgentEvent>>>,
     compaction_events: Arc<Mutex<Vec<CompactionEvent>>>,
-    /// `_lastAssistantMessage`（agent-session.ts:647）：post-run 检查的消费源。
+    /// `_lastAssistantMessage` (agent-session.ts:647): the consumption source of the
+    /// post-run check.
     last_assistant: Option<AssistantMessage>,
 }
 
@@ -178,7 +183,8 @@ impl Harness {
             ..Default::default()
         };
         let mut agent = Agent::new(options);
-        // agent-session 把 session id 透传给 provider（prompt-cache 模拟的键）。
+        // agent-session passes the session id through to the provider (the key the
+        // prompt-cache mock keys on).
         agent.session_id = Some("parity-compaction-session".to_owned());
         let agent = Arc::new(agent);
 
@@ -216,7 +222,7 @@ impl Harness {
             compaction_events,
             last_assistant: None,
         };
-        // createAgentSession 的初始条目序（fixture 第 2/3 行）。
+        // createAgentSession's initial entry order (fixture lines 2/3).
         harness
             .runner
             .session_mut()
@@ -230,9 +236,10 @@ impl Harness {
         harness
     }
 
-    /// `_handleAgentEvent` 的持久化部分（agent-session.ts:624-652）：
-    /// message_end 的 user/assistant/toolResult 落盘；user 回合开始与非错误
-    /// assistant 回复重置 overflow 恢复预算；跟踪 `_lastAssistantMessage`。
+    /// The persistence part of `_handleAgentEvent` (agent-session.ts:624-652):
+    /// message_end persists user/assistant/toolResult; a user-turn start and a
+    /// non-error assistant reply reset the overflow recovery budget; tracks
+    /// `_lastAssistantMessage`.
     fn drain_agent_events(&mut self) {
         let events: Vec<AgentEvent> =
             std::mem::take(&mut *self.agent_events.lock().expect("events"));
@@ -267,8 +274,8 @@ impl Harness {
         }
     }
 
-    /// `_runAgentPrompt`（agent-session.ts:1061-1073）+ prompt 提交前检查
-    /// （:1197-1202）。pre-prompt 检查不 continue。
+    /// `_runAgentPrompt` (agent-session.ts:1061-1073) + the pre-prompt submission
+    /// check (:1197-1202). The pre-prompt check does not continue.
     async fn prompt(&mut self, text: &str) {
         if let Some(assistant) = self.find_last_assistant_in_state() {
             self.runner.check_compaction(&assistant, false).await;
@@ -277,7 +284,7 @@ impl Harness {
         self.agent.prompt(text).await.expect("prompt resolves");
         self.drain_agent_events();
 
-        // `_handlePostAgentRun` 循环：check → continue → check → …
+        // `_handlePostAgentRun` loop: check → continue → check → …
         while let Some(assistant) = self.last_assistant.take() {
             if self.runner.check_compaction(&assistant, true).await {
                 self.agent.continue_run().await.expect("continue resolves");
@@ -332,7 +339,8 @@ fn strip_keys(value: &mut Value) {
     }
 }
 
-/// session.jsonl 逐行准备：剥离 usage 系数值、占位 cwd，重新渲染为 JSONL。
+/// session.jsonl line-by-line preparation: strip usage coefficient values, placeholder
+/// cwd, re-render as JSONL.
 fn prepare_session_lines(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -350,7 +358,8 @@ fn prepare_session_lines(text: &str) -> String {
     out
 }
 
-/// events 逐行准备：只保留 compaction 事件子集，剥离 usage 系数值。
+/// events line-by-line preparation: keep only the compaction event subset, strip usage
+/// coefficient values.
 fn prepare_event_lines(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {

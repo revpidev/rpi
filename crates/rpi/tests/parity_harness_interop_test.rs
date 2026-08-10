@@ -277,19 +277,21 @@ async fn harness_session(
 }
 
 // ===========================================================================
-// 方向 1：harness → 主路径
+// Direction 1: harness → main path
 // ===========================================================================
 
-/// harness 会话（全部条目类型 + `firstKeptEntryId` 形态 compaction + 以
-/// `leaf` 记录收尾）→ `SessionManager`：条目/载荷逐一保留、leaf 按 harness
-/// 语义重建、context/name/label 一致、export 字节级无损、续跑后两加载器仍一致。
+/// A harness session (all entry types + a `firstKeptEntryId`-form compaction + ending
+/// with a `leaf` record) → `SessionManager`: entries/payloads preserved one by one, the
+/// leaf rebuilt per harness semantics, context/name/label consistent, export lossless
+/// at byte level, and both loaders still consistent after continuation.
 #[tokio::test]
 async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
     let dir = TestDir::new("harness-to-main");
     let (fs, file_path, storage, session) = harness_session(&dir.0, "harness-session-a").await;
 
-    // 1. 线性链 + 全部条目类型（含 harness 独有 active_tools_change / label /
-    //    session_info / custom / custom_message），firstKeptEntryId 形态 compaction。
+    // 1. Linear chain + all entry types (including the harness-only
+    //    active_tools_change / label / session_info / custom / custom_message), with a
+    //    firstKeptEntryId-form compaction.
     let u1 = session.append_message(user_msg("one")).await.expect("u1");
     session
         .append_model_change("openai", "gpt-4.1")
@@ -348,14 +350,16 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
         .await
         .expect("a2");
 
-    // Context（leaf = a2）：harness 的 buildContext 走 getBranch →
-    // getPathToRootOrCompaction，路径在 firstKeptEntryId（u2）处截断。最后一个
-    // compaction 生效，从 u2 起保留；label/session_info/custom 不产消息；
-    // custom_message 投影为 custom。
-    // 注：thinking_level / active_tool_names 从截断后的路径推导（上游继承差异：
-    // harness session.ts 从分支路径推导，主路径 session-manager.ts 从全路径推导；
-    // 此处 tlc/atc 在截断前，故为 off/None —— 两实现各自忠实于上游钉死行为，
-    // 消息序列本身两实现一致，见下方主路径断言）。
+    // Context (leaf = a2): harness buildContext goes getBranch →
+    // getPathToRootOrCompaction, with the path cut at firstKeptEntryId (u2). The last
+    // compaction wins, keeping from u2 on; label/session_info/custom produce no
+    // messages; custom_message projects to custom.
+    // Note: thinking_level / active_tool_names derive from the truncated path (an
+    // inherited upstream difference: harness session.ts derives from the branch path,
+    // the main path session-manager.ts from the full path; here tlc/atc sit before the
+    // cut, hence off/None — each implementation faithfully follows its pinned upstream
+    // behavior; the message sequences themselves agree, see the main-path assertions
+    // below).
     let mid_ctx = session
         .build_context(SessionContextBuildOptions::default())
         .await
@@ -371,7 +375,7 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
     assert_eq!(mid_ctx.thinking_level, "off");
     assert_eq!(mid_ctx.active_tool_names, None);
 
-    // 行走：从 a2 的 path-to-root-or-compaction 在 firstKeptEntryId（u2，含）处截断。
+    // Walk: a2's path-to-root-or-compaction is cut at firstKeptEntryId (u2, inclusive).
     let walk_a2 = storage
         .get_path_to_root_or_compaction(Some(&a2))
         .await
@@ -390,14 +394,15 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
         ]
     );
 
-    // 2. 收尾操作是 moveTo —— 文件最后一条记录是 `leaf` 条目，harness leaf 为 u1。
+    // 2. The closing operation is moveTo — the file's last record is a `leaf` entry;
+    //    the harness leaf is u1.
     session.move_to(Some(&u1), None).await.expect("move to u1");
     assert_eq!(
         session.get_leaf_id().await.expect("leaf").as_deref(),
         Some(u1.as_str())
     );
 
-    // 记录 harness 侧参照状态。
+    // Record the harness-side reference state.
     let harness_entries = session
         .get_entries(SessionEntryCursorOptions::default())
         .await
@@ -417,7 +422,8 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
     assert_eq!(entry_ids(&harness_walk), [u1.as_str()]);
     drop(session);
 
-    // 3. 主路径打开：条目数/类型/载荷逐一保留；leaf 与 harness 一致（leaf 重放）。
+    // 3. Main path opens: entry count/types/payloads preserved one by one; the leaf
+    //    matches the harness (leaf replay).
     let mut sm = SessionManager::open(&file_path, None, None).expect("main path open");
     assert_eq!(sm.get_session_id(), "harness-session-a");
     let sm_entries = sm.get_entries();
@@ -431,8 +437,8 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
         "leaf rebuild must follow the harness leaf semantics"
     );
 
-    // Context 与 harness 侧一致（messages / thinking_level / model；harness 另有
-    // active_tool_names，主路径 context 无此字段）。
+    // Context matches the harness side (messages / thinking_level / model; the harness
+    // additionally has active_tool_names, which the main-path context lacks).
     let sm_ctx = sm.build_session_context();
     assert_eq!(sm_ctx.messages, harness_ctx.messages);
     assert_eq!(sm_ctx.thinking_level, harness_ctx.thinking_level);
@@ -453,23 +459,27 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
         .expect("main walk u1");
     assert_eq!(stored_ids(&sm_walk), [u1.as_str()]);
 
-    // Stats：harness 加载器输出 == 对同一条目集的手工重算（主路径无 stats API）。
+    // Stats: harness loader output == manual recomputation over the same entry set
+    // (the main path has no stats API).
     assert_eq!(harness_stats, expected_stats(&harness_entries));
 
-    // 4. 无损写回：version 3 无迁移，export 与 harness 文件字节级一致。
+    // 4. Lossless write-back: version 3 needs no migration; the export is byte-identical
+    //    to the harness file.
     let exported = sm.export_jsonl().expect("export");
     let original = std::fs::read_to_string(&file_path).expect("read harness file");
     assert_eq!(exported, original);
 
-    // 主路径的设置推导走全路径（上游 session-manager.ts 语义）：同一 a2 叶，
-    // thinking_level 为 "high"（tlc 在 firstKeptEntryId 截断之前，harness 侧
-    // 为 "off"）——上游两实现本就如此，属继承差异而非互通缺陷。
+    // The main path derives settings from the full path (upstream session-manager.ts
+    // semantics): for the same a2 leaf, thinking_level is "high" (tlc before the
+    // firstKeptEntryId cut, "off" on the harness side) — upstream's two implementations
+    // already differ this way; an inherited difference, not an interop defect.
     sm.branch(&a2).expect("branch to a2");
     assert_eq!(sm.build_session_context().thinking_level, "high");
     sm.branch(&u1).expect("branch back to u1");
     assert_eq!(sm.get_leaf_id(), Some(u1.as_str()));
 
-    // 5. 续跑：追加不报错、文件 +2 行、重开 harness 后两加载器仍一致。
+    // 5. Continuation: appending does not error, the file grows by 2 lines, and after
+    //    reopening with the harness both loaders still agree.
     sm.append_message(user_msg("continued question"))
         .expect("append user");
     sm.append_message(assistant_msg("continued answer"))
@@ -505,9 +515,10 @@ async fn harness_session_loads_in_session_manager_preserving_all_entry_types() {
     assert_eq!(roles(&sm_ctx_after.messages), ["user", "user", "assistant"]);
 }
 
-/// harness 会话（`retainedTail` 形态 compaction + branch_summary + moveTo(root)
-/// + 收尾 leaf 移动）→ `SessionManager`：retainedTail 在 context 中展开、两种
-/// 行走形态两实现一致、分支/根重定向后的 leaf 与 context 一致。
+/// A harness session (a `retainedTail`-form compaction + branch_summary + moveTo(root)
+/// + a closing leaf move) → `SessionManager`: retainedTail expands in context, both
+/// walk forms agree across the two implementations, and the leaf/context after
+/// branch/root redirection are consistent.
 #[tokio::test]
 async fn harness_retained_tail_session_loads_in_session_manager() {
     let dir = TestDir::new("harness-retained-tail");
@@ -537,7 +548,7 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
         .expect("compaction");
     let u3 = session.append_message(user_msg("five")).await.expect("u3");
 
-    // retainedTail 形态：context = compactionSummary + 展开的 tail + 之后条目。
+    // retainedTail form: context = compactionSummary + expanded tail + later entries.
     let ctx_after_compaction = session
         .build_context(SessionContextBuildOptions::default())
         .await
@@ -551,15 +562,16 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
         ["retained summary", "three", "four", "five"]
     );
 
-    // 行走：自包含 compaction（retainedTail 形态）即路径终点 —— 从 u3 走
-    // 只含 [compaction, u3]，之前条目不进入。
+    // Walk: a self-contained compaction (retainedTail form) is the path end — from u3
+    // the walk only contains [compaction, u3]; earlier entries do not enter.
     let walk = storage
         .get_path_to_root_or_compaction(Some(&u3))
         .await
         .expect("walk u3");
     assert_eq!(entry_ids(&walk), [compaction_id.as_str(), u3.as_str()]);
 
-    // 分支：moveTo + summary 在 u1 下追加 branch_summary，后续消息挂其下。
+    // Branch: moveTo + summary append a branch_summary under u1; later messages hang
+    // below it.
     let bs_id = session
         .move_to(
             Some(&u1),
@@ -589,7 +601,7 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
         [u1.as_str(), bs_id.as_str(), u4.as_str()]
     );
 
-    // 移到根：leaf 为 None、context 清空、后续追加挂在 null 下。
+    // Move to root: leaf is None, context cleared, later appends hang under null.
     session.move_to(None, None).await.expect("move to root");
     assert_eq!(session.get_leaf_id().await.expect("leaf"), None);
     assert!(session
@@ -602,7 +614,7 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
     let u5_entry = session.get_entry(&u5).await.expect("entry").expect("found");
     assert_eq!(u5_entry.parent_id(), None);
 
-    // 收尾 moveTo(u1)：文件最后一条记录是 leaf 条目。
+    // Closing moveTo(u1): the file's last record is a leaf entry.
     session.move_to(Some(&u1), None).await.expect("final move");
 
     let harness_entries = session
@@ -616,7 +628,7 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
     assert_eq!(roles(&harness_ctx.messages), ["user"]);
     drop(session);
 
-    // 主路径打开：条目/leaf 一致，两形态行走一致，context 一致。
+    // Main path opens: entries/leaf agree, both walk forms agree, context agrees.
     let sm = SessionManager::open(&file_path, None, None).expect("main path open");
     let sm_entries = sm.get_entries();
     assert_eq!(sm_entries.len(), harness_entries.len());
@@ -642,14 +654,14 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
 }
 
 // ===========================================================================
-// 方向 2：主路径 → harness
+// Direction 2: main path → harness
 // ===========================================================================
 
-/// `SessionManager` 构造的会话（`firstKeptEntryId` 形态 compaction、branch、
-/// label/session_info/custom/custom_message、usage）写盘后经
-/// `JsonlSessionRepo::open` 加载：header/entries/leaf 重建正确、
-/// `get_path_to_root_or_compaction` 两形态行走与主路径一致、stats/name/label/
-/// context 一致。
+/// A session built by `SessionManager` (a `firstKeptEntryId`-form compaction, branch,
+/// label/session_info/custom/custom_message, usage) is written to disk and loaded via
+/// `JsonlSessionRepo::open`: header/entries/leaf rebuild correctly, both
+/// `get_path_to_root_or_compaction` walk forms match the main path, and
+/// stats/name/label/context agree.
 #[tokio::test]
 async fn session_manager_session_loads_in_harness_repo() {
     let dir = TestDir::new("main-to-harness");
@@ -717,8 +729,9 @@ async fn session_manager_session_loads_in_harness_repo() {
     let sm_entries = sm.get_entries();
     let sm_leaf = sm.get_leaf_id().expect("leaf").to_owned();
 
-    // 用 header + 文件路径构造 harness 侧 metadata 并打开（repo 的目录布局
-    // 是 `<root>/--<cwd>--/...`，主路径直接平铺在 session_dir 下，故不走 list）。
+    // Build the harness-side metadata from the header + file path and open (the repo's
+    // directory layout is `<root>/--<cwd>--/...` while the main path flattens directly
+    // under session_dir, so list is not used).
     let fs: Arc<dyn FileSystem> = Arc::new(NodeExecutionEnv::new(cwd.clone()));
     let repo = JsonlSessionRepo::new(fs, session_dir.to_string_lossy().into_owned());
     let metadata = JsonlSessionMetadata {
@@ -741,7 +754,7 @@ async fn session_manager_session_loads_in_harness_repo() {
         "header round-trips through the harness loader"
     );
 
-    // 条目解析为完全相同的 typed 值；leaf 重建为最后一条记录。
+    // Entries parse to exactly the same typed values; the leaf rebuilds as the last record.
     let storage = opened.storage();
     let entries = storage
         .get_entries(SessionEntryCursorOptions::default())
@@ -756,8 +769,8 @@ async fn session_manager_session_loads_in_harness_repo() {
         Some(sm_leaf.as_str())
     );
 
-    // get_path_to_root_or_compaction 两形态：分支路径（无 compaction，全路径）
-    // 与从 a2 的 firstKeptEntryId 截断。
+    // The two get_path_to_root_or_compaction forms: the branch path (no compaction,
+    // full path) and the firstKeptEntryId cut from a2.
     let harness_walk = storage
         .get_path_to_root_or_compaction(Some(&u4))
         .await
@@ -775,13 +788,13 @@ async fn session_manager_session_loads_in_harness_repo() {
         .expect("main walk a2");
     assert_eq!(entry_ids(&harness_walk_cut), stored_ids(&main_walk_cut));
 
-    // Stats：harness 加载器输出 == 对 typed 条目的手工重算。
+    // Stats: harness loader output == manual recomputation over the typed entries.
     assert_eq!(
         storage.get_session_stats().await.expect("stats"),
         expected_stats(&entries)
     );
 
-    // name / label / context 一致。
+    // name / label / context agree.
     assert_eq!(
         storage.get_session_name().await.expect("name"),
         sm.get_session_name()
@@ -811,13 +824,14 @@ async fn session_manager_session_loads_in_harness_repo() {
 }
 
 // ===========================================================================
-// 方向 3：fixtures 交叉验证
+// Direction 3: fixtures cross-check
 // ===========================================================================
 
-/// `fixtures/generated/*/session.jsonl`（上游 coding-agent 实录）逐一被
-/// harness `JsonlSessionStorage` 加载：version 3 硬校验通过、条目全解析、
-/// leaf 正确、path-to-root-or-compaction 行走完成，并与 T07 `SessionManager`
-/// 三方交叉（typed 条目 / leaf / 行走均相等）。
+/// Every `fixtures/generated/*/session.jsonl` (upstream coding-agent recordings) is
+/// loaded by the harness `JsonlSessionStorage`: the version-3 hard check passes, all
+/// entries parse, the leaf is correct, the path-to-root-or-compaction walk completes,
+/// and a three-way cross-check with the T07 `SessionManager` (typed entries / leaf /
+/// walk all equal) succeeds.
 #[tokio::test]
 async fn harness_storage_loads_all_fixture_sessions() {
     for scenario in SCENARIOS {
@@ -833,7 +847,7 @@ async fn harness_storage_loads_all_fixture_sessions() {
         let fs: Arc<dyn FileSystem> =
             Arc::new(NodeExecutionEnv::new(dir.0.to_string_lossy().into_owned()));
 
-        // Version 3 硬校验 + 全量解析：每一行都加载为 typed 条目。
+        // Version-3 hard check + full parse: every line loads as a typed entry.
         let storage = JsonlSessionStorage::open(Arc::clone(&fs), &staged.to_string_lossy())
             .await
             .unwrap_or_else(|e| panic!("{scenario}: harness open: {}", e.message));
@@ -843,7 +857,8 @@ async fn harness_storage_loads_all_fixture_sessions() {
             .expect("entries");
         assert_eq!(entries.len(), lines.len() - 1, "{scenario}: entry count");
 
-        // Header 元数据来自首行；leaf 重建为最后一条记录（fixtures 是线性链）。
+        // Header metadata comes from the first line; the leaf rebuilds as the last
+        // record (fixtures are linear chains).
         let metadata = storage.get_metadata().await.expect("metadata");
         let header: Value = serde_json::from_str(lines[0]).expect("header json");
         assert_eq!(
@@ -858,7 +873,8 @@ async fn harness_storage_loads_all_fixture_sessions() {
             "{scenario}: leaf"
         );
 
-        // 行走从 leaf 完成（有 compaction 的场景在截断处停，否则到根）。
+        // The walk completes from the leaf (scenarios with compaction stop at the cut,
+        // otherwise reach the root).
         let walk = storage
             .get_path_to_root_or_compaction(leaf.as_deref())
             .await
@@ -869,7 +885,7 @@ async fn harness_storage_loads_all_fixture_sessions() {
             "{scenario}: walk ends at the leaf"
         );
 
-        // 与 T07 主路径交叉：typed 条目 / leaf / 行走相等。
+        // Cross-check with the T07 main path: typed entries / leaf / walk are equal.
         let sm = SessionManager::open(&staged, None, None)
             .unwrap_or_else(|e| panic!("{scenario}: main path open: {e}"));
         let sm_entries = sm.get_entries();

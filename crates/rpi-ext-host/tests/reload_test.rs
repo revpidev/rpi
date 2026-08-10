@@ -111,9 +111,10 @@ fn write_wasm(dir: &Path, rel: &str, wat: &str) -> PathBuf {
     path
 }
 
-/// 信任路径（应解析信任）下：pre-trust 加载 builtins，final 复用（不重跑
-/// factory），`/reload` 重放 spec 重跑 inline——内置扩展不得丢失；reuse
-/// 顺序按最终路径表（项目本地在全局之前）。
+/// On the trust path (which should resolve as trusted): pre-trust loads builtins, the
+/// final pass reuses them (does not re-run the factory), and `/reload` replays the spec
+/// and re-runs inline — built-in extensions must not be lost; reuse order follows the
+/// final path table (project-local before global).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
     let dir = TempDir::new("order");
@@ -130,7 +131,7 @@ async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
         .load_startup_pre_trust(agent_dir.clone(), Vec::new(), vec![inline.clone()], false)
         .await;
     assert!(pre_errors.is_empty(), "{pre_errors:?}");
-    // 阶段一：全局 + inline；项目本地排除。
+    // Phase one: global + inline; project-local excluded.
     let paths = host.get_extension_paths();
     assert_eq!(paths.len(), 2, "{paths:?}");
     assert!(paths[0].ends_with("global.wasm"));
@@ -154,7 +155,7 @@ async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
         1,
         "reuse must not re-run inline factories"
     );
-    // 最终顺序 = 最终路径表 [project-local, global] + inline 尾部。
+    // Final order = final path table [project-local, global] + inline tail.
     let paths = host.get_extension_paths();
     assert_eq!(paths.len(), 3, "{paths:?}");
     assert!(paths[0].ends_with("local.wasm"), "{paths:?}");
@@ -162,7 +163,7 @@ async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
     assert_eq!(paths[2], "<inline:llama.cpp>", "{paths:?}");
     assert!(host.get_command("llama").is_some());
 
-    // `/reload`：spec 重放（路径 + inline 重跑）——内置扩展必须回来。
+    // `/reload`: spec replay (paths + inline re-run) — built-in extensions must come back.
     let reload_errors = host.reload().await;
     assert!(reload_errors.is_empty(), "{reload_errors:?}");
     assert_eq!(
@@ -185,8 +186,9 @@ async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
     assert_eq!(paths[2], "<inline:llama.cpp>", "{paths:?}");
 }
 
-/// `--no-extensions` 的 final pass 必须丢弃 pre-trust 加载的全局扩展
-/// （最终路径表 = CLI 仅；loadFinalExtensionSet 按最终路径表组装）。
+/// With `--no-extensions`, the final pass must drop the global extensions loaded by the
+/// pre-trust pass (final path table = CLI only; loadFinalExtensionSet assembles from the
+/// final path table).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_extensions_final_drops_pretrust_global_extensions() {
     let dir = TempDir::new("noext-final");
@@ -229,8 +231,8 @@ async fn no_extensions_final_drops_pretrust_global_extensions() {
     );
 }
 
-/// `--no-extensions` 的 pre-trust pass 本身只加载 CLI `-e` + inline
-/// （上游 loadProjectTrustExtensions → loadCurrentExtensionSet 尊重
+/// With `--no-extensions`, the pre-trust pass itself loads only CLI `-e` + inline
+/// (upstream loadProjectTrustExtensions → loadCurrentExtensionSet respects
 /// noExtensions）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_extensions_pretrust_skips_global_discovery() {

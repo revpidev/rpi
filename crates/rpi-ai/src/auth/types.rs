@@ -336,8 +336,8 @@ mod tests {
 
     use super::*;
 
-    /// 脱敏（编码规范 §11.1/§11.2）：凭据 secret 值不得出现在 `{:?}` 输出中，
-    /// 结构与非敏感字段保留可见。
+    /// Redaction (coding standards §11.1/§11.2): credential secret values must
+    /// not appear in `{:?}` output; structure and non-sensitive fields stay visible.
     #[test]
     fn debug_output_redacts_credential_secrets() {
         let mut headers = ProviderHeaders::new();
@@ -394,7 +394,7 @@ mod tests {
         assert!(!debug.contains("super-secret-token"));
         assert!(debug.contains("ANTHROPIC_API_KEY"));
 
-        // api_key 条目同样脱敏。
+        // api_key entries are redacted the same way.
         let credential = Credential::ApiKey(api_key);
         assert!(!format!("{credential:?}").contains("sk-secret-key"));
     }

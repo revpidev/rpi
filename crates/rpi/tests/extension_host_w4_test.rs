@@ -14,7 +14,7 @@ use rpi_tui::tui::Component as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-/// 桥 + 帧接收端 + pending 表。
+/// bridge + frame receiver + pending table.
 struct RpcRig {
     bridge: Arc<RpcUiBridge>,
     rx: mpsc::UnboundedReceiver<String>,
@@ -37,7 +37,7 @@ fn rpc_rig() -> RpcRig {
 }
 
 impl RpcRig {
-    /// 下一帧（解析为 JSON；带超时的异步等待）。
+    /// Next frame (parsed as JSON; async wait with timeout).
     async fn next_frame(&mut self) -> Value {
         let line = tokio::time::timeout(std::time::Duration::from_secs(5), self.rx.recv())
             .await
@@ -50,7 +50,7 @@ impl RpcRig {
         assert!(self.rx.try_recv().is_err(), "unexpected frame");
     }
 
-    /// 客户端应答：经 pending 表 resolve（stdin 路由的测试替身）。
+    /// Client reply: resolves through the pending table (test stand-in for the stdin route).
     fn respond(&self, id: &str, response: Value) {
         let tx = self
             .pending
@@ -63,7 +63,7 @@ impl RpcRig {
 }
 
 // ---------------------------------------------------------------------------
-// Dialog 方法（rpc-mode.ts:90-160 + docs/rpc.md）
+// Dialog methods (rpc-mode.ts:90-160 + docs/rpc.md)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -135,7 +135,7 @@ async fn w4_rpc_input_and_editor_frames() {
     let frame = rig.next_frame().await;
     assert_eq!(frame["method"], "editor");
     assert_eq!(frame["prefill"], "Line 1\nLine 2");
-    // editor 不带 timeout 字段（rpc-mode.ts:238-262）。
+    // editor carries no timeout field (rpc-mode.ts:238-262).
     assert!(frame.get("timeout").is_none());
     rig.respond(frame["id"].as_str().unwrap(), json!({"value": "edited"}));
     assert_eq!(task.await.unwrap(), Some("edited".to_owned()));
@@ -159,12 +159,12 @@ async fn w4_rpc_dialog_timeout_auto_resolves_default() {
     let frame = rig.next_frame().await;
     assert_eq!(frame["timeout"], 40);
     *id_sink.lock().unwrap() = frame["id"].as_str().unwrap().to_owned();
-    // 不应答 → 超时后 select → None。
+    // No reply → after the timeout select → None.
     assert_eq!(task.await.unwrap(), None);
-    // pending 条目已清理（rpc-mode.ts:101-108）。
+    // Pending entries are cleaned up (rpc-mode.ts:101-108).
     assert!(rig.pending.lock().unwrap().is_empty());
 
-    // confirm 超时 → false。
+    // confirm timeout → false.
     let bridge = rig.bridge.clone();
     let task = tokio::spawn(async move {
         bridge
@@ -176,7 +176,7 @@ async fn w4_rpc_dialog_timeout_auto_resolves_default() {
 }
 
 // ---------------------------------------------------------------------------
-// Fire-and-forget 5 方法
+// Fire-and-forget 5 methods
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -210,7 +210,7 @@ async fn w4_rpc_fire_and_forget_frames() {
     assert_eq!(frame["widgetLines"], json!(["l1", "l2"]));
     assert_eq!(frame["widgetPlacement"], "belowEditor");
 
-    // 组件描述符被忽略（不发帧，rpc-mode.ts:200-203）。
+    // The component descriptor is ignored (no frame sent, rpc-mode.ts:200-203).
     rig.bridge.set_widget(
         "w2",
         Some(WidgetContent::Component(json!({"type": "text"}))),
@@ -228,7 +228,7 @@ async fn w4_rpc_fire_and_forget_frames() {
     assert_eq!(frame["method"], "set_editor_text");
     assert_eq!(frame["text"], "prefill");
 
-    // pasteToEditor 退化为 set_editor_text 帧。
+    // pasteToEditor degrades to a set_editor_text frame.
     rig.bridge.paste_to_editor("pasted");
     let frame = rig.next_frame().await;
     assert_eq!(frame["method"], "set_editor_text");
@@ -236,7 +236,7 @@ async fn w4_rpc_fire_and_forget_frames() {
 }
 
 // ---------------------------------------------------------------------------
-// 降级 18 项（rpc-mode.ts:162-309 逐项）
+// 18 downgrade items (item by item from rpc-mode.ts:162-309)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -244,7 +244,7 @@ async fn w4_rpc_degraded_methods() {
     let mut rig = rpc_rig();
     // custom → undefined
     assert_eq!(rig.bridge.custom(json!({"type": "text"}), None).await, None);
-    // no-op 集合（无任何帧）
+    // no-op set (no frames at all)
     rig.bridge.set_working_message(Some("x"));
     rig.bridge.set_working_visible(false);
     rig.bridge.set_working_indicator(None);
@@ -257,7 +257,7 @@ async fn w4_rpc_degraded_methods() {
     rig.bridge.add_autocomplete_provider(json!({}));
     let _unsub = rig.bridge.on_terminal_input(Arc::new(|_| None));
     rig.assert_no_frame();
-    // 固定返回值
+    // fixed return values
     assert_eq!(rig.bridge.get_editor_text(), "");
     assert!(!rig.bridge.get_tools_expanded());
     assert!(rig.bridge.get_editor_component().is_none());
@@ -269,12 +269,12 @@ async fn w4_rpc_degraded_methods() {
         result.error.as_deref(),
         Some("Theme switching not supported in RPC mode")
     );
-    // theme getter 返回默认主题 JSON（rpc-mode.ts:283-285）。
+    // The theme getter returns the default theme JSON (rpc-mode.ts:283-285).
     assert_eq!(rig.bridge.theme()["name"], "dark");
 }
 
 // ---------------------------------------------------------------------------
-// ComponentTree v1 映射（schema: COMPONENT_TREE_SCHEMA_V1）
+// ComponentTree v1 mapping (schema: COMPONENT_TREE_SCHEMA_V1)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -285,17 +285,17 @@ fn w4_component_tree_text_spacer_box_column() {
         rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"))
     };
 
-    // text + 样式
+    // text + styling
     let out =
         render(json!({"type": "text", "props": {"text": "hello", "bold": true, "fg": "accent"}}));
     assert!(out.contains("hello"));
-    // spacer（直接数行：尾部空行在 join 后被 lines() 吞掉）
+    // spacer (counts raw lines: trailing empty lines are swallowed by lines() after join)
     let component = rpi::modes::interactive::component_tree::component_from_tree(
         &json!({"type": "spacer", "props": {"lines": 3}}),
         &theme,
     );
     assert_eq!(component.render(80).len(), 3);
-    // box + children（含 borderColor 边框线）
+    // box + children (with borderColor border lines)
     let out = render(json!({
         "type": "box",
         "props": {"borderColor": "border"},
@@ -313,13 +313,13 @@ fn w4_component_tree_text_spacer_box_column() {
         "children": [{"type": "text", "props": {"text": "a"}}, {"type": "text", "props": {"text": "b"}}]
     }));
     assert!(out.find("a").unwrap() < out.find("b").unwrap());
-    // 未知类型：fail-visible（渲染出 JSON 而不 panic）。
+    // Unknown type: fail-visible (renders the JSON instead of panicking).
     let out = render(json!({"type": "mystery", "props": {}}));
     assert!(out.contains("mystery"));
 }
 
 // ---------------------------------------------------------------------------
-// Renderer 管线（全链路：inline 扩展注册 renderer → TUI 组件）
+// Renderer pipeline (full chain: inline extension registers renderer → TUI component)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -363,7 +363,7 @@ async fn w4_message_renderer_descriptor_renders_in_tui() {
     let out = rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"));
     assert!(out.contains("CARD:card"), "out: {out}");
 
-    // 未注册的 customType → None（默认渲染回退）。
+    // Unregistered customType → None (default rendering fallback).
     assert!(
         rpi::modes::interactive::extension_renderers::host_message_renderer(&session, "other")
             .is_none()
@@ -372,8 +372,8 @@ async fn w4_message_renderer_descriptor_renders_in_tui() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w4_tool_render_override_and_inheritance() {
-    // 扩展覆盖内置 read：renderCall 有 → 描述符生效；无 renderResult →
-    // 结果侧回退内置（继承）。
+    // Extension overrides built-in read: renderCall present → descriptor applies; no
+    // renderResult → the result side falls back to the built-in (inheritance).
     let tool_ext = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
         api.register_tool(rpi_ext_host::types::ToolDefinition {
             name: "read".to_owned(),
@@ -428,7 +428,8 @@ async fn w4_tool_render_override_and_inheritance() {
         .expect("call render");
     let out = rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"));
     assert!(out.contains("EXT-CALL:call-9"), "out: {out}");
-    // renderResult 未提供 → None（组件回退内置结果渲染 = slot 继承）。
+    // renderResult not provided → None (component falls back to built-in result
+    // rendering = slot inheritance).
     assert!(definition
         .render_result(
             &rpi::modes::interactive::components::tool_execution::ToolResultState {
@@ -446,7 +447,8 @@ async fn w4_tool_render_override_and_inheritance() {
         .is_none());
 }
 
-/// T17：组件级按 hook 合并——扩展缺 hook 时继承内置渲染器
+/// T17: per-hook merge at the component level — an extension missing a hook inherits
+/// the built-in renderer
 /// （tool-execution.ts:81-99）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w4_extension_missing_hook_inherits_builtin_renderer() {
@@ -454,7 +456,8 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
         ToolExecutionComponent, ToolExecutionOptions, ToolResultContentLoose, ToolResultState,
     };
 
-    // 方向一：扩展只给 renderCall → renderResult 继承内置 bash 渲染器。
+    // Direction one: extension only provides renderCall → renderResult inherits the
+    // built-in bash renderer.
     let call_only_ext = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
         api.register_tool(rpi_ext_host::types::ToolDefinition {
             name: "bash".to_owned(),
@@ -507,13 +510,15 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
     );
     let out = rpi_test_support::vt::strip_ansi(&component.render(80).join("\n"));
     assert!(out.contains("EXT-CALL:call-ext-1"), "out: {out}");
-    // 内置 bash 结果渲染：输出行。无 Took 计时行——startedAt 由内置
-    // render_call 设置（bash.rs render_call 的 execution_started 分支，
-    // bash.ts:463-467），扩展覆盖 renderCall 后计时不启动。
+    // Built-in bash result rendering: output lines. No Took timing line — startedAt is
+    // set by the built-in render_call (the execution_started branch of bash.rs
+    // render_call, bash.ts:463-467); once the extension overrides renderCall the timing
+    // never starts.
     assert!(out.contains("total output"), "out: {out}");
     assert!(!out.contains("Took"), "out: {out}");
 
-    // 方向二：扩展只给 renderResult → renderCall 继承内置 `$ <command>`。
+    // Direction two: extension only provides renderResult → renderCall inherits the
+    // built-in `$ <command>`.
     let result_only_ext = rpi_ext_host::loader::InlineExtension::Anonymous(Arc::new(|api| {
         api.register_tool(rpi_ext_host::types::ToolDefinition {
             name: "bash".to_owned(),
@@ -569,7 +574,7 @@ async fn w4_extension_missing_hook_inherits_builtin_renderer() {
     assert!(out.contains("EXT-RESULT:call-ext-2"), "out: {out}");
 }
 
-/// 带真宿主的会话（W3 fixture 的 W4 版）。
+/// Session with a real host (the W4 version of the W3 fixture).
 async fn w4_session_with_host(
     host: rpi_ext_host::host::NativeExtensionHost,
 ) -> (rpi::core::agent_session::AgentSession, W4TempDir) {

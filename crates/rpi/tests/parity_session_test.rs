@@ -207,9 +207,10 @@ fn parity_fixture_sessions_continue_after_load() {
     }
 }
 
-/// W8 session 互通终验：上游实录 fixture 加载进全栈 `AgentSession`（faux
-/// provider），经真实 `prompt()` 续跑一轮——文件恰好追加 user+assistant
-/// 两条 message 行、原有行逐字节不动、重开后 context 含旧消息 + 新回合。
+/// W8 session interop final check: an upstream-recorded fixture loads into a full-stack
+/// `AgentSession` (faux provider) and is continued via a real `prompt()` round — the file
+/// appends exactly user+assistant message lines, existing lines stay byte-identical, and
+/// reopening yields a context with the old messages plus the new turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_fixture_session_prompt_continue_with_faux_provider() {
     use rpi::core::agent_session::PromptOptions;
@@ -258,7 +259,8 @@ async fn parity_fixture_session_prompt_continue_with_faux_provider() {
     .await
     .expect("services");
 
-    // cwd_override：fixture header 的 cwd 是上游实录机的 /tmp 路径（本机不存在）。
+    // cwd_override: the fixture header's cwd is the /tmp path of the upstream recording
+    // machine (does not exist here).
     let session_manager =
         SessionManager::open(&staged, None, Some(&cwd)).expect("open fixture session");
     let before_lines = non_empty_lines(&original);
@@ -281,7 +283,8 @@ async fn parity_fixture_session_prompt_continue_with_faux_provider() {
         .await
         .expect("prompt");
 
-    // 文件恰好追加两行（同 model/thinking 不变，无额外条目），前缀不动。
+    // The file appends exactly two lines (same model/thinking, no extra entries); the
+    // prefix is untouched.
     let on_disk = std::fs::read_to_string(&staged).expect("read continued session");
     let continued_lines = non_empty_lines(&on_disk);
     assert_eq!(
@@ -295,7 +298,7 @@ async fn parity_fixture_session_prompt_continue_with_faux_provider() {
         "original fixture lines untouched"
     );
 
-    // 重开：旧消息完整，末条是 faux 续跑的 assistant 回复。
+    // Reopening: old messages intact; the last one is the faux-continued assistant reply.
     let reopened = SessionManager::open(&staged, None, Some(&dir.0.join("workspace")))
         .expect("reopen continued session");
     let ctx = reopened.build_session_context();

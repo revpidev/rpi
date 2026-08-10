@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rpi_ext_host::host::NativeExtensionHost;
 use serde_json::json;
 
-/// tool_call gate guest：on("tool_call")，dispatch 恒返回 block。
+/// tool_call gate guest: on("tool_call"), dispatch always returns block.
 const GATE_GUEST_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -46,7 +46,7 @@ const GATE_GUEST_WAT: &str = r#"
 )
 "#;
 
-/// 工具 guest：registerTool("wasm_tool")，toolExecute 恒返回固定结果。
+/// Tool guest: registerTool("wasm_tool"), toolExecute always returns a fixed result.
 const TOOL_GUEST_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -81,7 +81,8 @@ const TOOL_GUEST_WAT: &str = r#"
 )
 "#;
 
-/// 能力探针 guest：init 调 registerTool 并把响应原样作为回执返回。
+/// Capability probe guest: init calls registerTool and returns the response verbatim as
+/// the init receipt.
 const PROBE_GUEST_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -94,7 +95,7 @@ const PROBE_GUEST_WAT: &str = r#"
     (local.get $ptr))
   (func (export "rpi_dealloc") (param i32 i32) nop)
   (func (export "rpi_extension_init") (result i64)
-    ;; 直接转发 host_call 的响应作为 init 回执。
+    ;; forwards the host_call response directly as the init receipt.
     (return (call $host_call (i32.const 16) (call $strlen (i32.const 16)))))
   (func (export "rpi_dispatch") (param i32 i32) (result i64)
     (return (i64.const 0)))
@@ -110,7 +111,7 @@ const PROBE_GUEST_WAT: &str = r#"
 )
 "#;
 
-/// 死循环 guest：init 永不返回，fuel 耗尽应 trap 成加载错误。
+/// Infinite-loop guest: init never returns; fuel exhaustion should trap into a load error.
 const LOOP_GUEST_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -123,7 +124,7 @@ const LOOP_GUEST_WAT: &str = r#"
 )
 "#;
 
-/// 缺 rpi_dispatch 导出的 guest。
+/// Guest missing the rpi_dispatch export.
 const NO_DISPATCH_GUEST_WAT: &str = r#"
 (module
   (memory (export "memory") 1)
@@ -146,7 +147,8 @@ impl TempDir {
         TempDir(dir)
     }
 
-    /// 写一个 guest 包目录：dist/*.wat（.wasm 扩展名）+ 可选 manifest。
+    /// Writes a guest package directory: dist/*.wat (with a .wasm extension) + optional
+    /// manifest.
     fn write_guest(&self, dir_name: &str, wat: &str, manifest: Option<&str>) -> PathBuf {
         let dir = self.0.join(dir_name);
         std::fs::create_dir_all(dir.join("dist")).expect("dist");
@@ -230,7 +232,7 @@ async fn wasm_tool_guest_registers_and_executes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wasm_capability_denied_for_bare_guest_and_allowed_by_manifest() {
     let tmp = TempDir::new("caps");
-    // 裸 .wasm（无 manifest）→ capabilities=[] → registerTool 被拒。
+    // Bare .wasm (no manifest) → capabilities=[] → registerTool is rejected.
     let bare = tmp.write_guest("bare", PROBE_GUEST_WAT, None);
     let (_host, errors) = host_loading(&[bare]).await;
     assert_eq!(errors.len(), 1);
@@ -239,7 +241,7 @@ async fn wasm_capability_denied_for_bare_guest_and_allowed_by_manifest() {
         "bare guest must be denied: {errors:?}"
     );
 
-    // manifest 授予 tools → 同一 guest 加载成功。
+    // Manifest grants tools → the same guest loads successfully.
     let granted = tmp.write_guest(
         "granted",
         PROBE_GUEST_WAT,
@@ -289,8 +291,9 @@ async fn wasm_abi_version_mismatch_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wasm_module_cache_reused_within_generation() {
-    // 同一代 (cwd+generation) 下二次加载命中缓存的 factory；都能跑通即
-    // 为证据（编译只发生一次——由 FactoryCache 语义保证，W1 单测锚定）。
+    // A second load under the same generation (cwd+generation) hits the cached factory;
+    // both succeeding is the evidence (compilation happens exactly once — guaranteed by
+    // FactoryCache semantics, anchored by W1 unit tests).
     let tmp = TempDir::new("cache");
     let wasm = tmp.write_guest(
         "cached",
@@ -306,12 +309,13 @@ async fn wasm_module_cache_reused_within_generation() {
 }
 
 // ============================================================================
-// 阻塞渲染往返（TUI 线程 dispatch_blocking）超时回归（审查修复）
+// Blocking render round-trip (TUI-thread dispatch_blocking) timeout regression (review fix)
 // ============================================================================
 
-/// 阻塞型 guest：每次 dispatch 都调 host_call("exec") 并把宿主响应原样
-/// 返回——宿主 exec 未决时 guest 线程阻塞在 host call 上（对应真实场景：
-/// guest 在 ui.select 对话框 host call 里等待 TUI 输入）。
+/// Blocking guest: every dispatch calls host_call("exec") and returns the host
+/// response verbatim — while the host exec is pending, the guest thread blocks on the
+/// host call (mirrors the real scenario: a guest waiting on TUI input inside a
+/// ui.select dialog host call).
 const BLOCKING_EXEC_GUEST_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -340,13 +344,13 @@ const BLOCKING_EXEC_GUEST_WAT: &str = r#"
     (drop (call $host_call (i32.const 16) (call $strlen (i32.const 16))))
     (return (call $pack (i32.const 512))))
   (func (export "rpi_dispatch") (param i32 i32) (result i64)
-    ;; 仅第一次 dispatch 调 exec（挂起）；之后的 dispatch 返回 null——
-    ;; 超时后残留在队列里的 dispatch 恢复执行时不再阻塞。
+    ;; only the first dispatch calls exec (hangs); later dispatches return null —
+    ;; dispatches left in the queue after the timeout resume without blocking.
     (if (i32.eqz (global.get $first))
       (then (return (call $pack (i32.const 128)))))
     (global.set $first (i32.const 0))
-    ;; 原样转发 exec host call 的响应（宿主在 guest 内存里分配的
-    ;; (ptr<<32)|len 就是 dispatch 的返回格式）。
+    ;; forwards the exec host call response verbatim (the (ptr<<32)|len the host
+    ;; allocates in guest memory is the dispatch return format).
     (return (call $host_call (i32.const 64) (call $strlen (i32.const 64)))))
   (data (i32.const 16) "{\"call\":\"on\",\"args\":{\"event\":\"tool_call\"}}\00")
   (data (i32.const 512) "{\"ok\":true}\00")
@@ -355,7 +359,8 @@ const BLOCKING_EXEC_GUEST_WAT: &str = r#"
 )
 "#;
 
-/// Stub actions：exec 挂起直到 Notify 放行（模拟未决对话框/慢宿主动作）。
+/// Stub actions: exec stays pending until Notify releases it (mimics a pending dialog /
+/// slow host action).
 struct BlockingExecActions {
     notify: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -423,8 +428,9 @@ impl rpi_ext_host::api::HostActions for BlockingExecActions {
     async fn unregister_provider(&self, _name: &str) {}
 }
 
-/// guest 阻塞在宿主动作（对话框等）上时，TUI 线程的渲染往返
-/// `dispatch_blocking` 必须超时失败（回退默认渲染）而非永久卡死。
+/// When a guest blocks on a host action (dialog, etc.), the TUI thread's render
+/// round-trip `dispatch_blocking` must time out and fail (falling back to default
+/// rendering) instead of hanging forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wasm_blocking_render_roundtrip_times_out_when_guest_busy() {
     use std::sync::Arc;
@@ -445,8 +451,8 @@ async fn wasm_blocking_render_roundtrip_times_out_when_guest_busy() {
     }))
     .await;
 
-    // 1. 触发一次事件分发：guest 进入 dispatch handler → host_call("exec")
-    //    → 阻塞在未决的 exec 上（模拟对话框挂起）。
+    // 1. Trigger one event dispatch: the guest enters its dispatch handler →
+    //    host_call("exec") → blocks on the pending exec (mimics a hung dialog).
     let emit_host = host.clone();
     let emit_task = tokio::spawn(async move {
         emit_host
@@ -455,7 +461,8 @@ async fn wasm_blocking_render_roundtrip_times_out_when_guest_busy() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // 2. TUI 线程的阻塞渲染往返：必须超时失败而不是死锁。
+    // 2. The TUI thread's blocking render round-trip: must time out and fail rather
+    //    than deadlock.
     let extension = host.core().extensions()[0].clone();
     let forward = extension.wasm_forward().expect("wasm guest attached");
     let started = std::time::Instant::now();
@@ -471,8 +478,9 @@ async fn wasm_blocking_render_roundtrip_times_out_when_guest_busy() {
         "timed out in ~2s, took {elapsed:?}"
     );
 
-    // 3. 释放宿主动作：guest 恢复，挂起的 emit 完成，串行队列继续工作。
-    // （第一个 notify 被挂起的 emit 消费；第二次放行给恢复后的 dispatch。）
+    // 3. Release the host action: the guest resumes, the pending emit completes, and
+    //    the serial queue keeps working. (The first notify is consumed by the pending
+    //    emit; the second release goes to the resumed dispatch.)
     notify.notify_one();
     emit_task.await.expect("emit completes after release");
     notify.notify_one();

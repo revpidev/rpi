@@ -52,7 +52,7 @@ const FIXED_TOOL_ID_2 = { id: "fixture-tool-call-2" };
 // ---------------------------------------------------------------------------
 
 const SCENARIOS = {
-	/** 单轮问答：one user prompt, one text response. */
+	/** Single turn: one user prompt, one text response. */
 	"single-turn": {
 		responses: () => [fauxAssistantMessage("Hello from the faux provider!")],
 		async drive(session) {
@@ -60,7 +60,7 @@ const SCENARIOS = {
 		},
 	},
 
-	/** read/bash 工具调用：tool calls execute real tools in the temp cwd. */
+	/** read/bash tool calls: tool calls execute real tools in the temp cwd. */
 	"tool-calls": {
 		setup(workspace) {
 			writeFileSync(join(workspace, "note.txt"), "fixture note content\n");
@@ -81,7 +81,7 @@ const SCENARIOS = {
 		},
 	},
 
-	/** steering / follow-up：流式进行中 steer / followUp 排队，作为后续 turn 依次投递。 */
+	/** steering / follow-up: steer / followUp queue mid-stream and are delivered as subsequent turns in order. */
 	"steering-followup": {
 		// Slow pacing + long texts so steer/followUp are queued while streaming.
 		// Captured upstream semantics: with no tool calls pending, both are
@@ -130,7 +130,7 @@ const SCENARIOS = {
 		},
 	},
 
-	/** length 截断整批失败：response truncated by max_tokens (stopReason length). */
+	/** Length truncation, whole-batch failure: response truncated by max_tokens (stopReason length). */
 	"length-truncation": {
 		responses: () => [
 			fauxAssistantMessage("Truncated answer that hit the max token limit", {
@@ -143,11 +143,12 @@ const SCENARIOS = {
 	},
 
 	/**
-	 * compaction 阈值触发：contextWindow 8192 / reserve 4096 → 阈值 4096 tokens。
-	 * 两轮大回复各触发一次自动压缩：第一轮 split-turn 仅 turn-prefix 摘要
-	 * （history 为空 → "No prior history."），第二轮带 previousSummary 走
-	 * UPDATE prompt + turn-prefix 双调用；第三轮小回复的压缩检查因切点
-	 * 无内容可摘要而静默跳过（stale 守卫同时覆盖 pre-prompt 检查）。
+	 * Compaction threshold trigger: contextWindow 8192 / reserve 4096 → threshold 4096 tokens.
+	 * Each of the two large replies triggers one auto-compaction: the first round is a
+	 * split-turn with only a turn-prefix summary (empty history → "No prior history."),
+	 * the second round runs the UPDATE prompt + turn-prefix summary with a previousSummary;
+	 * the third round's small reply skips compaction silently because the cut point has
+	 * no content to summarize (the stale guard also covers the pre-prompt check).
 	 */
 	"compaction-threshold": {
 		options: { models: [{ id: "faux-1", contextWindow: 8192, maxTokens: 65536 }] },
@@ -173,10 +174,11 @@ const SCENARIOS = {
 	},
 
 	/**
-	 * compaction overflow 恢复：窗口 16384 / reserve 8192（阈值远离正常用量）。
-	 * 第三轮收到 "prompt is too long" 错误 → overflow 恢复压缩（split-turn：
-	 * history 初始摘要 + turn-prefix 摘要两次 LLM 调用）→ willRetry →
-	 * agent.continue 自动重试该轮并成功。
+	 * Compaction overflow recovery: window 16384 / reserve 8192 (threshold far from
+	 * normal usage). The third round receives a "prompt is too long" error → overflow
+	 * recovery compaction (split-turn: initial history summary + turn-prefix summary,
+	 * two LLM calls) → willRetry → agent.continue automatically retries the round
+	 * and succeeds.
 	 */
 	"compaction-overflow": {
 		options: { models: [{ id: "faux-1", contextWindow: 16384, maxTokens: 65536 }] },

@@ -83,7 +83,8 @@ struct Fixture {
     events: Arc<Mutex<Vec<CompactionEvent>>>,
 }
 
-/// window 8192 的 faux 模型 + 内存 session；`responses` 供压缩摘要调用消费。
+/// faux model with window 8192 + in-memory session; `responses` feeds the compaction
+/// summary calls.
 fn fixture(settings: CompactionSettings, responses: Vec<FauxResponseStep>) -> Fixture {
     let provider = FauxProvider::new(FauxProviderOptions {
         models: Some(vec![FauxModelDefinition {
@@ -146,7 +147,7 @@ fn scripted(text: &str) -> FauxResponseStep {
 }
 
 impl Fixture {
-    /// 给 session 铺一轮对话并同步 agent state。
+    /// Lays one conversation round into the session and syncs agent state.
     fn seed_turn(&mut self, user_text: &str, assistant_text: &str, total_tokens: u64) {
         let user = user(user_text);
         let assistant = assistant(assistant_text, StopReason::Stop, total_tokens, now_ms());
@@ -201,7 +202,7 @@ fn event_types(events: &[CompactionEvent]) -> Vec<&str> {
 // _checkCompaction guards
 // ---------------------------------------------------------------------------
 
-/// `settings.enabled = false` 时一切检查短路（agent-session.ts:1955）。
+/// `settings.enabled = false` short-circuits every check (agent-session.ts:1955).
 #[tokio::test]
 async fn check_compaction_disabled_settings_short_circuits() {
     let mut fixture = fixture(
@@ -221,8 +222,8 @@ async fn check_compaction_disabled_settings_short_circuits() {
     assert!(fixture.events().is_empty());
 }
 
-/// `skipAbortedCheck = true` 时 aborted 消息跳过（:1958）；pre-prompt 路径
-/// （false）不跳过——aborted 走阈值估算分支。
+/// `skipAbortedCheck = true` skips aborted messages (:1958); the pre-prompt path
+/// (false) does not skip — aborted messages take the threshold-estimate branch.
 #[tokio::test]
 async fn check_compaction_aborted_message_skipped_only_for_post_run() {
     let mut fixture = fixture(settings(), Vec::new());
@@ -232,7 +233,7 @@ async fn check_compaction_aborted_message_skipped_only_for_post_run() {
     assert!(fixture.events().is_empty());
 }
 
-/// 同模型守卫：来自其它模型的 overflow 错误不触发（:1966-1967）。
+/// Same-model guard: overflow errors from other models do not trigger (:1966-1967).
 #[tokio::test]
 async fn check_compaction_overflow_from_other_model_is_ignored() {
     let mut fixture = fixture(settings(), Vec::new());
@@ -246,7 +247,8 @@ async fn check_compaction_overflow_from_other_model_is_ignored() {
     assert!(fixture.events().is_empty());
 }
 
-/// stale 守卫：assistant 时间戳早于最新压缩条目即跳过（:1972-1977）。
+/// Stale guard: an assistant timestamp older than the newest compaction entry is
+/// skipped (:1972-1977).
 #[tokio::test]
 async fn check_compaction_stale_message_before_compaction_boundary_is_ignored() {
     let mut fixture = fixture(settings(), Vec::new());
@@ -256,13 +258,14 @@ async fn check_compaction_stale_message_before_compaction_boundary_is_ignored() 
         .session_mut()
         .append_compaction("summary", "nonexistent-kept-id", 10, None, None, None)
         .expect("append compaction");
-    // 时间戳 1 必然早于刚写入的压缩条目。
+    // Timestamp 1 is necessarily older than the just-written compaction entry.
     let stale = assistant("old", StopReason::Stop, 99999, 1);
     assert!(!fixture.runner.check_compaction(&stale, true).await);
     assert!(fixture.events().is_empty());
 }
 
-/// stop 的 overflow（静默超限，usage.input+cacheRead > window）只压缩不重试：
+/// Overflow with stop (silent overrun, usage.input+cacheRead > window) compacts but
+/// does not retry:
 /// willRetry=false（:1984-1987）。
 #[tokio::test]
 async fn check_compaction_silent_overflow_compacts_without_retry() {
@@ -273,9 +276,9 @@ async fn check_compaction_silent_overflow_compacts_without_retry() {
         100,
     );
 
-    // stopReason "stop" 且 input > contextWindow(8192) → overflow Case 2。
+    // stopReason "stop" and input > contextWindow(8192) → overflow Case 2.
     let silent_overflow = assistant("big answer", StopReason::Stop, 9000, now_ms());
-    // 阈值检查后返回 hasQueuedMessages() = false。
+    // After the threshold check, hasQueuedMessages() = false.
     assert!(
         !fixture
             .runner
@@ -307,7 +310,8 @@ async fn check_compaction_silent_overflow_compacts_without_retry() {
     }
 }
 
-/// overflow 恢复一次限制：第一次恢复后再次 overflow → 发恢复失败事件并返回
+/// One-shot overflow recovery: after the first recovery, another overflow emits a
+/// recovery-failure event and returns
 /// false（:1990-2001）。
 #[tokio::test]
 async fn check_compaction_overflow_recovery_is_attempted_only_once() {
@@ -317,21 +321,22 @@ async fn check_compaction_overflow_recovery_is_attempted_only_once() {
         &format!("a {}", "y".repeat(80)),
         100,
     );
-    // agent state 末尾是 error 消息（恢复路径会先弹出它）。
+    // Agent state ends with the error message (the recovery path pops it first).
     let mut messages = fixture.agent.state().messages;
     messages.push(AgentMessage::Assistant(overflow_error()));
     fixture.agent.set_messages(messages);
 
-    // 第一次：恢复压缩 + willRetry → true。
+    // First: recovery compaction + willRetry → true.
     assert!(
         fixture
             .runner
             .check_compaction(&overflow_error(), true)
             .await
     );
-    // 第二次（中间没有成功回复重置预算）：恢复失败事件。时间戳必须严格
-    // 晚于第一次恢复写入的 compaction 条目（同毫秒会被 :366 的陈旧守卫
-    // 拦截），这里显式 +1s 消除时序竞争。
+    // Second (no successful reply in between to reset the budget): recovery-failure
+    // event. The timestamp must be strictly later than the compaction entry written by
+    // the first recovery (the same millisecond would be intercepted by the :366 stale
+    // guard); an explicit +1s removes the timing race.
     let mut second = overflow_error();
     second.timestamp = now_ms() + 1000;
     assert!(!fixture.runner.check_compaction(&second, true).await);
@@ -345,7 +350,8 @@ async fn check_compaction_overflow_recovery_is_attempted_only_once() {
     );
 }
 
-/// 阈值分支：error/零 usage 消息用最后一个有效 usage 估算（:2017-2037）。
+/// Threshold branch: error/zero-usage messages estimate with the last valid usage
+/// (:2017-2037).
 #[tokio::test]
 async fn check_compaction_threshold_estimates_from_last_valid_usage() {
     let mut fixture = fixture(settings(), vec![scripted("SUMMARY")]);
@@ -355,7 +361,7 @@ async fn check_compaction_threshold_estimates_from_last_valid_usage() {
         5000,
     );
 
-    // 非 overflow 的普通错误 + 零 usage → 估算路径；锚点 5000 > 8192-4096。
+    // A non-overflow ordinary error + zero usage → estimate path; anchor 5000 > 8192-4096.
     let mut error = assistant("", StopReason::Error, 0, now_ms());
     error.error_message = Some("boom".to_owned());
     assert!(!fixture.runner.check_compaction(&error, true).await); // no retry
@@ -375,11 +381,11 @@ async fn check_compaction_threshold_estimates_from_last_valid_usage() {
     }
 }
 
-/// 估算路径找不到任何有效 usage → false（:2022）。
+/// The estimate path finds no valid usage at all → false (:2022).
 #[tokio::test]
 async fn check_compaction_threshold_without_any_usage_data_is_ignored() {
     let mut fixture = fixture(settings(), Vec::new());
-    // agent state 只有 user 消息，没有任何 assistant usage。
+    // Agent state has only user messages; no assistant usage at all.
     fixture.agent.set_messages(vec![user("q")]);
     let mut error = assistant("", StopReason::Error, 0, now_ms());
     error.error_message = Some("boom".to_owned());
@@ -387,12 +393,13 @@ async fn check_compaction_threshold_without_any_usage_data_is_ignored() {
     assert!(fixture.events().is_empty());
 }
 
-/// usage 时间戳守卫：锚点 usage 来自压缩之前的消息 → false（:2026-2033）。
+/// Usage timestamp guard: an anchor usage from before the compaction is → false
+/// (:2026-2033).
 #[tokio::test]
 async fn check_compaction_threshold_stale_usage_anchor_is_ignored() {
     let mut fixture = fixture(settings(), Vec::new());
-    // agent state：一条时间戳为 1 的高用量 assistant；session 里有更新的
-    // 压缩条目。
+    // Agent state: one high-usage assistant with timestamp 1; the session holds a
+    // newer compaction entry.
     fixture.agent.set_messages(vec![
         user("q"),
         AgentMessage::Assistant(assistant("a", StopReason::Stop, 99999, 1)),
@@ -412,13 +419,14 @@ async fn check_compaction_threshold_stale_usage_anchor_is_ignored() {
 // Manual compact()
 // ---------------------------------------------------------------------------
 
-/// 手动 compact：session 太小 → "Nothing to compact"；成功后再 compact →
+/// Manual compact: session too small → "Nothing to compact"; after success, compacting
+/// again →
 /// "Already compacted"（:1799-1807）。
 #[tokio::test]
 async fn manual_compact_error_paths_and_success() {
     let mut fixture = fixture(settings(), vec![scripted("MANUAL SUMMARY")]);
 
-    // 空 session：无内容可压缩。
+    // Empty session: nothing to compact.
     let error = fixture.runner.compact(None).await.expect_err("too small");
     assert_eq!(
         error.to_string(),
@@ -429,8 +437,9 @@ async fn manual_compact_error_paths_and_success() {
         vec!["Compaction failed: Nothing to compact (session too small)".to_owned()]
     );
 
-    // 铺三轮后手动压缩成功。q2 放大（~21 tokens）使 keep_recent=10 的
-    // 切点落在 q2（user = turn start，非 split），被压缩的是第一轮。
+    // After three rounds, manual compaction succeeds. q2 amplification (~21 tokens)
+    // puts the keep_recent=10 cut point at q2 (user = turn start, not a split); the
+    // first round is what gets compacted.
     fixture.seed_turn(
         &format!("q1 {}", "x".repeat(80)),
         &format!("a1 {}", "y".repeat(80)),
@@ -450,7 +459,7 @@ async fn manual_compact_error_paths_and_success() {
     );
     assert!(result.estimated_tokens_after.is_some());
     let events = fixture.events();
-    // 第一次失败的 start/end + 成功的 start/end。
+    // First failed start/end + successful start/end.
     assert_eq!(
         event_types(&events),
         vec![
@@ -461,7 +470,7 @@ async fn manual_compact_error_paths_and_success() {
         ]
     );
 
-    // 末尾已是 compaction 条目：再次压缩被拒绝。
+    // The tail is already a compaction entry: compacting again is rejected.
     let error = fixture
         .runner
         .compact(None)

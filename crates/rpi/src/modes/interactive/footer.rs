@@ -865,7 +865,7 @@ mod tests {
         );
     }
 
-    /// T12-S7a：compaction 后无 post-compaction usage → context 百分比 "?"。
+    /// T12-S7a: after compaction there is no post-compaction usage → context percentage "?".
     #[tokio::test]
     async fn context_percent_unknown_after_compaction_without_post_usage() {
         let harness = crate::modes::interactive::test_support::build_test_session().await;

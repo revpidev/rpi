@@ -302,11 +302,13 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    //! 自测清单（docs/plan/v0.1/T04-rpi-ai-auth.md）解析链断言，期望语义逐条
-    //! 对照 `packages/ai/src/auth/resolve.ts` @ pi 0.82.1 (2efa728)：
-    //! 显式 apiKey 在 `readCredential` 之前返回；stored credential 拥有
-    //! provider（无匹配 handler → undefined，绝不回退 ambient）；OAuth 过期
-    //! 在 modify 锁内双检查刷新，刷新失败抛 `ModelsError("oauth")` 且不回退
+    //! Self-check list (docs/plan/v0.1/T04-rpi-ai-auth.md) resolution-chain assertions;
+    //! expected semantics compared item by item against
+    //! `packages/ai/src/auth/resolve.ts` @ pi 0.82.1 (2efa728):
+    //! an explicit apiKey returns before `readCredential`; a stored credential owns its
+    //! provider (no matching handler → undefined, never falls back to ambient); OAuth
+    //! expiry is double-checked inside the modify lock, and a failed refresh throws
+    //! `ModelsError("oauth")` without falling back
     //! env。
 
     use std::collections::HashMap;
@@ -630,8 +632,9 @@ mod tests {
     // Tests
     // ------------------------------------------------------------------
 
-    /// 自测清单：显式 key > store。overrides.apiKey 在 readCredential 之前
-    /// 返回（resolve.ts:54-60），store 里那条的 key 形状不同可区分。
+    /// Self-check: explicit key > store. overrides.apiKey returns before
+    /// readCredential (resolve.ts:54-60); the stored entry's key shape differs so the
+    /// two are distinguishable.
     #[tokio::test]
     async fn explicit_api_key_wins_over_stored_credential() {
         let store = Arc::new(CountingStore::new(
@@ -663,8 +666,9 @@ mod tests {
         );
     }
 
-    /// 自测清单：store 命中即停。stored key 存在时不再查 env（记录式
-    /// AuthContext 断言零调用），结果来自 stored credential。
+    /// Self-check: store hit stops the chain. When a stored key exists, env is not
+    /// consulted (the recording AuthContext asserts zero calls); the result comes from
+    /// the stored credential.
     #[tokio::test]
     async fn stored_key_wins_and_env_is_never_consulted() {
         let credentials: Arc<dyn CredentialStore> =
@@ -687,10 +691,10 @@ mod tests {
         );
     }
 
-    /// 「命中即停」边界：stored credential 无 key 时，handler 仍经 stored
-    /// 路径拿到 `credential: Some(..)` 并通过 `ctx.env` 解析（upstream
-    /// envApiKeyAuth 语义）——链上不走底部 ambient 分支（credential 为
-    /// `None` 才是 ambient）。
+    /// "Hit stops the chain" boundary: when a stored credential has no key, the handler
+    /// still reaches `credential: Some(..)` through the stored path and resolves via
+    /// `ctx.env` (upstream envApiKeyAuth semantics) — the bottom ambient branch is not
+    /// taken (credential `None` is what denotes ambient).
     #[tokio::test]
     async fn keyless_stored_credential_still_resolves_env_through_handler() {
         let credentials: Arc<dyn CredentialStore> =
@@ -714,8 +718,9 @@ mod tests {
         );
     }
 
-    /// 「命中即停」的上游定义（resolve.ts:71）：stored credential 类型无
-    /// 匹配 handler → `undefined`，绝不回退 ambient/env。
+    /// Upstream definition of "hit stops the chain" (resolve.ts:71): a stored
+    /// credential type with no matching handler → `undefined`, never falls back to
+    /// ambient/env.
     #[tokio::test]
     async fn stored_credential_without_matching_handler_returns_none_no_env_fallback() {
         let credentials: Arc<dyn CredentialStore> =
@@ -737,7 +742,8 @@ mod tests {
         );
     }
 
-    /// 自测清单：ambient 兜底。store 为空 → env 变量命中，source 为变量名。
+    /// Self-check: ambient fallback. Store empty → env variable hit, source is the
+    /// variable name.
     #[tokio::test]
     async fn ambient_env_resolves_when_store_is_empty() {
         let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::new());
@@ -760,8 +766,9 @@ mod tests {
         );
     }
 
-    /// 自测清单：OAuth 刷新失败抛 `ModelsError("oauth")` 且绝不静默回退
-    /// env key；credential 保留在 store 中供重登。
+    /// Self-check: a failed OAuth refresh throws `ModelsError("oauth")` and never
+    /// silently falls back to the env key; the credential stays in the store for
+    /// re-login.
     #[tokio::test]
     async fn oauth_refresh_failure_errors_without_env_fallback() {
         let expired = oauth_credential("expired-access", 0);
@@ -787,12 +794,13 @@ mod tests {
             "no env fallback after a failed refresh"
         );
         assert_eq!(oauth.refresh_calls(), 1);
-        // 凭据保留（modify 回调抛错不写回），供重登。
+        // Credential preserved (the modify callback error does not write back), for re-login.
         assert_eq!(credentials.read("test").await.expect("read"), Some(expired));
     }
 
-    /// 自测清单：modify 锁内双检查——锁内发现 credential 已被另一进程刷新
-    /// （未过期）→ 不调用 refresh，直接用锁内读到的 credential。
+    /// Self-check: double check inside the modify lock — if the lock finds the
+    /// credential already refreshed by another process (not expired), refresh is not
+    /// called; the in-lock credential is used directly.
     #[tokio::test]
     async fn oauth_refresh_is_double_checked_under_the_store_lock() {
         let expired = oauth_credential("expired-access", 0);

@@ -163,7 +163,7 @@ struct SessionFixture {
 }
 
 /// Full pipeline: `create_agent_session` with the real extension host
-/// (sdk.rs 挂钩子的真实路径） + faux provider 脚本化响应。
+/// (the real path where sdk.rs hooks in) + faux provider scripted responses.
 async fn session_fixture(
     responses: Vec<FauxResponseStep>,
     host: Arc<NativeExtensionHost>,
@@ -253,7 +253,7 @@ async fn session_fixture(
     }
 }
 
-/// 会话消息里的第一个 toolResult 的 JSON 视图。
+/// JSON view of the first toolResult in the session messages.
 fn tool_result_json(session: &rpi::core::agent_session::AgentSession) -> Value {
     session
         .messages()
@@ -299,13 +299,13 @@ async fn w2_tool_call_block_short_circuits_execution() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // block: 工具未执行；错误 tool result 带 reason。
+    // block: the tool does not execute; the error tool result carries a reason.
     assert!(calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     let result = tool_result_json(&fixture.session);
     assert_eq!(result["isError"], true);
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("policy denies recorder"), "content: {text}");
-    // 无 handler 抛错 → 无 extension error。
+    // No handler error → no extension error.
     assert!(ext_errors
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -316,8 +316,8 @@ async fn w2_tool_call_block_short_circuits_execution() {
 async fn w2_tool_call_args_mutation_applies_without_revalidation() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let host = host_with(vec![inline_ext(|api| {
-        // 上游原地改 event.input；rpi 经结果的 "input" 字段穿线（见
-        // runner.rs emit_tool_call 偏离注释）。
+        // Upstream mutates event.input in place; rpi threads it through the result's
+        // "input" field (see the runner.rs emit_tool_call divergence note).
         on_json(api, ext::EVENT_TOOL_CALL, |event| {
             let mut input = event["input"].clone();
             input["patched"] = json!(true);
@@ -380,7 +380,7 @@ async fn w2_tool_call_handler_error_fail_safe_blocks() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // fail-safe：工具被阻塞；reason 前缀对齐上游
+    // fail-safe: the tool is blocked; the reason prefix aligns with upstream
     // "Extension failed, blocking execution"（agent-session.ts:482）。
     assert!(calls.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
     let result = tool_result_json(&fixture.session);
@@ -390,7 +390,7 @@ async fn w2_tool_call_handler_error_fail_safe_blocks() {
         text.contains("Extension failed, blocking execution: handler exploded"),
         "content: {text}"
     );
-    // 错误同时进 extension error 总线。
+    // The error also enters the extension error bus.
     let errors = ext_errors.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].event, "tool_call");
@@ -414,7 +414,7 @@ async fn w2_tool_result_partial_patches_chain_across_extensions() {
         inline_ext(move |api| {
             let seen = seen.clone();
             on_json(api, ext::EVENT_TOOL_RESULT, move |event| {
-                // 链式：看到 ext-a 的补丁（runner.ts:878-893）。
+                // Chained: sees ext-a's patch (runner.ts:878-893).
                 *seen.lock().unwrap_or_else(|e| e.into_inner()) = event["content"][0]["text"]
                     .as_str()
                     .unwrap_or("")
@@ -453,7 +453,7 @@ async fn w2_tool_result_partial_patches_chain_across_extensions() {
 
 // ---------------------------------------------------------------------------
 // session_before_compact / session_compact
-// （agent-session.ts:1783-1925 manual；compaction_runner_test.rs fixture 模式）
+// (agent-session.ts:1783-1925 manual; compaction_runner_test.rs fixture pattern)
 // ---------------------------------------------------------------------------
 
 struct CompactionFixture {
@@ -565,7 +565,7 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
     // compaction_end{aborted:true, errorMessage:undefined}。
     let host = host_with(vec![inline_ext(|api| {
         on_json(api, ext::EVENT_SESSION_BEFORE_COMPACT, |event| {
-            // payload 完整化检查：preparation/branchEntries/reason/willRetry。
+            // Payload-completeness check: preparation/branchEntries/reason/willRetry.
             assert!(event["preparation"].is_object());
             assert!(event["branchEntries"]
                 .as_array()
@@ -602,8 +602,9 @@ async fn w2_session_before_compact_cancel_aborts_manual_compaction() {
 
 #[tokio::test]
 async fn w2_session_before_compact_replacement_sets_from_extension_and_emits_session_compact() {
-    // agent-session.ts:1823-1827 + :1872-1891：扩展提供完整 CompactionResult
-    // 时跳过默认摘要、appendCompaction(fromExtension=true)、发 session_compact。
+    // agent-session.ts:1823-1827 + :1872-1891: when the extension provides a complete
+    // CompactionResult, skip the default summary, appendCompaction(fromExtension=true),
+    // and emit session_compact.
     let captured = Arc::new(Mutex::new(Value::Null));
     let sink = captured.clone();
     let host = host_with(vec![inline_ext(move |api| {
@@ -647,13 +648,15 @@ async fn w2_session_before_compact_replacement_sets_from_extension_and_emits_ses
     assert_eq!(event["willRetry"], false);
     assert_eq!(event["compactionEntry"]["type"], "compaction");
     assert_eq!(event["compactionEntry"]["summary"], "ext-summary");
-    // 条目上的持久化字段上游叫 `fromHook`（session-manager.ts:79）。
+    // The persisted field on the entry is called `fromHook` upstream
+    // (session-manager.ts:79).
     assert_eq!(event["compactionEntry"]["fromHook"], true);
 }
 
 #[tokio::test]
 async fn w2_session_before_compact_no_handlers_runs_default_path() {
-    // 无 handler：走默认摘要（faux 提供摘要文本），fromExtension=false。
+    // No handler: default summary path (faux provides the summary text),
+    // fromExtension=false.
     let runner_ref = new_extension_runner_ref(runner_with(Vec::new()).await);
     let mut fixture = compaction_fixture(
         vec![FauxResponseStep::Factory(Box::new(
@@ -669,7 +672,7 @@ async fn w2_session_before_compact_no_handlers_runs_default_path() {
 }
 
 // ---------------------------------------------------------------------------
-// after_provider_response（sdk.rs stream_fn on_response 接线）
+// after_provider_response (sdk.rs stream_fn on_response wiring)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -707,7 +710,7 @@ async fn w2_after_provider_response_reaches_extension() {
 
 #[tokio::test]
 async fn w2_after_provider_response_skipped_without_handlers() {
-    // has_handlers 门控（agent-session.ts:467-470 同款短路）。
+    // has_handlers gate (same short-circuit as agent-session.ts:467-470).
     let hit = Arc::new(AtomicUsize::new(0));
     let marker = hit.clone();
     let runner = runner_with(vec![inline_ext(move |api| {
@@ -766,8 +769,9 @@ async fn w2_user_bash_full_result_replacement() {
 
 #[tokio::test]
 async fn w2_user_bash_operations_only_and_no_handler_fall_back() {
-    // operations（闭包束）无法跨 JSON 边界 → 丢弃回退（候选偏离）；
-    // 无 handler → None（调用方走默认 bash 执行）。
+    // operations (closure bundle) cannot cross the JSON boundary → dropped fallback
+    // (candidate divergence); no handler → None (the caller runs default bash
+    // execution).
     let runner = runner_with(vec![inline_ext(|api| {
         on_json(api, ext::EVENT_USER_BASH, |_| {
             Ok(json!({"operations": {"note": "custom backend"}}))
@@ -781,7 +785,7 @@ async fn w2_user_bash_operations_only_and_no_handler_fall_back() {
 }
 
 // ---------------------------------------------------------------------------
-// project_trust 两阶段加载（resource-loader.ts:327-335,520-571 +
+// project_trust two-phase loading (resource-loader.ts:327-335,520-571 +
 // project-trust.ts:54-70）
 // ---------------------------------------------------------------------------
 
@@ -790,7 +794,7 @@ async fn w2_project_trust_two_phase_load_and_extension_decision() {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
-    // 项目本地扩展（信任门控对象）+ 全局扩展。
+    // Project-local extensions (trust-gated objects) + global extensions.
     std::fs::create_dir_all(cwd.join(".rpi/extensions")).expect("project ext dir");
     std::fs::write(cwd.join(".rpi/extensions/local.wasm"), "wasm").expect("local.wasm");
     std::fs::create_dir_all(agent_dir.join("extensions")).expect("global ext dir");
@@ -806,7 +810,7 @@ async fn w2_project_trust_two_phase_load_and_extension_decision() {
     });
 
     let host = NativeExtensionHost::new(&cwd.to_string_lossy());
-    // 阶段一（pre-trust）：全局 + CLI + inline；项目本地排除。
+    // Phase one (pre-trust): global + CLI + inline; project-local excluded.
     let pre_errors = host
         .load_startup_pre_trust(agent_dir.clone(), Vec::new(), vec![trust_ext], false)
         .await;
@@ -820,7 +824,8 @@ async fn w2_project_trust_two_phase_load_and_extension_decision() {
         "project-local must stay out pre-trust: {pre_errors:?}"
     );
 
-    // project_trust 决议（project-trust.ts:54-70 的 extension_event 优先位）。
+    // project_trust resolution (the extension_event priority slot of
+    // project-trust.ts:54-70).
     let (result, errors) = host
         .emit_project_trust(json!({"type": "project_trust", "cwd": cwd.to_string_lossy()}))
         .await;
@@ -840,11 +845,12 @@ async fn w2_project_trust_two_phase_load_and_extension_decision() {
         &mut context,
     )
     .expect("resolve");
-    // 扩展说 no → 不信任（早退分支会给 true，故此断言证明事件被消费）。
+    // Extension says no → not trusted (the early-exit branch would give true, so this
+    // assertion proves the event was consumed).
     assert!(!trusted);
 
-    // 阶段二（final）：全量加载；pre-trust 的 inline 复用（factory 不重跑），
-    // 项目本地路径此刻才进入尝试集。
+    // Phase two (final): full load; pre-trust inline extensions are reused (factory
+    // not re-run); project-local paths only enter the attempt set now.
     let final_errors = host
         .load_startup_final(
             agent_dir.clone(),
@@ -868,7 +874,7 @@ async fn w2_project_trust_two_phase_load_and_extension_decision() {
         final_errors.iter().any(|e| e.path.contains("global.wasm")),
         "pre-trust errors carried over: {final_errors:?}"
     );
-    // inline 扩展在最终扩展集中（尾部）。
+    // Inline extensions are in the final extension set (at the tail).
     assert_eq!(host.get_extension_paths(), ["<inline:1>"]);
 }
 
@@ -899,7 +905,7 @@ async fn w2_resources_discover_extends_resource_loader() {
 
     let fixture = session_fixture(vec![text_step("hi")], Arc::new(host), Vec::new()).await;
 
-    // bind_extensions 内 session_start 之后触发（agent-session.ts:2249-2251）。
+    // Fires after session_start inside bind_extensions (agent-session.ts:2249-2251).
     fixture
         .session
         .bind_extensions(rpi::core::agent_session::ExtensionBindings {
@@ -927,7 +933,7 @@ async fn w2_resources_discover_extends_resource_loader() {
 }
 
 // ---------------------------------------------------------------------------
-// before_agent_start 链式（agent-session.ts:1224-1253 + runner.ts:1068-1132）
+// before_agent_start chaining (agent-session.ts:1224-1253 + runner.ts:1068-1132)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -937,7 +943,7 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
     let host = host_with(vec![
         inline_ext(|api| {
             on_json(api, ext::EVENT_BEFORE_AGENT_START, |event| {
-                // 真实 base system prompt 由调用侧传入（非空）。
+                // The real base system prompt is passed in by the caller (non-empty).
                 assert!(event["systemPrompt"]
                     .as_str()
                     .is_some_and(|s| !s.is_empty()));
@@ -967,7 +973,7 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
         .expect("prompt");
     fixture.session.wait_for_idle().await;
 
-    // 链式：ext-b 看到 ext-a 替换后的 prompt；最终生效 prompt-B。
+    // Chained: ext-b sees ext-a's replaced prompt; the effective prompt is prompt-B.
     assert_eq!(
         observed
             .lock()
@@ -976,7 +982,7 @@ async fn w2_before_agent_start_chains_system_prompt_and_injects_messages() {
         ["prompt-A"]
     );
     assert_eq!(fixture.session.system_prompt(), "prompt-B");
-    // 注入的 custom message 入列（role:"custom"）。
+    // The injected custom message is queued (role:"custom").
     let has_injected = fixture.session.messages().into_iter().any(|message| {
         let value = serde_json::to_value(&message).expect("json");
         value.get("role").and_then(Value::as_str) == Some("custom")

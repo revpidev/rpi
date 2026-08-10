@@ -508,7 +508,7 @@ fn handles_orphaned_entries_gracefully() {
 }
 
 /// retainedTail form (session-format.md §Context Building, harness
-/// session.ts:72-77/123-127; T07 self-check: 两种形态).
+/// session.ts:72-77/123-127; T07 self-check: both forms).
 #[test]
 fn retained_tail_compaction_form_is_self_contained_checkpoint() {
     let tail = vec![user_msg("latest request"), assistant_msg("latest reply")];
@@ -588,8 +588,8 @@ fn should_be_idempotent_skip_already_migrated() {
     assert_eq!(entries[1]["parentId"], Value::Null);
 }
 
-/// v1→v2: `firstKeptEntryIndex` 数字下标 → `firstKeptEntryId`
-/// (T07 self-check: 含 firstKeptEntryIndex 转换).
+/// v1→v2: `firstKeptEntryIndex` numeric index → `firstKeptEntryId`
+/// (T07 self-check: includes the firstKeptEntryIndex conversion).
 #[test]
 fn converts_first_kept_entry_index_to_first_kept_entry_id() {
     let mut entries = vec![
@@ -618,7 +618,8 @@ fn renames_hook_message_role_to_custom() {
     assert_eq!(entries[1]["message"]["role"], json!("custom"));
 }
 
-/// 迁移后整文件重写 (session-format.md §Session Version; T07 self-check).
+/// After migration the whole file is rewritten (session-format.md §Session Version;
+/// T07 self-check).
 #[test]
 fn migrated_v1_file_is_rewritten_on_open() {
     let tmp = TempDir::new();
@@ -769,7 +770,7 @@ fn reads_cwd_from_session_with_multi_buffer_header() {
     assert_eq!(sm.get_cwd(), stored_cwd);
 }
 
-/// 超大 header 回退全量加载 (T07 self-check: 读取健壮性).
+/// Oversized header falls back to full loading (T07 self-check: read robustness).
 #[test]
 fn opens_compatible_sessions_beyond_the_discovery_scan_limit() {
     let tmp = TempDir::new();
@@ -1338,7 +1339,7 @@ fn get_tree_handles_deep_branching() {
     assert_eq!(node3.children.len(), 1);
 }
 
-/// getTree: 孤儿当根 + 子节点按 timestamp 排序 (T07 self-check).
+/// getTree: orphans as roots + children sorted by timestamp (T07 self-check).
 #[test]
 fn get_tree_treats_orphans_as_roots_and_sorts_children_by_timestamp() {
     // Hand-built file: entry "b" and "a" both children of "root" with
@@ -2119,7 +2120,8 @@ fn generates_a_uuidv7_id_when_options_provided_without_id() {
 // T07 self-check anchors
 // ===========================================================================
 
-/// 延迟落盘：首个 assistant 消息前不创建文件 (flushed + wx).
+/// Deferred persistence: the file is not created before the first assistant message
+/// (flushed + wx).
 #[test]
 fn deferred_persistence_no_file_before_first_assistant() {
     let tmp = TempDir::new();
@@ -2150,7 +2152,7 @@ fn deferred_persistence_no_file_before_first_assistant() {
     assert_eq!(content.trim().split('\n').count(), 6);
 }
 
-/// `wx` 独占创建：目标已存在 → 错误上抛，不覆盖、不 panic。
+/// `wx` exclusive creation: target exists → the error propagates; no overwrite, no panic.
 #[test]
 fn wx_exclusive_create_fails_when_file_already_exists() {
     let tmp = TempDir::new();
@@ -2170,7 +2172,8 @@ fn wx_exclusive_create_fails_when_file_already_exists() {
     assert_eq!(std::fs::read_to_string(&file).expect("read"), "stale\n");
 }
 
-/// 追加写失败上抛错误，不 panic (T07 self-check: 只读目录模拟).
+/// Failed append writes propagate the error, no panic (T07 self-check: read-only dir
+/// simulation).
 #[cfg(unix)]
 #[test]
 fn append_write_failure_in_readonly_directory_is_error_not_panic() {
@@ -2194,8 +2197,8 @@ fn append_write_failure_in_readonly_directory_is_error_not_panic() {
     );
 }
 
-/// 未知 entry 类型：加载保留 → 写回无损；已知条目的未知扩展字段同样保留
-/// (T07 self-check + 需求 §6.6).
+/// Unknown entry types: preserved on load → lossless write-back; unknown extension
+/// fields on known entries are preserved too (T07 self-check + requirements §6.6).
 #[test]
 fn unknown_entry_types_roundtrip_losslessly() {
     let tmp = TempDir::new();
@@ -2245,7 +2248,8 @@ fn unknown_entry_types_roundtrip_losslessly() {
     assert_eq!(parsed[2].type_tag(), "quantum_state");
 }
 
-/// 迁移对未知类型同样赋予 id/parentId 且保留其余字段 (需求 §6.6 写回不丢数据).
+/// Migration assigns id/parentId to unknown types too and keeps the remaining fields
+/// (requirements §6.6: write-back does not lose data).
 #[test]
 fn migration_preserves_unknown_entries_while_assigning_ids() {
     let tmp = TempDir::new();
@@ -2274,7 +2278,8 @@ fn migration_preserves_unknown_entries_while_assigning_ids() {
     assert_eq!(entries[0].parent_id(), None);
 }
 
-/// 已知条目在迁移重写后保留未知扩展字段 (写回不丢数据).
+/// Known entries keep unknown extension fields after the migration rewrite (write-back
+/// does not lose data).
 #[test]
 fn migration_rewrite_preserves_extra_fields_on_known_entries() {
     let tmp = TempDir::new();
@@ -2291,7 +2296,7 @@ fn migration_rewrite_preserves_extra_fields_on_known_entries() {
     assert_eq!(entry["vendor"], json!({"x": 1}));
 }
 
-/// session_info sanitize：`\r\n` → 空格 (T07 self-check).
+/// session_info sanitize: `\r\n` → space (T07 self-check).
 #[test]
 fn append_session_info_sanitizes_newlines() {
     let mut session = in_memory();
@@ -2334,7 +2339,7 @@ fn get_session_name_uses_latest_entry_and_honors_clears() {
     );
 }
 
-/// forkFrom：新 header + parentSession + 全量原样拷贝 + wx (T07 self-check).
+/// forkFrom: new header + parentSession + full verbatim copy + wx (T07 self-check).
 #[test]
 fn fork_from_copies_full_history_with_new_header() {
     let tmp = TempDir::new();
@@ -2394,8 +2399,8 @@ fn fork_from_rejects_empty_or_invalid_source() {
         .contains("source session file is empty or invalid"));
 }
 
-/// forkFrom 带 entry_id + position (harness repo-utils.ts getEntriesToFork;
-/// T07 self-check: position before|at 与 user-message 校验).
+/// forkFrom with entry_id + position (harness repo-utils.ts getEntriesToFork;
+/// T07 self-check: position before|at and user-message validation).
 #[test]
 fn fork_from_with_entry_position_at_and_before() {
     let tmp = TempDir::new();
@@ -2461,8 +2466,9 @@ fn fork_from_with_entry_position_at_and_before() {
     );
 }
 
-/// getPathToRootOrCompaction：retainedTail 形态停在 compaction（含）；
-/// firstKeptEntryId 形态走到 firstKept 为止（harness jsonl-storage.ts:344-370）.
+/// getPathToRootOrCompaction: the retainedTail form stops at the compaction
+/// (inclusive); the firstKeptEntryId form walks up to firstKept
+/// (harness jsonl-storage.ts:344-370).
 #[test]
 fn path_to_root_or_compaction_stops_at_compaction_checkpoint() {
     // retainedTail form: stop at the compaction entry itself.
@@ -2498,7 +2504,8 @@ fn path_to_root_or_compaction_stops_at_compaction_checkpoint() {
     assert_eq!(entry_ids(&path), ["2", "3", "4", "5"]);
 }
 
-/// 畸形行跳过 (T07 self-check: 读取健壮性) — 含已知文件继续可用.
+/// Malformed lines are skipped (T07 self-check: read robustness) — the rest of the
+/// known file stays usable.
 #[test]
 fn malformed_lines_are_skipped_and_session_stays_usable() {
     let tmp = TempDir::new();
@@ -2515,7 +2522,7 @@ fn malformed_lines_are_skipped_and_session_stays_usable() {
     assert_eq!(sm.get_leaf_id(), Some("m2"));
 }
 
-/// --no-session 内存会话：不写盘.
+/// --no-session in-memory session: no disk writes.
 #[test]
 fn in_memory_session_never_touches_disk() {
     let tmp = TempDir::new();
@@ -2528,7 +2535,7 @@ fn in_memory_session_never_touches_disk() {
     assert_eq!(std::fs::read_dir(tmp.path()).expect("readdir").count(), 0);
 }
 
-/// continueRecent：有最近 session 则打开，否则新建.
+/// continueRecent: opens the most recent session if any, otherwise creates one.
 #[test]
 fn continue_recent_opens_most_recent_or_creates_new() {
     let tmp = TempDir::new();
@@ -2552,7 +2559,7 @@ fn continue_recent_opens_most_recent_or_creates_new() {
     assert_eq!(continued.get_entries().len(), 2);
 }
 
-/// 时间辅助函数：toISOString 往返.
+/// Time helpers: toISOString round-trip.
 #[test]
 fn iso8601_format_parse_roundtrip() {
     assert_eq!(format_iso8601_ms(0), "1970-01-01T00:00:00.000Z");
@@ -2572,7 +2579,7 @@ fn iso8601_format_parse_roundtrip() {
     assert_eq!(parse_iso8601_ms("2024-12-03 14:00:00"), None);
 }
 
-/// 文件名的 timestamp `:.→-` 规则 (session-format.md §File Location).
+/// The timestamp `:.→-` rule for file names (session-format.md §File Location).
 #[test]
 fn session_file_name_replaces_colons_and_dots() {
     let tmp = TempDir::new();
@@ -2611,7 +2618,8 @@ fn parse_iso8601_ms_handles_civil_algorithm_edges() {
 // order, getBranch unknown id, fork validation-before-write, migration edges)
 // ===========================================================================
 
-/// 已知类型条目上的未知扩展字段经 createBranchedSession / forkFrom 后仍在
+/// Unknown extension fields on known entry types survive createBranchedSession /
+/// forkFrom
 /// (session-manager.ts:1426 `{...entry, parentId}`).
 #[test]
 fn branch_and_fork_preserve_unknown_extension_fields() {
@@ -2657,7 +2665,8 @@ fn branch_and_fork_preserve_unknown_extension_fields() {
     );
 }
 
-/// createBranchedSession 按 JS Map 插入序重放 label（非 HashMap 迭代序）.
+/// createBranchedSession replays labels in JS Map insertion order (not HashMap
+/// iteration order).
 #[test]
 fn branched_session_replays_labels_in_insertion_order() {
     let mut session = in_memory();
@@ -2696,7 +2705,8 @@ fn branched_session_replays_labels_in_insertion_order() {
     assert_eq!(entries[4].parent_id(), Some(ids[3]));
 }
 
-/// 方法级 getBranch 对未知 id 返回 []（回退只存在于自由 buildSessionPath）.
+/// The method-level getBranch returns [] for unknown ids (the fallback only exists in
+/// the free buildSessionPath).
 #[test]
 fn get_branch_with_unknown_id_returns_empty() {
     let mut session = in_memory();
@@ -2705,8 +2715,8 @@ fn get_branch_with_unknown_id_returns_empty() {
     assert_eq!(session.get_branch(None).len(), 1);
 }
 
-/// forkFrom 的 entry 校验失败不得在磁盘留下孤儿 header 文件
-/// (harness jsonl-repo.ts:138-147 先校验后创建).
+/// A forkFrom entry-validation failure must not leave an orphan header file on disk
+/// (harness jsonl-repo.ts:138-147 validates before creating).
 #[test]
 fn fork_from_validation_failure_leaves_no_orphan_file() {
     let tmp = TempDir::new();
@@ -2735,7 +2745,7 @@ fn fork_from_validation_failure_leaves_no_orphan_file() {
     assert_eq!(files_before, files_after, "no orphan file left behind");
 }
 
-/// 迁移：firstKeptEntryIndex 为任何 JSON number（含浮点）都删除
+/// Migration: firstKeptEntryIndex is removed for any JSON number (including floats)
 /// (session-manager.ts:248-254 `typeof === "number"`).
 #[test]
 fn migrate_v1_removes_float_first_kept_entry_index() {
@@ -2754,8 +2764,8 @@ fn migrate_v1_removes_float_first_kept_entry_index() {
     assert!(compaction.get("firstKeptEntryId").is_none(), "{compaction}");
 }
 
-/// 迁移：header version 为浮点 2.0 时按 JS number 语义处理——不当作 v1
-/// （不做 id/parentId 赋值的 v1→v2 迁移），但仍执行 v2→v3.
+/// Migration: a float 2.0 header version follows JS number semantics — not treated as
+/// v1 (no v1→v2 id/parentId migration), but v2→v3 still runs.
 #[test]
 fn migrate_float_version_2_0_is_not_treated_as_v1() {
     let mut entries = vec![

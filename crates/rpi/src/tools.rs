@@ -46,7 +46,7 @@ pub struct ToolContext {
     ///
     /// Shared cell (T10): the owning `AgentSession` updates the contents on
     /// model/thinking/session-file changes so the bash tool resolves `RPI_*`
-    /// per command spawn (requirements §3.3: 模型切换即时生效).
+    /// per command spawn (requirements §3.3: model switches take effect immediately).
     pub session_env: Option<std::sync::Arc<std::sync::RwLock<SessionEnv>>>,
 }
 

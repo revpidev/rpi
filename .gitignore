@@ -1,8 +1,8 @@
-# Rust（工作区根 target 与各 crate 内误产物目录）
+# Rust (workspace root target and stray build dirs inside crates)
 **/target/
 **/*.rs.bk
 
-# 编辑器与系统
+# Editors and system
 *.swp
 .DS_Store
 .tooling/

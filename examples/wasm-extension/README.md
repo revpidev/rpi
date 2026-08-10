@@ -1,23 +1,25 @@
 # rpi wasm extension example: permission-gate
 
-ABI v1 guest（`docs/extension-abi.md`）。行为：`tool_call` 里 block `read`
-工具；注册自定义 `gate_tool`。
+An ABI v1 guest (`docs/extension-abi.md`). Behavior: blocks the `read` tool in
+`tool_call`; registers a custom `gate_tool`.
 
-## 构建
+## Build
 
 ```sh
-rustup target add wasm32-unknown-unknown   # 一次性
+rustup target add wasm32-unknown-unknown   # one-time
 cargo build --target wasm32-unknown-unknown --release
 mkdir -p dist
 cp ../../target/wasm32-unknown-unknown/release/rpi_wasm_extension_example.wasm dist/permission_gate.wasm
 ```
 
-## 安装
+## Install
 
-把整个 `examples/wasm-extension/` 目录拷贝（或链接）到
-`~/.rpi/agent/extensions/permission-gate/`（或项目的 `.rpi/extensions/`），
-rpi 启动时按一层目录发现规则加载 `rpi-extension.json`。
+Copy (or symlink) the whole `examples/wasm-extension/` directory to
+`~/.rpi/agent/extensions/permission-gate/` (or a project's `.rpi/extensions/`).
+rpi loads `rpi-extension.json` on startup using the one-directory-deep
+discovery rule.
 
-裸 `.wasm` 文件（无 manifest）也可直接放入扩展目录，此时
-`capabilities = []`（仅 `on` 订阅），本例的 `registerTool` 会被
-`capabilityDenied` 拒绝——用它可演示沙箱。
+A bare `.wasm` file (without a manifest) can also be dropped directly into the
+extensions directory; in that case `capabilities = []` (only `on` subscriptions
+are allowed), and this example's `registerTool` would be rejected with
+`capabilityDenied` — useful for demonstrating the sandbox.

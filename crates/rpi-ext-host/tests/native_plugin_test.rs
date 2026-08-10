@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use rpi_ext_host::host::NativeExtensionHost;
 use serde_json::json;
 
-/// 平台化的 cdylib 产物名（`cargo build` 的默认命名：lib<name>.so /
+/// Platform-specific cdylib artifact names (`cargo build` default naming: lib<name>.so /
 /// lib<name>.dylib / <name>.dll）。
 fn plugin_file_name() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -21,7 +21,7 @@ fn plugin_file_name() -> &'static str {
     }
 }
 
-/// Fixture cdylib 的 debug 产物路径。
+/// Debug artifact path of the fixture cdylib.
 fn plugin_path() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -34,8 +34,8 @@ fn plugin_path() -> PathBuf {
     target.join("debug").join(plugin_file_name())
 }
 
-/// 产物缺失（`cargo test -p rpi-ext-host` 不构建非依赖 crate 的 cdylib）
-/// 时跳过并给出构建指引。
+/// Skips with a build hint when the artifact is missing (`cargo test -p rpi-ext-host`
+/// does not build cdylibs of non-dependency crates).
 fn require_plugin() -> Option<PathBuf> {
     let plugin = plugin_path();
     if plugin.is_file() {
@@ -79,7 +79,7 @@ async fn native_plugin_manifest_entry_loads() {
         return;
     };
 
-    // manifest 的 `native` 字段经发现规则解析（wasm 优先于 native）。
+    // The manifest's `native` field resolves through the discovery rule (wasm wins over native).
     let dir = std::env::temp_dir().join(format!("rpi-native-manifest-{}", std::process::id()));
     let plugin_dir = dir.join("plug");
     std::fs::create_dir_all(plugin_dir.join("dist")).expect("dist");
@@ -107,8 +107,9 @@ async fn native_plugin_capability_denied_without_tools() {
         return;
     };
 
-    // 裸 .so（无 manifest）→ capabilities=[] —— fixture 只调 `on`（免费），
-    // 应加载成功；capability 拒绝已由 wasm 侧对拍覆盖（同一 method 表）。
+    // Bare .so (no manifest) → capabilities=[] — the fixture only calls `on` (free);
+    // it must load successfully; capability denial is already covered by the wasm-side
+    // parity (same method table).
     let host = NativeExtensionHost::new("/w7-native-caps");
     let errors = host.load_paths(&[plugin]).await;
     assert!(errors.is_empty(), "{errors:?}");

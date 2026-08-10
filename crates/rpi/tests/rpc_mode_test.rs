@@ -497,7 +497,7 @@ async fn model_and_thinking_commands() {
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 
-/// cycle_model / cycle_thinking_level 的单模型/无推理 null data 路径
+/// cycle_model / cycle_thinking_level null-data paths for single-model / no-reasoning setups
 /// (rpc.md §cycle_model §cycle_thinking_level)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cycle_commands_null_data_paths() {
@@ -529,7 +529,7 @@ async fn cycle_commands_null_data_paths() {
     assert_eq!(response["success"], true);
     assert_eq!(response["data"], Value::Null);
 
-    // 非推理模型的可用级别只有 off（rpc.md §get_available_thinking_levels）。
+    // A non-reasoning model's only available level is off (rpc.md §get_available_thinking_levels).
     rpc.send(&json!({"id": "tl1", "type": "get_available_thinking_levels"}))
         .await;
     let response = rpc.next_response(Some("tl1")).await;
@@ -616,14 +616,14 @@ async fn bash_commands() {
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 
-/// bash 运行中可被 abort_bash 取消（bash/abort_bash 往返）。
+/// bash running can be cancelled by abort_bash (bash/abort_bash round-trip).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bash_abort_roundtrip() {
     let mut rpc = start_rpc(vec![]).await;
 
     rpc.send(&json!({"id": "b1", "type": "bash", "command": "sleep 30"}))
         .await;
-    // 给 executor 一点启动时间，再发 abort。
+    // Give the executor some startup time, then send abort.
     tokio::time::sleep(Duration::from_millis(150)).await;
     rpc.send(&json!({"id": "b2", "type": "abort_bash"})).await;
     assert_eq!(rpc.next_response(Some("b2")).await["success"], true);
@@ -754,8 +754,9 @@ async fn session_replacement_commands() {
         SessionManager::create(&rpc.cwd, Some(&other_dir), NewSessionOptions::default())
             .expect("create other session");
     let other_id = other_manager.get_session_id().to_owned();
-    // SessionManager 延迟落盘：文件在首个 assistant 消息时才创建
-    // (session-manager.ts `_persist`)，先补一条让 header 真正写入。
+    // SessionManager defers persistence: the file is only created on the first
+    // assistant message (session-manager.ts `_persist`); add one first so the header
+    // is actually written.
     other_manager
         .append_message(AgentMessage::Assistant(faux_assistant_message(
             "seed",
@@ -790,9 +791,9 @@ async fn session_replacement_commands() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compact_command() {
-    // 小会话默认可压缩性不足（keepRecentTokens=20000）；收紧阈值使切点
-    // 恰好落在第二个 user 消息（turn 起点，单次摘要调用，避免 split-turn
-    // 双调用）。
+    // Small sessions are not compactable by default (keepRecentTokens=20000); tighten
+    // the threshold so the cut point lands exactly on the second user message (turn
+    // start, a single summary call, avoiding the split-turn double call).
     let tmp = TempDir::new();
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -851,7 +852,7 @@ async fn compact_command() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn steer_follow_up_abort_during_streaming() {
-    // 慢速流（tokens_per_second 限速）保证 prompt 在途时可交互。
+    // Slow stream (tokens_per_second rate limit) keeps the prompt interactive mid-flight.
     let long_text = "word ".repeat(400);
     let mut rpc = start_rpc_with(
         FauxProviderOptions {
@@ -926,7 +927,8 @@ async fn steer_follow_up_abort_during_streaming() {
 async fn session_name_and_get_commands() {
     let mut rpc = start_rpc(vec![]).await;
 
-    // 空目录：无扩展命令/模板/技能（内置 TUI 命令不在其列，rpc.md §get_commands）。
+    // Empty dir: no extension commands/templates/skills (built-in TUI commands are
+    // not in the list, rpc.md §get_commands).
     rpc.send(&json!({"id": "c1", "type": "get_commands"})).await;
     let response = rpc.next_response(Some("c1")).await;
     assert_eq!(response["success"], true);
@@ -950,7 +952,7 @@ async fn session_name_and_get_commands() {
     assert_eq!(rpc.close_and_wait().await, 0);
 }
 
-/// get_commands 的 prompt 模板与 sourceInfo 重建（user scope，
+/// get_commands prompt templates and sourceInfo reconstruction (user scope,
 /// prompt-templates.ts `getSourceInfo`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_commands_with_prompt_template() {
@@ -999,7 +1001,7 @@ async fn get_commands_with_prompt_template() {
 async fn protocol_errors_and_framing() {
     let mut rpc = start_rpc(vec![]).await;
 
-    // 非法 JSON → command:"parse"（rpc.md §Error Handling）。
+    // Invalid JSON → command:"parse" (rpc.md §Error Handling).
     rpc.send_raw("this is not json\n").await;
     let response = rpc.next_response(None).await;
     assert_eq!(response["command"], "parse");
@@ -1010,7 +1012,8 @@ async fn protocol_errors_and_framing() {
         .starts_with("Failed to parse command: "));
     assert!(response.get("id").is_none());
 
-    // 空行 / 纯空白行同样回 parse 错误（上游不过滤空行，JSON.parse("") 抛错）。
+    // Empty / whitespace-only lines also return a parse error (upstream does not
+    // filter empty lines; JSON.parse("") throws).
     rpc.send_raw("\n").await;
     let response = rpc.next_response(None).await;
     assert_eq!(response["command"], "parse");
@@ -1020,38 +1023,43 @@ async fn protocol_errors_and_framing() {
         .expect("error")
         .starts_with("Failed to parse command: "));
 
-    // 未知命令（rpc-mode.ts:695-698）。
+    // Unknown command (rpc-mode.ts:695-698).
     rpc.send(&json!({"id": "u1", "type": "frobnicate"})).await;
     let response = rpc.next_response(Some("u1")).await;
     assert_eq!(response["success"], false);
     assert_eq!(response["command"], "frobnicate");
     assert_eq!(response["error"], "Unknown command: frobnicate");
 
-    // 非字符串 type：command 原值回显（上游 error(id, unknownCommand.type, ...)）。
+    // Non-string type: the command echoes the original value (upstream
+    // error(id, unknownCommand.type, ...)).
     rpc.send_raw("{\"id\":\"u9\",\"type\":42}\n").await;
     let response = rpc.next_response(Some("u9")).await;
     assert_eq!(response["success"], false);
     assert_eq!(response["command"], 42);
     assert_eq!(response["error"], "Unknown command: 42");
 
-    // 缺 type：command 键整键省略（JSON.stringify 丢弃 undefined）。
+    // Missing type: the command key is omitted entirely (JSON.stringify drops
+    // undefined).
     rpc.send_raw("{\"id\":\"u10\"}\n").await;
     let response = rpc.next_response(Some("u10")).await;
     assert_eq!(response["success"], false);
     assert!(response.get("command").is_none());
     assert_eq!(response["error"], "Unknown command: undefined");
 
-    // 已知命令但字段形状错误 → 边界拒绝（上游为 TypeError，同为 success:false）。
+    // Known command with a malformed field shape → boundary rejection (upstream is a
+    // TypeError, also success:false).
     rpc.send(&json!({"id": "u2", "type": "prompt"})).await;
     let response = rpc.next_response(Some("u2")).await;
     assert_eq!(response["success"], false);
     assert_eq!(response["command"], "prompt");
 
-    // extension_ui_response 无匹配请求：静默忽略（后续命令不受影响）。
+    // extension_ui_response with no matching request: silently ignored (later
+    // commands are unaffected).
     rpc.send(&json!({"type": "extension_ui_response", "id": "nobody", "value": "x"}))
         .await;
 
-    // U+2028/U+2029 在 payload 内不错拆 + CRLF 容忍（jsonl.ts 帧语义）。
+    // U+2028/U+2029 inside a payload do not split it + CRLF tolerance (jsonl.ts frame
+    // semantics).
     rpc.send_raw(
         "{\"id\":\"f1\",\"type\":\"set_session_name\",\"name\":\"a\u{2028}b\u{2029}c\"}\r\n",
     )
@@ -1062,7 +1070,8 @@ async fn protocol_errors_and_framing() {
     let response = rpc.next_response(Some("f2")).await;
     assert_eq!(response["data"]["sessionName"], "a\u{2028}b\u{2029}c");
 
-    // EOF 前无换行的尾行仍被处理（jsonl.ts:43-49），随后 EOF 正常关闭。
+    // A trailing line without a final newline is still processed (jsonl.ts:43-49),
+    // then EOF closes normally.
     rpc.send_raw("{\"id\":\"f3\",\"type\":\"get_available_thinking_levels\"}")
         .await;
     assert_eq!(rpc.close_and_wait().await, 0);
@@ -1075,7 +1084,7 @@ async fn protocol_errors_and_framing() {
 }
 
 // ---------------------------------------------------------------------------
-// export_html（T14-W5：真实导出；in-memory 会话报上游错误）
+// export_html (T14-W5: real export; in-memory sessions report the upstream error)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1093,7 +1102,7 @@ async fn export_html_in_memory_session_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// 信号退出码（print-mode.ts / rpc-mode.ts：SIGTERM=143 / SIGHUP=129）
+// Signal exit codes (print-mode.ts / rpc-mode.ts: SIGTERM=143 / SIGHUP=129)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -1123,7 +1132,7 @@ fn signal_exit_code(signal: libc::c_int, expected_code: i32) {
         .spawn()
         .expect("spawn rpi-rpc");
 
-    // 等启动管线完成（rpc 循环就位），再发信号。
+    // Wait for the startup pipeline (rpc loop in place), then send the signal.
     std::thread::sleep(std::time::Duration::from_millis(800));
     unsafe {
         libc::kill(child.id() as libc::pid_t, signal);

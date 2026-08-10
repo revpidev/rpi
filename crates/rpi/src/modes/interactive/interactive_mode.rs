@@ -183,7 +183,7 @@ pub struct InteractiveModeOptions {
 /// matching). The rpi core manager owns the definition table, JSON loading
 /// and legacy-name migration (core/keybindings.rs); the rpi-tui manager is
 /// rebuilt from the same definitions + user overrides (T12 plan, keybindings
-/// 双轨打通).
+/// both tracks connected).
 pub fn install_global_keybindings() {
     use crate::core::keybindings as core_keybindings;
     use rpi_tui::keybindings::{
@@ -4665,11 +4665,12 @@ mod tests {
 
     #[tokio::test]
     async fn set_tools_expanded_reaches_displayed_chat_tool_after_pending_cleared() {
-        // T17 回归：`setToolsExpanded` 遍历 loaded-resources + chat 容器
-        // （interactive-mode.ts:4033-4048），而非 pending_tools —— 工具执行
-        // 结束后 `pending_tools` 已被 `tool_execution_end`/`agent_end` 清空，
-        // 只遍历 pending map 会让 ctrl+o 对已展示组件失效，且标志残留污染
-        // 后续新建组件（write 不折叠）。
+        // T17 regression: `setToolsExpanded` iterates the loaded-resources + chat
+        // containers (interactive-mode.ts:4033-4048), not pending_tools — after tool
+        // execution ends, `pending_tools` has already been cleared by
+        // `tool_execution_end`/`agent_end`; iterating only the pending map would break
+        // ctrl+o for already-shown components, and leftover flags would pollute
+        // components created later (write is not collapsed).
         let (mode, _terminal, _session) = mode_harness().await;
         let ui = &mode.ui_state;
         let content = (1..=15)
@@ -5966,18 +5967,19 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // T12-S7a: 自测清单补全
+    // T12-S7a: self-check list completion
     // ---------------------------------------------------------------------
 
-    /// 大 session 性能基准（T12 自测清单「大 session 性能」）：1k+ 消息
-    /// 全量重建 + 渲染，断言完成与宽松时限，输出基准数字。
+    /// Large-session performance benchmark (T12 self-check list "large-session
+    /// performance"): full rebuild + render of 1k+ messages, asserting completion
+    /// within a loose time limit and printing the benchmark numbers.
     #[tokio::test]
     async fn large_session_render_initial_messages_completes() {
         let (mut mode, _terminal, _session) = mode_harness().await;
         mode.init().await;
         let ui = &mode.ui_state;
 
-        // 600 轮 user/assistant 对（含长 markdown 与代码块）≈ 1200 条。
+        // 600 user/assistant pairs (with long markdown and code blocks) ≈ 1200 entries.
         {
             let manager = ui.session().session_manager();
             let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
@@ -6019,14 +6021,16 @@ mod tests {
             "PERF large_session: build={build_elapsed:?} render={render_elapsed:?} children={children} lines={}",
             lines.len()
         );
-        // 宽松上限：正常机器应远低于此（基准数字见报告；测量输出经
-        // RUST_LOG/测试捕获不可见时以测试耗时为准）。
+        // Loose upper bound: normal machines should be far below this (see the report
+        // for the benchmark numbers; when the measurement output is invisible due to
+        // RUST_LOG/test capture, the test duration is the measure).
         assert!(build_elapsed.as_secs() < 30, "initial build must complete");
         assert!(render_elapsed.as_secs() < 10, "full render must complete");
     }
 
-    /// 渲染节流合并（T12 自测清单「节流不丢帧」）：连续 request_render
-    /// 合并为一个 deadline，单次 tick 消费。
+    /// Render-throttle coalescing (T12 self-check list "throttle does not drop
+    /// frames"): consecutive request_render calls coalesce into one deadline, consumed
+    /// by a single tick.
     #[test]
     fn render_throttle_coalesces_requests() {
         let tui = Tui::new(Box::new(TestTerminal::new()));
@@ -6045,8 +6049,9 @@ mod tests {
         assert!(!tui.has_pending_work());
     }
 
-    /// VT 驱动的消息队列/编辑器场景（T12 自测清单「消息队列 VT 驱动」）：
-    /// steer 入队 → pending 渲染 → Alt+Up 合并回填 → Escape 清空 → 输入提交。
+    /// VT-driven message-queue/editor scenario (T12 self-check list "message queue VT
+    /// driven"): steer enqueues → pending render → Alt+Up coalesces and fills back →
+    /// Escape clears → input submits.
     #[tokio::test]
     async fn vt_driven_queue_and_editor_scenario() {
         install_global_keybindings();
@@ -6054,7 +6059,8 @@ mod tests {
         mode.init().await;
         let ui = &mode.ui_state;
 
-        // 模拟 streaming 中入队（session.steer 直接排队，无需真 streaming）。
+        // Mimic enqueueing mid-stream (session.steer queues directly; no real
+        // streaming needed).
         let _ = ui.session().steer("steer message", None).await;
         ui.update_pending_messages_display();
         let pending = lock(&ui.pending_messages_container).render(60).join("\n");
@@ -6067,8 +6073,8 @@ mod tests {
             "pending: {pending}"
         );
 
-        // Alt+Up（legacy 序列 \x1bp）经 TUI dispatch 排队 Dequeue，测试无
-        // driver 线程，手动 drain 应用。
+        // Alt+Up (legacy sequence \x1bp) queues a Dequeue via TUI dispatch; the test
+        // has no driver thread, so a manual drain applies it.
         terminal.feed("\u{1b}p");
         ui.ui.tick(std::time::Instant::now());
         ui.drain_events();
@@ -6079,9 +6085,10 @@ mod tests {
             "queue drained"
         );
 
-        // Escape（编辑器非空、非 bash 模式）→ 经 dispatch + drain 清空？——
-        // Escape 在编辑器中输入文本时由 CustomEditor 分派给 base editor，
-        // 无文本时不动作；这里直接驱动 Escape 命令验证 bash 模式清空路径。
+        // Escape (editor non-empty, not bash mode) → cleared via dispatch + drain? —
+        // when text is being typed, CustomEditor dispatches Escape to the base editor,
+        // which does nothing without text; here the Escape command is driven directly to
+        // verify the bash-mode clearing path.
         lock(&ui.editor).set_text("!draft bash");
         *lock(&ui.is_bash_mode) = true;
         terminal.feed("\u{1b}");
@@ -6090,7 +6097,8 @@ mod tests {
         assert_eq!(lock(&ui.editor).get_text(), "", "bash mode cleared");
         assert!(!*lock(&ui.is_bash_mode));
 
-        // 输入 + Enter：dispatch 驱动 submit_value（清空编辑器 + 回调入通道）。
+        // Input + Enter: dispatch drives submit_value (clears the editor + callback
+        // into the channel).
         terminal.feed("hello");
         ui.ui.tick(std::time::Instant::now());
         assert_eq!(lock(&ui.editor).get_text(), "hello");
@@ -6099,7 +6107,8 @@ mod tests {
         assert_eq!(lock(&ui.editor).get_text(), "", "submit clears editor");
     }
 
-    /// /tree 三分支（T12 自测清单）：user → leaf=parent + 文本回填（UI 集成）。
+    /// /tree three branches (T12 self-check list): user → leaf=parent + text fill-back
+    /// (UI integration).
     #[tokio::test]
     async fn tree_select_user_message_restores_leaf_and_editor_text() {
         let (mut mode, terminal, session) = mode_harness().await;
@@ -6124,8 +6133,9 @@ mod tests {
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
         assert!(lock(&ui.active_selector).is_some());
 
-        // 初始选中 leaf（follow-up）——选中 leaf 自身是 no-op（上游
-        // 4652-4656）；Up 两次到第一个 user（root question）后 Enter。
+        // Initially the leaf (follow-up) is selected — selecting the leaf itself is a
+        // no-op (upstream 4652-4656); Up twice to the first user (root question), then
+        // Enter.
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\u{1b}[A");
@@ -6135,7 +6145,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         assert!(lock(&ui.active_selector).is_none(), "selector closed");
-        // leaf = 被选 user 的 parent（SDK 种子条目之一）。
+        // leaf = the selected user's parent (one of the SDK seed entries).
         let leaf = lock(&session.session_manager())
             .get_leaf_id()
             .map(str::to_owned);
@@ -6156,12 +6166,13 @@ mod tests {
             first_user_parent.as_deref(),
             "leaf moved to the user message's parent"
         );
-        // 编辑器回填被选 user 的文本（空编辑器时）。
+        // The editor fills back the selected user's text (when the editor is empty).
         let text = lock(&ui.editor).get_text();
         assert!(text.contains("root question"), "editor: {text:?}");
     }
 
-    /// /tree 三分支：根 user（reset_leaf 后构造，parent=None）→ 重置 leaf。
+    /// /tree three branches: root user (built after reset_leaf, parent=None) → leaf
+    /// reset.
     #[tokio::test]
     async fn tree_select_root_user_resets_leaf() {
         let (mut mode, terminal, session) = mode_harness().await;
@@ -6170,7 +6181,8 @@ mod tests {
         {
             let manager = session.session_manager();
             let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
-            // 清掉 SDK 种子条目形成的 leaf，使下一条 user 成为真正根节点。
+            // Clear the leaf formed by the SDK seed entries so the next user becomes a
+            // true root node.
             manager.reset_leaf();
             manager
                 .append_message(user_message("root question"))
@@ -6183,7 +6195,7 @@ mod tests {
                 .expect("append");
         }
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
-        // 选中 assistant（leaf）→ Up 到根 user → Enter。
+        // Select the assistant (leaf) → Up to the root user → Enter.
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\r");
@@ -6198,7 +6210,8 @@ mod tests {
         assert!(text.contains("root question"), "editor: {text:?}");
     }
 
-    /// /tree 三分支：assistant → 移 leaf 留空（不回填编辑器）。
+    /// /tree three branches: assistant → moving the leaf leaves it empty (no editor
+    /// fill-back).
     #[tokio::test]
     async fn tree_select_assistant_moves_leaf_without_editor_text() {
         let (mut mode, terminal, session) = mode_harness().await;
@@ -6218,9 +6231,10 @@ mod tests {
                 .expect("append");
         }
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
-        // 选中 assistant（leaf）→ Enter 是 no-op（Already at this point）；
-        // Up 到 user 再 Down 回 assistant？—— 直接选 assistant：初始选中即 leaf，
-        // Enter 命中 "Already at this point"。改用 Up 选 user 后 Down 回 assistant。
+        // Selecting the assistant (leaf) → Enter is a no-op (Already at this point);
+        // Up to user then Down back to assistant? — selecting the assistant directly:
+        // the initial selection is already the leaf, so Enter hits "Already at this
+        // point". Instead, Up to select the user, then Down back to the assistant.
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\u{1b}[B");
@@ -6229,7 +6243,8 @@ mod tests {
         ui.ui.tick(std::time::Instant::now());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // leaf 仍是 assistant（移动自身）且编辑器未回填。
+        // The leaf is still the assistant (moved onto itself) and the editor is not
+        // filled back.
         let entries = lock(&session.session_manager()).get_entries();
         let assistant_id = entries
             .iter()
@@ -6253,7 +6268,7 @@ mod tests {
         );
     }
 
-    /// /tree 三分支：custom_message → leaf=parent + 文本回填。
+    /// /tree three branches: custom_message → leaf=parent + text fill-back.
     #[tokio::test]
     async fn tree_select_custom_message_restores_leaf_and_editor_text() {
         let (mut mode, terminal, session) = mode_harness().await;
@@ -6285,14 +6300,14 @@ mod tests {
                 .expect("append assistant tail");
         }
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
-        // leaf=tail assistant → Up 到 custom → Enter。
+        // leaf=tail assistant → Up to the custom → Enter.
         terminal.feed("\u{1b}[A");
         ui.ui.tick(std::time::Instant::now());
         terminal.feed("\r");
         ui.ui.tick(std::time::Instant::now());
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // leaf = custom 的 parent（root user），编辑器回填 custom 文本。
+        // leaf = the custom's parent (root user); the editor fills back the custom text.
         let leaf = lock(&session.session_manager())
             .get_leaf_id()
             .map(str::to_owned);
@@ -6315,15 +6330,17 @@ mod tests {
         assert!(text.contains("custom payload"), "editor: {text:?}");
     }
 
-    /// T12-S7b：M5 必达的脚本化 smoke——run loop 全路径 VT 端到端：
-    /// 启动 → bash 提问 → 快捷键 → Ctrl+D 退出 → 终端恢复。真机
-    /// streaming/abort 路径留人工 smoke（无 tty/provider key 环境）。
+    /// T12-S7b: the M5-mandatory scripted smoke — full-path VT end-to-end through the
+    /// run loop: startup → bash question → shortcuts → Ctrl+D exit → terminal restore.
+    /// Real-machine streaming/abort paths remain manual smoke (no tty/provider-key
+    /// environment).
     #[tokio::test]
     async fn run_loop_end_to_end_vt_smoke() {
         install_global_keybindings();
         let (mut mode, terminal, _session) = mode_harness().await;
-        // run() 的 future 非 Send（unsubscribe 槽等）——用专用线程 +
-        // current_thread runtime 驱动（生产是主 tokio task，语义一致）。
+        // run()'s future is not Send (unsubscribe slots etc.) — drive it with a
+        // dedicated thread + current_thread runtime (production uses the main tokio
+        // task; semantics are the same).
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -6333,22 +6350,23 @@ mod tests {
                 mode.run().await;
             });
         });
-        // 等 init + driver 线程起来。
+        // Wait for init + the driver thread to start.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(terminal.is_started(), "terminal started by run()");
 
-        // 「提问」：bash 命令经输入通道 → run loop → 执行。
+        // The "question": a bash command goes through the input channel → run loop →
+        // execution.
         terminal.feed("!echo vt-e2e\r");
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-        // 快捷键：Ctrl+C 单次清空编辑器（不退出）——单独 feed 使 
-        // 成为独立 dispatch。
+        // Shortcut: a single Ctrl+C clears the editor (does not exit) — fed separately
+        // so  becomes its own dispatch.
         terminal.feed("draft");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         terminal.feed("\u{3}");
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        // Ctrl+D 退出：dispatch → shutdown 信号 → run loop 收尾。
+        // Ctrl+D exit: dispatch → shutdown signal → run loop winds down.
         terminal.feed("\u{4}");
         tokio::time::timeout(std::time::Duration::from_secs(5), async move {
             handle.join().expect("run thread")
@@ -6356,12 +6374,12 @@ mod tests {
         .await
         .expect("run loop exits after Ctrl+D");
 
-        // 退出恢复：终端 stop 被调用（raw 模式还原）。
+        // Exit restore: the terminal stop is called (raw mode restored).
         assert!(!terminal.is_started(), "terminal restored on shutdown");
     }
 
     // ---------------------------------------------------------------------
-    // T15 W4: InteractiveUiBridge VT 测试
+    // T15 W4: InteractiveUiBridge VT tests
     // ---------------------------------------------------------------------
 
     #[tokio::test]
@@ -6372,7 +6390,8 @@ mod tests {
         let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
         let bridge = Arc::new(bridge);
 
-        // select：对话框挂载在编辑器位置，回车解析为选项值。
+        // select: the dialog mounts at the editor position; Enter resolves to the
+        // option value.
         let b = bridge.clone();
         let task = tokio::spawn(async move {
             b.select("Pick one", &["Allow".to_owned(), "Block".to_owned()], None)
@@ -6389,10 +6408,10 @@ mod tests {
             .expect("selector mounted");
         lock(&selector).handle_input("\r");
         assert_eq!(task.await.expect("task"), Some("Allow".to_owned()));
-        // 对话框关闭、编辑器复位。
+        // The dialog closes and the editor resets.
         assert!(lock(&mode.ui_state.active_selector).is_none());
 
-        // confirm 走 Yes/No 选择器（interactive-mode.ts:2262-2269）。
+        // confirm goes through the Yes/No selector (interactive-mode.ts:2262-2269).
         let b = bridge.clone();
         let task = tokio::spawn(async move { b.confirm("Sure?", "really", None).await });
         for _ in 0..100 {
@@ -6407,7 +6426,7 @@ mod tests {
         lock(&selector).handle_input("\r");
         assert!(task.await.expect("task"));
 
-        // timeout：自动解析默认值并关闭。
+        // timeout: resolves the default value automatically and closes.
         let b = bridge.clone();
         let task = tokio::spawn(async move {
             b.select(
@@ -6430,7 +6449,7 @@ mod tests {
         let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
         let ui = &mode.ui_state;
 
-        // setWidget（string[]，aboveEditor 默认）→ 渲染进 widgets_above。
+        // setWidget (string[], aboveEditor default) → rendered into widgets_above.
         bridge.set_widget(
             "w1",
             Some(WidgetContent::Lines(vec!["WIDGET-LINE".to_owned()])),
@@ -6449,11 +6468,12 @@ mod tests {
                 "widget rendered: {rendered:?}"
             );
         }
-        // 清除 → 容器空。
+        // Clear → the container is empty.
         bridge.set_widget("w1", None, None);
         assert!(lock(&ui.widgets_above).children.is_empty());
 
-        // setHeader 组件描述替换 header 区域；None 恢复内置。
+        // setHeader replaces the header area with the component description; None
+        // restores the built-in.
         bridge.set_header(Some(serde_json::json!({
             "type": "text", "props": {"text": "EXT-HEADER"}
         })));
@@ -6461,7 +6481,7 @@ mod tests {
         bridge.set_header(None);
         assert!(lock(&ui.custom_header).is_none());
 
-        // setFooter 同理。
+        // setFooter likewise.
         bridge.set_footer(Some(serde_json::json!({
             "type": "text", "props": {"text": "EXT-FOOTER"}
         })));
@@ -6469,7 +6489,7 @@ mod tests {
         bridge.set_footer(None);
         assert!(lock(&ui.custom_footer).is_none());
 
-        // setStatus 进 footer 数据；None 清除。
+        // setStatus goes into the footer data; None clears it.
         bridge.set_status("ext", Some("busy"));
         assert_eq!(
             ui.footer_data
@@ -6481,7 +6501,7 @@ mod tests {
         bridge.set_status("ext", None);
         assert!(!ui.footer_data.get_extension_statuses().contains_key("ext"));
 
-        // editor 文本读写 + paste 路径。
+        // editor text read/write + paste path.
         bridge.set_editor_text("hello");
         assert_eq!(bridge.get_editor_text(), "hello");
         bridge.paste_to_editor("pasted-content");

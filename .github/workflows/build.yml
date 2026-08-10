@@ -1,15 +1,15 @@
 name: build
 
-# 构建矩阵（全部使用 GitHub runner 原生支持的工具链，无第三方构建器）：
-#   - Windows x64        x86_64-pc-windows-msvc     原生（自带 MSVC）
-#   - macOS arm64        aarch64-apple-darwin        原生（macos-14 arm64 runner）
-#   - Linux x64 glibc    x86_64-unknown-linux-gnu    原生
-#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools（musl-gcc）
-#   - Linux arm64 musl   aarch64-unknown-linux-musl  musl.cc 交叉工具链（静态单文件）
+# Build matrix (only toolchains natively supported by GitHub runners; no third-party builders):
+#   - Windows x64        x86_64-pc-windows-msvc     native (bundled MSVC)
+#   - macOS arm64        aarch64-apple-darwin        native (macos-14 arm64 runner)
+#   - Linux x64 glibc    x86_64-unknown-linux-gnu    native
+#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc)
+#   - Linux arm64 musl   aarch64-unknown-linux-musl  musl.cc cross toolchain (static single file)
 #   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc-aarch64-linux-gnu
 #
-# 触发：push 到 main / 0.* 开发分支构建并上传 artifact（可下载调试）；
-#       tag v* 额外发布到 GitHub Release；workflow_dispatch 手动触发。
+# Triggers: push to main / 0.* dev branches builds and uploads artifacts (downloadable for
+# debugging); tag v* additionally publishes to GitHub Release; workflow_dispatch for manual runs.
 
 on:
   push:
@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # GitHub Release 上传需要
+  contents: write # required for GitHub Release uploads
 
 jobs:
   build:
@@ -52,7 +52,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # ---- Linux 交叉工具链（GitHub runner 原生支持的安装方式）----
+      # ---- Linux cross toolchains (installation methods natively supported by GitHub runners) ----
 
       - name: Install musl toolchain (x64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -62,9 +62,10 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      # arm64 musl：apt 无现成工具链，musl.cc 大文件在 runner 上不稳定（
-      # 108MB 下载超时），改用 cross-rs 容器方案——cross 二进制来自 GitHub
-      # Releases，镜像来自 ghcr.io，均走 GitHub 自己的 CDN。
+      # arm64 musl: apt has no ready-made toolchain, and the large musl.cc files are
+      # unstable on runners (108MB download timeouts); switched to the cross-rs container
+      # approach — the cross binary comes from GitHub Releases and the images from ghcr.io,
+      # both on GitHub's own CDN.
       - name: Install cross (arm64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
@@ -78,7 +79,7 @@ jobs:
           workspaces: . -> target
           key: ${{ matrix.target }}
 
-      # ---- 构建 ----
+      # ---- Build ----
 
       - name: Build (native)
         if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
@@ -104,7 +105,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --bin rpi
         shell: bash
 
-      # ---- 打包 ----
+      # ---- Packaging ----
 
       - name: Extract version
         id: version
@@ -119,7 +120,7 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
           TARGET=${{ matrix.target }}
-          # macOS 无 GNU sha256sum（自带 shasum），两平台输出格式一致
+          # macOS has no GNU sha256sum (ships shasum); both platforms print the same format
           SHA256=$(command -v sha256sum || command -v shasum)
           mkdir -p dist
           tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi

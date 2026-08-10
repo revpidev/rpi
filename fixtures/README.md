@@ -1,32 +1,38 @@
-# Rpi 对拍 Fixtures
+# Rpi Parity Fixtures
 
-> 对拍/契约测试基准数据（golden fixtures）的落地目录与操作手册（runbook）。
-> 上游对照：`external/pi` @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（0.82.1），钉死，见 `UPSTREAM.md`。
+> Landing directory and runbook for the parity/contract test baseline data
+> (golden fixtures).
+> Upstream reference: `external/pi` @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c`
+> (0.82.1), pinned — see `UPSTREAM.md`.
 >
-> **归一化与 diff 的共享实现**在 `rpi-test-support`（`normalize.rs` / `diff.rs`）。
-> 此外各 parity 测试在 diff 前还会剥离数值型键（`usage`/`details` 等，键表见各测试文件
-> 顶部的 `STRIPPED_KEYS`——目前为各测试文件内的局部实现，共三处）。
-> fixtures 保存**原始字节**；timestamp / uuid / session id / cwd 的剥离在 diff 时进行，不在生成时进行。
+> The **shared normalization and diff implementation** lives in
+> `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity
+> test strips numeric keys (`usage`/`details` etc., see the `STRIPPED_KEYS`
+> list at the top of each test file — currently a local implementation in
+> three test files) before diffing.
+> Fixtures store **raw bytes**; timestamp / uuid / session id / cwd stripping
+> happens at diff time, not at generation time.
 
-## 1. 目录结构
+## 1. Directory layout
 
 ```
 fixtures/
-├── README.md                # 本文件：runbook + 逐条对拍基准清单
-├── generate-fixtures.mjs    # 生成脚本（钉死 commit + 固定 prompt 脚本）
+├── README.md                # This file: runbook + itemized parity baseline list
+├── generate-fixtures.mjs    # Generation script (pinned commit + fixed prompt scripts)
 └── generated/
     └── <scenario>/
-        ├── session.jsonl    # 真实落盘的 session 文件（file-backed SessionManager）
-        └── events.jsonl     # AgentSession 事件 transcript（json 模式同款事件形状）
+        ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
+        └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
 ```
 
-## 2. Runbook（可重复生成）
+## 2. Runbook (repeatable generation)
 
-前置（一次性；`node_modules/` 与 `dist/` 均在 `.gitignore` 内，不触碰红线 G4）：
+Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`,
+so red-line G4 is not touched):
 
 ```bash
 cd external/pi
-git rev-parse HEAD   # 必须为 2efa728d2ee90ef597626e96b1e28ef2b279f07c
+git rev-parse HEAD   # must be 2efa728d2ee90ef597626e96b1e28ef2b279f07c
 npm ci
 npm run build --workspace @earendil-works/pi-tui
 npm run build --workspace @earendil-works/pi-ai
@@ -34,19 +40,23 @@ npm run build --workspace @earendil-works/pi-agent-core
 npm run build --workspace @earendil-works/pi-coding-agent
 ```
 
-生成（在本仓库根目录）：
+Generate (from this repository root):
 
 ```bash
-node fixtures/generate-fixtures.mjs            # 全量场景
-node fixtures/generate-fixtures.mjs single-turn # 单个场景
+node fixtures/generate-fixtures.mjs            # all scenarios
+node fixtures/generate-fixtures.mjs single-turn # a single scenario
 ```
 
-生成器行为：每个场景在临时目录建独立 cwd / agentDir（**不读写 `~/.pi`**），
-用 `fauxProvider()`（`api: "faux"` 固定）+ 固定 prompt 脚本驱动 `createAgentSession`，
-导出 file-backed `SessionManager` 的真实 session 文件与 `session.subscribe` 捕获的事件序列。
+Generator behavior: each scenario creates an isolated cwd / agentDir in a
+temporary directory (**does not read or write `~/.pi`**), drives
+`createAgentSession` with `fauxProvider()` (fixed `api: "faux"`) plus a fixed
+prompt script, and exports the real session file of the file-backed
+`SessionManager` together with the event sequence captured via
+`session.subscribe`.
 
-验证可重复性（抽一条场景）：重新生成同一场景到临时副本，归一化后与仓库内
-fixtures diff 应为空：
+Verify repeatability (spot-check one scenario): regenerate the same scenario
+into a temporary copy; after normalization the diff against the in-repo
+fixtures must be empty:
 
 ```bash
 cp -r fixtures/generated/single-turn /tmp/single-turn-before
@@ -55,150 +65,168 @@ cargo run -p rpi-test-support --example normalize-diff -- \
   /tmp/single-turn-before/session.jsonl fixtures/generated/single-turn/session.jsonl
 ```
 
-（`normalize-diff` example 见 §4；退出码 0 = 归一化后一致。）
+(`normalize-diff` example — see §4; exit code 0 = identical after normalization.)
 
-> **`session.jsonl` 是字节级可重复锚点；`events.jsonl` 不是。** 上游 faux
-> provider 用 `Math.random` 切 delta（`faux.ts` `splitStringByTokenSize`），
-> 每次运行的 delta 边界与数量不同。`events.jsonl` 的对拍粒度是**事件类型
-> 序列 + 终止消息内容**（delta 边界不入契约，也不会落盘进 session JSONL）；
-> rpi 侧 faux 为确定性切块（`rpi-test-support/src/faux.rs` 文件头有偏离说明）。
+> **`session.jsonl` is a byte-level repeatable anchor; `events.jsonl` is not.**
+> The upstream faux provider splits deltas with `Math.random`
+> (`faux.ts` `splitStringByTokenSize`), so delta boundaries and counts differ
+> between runs. The parity granularity for `events.jsonl` is the **event-type
+> sequence plus terminal message content** (delta boundaries are not part of
+> the contract and never land in the session JSONL); the rpi-side faux uses
+> deterministic chunking (deviation note in the header of
+> `rpi-test-support/src/faux.rs`).
 
-**纪律**：fixtures 变更必须与行为变更同 commit 提交，并在提交信息中说明。
+**Discipline**: fixture changes must be committed in the same commit as the
+behavior change, with the change described in the commit message.
 
-## 3. 首批场景（T02 交付）
+## 3. Initial scenarios (delivered by T02)
 
-| 场景 | 脚本要点 | 覆盖契约 |
-|------|---------|---------|
-| `single-turn` | 单 prompt → 单 text 响应 | header/model_change/thinking_level_change/message 条目；agent_start→turn_start→message_*→turn_end→agent_end→agent_settled 事件序 |
-| `tool-calls` | read + bash 两个 toolCall → 真实工具执行 → 收尾 text | toolcall_* 事件序、toolResult 条目、tool_execution_* 事件、双工具源序 |
-| `steering-followup` | 流式中 steer、后续流式中 followUp | 排队语义：无工具调用时 steer/followUp 均作为后续 turn 投递（queue_update 事件、turn 序列） |
-| `abort` | 流式中 `session.abort()` | aborted assistant 消息落盘（stopReason=aborted）、abort 事件序 |
-| `length-truncation` | stopReason=length 收尾 | length 截断消息的持久化形状 |
-| `compaction-threshold` | 8192 窗口/4096 reserve/512 keep：三轮问答，阈值触发两轮压缩（split-turn 前缀 + UPDATE 迭代），第三轮 prepare 为空静默 | CompactionEntry（firstKeptEntryId/usage/details/fromHook=false）、compaction_start/end 事件序、tokensBefore 重算、estimatedTokensAfter |
-| `compaction-overflow` | 16384 窗口：overflow error（"prompt is too long"）→ 恢复压缩 → 重试成功 | overflow 恢复路径、willRetry=true 事件序、恢复预算一次后重置 |
+| Scenario | Script highlights | Contract covered |
+|----------|-------------------|------------------|
+| `single-turn` | Single prompt → single text response | header/model_change/thinking_level_change/message entries; agent_start→turn_start→message_*→turn_end→agent_end→agent_settled event order |
+| `tool-calls` | Two toolCalls (read + bash) → real tool execution → closing text | toolcall_* event order, toolResult entries, tool_execution_* events, source order of both tools |
+| `steering-followup` | steer mid-stream, followUp mid-stream afterwards | Queuing semantics: without tool calls both steer and followUp are delivered as subsequent turns (queue_update events, turn sequence) |
+| `abort` | `session.abort()` mid-stream | Aborted assistant message persisted (stopReason=aborted), abort event order |
+| `length-truncation` | stopReason=length closing | Persisted shape of length-truncated messages |
+| `compaction-threshold` | 8192 window / 4096 reserve / 512 keep: three Q&A rounds, threshold triggers two compaction rounds (split-turn prefix + UPDATE iteration), third round's prepare is empty and silent | CompactionEntry (firstKeptEntryId/usage/details/fromHook=false), compaction_start/end event order, tokensBefore recomputation, estimatedTokensAfter |
+| `compaction-overflow` | 16384 window: overflow error ("prompt is too long") → recovery compaction → retry succeeds | Overflow recovery path, willRetry=true event order, budget reset after one recovery |
 
-补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 覆盖随 **T10**
-交付——采用进程内 32 命令逐条契约测试（`crates/rpi/tests/rpc_mode_test.rs`，
-锚定上游 RPC 协议文档）+ 上表场景的三模式对拍（`crates/rpi/tests/parity_headless_test.rs`），
-不另录 RPC transcript fixtures（32 命令线协议由契约测试全枚举，transcript
-不增加覆盖面）。
+Completion plan (task index): the compaction scenarios shipped with **T08**;
+RPC coverage ships with **T10** — via in-process per-command contract tests
+for all 32 commands (`crates/rpi/tests/rpc_mode_test.rs`, anchored to the
+upstream RPC protocol doc) plus three-mode parity of the scenarios above
+(`crates/rpi/tests/parity_headless_test.rs`). No separate RPC transcript
+fixtures are recorded (the 32-command wire protocol is fully enumerated by
+the contract tests; transcripts would add no coverage).
 
-### 3.1 resources 用例组（T09 交付）
+### 3.1 resources case group (delivered by T09)
 
-`fixtures/generated/resources/`：上游真实模块（skills/prompt-templates/theme/
-keybindings/settings-manager/resource-loader，dist 构建）产出的黄金 JSON，
-Rust 侧对拍测试为 `crates/rpi/tests/parity_resources_test.rs`（归一化 diff
-复用 rpi-test-support，黄金中绝对路径已在生成时替换为 `<path>`，Rust 侧用
-`Normalizer::with_path` 做同一替换）。
+`fixtures/generated/resources/`: golden JSON produced by the real upstream
+modules (skills/prompt-templates/theme/keybindings/settings-manager/
+resource-loader, dist builds). The Rust-side parity test is
+`crates/rpi/tests/parity_resources_test.rs` (normalized diff reuses
+rpi-test-support; absolute paths in the golden data were replaced with
+`<path>` at generation time, and the Rust side applies the same replacement
+via `Normalizer::with_path`).
 
-生成（在本仓库根目录）：
+Generate (from this repository root):
 
 ```bash
-node fixtures/generate-resources-golden.mjs                  # 全量 6 组
-node fixtures/generate-resources-golden.mjs themes settings  # 单组
+node fixtures/generate-resources-golden.mjs                  # all 6 groups
+node fixtures/generate-resources-golden.mjs themes settings  # single group
 ```
 
-| 用例组 | 输入 | 覆盖契约 |
-|--------|------|---------|
-| `skills-battery` | 上游 `test/fixtures/skills/` 13 用例目录 + `skills-collision/` 的只读副本（`input/`，不改动 external/） | `loadSkills()` 的 name/description/filePath/baseDir/sourceInfo/disableModelInvocation + warning/collision 诊断形状；先到先得冲突 |
-| `prompt-dsl` | 脚本内嵌 (模板正文, args 字符串) 21 例 | `parseCommandArgs` 引号感知 + `substituteArgs` 全形态（`$1..$N`/`$@`/`$ARGUMENTS`/`${N:-d}`/`${@:-d}`/`${ARGUMENTS:-d}`/`${@:N}`/`${@:N:L}`、缺位空串、不递归） |
-| `themes` | 脚本内嵌自定义主题 JSON 11 例 + 内置 dark/light | `loadThemeFromPath` 双色彩模式（truecolor/256color）解析后 ANSI 颜色表：vars 引用、256 色整数、`""` 默认值、thinkingMax 回退、非法值诊断；内置主题解析后颜色表快照 |
-| `keybindings` | 脚本内嵌旧键名配置 5 例 | `migrateKeybindingsConfig`：旧名迁移、新旧冲突新名胜、定义序+extras 字母序、原始值透传 |
-| `settings` | 脚本内嵌 deepMerge 5 例 + 迁移 8 例 | `deepMergeSettings`（嵌套单层浅合并/深度≥2 替换/数组与标量替换，经 `SettingsManager.fromStorage` getter 面观察）+ 4 条旧格式迁移（queueMode/websockets/skills 对象/retry.maxDelayMs） |
-| `resource-loader-e2e` | `input/` 多级目录树（home `.agents/skills`、全局 agentDir、git repo 内 `.agents/skills`、cwd `.rpi`、settings 声明路径、CLI 路径、非法主题 JSON、repo 外隔离用例） | `DefaultResourceLoader` 全管线：rank 序（project settings > project auto > user settings > user auto > CLI 附加）、同名冲突先到先得、git repo root 祖先扫描上界、context files 全局→根→叶序、主题/提示词冲突与非法主题 warning 诊断全文本 |
+| Case group | Input | Contract covered |
+|------------|-------|------------------|
+| `skills-battery` | Upstream `test/fixtures/skills/` 13-case directory + read-only copy of `skills-collision/` (`input/`, never modifies external/) | `loadSkills()` name/description/filePath/baseDir/sourceInfo/disableModelInvocation + warning/collision diagnostic shapes; first-come-first-served conflicts |
+| `prompt-dsl` | 21 embedded (template body, args string) cases in the script | `parseCommandArgs` quote awareness + all `substituteArgs` forms (`$1..$N`/`$@`/`$ARGUMENTS`/`${N:-d}`/`${@:-d}`/`${ARGUMENTS:-d}`/`${@:N}`/`${@:N:L}`, missing slots → empty string, no recursion) |
+| `themes` | 11 embedded custom theme JSONs + built-in dark/light | ANSI color tables after `loadThemeFromPath` parses both color modes (truecolor/256color): vars references, 256-color integers, `""` defaults, thinkingMax fallback, invalid-value diagnostics; color table snapshot of parsed built-in themes |
+| `keybindings` | 5 embedded legacy key-name configs | `migrateKeybindingsConfig`: legacy name migration, new name wins on new/old conflict, definition order + extras alphabetical order, raw values pass through |
+| `settings` | 5 embedded deepMerge cases + 8 migration cases | `deepMergeSettings` (single-level shallow merge for nesting / replacement at depth ≥ 2 / arrays and scalars replaced, observed through the `SettingsManager.fromStorage` getter surface) + 4 legacy-format migrations (queueMode/websockets/skills object/retry.maxDelayMs) |
+| `resource-loader-e2e` | `input/` multi-level tree (home `.agents/skills`, global agentDir, `.agents/skills` inside a git repo, cwd `.rpi`, settings-declared paths, CLI paths, invalid theme JSON, outside-repo isolation case) | Full `DefaultResourceLoader` pipeline: rank order (project settings > project auto > user settings > user auto > CLI extras), first-come-first-served name conflicts, git repo root ancestor scan upper bound, context files global→root→leaf order, theme/prompt conflicts and full invalid-theme warning diagnostics |
 
-e2e 目录树的准备由脚本与 Rust 测试各自重复同一流程（`prepareE2eTree`）：
-复制 `input/` → 临时目录，把每个 `.rpi/` 复制出 `.pi/` 孪生（上游读 `.pi`、
-rpi 读 `.rpi`，命名有意差异；黄金统一记录为 `.rpi` 拼写），并创建
-git 无法跟踪的 `repo/.git` 标记目录。
+The e2e tree is prepared by the script and the Rust test repeating the same
+flow (`prepareE2eTree`): copy `input/` to a temp dir, create a `.pi/` twin
+for every `.rpi/` (upstream reads `.pi`, rpi reads `.rpi` — intentional
+naming difference; the golden data uniformly records the `.rpi` spelling),
+and create a `repo/.git` marker directory that git cannot track.
 
-**引擎相关排除**（黄金只钉稳定部分，详见生成脚本注释）：`invalid-yaml`
-诊断消息文本（JS yaml vs serde_yaml）、`multiline-description` 块标量末尾
-换行（serde_yaml 在 EOF 处不保留 `|` 的尾换行）、`invalid-color-value-type`
-（typebox vs 手写校验器措辞）、`invalid-json-document`（JS SyntaxError vs
-serde_json 错误文本）。
+**Engine-related exclusions** (golden data pins only the stable parts; see
+generation script comments): `invalid-yaml` diagnostic message text (JS yaml
+vs serde_yaml), trailing newline of block scalars in `multiline-description`
+(serde_yaml does not keep `|` trailing newlines at EOF),
+`invalid-color-value-type` (typebox vs handwritten validator wording),
+`invalid-json-document` (JS SyntaxError vs serde_json error text).
 
-## 4. 归一化 / diff 用法
+## 4. Normalization / diff usage
 
 ```rust
 use rpi_test_support::{diff_jsonl, diff_event_sequence, Normalizer};
 
-// session JSONL 对拍（含行序）：
+// Session JSONL parity (line order included):
 diff_jsonl(expected_fixture, actual_output)?;
 
-// 事件序列对拍（事件类型序）：
+// Event sequence parity (event-type order):
 diff_event_sequence(expected_events, actual_events)?;
 ```
 
-CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example normalize-diff -- <expected> <actual>`
-—— 各自归一化后 diff，输出首个差异定位（行号 + 上下文）。
+CLI form (spot checks, manual parity):
+`cargo run -p rpi-test-support --example normalize-diff -- <expected> <actual>`
+— normalizes each side, diffs, and prints the first difference (line number +
+context).
 
-归一化规则（`rpi-test-support/src/normalize.rs`）：
+Normalization rules (`rpi-test-support/src/normalize.rs`):
 
-- `timestamp` 键 → 类型保留常量（数字 → `0`，字符串 → `"<ts>"`）
-- id 键（`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/`sessionId`/`responseId`/`parentSession`）
-  与任意位置的 uuid → 一致占位符 `<id:N>`（首次出现序）
-- 字符串内 ISO-8601 时间戳 → `<ts>`
-- 配置的 cwd / agentDir 路径前缀 → `<path>`
-- 其余字节保留
+- `timestamp` keys → type-preserving constants (number → `0`, string →
+  `"<ts>"`)
+- id keys (`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/
+  `sessionId`/`responseId`/`parentSession`) and uuids anywhere → the uniform
+  placeholder `<id:N>` (first-appearance order)
+- ISO-8601 timestamps inside strings → `<ts>`
+- configured cwd / agentDir path prefixes → `<path>`
+- everything else is kept byte-for-byte
 
-此外，各 parity 测试在 `diff_jsonl` 前还按场景剥离数值键（`STRIPPED_KEYS`：
-`parity_headless_test.rs` 剥 `usage`/`details`，`parity_compaction_test.rs` 剥
-`usage`/`tokensBefore`/`estimatedTokensAfter`，`parity_tools_test.rs` 剥
-`usage`/`willRetry`/`details`）——token 记账数值不参与对拍；该剥离逻辑目前分散在三个
-测试文件内（未下沉 rpi-test-support）。
+In addition, each parity test strips numeric keys per scenario before
+`diff_jsonl` (`STRIPPED_KEYS`: `parity_headless_test.rs` strips
+`usage`/`details`, `parity_compaction_test.rs` strips
+`usage`/`tokensBefore`/`estimatedTokensAfter`, `parity_tools_test.rs` strips
+`usage`/`willRetry`/`details`) — token accounting numbers do not participate
+in parity; this stripping currently lives in three test files (not yet moved
+down into rpi-test-support).
 
-## 5. 逐条对拍级基准清单
+## 5. Itemized parity-level baseline list
 
-六份上游文档（`external/pi/packages/coding-agent/docs/`）是字节/行为级对拍基准。下表登记「文档条目 → 对拍锚点」；
-锚点状态随任务推进补齐（✅ = 已有锚点，⏳ = 计划任务）。
+Six upstream documents (`external/pi/packages/coding-agent/docs/`) are the
+byte/behavior-level parity baselines. The table below registers
+"document item → parity anchor"; anchor status fills in as tasks progress
+(✅ = anchored, ⏳ = planned task).
 
-### 5.1 `session-format.md`（T07 主场）
+### 5.1 `session-format.md` (T07 home)
 
-| 条目 | 锚点 | 状态 |
-|------|------|------|
-| 文件位置 `sessions/--<path>--/<ts>_<uuid>.jsonl` | T07 单测 + fixtures header | ⏳ T07 |
-| Session version（v1→v2→v3 迁移、当前 v3） | T07 迁移用例 | ⏳ T07 |
-| Entry base（`id` 8-hex / `parentId` / ISO `timestamp`） | 全部 `generated/*/session.jsonl` | ✅ T02 |
-| SessionHeader（含 `parentSession` 变体） | `generated/*/session.jsonl` 首行 | ✅ T02（parentSession 变体 ⏳ T07） |
-| SessionMessageEntry（user/assistant/toolResult） | `single-turn` / `tool-calls` / `abort` | ✅ T02 |
-| ModelChangeEntry / ThinkingLevelChangeEntry | 各 fixtures 第 2/3 行 | ✅ T02 |
-| CompactionEntry（firstKeptEntryId / retainedTail / usage / details / fromHook） | `compaction-threshold` / `compaction-overflow` fixtures | ✅ T08（firstKeptEntryId 形态；retainedTail 读取兼容见 D-012） |
+| Item | Anchor | Status |
+|------|--------|--------|
+| File location `sessions/--<path>--/<ts>_<uuid>.jsonl` | T07 unit tests + fixtures header | ⏳ T07 |
+| Session version (v1→v2→v3 migration, current v3) | T07 migration cases | ⏳ T07 |
+| Entry base (`id` 8-hex / `parentId` / ISO `timestamp`) | all `generated/*/session.jsonl` | ✅ T02 |
+| SessionHeader (incl. `parentSession` variant) | first line of `generated/*/session.jsonl` | ✅ T02 (parentSession variant ⏳ T07) |
+| SessionMessageEntry (user/assistant/toolResult) | `single-turn` / `tool-calls` / `abort` | ✅ T02 |
+| ModelChangeEntry / ThinkingLevelChangeEntry | lines 2/3 of each fixture | ✅ T02 |
+| CompactionEntry (firstKeptEntryId / retainedTail / usage / details / fromHook) | `compaction-threshold` / `compaction-overflow` fixtures | ✅ T08 (firstKeptEntryId form; retainedTail read compatibility see D-012) |
 | BranchSummaryEntry / CustomEntry / CustomMessageEntry / LabelEntry / SessionInfoEntry | — | ⏳ T07/T08 |
-| Extended messages（bashExecution / custom / branchSummary / compactionSummary） | — | ⏳ T07/T08 |
-| Tree Structure / Context Building 算法 | T07 单测 | ⏳ T07 |
-| stopReason=length / aborted 持久化形状 | `length-truncation` / `abort` | ✅ T02 |
+| Extended messages (bashExecution / custom / branchSummary / compactionSummary) | — | ⏳ T07/T08 |
+| Tree Structure / Context Building algorithm | T07 unit tests | ⏳ T07 |
+| Persisted shape of stopReason=length / aborted | `length-truncation` / `abort` | ✅ T02 |
 
-### 5.2 `rpc.md`（T10 主场）
+### 5.2 `rpc.md` (T10 home)
 
-| 条目 | 锚点 | 状态 |
-|------|------|------|
-| 协议框架（framing：JSONL 请求/响应/事件） | RPC transcript fixtures | ⏳ T10 |
-| 32 命令逐条（prompt/steer/follow_up/abort/new_session/get_state/get_messages/set_model/cycle_model/get_available_models/set_thinking_level/cycle_thinking_level/get_available_thinking_levels/set_steering_mode/set_follow_up_mode/compact/set_auto_compaction/set_auto_retry/abort_retry/bash/abort_bash/get_session_stats/export_html/switch_session/fork/clone 等） | RPC transcript fixtures + 契约测 | ⏳ T10 |
-| steer/followUp/abort 事件语义 | `steering-followup` / `abort` 事件 transcript | ✅ T02（SDK 层；RPC 层 ⏳ T10） |
+| Item | Anchor | Status |
+|------|--------|--------|
+| Protocol framing (JSONL request/response/event) | RPC transcript fixtures | ⏳ T10 |
+| All 32 commands (prompt/steer/follow_up/abort/new_session/get_state/get_messages/set_model/cycle_model/get_available_models/set_thinking_level/cycle_thinking_level/get_available_thinking_levels/set_steering_mode/set_follow_up_mode/compact/set_auto_compaction/set_auto_retry/abort_retry/bash/abort_bash/get_session_stats/export_html/switch_session/fork/clone etc.) | RPC transcript fixtures + contract tests | ⏳ T10 |
+| steer/followUp/abort event semantics | `steering-followup` / `abort` event transcripts | ✅ T02 (SDK layer; RPC layer ⏳ T10) |
 
-### 5.3 `compaction.md`（T08 主场）
+### 5.3 `compaction.md` (T08 home)
 
-| 条目 | 锚点 | 状态 |
-|------|------|------|
-| 触发条件 / 切点规则 / split turns | T08 黄金用例（`compaction/golden.json`）+ `compaction_runner_test` + compaction fixtures | ✅ T08 |
-| CompactionEntry / BranchSummaryEntry 结构 | `compaction-threshold` / `compaction-overflow` fixtures（CompactionEntry）；BranchSummaryEntry 准备/装填在 T08 黄金单测 | ✅ T08（BranchSummaryEntry 持久化 ⏳ T12/T16） |
-| Summary Format 章节模板（Goal/Constraints/Progress/…/Critical Context） | T08 `compaction/prompts/*.txt` 逐字节比对 | ✅ T08 |
-| 消息序列化（Message Serialization） | T08 黄金用例（serializeConversation） | ✅ T08 |
-| session_before_compact / session_before_tree 扩展语义 | T15 扩展事件对拍 | ⏳ T15 |
-| Settings（阈值字段） | T08 用例（reserveTokens/keepRecentTokens）；settings 文件接线 `parity_resources_test::parity_settings_*` | ✅ T08 + ✅ T09 |
+| Item | Anchor | Status |
+|------|--------|--------|
+| Trigger conditions / cut-point rules / split turns | T08 golden cases (`compaction/golden.json`) + `compaction_runner_test` + compaction fixtures | ✅ T08 |
+| CompactionEntry / BranchSummaryEntry structure | `compaction-threshold` / `compaction-overflow` fixtures (CompactionEntry); BranchSummaryEntry preparation/filling in T08 golden unit tests | ✅ T08 (BranchSummaryEntry persistence ⏳ T12/T16) |
+| Summary Format section template (Goal/Constraints/Progress/…/Critical Context) | T08 `compaction/prompts/*.txt` byte-for-byte comparison | ✅ T08 |
+| Message Serialization | T08 golden cases (serializeConversation) | ✅ T08 |
+| session_before_compact / session_before_tree extended semantics | T15 extension event parity | ⏳ T15 |
+| Settings (threshold fields) | T08 cases (reserveTokens/keepRecentTokens); settings file wiring `parity_resources_test::parity_settings_*` | ✅ T08 + ✅ T09 |
 
-### 5.4 `keybindings.md`（T11/T12 主场）
+### 5.4 `keybindings.md` (T11/T12 home)
 
-| 条目 | 锚点 | 状态 |
-|------|------|------|
-| Key Format 解析 | T11 单测 | ⏳ T11 |
-| 全部 action 默认绑定表（12 节逐表） | T12 绑定表快照黄金文件 | ⏳ T12 |
-| 自定义配置合并语义 | T09/T12 用例 | ⏳ T12 |
+| Item | Anchor | Status |
+|------|--------|--------|
+| Key Format parsing | T11 unit tests | ⏳ T11 |
+| Default binding tables for all actions (per-table across 12 sections) | T12 binding-table snapshot golden files | ⏳ T12 |
+| Custom config merge semantics | T09/T12 cases | ⏳ T12 |
 
-### 5.5 `tmux.md` / 5.6 `terminal-setup.md`（T11/T12 主场，字节序列级）
+### 5.5 `tmux.md` / 5.6 `terminal-setup.md` (T11/T12 home, byte-sequence level)
 
-| 条目 | 锚点 | 状态 |
-|------|------|------|
-| tmux 推荐配置与 `csi-u` 行为 | T12 终端能力检测用例 | ⏳ T12 |
-| 各终端（Kitty/iTerm2/Apple/Ghostty/WezTerm/Alacritty/VS Code/Windows Terminal/xfce4/IntelliJ）设置与转义序列 | T11/T12 VirtualTerminal 帧对拍（去 CSI 2026 抖动） | ⏳ T11/T12 |
+| Item | Anchor | Status |
+|------|--------|--------|
+| tmux recommended config and `csi-u` behavior | T12 terminal capability detection cases | ⏳ T12 |
+| Per-terminal (Kitty/iTerm2/Apple/Ghostty/WezTerm/Alacritty/VS Code/Windows Terminal/xfce4/IntelliJ) settings and escape sequences | T11/T12 VirtualTerminal frame parity (CSI 2026 jitter removed) | ⏳ T11/T12 |

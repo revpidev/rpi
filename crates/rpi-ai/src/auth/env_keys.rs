@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(get_env_api_key("openai", None), None);
         assert_eq!(get_env_api_key("unknown-provider", None), None);
 
-        // T13 范围：vertex/bedrock ambient 不返回 `<authenticated>`。
+        // T13 scope: vertex/bedrock ambient do not return `<authenticated>`.
         let env = ProviderEnv::from([
             ("GOOGLE_CLOUD_PROJECT".to_owned(), "p".to_owned()),
             ("GOOGLE_CLOUD_LOCATION".to_owned(), "l".to_owned()),

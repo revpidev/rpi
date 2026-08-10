@@ -138,7 +138,7 @@ pub fn event_type_name(event: &StreamEvent) -> &'static str {
 }
 
 /// Compare two event streams by their **event type sequence** (design §10.2
-/// step 5: 事件类型序列必须一致).
+/// step 5: the event-type sequence must match).
 pub fn diff_event_sequence(
     expected: &[StreamEvent],
     actual: &[StreamEvent],

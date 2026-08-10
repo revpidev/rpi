@@ -45,7 +45,7 @@ impl Drop for TempDir {
 }
 
 /// gate guest（on tool_call → block reason "gate-block"）+ tool guest
-/// （注册 wasm_tool 执行返回 "gate-output"）合并为一个双能力 guest。
+/// (registered as wasm_tool, returns "gate-output") merged into one dual-capability guest.
 const PARITY_GUEST_WAT: &str = r#"
 (module
   (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
@@ -69,7 +69,7 @@ const PARITY_GUEST_WAT: &str = r#"
     (i64.or
       (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
       (i64.extend_i32_u (call $strlen (local.get $ptr)))))
-  ;; 子串匹配（定长 needle，无需 NUL）。
+  ;; substring match (fixed-length needle, no NUL needed).
   (func $contains (param $hay i32) (param $haylen i32) (param $needle i32) (param $needlelen i32) (result i32)
     (local $i i32) (local $j i32) (local $match i32)
     (block $outer_done
@@ -95,7 +95,7 @@ const PARITY_GUEST_WAT: &str = r#"
     (drop (call $host_call (i32.const 256) (call $strlen (i32.const 256))))
     (return (call $pack (i32.const 512))))
   (func (export "rpi_dispatch") (param $ptr i32) (param $len i32) (result i64)
-    ;; 针对 "read" 的 tool_call → block；toolExecute → 工具结果；其他 → null。
+    ;; tool_call for "read" → block; toolExecute → tool result; anything else → null.
     (if (call $contains (local.get $ptr) (local.get $len) (i32.const 1536) (i32.const 4))
       (then (return (call $pack (i32.const 768)))))
     (if (call $contains (local.get $ptr) (local.get $len) (i32.const 1544) (i32.const 11))
@@ -117,7 +117,7 @@ struct E2eFixture {
     _tmp: TempDir,
 }
 
-/// 完整会话管线（faux provider + 真宿主），wasm 包放在
+/// Full-session pipeline (faux provider + real host), wasm package placed in
 /// `<cwd>/.rpi/extensions/parity/`。
 async fn e2e_fixture(responses: Vec<FauxResponseStep>, wasm_wat: Option<&str>) -> E2eFixture {
     let tmp = TempDir::new();
@@ -241,7 +241,7 @@ fn first_tool_result(session: &rpi::core::agent_session::AgentSession) -> Value 
         .expect("toolResult message")
 }
 
-/// 对拍场景：先调 gate_tool（执行），再调 read（被 gate block）。
+/// Parity scenario: call gate_tool first (executes), then read (blocked by the gate).
 async fn run_parity_scenario(fixture: &E2eFixture) -> (String, String) {
     fixture
         .session
@@ -260,12 +260,12 @@ async fn run_parity_scenario(fixture: &E2eFixture) -> (String, String) {
 }
 
 // ---------------------------------------------------------------------------
-// e2e + 对拍
+// e2e + parity
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6_wasm_tool_executes_and_gate_blocks_in_agent_loop() {
-    // gate_tool 执行（toolExecute 分发）。
+    // gate_tool executes (toolExecute dispatch).
     let fixture = e2e_fixture(
         vec![tool_call_step("gate_tool"), text_step("done")],
         Some(PARITY_GUEST_WAT),
@@ -275,7 +275,7 @@ async fn w6_wasm_tool_executes_and_gate_blocks_in_agent_loop() {
     assert_eq!(content, "gate-output");
     assert_eq!(is_error, "false");
 
-    // read 被 gate block。
+    // read is blocked by the gate.
     let fixture = e2e_fixture(
         vec![tool_call_step("read"), text_step("done")],
         Some(PARITY_GUEST_WAT),
@@ -288,7 +288,7 @@ async fn w6_wasm_tool_executes_and_gate_blocks_in_agent_loop() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6_native_and_wasm_gate_behave_identically() {
-    // native 版 gate：同 reason 的 block + 同名工具同输出。
+    // native gate: same-reason block + same-named tool with the same output.
     let native_ext = InlineExtension::Anonymous(Arc::new(|api| {
         api.on(
             "tool_call",

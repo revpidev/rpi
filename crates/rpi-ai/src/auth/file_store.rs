@@ -1065,7 +1065,8 @@ mod tests {
     // Self-check coverage beyond the upstream test file.
     // ------------------------------------------------------------------
 
-    /// 自测清单：凭据文件创建后权限为 0600，父目录 0700，写入后仍 0600。
+    /// Self-check: a created credential file has 0600 permissions, its parent 0700,
+    /// and stays 0600 after writes.
     #[cfg(unix)]
     #[tokio::test]
     async fn auth_file_is_created_with_0600_and_parent_dir_with_0700() {
@@ -1110,7 +1111,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 自测清单：`list()` 只出元数据，绝不解析/执行命令。
+    /// Self-check: `list()` returns only metadata, never parses or executes commands.
     #[tokio::test]
     async fn list_never_executes_configured_commands() {
         let dir = temp_dir();
@@ -1133,7 +1134,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 自测清单：多 task 并发 modify 同一 provider 不撕裂（严格串行）。
+    /// Self-check: concurrent modify calls on the same provider from multiple tasks
+    /// never tear (strictly serialized).
     #[tokio::test]
     async fn concurrent_same_provider_modifies_are_serialized() {
         let dir = temp_dir();
@@ -1183,7 +1185,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `reload()`：磁盘外部修改后刷新快照；损坏文件保留旧快照。
+    /// `reload()`: refresh the snapshot after external disk changes; a corrupted file
+    /// keeps the old snapshot.
     #[tokio::test]
     async fn reload_refreshes_snapshot_and_keeps_it_on_failure() {
         let dir = temp_dir();
@@ -1214,7 +1217,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `readStoredCredential`：不解析 DSL、不实例化 store。
+    /// `readStoredCredential`: does not parse the DSL and does not instantiate a store.
     #[tokio::test]
     async fn read_stored_credential_reads_without_resolving() {
         let dir = temp_dir();
@@ -1236,9 +1239,9 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // fixtures 对拍（编码规范 §12.3 / 需求 §1.2.3）：
-    // `fixtures/generated/auth/auth.json` 的字节形状与上游
-    // `JSON.stringify(data, null, 2)` 输出一致（无尾部换行）。
+    // Fixture parity (coding standards §12.3 / requirements §1.2.3):
+    // the byte shape of `fixtures/generated/auth/auth.json` matches upstream's
+    // `JSON.stringify(data, null, 2)` output (no trailing newline).
     // ------------------------------------------------------------------
 
     const AUTH_FIXTURE: &str = include_str!("../../../../fixtures/generated/auth/auth.json");

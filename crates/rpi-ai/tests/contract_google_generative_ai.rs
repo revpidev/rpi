@@ -273,7 +273,7 @@ const GOOGLE_NO_FINISH_SSE: &str = concat!(
 );
 
 // ---------------------------------------------------------------------------
-// 正常流 contract
+// Normal flow contract
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -356,7 +356,7 @@ async fn test_google_generative_ai_system_prompt_and_generation_config() {
 }
 
 // ---------------------------------------------------------------------------
-// thinking 流 + thoughtSignature 保留
+// Thinking stream + thoughtSignature preservation
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -394,7 +394,7 @@ async fn test_google_thinking_stream_retains_thought_signature() {
 }
 
 // ---------------------------------------------------------------------------
-// tool-call 流（无函数调用流式 + id 自增）
+// Tool-call stream (no function-call streaming + auto-incrementing ids)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -487,7 +487,7 @@ async fn test_google_tool_choice_any_sets_validated_mode_off() {
 }
 
 // ---------------------------------------------------------------------------
-// 错误流
+// Error flow
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -573,8 +573,8 @@ async fn test_google_stream_simple_without_api_key_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// 锚点：thinking 分流与 budget 档位表（wire 断言，覆盖
-// google-thinking-disable.test.ts 的意图——上游为 env 门控的 live E2E）
+// Anchor: thinking split and budget tier table (wire assertions covering the intent of
+// google-thinking-disable.test.ts — upstream is an env-gated live E2E)
 // ---------------------------------------------------------------------------
 
 async fn assert_thinking_config(
@@ -771,7 +771,7 @@ async fn test_thinking_disable_configs() {
 }
 
 // ---------------------------------------------------------------------------
-// 上游测试意图移植：google-thinking-signature.test.ts
+// Ported intent of upstream test: google-thinking-signature.test.ts
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -796,7 +796,7 @@ fn test_retain_thought_signature() {
 }
 
 // ---------------------------------------------------------------------------
-// 上游测试意图移植：google-shared-convert-tools.test.ts
+// Ported intent of upstream test: google-shared-convert-tools.test.ts
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -949,7 +949,7 @@ fn test_strict_tools_use_validated_mode_on_gemini_3() {
 }
 
 // ---------------------------------------------------------------------------
-// 上游测试意图移植：google-shared-gemini3-unsigned-tool-call.test.ts
+// Ported intent of upstream test: google-shared-gemini3-unsigned-tool-call.test.ts
 // ---------------------------------------------------------------------------
 
 fn gemini3_model(id: &str) -> Model {
@@ -1037,7 +1037,7 @@ fn test_convert_messages_drops_signature_for_other_model() {
 }
 
 // ---------------------------------------------------------------------------
-// 上游测试意图移植：google-shared-image-tool-result-routing.test.ts
+// Ported intent of upstream test: google-shared-image-tool-result-routing.test.ts
 // ---------------------------------------------------------------------------
 
 fn image_routing_context(model: &Model) -> Context {
@@ -1115,7 +1115,7 @@ fn test_image_tool_result_nested_for_gemini_3() {
 }
 
 // ---------------------------------------------------------------------------
-// 其余锚点：stop 映射 / requiresToolCallId
+// Remaining anchors: stop mapping / requiresToolCallId
 // ---------------------------------------------------------------------------
 
 #[test]
