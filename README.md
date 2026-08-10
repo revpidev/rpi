@@ -1,10 +1,16 @@
 # Rpi
 
-**The AI coding partner in your terminal — a Rust reimplementation of [Pi](https://github.com/earendil-works/pi).**
+**The AI coding partner in your terminal — written in Rust, derived from [Pi](https://github.com/earendil-works/pi).**
 
 [English](./README.md) · [中文](./README.zh-CN.md)
 
-Rpi is a 1:1 behavioral reimplementation of the [Pi coding agent](https://github.com/earendil-works/pi) in Rust: same behavior, same session formats, same extension API shape — with an API shape isomorphic to upstream (Rust/Wasm reimplementation) and naming/package conventions fixed as intentional deviations by ADR. It compiles to a single static binary with no Node, Python, or other runtime dependency.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?logo=rust&logoColor=white)](./Cargo.toml)
+[![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
+[![GitHub stars](https://img.shields.io/github/stars/revpidev/rpi)](https://github.com/revpidev/rpi)
+[![GitHub issues](https://img.shields.io/github/issues/revpidev/rpi)](https://github.com/revpidev/rpi)
+
+Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and early behavior is kept in parity with upstream — but rpi is an independent project, and the two may diverge as it evolves. It compiles to a single static binary with no Node, Python, or other runtime dependency.
 
 ## Highlights
 
@@ -26,7 +32,7 @@ cargo build --release
 ./target/release/rpi --provider anthropic --model claude-sonnet-4-20250514
 ```
 
-The `external/pi` submodule is the pinned upstream reference used for behavioral parity checks and development scripts — it is **not** required to build or run rpi.
+The `external/pi` submodule is the pinned upstream baseline used for parity reference and development scripts — it is **not** required to build or run rpi.
 
 Set your API key via the standard environment variable for your provider (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), or in `~/.rpi/settings.json`. Anthropic, OpenAI Codex, and radius also support interactive OAuth login.
 
@@ -98,11 +104,11 @@ The site is deployed from the [rpi-pages](https://github.com/revpidev/rpi-pages)
 | `crates/rpi-ext-sdk` | SDK crate for writing extensions |
 | `fixtures/` | Contract/parity test fixtures (generator scripts + golden data) |
 | `scripts/` | Dev scripts (upstream pin verification, catalog refresh, data generation) |
-| `external/pi` | Upstream Pi checkout (git submodule, pinned — see `UPSTREAM.md`) |
+| `external/pi` | Upstream Pi checkout (git submodule, pinned parity baseline — see `UPSTREAM.md`) |
 
-## Upstream parity
+## Relationship to Pi
 
-Rpi is a 1:1 reimplementation of Pi: behavior is pinned against a specific upstream commit, verified by a parity checklist (session wire format, extension API, TUI frames). The pinned version and intentional deviations are recorded in [`UPSTREAM.md`](./UPSTREAM.md) — do not update the baseline without an ADR. The project is MIT-licensed, matching Pi.
+Rpi started as a Rust port of Pi, and during early development its behavior was pinned against a specific upstream commit for parity verification (see [`UPSTREAM.md`](./UPSTREAM.md) for the pinned baseline). The project is independent: parity with Pi is a starting point, not a guarantee — behavior may diverge as both projects evolve. Both rpi and Pi are MIT-licensed.
 
 ## Development
 

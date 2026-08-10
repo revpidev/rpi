@@ -1,10 +1,16 @@
 # Rpi
 
-**终端里的 AI 编程搭档——用 Rust 1:1 复刻 [Pi](https://github.com/earendil-works/pi)。**
+**终端里的 AI 编程搭档——用 Rust 编写，源自 [Pi](https://github.com/earendil-works/pi)。**
 
 [English](./README.md) · [中文](./README.zh-CN.md)
 
-Rpi 是用 Rust 对 [Pi coding agent](https://github.com/earendil-works/pi) 的 1:1 行为复刻：行为层与上游对拍一致，扩展为 API 形状同构（Rust/Wasm 重写），命名与包格式为 ADR 钉死的有意差异。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?logo=rust&logoColor=white)](./Cargo.toml)
+[![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
+[![GitHub stars](https://img.shields.io/github/stars/revpidev/rpi)](https://github.com/revpidev/rpi)
+[![GitHub issues](https://img.shields.io/github/issues/revpidev/rpi)](https://github.com/revpidev/rpi)
+
+Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，早期行为与上游保持对拍一致；但 rpi 是独立项目，后续发展可能与 Pi 产生偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
 
 ## 特性
 
@@ -26,7 +32,7 @@ cargo build --release
 ./target/release/rpi --provider anthropic --model claude-sonnet-4-20250514
 ```
 
-`external/pi` submodule 是对拍校验用的上游钉死参照，仅开发期使用——**构建和运行 rpi 不需要它**。
+`external/pi` submodule 是对拍用的钉死上游基线，仅开发期使用——**构建和运行 rpi 不需要它**。
 
 在 `~/.rpi/settings.json` 或对应标准环境变量（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）中配置你的 API key；Anthropic、OpenAI Codex、radius 还支持交互式 OAuth 登录。
 
@@ -98,11 +104,11 @@ rpi config                 # 查看已批准的项目信任决策
 | `crates/rpi-ext-sdk` | 编写扩展用的 SDK crate |
 | `fixtures/` | 契约/对拍测试 fixtures（生成脚本 + golden 数据） |
 | `scripts/` | 开发脚本（上游 pin 校验、catalog 刷新、数据生成） |
-| `external/pi` | 上游 Pi 对照（git submodule，钉死版本见 `UPSTREAM.md`） |
+| `external/pi` | 上游 Pi 对照（git submodule，对拍用钉死基线，见 `UPSTREAM.md`） |
 
-## 上游对拍
+## 与 Pi 的关系
 
-Rpi 是对 Pi 的 1:1 复刻：行为钉死于特定上游 commit，由对拍清单验证（会话线格式、扩展 API、TUI 帧）。钉死版本与有意差异记录在 [`UPSTREAM.md`](./UPSTREAM.md)——未立 ADR 不得更新基线。项目许可证为 MIT，与 Pi 一致。
+Rpi 起步于对 Pi 的 Rust 移植，早期开发期将行为钉死于特定上游 commit 进行对拍验证（钉死基线见 [`UPSTREAM.md`](./UPSTREAM.md)）。项目独立演进：对拍一致是起点而非承诺，两个项目各自发展后行为可能出现偏差。rpi 与 Pi 均为 MIT 许可证。
 
 ## 开发
 
