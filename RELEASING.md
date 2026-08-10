@@ -24,32 +24,25 @@ sequence.
    | `aarch64-unknown-linux-musl` | `rpi-<version>-aarch64-unknown-linux-musl.tar.gz` |
    | `aarch64-unknown-linux-gnu` | `rpi-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
-4. **Mirror the assets to the official site** — with the 12 files on the
-   Release page, run in the `rpi-pages` repository:
-
-   ```bash
-   scripts/mirror-release.sh <version>
-   ```
-
-   This mirrors the release assets to R2 so that
-   `https://revpi.dev/releases/download/...` works — the install scripts and
-   `rpi update --self` fall back to the site mirror when GitHub is
-   unreachable. (`install.sh` / `install.ps1` themselves are synced to the
-   site by `generate-site.py`.)
-5. **Update the version endpoint** — only after steps 3–4 are complete. In
-   the `rpi-pages` repository:
+4. **Update the version endpoint** — only after step 3 is complete. In the
+   `rpi-pages` repository, then commit and push (Git integration deploys):
 
    ```bash
    python3 scripts/generate-site.py --version <version>
-   npx wrangler pages deploy . --project-name=revpi --branch main
+   git add api/ && git commit -m "chore(api): latest-version -> v<version>" && git push
    ```
+
+   The official-site asset mirror (`https://revpi.dev/releases/download/...`)
+   is a Pages Function that proxies GitHub — zero storage, nothing to upload;
+   it works as soon as the Release assets exist. (`install.sh` / `install.ps1`
+   themselves are synced to the site root by `generate-site.py`.)
 
 ## Why the order matters
 
-- **Endpoint ahead of the Release** (step 5 before step 3 finishes): clients
+- **Endpoint ahead of the Release** (step 4 before step 3 finishes): clients
   probe a version whose assets are not uploaded yet — `rpi update --self` and
   `install.sh` hit download 404s.
-- **Endpoint behind the Release** (step 5 skipped or delayed): clients never
+- **Endpoint behind the Release** (step 4 skipped or delayed): clients never
   see the new version — the update banner never appears and self-update
   reports "already up to date" forever.
 
