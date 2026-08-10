@@ -124,7 +124,11 @@ jobs:
           SHA256=$(command -v sha256sum || command -v shasum)
           mkdir -p dist
           tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi
-          "$SHA256" "dist/rpi-${VERSION}-${TARGET}.tar.gz" > "dist/rpi-${VERSION}-${TARGET}.tar.gz.sha256"
+          # Sidecar must list the basename only: install.sh verifies from a
+          # temp dir where the archive lives as <basename> (a dist/ path
+          # prefix makes the check fail). Same shape as the fake releases in
+          # scripts/test-install-sh.sh.
+          (cd dist && "$SHA256" "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
 
       - name: Package (zip)
         if: runner.os == 'Windows'
@@ -150,3 +154,6 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          # Tag re-push (release rebuild) must replace existing assets
+          # instead of failing on "asset already exists".
+          overwrite: true

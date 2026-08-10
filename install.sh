@@ -250,6 +250,10 @@ add_candidate "$ARCHIVE_URL"
 add_candidate "$RELEASE_BASE_URL/download/v$VERSION/$ARCHIVE_NAME"
 add_candidate "$SITE_BASE_URL/releases/download/v$VERSION/$ARCHIVE_NAME"
 
+# Reject HTML bodies (e.g. a login page served behind a redirect while the
+# repo is private): archive and sidecar must be binary/plain text.
+is_html() { head -c 256 "$1" 2>/dev/null | grep -qi '<html'; }
+
 TMPDIR_RPI=$(mktemp -d 2>/dev/null || mktemp -d -t rpi-install)
 
 DOWNLOAD_SOURCE=""
@@ -263,22 +267,40 @@ for candidate in $CANDIDATES; do
         warn "download failed from $candidate; trying the next mirror"
         continue
     fi
+    if is_html "$TMPDIR_RPI/$ARCHIVE_NAME"; then
+        warn "unexpected HTML content from $candidate; trying the next mirror"
+        continue
+    fi
     # The sidecar URL is <archive>.sha256 by construction — on GitHub and
     # on the site mirror alike.
     if ! fetch "$candidate.sha256" "$TMPDIR_RPI/$ARCHIVE_NAME.sha256"; then
         warn "checksum download failed from $candidate.sha256; trying the next mirror"
         continue
     fi
+    if is_html "$TMPDIR_RPI/$ARCHIVE_NAME.sha256"; then
+        warn "unexpected HTML checksum from $candidate.sha256; trying the next mirror"
+        continue
+    fi
     # An integrity failure is fatal — never switch mirrors on a bad
-    # checksum.
+    # checksum. Compare the hash token, not `sha256sum -c`: the check must
+    # not depend on the filename embedded in the sidecar (published sidecars
+    # used to carry a dist/ path prefix). GNU sha256sum prints
+    # "<hash>  <file>", BSD shasum prints "SHA256 (<file>) = <hash>";
+    # extract the hex token from each format.
     if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$TMPDIR_RPI" && sha256sum -c "$ARCHIVE_NAME.sha256" >/dev/null) ||
-            die "sha256 integrity check failed for $ARCHIVE_NAME; aborting"
+        actual=$(sha256sum "$TMPDIR_RPI/$ARCHIVE_NAME" | awk '{print $1}')
     elif command -v shasum >/dev/null 2>&1; then
-        (cd "$TMPDIR_RPI" && shasum -a 256 -c "$ARCHIVE_NAME.sha256" >/dev/null) ||
-            die "sha256 integrity check failed for $ARCHIVE_NAME; aborting"
+        actual=$(shasum -a 256 "$TMPDIR_RPI/$ARCHIVE_NAME" | awk '{print $NF}')
     else
         die "neither sha256sum nor shasum found; cannot verify download integrity"
+    fi
+    expected=$(sed 's/[[:space:]].*//' "$TMPDIR_RPI/$ARCHIVE_NAME.sha256" | head -n 1)
+    case $expected in
+        '' | *[!0-9a-fA-F]*) die "malformed checksum in $ARCHIVE_NAME.sha256" ;;
+    esac
+    if [ "$actual" != "$expected" ]; then
+        warn "expected $expected, got $actual"
+        die "sha256 integrity check failed for $ARCHIVE_NAME; aborting"
     fi
     DOWNLOAD_SOURCE=$candidate
     break
