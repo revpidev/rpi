@@ -62,12 +62,16 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Install aarch64 musl cross toolchain
+      # arm64 musl：apt 无现成工具链，musl.cc 大文件在 runner 上不稳定（
+      # 108MB 下载超时），改用 cross-rs 容器方案——cross 二进制来自 GitHub
+      # Releases，镜像来自 ghcr.io，均走 GitHub 自己的 CDN。
+      - name: Install cross (arm64 musl)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz -o "$RUNNER_TEMP/musl-cross.tgz"
-          tar -xzf "$RUNNER_TEMP/musl-cross.tgz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          curl -sL --retry 5 --retry-all-errors \
+            https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,13 +90,9 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --bin rpi
         shell: bash
 
-      - name: Build (arm64 musl)
+      - name: Build (arm64 musl via cross container)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_CC: aarch64-linux-musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_AR: aarch64-linux-musl-ar
-        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        run: cross build --release --target ${{ matrix.target }} --bin rpi
         shell: bash
 
       - name: Build (arm64 glibc)
