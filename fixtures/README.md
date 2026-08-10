@@ -1,6 +1,6 @@
 # Rpi 对拍 Fixtures
 
-> 设计文档 §10.2 / 需求 §11.1 / 编码规范 §12.3 的落地目录。
+> 对拍/契约测试基准数据（golden fixtures）的落地目录与操作手册（runbook）。
 > 上游对照：`external/pi` @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（0.82.1），钉死，见 `UPSTREAM.md`。
 >
 > **归一化与 diff 的共享实现**在 `rpi-test-support`（`normalize.rs` / `diff.rs`）。
@@ -63,7 +63,7 @@ cargo run -p rpi-test-support --example normalize-diff -- \
 > 序列 + 终止消息内容**（delta 边界不入契约，也不会落盘进 session JSONL）；
 > rpi 侧 faux 为确定性切块（`rpi-test-support/src/faux.rs` 文件头有偏离说明）。
 
-**纪律**：fixtures 变更必须与行为变更同 commit 提交，并在提交信息中说明（编码规范 §12.3）。
+**纪律**：fixtures 变更必须与行为变更同 commit 提交，并在提交信息中说明。
 
 ## 3. 首批场景（T02 交付）
 
@@ -79,7 +79,7 @@ cargo run -p rpi-test-support --example normalize-diff -- \
 
 补齐计划（任务索引）：compaction 场景已随 **T08** 交付；RPC 覆盖随 **T10**
 交付——采用进程内 32 命令逐条契约测试（`crates/rpi/tests/rpc_mode_test.rs`，
-锚定 `docs/rpc.md`）+ 上表场景的三模式对拍（`crates/rpi/tests/parity_headless_test.rs`），
+锚定上游 RPC 协议文档）+ 上表场景的三模式对拍（`crates/rpi/tests/parity_headless_test.rs`），
 不另录 RPC transcript fixtures（32 命令线协议由契约测试全枚举，transcript
 不增加覆盖面）。
 
@@ -109,7 +109,7 @@ node fixtures/generate-resources-golden.mjs themes settings  # 单组
 
 e2e 目录树的准备由脚本与 Rust 测试各自重复同一流程（`prepareE2eTree`）：
 复制 `input/` → 临时目录，把每个 `.rpi/` 复制出 `.pi/` 孪生（上游读 `.pi`、
-rpi 读 `.rpi`，需求 §1.4 有意改名；黄金统一记录为 `.rpi` 拼写），并创建
+rpi 读 `.rpi`，命名有意差异；黄金统一记录为 `.rpi` 拼写），并创建
 git 无法跟踪的 `repo/.git` 标记目录。
 
 **引擎相关排除**（黄金只钉稳定部分，详见生成脚本注释）：`invalid-yaml`
@@ -148,12 +148,12 @@ CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example
 `usage`/`willRetry`/`details`）——token 记账数值不参与对拍；该剥离逻辑目前分散在三个
 测试文件内（未下沉 rpi-test-support）。
 
-## 5. 逐条对拍级基准清单（需求 §11.1）
+## 5. 逐条对拍级基准清单
 
-六份上游文档是字节/行为级对拍基准。下表登记「文档条目 → 对拍锚点」；
+六份上游文档（`external/pi/packages/coding-agent/docs/`）是字节/行为级对拍基准。下表登记「文档条目 → 对拍锚点」；
 锚点状态随任务推进补齐（✅ = 已有锚点，⏳ = 计划任务）。
 
-### 5.1 `docs/session-format.md`（T07 主场）
+### 5.1 `session-format.md`（T07 主场）
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|
@@ -169,7 +169,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example
 | Tree Structure / Context Building 算法 | T07 单测 | ⏳ T07 |
 | stopReason=length / aborted 持久化形状 | `length-truncation` / `abort` | ✅ T02 |
 
-### 5.2 `docs/rpc.md`（T10 主场）
+### 5.2 `rpc.md`（T10 主场）
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|
@@ -177,7 +177,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example
 | 32 命令逐条（prompt/steer/follow_up/abort/new_session/get_state/get_messages/set_model/cycle_model/get_available_models/set_thinking_level/cycle_thinking_level/get_available_thinking_levels/set_steering_mode/set_follow_up_mode/compact/set_auto_compaction/set_auto_retry/abort_retry/bash/abort_bash/get_session_stats/export_html/switch_session/fork/clone 等） | RPC transcript fixtures + 契约测 | ⏳ T10 |
 | steer/followUp/abort 事件语义 | `steering-followup` / `abort` 事件 transcript | ✅ T02（SDK 层；RPC 层 ⏳ T10） |
 
-### 5.3 `docs/compaction.md`（T08 主场）
+### 5.3 `compaction.md`（T08 主场）
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|
@@ -188,7 +188,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example
 | session_before_compact / session_before_tree 扩展语义 | T15 扩展事件对拍 | ⏳ T15 |
 | Settings（阈值字段） | T08 用例（reserveTokens/keepRecentTokens）；settings 文件接线 `parity_resources_test::parity_settings_*` | ✅ T08 + ✅ T09 |
 
-### 5.4 `docs/keybindings.md`（T11/T12 主场）
+### 5.4 `keybindings.md`（T11/T12 主场）
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|
@@ -196,7 +196,7 @@ CLI 形式（抽验、手工对拍）：`cargo run -p rpi-test-support --example
 | 全部 action 默认绑定表（12 节逐表） | T12 绑定表快照黄金文件 | ⏳ T12 |
 | 自定义配置合并语义 | T09/T12 用例 | ⏳ T12 |
 
-### 5.5 `docs/tmux.md` / 5.6 `docs/terminal-setup.md`（T11/T12 主场，字节序列级）
+### 5.5 `tmux.md` / 5.6 `terminal-setup.md`（T11/T12 主场，字节序列级）
 
 | 条目 | 锚点 | 状态 |
 |------|------|------|

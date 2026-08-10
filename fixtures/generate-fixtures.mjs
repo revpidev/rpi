@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Rpi fixtures generator (runbook step: design doc §10.2).
+ * Rpi fixtures generator (runbook step: see fixtures/README.md §2).
  *
  * Runs the pinned upstream Pi (@ pi 0.82.1, external/pi @ 2efa728) with the
  * faux provider and fixed prompt scripts over the SDK (`createAgentSession`),
@@ -48,7 +48,7 @@ const FIXED_TOOL_ID_2 = { id: "fixture-tool-call-2" };
 
 // ---------------------------------------------------------------------------
 // Scenario scripts (fixed — changes require regenerating + re-reviewing all
-// fixtures in the same commit, coding-standards §12.3)
+// fixtures in the same commit)
 // ---------------------------------------------------------------------------
 
 const SCENARIOS = {

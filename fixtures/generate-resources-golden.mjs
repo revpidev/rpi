@@ -29,7 +29,7 @@
  *     multi-level tree (global agentDir + project config + settings paths +
  *     CLI paths + ancestor `.agents/skills` + git-repo boundary). The tree
  *     is copied to a temp dir; `repo/.git` (untrackable) and the `.pi` twin
- *     of `.rpi` (upstream reads `.pi`, rpi reads `.rpi` — requirements §1.4)
+ *     of `.rpi` (upstream reads `.pi`, rpi reads `.rpi` — intentional rename)
  *     are created by the script; the Rust test repeats the same prep.
  *
  * Absolute paths in goldens are rewritten to `<path>` at generation time
@@ -76,8 +76,7 @@ function stripRoot(value, root) {
 }
 
 /**
- * Canonicalize the intentional `.pi` → `.rpi` rename (requirements §1.4,
- * ADR-0001) in path strings: upstream discovers `cwd/.pi`, rpi discovers
+ * Canonicalize the intentional `.pi` → `.rpi` rename (ADR-0001) in path strings: upstream discovers `cwd/.pi`, rpi discovers
  * `cwd/.rpi`; goldens are recorded in the rpi spelling so the Rust side
  * needs no per-test compensation. Only path-segment occurrences are
  * rewritten (`/.pi/` or a trailing `/.pi`).
