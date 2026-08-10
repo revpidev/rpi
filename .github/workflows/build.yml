@@ -1,0 +1,147 @@
+name: build
+
+# 构建矩阵（全部使用 GitHub runner 原生支持的工具链，无第三方构建器）：
+#   - Windows x64        x86_64-pc-windows-msvc     原生（自带 MSVC）
+#   - macOS arm64        aarch64-apple-darwin        原生（macos-14 arm64 runner）
+#   - Linux x64 glibc    x86_64-unknown-linux-gnu    原生
+#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools（musl-gcc）
+#   - Linux arm64 musl   aarch64-unknown-linux-musl  musl.cc 交叉工具链（静态单文件）
+#   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc-aarch64-linux-gnu
+#
+# 触发：push 到 main / 0.* 开发分支构建并上传 artifact（可下载调试）；
+#       tag v* 额外发布到 GitHub Release；workflow_dispatch 手动触发。
+
+on:
+  push:
+    branches:
+      - main
+      - "0.*"
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write # GitHub Release 上传需要
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: aarch64-apple-darwin
+            os: macos-14 # arm64 runner
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # ---- Linux 交叉工具链（GitHub runner 原生支持的安装方式）----
+
+      - name: Install musl toolchain (x64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install aarch64 gcc (arm64 glibc)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install aarch64 musl cross toolchain
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz -o "$RUNNER_TEMP/musl-cross.tgz"
+          tar -xzf "$RUNNER_TEMP/musl-cross.tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: ${{ matrix.target }}
+
+      # ---- 构建 ----
+
+      - name: Build (native)
+        if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        shell: bash
+
+      - name: Build (x64 musl)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        shell: bash
+
+      - name: Build (arm64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_CC: aarch64-linux-musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_AR: aarch64-linux-musl-ar
+        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        shell: bash
+
+      - name: Build (arm64 glibc)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CC: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-ar
+        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        shell: bash
+
+      # ---- 打包 ----
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=$(sed -n '/\[workspace.package\]/,/^\[/p' Cargo.toml | grep '^version' | head -1 | cut -d'"' -f2)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          TARGET=${{ matrix.target }}
+          mkdir -p dist
+          tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi
+          sha256sum "dist/rpi-${VERSION}-${TARGET}.tar.gz" > "dist/rpi-${VERSION}-${TARGET}.tar.gz.sha256"
+
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          $TARGET = "${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path "target\$TARGET\release\rpi.exe" -DestinationPath "dist\rpi-$VERSION-$TARGET.zip"
+          $hash = (Get-FileHash "dist\rpi-$VERSION-$TARGET.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "dist\rpi-$VERSION-$TARGET.zip.sha256" -Value "$hash  rpi-$VERSION-$TARGET.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi-${{ steps.version.outputs.version }}-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
