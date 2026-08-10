@@ -108,18 +108,22 @@ jobs:
 
       - name: Extract version
         id: version
+        shell: bash
         run: |
           VERSION=$(sed -n '/\[workspace.package\]/,/^\[/p' Cargo.toml | grep '^version' | head -1 | cut -d'"' -f2)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
           VERSION=${{ steps.version.outputs.version }}
           TARGET=${{ matrix.target }}
+          # macOS 无 GNU sha256sum（自带 shasum），两平台输出格式一致
+          SHA256=$(command -v sha256sum || command -v shasum)
           mkdir -p dist
           tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi
-          sha256sum "dist/rpi-${VERSION}-${TARGET}.tar.gz" > "dist/rpi-${VERSION}-${TARGET}.tar.gz.sha256"
+          "$SHA256" "dist/rpi-${VERSION}-${TARGET}.tar.gz" > "dist/rpi-${VERSION}-${TARGET}.tar.gz.sha256"
 
       - name: Package (zip)
         if: runner.os == 'Windows'
