@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="zh-CN" data-lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文档 — Rpi</title>
+  <meta name="description" content="Rpi 文档中心：项目介绍、快速开始、更新记录与插件开发指南。">
+  <script>
+    (function () {
+      var l;
+      try { l = localStorage.getItem("rpi-lang"); } catch (e) {}
+      if (!l) { l = ((navigator.language || "").toLowerCase().indexOf("zh") === 0) ? "zh" : "en"; }
+      document.documentElement.dataset.lang = l;
+      document.documentElement.lang = (l === "zh") ? "zh-CN" : "en";
+    })();
+  </script>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --bg-soft: #11151d;
+      --bg-code: #080b10;
+      --border: #212833;
+      --border-soft: #1a212c;
+      --text: #e8eef6;
+      --muted: #8a94a3;
+      --green: #4ade80;
+      --green-deep: #22c55e;
+      --blue: #60a5fa;
+      --yellow: #fbbf24;
+      --purple: #c084fc;
+      --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.75;
+      -webkit-font-smoothing: antialiased;
+    }
+    ::selection { background: rgba(74, 222, 128, 0.25); }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+      font-family: var(--mono);
+      font-size: 0.88em;
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.12em 0.4em;
+    }
+    pre {
+      font-family: var(--mono);
+      font-size: 0.84rem;
+      line-height: 1.7;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.2rem;
+      overflow-x: auto;
+      color: #c4cdd9;
+      margin: 0.8rem 0 1.4rem;
+    }
+    pre code { background: none; border: none; padding: 0; }
+    pre .c { color: #5b6676; }
+    pre .p { color: var(--green); }
+    .container { max-width: 1060px; margin: 0 auto; padding: 0 1.5rem; }
+
+    /* ---------- i18n ---------- */
+    html[data-lang="zh"] .l-en { display: none !important; }
+    html[data-lang="en"] .l-zh { display: none !important; }
+
+    /* ---------- nav ---------- */
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      background: rgba(11, 14, 20, 0.88);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border-soft);
+    }
+    .nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 58px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-weight: 700;
+      font-size: 1.08rem;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+    .brand:hover { text-decoration: none; }
+    .brand .logo {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--green);
+      color: #0b0e14;
+      font-family: Georgia, "Times New Roman", serif;
+      font-style: italic;
+      font-weight: 700;
+      font-size: 1.15rem;
+      line-height: 1;
+      padding-bottom: 2px;
+    }
+    .nav-links { display: flex; align-items: center; gap: 1.5rem; font-size: 0.92rem; }
+    .nav-links a { color: var(--muted); }
+    .nav-links a:hover, .nav-links a.active { color: var(--text); text-decoration: none; }
+    .lang-toggle {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 0.3rem 0.7rem;
+      cursor: pointer;
+      transition: border-color 0.15s ease, color 0.15s ease;
+    }
+    .lang-toggle:hover { border-color: var(--muted); color: var(--text); }
+    .nav-gh {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--text) !important;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 0.3rem 0.8rem;
+      transition: border-color 0.15s ease;
+    }
+    .nav-gh:hover { border-color: var(--muted); }
+    .nav-gh svg { width: 15px; height: 15px; fill: currentColor; }
+
+    /* ---------- docs layout ---------- */
+    .docs-layout {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 3rem;
+      padding-top: 3rem;
+      padding-bottom: 4.5rem;
+    }
+    .docs-nav {
+      position: sticky;
+      top: 90px;
+      align-self: start;
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+    .docs-nav .nav-caption {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 0.7rem;
+      padding-left: 0.8rem;
+    }
+    .docs-nav a {
+      display: block;
+      color: var(--muted);
+      font-size: 0.93rem;
+      padding: 0.42rem 0.8rem;
+      border-radius: 8px;
+      border-left: 2px solid transparent;
+      transition: color 0.15s ease, background 0.15s ease;
+    }
+    .docs-nav a:hover { color: var(--text); text-decoration: none; background: var(--bg-soft); }
+    .docs-nav a.active {
+      color: var(--green);
+      background: rgba(74, 222, 128, 0.08);
+      border-left-color: var(--green);
+    }
+
+    /* ---------- article ---------- */
+    article { display: none; max-width: 720px; }
+    article.active { display: block; }
+    article h1 {
+      font-size: 1.9rem;
+      font-weight: 750;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.6rem;
+    }
+    article h1 + .sub { color: var(--muted); margin-bottom: 2rem; }
+    article h2 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin: 2.2rem 0 0.7rem;
+      padding-top: 1.4rem;
+      border-top: 1px solid var(--border-soft);
+    }
+    article h2:first-of-type { border-top: none; padding-top: 0; }
+    article p { margin-bottom: 0.9rem; color: #c4cdd9; }
+    article ul, article ol { margin: 0 0 1rem 1.3rem; color: #c4cdd9; }
+    article li { margin: 0.35rem 0; }
+    article .muted { color: var(--muted); }
+    .version-tag {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--green);
+      background: rgba(74, 222, 128, 0.1);
+      border: 1px solid rgba(74, 222, 128, 0.3);
+      border-radius: 6px;
+      padding: 0.05rem 0.5rem;
+      margin-right: 0.5rem;
+      vertical-align: 2px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      margin: 0.8rem 0 1.4rem;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    th, td { text-align: left; padding: 0.65rem 0.9rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { background: var(--bg-soft); font-weight: 600; font-size: 0.84rem; color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+
+    /* ---------- footer ---------- */
+    footer {
+      border-top: 1px solid var(--border-soft);
+      padding: 2.8rem 0;
+      color: var(--muted);
+      font-size: 0.89rem;
+    }
+    footer .container { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.8rem 2rem; }
+    footer a { color: var(--muted); }
+    footer a:hover { color: var(--text); text-decoration: none; }
+
+    @media (max-width: 860px) {
+      .docs-layout { grid-template-columns: 1fr; gap: 1.6rem; padding-top: 2rem; }
+      .docs-nav {
+        position: static;
+        flex-direction: row;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+      }
+      .docs-nav .nav-caption { width: 100%; padding-left: 0; }
+      .docs-nav a { border-left: none; border: 1px solid var(--border); }
+      .docs-nav a.active { border-color: rgba(74, 222, 128, 0.45); }
+      .nav-links a:not(.nav-gh) { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="container nav">
+    <a class="brand" href="/">
+      <span class="logo">π</span> Rpi
+    </a>
+    <nav class="nav-links">
+      <a href="/"><span class="l-zh">首页</span><span class="l-en">Home</span></a>
+      <a href="/docs" class="active"><span class="l-zh">文档</span><span class="l-en">Docs</span></a>
+      <button class="lang-toggle" id="lang-toggle" type="button" aria-label="Switch language">
+        <span class="l-zh">EN</span><span class="l-en">中文</span>
+      </button>
+      <a class="nav-gh" href="https://github.com/zhuacloud/rpi">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </nav>
+  </div>
+</header>
+
+<div class="container docs-layout">
+
+  <aside class="docs-nav" id="docs-nav">
+    <p class="nav-caption"><span class="l-zh">文档</span><span class="l-en">Docs</span></p>
+    <a href="#/intro" data-doc="intro"><span class="l-zh">项目介绍</span><span class="l-en">Introduction</span></a>
+    <a href="#/quickstart" data-doc="quickstart"><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></a>
+    <a href="#/changelog" data-doc="changelog"><span class="l-zh">更新记录</span><span class="l-en">Changelog</span></a>
+    <a href="#/extensions" data-doc="extensions"><span class="l-zh">插件开发指南</span><span class="l-en">Plugin guide</span></a>
+  </aside>
+
+  <div class="docs-content">
+
+    <!-- ================= 项目介绍 ================= -->
+    <article id="doc-intro">
+      <h1><span class="l-zh">项目介绍</span><span class="l-en">Introduction</span></h1>
+      <p class="sub">
+        <span class="l-zh">Rpi 是什么，从哪里来，能做什么。</span>
+        <span class="l-en">What Rpi is, where it comes from, and what it can do.</span>
+      </p>
+
+      <p>
+        <span class="l-zh">Rpi 是一个运行在终端里的 AI 编程助手，用 Rust 编写。它可以读取你的代码、按你的要求修改文件、执行命令，并管理多轮会话——所有工作都在终端里完成，无需离开命令行。项目的设计源自 <a href="https://github.com/earendil-works/pi">Pi</a>（earendil-works/pi），并在此基础上独立演进。</span>
+        <span class="l-en">Rpi is an AI coding assistant that lives in your terminal, written in Rust. It reads your code, edits files on request, runs commands, and manages multi-turn sessions — all without leaving the command line. The design originates from <a href="https://github.com/earendil-works/pi">Pi</a> (earendil-works/pi) and evolves independently from there.</span>
+      </p>
+
+      <h2><span class="l-zh">主要特性</span><span class="l-en">Highlights</span></h2>
+      <ul>
+        <li><span class="l-zh"><strong>单二进制</strong>：静态链接，无运行时依赖，拷贝即可运行。</span><span class="l-en"><strong>Single binary</strong>: statically linked, zero runtime dependencies, copy and run.</span></li>
+        <li><span class="l-zh"><strong>完整终端界面</strong>：流式输出、语法高亮、斜杠命令、<code>@</code> 文件引用、会话树。</span><span class="l-en"><strong>Complete terminal UI</strong>: streaming output, syntax highlighting, slash commands, <code>@</code> file references, session tree.</span></li>
+        <li><span class="l-zh"><strong>内置工具</strong>：读写文件、编辑代码、执行命令；长对话自动压缩上下文。</span><span class="l-en"><strong>Built-in tools</strong>: read/write files, edit code, run commands; automatic context compaction for long conversations.</span></li>
+        <li><span class="l-zh"><strong>38 家模型服务商</strong>：OpenAI、Anthropic、DeepSeek、Kimi、Google、Bedrock 等开箱即用。</span><span class="l-en"><strong>38 model providers</strong>: OpenAI, Anthropic, DeepSeek, Kimi, Google, Bedrock and more, out of the box.</span></li>
+        <li><span class="l-zh"><strong>插件系统</strong>：支持 WebAssembly 与原生动态库两种插件，可热重载。</span><span class="l-en"><strong>Plugin system</strong>: WebAssembly and native dynamic-library plugins, with hot reload.</span></li>
+        <li><span class="l-zh"><strong>会话分享</strong>：导出 HTML 或生成分享链接。</span><span class="l-en"><strong>Session sharing</strong>: export to HTML or generate a share link.</span></li>
+        <li><span class="l-zh"><strong>隐私可控</strong>：网络请求可逐项关闭，配置全部保存在本机 <code>~/.rpi</code>。</span><span class="l-en"><strong>Privacy control</strong>: every network request can be disabled; all configuration stays in <code>~/.rpi</code>.</span></li>
+      </ul>
+
+      <h2><span class="l-zh">许可证与致谢</span><span class="l-en">License &amp; credits</span></h2>
+      <p>
+        <span class="l-zh">Rpi 以 <strong>MIT</strong> 许可证开源，与上游项目 Pi 一致。感谢 <a href="https://github.com/earendil-works/pi">earendil-works/pi</a> 提供了设计原型。源码与 Issue 见 <a href="https://github.com/zhuacloud/rpi">GitHub 仓库</a>。</span>
+        <span class="l-en">Rpi is open source under the <strong>MIT</strong> license, same as the upstream project Pi. Thanks to <a href="https://github.com/earendil-works/pi">earendil-works/pi</a> for the design it originates from. Source code and issues live in the <a href="https://github.com/zhuacloud/rpi">GitHub repository</a>.</span>
+      </p>
+    </article>
+
+    <!-- ================= 快速开始 ================= -->
+    <article id="doc-quickstart">
+      <h1><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></h1>
+      <p class="sub">
+        <span class="l-zh">从构建到第一次对话，大约三分钟。</span>
+        <span class="l-en">From source to your first conversation in about three minutes.</span>
+      </p>
+
+      <h2><span class="l-zh">1. 构建</span><span class="l-en">1. Build</span></h2>
+      <p>
+        <span class="l-zh">需要安装 <a href="https://rustup.rs">Rust 工具链</a>。构建产物是单个可执行文件 <code>target/release/rpi</code>，可以拷贝到 <code>PATH</code> 中的任意位置。</span>
+        <span class="l-en">You need the <a href="https://rustup.rs">Rust toolchain</a>. The build produces a single executable, <code>target/release/rpi</code>, which you can copy anywhere on your <code>PATH</code>.</span>
+      </p>
+      <pre><code><span class="p">$</span> git clone https://github.com/zhuacloud/rpi.git
+<span class="p">$</span> cd rpi
+<span class="p">$</span> cargo build --release
+<span class="p">$</span> ./target/release/rpi</code></pre>
+
+      <h2><span class="l-zh">2. 配置模型</span><span class="l-en">2. Configure a model</span></h2>
+      <p>
+        <span class="l-zh">Rpi 内置了 38 家模型服务商的模型清单。大多数情况下只需要在 <code>~/.rpi/agent/models.json</code> 里写入你的 API Key（以 DeepSeek 为例）：</span>
+        <span class="l-en">Rpi ships model catalogs for 38 providers. In most cases you only need to add your API key in <code>~/.rpi/agent/models.json</code> (DeepSeek example):</span>
+      </p>
+      <pre><code>{"providers": {"deepseek": {
+  "apiKey": "DEEPSEEK_API_KEY",
+  "models": [{"id": "deepseek-v4-flash"}]}}}</code></pre>
+      <p class="muted">
+        <span class="l-zh"><code>apiKey</code> 也可以直接写 Key 字符串；写环境变量名时会从环境读取。</span>
+        <span class="l-en"><code>apiKey</code> accepts either a literal key or the name of an environment variable to read it from.</span>
+      </p>
+
+      <h2><span class="l-zh">3. 三种运行模式</span><span class="l-en">3. Three run modes</span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th><span class="l-zh">命令</span><span class="l-en">Command</span></th>
+            <th><span class="l-zh">模式</span><span class="l-en">Mode</span></th>
+            <th><span class="l-zh">适用场景</span><span class="l-en">Use case</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>rpi</code></td>
+            <td><span class="l-zh">交互模式</span><span class="l-en">Interactive</span></td>
+            <td><span class="l-zh">日常使用：多轮对话、边聊边改代码</span><span class="l-en">Everyday work: multi-turn chat, edit as you go</span></td>
+          </tr>
+          <tr>
+            <td><code>rpi --print "..."</code></td>
+            <td><span class="l-zh">一次性问答</span><span class="l-en">One-shot</span></td>
+            <td><span class="l-zh">脚本集成：问一个问题，拿到答案就退出</span><span class="l-en">Scripting: ask one question, print the answer, exit</span></td>
+          </tr>
+          <tr>
+            <td><code>rpi --rpc</code></td>
+            <td>RPC</td>
+            <td><span class="l-zh">给其他程序（编辑器、IDE）调用</span><span class="l-en">Driving Rpi from other programs (editors, IDEs)</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2><span class="l-zh">4. （可选）关闭网络请求</span><span class="l-en">4. (Optional) Disable network requests</span></h2>
+      <p>
+        <span class="l-zh">Rpi 默认会在线获取模型目录更新和新版本提示。如果不需要，可以用环境变量逐项关闭：</span>
+        <span class="l-en">By default Rpi fetches model catalog updates and new-version notices online. Each can be turned off individually:</span>
+      </p>
+      <pre><code><span class="p">$</span> export RPI_MODEL_CATALOG_URL=off
+<span class="p">$</span> export RPI_VERSION_CHECK_URL=off
+<span class="p">$</span> export RPI_TELEMETRY_URL=off</code></pre>
+      <p class="muted">
+        <span class="l-zh">全部设为 <code>off</code> 后，除你自己配置的模型服务商之外，Rpi 不发起任何网络请求。</span>
+        <span class="l-en">With all three set to <code>off</code>, Rpi makes no network requests beyond the model providers you configured yourself.</span>
+      </p>
+    </article>
+
+    <!-- ================= 更新记录 ================= -->
+    <article id="doc-changelog">
+      <h1><span class="l-zh">更新记录</span><span class="l-en">Changelog</span></h1>
+      <p class="sub">
+        <span class="l-zh">每个版本的变更记录。程序内的新版本提示也会链接到本页。</span>
+        <span class="l-en">What changed in each release. The in-app update notice links here too.</span>
+      </p>
+
+      <h2><span class="version-tag">0.1.0</span><span class="l-zh">首个版本</span><span class="l-en">Initial release</span></h2>
+      <ul>
+        <li><span class="l-zh">终端 AI 编程助手的完整功能：多轮对话、内置工具、会话管理。</span><span class="l-en">The complete terminal AI coding assistant: multi-turn chat, built-in tools, session management.</span></li>
+        <li><span class="l-zh">交互 / 一次性问答 / RPC 三种运行模式。</span><span class="l-en">Three run modes: interactive, one-shot (<code>--print</code>) and RPC.</span></li>
+        <li><span class="l-zh">内置 38 家模型服务商。</span><span class="l-en">38 built-in model providers.</span></li>
+        <li><span class="l-zh">插件系统：WebAssembly 与原生动态库，支持热重载。</span><span class="l-en">Plugin system: WebAssembly and native dynamic libraries, with hot reload.</span></li>
+        <li><span class="l-zh">会话导出 HTML 与链接分享。</span><span class="l-en">Session export to HTML and link sharing.</span></li>
+      </ul>
+    </article>
+
+    <!-- ================= 插件开发指南 ================= -->
+    <article id="doc-extensions">
+      <h1><span class="l-zh">插件开发指南</span><span class="l-en">Plugin guide</span></h1>
+      <p class="sub">
+        <span class="l-zh">用插件给 Rpi 增加新工具、新命令和新行为。</span>
+        <span class="l-en">Extend Rpi with new tools, commands and behaviors.</span>
+      </p>
+
+      <h2><span class="l-zh">两种插件形态</span><span class="l-en">Two plugin formats</span></h2>
+      <table>
+        <thead>
+          <tr>
+            <th><span class="l-zh">形态</span><span class="l-en">Format</span></th>
+            <th><span class="l-zh">文件</span><span class="l-en">File</span></th>
+            <th><span class="l-zh">特点</span><span class="l-en">Characteristics</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>WebAssembly</td>
+            <td><code>.wasm</code></td>
+            <td><span class="l-zh">在沙箱中运行，按声明的能力授权；可用任何能编译到 wasm32 的语言编写</span><span class="l-en">Runs in a sandbox with declared capabilities; write in any language that targets wasm32</span></td>
+          </tr>
+          <tr>
+            <td><span class="l-zh">原生动态库</span><span class="l-en">Native library</span></td>
+            <td><code>.so</code> / <code>.dll</code> / <code>.dylib</code></td>
+            <td><span class="l-zh">性能最好，但无沙箱，拥有与 Rpi 进程相同的权限，只安装可信来源</span><span class="l-en">Best performance, but unsandboxed — same permissions as the Rpi process; install only from sources you trust</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2><span class="l-zh">一个插件长什么样</span><span class="l-en">Anatomy of a plugin</span></h2>
+      <p>
+        <span class="l-zh">一个插件就是一个目录，里面放一个清单元文件 <code>rpi-extension.json</code> 和插件本体：</span>
+        <span class="l-en">A plugin is a directory containing a manifest file, <code>rpi-extension.json</code>, plus the plugin binary:</span>
+      </p>
+      <pre><code>permission-gate/
+├── rpi-extension.json   <span class="c"># 清单 / manifest</span>
+└── dist/
+    └── permission_gate.wasm</code></pre>
+      <pre><code>{
+  "name": "permission-gate",
+  "version": "0.1.0",
+  "description": "Block a tool + register a custom tool",
+  "wasm": "dist/permission_gate.wasm",
+  "capabilities": ["tools", "session"],
+  "rpiAbi": 1
+}</code></pre>
+      <p class="muted">
+        <span class="l-zh"><code>capabilities</code> 声明插件需要的能力，未声明的能力在运行时会被拒绝。原生动态库插件把 <code>wasm</code> 字段换成 <code>native</code>。</span>
+        <span class="l-en"><code>capabilities</code> declares what the plugin is allowed to do; anything undeclared is denied at runtime. Native plugins use a <code>native</code> field instead of <code>wasm</code>.</span>
+      </p>
+
+      <h2><span class="l-zh">安装与重载</span><span class="l-en">Install &amp; reload</span></h2>
+      <p>
+        <span class="l-zh">把插件目录拷贝（或软链）到以下任一位置，Rpi 启动时会自动发现：</span>
+        <span class="l-en">Copy (or symlink) the plugin directory into either location below; Rpi discovers it at startup:</span>
+      </p>
+      <ul>
+        <li><code>~/.rpi/agent/extensions/&lt;name&gt;/</code> — <span class="l-zh">对所有项目生效</span><span class="l-en">applies to every project</span></li>
+        <li><code>.rpi/extensions/&lt;name&gt;/</code> — <span class="l-zh">仅当前项目生效</span><span class="l-en">applies to the current project only</span></li>
+      </ul>
+      <p>
+        <span class="l-zh">修改插件后无需退出 Rpi，在会话里执行 <code>/reload</code> 即可热重载。</span>
+        <span class="l-en">After changing a plugin, run <code>/reload</code> inside the session — no need to restart Rpi.</span>
+      </p>
+
+      <h2><span class="l-zh">从示例开始</span><span class="l-en">Start from the example</span></h2>
+      <p>
+        <span class="l-zh">仓库里的 <code>examples/wasm-extension/</code> 是一个完整示例：拦截指定工具的调用，并注册一个自定义工具。构建并安装：</span>
+        <span class="l-en">The repository ships a complete example at <code>examples/wasm-extension/</code>: it intercepts calls to a specific tool and registers a custom one. Build and install it:</span>
+      </p>
+      <pre><code><span class="p">$</span> rustup target add wasm32-unknown-unknown   <span class="c"># 一次性 / one-time</span>
+<span class="p">$</span> cd examples/wasm-extension
+<span class="p">$</span> cargo build --target wasm32-unknown-unknown --release
+<span class="p">$</span> mkdir -p dist
+<span class="p">$</span> cp ../../target/wasm32-unknown-unknown/release/rpi_wasm_extension_example.wasm dist/permission_gate.wasm
+<span class="p">$</span> cp -r ../wasm-extension ~/.rpi/agent/extensions/permission-gate</code></pre>
+      <p class="muted">
+        <span class="l-zh">插件与宿主之间的完整通信规范（消息格式、能力列表、错误类型）见仓库中的 <a href="https://github.com/zhuacloud/rpi/blob/main/docs/extension-abi.md">Extension ABI 文档</a>。</span>
+        <span class="l-en">The full contract between plugins and the host — message formats, capability list, error kinds — is documented in the <a href="https://github.com/zhuacloud/rpi/blob/main/docs/extension-abi.md">Extension ABI document</a> in the repository.</span>
+      </p>
+    </article>
+
+  </div>
+</div>
+
+<footer>
+  <div class="container">
+    <div>
+      <strong style="color: var(--text)">Rpi</strong> ·
+      <span class="l-zh">用 Rust 编写的终端 AI 编程助手</span>
+      <span class="l-en">a terminal AI coding assistant written in Rust</span>
+    </div>
+    <div>
+      <a href="https://github.com/zhuacloud/rpi">GitHub</a> ·
+      <a href="/"><span class="l-zh">首页</span><span class="l-en">Home</span></a> ·
+      <span>MIT License</span> ·
+      <span class="l-zh">致谢上游 </span><span class="l-en">Thanks to upstream </span><a href="https://github.com/earendil-works/pi">earendil-works/pi</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // 语言切换
+  (function () {
+    function setLang(l) {
+      document.documentElement.dataset.lang = l;
+      document.documentElement.lang = (l === "zh") ? "zh-CN" : "en";
+      try { localStorage.setItem("rpi-lang", l); } catch (e) {}
+      updateTitle();
+    }
+    window.__setLang = setLang;
+    document.getElementById("lang-toggle").addEventListener("click", function () {
+      setLang(document.documentElement.dataset.lang === "zh" ? "en" : "zh");
+    });
+  })();
+
+  // hash 路由：#/intro #/quickstart #/changelog #/extensions
+  var DOCS = ["intro", "quickstart", "changelog", "extensions"];
+  var TITLES = {
+    intro:      { zh: "项目介绍 — Rpi 文档",   en: "Introduction — Rpi Docs" },
+    quickstart: { zh: "快速开始 — Rpi 文档",   en: "Quickstart — Rpi Docs" },
+    changelog:  { zh: "更新记录 — Rpi 文档",   en: "Changelog — Rpi Docs" },
+    extensions: { zh: "插件开发指南 — Rpi 文档", en: "Plugin guide — Rpi Docs" }
+  };
+  function currentDoc() {
+    var m = /^#\/?([a-z]+)/.exec(location.hash || "");
+    return (m && DOCS.indexOf(m[1]) !== -1) ? m[1] : "intro";
+  }
+  function updateTitle() {
+    var lang = document.documentElement.dataset.lang === "en" ? "en" : "zh";
+    document.title = TITLES[currentDoc()][lang];
+  }
+  function showDoc() {
+    var id = currentDoc();
+    DOCS.forEach(function (d) {
+      document.getElementById("doc-" + d).classList.toggle("active", d === id);
+    });
+    var links = document.querySelectorAll(".docs-nav a");
+    Array.prototype.forEach.call(links, function (a) {
+      a.classList.toggle("active", a.dataset.doc === id);
+    });
+    updateTitle();
+    window.scrollTo(0, 0);
+  }
+  window.addEventListener("hashchange", showDoc);
+  showDoc();
+</script>
+</body>
+</html>

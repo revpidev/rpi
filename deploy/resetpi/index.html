@@ -1,24 +1,35 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-lang="zh">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Rpi — 源于 Pi 的 Rust coding agent</title>
-  <meta name="description" content="Rpi 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：四层 crate 架构，wasm / 原生扩展宿主，38 个内置 provider，MIT 许可。">
+  <title>Rpi — 终端里的 AI 编程搭档</title>
+  <meta name="description" content="Rpi 是一个用 Rust 编写的终端 AI 编程助手：单二进制、内置 38 家模型服务商、支持插件扩展与会话分享。项目源自 Pi。">
+  <script>
+    // 尽早确定语言，避免渲染闪烁
+    (function () {
+      var l;
+      try { l = localStorage.getItem("rpi-lang"); } catch (e) {}
+      if (!l) { l = ((navigator.language || "").toLowerCase().indexOf("zh") === 0) ? "zh" : "en"; }
+      document.documentElement.dataset.lang = l;
+      document.documentElement.lang = (l === "zh") ? "zh-CN" : "en";
+    })();
+  </script>
   <style>
     :root {
-      --bg: #0d1117;
-      --bg-soft: #161b22;
-      --bg-code: #0a0e14;
-      --border: #30363d;
-      --text: #f0f6fc;
-      --muted: #8b949e;
-      --green: #3fb950;
-      --green-dim: #2ea043;
-      --blue: #58a6ff;
-      --yellow: #d29922;
-      --purple: #bc8cff;
-      --red: #f85149;
+      --bg: #0b0e14;
+      --bg-soft: #11151d;
+      --bg-code: #080b10;
+      --border: #212833;
+      --border-soft: #1a212c;
+      --text: #e8eef6;
+      --muted: #8a94a3;
+      --green: #4ade80;
+      --green-deep: #22c55e;
+      --blue: #60a5fa;
+      --yellow: #fbbf24;
+      --purple: #c084fc;
+      --red: #f87171;
       --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
     }
@@ -31,150 +42,214 @@
       line-height: 1.7;
       -webkit-font-smoothing: antialiased;
     }
+    ::selection { background: rgba(74, 222, 128, 0.25); }
     a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
     code {
       font-family: var(--mono);
-      font-size: 0.9em;
+      font-size: 0.88em;
       background: var(--bg-soft);
       border: 1px solid var(--border);
       border-radius: 4px;
-      padding: 0.1em 0.35em;
+      padding: 0.12em 0.4em;
     }
     pre {
       font-family: var(--mono);
-      font-size: 0.85rem;
-      line-height: 1.6;
+      font-size: 0.84rem;
+      line-height: 1.7;
       background: var(--bg-code);
       border: 1px solid var(--border);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 1rem 1.2rem;
       overflow-x: auto;
-      color: #c9d1d9;
+      color: #c4cdd9;
     }
     pre code { background: none; border: none; padding: 0; }
-    .container { max-width: 1080px; margin: 0 auto; padding: 0 1.5rem; }
-    section { padding: 4.5rem 0; }
+    pre .c { color: #5b6676; }
+    pre .p { color: var(--green); }
+    .container { max-width: 1060px; margin: 0 auto; padding: 0 1.5rem; }
+    section { padding: 5rem 0; }
+    .kicker {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--green);
+      margin-bottom: 0.7rem;
+    }
     section h2 {
-      font-size: 1.7rem;
+      font-size: 1.8rem;
       font-weight: 700;
       letter-spacing: -0.02em;
-      margin-bottom: 0.5rem;
+      margin-bottom: 0.6rem;
     }
-    section .lead { color: var(--muted); max-width: 640px; margin-bottom: 2.5rem; }
+    section .lead { color: var(--muted); max-width: 620px; margin-bottom: 2.6rem; }
+
+    /* ---------- i18n ---------- */
+    html[data-lang="zh"] .l-en { display: none !important; }
+    html[data-lang="en"] .l-zh { display: none !important; }
 
     /* ---------- nav ---------- */
     header {
       position: sticky;
       top: 0;
       z-index: 10;
-      background: rgba(13, 17, 23, 0.85);
-      backdrop-filter: blur(8px);
-      border-bottom: 1px solid var(--border);
+      background: rgba(11, 14, 20, 0.88);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border-soft);
     }
     .nav {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      height: 56px;
+      height: 58px;
     }
     .brand {
       display: flex;
       align-items: center;
       gap: 0.6rem;
       font-weight: 700;
-      font-size: 1.1rem;
+      font-size: 1.08rem;
       color: var(--text);
+      letter-spacing: -0.01em;
     }
     .brand:hover { text-decoration: none; }
     .brand .logo {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
-      background: linear-gradient(135deg, var(--green), var(--blue));
-      color: #0d1117;
-      font-weight: 800;
-      font-size: 0.85rem;
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--green);
+      color: #0b0e14;
+      font-family: Georgia, "Times New Roman", serif;
+      font-style: italic;
+      font-weight: 700;
+      font-size: 1.15rem;
+      line-height: 1;
+      padding-bottom: 2px;
     }
-    .nav-links { display: flex; gap: 1.4rem; font-size: 0.92rem; }
+    .nav-links { display: flex; align-items: center; gap: 1.5rem; font-size: 0.92rem; }
     .nav-links a { color: var(--muted); }
     .nav-links a:hover { color: var(--text); text-decoration: none; }
+    .lang-toggle {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: var(--muted);
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 0.3rem 0.7rem;
+      cursor: pointer;
+      transition: border-color 0.15s ease, color 0.15s ease;
+    }
+    .lang-toggle:hover { border-color: var(--muted); color: var(--text); }
+    .nav-gh {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--text) !important;
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 0.3rem 0.8rem;
+      transition: border-color 0.15s ease;
+    }
+    .nav-gh:hover { border-color: var(--muted); }
+    .nav-gh svg { width: 15px; height: 15px; fill: currentColor; }
 
     /* ---------- hero ---------- */
-    .hero { padding: 6rem 0 3rem; text-align: center; }
+    .hero {
+      position: relative;
+      padding: 6.5rem 0 4rem;
+      text-align: center;
+      overflow: hidden;
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255, 255, 255, 0.022) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.022) 1px, transparent 1px);
+      background-size: 44px 44px;
+      mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, black, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 0%, black, transparent 75%);
+      pointer-events: none;
+    }
+    .hero .container { position: relative; z-index: 1; }
     .hero h1 {
-      font-size: clamp(2.2rem, 5vw, 3.4rem);
+      font-size: clamp(2.3rem, 5.5vw, 3.5rem);
       font-weight: 800;
       letter-spacing: -0.03em;
       line-height: 1.15;
     }
-    .hero h1 .accent {
-      background: linear-gradient(90deg, var(--green), var(--blue));
-      -webkit-background-clip: text;
-      background-clip: text;
-      color: transparent;
-    }
+    .hero h1 .accent { color: var(--green); }
     .hero .tagline {
-      margin: 1.2rem auto 2rem;
-      max-width: 640px;
+      margin: 1.3rem auto 2.1rem;
+      max-width: 600px;
       color: var(--muted);
-      font-size: 1.15rem;
+      font-size: 1.12rem;
     }
-    .badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.6rem; margin-bottom: 2.2rem; }
+    .badges { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.55rem; margin-bottom: 2.3rem; }
     .badge {
       display: inline-flex;
       align-items: center;
-      gap: 0.4rem;
-      font-size: 0.8rem;
+      gap: 0.45rem;
+      font-size: 0.79rem;
       font-family: var(--mono);
       color: var(--muted);
-      background: var(--bg-soft);
+      background: rgba(17, 21, 29, 0.7);
       border: 1px solid var(--border);
       border-radius: 999px;
-      padding: 0.25rem 0.75rem;
+      padding: 0.26rem 0.8rem;
     }
-    .badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .badge .dot { width: 7px; height: 7px; border-radius: 50%; }
     .badge .dot.green { background: var(--green); }
     .badge .dot.blue { background: var(--blue); }
     .badge .dot.yellow { background: var(--yellow); }
     .badge .dot.purple { background: var(--purple); }
-    .cta { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem; }
+    .cta { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.9rem; }
     .btn {
-      display: inline-block;
-      font-size: 0.98rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.96rem;
       font-weight: 600;
-      padding: 0.65rem 1.5rem;
-      border-radius: 8px;
+      padding: 0.68rem 1.55rem;
+      border-radius: 9px;
       border: 1px solid var(--border);
       transition: all 0.15s ease;
     }
     .btn:hover { text-decoration: none; transform: translateY(-1px); }
-    .btn-primary { background: var(--green); border-color: var(--green); color: #0d1117; }
-    .btn-primary:hover { background: var(--green-dim); }
+    .btn-primary {
+      background: var(--green);
+      border-color: var(--green);
+      color: #0b0e14;
+    }
+    .btn-primary:hover { background: var(--green-deep); border-color: var(--green-deep); }
     .btn-secondary { background: var(--bg-soft); color: var(--text); }
     .btn-secondary:hover { border-color: var(--muted); }
+    .btn svg { width: 16px; height: 16px; fill: currentColor; }
 
     /* ---------- terminal mockup ---------- */
     .terminal {
-      margin: 3rem auto 0;
+      margin: 3.4rem auto 0;
       max-width: 760px;
       text-align: left;
       background: var(--bg-code);
       border: 1px solid var(--border);
-      border-radius: 12px;
-      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      border-radius: 13px;
+      box-shadow: 0 30px 70px rgba(0, 0, 0, 0.5);
       overflow: hidden;
     }
     .terminal-bar {
       display: flex;
       align-items: center;
       gap: 0.5rem;
-      padding: 0.7rem 1rem;
+      padding: 0.72rem 1rem;
       background: var(--bg-soft);
-      border-bottom: 1px solid var(--border);
+      border-bottom: 1px solid var(--border-soft);
     }
     .terminal-bar .t-dot { width: 12px; height: 12px; border-radius: 50%; }
     .terminal-bar .t-dot:nth-child(1) { background: #ff5f56; }
@@ -183,16 +258,16 @@
     .terminal-bar .t-title {
       margin-left: 0.5rem;
       font-family: var(--mono);
-      font-size: 0.78rem;
+      font-size: 0.77rem;
       color: var(--muted);
     }
     .terminal-body {
-      padding: 1.2rem 1.4rem;
+      padding: 1.25rem 1.4rem;
       font-family: var(--mono);
       font-size: 0.84rem;
-      line-height: 1.75;
+      line-height: 1.8;
       min-height: 300px;
-      color: #c9d1d9;
+      color: #c4cdd9;
     }
     .t-prompt::before { content: "❯ "; color: var(--green); font-weight: 700; }
     .t-user { color: var(--text); }
@@ -201,14 +276,13 @@
     .t-blue { color: var(--blue); }
     .t-yellow { color: var(--yellow); }
     .t-purple { color: var(--purple); }
-    .t-red { color: var(--red); }
     .t-caret::after {
       content: "▋";
       color: var(--green);
       animation: blink 1s steps(1) infinite;
     }
     @keyframes blink { 50% { opacity: 0; } }
-    .t-line { white-space: pre-wrap; word-break: break-word; min-height: 1.75em; }
+    .t-line { white-space: pre-wrap; word-break: break-word; min-height: 1.8em; }
     .t-hidden { display: none; }
     .t-thinking {
       border-left: 2px solid var(--purple);
@@ -218,80 +292,115 @@
     }
 
     /* ---------- features ---------- */
-    .features { background: var(--bg-soft); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .features { background: var(--bg-soft); border-top: 1px solid var(--border-soft); border-bottom: 1px solid var(--border-soft); }
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 1.2rem;
+      gap: 1.1rem;
     }
     .card {
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 1.4rem 1.5rem;
+      border-radius: 12px;
+      padding: 1.5rem 1.55rem;
+      transition: border-color 0.18s ease, transform 0.18s ease;
     }
-    .card h3 { font-size: 1.05rem; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
-    .card h3 .icon { font-size: 1.1rem; }
-    .card p { color: var(--muted); font-size: 0.93rem; }
-    .card ul { color: var(--muted); font-size: 0.93rem; padding-left: 1.1rem; }
-    .card li { margin: 0.25rem 0; }
+    .card:hover { border-color: #2e3a4b; transform: translateY(-2px); }
+    .card h3 { font-size: 1.03rem; margin-bottom: 0.55rem; display: flex; align-items: center; gap: 0.55rem; }
+    .card h3 .icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 8px;
+      background: var(--bg-soft);
+      border: 1px solid var(--border);
+      font-size: 0.95rem;
+      flex-shrink: 0;
+    }
+    .card p { color: var(--muted); font-size: 0.92rem; }
+    .card ul { color: var(--muted); font-size: 0.92rem; padding-left: 1.15rem; }
+    .card li { margin: 0.3rem 0; }
 
     /* ---------- quickstart ---------- */
-    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
-    .step { margin-bottom: 1.6rem; }
-    .step h3 { font-size: 1rem; margin-bottom: 0.6rem; }
+    .steps-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.2rem;
+      align-items: stretch;
+    }
+    .step {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-soft);
+      border: 1px solid var(--border-soft);
+      border-radius: 12px;
+      padding: 1.3rem 1.4rem;
+    }
+    .step h3 { font-size: 1rem; margin-bottom: 0.8rem; display: flex; align-items: center; }
     .step h3 .num {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       width: 22px; height: 22px;
       border-radius: 6px;
-      background: var(--green);
-      color: #0d1117;
-      font-size: 0.8rem;
-      font-weight: 800;
-      margin-right: 0.5rem;
+      background: rgba(74, 222, 128, 0.14);
+      border: 1px solid rgba(74, 222, 128, 0.35);
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 700;
+      font-family: var(--mono);
+      margin-right: 0.6rem;
+      flex-shrink: 0;
     }
+    .step pre { flex: 1; }
     .muted { color: var(--muted); font-size: 0.9rem; }
     .muted a { color: var(--blue); }
 
-    /* ---------- endpoints ---------- */
-    .endpoints { background: var(--bg-soft); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.92rem;
+    /* ---------- docs ---------- */
+    .docs { background: var(--bg-soft); border-top: 1px solid var(--border-soft); }
+    .doc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 1rem;
+    }
+    .doc-link {
+      display: block;
       background: var(--bg);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      overflow: hidden;
+      border-radius: 12px;
+      padding: 1.25rem 1.35rem;
+      color: var(--text);
+      transition: border-color 0.18s ease, transform 0.18s ease;
     }
-    th, td { text-align: left; padding: 0.8rem 1rem; border-bottom: 1px solid var(--border); vertical-align: top; }
-    th { background: var(--bg-soft); font-weight: 600; font-size: 0.85rem; color: var(--muted); }
-    tr:last-child td { border-bottom: none; }
-    td code { white-space: nowrap; }
-    .status-ok { color: var(--green); font-weight: 600; }
+    .doc-link:hover { text-decoration: none; border-color: rgba(74, 222, 128, 0.45); transform: translateY(-2px); }
+    .doc-link .doc-title { font-weight: 600; font-size: 0.98rem; display: flex; align-items: center; gap: 0.5rem; }
+    .doc-link .doc-title .arrow { margin-left: auto; color: var(--muted); font-size: 0.85rem; transition: transform 0.15s ease; }
+    .doc-link:hover .doc-title .arrow { transform: translate(2px, -2px); color: var(--green); }
+    .doc-link .doc-desc { color: var(--muted); font-size: 0.87rem; margin-top: 0.35rem; }
 
     /* ---------- footer ---------- */
     footer {
-      border-top: 1px solid var(--border);
-      padding: 3rem 0;
+      border-top: 1px solid var(--border-soft);
+      padding: 2.8rem 0;
       color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 0.89rem;
     }
-    footer .container { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; }
+    footer .container { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.8rem 2rem; }
     footer a { color: var(--muted); }
-    footer a:hover { color: var(--text); }
+    footer a:hover { color: var(--text); text-decoration: none; }
 
     @media (max-width: 760px) {
-      .two-col { grid-template-columns: 1fr; }
-      .nav-links { display: none; }
-      section { padding: 3rem 0; }
-      .hero { padding: 4rem 0 2rem; }
+      .steps-grid { grid-template-columns: 1fr; }
+      .nav-links a:not(.nav-gh) { display: none; }
+      section { padding: 3.4rem 0; }
+      .hero { padding: 4.2rem 0 2.6rem; }
     }
     @media (prefers-reduced-motion: reduce) {
       html { scroll-behavior: auto; }
       .t-caret::after { animation: none; }
+      .card, .doc-link, .btn { transition: none; }
     }
   </style>
 </head>
@@ -300,17 +409,20 @@
 <header>
   <div class="container nav">
     <a class="brand" href="/">
-      <span class="logo">P</span> Rpi
+      <span class="logo">π</span> Rpi
     </a>
     <nav class="nav-links">
-      <a href="#features">特性</a>
-      <a href="#quickstart">快速开始</a>
-      <a href="#endpoints">端点</a>
-      <a href="/changelog">Changelog</a>
-      <!-- TODO: 填写仓库地址后启用
-      <a href="https://github.com/your-org/rpi">GitHub</a>
-      -->
-      <a href="#docs">文档</a>
+      <a href="#features"><span class="l-zh">特性</span><span class="l-en">Features</span></a>
+      <a href="#quickstart"><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></a>
+      <a href="/docs"><span class="l-zh">文档</span><span class="l-en">Docs</span></a>
+      <a href="/docs#/changelog"><span class="l-zh">更新日志</span><span class="l-en">Changelog</span></a>
+      <button class="lang-toggle" id="lang-toggle" type="button" aria-label="Switch language">
+        <span class="l-zh">EN</span><span class="l-en">中文</span>
+      </button>
+      <a class="nav-gh" href="https://github.com/zhuacloud/rpi">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
     </nav>
   </div>
 </header>
@@ -320,25 +432,31 @@
   <!-- ================= Hero ================= -->
   <section class="hero">
     <div class="container">
-      <h1>源于 Pi 的<br><span class="accent">Rust coding agent</span></h1>
+      <h1>
+        <span class="l-zh">终端里的<br><span class="accent">AI 编程搭档</span></span>
+        <span class="l-en">The AI coding partner<br><span class="accent">in your terminal</span></span>
+      </h1>
       <p class="tagline">
-        Rpi 源于 <a href="https://github.com/earendil-works/pi">Pi</a>，
-        用 Rust 完整移植的终端 AI 编程搭档：自带 TUI、工具执行、扩展宿主与 38 个内置 provider。
+        <span class="l-zh">Rpi 是一个用 Rust 编写的终端 AI 编程助手：读代码、改文件、跑命令、管理会话，全都在你的终端里完成。项目源自 <a href="https://github.com/earendil-works/pi">Pi</a>。</span>
+        <span class="l-en">Rpi is a terminal AI coding assistant written in Rust: it reads code, edits files, runs commands and manages sessions — all without leaving your terminal. The project originates from <a href="https://github.com/earendil-works/pi">Pi</a>.</span>
       </p>
       <div class="badges">
-        <span class="badge"><span class="dot green"></span>MIT License</span>
-        <span class="badge"><span class="dot blue"></span>Rust</span>
+        <span class="badge"><span class="dot green"></span><span class="l-zh">MIT 开源</span><span class="l-en">MIT License</span></span>
+        <span class="badge"><span class="dot blue"></span><span class="l-zh">Rust 单二进制</span><span class="l-en">Single Rust binary</span></span>
         <span class="badge"><span class="dot yellow"></span>v0.1.0</span>
-        <span class="badge"><span class="dot purple"></span>Wasm + 原生扩展</span>
-        <span class="badge"><span class="dot green"></span>零遥测可配</span>
+        <span class="badge"><span class="dot purple"></span><span class="l-zh">38 家模型服务商</span><span class="l-en">38 model providers</span></span>
+        <span class="badge"><span class="dot green"></span><span class="l-zh">插件可扩展</span><span class="l-en">Extensible</span></span>
       </div>
       <div class="cta">
-        <a class="btn btn-primary" href="#quickstart">快速开始</a>
-        <a class="btn btn-secondary" href="#features">了解特性</a>
+        <a class="btn btn-primary" href="#quickstart"><span class="l-zh">快速开始</span><span class="l-en">Get started</span></a>
+        <a class="btn btn-secondary" href="https://github.com/zhuacloud/rpi">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          <span class="l-zh">GitHub 仓库</span><span class="l-en">GitHub</span>
+        </a>
       </div>
 
-      <!-- 终端演示：与 pi 的 TUI 交互形态一致 -->
-      <div class="terminal" aria-hidden="false">
+      <!-- 终端演示 -->
+      <div class="terminal">
         <div class="terminal-bar">
           <span class="t-dot"></span><span class="t-dot"></span><span class="t-dot"></span>
           <span class="t-title">rpi — ~/develop/ai/rpi</span>
@@ -362,32 +480,54 @@
   <!-- ================= Features ================= -->
   <section class="features" id="features">
     <div class="container">
-      <h2>为什么是 Rpi</h2>
-      <p class="lead">Rpi 是 Pi（earendil-works/pi）coding agent 的 Rust 移植：继承其交互形态与扩展模型，四层 crate 清晰拆分，独立演进。</p>
+      <p class="kicker">Features</p>
+      <h2><span class="l-zh">为什么是 Rpi</span><span class="l-en">Why Rpi</span></h2>
+      <p class="lead">
+        <span class="l-zh">一个趁手的终端编程助手该有的样子：启动快、看得懂你的项目、改得动你的代码，还能按你的习惯扩展。</span>
+        <span class="l-en">Everything a handy terminal coding assistant should be: fast to start, aware of your project, able to change your code, and easy to extend.</span>
+      </p>
       <div class="grid">
         <div class="card">
-          <h3><span class="icon">🧩</span> 四层 crate 架构</h3>
-          <p><code>rpi-ai</code> provider/适配层 · <code>rpi-agent</code> agent 循环与 harness · <code>rpi-tui</code> 终端渲染 · <code>rpi</code> 组装与 CLI。职责清晰，可独立复用。</p>
+          <h3><span class="icon">⚡</span><span class="l-zh">Rust 单二进制</span><span class="l-en">Single Rust binary</span></h3>
+          <p>
+            <span class="l-zh">编译产出是一个静态链接的可执行文件，不依赖 Node、Python 或任何运行时。拷到机器上就能跑，启动毫秒级。</span>
+            <span class="l-en">Builds into one statically linked executable — no Node, no Python, no runtime at all. Copy it onto a machine and it just runs, with millisecond startup.</span>
+          </p>
         </div>
         <div class="card">
-          <h3><span class="icon">🔌</span> 扩展宿主</h3>
-          <p>双通道扩展：L1 Wasm（ABI v1）+ L0 原生动态库（abi_stable），两阶段信任加载、33 事件 / 24 API / 28 UI 方法，支持 <code>/reload</code> 热更。</p>
+          <h3><span class="icon">🖥️</span><span class="l-zh">完整的终端体验</span><span class="l-en">A complete terminal UI</span></h3>
+          <p>
+            <span class="l-zh">多轮对话、流式输出、代码语法高亮、斜杠命令、<code>@</code> 模糊引用文件、会话树回看与分支——在终端里就是完整的工作台。</span>
+            <span class="l-en">Multi-turn chat, streaming output, syntax highlighting, slash commands, <code>@</code> fuzzy file references, and a session tree you can revisit and branch — a full workbench in your terminal.</span>
+          </p>
         </div>
         <div class="card">
-          <h3><span class="icon">🖥️</span> 终端原生体验</h3>
-          <p>完整 TUI：会话树、slash 命令、选择器、语法高亮（syntect）、HTML export 与 gist share。交互模式与 headless / RPC 三模式并存。</p>
+          <h3><span class="icon">🛠️</span><span class="l-zh">真正能干活</span><span class="l-en">Gets real work done</span></h3>
+          <p>
+            <span class="l-zh">内置读文件、改代码、执行命令等工具，长对话自动压缩上下文不中断；可以把会话导出成 HTML，或一键生成链接分享给同事。</span>
+            <span class="l-en">Built-in tools for reading files, editing code and running commands, with automatic context compaction on long conversations. Export sessions to HTML or share them with a link.</span>
+          </p>
         </div>
         <div class="card">
-          <h3><span class="icon">☁️</span> 38 个内置 provider</h3>
-          <p>OpenAI、Anthropic、DeepSeek、MiniMax、Kimi、Moonshot、Google、Bedrock…开箱即用；模型目录由本站点静态下发，支持 ETag 增量更新。</p>
+          <h3><span class="icon">☁️</span><span class="l-zh">38 家模型服务商</span><span class="l-en">38 model providers</span></h3>
+          <p>
+            <span class="l-zh">OpenAI、Anthropic、DeepSeek、Kimi、Google、Bedrock……开箱内置 38 家服务商的模型清单，填个 API Key 就能切换使用。</span>
+            <span class="l-en">OpenAI, Anthropic, DeepSeek, Kimi, Google, Bedrock… model catalogs for 38 providers ship out of the box — add an API key and switch models anytime.</span>
+          </p>
         </div>
         <div class="card">
-          <h3><span class="icon">🔒</span> 隐私优先</h3>
-          <p>全部产品端点自托管（本站即部署源）且可逐项关闭：<code>RPI_MODEL_CATALOG_URL</code>、<code>RPI_VERSION_CHECK_URL</code>、<code>RPI_TELEMETRY_URL</code> 设 <code>off</code> 即零请求；telemetry payload 仅版本号。</p>
+          <h3><span class="icon">🔌</span><span class="l-zh">插件可扩展</span><span class="l-en">Extensible with plugins</span></h3>
+          <p>
+            <span class="l-zh">想用自己喜欢的语言写插件？Rpi 同时支持 WebAssembly 插件和原生动态库插件，挂载后无需重启即可热重载。</span>
+            <span class="l-en">Write plugins in the language you like: Rpi supports both WebAssembly and native dynamic-library plugins, with hot reload — no restart required.</span>
+          </p>
         </div>
         <div class="card">
-          <h3><span class="icon">🌱</span> 项目来源</h3>
-          <p>由 Pi（<a href="https://github.com/earendil-works/pi">earendil-works/pi</a>）移植而来，保留 MIT 许可；上游参考实现在 <code>external/pi/</code>，设计决策记录于 <code>docs/</code> 与 ADR。</p>
+          <h3><span class="icon">🔒</span><span class="l-zh">隐私由你掌控</span><span class="l-en">Privacy under your control</span></h3>
+          <p>
+            <span class="l-zh">不强制上传任何数据。模型目录、版本检查等网络请求都可以用环境变量逐项关闭，配置文件都在本机 <code>~/.rpi</code> 目录下。</span>
+            <span class="l-en">Nothing is uploaded unless you want it to be. Model catalog, version check and other requests can each be disabled via environment variables; all configuration stays local in <code>~/.rpi</code>.</span>
+          </p>
         </div>
       </div>
     </div>
@@ -396,116 +536,89 @@
   <!-- ================= Quickstart ================= -->
   <section id="quickstart">
     <div class="container">
-      <h2>快速开始</h2>
-      <p class="lead">单二进制、零运行时依赖（musl 静态构建），从源码构建或直接使用发布产物。</p>
-      <div class="two-col">
-        <div>
-          <div class="step">
-            <h3><span class="num">1</span>构建</h3>
-            <pre><code>git clone &lt;your-repo-url&gt; rpi &amp;&amp; cd rpi
-cargo build --release
-./target/release/rpi</code></pre>
-          </div>
-          <div class="step">
-            <h3><span class="num">2</span>配置 provider</h3>
-            <pre><code># 官方 38 个 provider 已内置，只需写自定义/覆盖：
-# ~/.rpi/agent/models.json（可选）
+      <p class="kicker">Quickstart</p>
+      <h2><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></h2>
+      <p class="lead">
+        <span class="l-zh">三分钟跑起来：从源码构建，配上你的模型 Key，然后开始对话。</span>
+        <span class="l-en">Up and running in three minutes: build from source, add your model key, and start chatting.</span>
+      </p>
+      <div class="steps-grid">
+        <div class="step">
+          <h3><span class="num">1</span><span class="l-zh">从源码构建</span><span class="l-en">Build from source</span></h3>
+          <pre><code><span class="p">$</span> git clone https://github.com/zhuacloud/rpi.git
+<span class="p">$</span> cd rpi
+<span class="p">$</span> cargo build --release
+<span class="p">$</span> ./target/release/rpi</code></pre>
+        </div>
+        <div class="step">
+          <h3><span class="num">2</span><span class="l-zh">配置模型</span><span class="l-en">Configure a model</span></h3>
+          <pre class="l-zh"><code><span class="c"># 在 ~/.rpi/agent/models.json 里加入你的 Key（以 DeepSeek 为例）</span>
 {"providers": {"deepseek": {
   "apiKey": "DEEPSEEK_API_KEY",
   "models": [{"id": "deepseek-v4-flash"}]}}}</code></pre>
-          </div>
+          <pre class="l-en"><code><span class="c"># Add your key in ~/.rpi/agent/models.json (DeepSeek example)</span>
+{"providers": {"deepseek": {
+  "apiKey": "DEEPSEEK_API_KEY",
+  "models": [{"id": "deepseek-v4-flash"}]}}}</code></pre>
         </div>
-        <div>
-          <div class="step">
-            <h3><span class="num">3</span>端点自托管（可选）</h3>
-            <pre><code># 默认已指向本站；自建请见 deploy/resetpi/
-export RPI_MODEL_CATALOG_URL=https://resetpi.com
-export RPI_VERSION_CHECK_URL=https://resetpi.com/api/latest-version
-export RPI_TELEMETRY_URL=https://resetpi.com/api/report-install</code></pre>
-          </div>
-          <div class="step">
-            <h3><span class="num">4</span>开始使用</h3>
-            <pre><code>rpi                     # 交互模式
-rpi --print "重构这个函数"  # headless 一次问答
-rpi --rpc               # RPC 服务（32 命令）</code></pre>
-          </div>
+        <div class="step">
+          <h3><span class="num">3</span><span class="l-zh">开始使用</span><span class="l-en">Start using it</span></h3>
+          <pre class="l-zh"><code><span class="p">$</span> rpi                        <span class="c"># 交互模式：边聊边改</span>
+<span class="p">$</span> rpi --print "重构这个函数"    <span class="c"># 一次性问答，适合脚本</span>
+<span class="p">$</span> rpi --rpc                  <span class="c"># RPC 模式：给其他程序调用</span></code></pre>
+          <pre class="l-en"><code><span class="p">$</span> rpi                           <span class="c"># interactive: chat and edit</span>
+<span class="p">$</span> rpi --print "refactor this"   <span class="c"># one-shot, script-friendly</span>
+<span class="p">$</span> rpi --rpc                     <span class="c"># RPC mode for other programs</span></code></pre>
+        </div>
+        <div class="step">
+          <h3><span class="num">4</span><span class="l-zh">（可选）关掉网络请求</span><span class="l-en">(Optional) Disable requests</span></h3>
+          <pre class="l-zh"><code><span class="c"># 不需要模型目录更新 / 版本检查时，逐项关闭：</span>
+<span class="p">$</span> export RPI_MODEL_CATALOG_URL=off
+<span class="p">$</span> export RPI_VERSION_CHECK_URL=off
+<span class="p">$</span> export RPI_TELEMETRY_URL=off</code></pre>
+          <pre class="l-en"><code><span class="c"># Turn off catalog updates / version checks individually:</span>
+<span class="p">$</span> export RPI_MODEL_CATALOG_URL=off
+<span class="p">$</span> export RPI_VERSION_CHECK_URL=off
+<span class="p">$</span> export RPI_TELEMETRY_URL=off</code></pre>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ================= Endpoints ================= -->
-  <section class="endpoints" id="endpoints">
-    <div class="container">
-      <h2>产品端点</h2>
-      <p class="lead">本站托管 rpi 的全部产品回调；静态托管 + Pages Functions，无后端。每个端点均可在客户端用 <code>RPI_*</code> 环境变量或 <code>settings.json</code> 覆盖或关闭。</p>
-      <table>
-        <thead>
-          <tr><th>端点</th><th>用途</th><th>状态</th></tr>
-        </thead>
-        <tbody>
-          <tr>
-            <td><code>/api/models/providers/{id}</code></td>
-            <td>远程模型目录 overlay——38 个内置 provider 的模型清单，ETag/304 增量 revalidate</td>
-            <td><span class="status-ok">● 运行中</span></td>
-          </tr>
-          <tr>
-            <td><code>/api/latest-version</code></td>
-            <td>版本检查（<code>{"version","packageName","note"}</code>），交互模式启动时异步探测</td>
-            <td><span class="status-ok">● 运行中</span></td>
-          </tr>
-          <tr>
-            <td><code>/api/report-install</code></td>
-            <td>install telemetry 收口（GET <code>?version=</code>），payload 仅版本号</td>
-            <td><span class="status-ok">● 运行中</span></td>
-          </tr>
-          <tr>
-            <td><code>/session/#{gistId}</code></td>
-            <td>会话分享 viewer（gist id 走 URL fragment，前端渲染）</td>
-            <td><span class="status-ok">● 运行中</span></td>
-          </tr>
-          <tr>
-            <td><code>/changelog</code></td>
-            <td>更新横幅里的 changelog 页面</td>
-            <td><span class="status-ok">● 运行中</span></td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-
   <!-- ================= Docs ================= -->
-  <section id="docs">
+  <section class="docs" id="docs">
     <div class="container">
-      <h2>文档与参与</h2>
-      <p class="lead">完整的需求、设计与决策记录都在仓库 <code>docs/</code> 下；所有偏离均有 ADR 背书。</p>
-      <div class="grid">
-        <div class="card">
-          <h3>📖 项目文档</h3>
-          <ul>
-            <li>需求规格（<code>docs/01-requirements.md</code>）——功能与验收里程碑</li>
-            <li>架构设计（<code>docs/02-design.md</code>）——crate 划分与核心设计</li>
-            <li>Extension ABI v1（wasm / 原生动态库）</li>
-            <li>上游参考实现对照（<code>external/pi/</code> + <code>UPSTREAM.md</code>）</li>
-          </ul>
-        </div>
-        <div class="card">
-          <h3>🤝 贡献</h3>
-          <ul>
-            <li>以 <code>external/pi/</code> 为参考实现，设计与决策记录于 ADR</li>
-            <li>测试纪律：单元测试零网络，产品端点注入 no-op transport</li>
-            <li>MIT 许可</li>
-          </ul>
-        </div>
-        <div class="card">
-          <h3>⚙️ 部署本站</h3>
-          <ul>
-            <li>源文件：<code>deploy/resetpi/</code>（仓库内）</li>
-            <li>重新生成：<code>python3 deploy/resetpi/scripts/generate-site.py</code></li>
-            <li>发布：<code>npx wrangler pages deploy deploy/resetpi</code></li>
-            <li>发版时同步更新 <code>/api/latest-version</code> 与 <code>/changelog</code></li>
-          </ul>
-        </div>
+      <p class="kicker">Docs</p>
+      <h2><span class="l-zh">文档</span><span class="l-en">Documentation</span></h2>
+      <p class="lead">
+        <span class="l-zh">项目介绍、使用说明与插件开发指南，都在本站文档中心。</span>
+        <span class="l-en">Project introduction, usage guides and the plugin development guide — all in the docs center on this site.</span>
+      </p>
+      <div class="doc-grid">
+        <a class="doc-link" href="/docs#/intro">
+          <span class="doc-title"><span class="l-zh">项目介绍</span><span class="l-en">Introduction</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">Rpi 是什么、从哪来、能做什么</span><span class="l-en">What Rpi is, where it comes from, what it does</span></p>
+        </a>
+        <a class="doc-link" href="/docs#/quickstart">
+          <span class="doc-title"><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">构建、配置模型与三种运行模式</span><span class="l-en">Build, configure a model, and the three run modes</span></p>
+        </a>
+        <a class="doc-link" href="/docs#/changelog">
+          <span class="doc-title"><span class="l-zh">更新记录</span><span class="l-en">Changelog</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">每个版本的变更记录</span><span class="l-en">What changed in each release</span></p>
+        </a>
+        <a class="doc-link" href="/docs#/extensions">
+          <span class="doc-title"><span class="l-zh">插件开发指南</span><span class="l-en">Plugin guide</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">用 WebAssembly 或原生动态库编写扩展</span><span class="l-en">Write extensions in WebAssembly or as native libraries</span></p>
+        </a>
+        <a class="doc-link" href="https://github.com/zhuacloud/rpi">
+          <span class="doc-title"><span class="l-zh">GitHub 仓库</span><span class="l-en">GitHub repository</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">源码、Issue 与完整设计文档</span><span class="l-en">Source code, issues and full design documents</span></p>
+        </a>
+        <a class="doc-link" href="https://github.com/earendil-works/pi">
+          <span class="doc-title"><span class="l-zh">上游项目 Pi</span><span class="l-en">Upstream project Pi</span> <span class="arrow">↗</span></span>
+          <p class="doc-desc"><span class="l-zh">Rpi 的设计原型与灵感来源</span><span class="l-en">The design origin and inspiration of Rpi</span></p>
+        </a>
       </div>
     </div>
   </section>
@@ -515,18 +628,39 @@ rpi --rpc               # RPC 服务（32 命令）</code></pre>
 <footer>
   <div class="container">
     <div>
-      <strong style="color: var(--text)">Rpi</strong> · 用 Rust 复刻的 Pi coding agent
+      <strong style="color: var(--text)">Rpi</strong> ·
+      <span class="l-zh">用 Rust 编写的终端 AI 编程助手</span>
+      <span class="l-en">a terminal AI coding assistant written in Rust</span>
     </div>
     <div>
-      <a href="/changelog">Changelog</a> · <a href="#endpoints">Endpoints</a> ·
-      <!-- TODO: 填写仓库地址后启用 <a href="https://github.com/your-org/rpi">GitHub</a> · -->
-      <span>MIT License</span> · 上游致谢 <a href="https://github.com/earendil-works/pi">earendil-works/pi</a>
+      <a href="https://github.com/zhuacloud/rpi">GitHub</a> ·
+      <a href="/docs"><span class="l-zh">文档</span><span class="l-en">Docs</span></a> ·
+      <span>MIT License</span> ·
+      <span class="l-zh">致谢上游 </span><span class="l-en">Thanks to upstream </span><a href="https://github.com/earendil-works/pi">earendil-works/pi</a>
     </div>
   </div>
 </footer>
 
 <script>
-  // 终端演示：逐行打字机回放，prefers-reduced-motion 时直接全显。
+  // 语言切换
+  (function () {
+    var titles = {
+      zh: "Rpi — 终端里的 AI 编程搭档",
+      en: "Rpi — The AI coding partner in your terminal"
+    };
+    function setLang(l) {
+      document.documentElement.dataset.lang = l;
+      document.documentElement.lang = (l === "zh") ? "zh-CN" : "en";
+      document.title = titles[l] || titles.zh;
+      try { localStorage.setItem("rpi-lang", l); } catch (e) {}
+    }
+    setLang(document.documentElement.dataset.lang === "en" ? "en" : "zh");
+    document.getElementById("lang-toggle").addEventListener("click", function () {
+      setLang(document.documentElement.dataset.lang === "zh" ? "en" : "zh");
+    });
+  })();
+
+  // 终端演示：逐行回放，prefers-reduced-motion 时直接全显。
   (function () {
     var demo = document.getElementById("demo");
     var lines = Array.prototype.slice.call(demo.children);
@@ -539,11 +673,9 @@ rpi --rpc               # RPC 服务（32 命令）</code></pre>
       if (i >= lines.length) { return; }
       lines[i].classList.remove("t-hidden");
       i += 1;
-      // 最后一行是光标行，保留闪烁
       if (i >= lines.length) { return; }
       setTimeout(showNext, i === 1 ? 500 : 900 + Math.random() * 700);
     }
-    // 等终端进入视口附近再开始
     if ("IntersectionObserver" in window) {
       var io = new IntersectionObserver(function (entries) {
         if (entries[0].isIntersecting) { showNext(); io.disconnect(); }

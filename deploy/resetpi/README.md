@@ -2,8 +2,9 @@
 
 rpi 的 5 个产品端点默认值自 ADR-0009 起指向 `resetpi.com`。本目录是
 Cloudflare Pages 项目：静态目录内容 + Pages Functions，零后端。
-`index.html` 为站点首页（开源项目主页，含特性/快速开始/端点说明），
-`/` 请求直接命中。
+`index.html` 为站点首页（项目介绍/特性/快速开始，中英双语，语言偏好存
+localStorage），`/` 请求直接命中；`docs.html` 为文档中心（`/docs`，hash
+路由 `#/intro` `#/quickstart` `#/changelog` `#/extensions` 四篇）。
 
 ## 端点 → 文件映射
 
