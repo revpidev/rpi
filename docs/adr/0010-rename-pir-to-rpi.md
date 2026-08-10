@@ -36,7 +36,7 @@ pir 是 Pi 的 Rust 移植，独立分发（ADR-0001 起已把命名从 `PI_*` �
   一次性搬移（本机已 `mv`，auth/settings/models/sessions 随迁）。
 - **上游引用保留**：`Pi`、`external/pi/`、`pi.dev`（radius 上游托管服务）等
   对上游的指称不改；`parity_*`（对拍测试）命名保留。
-- 文档、部署站点（`deploy/resetpi/`，brand 为 Rpi）、示例扩展同步改名。
+- 文档、部署站点（`deploy/revpi/`，brand 为 Rpi）、示例扩展同步改名。
 
 ## 影响与回退
 

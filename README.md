@@ -12,7 +12,7 @@
 | [UPSTREAM](./UPSTREAM.md) | 钉死的 Pi commit（0.82.1 / `2efa728`） |
 | [ADR-0001](./docs/adr/0001-extension-and-config-dir.md) | 扩展=Rust/Wasm；配置=`~/.rpi` |
 | [ADR-0002](./docs/adr/0002-baseline-decisions.md) | 版本钉死、TUI、token、单文件、JSONL、endpoint、MIT |
-| [ADR-0009](./docs/adr/0009-product-endpoints-resetpi.md) | 产品端点默认值迁移 resetpi.com（Cloudflare Pages 自部署，`deploy/resetpi/`） |
+| [ADR-0009](./docs/adr/0009-product-endpoints.md) | 产品端点默认值迁移 resetpi.com（Cloudflare Pages 自部署，`deploy/revpi/`） |
 | [ADR-0010](./docs/adr/0010-rename-pir-to-rpi.md) | 项目改名 rpi（crate/env/目录/ABI 全量） |
 | [ADR-0011](./docs/adr/0011-product-endpoints-revpi-dev.md) | 产品端点域名 resetpi.com → revpi.dev（ADR-0009 域名部分取代） |
 | [Extension ABI](./docs/extension-abi.md) | wasm（L1）/ 原生动态库（L0）扩展 ABI v1 |

@@ -4,7 +4,7 @@
 - **日期**：2026-08-09
 - **关联**：[`01-requirements.md`](../01-requirements.md) §8（产品 endpoint）、
   [D-046](../plan/v0.1/deviations/D-046-product-endpoints-telemetry-rust-notes.md)、
-  ADR-0002（基线决策，含端点可配置）、部署内容 `deploy/resetpi/`
+  ADR-0002（基线决策，含端点可配置）、部署内容 `deploy/revpi/`
 
 ## 背景
 
@@ -26,7 +26,7 @@ rpi 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 
 ## 决策
 
 5 个端点默认值改为 `resetpi.com`（`https://resetpi.com` 为 base），内容用
-**Cloudflare Pages 静态托管 + Pages Functions** 部署（`deploy/resetpi/`）：
+**Cloudflare Pages 静态托管 + Pages Functions** 部署（`deploy/revpi/`）：
 
 - 模型目录：37 个静态 JSON（构建脚本从 `crates/rpi-ai/src/providers/data/*.json`
   生成，`{"models":[...]}` 平铺）；Pages 静态资产自带 ETag/Last-Modified，

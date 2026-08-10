@@ -1,7 +1,7 @@
 # Cloudflare Pages project for the revpi.dev product endpoints (ADR-0009).
 #
 # Deploy from the repository root:
-#   cd deploy/resetpi && npx wrangler pages deploy . --project-name=revpi --branch main
+#   cd deploy/revpi && npx wrangler pages deploy . --project-name=revpi --branch main
 #
 # Optional: install-count telemetry recording (functions/api/report-install.js
 # writes into this KV namespace when bound):

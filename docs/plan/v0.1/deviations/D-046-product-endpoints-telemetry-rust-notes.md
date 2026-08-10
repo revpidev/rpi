@@ -79,7 +79,7 @@ payload。TUI 行为差异仅两处新增：启动版本检查通知块（上游
 ## 补记（2026-08-09，ADR-0009）
 
 默认值自 ADR-0009 起迁移到 `revpi.dev`（Cloudflare Pages 自部署，见
-`deploy/resetpi/`）：`DEFAULT_CATALOG_BASE_URL`、`LATEST_VERSION_URL`、
+`deploy/revpi/`）：`DEFAULT_CATALOG_BASE_URL`、`LATEST_VERSION_URL`、
 `DEFAULT_REPORT_INSTALL_URL`、`DEFAULT_SHARE_VIEWER_URL`、changelog 链接五处。
 第 1 条「不改变任何默认行为」随之失效——**默认配置下端点 URL 与上游不同**
 （行为级偏离，由 ADR-0009 记录）；覆盖链（env > settings > `off` > `RPI_OFFLINE`）

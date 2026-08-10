@@ -3,9 +3,9 @@
 
 Run from the repository root:
 
-    python3 deploy/resetpi/scripts/generate-site.py
+    python3 deploy/revpi/scripts/generate-site.py
 
-Output (Cloudflare Pages project rooted at deploy/resetpi/):
+Output (Cloudflare Pages project rooted at deploy/revpi/):
 
 - api/models/providers/{providerId}.json — one catalog per built-in provider.
   The rpi client fetches `GET {catalogBaseUrl}/api/models/providers/{id}`
@@ -29,7 +29,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 DATA = REPO / "crates/rpi-ai/src/providers/data"
-SITE = REPO / "deploy/resetpi"
+SITE = REPO / "deploy/revpi"
 OUT_PROVIDERS = SITE / "api/models/providers"
 OUT_VERSION = SITE / "api/latest-version.json"
 
@@ -92,7 +92,7 @@ def main() -> int:
     generate_latest_version(version, args.note)
     print(f"catalogs: {len(generated)} providers under {OUT_PROVIDERS.relative_to(REPO)}")
     print(f"version:  {OUT_VERSION.relative_to(REPO)} -> v{version}")
-    print("deploy:   cd deploy/resetpi && npx wrangler pages deploy . --project-name=revpi --branch main")
+    print("deploy:   cd deploy/revpi && npx wrangler pages deploy . --project-name=revpi --branch main")
     return 0
 
 

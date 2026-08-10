@@ -20,14 +20,14 @@ Pages Functions，零后端。
 
 ```bash
 # 1. 生成 catalog 与 latest-version（在 rpi 仓库根运行；版本默认取 workspace Cargo.toml）
-python3 deploy/resetpi/scripts/generate-site.py
-#    发版时：python3 deploy/resetpi/scripts/generate-site.py --version 0.2.0 --note "..."
+python3 deploy/revpi/scripts/generate-site.py
+#    发版时：python3 deploy/revpi/scripts/generate-site.py --version 0.2.0 --note "..."
 
 # 2. 部署（首次需 npx wrangler login）
 npx wrangler pages project create revpi --production-branch main
 #    注意：wrangler 4.x 的 Pages Functions 目录取「当前工作目录/functions」，
-#    必须在 deploy/resetpi 目录内执行部署（仓库根目录部署会丢失 functions）
-cd deploy/resetpi && npx wrangler pages deploy . --project-name=revpi --branch main
+#    必须在 deploy/revpi 目录内执行部署（仓库根目录部署会丢失 functions）
+cd deploy/revpi && npx wrangler pages deploy . --project-name=revpi --branch main
 
 # 3. 自定义域（DNS 在 Cloudflare 托管时自动配置）
 #    Pages 控制台 → Custom domains → 添加 revpi.dev
