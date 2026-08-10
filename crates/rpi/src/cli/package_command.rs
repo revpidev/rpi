@@ -3,12 +3,13 @@
 //! @ pi 0.82.1 (2efa728) — W6-C landed the `update --models` target (remote
 //! model catalog refresh); T14-W2 landed `install` / `remove`
 //! (`uninstall`) / `list`; T14-W3 lands the remaining `update` targets
-//! (self / extensions / all / single-source) with the self-update plan,
-//! release-note rendering, and install-method command construction. T18
-//! adds the rpi-specific binary lifecycle (ADR-0011, D-054): Binary
-//! installs self-update for real (no more "print + exit 1"), and
-//! `self-uninstall` removes the binary install. The `config` command
-//! lives in `cli::config_command`.
+//! (self / extensions / all / single-source) with the self-update plan and
+//! release-note rendering (the upstream install-method command construction
+//! was dropped with the ADR-0011 revision, 2026-08-10, D-055: rpi is
+//! distributed only as a GitHub Releases binary). T18 adds the rpi-specific
+//! binary lifecycle (ADR-0011, D-054): Binary installs self-update for real
+//! (no more "print + exit 1"), and `self-uninstall` removes the binary
+//! install. The `config` command lives in `cli::config_command`.
 //!
 //! Intentional differences (D-037, D-041):
 //! - `--force` is inert for the models target (the refresh always runs with
@@ -28,17 +29,12 @@ use rpi_tui::components::markdown::{Markdown, MarkdownTheme};
 use rpi_tui::tui::Component;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{
-    detect_install_method, get_self_update_command, get_self_update_unavailable_instruction,
-    system_command_probe, InstallMethod, SelfUpdateCommand, SelfUpdatePackageTarget, APP_NAME,
-    PACKAGE_NAME, VERSION,
-};
+use crate::config::{APP_NAME, PACKAGE_NAME, VERSION};
 use crate::core::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput, DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
 };
 use crate::core::package_manager::{
-    CommandRequest, ConfiguredPackage, DefaultPackageManager, PackageCommandRunner,
-    SystemPackageCommandRunner,
+    ConfiguredPackage, DefaultPackageManager, PackageCommandRunner, SystemPackageCommandRunner,
 };
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
@@ -303,7 +299,6 @@ async fn refresh_model_catalogs() -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelfUpdatePlan {
     pub package_name: String,
-    pub install_spec: String,
     pub version: String,
     pub should_run: bool,
     pub note: Option<String>,
@@ -337,14 +332,12 @@ async fn get_self_update_plan(
     let package_name = latest_release
         .package_name
         .unwrap_or_else(|| PACKAGE_NAME.to_string());
-    let install_spec = format!("{package_name}@{}", latest_release.version);
     if force
         || package_name != PACKAGE_NAME
         || is_newer_package_version(&latest_release.version, VERSION)
     {
         return Ok(SelfUpdatePlan {
             package_name,
-            install_spec,
             version: latest_release.version,
             should_run: true,
             note: latest_release.note,
@@ -354,25 +347,10 @@ async fn get_self_update_plan(
     println!("{APP_NAME} is already up to date (v{VERSION})");
     Ok(SelfUpdatePlan {
         package_name,
-        install_spec,
         version: latest_release.version,
         should_run: false,
         note: None,
     })
-}
-
-/// `runSelfUpdate` (package-manager-cli.ts:503-524): the steps run with
-/// inherited stdio through the package command runner.
-fn run_self_update(
-    command: &SelfUpdateCommand,
-    runner: &dyn PackageCommandRunner,
-) -> Result<(), String> {
-    println!("Updating {APP_NAME} with {}...", command.display);
-    for step in &command.steps {
-        let args: Vec<&str> = step.args.iter().map(String::as_str).collect();
-        runner.run(&CommandRequest::new(&step.command, &args))?;
-    }
-    Ok(())
 }
 
 /// The Binary branch of the self target (T18, ADR-0011 §4): download +
@@ -454,30 +432,6 @@ async fn run_binary_self_update_branch(
             eprintln!("Error: {message}");
             1
         }
-    }
-}
-
-/// `printSelfUpdateUnavailable` (package-manager-cli.ts:424-436). The
-/// executable location line uses the rpi name (ADR-0001); upstream's
-/// literal is `Location of pi executable: …` with `process.argv[1]`, and
-/// the current executable takes the argv[1] role here (D-041).
-fn print_self_update_unavailable(
-    npm_command: Option<&[String]>,
-    update_package_target: &SelfUpdatePackageTarget,
-) {
-    eprintln!("error: {APP_NAME} cannot self-update this installation.");
-    eprintln!(
-        "{}",
-        get_self_update_unavailable_instruction(
-            PACKAGE_NAME,
-            npm_command,
-            update_package_target,
-            &system_command_probe,
-        )
-    );
-    if let Ok(exe) = std::env::current_exe() {
-        eprintln!();
-        eprintln!("Location of {APP_NAME} executable: {}", exe.display());
     }
 }
 
@@ -624,7 +578,6 @@ pub async fn run_update_in(
             error.error
         );
     }
-    let npm_command = settings_manager.get_npm_command();
     // T14-W6a (ADR-0002 §8): resolve the version-check endpoint before the
     // settings manager moves into the package manager below.
     let version_check_endpoint =
@@ -689,57 +642,12 @@ pub async fn run_update_in(
         if !plan.should_run {
             return 0;
         }
-        let install_method = detect_install_method();
-        if install_method == InstallMethod::Binary {
-            // T18 (ADR-0011 §4/§7, D-054): a binary install self-updates
-            // for real — the upstream "print the releases page + exit 1"
-            // outcome is gone.
-            return run_binary_self_update_branch(&plan, binary_seam).await;
-        }
-        if cfg!(windows) && !matches!(install_method, InstallMethod::Npm | InstallMethod::Pnpm) {
-            eprintln!(
-                "{APP_NAME} self-update on Windows is only supported for npm and pnpm installs."
-            );
-            eprintln!(
-                "Detected install method: {}. Update {APP_NAME} manually.",
-                install_method.as_str()
-            );
-            return 1;
-        }
-        let update_target = SelfUpdatePackageTarget {
-            package_name: plan.package_name.clone(),
-            install_spec: plan.install_spec.clone(),
-        };
-        let Some(command) = get_self_update_command(
-            PACKAGE_NAME,
-            npm_command.as_deref(),
-            &update_target,
-            &system_command_probe,
-        ) else {
-            print_self_update_unavailable(npm_command.as_deref(), &update_target);
-            return 1;
-        };
-        if let Some(note) = &plan.note {
-            print_self_update_note(note);
-        }
-        // `prepareWindowsNpmSelfUpdate` (package-manager-cli.ts:526-534) is
-        // a win32-only native-dependency quarantine; Windows is not a v0.1
-        // target, so there is nothing to prepare here.
-        if let Err(message) = run_self_update(&command, runner.as_ref()) {
-            eprintln!("Error: {message}");
-            if install_method == InstallMethod::Pnpm {
-                eprintln!(
-                    "If pnpm reports missing package versions, its cached registry metadata may be stale."
-                );
-                eprintln!("Run `pnpm store prune` and retry `{APP_NAME} update --self`.");
-            }
-            eprintln!(
-                "If this keeps failing, run this command yourself: {}",
-                command.display
-            );
-            return 1;
-        }
-        println!("Updated {APP_NAME} from {VERSION} to {}", plan.version);
+        // T18 (ADR-0011 §4/§7, D-054): a binary install self-updates for
+        // real — the upstream "print the releases page + exit 1" outcome is
+        // gone. The install method is always Binary (D-055): rpi is
+        // distributed only as a GitHub Releases binary, so there is no
+        // package-manager branch and no Windows npm/pnpm gate.
+        return run_binary_self_update_branch(&plan, binary_seam).await;
     }
     0
 }
@@ -1809,7 +1717,7 @@ mod update_cli_tests {
     //! fake runner / scripted release transport (no process, no network).
 
     use super::*;
-    use crate::core::package_manager::SystemPackageCommandRunner;
+    use crate::core::package_manager::{CommandRequest, SystemPackageCommandRunner};
     use crate::core::version_check::LatestVersionTransport;
     use futures::future::BoxFuture;
     use std::path::PathBuf;

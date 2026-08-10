@@ -3,7 +3,9 @@
  * Compaction golden-values generator (T08).
  *
  * Runs the pinned upstream compaction implementation
- * (external/pi @ 2efa728, built dist) over a fixed battery of inputs and
+ * (recording pin: external/pi @ 2efa728 — see the pin note in
+ * fixtures/README.md; the current repo pin lives in UPSTREAM.md — built
+ * dist) over a fixed battery of inputs and
  * dumps:
  *   - `generated/compaction/golden.json`  — numeric/structural golden cases
  *     (estimateTokens / calculateContextTokens / estimateContextTokens /

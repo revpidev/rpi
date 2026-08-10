@@ -3,7 +3,9 @@
  * Resources golden-values generator (T09 parity layer).
  *
  * Runs the pinned upstream resource-loading implementation
- * (external/pi @ 2efa728, built dist) over fixed inputs and dumps golden
+ * (recording pin: external/pi @ 2efa728 — see the pin note in
+ * fixtures/README.md; the current repo pin lives in UPSTREAM.md — built
+ * dist) over fixed inputs and dumps golden
  * JSON per group under `fixtures/generated/resources/`:
  *
  *   - `skills-battery/golden.json`   — upstream `loadSkills()` over the 13
