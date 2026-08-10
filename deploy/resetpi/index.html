@@ -132,7 +132,7 @@
     }
     .nav-links { display: flex; align-items: center; gap: 1.5rem; font-size: 0.92rem; }
     .nav-links a { color: var(--muted); }
-    .nav-links a:hover { color: var(--text); text-decoration: none; }
+    .nav-links a:hover, .nav-links a.active { color: var(--text); text-decoration: none; }
     .lang-toggle {
       font-family: var(--mono);
       font-size: 0.8rem;
@@ -657,6 +657,35 @@
     setLang(document.documentElement.dataset.lang === "en" ? "en" : "zh");
     document.getElementById("lang-toggle").addEventListener("click", function () {
       setLang(document.documentElement.dataset.lang === "zh" ? "en" : "zh");
+    });
+  })();
+
+  // 导航高亮：滚动到对应 section 时高亮顶部菜单
+  (function () {
+    var links = {};
+    Array.prototype.forEach.call(document.querySelectorAll(".nav-links a"), function (a) {
+      var href = a.getAttribute("href");
+      if (href === "#features") { links.features = a; }
+      else if (href === "#quickstart") { links.quickstart = a; }
+      else if (href === "/docs") { links.docs = a; }
+    });
+    var order = ["features", "quickstart", "docs"];
+    function setActive(id) {
+      order.forEach(function (k) {
+        if (links[k]) { links[k].classList.toggle("active", k === id); }
+      });
+    }
+    if (!("IntersectionObserver" in window)) { return; }
+    var visible = {};
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { visible[e.target.id] = e.isIntersecting; });
+      var active = null;
+      order.forEach(function (id) { if (visible[id] && !active) { active = id; } });
+      setActive(active);
+    }, { rootMargin: "-25% 0px -60% 0px" });
+    order.forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) { io.observe(el); }
     });
   })();
 

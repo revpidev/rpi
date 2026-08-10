@@ -268,8 +268,8 @@
     <nav class="nav-links">
       <a href="/#features"><span class="l-zh">特性</span><span class="l-en">Features</span></a>
       <a href="/#quickstart"><span class="l-zh">快速开始</span><span class="l-en">Quickstart</span></a>
-      <a href="/docs" class="active"><span class="l-zh">文档</span><span class="l-en">Docs</span></a>
-      <a href="/docs#/changelog"><span class="l-zh">更新日志</span><span class="l-en">Changelog</span></a>
+      <a href="/docs" data-nav="docs"><span class="l-zh">文档</span><span class="l-en">Docs</span></a>
+      <a href="/docs#/changelog" data-nav="changelog"><span class="l-zh">更新日志</span><span class="l-en">Changelog</span></a>
       <button class="lang-toggle" id="lang-toggle" type="button" aria-label="Switch language">
         <span class="l-zh">EN</span><span class="l-en">中文</span>
       </button>
@@ -557,6 +557,11 @@
     var links = document.querySelectorAll(".docs-nav a");
     Array.prototype.forEach.call(links, function (a) {
       a.classList.toggle("active", a.dataset.doc === id);
+    });
+    // 顶部菜单：更新日志页高亮「更新日志」，其余文档页高亮「文档」
+    var topLinks = document.querySelectorAll(".nav-links a[data-nav]");
+    Array.prototype.forEach.call(topLinks, function (a) {
+      a.classList.toggle("active", a.dataset.nav === (id === "changelog" ? "changelog" : "docs"));
     });
     updateTitle();
     window.scrollTo(0, 0);
