@@ -1,6 +1,6 @@
-# ADR-0009：产品端点默认值迁移到 resetpi.com（Cloudflare Pages 自部署）
+# ADR-0009：产品端点默认值迁移到 revpi.dev（Cloudflare Pages 自部署）
 
-- **状态**：已采纳（端点域名部分已被 [ADR-0011](./0011-product-endpoints-revpi-dev.md) 取代为 revpi.dev）
+- **状态**：已采纳
 - **日期**：2026-08-09
 - **关联**：[`01-requirements.md`](../01-requirements.md) §8（产品 endpoint）、
   [D-046](../plan/v0.1/deviations/D-046-product-endpoints-telemetry-rust-notes.md)、
@@ -25,7 +25,7 @@ rpi 是独立分发的 fork（ADR-0001/0002 已把环境变量与命名从 PI_* 
 
 ## 决策
 
-5 个端点默认值改为 `resetpi.com`（`https://resetpi.com` 为 base），内容用
+5 个端点默认值改为 `revpi.dev`（`https://revpi.dev` 为 base），内容用
 **Cloudflare Pages 静态托管 + Pages Functions** 部署（`deploy/revpi/`）：
 
 - 模型目录：37 个静态 JSON（构建脚本从 `crates/rpi-ai/src/providers/data/*.json`

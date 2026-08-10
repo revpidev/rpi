@@ -1,7 +1,6 @@
 # revpi.dev — rpi 产品端点部署（Cloudflare Pages）
 
-rpi 的 5 个产品端点默认值自 ADR-0009 起指向 `revpi.dev`（域名变更见
-ADR-0011）。本目录是 Cloudflare Pages 项目（项目名 `revpi`）：静态目录内容 +
+rpi 的 5 个产品端点默认值自 ADR-0009 起指向 `revpi.dev`。本目录是 Cloudflare Pages 项目（项目名 `revpi`）：静态目录内容 +
 Pages Functions，零后端。
 `index.html` 为站点首页（开源项目主页，含特性/快速开始/端点说明），
 `/` 请求直接命中。
@@ -41,7 +40,7 @@ npx wrangler kv namespace create ANALYTICS   # 把 id 填入 wrangler.toml 后�
 
 ## 客户端侧
 
-默认端点已在代码里改为 revpi.dev（ADR-0009/0011）。仍可逐项覆盖：
+默认端点已在代码里改为 revpi.dev（ADR-0009）。仍可逐项覆盖：
 
 ```bash
 RPI_MODEL_CATALOG_URL=https://revpi.dev        # 或 settings.json modelCatalogUrl
@@ -59,7 +58,5 @@ RPI_SHARE_VIEWER_URL=https://revpi.dev/session
 - **radius 不在 catalog 内**：radius 是动态 gateway provider（默认
   `https://radius.pi.dev`，上游托管服务，非静态内容），`/api/models/providers/radius`
   返回 404 即"overlay 不可用"语义，radius 用户不受影响。
-- **旧域名 resetpi.com 过渡期兼容**：ADR-0011 前部署的旧项目 `resetpi` 在
-  Pages 上保留在线，旧版本二进制仍可命中；确认无流量后可下线。
 - **数据源**：catalog 由 `crates/rpi-ai/src/providers/data/*.json` 生成，
   与 rpi 发版同步更新。

@@ -1,15 +1,15 @@
-# ADR-0010：项目改名 pir → rpi（与域名 resetpi.com 对应）
+# ADR-0010：项目改名 pir → rpi（与域名 revpi.dev 对应）
 
 - **状态**：已采纳
 - **日期**：2026-08-09
-- **关联**：ADR-0001（命名决策）、ADR-0009（端点域名 resetpi.com，已由 ADR-0011 更新为 revpi.dev）、
+- **关联**：ADR-0001（命名决策）、ADR-0009（端点域名 revpi.dev）、
   扩展 ABI 文档 `docs/extension-abi.md`
 
 ## 背景
 
 pir 是 Pi 的 Rust 移植，独立分发（ADR-0001 起已把命名从 `PI_*` 迁到 `PIR_*`、
-配置目录从 `~/.pi` 迁到 `~/.pir`）。产品端点域名确定为 `resetpi.com`
-（ADR-0009）后，项目名与域名不对应（pir ↔ resetpi）。本项目尚未对外发布，
+配置目录从 `~/.pi` 迁到 `~/.pir`）。产品端点域名确定为 `revpi.dev`
+（ADR-0009）后，项目名与域名不对应（pir ↔ revpi）。本项目尚未对外发布，
 改名成本最低，决定全面改名。
 
 ## 决策
