@@ -12,11 +12,11 @@
 | 提交说明 | `docs(agent): tighten durable harness design` |
 | 提交时间 | 2026-08-08 |
 
-升级说明：v0.11 将对照基线从 `2efa728`（v0.82.1）提升至 `4181f66`（v0.84.1+），跨度 461 commits / 655 文件。变更需求与设计见 [`docs/v0.11/`](./docs/v0.11/)。
+升级说明：v0.11 将对照基线从 `2efa728`（v0.82.1）提升至 `4181f66`（v0.84.1+），跨度 461 commits / 655 文件。变更需求与设计见 [`rpi-docs/v0.11/`](../rpi-docs/v0.11/)。
 
-历史基线：v0.1 钉死 `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（v0.82.1，2026-07-27），决策记录 [ADR-0002](./docs/adr/0002-baseline-decisions.md)。
+历史基线：v0.1 钉死 `2efa728d2ee90ef597626e96b1e28ef2b279f07c`（v0.82.1，2026-07-27），决策记录 [ADR-0002](../rpi-docs/adr/0002-baseline-decisions.md)。
 
-已立 ADR 的有意差异（不在金标准范围内）：产品端点默认值迁移 `revpi.dev`（[ADR-0009](./docs/adr/0009-product-endpoints.md)，含 `deploy/revpi/` Cloudflare Pages 部署）；覆盖链与上游端点可配置语义不变。
+已立 ADR 的有意差异（不在金标准范围内）：产品端点默认值迁移 `revpi.dev`（[ADR-0009](../rpi-docs/adr/0009-product-endpoints.md)，含 rpi-pages 仓库的 Cloudflare Pages 部署）；覆盖链与上游端点可配置语义不变。
 
 校验：
 
