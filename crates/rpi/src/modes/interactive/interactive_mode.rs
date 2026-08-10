@@ -2318,10 +2318,14 @@ impl InteractiveUi {
             Box::new(move |text: &str| theme.fg("warning", text))
                 as rpi_tui::components::text::ColorFn
         };
-        let action = theme.fg("accent", &format!("{APP_NAME} update"));
+        // T18 (ADR-0011 §6): the action matches self-update availability —
+        // `rpi update --self` when this install can self-update, the
+        // download URL when it cannot (binary build without a target
+        // triple).
+        let action = theme.fg("accent", &crate::config::self_update_instruction());
         let update_instruction = theme.fg(
             "muted",
-            &format!("New version {} is available. Run ", release.version),
+            &format!("New version {} is available. ", release.version),
         ) + &action;
         let changelog_url = "https://revpi.dev/changelog";
         let styled_url = theme.fg("accent", changelog_url);
@@ -4909,8 +4913,15 @@ mod tests {
             rendered.contains("Update Available"),
             "rendered: {rendered}"
         );
+        // T18 (ADR-0011 §6): the action is the self-update command; the
+        // muted/accent split puts an ANSI boundary between the lead-in and
+        // the action, so assert the two segments separately.
         assert!(
-            rendered.contains("New version 99.0.0 is available. Run"),
+            rendered.contains("New version 99.0.0 is available."),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("Run rpi update --self"),
             "rendered: {rendered}"
         );
         assert!(rendered.contains("rpi update"), "rendered: {rendered}");

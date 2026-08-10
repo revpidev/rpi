@@ -24,7 +24,31 @@ Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent]
 
 ## 快速开始
 
-> **注意**：目前尚无预编译二进制与已发布的 crate——请从源码构建（仅需稳定版 Rust 工具链）。
+### 安装（预编译二进制）
+
+macOS / Linux（POSIX sh；自动区分 glibc / musl）：
+
+```bash
+curl -fsSL https://revpi.dev/install.sh | sh
+```
+
+安装脚本自动检测操作系统与架构，下载匹配的 Release 资产并做 SHA-256 校验（针对下载损坏的完整性校验），默认安装到 `~/.local/bin`（可用 `--prefix <dir>` 覆盖）。脚本与资产均可从官网（revpi.dev）下载——GitHub 不可直连时安装脚本会自动回退到官网镜像，也可以随时从 GitHub Releases 手动下载资产。若 `~/.local/bin` 不在 `PATH` 中，请添加：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # 追加到 ~/.profile、~/.bashrc 或 ~/.zshrc
+```
+
+Windows（PowerShell；默认安装到 `%LOCALAPPDATA%\Programs\rpi`，可用 `-Prefix` 覆盖）：
+
+```powershell
+irm https://revpi.dev/install.ps1 | iex
+```
+
+手动安装：从 [GitHub Releases](https://github.com/revpidev/rpi/releases) 下载 `rpi-<version>-<target>.tar.gz`（Windows 为 `.zip`）及其 `.sha256` 校验文件，核对校验和后把 `rpi` 二进制解压到 `PATH` 中的任意目录。
+
+### 从源码构建
+
+仅需稳定版 Rust 工具链：
 
 ```bash
 git clone --recurse-submodules https://github.com/revpidev/rpi.git
@@ -36,6 +60,23 @@ cargo build --release
 `external/pi` submodule 是对拍用的钉死上游基线，仅开发期使用——**构建和运行 rpi 不需要它**。
 
 在 `~/.rpi/settings.json` 或对应标准环境变量（如 `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`）中配置你的 API key；Anthropic、OpenAI Codex、radius 还支持交互式 OAuth 登录。
+
+### 更新
+
+```bash
+rpi update --self   # 下载、校验并原地替换二进制
+```
+
+重新运行安装脚本也可以更新已有安装。
+
+### 卸载
+
+```bash
+rpi self-uninstall           # 删除二进制与安装清单；保留 ~/.rpi
+rpi self-uninstall --purge   # 连同 ~/.rpi（会话、认证、设置）一起删除
+```
+
+手动清理遗留物：未加 `--purge` 卸载时，`~/.rpi/` 目录需要自行删除；Windows 上运行中的二进制无法删除自身，`self-uninstall` 会打印需要手动删除的准确路径（`rpi.exe`、`rpi.install.json`）。
 
 ## 使用
 
@@ -56,7 +97,7 @@ cargo build --release
 包管理命令：
 
 ```bash
-rpi update --self          # 自更新（二进制安装会打印下载指引）
+rpi update --self          # 自更新到最新 Release
 rpi update --models        # 刷新远程模型目录
 rpi update --extensions    # 更新扩展（或 --all）
 rpi install <source>       # 安装扩展

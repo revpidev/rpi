@@ -30,9 +30,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use regex::RegexBuilder;
 use rpi_agent::{AgentError, AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use rpi_ai::types::{TextContent, ToolResultContent};
-use regex::RegexBuilder;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 

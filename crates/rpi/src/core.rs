@@ -20,6 +20,7 @@ pub mod package_manager;
 pub mod prompt_templates;
 pub mod remote_catalog_provider;
 pub mod resource_loader;
+pub mod self_update;
 pub mod session_cwd;
 pub mod session_manager;
 pub mod settings_manager;

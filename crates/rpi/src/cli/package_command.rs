@@ -4,8 +4,11 @@
 //! model catalog refresh); T14-W2 landed `install` / `remove`
 //! (`uninstall`) / `list`; T14-W3 lands the remaining `update` targets
 //! (self / extensions / all / single-source) with the self-update plan,
-//! release-note rendering, and install-method command construction. The
-//! `config` command lives in `cli::config_command`.
+//! release-note rendering, and install-method command construction. T18
+//! adds the rpi-specific binary lifecycle (ADR-0011, D-054): Binary
+//! installs self-update for real (no more "print + exit 1"), and
+//! `self-uninstall` removes the binary install. The `config` command
+//! lives in `cli::config_command`.
 //!
 //! Intentional differences (D-037, D-041):
 //! - `--force` is inert for the models target (the refresh always runs with
@@ -37,6 +40,7 @@ use crate::core::package_manager::{
     CommandRequest, ConfiguredPackage, DefaultPackageManager, PackageCommandRunner,
     SystemPackageCommandRunner,
 };
+use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::skills::SourceScope;
 use crate::core::trust_manager::{
@@ -371,6 +375,88 @@ fn run_self_update(
     Ok(())
 }
 
+/// The Binary branch of the self target (T18, ADR-0011 §4): download +
+/// sha256 integrity check + atomic replace via
+/// [`crate::core::self_update::run_binary_self_update`]. `seam` is the
+/// test injection; production (`None`) resolves the current executable,
+/// the built-in release base URLs (GitHub + official-site mirror), and the
+/// reqwest transport. On Windows
+/// the phase-1 outcome is manual-replace instructions (no auto replace).
+async fn run_binary_self_update_branch(
+    plan: &SelfUpdatePlan,
+    seam: Option<BinarySelfUpdateSeam>,
+) -> i32 {
+    let seam = match seam {
+        Some(seam) => seam,
+        None => {
+            let exe_path = match std::env::current_exe() {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("Error: could not locate the {APP_NAME} executable: {error}");
+                    return 1;
+                }
+            };
+            BinarySelfUpdateSeam {
+                exe_path,
+                base_urls: vec![
+                    crate::core::self_update::RELEASE_DOWNLOAD_BASE_URL.to_string(),
+                    crate::core::self_update::SITE_DOWNLOAD_BASE_URL.to_string(),
+                ],
+                transport: Arc::new(crate::core::self_update::ReqwestBinaryDownloadTransport),
+            }
+        }
+    };
+    if !crate::core::self_update::binary_inplace_replace_supported() {
+        // Windows cannot rename over a running executable (ADR-0011 §4).
+        eprintln!(
+            "{}",
+            crate::core::self_update::windows_manual_update_instructions(
+                &plan.version,
+                &seam.exe_path
+            )
+        );
+        return 1;
+    }
+    let target = crate::config::build_target();
+    match target {
+        Some(target) => println!(
+            "Updating {APP_NAME} to v{} ({})...",
+            plan.version,
+            crate::core::self_update::asset_file_name(&plan.version, target),
+        ),
+        None => println!("Updating {APP_NAME} to v{}...", plan.version),
+    }
+    let request = BinarySelfUpdateRequest {
+        exe_path: &seam.exe_path,
+        version: &plan.version,
+        target,
+    };
+    match crate::core::self_update::run_binary_self_update(
+        &request,
+        seam.transport.as_ref(),
+        &seam.base_urls,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            if let Some(warning) = &outcome.manifest_warning {
+                eprintln!("Warning: {warning}");
+            }
+            // Release note after the replace (ADR-0011 §4 order: replace →
+            // manifest → note).
+            if let Some(note) = &plan.note {
+                print_self_update_note(note);
+            }
+            println!("Updated {APP_NAME} from {VERSION} to {}", plan.version);
+            0
+        }
+        Err(message) => {
+            eprintln!("Error: {message}");
+            1
+        }
+    }
+}
+
 /// `printSelfUpdateUnavailable` (package-manager-cli.ts:424-436). The
 /// executable location line uses the rpi name (ADR-0001); upstream's
 /// literal is `Location of pi executable: …` with `process.argv[1]`, and
@@ -450,18 +536,20 @@ pub fn print_self_update_note(note: &str) {
 pub async fn run_update(args: &[String]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let agent_dir = crate::config::get_agent_dir();
-    run_update_in(args, &cwd, &agent_dir, None, None).await
+    run_update_in(args, &cwd, &agent_dir, None, None, None).await
 }
 
 /// [`run_update`] against explicit directories with injectable command
-/// runner and release transport (tests inject fakes so no real `~/.rpi`,
-/// process, or network is touched).
+/// runner, release transport, and binary self-update seam (tests inject
+/// fakes so no real `~/.rpi`, process, network, or running executable is
+/// touched).
 pub async fn run_update_in(
     args: &[String],
     cwd: &Path,
     agent_dir: &Path,
     runner: Option<Arc<dyn PackageCommandRunner>>,
     transport: Option<Arc<dyn LatestVersionTransport>>,
+    binary_seam: Option<BinarySelfUpdateSeam>,
 ) -> i32 {
     let parsed = parse_update_args(args);
     if parsed.help {
@@ -602,6 +690,12 @@ pub async fn run_update_in(
             return 0;
         }
         let install_method = detect_install_method();
+        if install_method == InstallMethod::Binary {
+            // T18 (ADR-0011 §4/§7, D-054): a binary install self-updates
+            // for real — the upstream "print the releases page + exit 1"
+            // outcome is gone.
+            return run_binary_self_update_branch(&plan, binary_seam).await;
+        }
         if cfg!(windows) && !matches!(install_method, InstallMethod::Npm | InstallMethod::Pnpm) {
             eprintln!(
                 "{APP_NAME} self-update on Windows is only supported for npm and pnpm installs."
@@ -648,6 +742,110 @@ pub async fn run_update_in(
         println!("Updated {APP_NAME} from {VERSION} to {}", plan.version);
     }
     0
+}
+
+// ---------------------------------------------------------------------------
+// self-uninstall (T18, ADR-0011 §5) — rpi-specific; no upstream counterpart.
+// `uninstall` stays the extension-remove alias (parse_package_command
+// below); `self-uninstall` is the binary lifecycle command.
+// ---------------------------------------------------------------------------
+
+/// Usage line for the rpi-specific `self-uninstall` command (ADR-0011 §5).
+pub const SELF_UNINSTALL_USAGE: &str = "rpi self-uninstall [--purge]";
+
+/// Parsed `self-uninstall` command.
+#[derive(Debug, Default)]
+pub struct ParsedSelfUninstall {
+    pub help: bool,
+    /// `--purge` — also delete the `~/.rpi` data root (default: keep).
+    pub purge: bool,
+    pub invalid_option: Option<String>,
+}
+
+/// Parse `self-uninstall` args; `args[0]` must be `"self-uninstall"`.
+pub fn parse_self_uninstall_args(args: &[String]) -> ParsedSelfUninstall {
+    let mut parsed = ParsedSelfUninstall::default();
+    for arg in &args[1..] {
+        if arg == "-h" || arg == "--help" {
+            parsed.help = true;
+        } else if arg == "--purge" {
+            parsed.purge = true;
+        } else {
+            parsed.invalid_option.get_or_insert_with(|| arg.clone());
+        }
+    }
+    parsed
+}
+
+/// Help text for `self-uninstall`, plain text (headless stdout).
+pub fn self_uninstall_help() -> String {
+    format!(
+        r#"Usage:
+  {SELF_UNINSTALL_USAGE}
+
+Uninstall this {APP_NAME} binary installation: remove the executable and the
+install manifest, and report leftover data.
+
+Options:
+  --purge    Also delete the rpi data directory (~/.rpi: sessions, auth,
+             extensions). Without --purge the data is kept; an interactive
+             run asks first (default: keep), a non-interactive run always
+             keeps.
+"#
+    )
+}
+
+/// Interactive confirmation for deleting the data root (ADR-0011 §5): the
+/// default answer is keep — only an explicit `y`/`yes` deletes.
+fn confirm_delete_data_dir(data_dir: &Path) -> bool {
+    use std::io::Write;
+    print!(
+        "Delete {} and all {APP_NAME} data (sessions, auth, extensions)? [y/N] ",
+        data_dir.display(),
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}
+
+/// `rpi self-uninstall [--purge]` (ADR-0011 §5). Returns the exit code.
+pub fn run_self_uninstall(args: &[String]) -> i32 {
+    let parsed = parse_self_uninstall_args(args);
+    if parsed.help {
+        print!("{}", self_uninstall_help());
+        return 0;
+    }
+    if let Some(option) = &parsed.invalid_option {
+        eprintln!("Unknown option {option} for \"self-uninstall\".");
+        eprintln!("Usage: {SELF_UNINSTALL_USAGE}");
+        return 1;
+    }
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Error: could not locate the {APP_NAME} executable: {error}");
+            return 1;
+        }
+    };
+    let data_dir = crate::config::get_uninstall_data_dir();
+    // Non-interactive stdin never asks and keeps the data (ADR-0011 §5).
+    use std::io::IsTerminal;
+    let confirm: Option<&dyn Fn(&Path) -> bool> = if std::io::stdin().is_terminal() {
+        Some(&confirm_delete_data_dir)
+    } else {
+        None
+    };
+    crate::core::self_update::run_self_uninstall_in(
+        &crate::core::self_update::SelfUninstallRequest {
+            exe_path: &exe_path,
+            data_dir: &data_dir,
+            purge: parsed.purge,
+            confirm_delete_data: confirm,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,6 +1389,26 @@ mod tests {
         assert!(help.contains("--models                Refresh model catalogs only"));
         assert!(help.contains("rpi update --models       Refresh model catalogs only"));
     }
+
+    // ---- self-uninstall parsing (T18, ADR-0011 §5) ----
+
+    #[test]
+    fn test_self_uninstall_parses_purge_and_help() {
+        let parsed = parse_self_uninstall_args(&["self-uninstall".to_string()]);
+        assert!(!parsed.purge && !parsed.help && parsed.invalid_option.is_none());
+        let parsed =
+            parse_self_uninstall_args(&["self-uninstall".to_string(), "--purge".to_string()]);
+        assert!(parsed.purge);
+        let parsed =
+            parse_self_uninstall_args(&["self-uninstall".to_string(), "--help".to_string()]);
+        assert!(parsed.help);
+        let parsed =
+            parse_self_uninstall_args(&["self-uninstall".to_string(), "--bogus".to_string()]);
+        assert_eq!(parsed.invalid_option.as_deref(), Some("--bogus"));
+        // Usage/help text sanity.
+        assert!(self_uninstall_help().contains(SELF_UNINSTALL_USAGE));
+        assert!(self_uninstall_help().contains("--purge"));
+    }
 }
 
 #[cfg(test)]
@@ -1708,6 +1926,77 @@ mod update_cli_tests {
         }
     }
 
+    // ---- T18: Binary self-update seam (ADR-0011 §4) ----
+
+    /// Scripted binary-download transport: exact-URL map.
+    struct StubBinaryTransport {
+        responses: std::collections::HashMap<String, Result<Vec<u8>, String>>,
+    }
+
+    impl crate::core::self_update::BinaryDownloadTransport for StubBinaryTransport {
+        fn download<'a>(
+            &'a self,
+            url: &'a str,
+            _timeout: Duration,
+        ) -> BoxFuture<'a, Result<Vec<u8>, String>> {
+            let response = self
+                .responses
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("404 for {url}")));
+            Box::pin(async move { response })
+        }
+    }
+
+    /// A fake release asset (`tar.gz` + `sha256sum`-format sidecar) with
+    /// `binary` as the `rpi` entry.
+    fn fake_release_tarball(binary: &[u8]) -> (Vec<u8>, String) {
+        use sha2::Digest;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(binary.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder.append_data(&mut header, "rpi", binary).unwrap();
+        let tarball = builder.into_inner().unwrap().finish().unwrap();
+        let digest = sha2::Sha256::digest(&tarball);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        (tarball, format!("{hex}  asset.tar.gz\n"))
+    }
+
+    /// A temp "installed" exe plus the Binary self-update seam serving a
+    /// fake release for `version`. The exe lives under `dirs.root`, so
+    /// cleanup rides on `TestDirs`.
+    fn binary_seam(
+        dirs: &TestDirs,
+        version: &str,
+        binary: &[u8],
+    ) -> (PathBuf, BinarySelfUpdateSeam) {
+        let exe = dirs.root.join("bin").join("rpi");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"old-binary").unwrap();
+        let target = crate::config::build_target().unwrap();
+        let asset_url =
+            crate::core::self_update::asset_url("https://releases.test", version, target);
+        let (tarball, sidecar) = fake_release_tarball(binary);
+        let transport = StubBinaryTransport {
+            responses: std::collections::HashMap::from([
+                (asset_url.clone(), Ok(tarball)),
+                (
+                    crate::core::self_update::sha256_sidecar_url(&asset_url),
+                    Ok(sidecar.into_bytes()),
+                ),
+            ]),
+        };
+        let seam = BinarySelfUpdateSeam {
+            exe_path: exe.clone(),
+            base_urls: vec!["https://releases.test".to_string()],
+            transport: Arc::new(transport),
+        };
+        (exe, seam)
+    }
+
     fn args(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
     }
@@ -1789,6 +2078,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(transport.clone()),
+            None,
         )
         .await;
         assert_eq!(code, 0);
@@ -1824,6 +2114,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(transport.clone()),
+            None,
         )
         .await;
         assert_eq!(code, 0);
@@ -1843,6 +2134,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner),
             Some(transport),
+            None,
         )
         .await;
         assert_eq!(code, 1);
@@ -1866,6 +2158,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(StubTransport::newer_version()),
+            None,
         )
         .await;
         assert_eq!(code, 0);
@@ -1884,6 +2177,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(StubTransport::newer_version()),
+            None,
         )
         .await;
         assert_eq!(code, 0);
@@ -1907,6 +2201,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(transport),
+            None,
         )
         .await;
         assert_eq!(code, 0);
@@ -1914,39 +2209,87 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
-    async fn update_self_newer_version_on_binary_install_is_unavailable() {
+    async fn update_self_newer_version_on_binary_install_self_updates() {
+        // T18 (ADR-0011 §7, D-054): the Binary branch no longer prints the
+        // releases page and exits 1 — it downloads, verifies the sha256,
+        // atomically replaces the executable, and updates the manifest.
         let dirs = TestDirs::new();
         let transport = StubTransport::newer_version();
+        let (exe, seam) = binary_seam(&dirs, "99.0.0", b"new-binary");
         let code = run_update_in(
             &args(&["update", "--self"]),
             &dirs.cwd,
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(transport.clone()),
+            Some(seam),
         )
         .await;
-        // A standalone binary cannot self-update (upstream bun-binary
-        // outcome): exit 1 after probing the release endpoint.
-        assert_eq!(code, 1);
+        assert_eq!(code, 0);
         assert_eq!(transport.call_count(), 1);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
+        let manifest = crate::config::read_install_manifest_for(&exe).unwrap();
+        assert_eq!(manifest.version, "99.0.0");
+        assert_eq!(manifest.method, "binary");
     }
 
     #[tokio::test]
-    async fn update_self_force_rechecks_even_when_current() {
+    async fn update_self_force_reinstalls_same_version_on_binary() {
         let dirs = TestDirs::new();
         let transport = StubTransport::responds(Ok(Some(format!(r#"{{"version": "{VERSION}"}}"#))));
         // --force makes the plan run even at the latest version; the
-        // binary install then reports unavailable → exit 1 proves the
-        // force path was taken (without force this exits 0, see above).
+        // replaced exe proves the reinstall went through (without force
+        // this exits 0 without touching the exe, see above).
+        let (exe, seam) = binary_seam(&dirs, VERSION, b"reinstalled-binary");
         let code = run_update_in(
             &args(&["update", "--self", "--force"]),
             &dirs.cwd,
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(transport),
+            Some(seam),
         )
         .await;
-        assert_eq!(code, 1);
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"reinstalled-binary");
+    }
+
+    #[tokio::test]
+    async fn bare_update_on_binary_without_new_version_exits_0() {
+        // T18 (ADR-0011 §4/§7, D-054): bare `rpi update` on a Binary
+        // install no longer exits 1 — nothing to do is a clean exit 0
+        // (the "Extensions are skipped" note is printed, not asserted
+        // here: it goes to stdout).
+        let dirs = TestDirs::new();
+        let transport = StubTransport::responds(Ok(Some(format!(r#"{{"version": "{VERSION}"}}"#))));
+        let code = run_update_in(
+            &args(&["update"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport),
+            None,
+        )
+        .await;
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn bare_update_on_binary_with_new_version_self_updates() {
+        let dirs = TestDirs::new();
+        let transport = StubTransport::newer_version();
+        let (exe, seam) = binary_seam(&dirs, "99.0.0", b"new-binary");
+        let code = run_update_in(
+            &args(&["update"]),
+            &dirs.cwd,
+            &dirs.agent_dir,
+            Some(FakeRunner::npm_view_latest()),
+            Some(transport),
+            Some(seam),
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
     }
 
     #[tokio::test]
@@ -1959,6 +2302,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(StubTransport::responds(Ok(None))),
+            None,
         )
         .await;
         assert_eq!(code, 1);
@@ -1969,6 +2313,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(StubTransport::responds(Err("dns".to_string()))),
+            None,
         )
         .await;
         assert_eq!(code, 1);
@@ -1991,6 +2336,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(transport.clone()),
+            None,
         )
         .await;
         // Current version → already up to date → exit 0.
@@ -2018,6 +2364,7 @@ mod update_cli_tests {
             &dirs.agent_dir,
             Some(FakeRunner::npm_view_latest()),
             Some(transport.clone()),
+            None,
         )
         .await;
         // Same surface as an unreachable endpoint (upstream !ok → undefined).
@@ -2042,22 +2389,25 @@ mod update_cli_tests {
         )]);
         drop(settings_manager);
 
+        let (exe, seam) = binary_seam(&dirs, "99.0.0", b"new-binary");
         let code = run_update_in(
             &args(&["update", "--all"]),
             &dirs.cwd,
             &dirs.agent_dir,
             Some(runner.clone()),
             Some(transport.clone()),
+            Some(seam),
         )
         .await;
-        // Extensions update succeeded; self-update then failed on the
-        // binary install (exit 1) — both halves ran.
-        assert_eq!(code, 1);
+        // Extensions update succeeded; the binary self-update then ran to
+        // completion (T18, ADR-0011 §7 / D-054: no more exit 1).
+        assert_eq!(code, 0);
         assert!(runner
             .calls()
             .iter()
             .any(|call| call.contains("foo@latest")));
         assert_eq!(transport.call_count(), 1);
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new-binary");
     }
 
     #[test]

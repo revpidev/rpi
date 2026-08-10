@@ -85,6 +85,14 @@ syntect = { version = "5.3", default-features = false, features = ["parsing", "d
 # its own syntect copy, unified to 5.3 via the caret range).
 syntect-assets = { version = "0.23.6", default-features = false }
 
+# T18 binary self-update (ADR-0011): unpack the release asset
+# (`rpi-<version>-<target>.tar.gz`) after the sha256 integrity check.
+# flate2 keeps its default miniz_oxide backend — pure Rust, no C dependency
+# (musl static single-file target). No zip crate: the Windows phase-1
+# outcome is manual-replace instructions, not auto-replace.
+flate2 = "1"
+tar = "0.4"
+
 # T11 rpi-tui core engine (coding-standards appendix A).
 crossterm = "0.29"              # terminal I/O only (raw mode / read-write / size); no ratatui
 unicode-width = "0.2"           # grapheme width

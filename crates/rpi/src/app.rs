@@ -585,13 +585,16 @@ pub async fn run_app(args: Vec<String>) -> i32 {
     // Subcommand dispatch (main.ts:492-507). `update --models` landed in
     // W6-C (remote model catalog refresh); install/remove/uninstall/list
     // landed in T14-W2; the remaining update targets and `config` landed
-    // in T14-W3.
+    // in T14-W3; T18 added `self-uninstall` (ADR-0011 §5, rpi-specific).
     if let Some(first) = args.first() {
         if first == "config" {
             return crate::cli::config_command::run_config(&args).await;
         }
         if first == "update" {
             return crate::cli::package_command::run_update(&args).await;
+        }
+        if first == "self-uninstall" {
+            return crate::cli::package_command::run_self_uninstall(&args);
         }
         if crate::cli::package_command::parse_package_command(&args).is_some() {
             return crate::cli::package_command::run_package_command(&args);

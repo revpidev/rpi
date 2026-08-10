@@ -24,7 +24,31 @@ Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding a
 
 ## Quick start
 
-> **Note**: no prebuilt binaries or published crates yet — build from source (a stable Rust toolchain is the only requirement).
+### Install (prebuilt binary)
+
+macOS / Linux (POSIX sh; glibc vs musl is detected automatically):
+
+```bash
+curl -fsSL https://revpi.dev/install.sh | sh
+```
+
+The installer detects your OS/architecture, downloads the matching release archive, verifies its SHA-256 (an integrity check against corrupted downloads), and installs to `~/.local/bin` (override with `--prefix <dir>`). Both the scripts and the release assets are served from the official site — when GitHub is unreachable the installer automatically falls back to the revpi.dev mirror, and you can always download assets manually from GitHub Releases. If `~/.local/bin` is not on your `PATH`, add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"   # append to ~/.profile, ~/.bashrc or ~/.zshrc
+```
+
+Windows (PowerShell; installs to `%LOCALAPPDATA%\Programs\rpi`, override with `-Prefix`):
+
+```powershell
+irm https://revpi.dev/install.ps1 | iex
+```
+
+Manual install: download `rpi-<version>-<target>.tar.gz` (`.zip` on Windows) and its `.sha256` sidecar from [GitHub Releases](https://github.com/revpidev/rpi/releases), verify the checksum, and unpack the `rpi` binary anywhere on your `PATH`.
+
+### Build from source
+
+A stable Rust toolchain is the only requirement:
 
 ```bash
 git clone --recurse-submodules https://github.com/revpidev/rpi.git
@@ -36,6 +60,23 @@ cargo build --release
 The `external/pi` submodule is the pinned upstream baseline used for parity reference and development scripts — it is **not** required to build or run rpi.
 
 Set your API key via the standard environment variable for your provider (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`), or in `~/.rpi/settings.json`. Anthropic, OpenAI Codex, and radius also support interactive OAuth login.
+
+### Updating
+
+```bash
+rpi update --self   # download, verify, and replace the binary in place
+```
+
+Re-running the install script also updates an existing installation.
+
+### Uninstalling
+
+```bash
+rpi self-uninstall           # removes the binary and install manifest; keeps ~/.rpi
+rpi self-uninstall --purge   # also deletes ~/.rpi (sessions, auth, settings)
+```
+
+Manual leftovers: if you uninstalled without `--purge`, delete `~/.rpi/` yourself once you no longer need it; on Windows the running binary cannot delete itself, so `self-uninstall` prints the exact paths (`rpi.exe`, `rpi.install.json`) to remove by hand.
 
 ## Usage
 
@@ -56,7 +97,7 @@ Common options:
 Package management commands:
 
 ```bash
-rpi update --self          # self-update (binary installs print a download instruction)
+rpi update --self          # self-update to the latest release
 rpi update --models        # refresh the remote model catalog
 rpi update --extensions    # update extensions (or --all)
 rpi install <source>       # install an extension

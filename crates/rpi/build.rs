@@ -46,6 +46,14 @@ const FANCY_INCOMPATIBLE: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
+    // T18 (ADR-0011 §4): inject the build target triple so the binary
+    // self-updater can name its release asset — glibc vs musl is not
+    // distinguishable at runtime via `std::env::consts`. Consumers read it
+    // with `option_env!("RPI_BUILD_TARGET")` and fall back to manual
+    // download guidance when it is absent (non-cargo builds); never guess.
+    let target = std::env::var("TARGET").unwrap_or_else(|_| panic!("no TARGET"));
+    println!("cargo:rustc-env=RPI_BUILD_TARGET={target}");
+
     // bat's curated set (embedded in syntect-assets as an uncompressed dump).
     let assets = HighlightingAssets::from_binary();
     let full = assets

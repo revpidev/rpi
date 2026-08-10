@@ -347,11 +347,11 @@ pub fn get_global_themes_dir() -> PathBuf {
 /// `PACKAGE_NAME` (config.ts:488) — see the section note above.
 pub const PACKAGE_NAME: &str = "rpi";
 
-/// Download page printed when a standalone binary cannot self-update
-/// (upstream `bun-binary` instruction, config.ts:336). Centralized here
+/// Last-resort download page for manual installs/updates (T18, ADR-0011
+/// §6): binary installs self-update via `rpi update --self` and only land
+/// on this URL when the build target triple is unknown. Centralized here
 /// for the W6 endpoint configuration pass.
-pub const SELF_UPDATE_DOWNLOAD_URL: &str =
-    "https://github.com/earendil-works/pi-mono/releases/latest";
+pub const SELF_UPDATE_DOWNLOAD_URL: &str = "https://github.com/revpidev/rpi/releases/latest";
 
 /// `InstallMethod` (config.ts:29). `Binary` covers both upstream
 /// `bun-binary` and `unknown` (indistinguishable for a native binary).
@@ -955,6 +955,111 @@ pub fn get_project_themes_dir(cwd: &Path) -> PathBuf {
     get_project_config_dir(cwd).join("themes")
 }
 
+// ===== T18: binary distribution lifecycle (ADR-0011 §3/§4/§6) =====
+//
+// No upstream counterpart: rpi's only real install shape is the GitHub
+// Releases binary (ADR-0011 §1), so the install manifest and the
+// build-target injection below are rpi-specific. The manifest lives next
+// to the executable (`~/.local/bin/rpi.install.json`), located via
+// `current_exe()`; it is deliberately NOT coupled to
+// `RPI_CODING_AGENT_DIR` (the agent data dir has separate semantics).
+
+/// Build-time target triple injected by build.rs (`cargo:rustc-env`,
+/// ADR-0011 §4). `None` only for non-cargo builds; consumers must then
+/// fall back to manual-download guidance and never guess glibc vs musl.
+pub fn build_target() -> Option<&'static str> {
+    option_env!("RPI_BUILD_TARGET")
+}
+
+/// Install-manifest file name, placed next to the rpi executable
+/// (ADR-0011 §3).
+pub const INSTALL_MANIFEST_FILE_NAME: &str = "rpi.install.json";
+
+/// `rpi.install.json` (ADR-0011 §3). camelCase wire shape (coding-standards
+/// §4.4): the install scripts write the same JSON.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallManifest {
+    pub version: String,
+    /// Full target triple (e.g. `x86_64-unknown-linux-musl`).
+    pub target: String,
+    /// ISO 8601 UTC timestamp of the install/update.
+    pub installed_at: String,
+    /// The release asset URL this binary came from.
+    pub source_url: String,
+    /// sha256 of the downloaded release asset (integrity check value).
+    pub sha256: String,
+    /// Path of the installed executable.
+    pub install_path: String,
+    /// Always `"binary"` (ADR-0011 §3).
+    pub method: String,
+}
+
+impl InstallManifest {
+    /// The only manifest method rpi writes (ADR-0011 §3).
+    pub const METHOD_BINARY: &'static str = "binary";
+}
+
+/// The manifest path for a given executable: same directory, fixed name
+/// (ADR-0011 §3 — the CLI locates it via `current_exe()`, the install
+/// scripts write it via the install path; one location semantics).
+pub fn install_manifest_path_for(exe_path: &Path) -> PathBuf {
+    match exe_path.parent() {
+        Some(dir) => dir.join(INSTALL_MANIFEST_FILE_NAME),
+        None => PathBuf::from(INSTALL_MANIFEST_FILE_NAME),
+    }
+}
+
+/// Read the manifest next to `exe_path`; a missing or corrupt manifest
+/// degrades to "no manifest" (`None`) — self-update stays available and
+/// uninstall falls back to manual guidance (ADR-0011 §3).
+pub fn read_install_manifest_for(exe_path: &Path) -> Option<InstallManifest> {
+    let text = std::fs::read_to_string(install_manifest_path_for(exe_path)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Persist the manifest next to `exe_path` (atomic write, same crash
+/// consistency rationale as settings/trust stores).
+pub fn write_install_manifest_for(
+    exe_path: &Path,
+    manifest: &InstallManifest,
+) -> std::io::Result<()> {
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&install_manifest_path_for(exe_path), &text)
+}
+
+/// The update instruction shown by the startup banner / new-version
+/// notification (T18, ADR-0011 §6): self-updatable installs get
+/// `rpi update --self`; a binary build without a target triple (non-cargo
+/// build) cannot self-update and gets the download URL directly.
+pub fn self_update_instruction_for(method: InstallMethod, target: Option<&str>) -> String {
+    if method == InstallMethod::Binary && target.is_none() {
+        return format!("Download the latest release from {SELF_UPDATE_DOWNLOAD_URL}");
+    }
+    format!("Run {APP_NAME} update --self")
+}
+
+/// [`self_update_instruction_for`] for the current installation.
+pub fn self_update_instruction() -> String {
+    self_update_instruction_for(detect_install_method(), build_target())
+}
+
+/// The data root `rpi self-uninstall --purge` offers to delete (ADR-0011
+/// §5): `~/.rpi` at the default layout; when `RPI_CODING_AGENT_DIR`
+/// redirects the agent dir elsewhere, the effective agent dir is the
+/// deletable root (never delete the parent of a redirected dir).
+pub fn get_uninstall_data_dir() -> PathBuf {
+    let agent_dir = get_agent_dir();
+    if let Some(home) = home_dir() {
+        let default_agent_dir = home.join(CONFIG_DIR_NAME).join("agent");
+        if agent_dir == default_agent_dir {
+            return home.join(CONFIG_DIR_NAME);
+        }
+    }
+    agent_dir
+}
+
 // ===== T14-W6a: configurable product endpoints (ADR-0002 §8) =====
 //
 // The three product HTTP callbacks — version check, install telemetry, and
@@ -1392,5 +1497,101 @@ mod self_update_tests {
             Some(PathBuf::from("/home/u/.local/share/pnpm/global/5"))
         );
         assert!(pnpm_global_root_from_package_dir(Path::new("/usr/local/bin")).is_none());
+    }
+
+    // ---- T18: install manifest + build target + update instruction ----
+
+    #[test]
+    fn test_build_target_is_injected_under_cargo() {
+        // build.rs injects RPI_BUILD_TARGET via cargo:rustc-env (ADR-0011
+        // §4); under `cargo test` it is always present.
+        let target = build_target().expect("RPI_BUILD_TARGET");
+        assert!(target.contains('-'), "{target}");
+    }
+
+    #[test]
+    fn test_install_manifest_roundtrip_and_camel_case_shape() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-manifest-test-{}-{}",
+            std::process::id(),
+            "roundtrip"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rpi");
+        std::fs::write(&exe, b"bin").unwrap();
+        assert_eq!(
+            install_manifest_path_for(&exe),
+            dir.join(INSTALL_MANIFEST_FILE_NAME)
+        );
+        let manifest = InstallManifest {
+            version: "1.2.3".to_string(),
+            target: "x86_64-unknown-linux-musl".to_string(),
+            installed_at: "2026-08-10T05:00:00.000Z".to_string(),
+            source_url: "https://github.com/revpidev/rpi/releases/download/v1.2.3/rpi-1.2.3-x86_64-unknown-linux-musl.tar.gz".to_string(),
+            sha256: "ab".to_string(),
+            install_path: exe.to_string_lossy().into_owned(),
+            method: InstallManifest::METHOD_BINARY.to_string(),
+        };
+        write_install_manifest_for(&exe, &manifest).unwrap();
+        let raw = std::fs::read_to_string(install_manifest_path_for(&exe)).unwrap();
+        // G5: camelCase wire shape (the install scripts write the same).
+        assert!(raw.contains("\"installedAt\""), "{raw}");
+        assert!(raw.contains("\"sourceUrl\""), "{raw}");
+        assert!(raw.contains("\"installPath\""), "{raw}");
+        assert!(!raw.contains("installed_at"), "{raw}");
+        assert_eq!(read_install_manifest_for(&exe), Some(manifest));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_install_manifest_missing_or_corrupt_degrades_to_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-manifest-test-{}-{}",
+            std::process::id(),
+            "corrupt"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("rpi");
+        // Missing manifest → None.
+        assert_eq!(read_install_manifest_for(&exe), None);
+        // Corrupt manifest → None (ADR-0011 §3: degrade to "no manifest").
+        std::fs::write(install_manifest_path_for(&exe), "not json").unwrap();
+        assert_eq!(read_install_manifest_for(&exe), None);
+        std::fs::write(install_manifest_path_for(&exe), "{}").unwrap();
+        assert_eq!(read_install_manifest_for(&exe), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_self_update_instruction_matches_availability() {
+        // T18 (ADR-0011 §6): self-updatable installs get `rpi update
+        // --self`; a binary build without a target triple gets the URL.
+        assert_eq!(
+            self_update_instruction_for(InstallMethod::Binary, Some("x86_64-unknown-linux-gnu")),
+            "Run rpi update --self"
+        );
+        assert_eq!(
+            self_update_instruction_for(InstallMethod::Npm, None),
+            "Run rpi update --self"
+        );
+        assert_eq!(
+            self_update_instruction_for(InstallMethod::Binary, None),
+            format!("Download the latest release from {SELF_UPDATE_DOWNLOAD_URL}")
+        );
+    }
+
+    #[test]
+    fn test_uninstall_data_dir_default_layout() {
+        // At the default layout the purge root is `~/.rpi` (the parent of
+        // the agent dir); a redirected agent dir deletes itself instead.
+        let agent_dir = get_agent_dir();
+        let data_dir = get_uninstall_data_dir();
+        if let Some(home) = home_dir() {
+            if agent_dir == home.join(CONFIG_DIR_NAME).join("agent") {
+                assert_eq!(data_dir, home.join(CONFIG_DIR_NAME));
+                return;
+            }
+        }
+        assert_eq!(data_dir, agent_dir);
     }
 }

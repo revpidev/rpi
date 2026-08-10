@@ -4,7 +4,7 @@
 
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
-use rpi_ext_host::native::{RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref, PluginCookie};
+use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
 use serde_json::{json, Value};
 
 fn host_call(calls: &RpiHostCalls, cookie: PluginCookie, method: &str, args: Value) -> Value {

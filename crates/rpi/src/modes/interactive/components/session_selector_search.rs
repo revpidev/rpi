@@ -13,8 +13,8 @@
 //!   text (session-selector-search.ts:26-28) — there is no separate `cwd`
 //!   parameter upstream.
 
-use rpi_tui::fuzzy::fuzzy_match;
 use regex::{Regex, RegexBuilder};
+use rpi_tui::fuzzy::fuzzy_match;
 
 use crate::core::session_manager::SessionInfo;
 
