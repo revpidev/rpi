@@ -156,4 +156,4 @@ jobs:
           fail_on_unmatched_files: true
           # Tag re-push (release rebuild) must replace existing assets
           # instead of failing on "asset already exists".
-          overwrite: true
+          overwrite_files: true
