@@ -1381,7 +1381,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     initial_message,
                     initial_images,
                 },
-                &mut out,
+                crate::core::output_guard::RawStdout::new(Box::new(std::io::stdout())),
                 &mut err,
             )
             .await;

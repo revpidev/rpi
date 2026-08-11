@@ -18,7 +18,9 @@ use rpi_ext_host::api::{
 };
 use rpi_ext_host::types::ComponentTree;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+
+use crate::core::output_guard::RawStdout;
 
 /// Shared pending-dialog table (`pendingExtensionRequests`,
 /// rpc-mode.ts:88-128): stdin `extension_ui_response` frames resolve these.
@@ -28,9 +30,11 @@ pub fn new_pending_ui_table() -> PendingUiTable {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// RPC extension UI context. Cheap to clone (channel + shared table).
+/// RPC extension UI context. Cheap to clone (shared writer + shared table).
 pub struct RpcUiBridge {
-    output: mpsc::UnboundedSender<String>,
+    /// Same single ordered stdout path as responses/events (T18: replaces
+    /// the v0.1 unbounded line channel; blocking write = backpressure).
+    output: RawStdout,
     pending_ui: PendingUiTable,
     /// Default theme JSON for the `theme` getter (upstream returns the
     /// statically imported default theme, rpc-mode.ts:283-285).
@@ -42,11 +46,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl RpcUiBridge {
-    pub fn new(
-        output: mpsc::UnboundedSender<String>,
-        pending_ui: PendingUiTable,
-        default_theme: Value,
-    ) -> Self {
+    pub fn new(output: RawStdout, pending_ui: PendingUiTable, default_theme: Value) -> Self {
         RpcUiBridge {
             output,
             pending_ui,
@@ -57,7 +57,7 @@ impl RpcUiBridge {
     fn emit(&self, frame: Value) {
         let mut line = serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_owned());
         line.push('\n');
-        let _ = self.output.send(line);
+        self.output.write(&line);
     }
 
     /// `createDialogPromise` (rpc-mode.ts:90-129): register the pending

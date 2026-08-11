@@ -5,14 +5,34 @@
 //! Upstream anchors: rpc-mode.ts:88-309 (createDialogPromise +
 //! createExtensionUIContext), docs/rpc.md:1143-1333 (wire format).
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use rpi::core::output_guard::RawStdout;
 use rpi::modes::rpc::ui_bridge::{new_pending_ui_table, PendingUiTable, RpcUiBridge};
 use rpi_ext_host::api::{NotifyType, UiBridge, UiDialogOptions, WidgetContent};
 use rpi_tui::tui::Component as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
+
+/// Test double for the RPC stdout sink: forwards each write into a channel
+/// so the rig can await frames (`RawStdout` took over the real wire path in
+/// T18; this keeps the old channel-based assertions intact).
+struct ChannelWriter(mpsc::UnboundedSender<String>);
+
+impl Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .send(String::from_utf8_lossy(data).into_owned())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver gone"))?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// bridge + frame receiver + pending table.
 struct RpcRig {
@@ -25,7 +45,7 @@ fn rpc_rig() -> RpcRig {
     let (tx, rx) = mpsc::unbounded_channel();
     let pending = new_pending_ui_table();
     let bridge = Arc::new(RpcUiBridge::new(
-        tx,
+        RawStdout::new(Box::new(ChannelWriter(tx))),
         pending.clone(),
         rpi::core::themes::default_theme_json(),
     ));

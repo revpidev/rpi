@@ -2,12 +2,16 @@
 
 > Landing directory and runbook for the parity/contract test baseline data
 > (golden fixtures).
-> Upstream reference: the committed goldens were recorded against `external/pi`
-> @ `2efa728d2ee90ef597626e96b1e28ef2b279f07c` (0.82.1). The repository pin has
-> since moved — the current pin always lives in `UPSTREAM.md` (4181f66 / 0.84.1+
-> as of v0.11). Re-recording the baselines against the new pin is planned v0.11
-> work (rpi-docs `v0.11/02-design.md`); until then, regenerating fixtures that
-> match the committed data requires checking the submodule out at `2efa728`.
+> Upstream reference: the committed goldens are recorded against `external/pi`
+> @ `4181f66e6b3ccbef760c2966ecd8b596b926fec6` (0.84.1+) — re-recorded in v0.11
+> T18 (previously `2efa728` / 0.82.1, recorded for v0.1). The current pin
+> always lives in `UPSTREAM.md`; regenerating fixtures that match the
+> committed data requires the submodule checked out at the recording pin.
+> Note: `events.jsonl` holds the **internal** AgentSession event transcript
+> (with cumulative `message`/`partial` on `message_update`); the delta-only
+> wire shape (`toJsonEvent`, json-event.ts @ 4181f66) applies only at the
+> print/json + RPC stdout boundary and is covered by the print/RPC tests, not
+> by these fixtures.
 >
 > The **shared normalization and diff implementation** lives in
 > `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity
@@ -36,11 +40,16 @@ so red-line G4 is not touched):
 
 ```bash
 cd external/pi
-git rev-parse HEAD   # must match the recording pin (2efa728d2ee90ef597626e96b1e28ef2b279f07c,
+git rev-parse HEAD   # must match the recording pin (4181f66e6b3ccbef760c2966ecd8b596b926fec6,
                      # see the note at the top of this file)
-npm ci
+npm ci --ignore-scripts
+# Build order matters (workspace deps); pi-ai uses build:offline so the
+# network-fetching generate-models step does not rewrite pinned sources.
+npm run build --workspace @earendil-works/pi-telemetry
 npm run build --workspace @earendil-works/pi-tui
-npm run build --workspace @earendil-works/pi-ai
+npm run build:offline --workspace @earendil-works/pi-ai
+npm run build --workspace @earendil-works/pi-protocol
+npm run build --workspace @earendil-works/pi-client
 npm run build --workspace @earendil-works/pi-agent-core
 npm run build --workspace @earendil-works/pi-coding-agent
 ```

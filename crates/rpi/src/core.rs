@@ -16,6 +16,7 @@ pub mod highlight;
 pub mod keybindings;
 pub mod model_resolver;
 pub mod model_runtime;
+pub mod output_guard;
 pub mod package_manager;
 pub mod prompt_templates;
 pub mod remote_catalog_provider;

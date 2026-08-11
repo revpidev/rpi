@@ -346,10 +346,14 @@ async fn prompt_lifecycle_messages_state_stats() {
 
     // Event sequence (rpc.md §Events).
     let mut event_types = Vec::new();
+    let mut message_updates = Vec::new();
     loop {
         let event = rpc.next_value().await;
         let event_type = event["type"].as_str().expect("event type").to_owned();
         let done = event_type == "agent_settled";
+        if event_type == "message_update" {
+            message_updates.push(event);
+        }
         event_types.push(event_type);
         if done {
             break;
@@ -374,6 +378,32 @@ async fn prompt_lifecycle_messages_state_stats() {
         event_types.last().map(String::as_str),
         Some("agent_settled")
     );
+
+    // T18 (rpc-mode.ts:355-356 toJsonEvent, docs/rpc.md:952-956): wire
+    // `message_update` events are delta-only — no cumulative `message`, no
+    // `assistantMessageEvent.partial`; `contentIndex`/`delta` carry the
+    // stream and `message_end.message` is the authoritative final state.
+    assert!(
+        !message_updates.is_empty(),
+        "expected message_update events in {event_types:?}"
+    );
+    let mut assembled = String::new();
+    for update in &message_updates {
+        assert!(
+            update.get("message").is_none(),
+            "wire message_update must not carry `message`: {update}"
+        );
+        let delta_event = &update["assistantMessageEvent"];
+        assert!(
+            delta_event.get("partial").is_none(),
+            "wire message_update must not carry `partial`: {update}"
+        );
+        if delta_event["type"].as_str() == Some("text_delta") {
+            assert!(delta_event.get("contentIndex").is_some());
+            assembled.push_str(delta_event["delta"].as_str().expect("delta"));
+        }
+    }
+    assert_eq!(assembled, "Hello from faux!");
 
     // The scripted response was consumed exactly once.
     assert_eq!(rpc.provider.call_count(), 1);

@@ -1,10 +1,13 @@
 //! Print mode (single-shot): send prompts, output result, exit.
 //!
 //! Port of `packages/coding-agent/src/modes/print-mode.ts` @ pi 0.82.1
-//! (2efa728). Covers both `text` (final response only) and `json` (full
-//! event stream) output modes.
+//! (2efa728), with the JSON event path updated to pi 0.84.1+ (4181f66, T18):
+//! JSON events stream to stdout as they are emitted via
+//! `writeRawStdout(JSON.stringify(toJsonEvent(event)))`
+//! (print-mode.ts:108-112) instead of being buffered until exit. Covers both
+//! `text` (final response only) and `json` (full event stream) output modes.
 //!
-//! Signal handling (print-mode.ts:47-63): upstream kills tracked detached
+//! Signal handling (print-mode.ts:50-66): upstream kills tracked detached
 //! children, disposes the runtime, then exits 143 (SIGTERM) / 129 (SIGHUP).
 //! rpi has no detached-child registry (D-011); the handler exits directly
 //! with the same codes — abort tokens do not outlive process death.
@@ -17,7 +20,9 @@ use rpi_ai::types::{ImageContent, StopReason};
 use crate::core::agent_session::AgentSessionEvent;
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::extensions::ExtensionMode;
+use crate::core::output_guard::RawStdout;
 use crate::core::session_manager::SessionManager;
+use crate::modes::json_event::to_json_event;
 
 /// `mode: "text" | "json"` (print-mode.ts:19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,30 +67,41 @@ fn register_signal_handlers() {
 }
 
 /// Serialize the session header line for JSON mode
-/// (`JSON.stringify(header)`, print-mode.ts:113-116).
+/// (`JSON.stringify(header)`, print-mode.ts:123-126).
 fn session_header_json(session_manager: &SessionManager) -> Option<String> {
     let header = session_manager.get_header()?;
     serde_json::to_string(&rpi_agent::session::FileEntry::Session(header.clone())).ok()
 }
 
-/// `runPrintMode` (print-mode.ts:32-158). `out`/`err` are the process
-/// stdout/stderr in production and captured buffers in tests.
+/// `runPrintMode` (print-mode.ts:33-169). `out` is the shared raw-stdout
+/// writer (see below); `err` is the process stderr in production and a
+/// captured buffer in tests.
+///
+/// `out` is a [`RawStdout`] rather than the v0.1 `&mut dyn Write` because
+/// JSON-mode events are now written from the session's **synchronous** event
+/// listener, which requires a `'static` shared owner — a borrow cannot move
+/// into the subscription closure. The blocking write inside the listener
+/// *is* the backpressure: session listeners run inside the agent loop's
+/// ordered listener barrier, so a slow stdout stalls the event source
+/// (print-mode.ts:113-118 `session.agent.subscribe(async () =>
+/// waitForRawStdoutBackpressure())`; see `core::output_guard` for the full
+/// semantic mapping). No events are buffered, dropped, or merged.
 pub async fn run_print_mode(
     runtime: &mut AgentSessionRuntime,
     options: PrintModeOptions,
-    out: &mut dyn Write,
+    out: RawStdout,
     err: &mut dyn Write,
 ) -> i32 {
     register_signal_handlers();
 
     let mut exit_code = 0;
 
-    // JSON mode: header line first (print-mode.ts:112-117).
+    // JSON mode: header line first (print-mode.ts:122-127).
     if options.mode == PrintOutputMode::Json {
         let manager = runtime.session().session_manager();
         let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(line) = session_header_json(&manager) {
-            let _ = writeln!(out, "{line}");
+            out.write(&format!("{line}\n"));
         }
     }
 
@@ -123,12 +139,22 @@ pub async fn run_print_mode(
             },
         );
     }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // JSON mode: stream each event to stdout as it is emitted
+    // (print-mode.ts:108-112 `writeRawStdout(JSON.stringify(toJsonEvent(event)))`).
+    // `to_json_event` strips the cumulative `message`/`partial` snapshots so
+    // `message_update` stays delta-only on the wire (T18, docs/json.md:82-85).
+    // The blocking write runs inside the session's synchronous event
+    // dispatch — which the agent loop awaits in subscription order — so a
+    // slow consumer stalls the event source itself instead of filling an
+    // unbounded buffer (print-mode.ts:113-118 backpressure hook, fused; see
+    // `core::output_guard`).
     let json_mode = options.mode == PrintOutputMode::Json;
+    let event_out = out.clone();
     let _unsubscribe = session.subscribe(std::sync::Arc::new(move |event: AgentSessionEvent| {
         if json_mode {
-            if let Ok(line) = serde_json::to_string(&event) {
-                let _ = tx.send(line);
+            if let Ok(mut line) = serde_json::to_string(&to_json_event(&event)) {
+                line.push('\n');
+                event_out.write(&line);
             }
         }
     }));
@@ -164,17 +190,12 @@ pub async fn run_print_mode(
     }
     .await;
 
-    // Drain serialized JSON events captured by the subscription.
-    while let Ok(line) = rx.try_recv() {
-        let _ = writeln!(out, "{line}");
-    }
-
     if let Err(error) = result {
         let _ = writeln!(err, "{error}");
         exit_code = 1;
     } else if options.mode == PrintOutputMode::Text {
         // Print the last assistant message's text blocks
-        // (print-mode.ts:129-146).
+        // (print-mode.ts:139-156).
         let messages = session.messages();
         if let Some(AgentMessage::Assistant(assistant)) = messages.last() {
             if assistant.stop_reason == StopReason::Error
@@ -188,7 +209,7 @@ pub async fn run_print_mode(
             } else {
                 for content in &assistant.content {
                     if let rpi_ai::types::AssistantContent::Text(text) = content {
-                        let _ = writeln!(out, "{}", text.text);
+                        out.write(&format!("{}\n", text.text));
                     }
                 }
             }
@@ -196,8 +217,14 @@ pub async fn run_print_mode(
     }
 
     runtime.dispose().await;
-    let _ = out.flush();
+    // `flushRawStdout` (print-mode.ts:167).
+    out.flush();
     let _ = err.flush();
+    // Upstream exits 1 when the stdout write chain rejects
+    // (output-guard.ts:90-92); rpi records the error and maps it here.
+    if exit_code == 0 && out.has_error() {
+        exit_code = 1;
+    }
     exit_code
 }
 

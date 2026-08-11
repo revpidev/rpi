@@ -1,7 +1,12 @@
 //! RPC mode: headless JSON protocol over stdin/stdout.
 //!
 //! Port of `packages/coding-agent/src/modes/rpc/{rpc-mode,rpc-types,jsonl}.ts`
-//! @ pi 0.82.1 (2efa728), contract-anchored to `docs/rpc.md`.
+//! @ pi 0.82.1 (2efa728), contract-anchored to `docs/rpc.md`, with the event
+//! emission path updated to pi 0.84.1+ (4181f66, T18): wire events pass
+//! through `to_json_event` (delta-only `message_update`, docs/rpc.md:952-956)
+//! and stdout writes go through a single blocking writer with backpressure
+//! (`core::output_guard`, mapping `writeRawStdout` +
+//! `waitForRawStdoutBackpressure`).
 //!
 //! Protocol:
 //! - Commands: JSON objects on stdin, strict LF framing (`jsonl.ts`: split on
@@ -34,9 +39,11 @@ use crate::core::agent_session::{
 };
 use crate::core::agent_session_runtime::{AgentSessionRuntime, ForkPosition};
 use crate::core::extensions::{ExtensionMode, InputSource, StreamingBehavior};
+use crate::core::output_guard::RawStdout;
 use crate::core::prompt_templates::PromptTemplate;
 use crate::core::skills::{SourceInfo, SourceOrigin, SourceScope};
 use crate::error::RpiError;
+use crate::modes::json_event::to_json_event;
 
 pub mod ui_bridge;
 
@@ -647,8 +654,20 @@ struct RpcState {
     /// Set by the (T15) extension `ctx.shutdown()` handler; honored on the
     /// next `agent_settled` event (rpc-mode.ts:727-730).
     shutdown_requested: AtomicBool,
-    /// Serialized output lines (responses + events).
-    output: mpsc::UnboundedSender<String>,
+    /// Single ordered stdout write path for responses + events (upstream
+    /// `writeRawStdout`'s promise chain, output-guard.ts:85-93). The blocking
+    /// write doubles as backpressure: producers wait while the consumer's
+    /// pipe is full instead of piling lines into an unbounded buffer (T18).
+    ///
+    /// Trade-off (coding-standards §6.1, deliberate): a blocking `Write` call
+    /// inside an async task parks its tokio worker until the fd drains.
+    /// Upstream stalls the exact same producers — the agent loop's listener
+    /// barrier awaits `waitForRawStdoutBackpressure` (rpc-mode.ts:361-363)
+    /// and each command handler awaits it after writing its response
+    /// (rpc-mode.ts:785,796) — so blocking here is behaviorally identical,
+    /// and no deadlock is possible because progress depends only on the
+    /// external reader, never on another tokio task.
+    output: RawStdout,
     /// Shutdown trigger for the main loop.
     shutdown: mpsc::UnboundedSender<i32>,
 }
@@ -662,7 +681,7 @@ impl RpcState {
     }
 
     fn emit_value(&self, value: &Value) {
-        let _ = self.output.send(serialize_json_line(value));
+        self.output.write(&serialize_json_line(value));
     }
 }
 
@@ -687,7 +706,7 @@ async fn rebind_session(
                 }
             })),
             on_error: Some(Arc::new(move |error| {
-                let _ = error_output.send(serialize_json_line(&json!({
+                error_output.write(&serialize_json_line(&json!({
                     "type": "extension_error",
                     "extensionPath": error.extension_path,
                     "event": error.event,
@@ -717,11 +736,16 @@ async fn rebind_session(
             &event,
             AgentSessionEvent::Session(SessionEvent::AgentSettled)
         );
-        if let Ok(mut line) = serde_json::to_string(&event) {
+        // `output(toJsonEvent(event))` (rpc-mode.ts:355-356, T18): the wire
+        // event is delta-only — `to_json_event` strips the cumulative
+        // `message`/`partial` snapshots (docs/rpc.md:952-956). The blocking
+        // write runs inside the agent loop's ordered listener barrier, so a
+        // slow consumer stalls the event source (rpc-mode.ts:361-363).
+        if let Ok(mut line) = serde_json::to_string(&to_json_event(&event)) {
             line.push('\n');
-            let _ = event_output.send(line);
+            event_output.write(&line);
         }
-        // `checkShutdownRequested` on agent_settled (rpc-mode.ts:354-358).
+        // `checkShutdownRequested` on agent_settled (rpc-mode.ts:357-359).
         if is_settled {
             if let Some(state) = state_weak.upgrade() {
                 if state.shutdown_requested.load(Ordering::SeqCst) {
@@ -777,29 +801,30 @@ async fn dispatch(
             let response_id = id.clone();
             let prompt_output = state.output.clone();
             tokio::spawn(async move {
-                let result =
-                    session
-                        .prompt(
-                            &message,
-                            PromptOptions {
-                                images,
-                                streaming_behavior,
-                                source: Some(InputSource::Rpc),
-                                preflight_result: Some(Box::new(move |did_succeed| {
-                                    if did_succeed {
-                                        accepted_observer.store(true, Ordering::SeqCst);
-                                        let _ = output.send(serialize_json_line(
-                                            &success_response(&response_id, "prompt", None),
-                                        ));
-                                    }
-                                })),
-                                ..Default::default()
-                            },
-                        )
-                        .await;
+                let result = session
+                    .prompt(
+                        &message,
+                        PromptOptions {
+                            images,
+                            streaming_behavior,
+                            source: Some(InputSource::Rpc),
+                            preflight_result: Some(Box::new(move |did_succeed| {
+                                if did_succeed {
+                                    accepted_observer.store(true, Ordering::SeqCst);
+                                    output.write(&serialize_json_line(&success_response(
+                                        &response_id,
+                                        "prompt",
+                                        None,
+                                    )));
+                                }
+                            })),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
                 if let Err(error) = result {
                     if !accepted.load(Ordering::SeqCst) {
-                        let _ = prompt_output.send(serialize_json_line(&error_response(
+                        prompt_output.write(&serialize_json_line(&error_response(
                             &id,
                             "prompt",
                             &error_message(&error),
@@ -1174,7 +1199,7 @@ fn register_signal_handlers() {
     }
 }
 
-/// `runRpcMode` (rpc-mode.ts:53-801). Consumes the runtime; returns the
+/// `runRpcMode` (rpc-mode.ts:54-807). Consumes the runtime; returns the
 /// process exit code (stdin EOF / shutdown → 0; signals exit the process
 /// directly with 143/129).
 pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
@@ -1184,18 +1209,13 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
 ) -> i32 {
     register_signal_handlers();
 
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel::<String>();
+    // Single ordered write path: all responses and events go through this
+    // blocking writer, preserving emission order (upstream `writeRawStdout`,
+    // output-guard.ts:85-93) and applying backpressure to producers when the
+    // consumer is slow (T18; replaces the v0.1 unbounded channel + writer
+    // task, which let slow consumers pile lines up without bound).
+    let output = RawStdout::new(out);
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<i32>();
-
-    // Single writer: all responses and events serialize through here,
-    // preserving emission order (upstream `writeRawStdout`).
-    let writer = tokio::spawn(async move {
-        let mut out = out;
-        while let Some(line) = output_rx.recv().await {
-            let _ = out.write_all(line.as_bytes());
-        }
-        let _ = out.flush();
-    });
 
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let initial_session = runtime.lock().await.session().clone();
@@ -1205,7 +1225,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
         unsubscribe: Mutex::new(None),
         pending_ui: ui_bridge::new_pending_ui_table(),
         shutdown_requested: AtomicBool::new(false),
-        output: output_tx.clone(),
+        output: output.clone(),
         shutdown: shutdown_tx,
     });
 
@@ -1240,7 +1260,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     {
         host.set_ui(
             Some(Arc::new(ui_bridge::RpcUiBridge::new(
-                output_tx.clone(),
+                output.clone(),
                 state.pending_ui.clone(),
                 crate::core::themes::default_theme_json(),
             ))),
@@ -1250,7 +1270,9 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
 
     // Input loop: each command is handled on its own task so `abort` /
     // `abort_bash` can land while a long-running `bash`/`prompt` is in
-    // flight (upstream fires `void handleInputLine(line)` per record).
+    // flight (upstream fires `void handleInputLine(line)` per record). The
+    // tasks are tracked so shutdown can wait out their responses (below).
+    let mut command_tasks = tokio::task::JoinSet::new();
     let exit_code = loop {
         tokio::select! {
             record = read_record(&mut input) => {
@@ -1263,7 +1285,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
                             ParsedLine::Command(command) => {
                                 let state = state.clone();
                                 let runtime = runtime.clone();
-                                tokio::spawn(async move {
+                                command_tasks.spawn(async move {
                                     handle_command(state, runtime, command).await;
                                 });
                             }
@@ -1301,8 +1323,8 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
         let runtime_guard = runtime.lock().await;
         runtime_guard.dispose().await;
     }
-    // Detach the event subscription so its output sender drops with the
-    // state; the writer only finishes once every sender is gone.
+    // Detach the event subscription so late tail events (aborted message_end,
+    // retry triggers) cannot write after the mode ends.
     if let Some(unsubscribe) = state
         .unsubscribe
         .lock()
@@ -1313,8 +1335,19 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     }
     drop(state);
     drop(runtime);
-    drop(output_tx);
     drop(initial_session);
-    let _ = writer.await;
+    // Wait out in-flight command tasks so their responses land on the wire
+    // before the process exits. The v0.1 writer task did this implicitly
+    // (the output channel only closed once every task's sender dropped);
+    // with direct writes the wait must be explicit. Dispose ran first, so
+    // in-flight prompts have already been aborted and every task terminates.
+    while command_tasks.join_next().await.is_some() {}
+    // `flushRawStdout` (rpc-mode.ts `shutdown`); a recorded write error maps
+    // to exit code 1 (upstream exits 1 on write-chain rejection,
+    // output-guard.ts:90-92).
+    output.flush();
+    if output.has_error() && exit_code == 0 {
+        return 1;
+    }
     exit_code
 }

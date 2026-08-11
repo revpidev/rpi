@@ -1,5 +1,5 @@
-{"type":"session","version":3,"id":"019fb0cc-ec89-7a11-8774-8ba7acae4622","timestamp":"2026-07-30T02:14:07.753Z","cwd":"/tmp/rpi-fixture-single-turn-PkAXqR/workspace"}
-{"type":"model_change","id":"3b3c5858","parentId":null,"timestamp":"2026-07-30T02:14:07.755Z","provider":"faux","modelId":"faux-1"}
-{"type":"thinking_level_change","id":"6519b763","parentId":"3b3c5858","timestamp":"2026-07-30T02:14:07.755Z","thinkingLevel":"off"}
-{"type":"message","id":"67e7b122","parentId":"6519b763","timestamp":"2026-07-30T02:14:07.760Z","message":{"role":"user","content":[{"type":"text","text":"Say hello."}],"timestamp":1785377647759}}
-{"type":"message","id":"aa78df9c","parentId":"67e7b122","timestamp":"2026-07-30T02:14:07.761Z","message":{"role":"assistant","content":[{"type":"text","text":"Hello from the faux provider!"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":1353,"output":8,"cacheRead":0,"cacheWrite":1353,"totalTokens":2714,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1785377647758}}
+{"type":"session","version":3,"id":"019fef42-eab4-74cf-9fc0-e45bf7fdb351","timestamp":"2026-08-11T05:19:27.924Z","cwd":"/tmp/rpi-fixture-single-turn-k5xBN8/workspace"}
+{"type":"model_change","id":"47febfce","parentId":null,"timestamp":"2026-08-11T05:19:27.926Z","provider":"faux","modelId":"faux-1"}
+{"type":"thinking_level_change","id":"41b821aa","parentId":"47febfce","timestamp":"2026-08-11T05:19:27.926Z","thinkingLevel":"off"}
+{"type":"message","id":"dfb5dfa4","parentId":"41b821aa","timestamp":"2026-08-11T05:19:27.936Z","message":{"role":"user","content":[{"type":"text","text":"Say hello."}],"timestamp":1786425567935}}
+{"type":"message","id":"5e1636ff","parentId":"dfb5dfa4","timestamp":"2026-08-11T05:19:27.938Z","message":{"role":"assistant","content":[{"type":"text","text":"Hello from the faux provider!"}],"api":"faux","provider":"faux","model":"faux-1","usage":{"input":1359,"output":8,"cacheRead":0,"cacheWrite":1359,"totalTokens":2726,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1786425567928}}

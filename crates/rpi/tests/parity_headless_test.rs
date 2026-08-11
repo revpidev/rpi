@@ -37,6 +37,7 @@ use rpi::core::agent_session_services::{
     create_agent_session_services, CreateAgentSessionServicesOptions,
 };
 use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
+use rpi::core::output_guard::RawStdout;
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi::modes::print_mode::{run_print_mode, PrintModeOptions, PrintOutputMode};
 use rpi_agent::types::AgentEvent;
@@ -80,6 +81,33 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Shared stdout capture for `run_print_mode`'s `RawStdout` (T18: the mode
+/// writes through a shared blocking writer instead of `&mut dyn Write`).
+#[derive(Clone, Default)]
+struct SharedBuf {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedBuf {
+    fn bytes(&self) -> Vec<u8> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -657,7 +685,7 @@ async fn print_mode_text_output() {
         .into()],
     )
     .await;
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
     let mut err: Vec<u8> = Vec::new();
     let exit = run_print_mode(
         &mut runtime,
@@ -667,13 +695,13 @@ async fn print_mode_text_output() {
             initial_message: Some("Say hello.".to_owned()),
             initial_images: None,
         },
-        &mut out,
+        RawStdout::new(Box::new(out.clone())),
         &mut err,
     )
     .await;
     assert_eq!(exit, 0, "stderr: {}", String::from_utf8_lossy(&err));
     assert_eq!(
-        String::from_utf8(out).expect("utf8 out"),
+        String::from_utf8(out.bytes()).expect("utf8 out"),
         "Hello from the faux provider!\n"
     );
 }
@@ -690,7 +718,7 @@ async fn print_mode_json_event_stream() {
         .into()],
     )
     .await;
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
     let mut err: Vec<u8> = Vec::new();
     let exit = run_print_mode(
         &mut runtime,
@@ -700,12 +728,12 @@ async fn print_mode_json_event_stream() {
             initial_message: Some("Say hello.".to_owned()),
             initial_images: None,
         },
-        &mut out,
+        RawStdout::new(Box::new(out.clone())),
         &mut err,
     )
     .await;
     assert_eq!(exit, 0, "stderr: {}", String::from_utf8_lossy(&err));
-    let out = String::from_utf8(out).expect("utf8 out");
+    let out = String::from_utf8(out.bytes()).expect("utf8 out");
     let lines: Vec<Value> = out
         .lines()
         .map(|line| serde_json::from_str(line).expect("json line"))
@@ -749,7 +777,7 @@ async fn print_mode_sends_all_messages_in_order() {
         ],
     )
     .await;
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
     let mut err: Vec<u8> = Vec::new();
     let exit = run_print_mode(
         &mut runtime,
@@ -759,12 +787,15 @@ async fn print_mode_sends_all_messages_in_order() {
             initial_message: Some("first".to_owned()),
             initial_images: None,
         },
-        &mut out,
+        RawStdout::new(Box::new(out.clone())),
         &mut err,
     )
     .await;
     assert_eq!(exit, 0, "stderr: {}", String::from_utf8_lossy(&err));
-    assert_eq!(String::from_utf8(out).expect("utf8 out"), "answer three\n");
+    assert_eq!(
+        String::from_utf8(out.bytes()).expect("utf8 out"),
+        "answer three\n"
+    );
     let user_texts: Vec<String> = runtime
         .session()
         .messages()
@@ -796,7 +827,7 @@ async fn print_mode_error_and_aborted_exit_1() {
         .into()],
     )
     .await;
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
     let mut err: Vec<u8> = Vec::new();
     let exit = run_print_mode(
         &mut runtime,
@@ -806,7 +837,7 @@ async fn print_mode_error_and_aborted_exit_1() {
             initial_message: Some("boom?".to_owned()),
             initial_images: None,
         },
-        &mut out,
+        RawStdout::new(Box::new(out.clone())),
         &mut err,
     )
     .await;
@@ -826,7 +857,7 @@ async fn print_mode_error_and_aborted_exit_1() {
         .into()],
     )
     .await;
-    let mut out: Vec<u8> = Vec::new();
+    let out = SharedBuf::default();
     let mut err: Vec<u8> = Vec::new();
     let exit = run_print_mode(
         &mut runtime,
@@ -836,7 +867,7 @@ async fn print_mode_error_and_aborted_exit_1() {
             initial_message: Some("abort?".to_owned()),
             initial_images: None,
         },
-        &mut out,
+        RawStdout::new(Box::new(out.clone())),
         &mut err,
     )
     .await;

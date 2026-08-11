@@ -2,17 +2,23 @@
 /**
  * Rpi fixtures generator (runbook step: see fixtures/README.md §2).
  *
- * Runs the pinned upstream Pi (recording pin: pi 0.82.1, external/pi @
- * 2efa728 — see the pin note in fixtures/README.md; the current repo pin
+ * Runs the pinned upstream Pi (recording pin: pi 0.84.1+, external/pi @
+ * 4181f66 — see the pin note in fixtures/README.md; the current repo pin
  * lives in UPSTREAM.md) with the
  * faux provider and fixed prompt scripts over the SDK (`createAgentSession`),
  * then exports, per scenario:
  *   - `session.jsonl`  — the real on-disk session file (file-backed SessionManager)
- *   - `events.jsonl`   — the AgentSession event transcript (json-mode shapes)
+ *   - `events.jsonl`   — the INTERNAL AgentSession event transcript (with
+ *     cumulative `message`/`partial`; the delta-only `toJsonEvent` wire shape
+ *     applies only at the print/json + RPC stdout boundary, T18)
  *
  * Prerequisites (one-time, see fixtures/README.md):
- *   cd external/pi && npm ci && npm run build --workspace @earendil-works/pi-tui \
- *     && npm run build --workspace @earendil-works/pi-ai \
+ *   cd external/pi && npm ci --ignore-scripts \
+ *     && npm run build --workspace @earendil-works/pi-telemetry \
+ *     && npm run build --workspace @earendil-works/pi-tui \
+ *     && npm run build:offline --workspace @earendil-works/pi-ai \
+ *     && npm run build --workspace @earendil-works/pi-protocol \
+ *     && npm run build --workspace @earendil-works/pi-client \
  *     && npm run build --workspace @earendil-works/pi-agent-core \
  *     && npm run build --workspace @earendil-works/pi-coding-agent
  *
