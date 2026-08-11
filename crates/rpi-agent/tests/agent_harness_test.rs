@@ -1676,10 +1676,9 @@ async fn test_compaction_persists_hook_provided_usage_body() {
                         cancel: None,
                         compaction: Some(CompactResult {
                             summary: "hook summary".to_owned(),
-                            first_kept_entry_id: Some(preparation.first_kept_entry_id),
                             tokens_before: preparation.tokens_before,
                             usage: Some(usage),
-                            retained_tail: None,
+                            retained_tail: preparation.retained_tail.clone(),
                             details: None,
                         }),
                     }),

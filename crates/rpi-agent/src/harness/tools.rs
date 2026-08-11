@@ -331,6 +331,17 @@ pub(crate) mod test_helpers {
             self.inner.append_file(path, content, abort_signal).await
         }
 
+        async fn rename_file(
+            &self,
+            source_path: &str,
+            destination_path: &str,
+            abort_signal: Option<CancellationToken>,
+        ) -> Result<(), FileError> {
+            self.inner
+                .rename_file(source_path, destination_path, abort_signal)
+                .await
+        }
+
         async fn file_info(
             &self,
             path: &str,

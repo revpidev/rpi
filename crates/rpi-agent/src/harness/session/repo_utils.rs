@@ -61,7 +61,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// `new Date(ms).toISOString()` — `YYYY-MM-DDTHH:MM:SS.sssZ`.
-fn format_iso8601_ms(ms: u64) -> String {
+pub(crate) fn format_iso8601_ms(ms: u64) -> String {
     let ms = ms as i64;
     let days = ms.div_euclid(86_400_000);
     let rem = ms.rem_euclid(86_400_000);
@@ -417,6 +417,16 @@ pub(crate) mod test_support {
                 .map_err(|error| io_error(path, "open", error))?;
             file.write_all(content)
                 .map_err(|error| io_error(path, "append", error))
+        }
+
+        async fn rename_file(
+            &self,
+            source_path: &str,
+            destination_path: &str,
+            _abort_signal: Option<CancellationToken>,
+        ) -> Result<(), FileError> {
+            std::fs::rename(source_path, destination_path)
+                .map_err(|error| io_error(source_path, "rename", error))
         }
 
         async fn file_info(

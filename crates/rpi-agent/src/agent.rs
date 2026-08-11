@@ -35,7 +35,7 @@ use crate::agent_loop::{
     now_millis, run_agent_loop, run_agent_loop_continue, thinking_level_from_model_level,
     AfterToolCallFn, AgentContext, AgentEventSink, AgentLoopConfig, AgentLoopTurnUpdate,
     BeforeToolCallFn, ConvertToLlmFn, GetApiKeyFn, GetQueuedMessagesFn, PrepareNextTurnContext,
-    PrepareNextTurnFn, TransformContextFn,
+    PrepareNextTurnFn, ShouldStopAfterTurnContext, ShouldStopAfterTurnFn, TransformContextFn,
 };
 use crate::error::AgentError;
 use crate::messages::AgentMessage;
@@ -51,6 +51,13 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// the active run's abort signal.
 pub type AgentListener =
     Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// `shouldStopAfterTurn` (agent.ts:108, agent-side variant). Receives the
+/// active run's abort signal as the second argument (upstream
+/// `this.signal`).
+pub type ShouldStopAfterTurnAgentFn = Arc<
+    dyn Fn(ShouldStopAfterTurnContext, CancellationToken) -> BoxFuture<'static, bool> + Send + Sync,
+>;
 
 /// `prepareNextTurn` (signal-only variant, agent.ts:191-193).
 pub type PrepareNextTurnSignalFn =
@@ -147,6 +154,7 @@ pub struct AgentOptions {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
     pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
     pub prepare_next_turn_with_context: Option<PrepareNextTurnWithContextFn>,
     pub steering_mode: Option<QueueMode>,
@@ -172,6 +180,7 @@ impl AgentOptions {
             on_response: None,
             before_tool_call: None,
             after_tool_call: None,
+            should_stop_after_turn: None,
             prepare_next_turn: None,
             prepare_next_turn_with_context: None,
             steering_mode: None,
@@ -346,6 +355,7 @@ pub struct Agent {
     pub on_response: Option<rpi_ai::types::OnResponseCallback>,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
+    pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
     pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
     pub prepare_next_turn_with_context: Option<PrepareNextTurnWithContextFn>,
     /// Session identifier forwarded to providers for cache-aware backends.
@@ -395,6 +405,7 @@ impl Agent {
             on_response: options.on_response,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
+            should_stop_after_turn: options.should_stop_after_turn,
             prepare_next_turn: options.prepare_next_turn,
             prepare_next_turn_with_context: options.prepare_next_turn_with_context,
             session_id: options.session_id,
@@ -527,7 +538,15 @@ impl Agent {
     }
 
     /// Clear transcript state, runtime state, and queued messages.
-    pub fn reset(&self) {
+    ///
+    /// Returns an error while a run is active (upstream agent.ts:332-345); the
+    /// transcript and all other state is left untouched in that case.
+    pub fn reset(&self) -> Result<(), AgentError> {
+        if lock(&self.active_run).is_some() {
+            return Err(AgentError::Message(
+                "Agent is already processing. Wait for completion before resetting.".to_owned(),
+            ));
+        }
         {
             let mut state = lock(&self.state);
             state.messages = Vec::new();
@@ -538,6 +557,7 @@ impl Agent {
         }
         self.clear_follow_up_queue();
         self.clear_steering_queue();
+        Ok(())
     }
 
     /// Start a new prompt from text, a single message, or a batch of messages
@@ -712,6 +732,25 @@ impl Agent {
                 None
             };
 
+        let should_stop_after_turn: Option<ShouldStopAfterTurnFn> =
+            if let Some(agent_callback) = self.should_stop_after_turn.clone() {
+                let active_run = self.active_run.clone();
+                Some(Arc::new(move |context: ShouldStopAfterTurnContext| {
+                    let agent_callback = agent_callback.clone();
+                    let active_run = active_run.clone();
+                    Box::pin(async move {
+                        // Upstream reads `this.signal` at call time (agent.ts:461).
+                        let signal = lock(&active_run)
+                            .as_ref()
+                            .map(|run| run.signal.clone())
+                            .unwrap_or_default();
+                        agent_callback(context, signal).await
+                    })
+                }))
+            } else {
+                None
+            };
+
         AgentLoopConfig {
             model,
             reasoning,
@@ -731,8 +770,7 @@ impl Agent {
             convert_to_llm: self.convert_to_llm.clone(),
             transform_context: self.transform_context.clone(),
             get_api_key: self.get_api_key.clone(),
-            // The Agent layer exposes no shouldStopAfterTurn option upstream.
-            should_stop_after_turn: None,
+            should_stop_after_turn,
             prepare_next_turn,
             get_steering_messages: Some(get_steering_messages),
             get_follow_up_messages: Some(get_follow_up_messages),

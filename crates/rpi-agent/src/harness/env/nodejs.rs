@@ -922,6 +922,22 @@ impl FileSystem for NodeExecutionEnv {
             .map_err(|error| to_file_error(error, None))
     }
 
+    /// `renameFile` (types.ts:252-253 @ 4181f66) — atomically rename a file,
+    /// replacing the destination when it exists. Uses `tokio::fs::rename`
+    /// which is atomic on the same filesystem and overwrites on Unix.
+    async fn rename_file(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        _abort_signal: Option<CancellationToken>,
+    ) -> Result<(), FileError> {
+        let source = resolve_path(&self.cwd, source_path);
+        let destination = resolve_path(&self.cwd, destination_path);
+        tokio::fs::rename(&source, &destination)
+            .await
+            .map_err(|error| to_file_error(error, None))
+    }
+
     /// `fileInfo` via `lstat` (nodejs.ts:582-589) — symlinks are not followed.
     async fn file_info(
         &self,
@@ -1410,5 +1426,59 @@ impl Shell for NodeExecutionEnv {
     /// `Shell::cleanup` — best-effort process cleanup (nodejs.ts:671-674).
     async fn cleanup(&self) {
         self.cleanup_active_child_pids();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn unique_tmp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-rename-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn rename_file_same_dir_replaces_destination() {
+        let tmp = unique_tmp_dir();
+        let cwd = tmp.to_str().expect("cwd");
+        let env = NodeExecutionEnv::new(cwd.to_owned());
+
+        let src = tmp.join("a.txt");
+        let dst = tmp.join("b.txt");
+        tokio::fs::write(&src, "hello").await.expect("write source");
+
+        // Rename to a non-existing destination.
+        env.rename_file("a.txt", "b.txt", None)
+            .await
+            .expect("rename to new file");
+        assert!(!src.exists());
+        assert_eq!(
+            tokio::fs::read_to_string(&dst).await.expect("read dst"),
+            "hello"
+        );
+
+        // Rename over an existing destination (atomic overwrite).
+        tokio::fs::write(&src, "world")
+            .await
+            .expect("write source again");
+        env.rename_file("a.txt", "b.txt", None)
+            .await
+            .expect("rename over existing");
+        assert_eq!(
+            tokio::fs::read_to_string(&dst).await.expect("read dst"),
+            "world"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

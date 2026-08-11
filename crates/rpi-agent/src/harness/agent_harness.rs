@@ -422,6 +422,21 @@ fn entry_message_for_compaction(entry: &SessionEntry) -> Option<AgentMessage> {
         .next()
 }
 
+/// Epoch milliseconds of an [`AgentMessage`] (untagged enum; each variant
+/// carries `timestamp: i64`). Used when virtualizing a compaction's retained
+/// tail into message entries (compaction.ts:636-645 @ 4181f66).
+fn agent_message_epoch_ms(message: &AgentMessage) -> i64 {
+    match message {
+        AgentMessage::User(message) => message.timestamp,
+        AgentMessage::Assistant(message) => message.timestamp,
+        AgentMessage::ToolResult(message) => message.timestamp,
+        AgentMessage::BashExecution(message) => message.timestamp,
+        AgentMessage::Custom(message) => message.timestamp,
+        AgentMessage::BranchSummary(message) => message.timestamp,
+        AgentMessage::CompactionSummary(message) => message.timestamp,
+    }
+}
+
 /// `prepareCompaction` (harness compaction.ts:640-713). Two differences from
 /// the coding-agent variant ported as [`prepare_compaction`]: it does NOT
 /// bail out when nothing needs summarizing (the summarization call still
@@ -446,30 +461,67 @@ fn prepare_harness_compaction(
         .iter()
         .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
     let mut previous_summary: Option<String> = None;
-    let mut boundary_start = 0;
+    // 44289550a @ 4181f66: the previous compaction's `retainedTail` is
+    // virtualized into message entries (`${prevId}:retained:${index}`) and the
+    // cut-point search runs over virtual + real entries; no firstKeptEntryId
+    // anchor. Legacy harness entries (retained_tail absent) keep the v1
+    // first_kept_entry_id anchor for backward compatibility.
+    let mut compactable: std::borrow::Cow<'_, [SessionEntry]> =
+        std::borrow::Cow::Borrowed(branch_entries);
     if let Some(index) = prev_compaction_index {
         if let SessionEntry::Compaction(prev_compaction) = &branch_entries[index] {
             previous_summary = Some(prev_compaction.summary.clone());
-            boundary_start = branch_entries
-                .iter()
-                .position(|entry| {
-                    Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref()
-                })
-                .map_or(index + 1, |kept| kept);
+            if let Some(tail) = &prev_compaction.retained_tail {
+                let mut virtualized: Vec<SessionEntry> = tail
+                    .iter()
+                    .enumerate()
+                    .map(|(tail_index, message)| {
+                        let virtual_id = format!("{}:retained:{}", prev_compaction.id, tail_index);
+                        SessionEntry::Message(crate::session::MessageEntry {
+                            parent_id: Some(if tail_index == 0 {
+                                prev_compaction.id.clone()
+                            } else {
+                                format!("{}:retained:{}", prev_compaction.id, tail_index - 1)
+                            }),
+                            // Entry timestamps are ISO strings in the
+                            // consolidated session skeleton; messages carry
+                            // epoch ms (messages.ts: virtual entry
+                            // `timestamp: message.timestamp`).
+                            timestamp: crate::harness::session::repo_utils::format_iso8601_ms(
+                                agent_message_epoch_ms(message).max(0) as u64,
+                            ),
+                            id: virtual_id,
+                            message: message.clone(),
+                        })
+                    })
+                    .collect();
+                virtualized.extend_from_slice(&branch_entries[index + 1..]);
+                compactable = std::borrow::Cow::Owned(virtualized);
+            } else {
+                // Legacy anchor (v1 form): start at the recorded first kept
+                // entry, or right after the compaction when unknown.
+                let boundary_start = branch_entries
+                    .iter()
+                    .position(|entry| {
+                        Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref()
+                    })
+                    .map_or(index + 1, |kept| kept);
+                compactable = std::borrow::Cow::Borrowed(&branch_entries[boundary_start..]);
+            }
         }
     }
-    let boundary_end = branch_entries.len();
+    let boundary_end = compactable.len();
 
     let tokens_before =
         crate::compaction::estimate_context_tokens(&build_context_messages(branch_entries)).tokens;
 
     let cut_point = crate::compaction::find_cut_point(
-        branch_entries,
-        boundary_start,
+        &compactable,
+        0,
         boundary_end,
         settings.keep_recent_tokens,
     );
-    let Some(first_kept_entry) = branch_entries.get(cut_point.first_kept_entry_index) else {
+    let Some(first_kept_entry) = compactable.get(cut_point.first_kept_entry_index) else {
         // compaction.ts:672-674.
         return Err(AgentHarnessError::new(
             AgentHarnessErrorCode::Compaction,
@@ -487,7 +539,7 @@ fn prepare_harness_compaction(
     };
 
     let mut messages_to_summarize = Vec::new();
-    for entry in &branch_entries[boundary_start..history_end] {
+    for entry in &compactable[..history_end] {
         if let Some(message) = entry_message_for_compaction(entry) {
             messages_to_summarize.push(message);
         }
@@ -497,14 +549,14 @@ fn prepare_harness_compaction(
         let turn_start = cut_point
             .turn_start_index
             .unwrap_or(cut_point.first_kept_entry_index);
-        for entry in &branch_entries[turn_start..cut_point.first_kept_entry_index] {
+        for entry in &compactable[turn_start..cut_point.first_kept_entry_index] {
             if let Some(message) = entry_message_for_compaction(entry) {
                 turn_prefix_messages.push(message);
             }
         }
     }
     let mut retained_tail = Vec::new();
-    for entry in &branch_entries[cut_point.first_kept_entry_index..boundary_end] {
+    for entry in &compactable[cut_point.first_kept_entry_index..boundary_end] {
         if let Some(message) = entry_message_for_compaction(entry) {
             retained_tail.push(message);
         }
@@ -1146,6 +1198,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                                     block: result.block,
                                     reason: result.reason,
                                     args: None,
+                                    terminate: None,
                                 })
                             }
                             Ok(_) => None,
@@ -1160,6 +1213,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                                     block: Some(true),
                                     reason: Some(reason),
                                     args: None,
+                                    terminate: None,
                                 })
                             }
                         }
@@ -1900,10 +1954,9 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                 })?;
                 CompactResult {
                     summary: compacted.summary,
-                    first_kept_entry_id: Some(compacted.first_kept_entry_id),
                     tokens_before: compacted.tokens_before,
                     usage: compacted.usage,
-                    retained_tail: Some(retained_tail),
+                    retained_tail,
                     details: compacted.details,
                 }
             }
@@ -1912,13 +1965,15 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
             .session
             .append_compaction(
                 &result.summary,
-                result.first_kept_entry_id.as_deref(),
+                // 44289550a @ 4181f66: harness compaction entries anchor via
+                // `retainedTail` (checkpoint semantics); no firstKeptEntryId.
+                None,
                 result.tokens_before,
                 AppendCompactionOptions {
                     details: result.details.clone(),
                     from_hook: Some(from_hook),
                     usage: result.usage.clone(),
-                    retained_tail: result.retained_tail.clone(),
+                    retained_tail: Some(result.retained_tail.clone()),
                 },
             )
             .await
@@ -2413,5 +2468,123 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
         if let Some(done) = done {
             done.cancelled().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{CompactionEntry, MessageEntry};
+    use rpi_ai::types::{UserContent, UserMessage};
+
+    fn user_message(text: &str, timestamp: i64) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            role: Default::default(),
+            content: UserContent::Text(text.to_owned()),
+            timestamp,
+        })
+    }
+
+    fn message_entry(id: &str, message: AgentMessage) -> SessionEntry {
+        SessionEntry::Message(MessageEntry {
+            id: id.to_owned(),
+            parent_id: None,
+            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+            message,
+        })
+    }
+
+    fn compaction_entry(
+        id: &str,
+        first_kept_entry_id: Option<&str>,
+        retained_tail: Option<Vec<AgentMessage>>,
+    ) -> SessionEntry {
+        SessionEntry::Compaction(CompactionEntry {
+            id: id.to_owned(),
+            parent_id: None,
+            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+            summary: "prev summary".to_owned(),
+            first_kept_entry_id: first_kept_entry_id.map(str::to_owned),
+            tokens_before: 100,
+            retained_tail,
+            details: None,
+            usage: None,
+            from_hook: None,
+        })
+    }
+
+    fn user_texts(messages: &[AgentMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| match message {
+                AgentMessage::User(user) => match &user.content {
+                    UserContent::Text(text) => text.as_str(),
+                    other => panic!("unexpected content: {other:?}"),
+                },
+                other => panic!("unexpected message: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn prepared_sequence(
+        preparation: &crate::compaction::CompactionPreparation,
+        retained_tail: &[AgentMessage],
+    ) -> Vec<String> {
+        let mut all = preparation.messages_to_summarize.clone();
+        all.extend(preparation.turn_prefix_messages.iter().cloned());
+        all.extend(retained_tail.iter().cloned());
+        user_texts(&all).into_iter().map(str::to_owned).collect()
+    }
+
+    /// 44289550a @ 4181f66 (compaction.ts:633-645): a previous compaction's
+    /// `retainedTail` is virtualized into message entries for the next
+    /// preparation — the retained messages lead the compactable sequence.
+    #[test]
+    fn prepare_virtualizes_previous_compaction_retained_tail() {
+        let entries = vec![
+            message_entry("e1", user_message("first", 1)),
+            compaction_entry(
+                "c1",
+                None,
+                Some(vec![user_message("tail-a", 2), user_message("tail-b", 3)]),
+            ),
+            message_entry("e3", user_message("after", 4)),
+        ];
+        let (preparation, retained_tail) =
+            prepare_harness_compaction(&entries, &DEFAULT_COMPACTION_SETTINGS)
+                .expect("prepare")
+                .expect("something to compact");
+        assert_eq!(
+            preparation.previous_summary.as_deref(),
+            Some("prev summary")
+        );
+        assert_eq!(
+            prepared_sequence(&preparation, &retained_tail),
+            vec!["tail-a", "tail-b", "after"]
+        );
+    }
+
+    /// Legacy harness entries (first_kept_entry_id anchor, no retainedTail)
+    /// keep the v1 boundary behavior for backward compatibility.
+    #[test]
+    fn prepare_falls_back_to_first_kept_entry_anchor_for_legacy_entries() {
+        let entries = vec![
+            message_entry("e1", user_message("first", 1)),
+            message_entry("e2", user_message("second", 2)),
+            compaction_entry("c1", Some("e2"), None),
+            message_entry("e3", user_message("after", 4)),
+        ];
+        let (preparation, retained_tail) =
+            prepare_harness_compaction(&entries, &DEFAULT_COMPACTION_SETTINGS)
+                .expect("prepare")
+                .expect("something to compact");
+        assert_eq!(
+            preparation.previous_summary.as_deref(),
+            Some("prev summary")
+        );
+        assert_eq!(
+            prepared_sequence(&preparation, &retained_tail),
+            vec!["second", "after"]
+        );
     }
 }

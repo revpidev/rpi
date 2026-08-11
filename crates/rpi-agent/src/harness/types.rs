@@ -734,6 +734,17 @@ pub trait FileSystem: Send + Sync {
     /// `force: false`, no abort signal.
     async fn remove(&self, path: &str, options: RemoveOptions) -> Result<(), FileError>;
 
+    /// `renameFile` (harness/types.ts:252-253 @ 4181f66) — atomically rename a
+    /// file, replacing the destination when it exists. Does not copy across
+    /// filesystems. Reserved for atomic publish (R4.3.2 prevision); no callers
+    /// are wired yet.
+    async fn rename_file(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        abort_signal: Option<CancellationToken>,
+    ) -> Result<(), FileError>;
+
     /// `createTempDir` — create a temporary directory and return its absolute
     /// path. Defaults: `prefix: "tmp-"`, no abort signal.
     async fn create_temp_dir(
@@ -1810,14 +1821,15 @@ pub struct AbortResult {
 #[serde(rename_all = "camelCase")]
 pub struct CompactResult {
     pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_kept_entry_id: Option<String>,
     pub tokens_before: u64,
     /// Usage from the LLM call(s) that generated this summary, if available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retained_tail: Option<Vec<AgentMessage>>,
+    /// Self-contained retained tail (44289550a @ 4181f66: required; the
+    /// `firstKeptEntryId` anchor was removed upstream). `#[serde(default)]`
+    /// keeps the extension ABI boundary tolerant of older hook payloads.
+    #[serde(default)]
+    pub retained_tail: Vec<AgentMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }

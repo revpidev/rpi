@@ -1,4 +1,12 @@
-//! Harness layer — port of `packages/agent/src/harness/` @ pi 0.82.1 (2efa728).
+//! Harness layer — port of `packages/agent/src/harness/` @ 4181f66.
+//!
+//! **Upstream harness v2 status**: the upstream `harness/` at 4181f66 is a
+//! scaffold. All record-write and v2-runtime methods reject with
+//! `HarnessNotImplemented`; the record contract is slated for a rewrite at
+//! upstream H0+. rpi keeps the v1 semantics (JSONL session storage, the T16
+//! parity-tested path) and defers harness-v2 alignment until the upstream
+//! record contract stabilizes. See
+//! `external/pi/packages/agent/docs/harness-v2.md` §20.
 //!
 //! T16 first block: the complete type layer ([`types`], mirroring
 //! `packages/agent/src/harness/types.ts` — errors, phase, events, hook

@@ -1493,6 +1493,111 @@ async fn allows_after_tool_call_to_mark_batch_as_terminating() {
 }
 
 // ---------------------------------------------------------------------------
+// beforeToolCall terminate — upstream agent-loop.test.ts:1253, 1312
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stops_after_blocked_tool_call_when_before_tool_call_sets_terminate_true() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed.clone());
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    let mut config = test_config();
+    config.before_tool_call = Some(Arc::new(|_hook_context, _signal| {
+        Box::pin(async move {
+            Some(BeforeToolCallResult {
+                block: Some(true),
+                reason: Some("Blocked by policy".to_owned()),
+                terminate: Some(true),
+                ..Default::default()
+            })
+        })
+    }));
+
+    let (stream_fn, state) = mock_stream_fn(vec![
+        assistant_message(
+            vec![tool_call("tool-1", "echo", json!({ "value": "hello" }))],
+            StopReason::ToolUse,
+        ),
+        text_assistant("should not run"),
+    ]);
+    let stream = agent_loop(
+        vec![user_message("echo something")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (_events, messages) = collect(stream).await;
+
+    let tool_result = messages
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::ToolResult(t) => Some(t),
+            _ => None,
+        })
+        .expect("a toolResult message exists");
+    assert!(executed.lock().unwrap().is_empty());
+    assert_eq!(call_count(&state), 1);
+    assert!(tool_result.is_error);
+    assert!(tool_result.content.iter().any(|c| match c {
+        ToolResultContent::Text(t) => t.text == "Blocked by policy",
+        _ => false,
+    }));
+}
+
+#[tokio::test]
+async fn continues_after_mixed_batch_with_one_terminating_blocked_call() {
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed.clone());
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    let mut config = test_config();
+    config.tool_execution = ToolExecutionMode::Parallel;
+    config.before_tool_call = Some(Arc::new(|hook_context, _signal| {
+        let value = hook_context
+            .args
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        Box::pin(async move {
+            if value == "first" {
+                Some(BeforeToolCallResult {
+                    block: Some(true),
+                    reason: Some("Blocked first".to_owned()),
+                    terminate: Some(true),
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        })
+    }));
+
+    let (stream_fn, state) = mock_stream_fn(two_call_script("echo"));
+    let stream = agent_loop(
+        vec![user_message("echo both")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (_events, _messages) = collect(stream).await;
+
+    assert_eq!(executed.lock().unwrap().as_slice(), &["second".to_owned()]);
+    assert_eq!(call_count(&state), 2);
+}
+
+// ---------------------------------------------------------------------------
 // agentLoopContinue with AgentMessage
 // ---------------------------------------------------------------------------
 

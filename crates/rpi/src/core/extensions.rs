@@ -201,6 +201,10 @@ pub struct ToolCallOutcome {
     pub reason: Option<String>,
     /// Extension-mutated tool arguments (no revalidation upstream).
     pub input: Option<serde_json::Value>,
+    /// `terminate` (extensions/types.ts:1068 @ 4181f66, #7715) — hint to stop
+    /// after the current tool batch when the call is blocked; only effective
+    /// when every finalized result in the batch sets it.
+    pub terminate: Option<bool>,
 }
 
 /// Aggregated `tool_result` patch (`ToolResultEventResult`,
@@ -600,6 +604,7 @@ pub fn extension_before_tool_call_hook(
                     block: outcome.block,
                     reason: outcome.reason,
                     args: outcome.input,
+                    terminate: outcome.terminate,
                 }
                 .into()
             })

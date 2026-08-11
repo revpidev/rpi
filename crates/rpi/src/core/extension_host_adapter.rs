@@ -356,6 +356,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 input: result.get("input").cloned().filter(|i| !i.is_null()),
+                terminate: result.get("terminate").and_then(Value::as_bool),
             }),
             Ok(None) => None,
             // Upstream rethrows (agent-session.ts:478-484), aborting the run;
@@ -368,6 +369,7 @@ impl ExtensionRunner for ExtensionHostAdapter {
                     block: Some(true),
                     reason: Some(reason),
                     input: None,
+                    terminate: None,
                 })
             }
         }

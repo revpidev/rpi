@@ -986,6 +986,26 @@ pub(crate) mod test_env {
             Ok(())
         }
 
+        async fn rename_file(
+            &self,
+            source_path: &str,
+            destination_path: &str,
+            _abort_signal: Option<tokio_util::sync::CancellationToken>,
+        ) -> Result<(), FileError> {
+            let content = self.read_text_file(source_path, None).await?;
+            self.put_file(destination_path, &content);
+            self.remove(
+                source_path,
+                RemoveOptions {
+                    recursive: false,
+                    force: false,
+                    abort_signal: None,
+                },
+            )
+            .await?;
+            Ok(())
+        }
+
         async fn file_info(
             &self,
             path: &str,

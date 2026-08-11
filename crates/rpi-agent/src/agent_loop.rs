@@ -97,6 +97,10 @@ pub struct BeforeToolCallResult {
     /// the mutation is returned instead). Applied **without revalidation**,
     /// matching upstream.
     pub args: Option<Value>,
+    /// Hint that the agent should stop after the current tool batch when this
+    /// call is blocked. Early termination only happens when every finalized
+    /// tool result in the batch sets this to true.
+    pub terminate: Option<bool>,
 }
 
 /// `AfterToolCallResult` — partial override with field-by-field replacement
@@ -1256,12 +1260,19 @@ async fn prepare_tool_call(
         }
         if let Some(result) = before_result {
             if result.block == Some(true) {
+                let mut error_result = create_error_tool_result(
+                    result
+                        .reason
+                        .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
+                );
+                // Upstream agent-loop.ts:638-640: propagate the terminate hint
+                // onto the synthesized error tool result so the batch-level
+                // `every()` check sees it.
+                if result.terminate == Some(true) {
+                    error_result.terminate = Some(true);
+                }
                 return Preparation::Immediate {
-                    result: create_error_tool_result(
-                        result
-                            .reason
-                            .unwrap_or_else(|| "Tool execution was blocked".to_owned()),
-                    ),
+                    result: error_result,
                     is_error: true,
                 };
             }

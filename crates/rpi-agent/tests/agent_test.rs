@@ -999,3 +999,185 @@ async fn forwards_thinking_level_to_stream_fn_options() {
         Some(rpi_ai::types::ModelThinkingLevel::Xhigh)
     );
 }
+
+// ---------------------------------------------------------------------------
+// reset() — upstream agent.test.ts:508
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rejects_reset_while_processing_without_corrupting_transcript() {
+    async fn scenario() {
+        let agent = Arc::new(Agent::new(AgentOptions::new(abortable_stream_fn())));
+        let prompt_agent = agent.clone();
+        let prompt_handle = tokio::spawn(async move { prompt_agent.prompt("Hello").await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Active run: reset must error and leave state intact.
+        assert!(agent.is_streaming());
+        assert_eq!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .map(role_str)
+                .collect::<Vec<_>>(),
+            ["user"]
+        );
+        let error = agent.reset().expect_err("reset must fail while processing");
+        assert_eq!(
+            error.to_string(),
+            "Agent is already processing. Wait for completion before resetting."
+        );
+        assert!(agent.is_streaming());
+        assert_eq!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .map(role_str)
+                .collect::<Vec<_>>(),
+            ["user"]
+        );
+
+        agent.abort();
+        prompt_handle
+            .await
+            .expect("prompt task")
+            .expect("prompt resolves");
+
+        assert!(!agent.is_streaming());
+        assert_eq!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .map(role_str)
+                .collect::<Vec<_>>(),
+            ["user", "assistant"]
+        );
+    }
+    tokio::time::timeout(TEST_TIMEOUT, scenario())
+        .await
+        .expect("must not hang");
+}
+
+#[tokio::test]
+async fn reset_when_idle_clears_state_and_queues() {
+    let provider = faux_provider();
+    provider.set_responses(vec![text_response("ok")]);
+    let agent = Agent::new(AgentOptions::new(provider.stream_fn()));
+    agent.set_messages(vec![user_message("hello")]);
+    agent.steer(user_message("steer"));
+    agent.follow_up(user_message("follow"));
+
+    agent.reset().expect("idle reset must succeed");
+    let state = agent.state();
+    assert!(state.messages.is_empty());
+    assert!(!state.is_streaming);
+    assert!(!agent.has_queued_messages());
+}
+
+// ---------------------------------------------------------------------------
+// shouldStopAfterTurn — upstream agent.test.ts:741
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn forwards_should_stop_after_turn_through_agent_options() {
+    let tool = TestTool::new(
+        "noop",
+        Arc::new(|_params, _on_update| {
+            Box::pin(async {
+                Ok(AgentToolResult {
+                    content: vec![ToolResultContent::Text(TextContent {
+                        text: "tool complete".to_owned(),
+                        text_signature: None,
+                    })],
+                    details: json!({}),
+                    ..Default::default()
+                })
+            })
+        }),
+    );
+
+    let request_count = Arc::new(AtomicU64::new(0));
+    let saw_abort_signal = Arc::new(AtomicBool::new(false));
+    let callback_context_roles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let stream_fn: StreamFn = {
+        let request_count = request_count.clone();
+        Arc::new(move |_model, _context, _options| {
+            let count = request_count.fetch_add(1, Ordering::SeqCst) + 1;
+            let (message, reason) = if count == 1 {
+                (
+                    faux_assistant_message(
+                        vec![tool_call("tool-1", "noop", json!({}))],
+                        FauxAssistantOptions {
+                            stop_reason: Some(StopReason::ToolUse),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_ai::types::DoneReason::ToolUse,
+                )
+            } else {
+                (
+                    faux_assistant_message(
+                        vec![AssistantContent::Text(TextContent {
+                            text: "should not run".to_owned(),
+                            text_signature: None,
+                        })],
+                        FauxAssistantOptions::default(),
+                    ),
+                    rpi_ai::types::DoneReason::Stop,
+                )
+            };
+            futures::stream::iter(vec![StreamEvent::Done { reason, message }]).boxed()
+        })
+    };
+
+    let mut options = AgentOptions::new(stream_fn);
+    options.initial_state = InitialAgentState {
+        tools: Some(vec![Arc::new(tool)]),
+        ..Default::default()
+    };
+    let cb_saw = saw_abort_signal.clone();
+    let cb_roles = callback_context_roles.clone();
+    options.should_stop_after_turn = Some(Arc::new(move |context, signal| {
+        let cb_saw = cb_saw.clone();
+        let cb_roles = cb_roles.clone();
+        Box::pin(async move {
+            cb_saw.store(!signal.is_cancelled(), Ordering::SeqCst);
+            *cb_roles.lock().unwrap() = context
+                .context
+                .messages
+                .iter()
+                .map(|m| role_str(m).to_owned())
+                .collect();
+            true
+        })
+    }));
+
+    let agent = Agent::new(options);
+    tokio::time::timeout(TEST_TIMEOUT, agent.prompt("start"))
+        .await
+        .expect("prompt must not hang")
+        .expect("prompt resolves");
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert!(saw_abort_signal.load(Ordering::SeqCst));
+    assert_eq!(
+        callback_context_roles.lock().unwrap().as_slice(),
+        ["user", "assistant", "toolResult"]
+    );
+}
+
+fn role_str(message: &AgentMessage) -> &'static str {
+    match message {
+        AgentMessage::User(_) => "user",
+        AgentMessage::Assistant(_) => "assistant",
+        AgentMessage::ToolResult(_) => "toolResult",
+        AgentMessage::BashExecution(_) => "bashExecution",
+        AgentMessage::Custom(_) => "custom",
+        AgentMessage::BranchSummary(_) => "branchSummary",
+        AgentMessage::CompactionSummary(_) => "compactionSummary",
+    }
+}

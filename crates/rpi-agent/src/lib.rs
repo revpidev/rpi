@@ -35,7 +35,10 @@ pub mod session;
 pub mod stream_fn;
 pub mod types;
 
-pub use agent::{Agent, AgentListener, AgentOptions, AgentState, InitialAgentState, PromptInput};
+pub use agent::{
+    Agent, AgentListener, AgentOptions, AgentState, InitialAgentState, PromptInput,
+    ShouldStopAfterTurnAgentFn,
+};
 pub use agent_loop::{
     agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterToolCallContext,
     AfterToolCallFn, AfterToolCallResult, AgentContext, AgentEventSink, AgentEventStream,
