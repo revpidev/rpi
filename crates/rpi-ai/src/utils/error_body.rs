@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/utils/error-body.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/utils/error-body.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Intentional differences: the upstream SDK-error shape probing (Mistral
 //! `statusCode`, `openai` SDK `error`, AWS `$metadata`/`$response`) inspects
@@ -7,6 +7,15 @@
 //! [`NormalizedProviderError`]. The display-string composition
 //! ([`format_provider_error`], [`truncate_error_text`], the 4000-char cap) is
 //! ported byte-for-byte.
+//!
+//! Upstream 4523528b2 ("treat only plain objects as provider error bodies")
+//! hardens `pickBodyText` against SDK wrapper *class instances* being
+//! stringified into the body. That bug class has no rpi equivalent: every
+//! body entering [`NormalizedProviderError`] is a plain `String` read from an
+//! HTTP response (`response.text()`), never an arbitrary object — serde_json
+//! values are plain by construction. The regression test below pins the
+//! matching guarantee at the rpi seam (a plain JSON body string is surfaced
+//! verbatim and never clobbers the real message).
 
 pub const MAX_PROVIDER_ERROR_BODY_CHARS: usize = 4000;
 
@@ -137,5 +146,34 @@ mod tests {
         let no_body = NormalizedProviderError::new(Some(500), None, "boom".to_owned());
         assert_eq!(format_provider_error(&no_body, Some("x")), "x (500): boom");
         assert_eq!(format_provider_error(&no_body, None), "boom");
+    }
+
+    /// error-body.test.ts: "still surfaces a plain parsed JSON body object"
+    /// (4523528b2 @ 4181f66). Upstream asserts the JSON-stringified plain
+    /// object survives as the body; at the rpi seam the body arrives as that
+    /// same JSON text, so it must pass through verbatim and mark
+    /// `message_carries_body = false` (the real message stays intact, the
+    /// body is appended by `format_provider_error`).
+    ///
+    /// The sibling upstream cases ("ignores a class-instance response body /
+    /// `error` field instead of serializing it") have no rpi analog: rpi
+    /// bodies are always plain HTTP text, never SDK class instances (see the
+    /// module header).
+    #[test]
+    fn still_surfaces_a_plain_parsed_json_body_object() {
+        let norm = NormalizedProviderError::new(
+            Some(400),
+            Some(r#"{"message":"schema validation failed","field":"tools[0]"}"#.to_owned()),
+            "400 status code (no body)".to_owned(),
+        );
+        assert_eq!(
+            norm.body.as_deref(),
+            Some(r#"{"message":"schema validation failed","field":"tools[0]"}"#)
+        );
+        assert!(!norm.message_carries_body);
+        assert_eq!(
+            format_provider_error(&norm, None),
+            r#"400: {"message":"schema validation failed","field":"tools[0]"}"#
+        );
     }
 }

@@ -461,6 +461,66 @@ async fn test_normal_text_stream() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Raw stop reasons (bedrock-raw-stop-reason.test.ts: 637737ca7, text unified
+// by 5a2539a7b @ 4181f66)
+// ---------------------------------------------------------------------------
+
+/// bedrock-raw-stop-reason.test.ts: "preserves raw Bedrock stop reasons for
+/// successful stops".
+#[tokio::test]
+async fn preserves_raw_bedrock_stop_reasons_for_successful_stops() {
+    let model = claude_model("http://unused");
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        no_cache_options(),
+        (
+            200,
+            "application/vnd.amazon.eventstream",
+            minimal_stream_body(),
+        ),
+    )
+    .await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(message.error_message, None);
+}
+
+/// bedrock-raw-stop-reason.test.ts: "preserves raw Bedrock stop reasons for
+/// provider error stops".
+#[tokio::test]
+async fn preserves_raw_bedrock_stop_reasons_for_provider_error_stops() {
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    body.extend_from_slice(&event_frame(
+        "messageStop",
+        r#"{"stopReason":"guardrail_intervened"}"#,
+    ));
+    let model = claude_model("http://unused");
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        no_cache_options(),
+        (200, "application/vnd.amazon.eventstream", body),
+    )
+    .await;
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.raw_stop_reason.as_deref(),
+        Some("guardrail_intervened")
+    );
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: guardrail_intervened")
+    );
+}
+
 #[tokio::test]
 async fn test_thinking_stream_with_signature() {
     let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);

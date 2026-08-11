@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/utils/retry.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/utils/retry.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Outer assistant-call retry: error classification regex tables + bounded
 //! exponential backoff (`baseDelayMs * 2^(attempt-1)`).
@@ -51,7 +51,10 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "service.?unavailable",
             "server.?error",
             "internal.?error",
+            // Wrapper/provider text for transient upstream failures, including
+            // OpenRouter "Provider returned error" responses (#2264).
             "provider.?returned.?error",
+            "exceeded request buffer limit while retrying upstream",
             "network.?error",
             "connection.?error",
             "connection.?refused",
@@ -264,6 +267,11 @@ mod tests {
         assert!(is_retryable_assistant_error(&assistant(
             StopReason::Error,
             Some("Server requested 90s retry delay (max: 60s)")
+        )));
+        // fe10558eb: upstream request buffer exhaustion wording is retryable.
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("Error: exceeded request buffer limit while retrying upstream")
         )));
         // Quota/billing exhaustion: not retryable.
         assert!(!is_retryable_assistant_error(&assistant(

@@ -1,5 +1,6 @@
 //! Port of `packages/ai/src/api/openai-responses-shared.ts` @ pi 0.82.1
-//! (2efa728).
+//! (2efa728); terminal-event semantics (rawStopReason, incomplete-reason
+//! mapping) updated to 4181f66 (e5ef8d065, 32850ef7c).
 //!
 //! Shared OpenAI Responses machinery: message/tool conversion
 //! (`convertResponsesMessages` / `convertResponsesTools`), text-signature v1
@@ -631,15 +632,31 @@ fn append_custom_tool_call_input(
 }
 
 /// `mapStopReason` (response status); unknown statuses are an error (the API
-/// may add new values).
-fn map_stop_reason(status: Option<&str>) -> Result<StopReason, String> {
+/// may add new values). For incomplete responses, `max_output_tokens` is the
+/// ONLY length-stop reason; any other provider reason is a non-retryable
+/// error carrying `Response incomplete: <reason>` (32850ef7c).
+fn map_stop_reason(
+    status: Option<&str>,
+    incomplete_reason: Option<&str>,
+) -> Result<(StopReason, Option<String>), String> {
     match status {
-        None => Ok(StopReason::Stop),
-        Some("completed") => Ok(StopReason::Stop),
-        Some("incomplete") => Ok(StopReason::Length),
-        Some("failed") | Some("cancelled") => Ok(StopReason::Error),
+        None => Ok((StopReason::Stop, None)),
+        Some("completed") => Ok((StopReason::Stop, None)),
+        Some("incomplete") => {
+            if incomplete_reason == Some("max_output_tokens") {
+                return Ok((StopReason::Length, None));
+            }
+            Ok((
+                StopReason::Error,
+                Some(match incomplete_reason {
+                    Some(reason) => format!("Response incomplete: {reason}"),
+                    None => "Response incomplete without a provider reason".to_owned(),
+                }),
+            ))
+        }
+        Some("failed") | Some("cancelled") => Ok((StopReason::Error, None)),
         // These two are wonky ...
-        Some("in_progress") | Some("queued") => Ok(StopReason::Stop),
+        Some("in_progress") | Some("queued") => Ok((StopReason::Stop, None)),
         Some(other) => Err(format!("Unhandled stop reason: {other}")),
     }
 }
@@ -951,8 +968,23 @@ impl<'a> ResponsesStreamProcessor<'a> {
             };
             apply(&mut self.output.usage, service_tier.as_deref());
         }
-        // Map status to stop reason.
-        self.output.stop_reason = map_stop_reason(response.get("status").and_then(Value::as_str))?;
+        // Map status to stop reason. For incomplete responses, retain the
+        // provider's specific reason so max-output truncation and content
+        // filtering stay distinct (32850ef7c; rawStopReason e5ef8d065).
+        let status = response.get("status").and_then(Value::as_str);
+        let incomplete_reason = response
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+        self.output.raw_stop_reason = match incomplete_reason {
+            // JS `${status}.${incompleteReason}` interpolates missing status
+            // as "undefined".
+            Some(reason) => Some(format!("{}.{reason}", status.unwrap_or("undefined"))),
+            None => status.map(str::to_owned),
+        };
+        let mapped_stop = map_stop_reason(status, incomplete_reason)?;
+        self.output.stop_reason = mapped_stop.0;
+        self.output.error_message = mapped_stop.1;
         if self
             .output
             .content
@@ -1319,6 +1351,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
             Some("response.failed") => {
                 self.saw_terminal_response_event = true;
                 let response = event.get("response").cloned().unwrap_or(Value::Null);
+                // e5ef8d065: preserve the raw terminal status before erroring.
+                self.output.raw_stop_reason = response
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let error = response.get("error").filter(|error| !error.is_null());
                 let message = if let Some(error) = error {
                     let code = error
@@ -2090,8 +2127,10 @@ mod tests {
             "status": "failed", "error": {"code": "server_error", "message": "boom"}
         }})];
         let m = model(json!({}));
-        let (_events, result, _output) = replay(&m, &no_grammar(), &raw);
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
         assert_eq!(result, Err("server_error: boom".to_owned()));
+        // e5ef8d065: the raw terminal status is preserved.
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("failed"));
 
         // No error object: fall back to incomplete_details.
         let raw = vec![json!({"type": "response.failed", "response": {
@@ -2109,6 +2148,104 @@ mod tests {
         assert_eq!(
             result,
             Err("OpenAI Responses stream ended before a terminal response event".to_owned())
+        );
+    }
+
+    // -- terminal event raw stop reasons -------------------------------------
+    // openai-responses-terminal-event.test.ts: e5ef8d065 + 32850ef7c @ 4181f66.
+
+    /// "finalizes completed terminal events as stop" (usage assertions
+    /// included, ported byte-for-byte).
+    #[test]
+    fn finalizes_completed_terminal_events_as_stop() {
+        let raw = vec![json!({"type": "response.completed", "response": {
+            "id": "resp_completed", "status": "completed",
+            "usage": {"input_tokens": 20, "output_tokens": 7, "total_tokens": 27,
+                      "input_tokens_details": {"cached_tokens": 2, "cache_write_tokens": 3}}
+        }})];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        assert_eq!(output.response_id.as_deref(), Some("resp_completed"));
+        assert_eq!(output.stop_reason, StopReason::Stop);
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("completed"));
+        assert_eq!(output.usage.input, 15);
+        assert_eq!(output.usage.output, 7);
+        assert_eq!(output.usage.cache_read, 2);
+        assert_eq!(output.usage.cache_write, 3);
+        assert_eq!(output.usage.total_tokens, 27);
+    }
+
+    /// "finalizes incomplete terminal events as length stops".
+    #[test]
+    fn finalizes_incomplete_terminal_events_as_length_stops() {
+        let raw = vec![json!({"type": "response.incomplete", "response": {
+            "id": "resp_incomplete", "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42,
+                      "input_tokens_details": {"cached_tokens": 5}}
+        }})];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        assert_eq!(output.response_id.as_deref(), Some("resp_incomplete"));
+        assert_eq!(output.stop_reason, StopReason::Length);
+        assert_eq!(
+            output.raw_stop_reason.as_deref(),
+            Some("incomplete.max_output_tokens")
+        );
+        assert_eq!(output.usage.input, 25);
+        assert_eq!(output.usage.output, 12);
+        assert_eq!(output.usage.cache_read, 5);
+        assert_eq!(output.usage.cache_write, 0);
+        assert_eq!(output.usage.total_tokens, 42);
+    }
+
+    /// "finalizes content-filtered incomplete responses as non-retryable
+    /// errors".
+    #[test]
+    fn finalizes_content_filtered_incomplete_responses_as_non_retryable_errors() {
+        let raw = vec![json!({"type": "response.incomplete", "response": {
+            "id": "resp_incomplete", "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42,
+                      "input_tokens_details": {"cached_tokens": 5}}
+        }})];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        assert_eq!(output.stop_reason, StopReason::Error);
+        assert_eq!(
+            output.raw_stop_reason.as_deref(),
+            Some("incomplete.content_filter")
+        );
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Response incomplete: content_filter")
+        );
+    }
+
+    /// "preserves unknown provider incomplete reasons as non-retryable
+    /// errors".
+    #[test]
+    fn preserves_unknown_provider_incomplete_reasons_as_non_retryable_errors() {
+        let raw = vec![json!({"type": "response.incomplete", "response": {
+            "id": "resp_incomplete", "status": "incomplete",
+            "incomplete_details": {"reason": "max_time_limit"},
+            "usage": {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42,
+                      "input_tokens_details": {"cached_tokens": 5}}
+        }})];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        assert_eq!(output.stop_reason, StopReason::Error);
+        assert_eq!(
+            output.raw_stop_reason.as_deref(),
+            Some("incomplete.max_time_limit")
+        );
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Response incomplete: max_time_limit")
         );
     }
 }

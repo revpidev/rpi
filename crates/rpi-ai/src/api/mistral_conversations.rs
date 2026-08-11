@@ -1,6 +1,8 @@
 //! Port of `packages/ai/src/api/mistral-conversations.ts` @ pi 0.82.1 (2efa728).
 //! (`mistral-conversations.lazy.ts` is the upstream dynamic-import wrapper;
 //! rpi adapters are linked statically, so there is no lazy counterpart.)
+//! Stream-termination semantics (rawStopReason, unmapped-reason error stops)
+//! updated to 4181f66 (5a53f086e, 5a2539a7b).
 //!
 //! Mistral Chat Completions adapter (`chat.stream`): request construction
 //! (promptMode vs reasoningEffort reasoning selection, `promptCacheKey` /
@@ -545,15 +547,22 @@ fn map_tool_choice(choice: &MistralToolChoice) -> Value {
     }
 }
 
-/// `mapChatStopReason`. The null case (`reason === null -> "stop"`) is
-/// unreachable here: callers only map a present finish reason.
-fn map_chat_stop_reason(reason: &str) -> StopReason {
+/// `mapChatStopReason` (5a53f086e; text unified by 5a2539a7b). The null case
+/// (`reason === null -> "stop"`) is unreachable here: callers only map a
+/// present finish reason. Unmapped reasons are provider errors, not stops.
+fn map_chat_stop_reason(reason: &str) -> (StopReason, Option<String>) {
     match reason {
-        "stop" => StopReason::Stop,
-        "length" | "model_length" => StopReason::Length,
-        "tool_calls" => StopReason::ToolUse,
-        "error" => StopReason::Error,
-        _ => StopReason::Stop,
+        "stop" => (StopReason::Stop, None),
+        "length" | "model_length" => (StopReason::Length, None),
+        "tool_calls" => (StopReason::ToolUse, None),
+        "error" => (
+            StopReason::Error,
+            Some("Provider stopped with: error".to_owned()),
+        ),
+        other => (
+            StopReason::Error,
+            Some(format!("Provider stopped with: {other}")),
+        ),
     }
 }
 
@@ -858,7 +867,14 @@ impl<'a> StreamProcessor<'a> {
             .as_deref()
             .filter(|reason| !reason.is_empty())
         {
-            self.output.stop_reason = map_chat_stop_reason(finish_reason);
+            // 5a53f086e: preserve the raw provider reason before mapping;
+            // unmapped reasons become provider errors with a message.
+            self.output.raw_stop_reason = Some(finish_reason.to_owned());
+            let (stop_reason, error_message) = map_chat_stop_reason(finish_reason);
+            self.output.stop_reason = stop_reason;
+            if let Some(error_message) = error_message {
+                self.output.error_message = Some(error_message);
+            }
         }
 
         if let Some(content) = &choice.delta.content {
@@ -1177,7 +1193,11 @@ fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneR
         StopReason::Pending | StopReason::Deferred => {
             Err("Mistral stream ended without a finish reason".to_owned())
         }
-        StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
+        // 5a53f086e (R2.3.3): carry the mapped provider error message.
+        StopReason::Aborted | StopReason::Error => Err(output
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "An unknown error occurred".to_owned())),
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
@@ -1644,12 +1664,31 @@ mod tests {
 
     #[test]
     fn test_map_chat_stop_reason() {
-        assert_eq!(map_chat_stop_reason("stop"), StopReason::Stop);
-        assert_eq!(map_chat_stop_reason("length"), StopReason::Length);
-        assert_eq!(map_chat_stop_reason("model_length"), StopReason::Length);
-        assert_eq!(map_chat_stop_reason("tool_calls"), StopReason::ToolUse);
-        assert_eq!(map_chat_stop_reason("error"), StopReason::Error);
-        assert_eq!(map_chat_stop_reason("something_new"), StopReason::Stop);
+        assert_eq!(map_chat_stop_reason("stop"), (StopReason::Stop, None));
+        assert_eq!(map_chat_stop_reason("length"), (StopReason::Length, None));
+        assert_eq!(
+            map_chat_stop_reason("model_length"),
+            (StopReason::Length, None)
+        );
+        assert_eq!(
+            map_chat_stop_reason("tool_calls"),
+            (StopReason::ToolUse, None)
+        );
+        assert_eq!(
+            map_chat_stop_reason("error"),
+            (
+                StopReason::Error,
+                Some("Provider stopped with: error".to_owned())
+            )
+        );
+        // 5a53f086e: unmapped reasons are provider errors, not stops.
+        assert_eq!(
+            map_chat_stop_reason("something_new"),
+            (
+                StopReason::Error,
+                Some("Provider stopped with: something_new".to_owned())
+            )
+        );
     }
 
     // -----------------------------------------------------------------------

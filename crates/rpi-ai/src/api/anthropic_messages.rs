@@ -1,4 +1,6 @@
-//! Port of `packages/ai/src/api/anthropic-messages.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/api/anthropic-messages.ts` @ pi 0.82.1 (2efa728);
+//! stream-termination semantics (rawStopReason, `sensitive` error text)
+//! updated to 4181f66 (926eb15c1, 5a2539a7b).
 //!
 //! Anthropic Messages API adapter: request construction (system prompt,
 //! cache control, thinking modes, tools, deferred tool references), Claude
@@ -1012,8 +1014,11 @@ fn map_stop_reason(
         "pause_turn" => Ok((StopReason::Stop, None)),
         // We don't supply stop sequences, so this should never happen.
         "stop_sequence" => Ok((StopReason::Stop, None)),
-        // Content flagged by safety filters.
-        "sensitive" => Ok((StopReason::Error, None)),
+        // Content flagged by safety filters (not yet in SDK types).
+        "sensitive" => Ok((
+            StopReason::Error,
+            Some("Provider stopped with: sensitive".to_owned()),
+        )),
         other => Err(format!("Unhandled stop reason: {other}")),
     }
 }
@@ -1340,6 +1345,9 @@ impl<'a> StreamProcessor<'a> {
                 let delta = &event["delta"];
                 if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
                     if !reason.is_empty() {
+                        // 926eb15c1: preserve the raw provider reason before
+                        // mapping.
+                        self.output.raw_stop_reason = Some(reason.to_owned());
                         let (stop_reason, error_message) =
                             map_stop_reason(reason, delta.get("stop_details"))?;
                         self.output.stop_reason = stop_reason;
@@ -2659,7 +2667,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             map_stop_reason("sensitive", None),
-            Ok((StopReason::Error, None))
+            Ok((
+                StopReason::Error,
+                Some("Provider stopped with: sensitive".to_owned())
+            ))
         );
         assert_eq!(
             map_stop_reason("refusal", None),
@@ -2888,6 +2899,35 @@ pub(crate) mod tests {
         assert_eq!(reason, Err("cannot help".to_owned()));
         assert_eq!(output.stop_reason, StopReason::Error);
         assert_eq!(output.error_message.as_deref(), Some("cannot help"));
+        // 926eb15c1: the raw provider reason is preserved.
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("refusal"));
+    }
+
+    /// anthropic-sse-parsing.test.ts: "preserves sensitive stop reasons with a
+    /// descriptive error message" (926eb15c1; text unified by 5a2539a7b @
+    /// 4181f66).
+    #[test]
+    fn preserves_sensitive_stop_reasons_with_a_descriptive_error_message() {
+        let model = make_model(json!({}));
+        let bytes = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_sensitive\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"sensitive\"},\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n"
+        );
+        let (_, reason, output) = drive_sse(&model, bytes.as_bytes());
+        assert_eq!(reason, Err("Provider stopped with: sensitive".to_owned()));
+        assert_eq!(output.stop_reason, StopReason::Error);
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("sensitive"));
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Provider stopped with: sensitive")
+        );
     }
 
     // -----------------------------------------------------------------------

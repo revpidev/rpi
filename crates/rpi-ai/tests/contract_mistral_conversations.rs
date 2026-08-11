@@ -448,6 +448,87 @@ async fn test_mistral_error_stream() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Raw stop reasons (mistral-raw-stop-reason.test.ts: 5a53f086e, text unified
+// by 5a2539a7b @ 4181f66)
+// ---------------------------------------------------------------------------
+
+/// mistral-raw-stop-reason.test.ts: "preserves raw Mistral finish reasons for
+/// successful stops".
+#[tokio::test]
+async fn preserves_raw_mistral_finish_reasons_for_successful_stops() {
+    let (base_url, mut captured) = serve(vec![(200, TEXT_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events =
+        collect(MistralConversations.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+            .await;
+
+    captured.recv().await.expect("request captured");
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("stop"));
+    assert_eq!(message.error_message, None);
+}
+
+/// mistral-raw-stop-reason.test.ts: "preserves raw Mistral finish reasons for
+/// provider error stops". (The upstream mock yields the SDK's camelCase
+/// `finishReason`; on the wire — which rpi parses — it is `finish_reason`.)
+#[tokio::test]
+async fn preserves_raw_mistral_finish_reasons_for_provider_error_stops() {
+    const ERROR_SSE: &str = concat!(
+        "data: {\"id\":\"mistral-response-id\",\"choices\":[{\"finish_reason\":\"error\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
+    let (base_url, mut captured) = serve(vec![(200, ERROR_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events =
+        collect(MistralConversations.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+            .await;
+
+    captured.recv().await.expect("request captured");
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("error"));
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: error")
+    );
+}
+
+/// mistral-raw-stop-reason.test.ts: "treats unknown Mistral finish reasons as
+/// provider error stops".
+#[tokio::test]
+async fn treats_unknown_mistral_finish_reasons_as_provider_error_stops() {
+    const UNMAPPED_SSE: &str = concat!(
+        "data: {\"id\":\"mistral-response-id\",\"choices\":[{\"finish_reason\":\"unmapped_error\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":0,\"total_tokens\":1}}\n",
+        "\n",
+        "data: [DONE]\n",
+        "\n",
+    );
+    let (base_url, mut captured) = serve(vec![(200, UNMAPPED_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events =
+        collect(MistralConversations.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+            .await;
+
+    captured.recv().await.expect("request captured");
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("unmapped_error"));
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: unmapped_error")
+    );
+}
+
 #[tokio::test]
 async fn test_mistral_cache_retention_none_omits_prompt_caching() {
     // mistral-reasoning-mode.test.ts intent: cacheRetention "none" omits both

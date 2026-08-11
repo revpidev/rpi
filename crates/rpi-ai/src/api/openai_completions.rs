@@ -1,4 +1,7 @@
-//! Port of `packages/ai/src/api/openai-completions.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/api/openai-completions.ts` @ pi 0.82.1 (2efa728);
+//! stream-termination semantics (rawStopReason, `supportsFinishReason`,
+//! function-vs-empty-custom tool-call deltas) updated to 4181f66 (fe1c9b6d5,
+//! 2c3041242, 34239180a).
 //!
 //! OpenAI Chat Completions adapter: compat auto-detection (`detect_compat` /
 //! `get_compat`), message conversion (tool-call id normalization, thinking
@@ -174,6 +177,9 @@ pub struct ResolvedOpenAICompletionsCompat {
     pub supports_developer_role: bool,
     pub supports_reasoning_effort: bool,
     pub supports_usage_in_streaming: bool,
+    /// 2c3041242: whether streamed responses include `finish_reason`. When
+    /// false, `stop`/`toolUse` is inferred from content at stream end.
+    pub supports_finish_reason: bool,
     pub max_tokens_field: MaxTokensField,
     pub requires_tool_result_name: bool,
     pub requires_assistant_after_tool_result: bool,
@@ -263,6 +269,7 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
             && !is_nvidia
             && !is_ant_ling,
         supports_usage_in_streaming: true,
+        supports_finish_reason: true,
         max_tokens_field: if use_max_tokens {
             MaxTokensField::MaxTokens
         } else {
@@ -329,6 +336,9 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         supports_usage_in_streaming: compat
             .supports_usage_in_streaming
             .unwrap_or(detected.supports_usage_in_streaming),
+        supports_finish_reason: compat
+            .supports_finish_reason
+            .unwrap_or(detected.supports_finish_reason),
         max_tokens_field: compat.max_tokens_field.unwrap_or(detected.max_tokens_field),
         requires_tool_result_name: compat
             .requires_tool_result_name
@@ -1495,6 +1505,8 @@ struct CompletionsProcessor<'a> {
     output: &'a mut AssistantMessage,
     model: &'a Model,
     grammar_tool_input_properties: &'a HashMap<String, String>,
+    /// Resolved `compat.supportsFinishReason` (2c3041242).
+    supports_finish_reason: bool,
     has_finish_reason: bool,
     text_block: Option<usize>,
     thinking_block: Option<usize>,
@@ -1509,11 +1521,13 @@ impl<'a> CompletionsProcessor<'a> {
         output: &'a mut AssistantMessage,
         model: &'a Model,
         grammar_tool_input_properties: &'a HashMap<String, String>,
+        supports_finish_reason: bool,
     ) -> Self {
         Self {
             output,
             model,
             grammar_tool_input_properties,
+            supports_finish_reason,
             has_finish_reason: false,
             text_block: None,
             thinking_block: None,
@@ -1634,7 +1648,11 @@ impl<'a> CompletionsProcessor<'a> {
             })
             .unwrap_or("");
         let id = tool_call.get("id").and_then(Value::as_str);
-        let is_custom = tool_call.get("custom").is_some_and(Value::is_object);
+        // 34239180a: `toolCall.custom && !toolCall.function` — a delta with a
+        // valid `function` plus an empty `custom` object stays a function call
+        // (its arguments must not be dropped).
+        let is_custom = tool_call.get("custom").is_some_and(Value::is_object)
+            && !tool_call.get("function").is_some_and(is_js_truthy);
 
         let mut content_index =
             stream_index.and_then(|index| self.tool_call_by_index.get(&index).copied());
@@ -1807,6 +1825,8 @@ impl<'a> CompletionsProcessor<'a> {
 
         if let Some(finish_reason) = choice.get("finish_reason") {
             if is_js_truthy(finish_reason) {
+                // fe1c9b6d5: preserve the raw provider reason before mapping.
+                self.output.raw_stop_reason = finish_reason.as_str().map(str::to_owned);
                 let (stop_reason, error_message) = map_stop_reason(finish_reason.as_str());
                 self.output.stop_reason = stop_reason;
                 if let Some(error_message) = error_message {
@@ -2050,6 +2070,20 @@ impl<'a> CompletionsProcessor<'a> {
         if self.output.stop_reason == StopReason::Aborted {
             return Err("Request was aborted".to_owned());
         }
+        // 2c3041242: providers that never send `finish_reason` get their stop
+        // reason inferred from content.
+        if !self.has_finish_reason && !self.supports_finish_reason {
+            self.output.stop_reason = if self
+                .output
+                .content
+                .iter()
+                .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+            {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            };
+        }
         if self.output.stop_reason == StopReason::Error {
             return Err(self
                 .output
@@ -2057,7 +2091,9 @@ impl<'a> CompletionsProcessor<'a> {
                 .clone()
                 .unwrap_or_else(|| "Provider returned an error stop reason".to_owned()));
         }
-        if !self.has_finish_reason || self.output.stop_reason == StopReason::Pending {
+        if (self.supports_finish_reason && !self.has_finish_reason)
+            || self.output.stop_reason == StopReason::Pending
+        {
             return Err("Stream ended without finish_reason".to_owned());
         }
         Ok(match self.output.stop_reason {
@@ -2251,7 +2287,12 @@ async fn run(
         partial: output.clone(),
     });
 
-    let mut processor = CompletionsProcessor::new(output, model, &grammar_tool_input_properties);
+    let mut processor = CompletionsProcessor::new(
+        output,
+        model,
+        &grammar_tool_input_properties,
+        compat.supports_finish_reason,
+    );
     let mut decoder = SseDecoder::new();
     let mut byte_stream = response.bytes_stream();
     let mut saw_done = false;
@@ -3912,7 +3953,12 @@ mod build_and_stream_tests {
         let events = AssistantMessageEventStream::new();
         let mut output = initial_output(model);
         let reason = {
-            let mut processor = CompletionsProcessor::new(&mut output, model, grammar_props);
+            let mut processor = CompletionsProcessor::new(
+                &mut output,
+                model,
+                grammar_props,
+                get_compat(model).supports_finish_reason,
+            );
             let mut decoder = SseDecoder::new();
             let mut result: Result<(), String> = Ok(());
             let mut saw_done = false;
@@ -4189,6 +4235,108 @@ mod build_and_stream_tests {
         let stream = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"},\"finish_reason\":\"length\"}]}\n\n";
         let (_events, reason, _output) = replay(&model, &no_grammar(), stream.as_bytes());
         assert_eq!(reason, Ok(DoneReason::Length));
+    }
+
+    // -- raw stop reasons (openai-completions-raw-stop-reason.test.ts: fe1c9b6d5 @ 4181f66) --
+
+    /// openai-completions-raw-stop-reason.test.ts: "preserves raw finish
+    /// reasons for successful stops".
+    #[test]
+    fn preserves_raw_finish_reasons_for_successful_stops() {
+        let model = make_model(json!({}));
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+            "\n",
+            "data: [DONE]\n\n",
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.stop_reason, StopReason::Stop);
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("stop"));
+        assert_eq!(output.error_message, None);
+    }
+
+    /// openai-completions-raw-stop-reason.test.ts: "preserves raw finish
+    /// reasons for provider error stops".
+    #[test]
+    fn preserves_raw_finish_reasons_for_provider_error_stops() {
+        let model = make_model(json!({}));
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n",
+            "\n",
+            "data: [DONE]\n\n",
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(
+            reason,
+            Err("Provider finish_reason: content_filter".to_owned())
+        );
+        assert_eq!(output.stop_reason, StopReason::Error);
+        assert_eq!(output.raw_stop_reason.as_deref(), Some("content_filter"));
+        assert_eq!(
+            output.error_message.as_deref(),
+            Some("Provider finish_reason: content_filter")
+        );
+    }
+
+    // -- supportsFinishReason (openai-completions-tool-choice.test.ts: 2c3041242 @ 4181f66) --
+
+    /// openai-completions-tool-choice.test.ts: "accepts streams without
+    /// finish_reason when compat disables it".
+    #[test]
+    fn accepts_streams_without_finish_reason_when_compat_disables_it() {
+        let model = make_model(json!({"compat": {"supportsFinishReason": false}}));
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-no-finish-reason\",\"choices\":[{\"delta\":{\"content\":\"complete answer\"},\"finish_reason\":null}]}\n",
+            "\n",
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.stop_reason, StopReason::Stop);
+        assert_eq!(output.error_message, None);
+        match &output.content[0] {
+            AssistantContent::Text(text) => assert_eq!(text.text, "complete answer"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// The toolUse arm of the 2c3041242 content inference (no upstream test
+    /// case; anchors the `toolCall` branch of `output.content.some(...)`).
+    #[test]
+    fn infers_tool_use_without_finish_reason_when_compat_disables_it() {
+        let model = make_model(json!({"compat": {"supportsFinishReason": false}}));
+        let stream = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n",
+            "\n",
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::ToolUse));
+        assert_eq!(output.stop_reason, StopReason::ToolUse);
+    }
+
+    // -- tool-call delta (openai-completions-tool-choice.test.ts: 34239180a @ 4181f66) --
+
+    /// openai-completions-tool-choice.test.ts: "ignores empty custom objects
+    /// on function tool call deltas".
+    #[test]
+    fn ignores_empty_custom_objects_on_function_tool_call_deltas() {
+        let model = make_model(json!({}));
+        let stream = concat!(
+            "data: {\"id\":\"chatcmpl-empty-custom\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"},\"custom\":{}}]},\"finish_reason\":\"tool_calls\"}]}\n",
+            "\n",
+            "data: [DONE]\n\n",
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::ToolUse));
+        let AssistantContent::ToolCall(call) = &output.content[0] else {
+            panic!("expected tool call block, got {:?}", output.content);
+        };
+        assert_eq!(call.id, "call_1");
+        assert_eq!(call.name, "read");
+        assert_eq!(
+            call.arguments,
+            json!({"path": "README.md"}).as_object().cloned().unwrap()
+        );
     }
 
     // -- stream_simple -----------------------------------------------------------

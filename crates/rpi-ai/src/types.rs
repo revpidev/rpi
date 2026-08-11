@@ -1454,6 +1454,10 @@ pub struct ModelCompat {
     /// Whether the provider supports `stream_options: { include_usage: true }`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_usage_in_streaming: Option<bool>,
+    /// Whether streamed responses include `finish_reason`. When false, pi
+    /// infers `stop` or `toolUse` when the stream ends. Default: true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_finish_reason: Option<bool>,
     /// Which field to use for max tokens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens_field: Option<MaxTokensField>,

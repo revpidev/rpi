@@ -40,6 +40,9 @@ fn test_detect_compat_standard_openai_baseline() {
     assert!(compat.supports_developer_role);
     assert!(compat.supports_reasoning_effort);
     assert!(compat.supports_usage_in_streaming);
+    // 2c3041242: finish_reason streams are the default; providers opt out via
+    // `compat.supportsFinishReason: false`.
+    assert!(compat.supports_finish_reason);
     assert_eq!(compat.max_tokens_field, MaxTokensField::MaxCompletionTokens);
     assert!(!compat.requires_tool_result_name);
     assert!(!compat.requires_assistant_after_tool_result);

@@ -319,6 +319,8 @@ async fn test_google_generative_ai_contract() {
     };
     assert_eq!(*reason, rpi_ai::types::DoneReason::Stop);
     assert_eq!(message.stop_reason, StopReason::Stop);
+    // 23cb385b6: the raw provider finish reason is preserved.
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
     assert_eq!(message.response_id.as_deref(), Some("resp-1"));
     // Usage mapping anchor (requirements §5.2):
     // input = promptTokenCount − cachedContentTokenCount,
@@ -553,6 +555,38 @@ async fn test_google_stream_without_finish_reason_is_error() {
     assert_eq!(
         error.error_message.as_deref(),
         Some("Google stream ended without a finish reason")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Raw stop reasons (google-raw-stop-reason.test.ts: 23cb385b6, text unified
+// by 5a2539a7b @ 4181f66)
+// ---------------------------------------------------------------------------
+
+/// google-raw-stop-reason.test.ts: "preserves raw Gemini finish reasons for
+/// Google Generative AI errors".
+#[tokio::test]
+async fn preserves_raw_gemini_finish_reasons_for_google_generative_ai_errors() {
+    const MALFORMED_SSE: &str = concat!(
+        "data: {\"responseId\":\"google-response-id\",\"candidates\":[{\"finishReason\":\"MALFORMED_FUNCTION_CALL\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":0,\"totalTokenCount\":1}}\n",
+        "\n",
+    );
+    let (base_url, _captured) = serve(vec![(200, MALFORMED_SSE)]).await;
+    let m = model(&base_url);
+    let events =
+        collect(GoogleGenerativeAi.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+            .await;
+    let StreamEvent::Error { error, .. } = events.last().expect("error") else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.raw_stop_reason.as_deref(),
+        Some("MALFORMED_FUNCTION_CALL")
+    );
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: MALFORMED_FUNCTION_CALL")
     );
 }
 

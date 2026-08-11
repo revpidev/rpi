@@ -1,6 +1,8 @@
 //! Port of `packages/ai/src/api/google-vertex.ts` (and the intent of
 //! `google-vertex.lazy.ts`, which only defers the module import — rpi has no
-//! lazy-loading boundary) @ pi 0.82.1 (2efa728).
+//! lazy-loading boundary) @ pi 0.82.1 (2efa728); stream-termination semantics
+//! (rawStopReason, provider-stopped error text) updated to 4181f66
+//! (23cb385b6, 5a2539a7b).
 //!
 //! Google Vertex AI adapter: API-key (Vertex Express) or ADC authentication,
 //! project/location resolution, regional endpoint selection, request
@@ -813,6 +815,8 @@ impl<'a> StreamProcessor<'a> {
             .and_then(|candidate| candidate.get("finishReason"))
             .and_then(Value::as_str)
         {
+            // 23cb385b6: preserve the raw provider reason before mapping.
+            self.output.raw_stop_reason = Some(finish_reason.to_owned());
             self.output.stop_reason = map_stop_reason(finish_reason)?;
             if self
                 .output
@@ -1046,7 +1050,12 @@ fn finish_processor(
         StopReason::Pending | StopReason::Deferred => {
             Err("Google Vertex stream ended without a finish reason".to_owned())
         }
-        StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
+        // 23cb385b6 + 5a2539a7b: the raw provider reason becomes the error
+        // text when one was seen.
+        StopReason::Aborted | StopReason::Error => Err(match &processor.output.raw_stop_reason {
+            Some(raw) => format!("Provider stopped with: {raw}"),
+            None => "An unknown error occurred".to_owned(),
+        }),
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),

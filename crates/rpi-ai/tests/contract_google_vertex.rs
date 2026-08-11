@@ -585,6 +585,8 @@ async fn test_normal_flow_text_events_and_wire_shape() {
     };
     assert_eq!(*reason, rpi_ai::types::DoneReason::Stop);
     assert_eq!(message.stop_reason, StopReason::Stop);
+    // 23cb385b6: the raw provider finish reason is preserved.
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
     assert_eq!(message.response_id.as_deref(), Some("vertex-response-id"));
     // usage: input = prompt - cached; output = candidates + thoughts.
     assert_eq!(message.usage.input, 6);
@@ -797,6 +799,36 @@ async fn test_error_flow_stream_ends_without_finish_reason() {
     assert_eq!(
         error.error_message.as_deref(),
         Some("Google Vertex stream ended without a finish reason")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Raw stop reasons (google-raw-stop-reason.test.ts: 23cb385b6, text unified
+// by 5a2539a7b @ 4181f66)
+// ---------------------------------------------------------------------------
+
+/// google-raw-stop-reason.test.ts: "preserves raw Gemini finish reasons for
+/// Google Vertex errors".
+#[tokio::test]
+async fn preserves_raw_gemini_finish_reasons_for_google_vertex_errors() {
+    let (base_url, _rx) = serve(vec![sse(
+        "data: {\"responseId\":\"google-response-id\",\"candidates\":[{\"finishReason\":\"SAFETY\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":0,\"totalTokenCount\":1}}\n\n",
+    )])
+    .await;
+    let events = collect(stream(
+        &model(&base_url),
+        &context(vec![user_text("hi")]),
+        vertex_options(api_key_options()),
+    ))
+    .await;
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("last event is error, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.raw_stop_reason.as_deref(), Some("SAFETY"));
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Provider stopped with: SAFETY")
     );
 }
 

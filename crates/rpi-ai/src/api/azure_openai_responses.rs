@@ -1,6 +1,7 @@
 //! Port of `packages/ai/src/api/azure-openai-responses.ts` @ pi 0.82.1 (2efa728).
 //! (`azure-openai-responses.lazy.ts` is the upstream dynamic-import wrapper;
 //! rpi adapters are linked statically, so there is no lazy counterpart.)
+//! Error tail carries `output.errorMessage` since 4181f66 (32850ef7c).
 //!
 //! Azure OpenAI Responses adapter: deployment-name resolution (option →
 //! `AZURE_OPENAI_DEPLOYMENT_NAME_MAP` → model id), Azure base-URL
@@ -606,7 +607,11 @@ async fn run(
         StopReason::Pending => {
             Err("Azure OpenAI Responses stream ended without a stop reason".to_owned())
         }
-        StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
+        // 32850ef7c (R2.3.3): carry the mapped provider error message.
+        StopReason::Aborted | StopReason::Error => Err(output
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "An unknown error occurred".to_owned())),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
         _ => Ok(DoneReason::Stop),

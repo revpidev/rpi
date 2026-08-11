@@ -1,7 +1,8 @@
-//! Port of `packages/ai/src/utils/overflow.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/utils/overflow.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Three-branch context-overflow detection: error-text pattern table (with a
-//! non-overflow exclusion table), z.ai silent overflow, Xiaomi truncation.
+//! non-overflow exclusion table), z.ai silent overflow, Xiaomi truncation;
+//! plus `isRecoverableLength` (32850ef7c).
 
 use std::sync::LazyLock;
 
@@ -113,6 +114,18 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
     false
 }
 
+/// `isRecoverableLength` (32850ef7c): whether a length stop ended below the
+/// caller or model's intended output limit. Such responses may be caused by
+/// context pressure or provider-side truncation, so callers can make one
+/// bounded compact-and-retry attempt. `desired_max_output` must be the
+/// original limit before any context-based clamping. (The recovery chain
+/// itself is T23 scope.)
+pub fn is_recoverable_length(message: &AssistantMessage, desired_max_output: u64) -> bool {
+    message.stop_reason == StopReason::Length
+        && desired_max_output > 0
+        && message.usage.output < desired_max_output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +228,44 @@ mod tests {
             &assistant(StopReason::Error, Some("authentication failed")),
             Some(100)
         ));
+    }
+
+    // -- isRecoverableLength -------------------------------------------------
+    // Ported from overflow.test.ts @ 32850ef7c (4181f66).
+
+    /// `createLengthStopMessage`.
+    fn length_stop(input: u64, cache_read: u64, cache_write: u64, output: u64) -> AssistantMessage {
+        let mut msg = assistant(StopReason::Length, None);
+        msg.usage.input = input;
+        msg.usage.cache_read = cache_read;
+        msg.usage.cache_write = cache_write;
+        msg.usage.output = output;
+        msg.usage.total_tokens = input + cache_read + cache_write + output;
+        msg
+    }
+
+    #[test]
+    fn treats_a_length_stop_below_the_desired_output_limit_as_recoverable() {
+        let message = length_stop(3, 253584, 25554, 16);
+        assert!(is_recoverable_length(&message, 128000));
+    }
+
+    #[test]
+    fn does_not_recover_a_length_stop_that_reached_the_desired_output_limit() {
+        let message = length_stop(4062, 0, 0, 1024);
+        assert!(!is_recoverable_length(&message, 1024));
+    }
+
+    #[test]
+    fn treats_zero_output_length_stops_as_recoverable_without_context_metadata() {
+        let message = length_stop(100, 0, 0, 0);
+        assert!(is_recoverable_length(&message, 128000));
+    }
+
+    #[test]
+    fn zero_desired_max_output_is_never_recoverable() {
+        // JS `desiredMaxOutput > 0` guard: an unknown limit disables recovery.
+        let message = length_stop(100, 0, 0, 0);
+        assert!(!is_recoverable_length(&message, 0));
     }
 }

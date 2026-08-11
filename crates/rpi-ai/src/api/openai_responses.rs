@@ -1,4 +1,5 @@
-//! Port of `packages/ai/src/api/openai-responses.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/api/openai-responses.ts` @ pi 0.82.1 (2efa728);
+//! error tail carries `output.errorMessage` since 4181f66 (32850ef7c).
 //!
 //! OpenAI Responses adapter: compat resolution (`get_compat`), session-affinity
 //! client headers, `build_params` (prompt-cache keys/retention, the 16-token
@@ -588,7 +589,11 @@ async fn run(
         StopReason::Pending => {
             Err("OpenAI Responses stream ended without a stop reason".to_owned())
         }
-        StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
+        // 32850ef7c (R2.3.3): carry the mapped provider error message.
+        StopReason::Aborted | StopReason::Error => Err(output
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "An unknown error occurred".to_owned())),
         StopReason::Length => Ok(DoneReason::Length),
         StopReason::ToolUse => Ok(DoneReason::ToolUse),
         _ => Ok(DoneReason::Stop),

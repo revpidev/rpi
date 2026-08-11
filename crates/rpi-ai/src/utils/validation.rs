@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/utils/validation.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/utils/validation.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Tool-call argument validation against JSON Schema with lenient type
 //! coercion (null→0, "123"→123, …), recursion through allOf/anyOf/oneOf,
@@ -211,6 +211,17 @@ fn apply_schema_array_coercion(value: &mut [Value], schema: &Value) {
 }
 
 fn coerce_with_union_schema(value: &Value, schemas: &[Value]) -> Value {
+    // 2e95584da: a value that already matches a union arm is preserved as-is
+    // before any coercion is attempted (nullable unions must not convert
+    // `null` into another primitive).
+    for schema in schemas {
+        if let Some(validator) = get_sub_schema_validator(schema) {
+            if validator.is_valid(value) {
+                return value.clone();
+            }
+        }
+    }
+
     for schema in schemas {
         let candidate = value.clone();
         let coerced = coerce_with_json_schema(candidate, schema);
@@ -480,8 +491,10 @@ mod tests {
                 "v": {"anyOf": [{"type": "integer"}, {"type": "string"}]}
             }
         }));
+        // 2e95584da: "42" already matches the `string` arm, so it is preserved
+        // as-is (pre-fix this was coerced to the integer 42).
         let out = validate_tool_arguments(&tool, &call(json!({"v": "42"}))).expect("valid");
-        assert_eq!(out, json!({"v": 42}));
+        assert_eq!(out, json!({"v": "42"}));
         let out = validate_tool_arguments(&tool, &call(json!({"v": "abc"}))).expect("valid");
         assert_eq!(out, json!({"v": "abc"}));
     }
@@ -498,6 +511,58 @@ mod tests {
         // Matches none: first convertible type wins.
         let out = validate_tool_arguments(&tool, &call(json!({"v": null}))).expect("valid");
         assert_eq!(out, json!({"v": 0}));
+    }
+
+    // -- union arm preservation (2e95584da / f9476a61e @ 4181f66) -------------
+
+    /// validation.test.ts: "preserves a value that already matches a nullable
+    /// union arm".
+    #[test]
+    fn preserves_a_value_that_already_matches_a_nullable_union_arm() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {"value": {"anyOf": [{"type": "number"}, {"type": "null"}]}}
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"value": null}))).expect("valid");
+        assert_eq!(out, json!({"value": null}));
+    }
+
+    /// validation.test.ts: "preserves a value that already matches a oneOf
+    /// nullable union arm".
+    #[test]
+    fn preserves_a_value_that_already_matches_a_one_of_nullable_union_arm() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {"value": {"oneOf": [{"type": "number"}, {"type": "null"}]}}
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"value": null}))).expect("valid");
+        assert_eq!(out, json!({"value": null}));
+    }
+
+    /// validation.test.ts: "still coerces nullable unions when the original
+    /// value does not match any arm".
+    #[test]
+    fn still_coerces_nullable_unions_when_the_original_value_does_not_match_any_arm() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {"value": {"anyOf": [{"type": "number"}, {"type": "null"}]}}
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"value": "42"}))).expect("valid");
+        assert_eq!(out, json!({"value": 42}));
+    }
+
+    /// validation.test.ts: "accepts null for nullable array schemas with
+    /// items" (f9476a61e; the TypeBox `Compile` assertion is TypeBox-specific —
+    /// rpi's jsonschema draft-7 validator is the only engine, so the intent
+    /// port asserts `validateToolArguments` accepts `null` unchanged).
+    #[test]
+    fn accepts_null_for_nullable_array_schemas_with_items() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {"value": {"type": ["array", "null"], "items": {"type": "string"}}}
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"value": null}))).expect("valid");
+        assert_eq!(out, json!({"value": null}));
     }
 
     #[test]

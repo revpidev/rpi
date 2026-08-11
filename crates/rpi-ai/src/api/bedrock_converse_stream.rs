@@ -1,6 +1,8 @@
 //! Port of `packages/ai/src/api/bedrock-converse-stream.ts` @ pi 0.82.1 (2efa728).
 //! (`bedrock-converse-stream.lazy.ts` is the upstream dynamic-import wrapper;
 //! rpi adapters are linked statically, so there is no lazy counterpart.)
+//! Stream-termination semantics (rawStopReason, unknown-reason error text)
+//! updated to 4181f66 (637737ca7, 5a2539a7b).
 //!
 //! Amazon Bedrock ConverseStream adapter: SigV4 vs bearer-token auth, region /
 //! endpoint resolution, the reserved-header whitelist for caller headers,
@@ -1010,14 +1012,19 @@ fn extract_error_message(body: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// `mapStopReason` — empty/unknown reasons map to `Error`; the empty string
-/// carries no message (JS `reason ? … : …` falsy edge).
+/// carries no message (JS `reason ? … : …` falsy edge). Unknown non-empty
+/// reasons carry `Provider stopped with: <reason>` (637737ca7; text unified
+/// by 5a2539a7b).
 fn map_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
     match reason {
         Some("end_turn") | Some("stop_sequence") => (StopReason::Stop, None),
         Some("max_tokens") | Some("model_context_window_exceeded") => (StopReason::Length, None),
         Some("tool_use") => (StopReason::ToolUse, None),
         Some("") | None => (StopReason::Error, None),
-        Some(other) => (StopReason::Error, Some(other.to_owned())),
+        Some(other) => (
+            StopReason::Error,
+            Some(format!("Provider stopped with: {other}")),
+        ),
     }
 }
 
@@ -1119,6 +1126,12 @@ impl<'a> StreamProcessor<'a> {
                 Ok(())
             }
             "messageStop" => {
+                // 637737ca7: preserve the raw provider reason before mapping
+                // (JS assigns `undefined` when absent, i.e. `None`).
+                self.output.raw_stop_reason = payload
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let (stop_reason, error_message) =
                     map_stop_reason(payload.get("stopReason").and_then(Value::as_str));
                 self.output.stop_reason = stop_reason;
