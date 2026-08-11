@@ -1,4 +1,7 @@
-//! Port of `packages/agent/src/proxy.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/agent/src/proxy.ts` @ pi 0.82.1 (2efa728), updated to
+//! 4181f66 for the v0.84 frame/protocol changes (`toolcall_end` carries the
+//! server-authoritative `toolCall`, :46/:338-350; `samplingParams` joins the
+//! options whitelist, :62/:105).
 //!
 //! SSE client that routes LLM calls through a server
 //! (`POST {proxyUrl}/api/stream`). The server strips the `partial` field from
@@ -108,6 +111,11 @@ pub enum ProxyAssistantMessageEvent {
     #[serde(rename = "toolcall_end")]
     ToolCallEnd {
         content_index: usize,
+        /// The server-authoritative finished tool call (proxy.ts:46). The
+        /// `type: "toolCall"` tag rides along via
+        /// [`rpi_ai::types::tagged_tool_call`].
+        #[serde(with = "rpi_ai::types::tagged_tool_call")]
+        tool_call: ToolCall,
     },
     Done {
         reason: DoneReason,
@@ -161,15 +169,19 @@ fn parse_proxy_event(
 // Stream options
 // ---------------------------------------------------------------------------
 
-/// `ProxySerializableStreamOptions = Pick<SimpleStreamOptions, ...>` (:59-71):
-/// the ten fields the proxy server is allowed to see
-/// (`buildProxyRequestOptions`, :101-114). Serialized with absent fields
+/// `ProxySerializableStreamOptions = Pick<SimpleStreamOptions, ...>` (:59-72):
+/// the eleven fields the proxy server is allowed to see
+/// (`buildProxyRequestOptions`, :102-115). Serialized with absent fields
 /// omitted (upstream `JSON.stringify` drops `undefined` properties).
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxySerializableStreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
+    /// Arbitrary sampling parameters, merged into the request body server-side
+    /// (v0.84, R2.1.4; upstream whitelist entry `samplingParams`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampling_params: Option<Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -190,13 +202,15 @@ struct ProxySerializableStreamOptions {
     max_retry_delay_ms: Option<u64>,
 }
 
-/// `ProxyStreamOptions extends ProxySerializableStreamOptions` (:73-80):
+/// `ProxyStreamOptions extends ProxySerializableStreamOptions` (:74-81):
 /// the whitelisted stream options plus the local-only `signal`, `authToken`
-/// and `proxyUrl`. The whitelist is structural: fields outside the ten
+/// and `proxyUrl`. The whitelist is structural: fields outside the eleven
 /// serializable ones cannot be sent to the server.
 #[derive(Debug, Clone)]
 pub struct ProxyStreamOptions {
     pub temperature: Option<f64>,
+    /// `StreamOptions.sampling_params` (v0.84, R2.1.4).
+    pub sampling_params: Option<Map<String, Value>>,
     pub max_tokens: Option<u32>,
     /// `SimpleStreamOptions.reasoning` — `ThinkingLevel` (off-exclusive).
     pub reasoning: Option<ThinkingLevel>,
@@ -224,10 +238,11 @@ struct ProxyRequestBody<'a> {
     options: ProxySerializableStreamOptions,
 }
 
-/// `buildProxyRequestOptions` (:101-114).
+/// `buildProxyRequestOptions` (:102-115).
 fn build_proxy_request_options(options: &ProxyStreamOptions) -> ProxySerializableStreamOptions {
     ProxySerializableStreamOptions {
         temperature: options.temperature,
+        sampling_params: options.sampling_params.clone(),
         max_tokens: options.max_tokens,
         reasoning: options.reasoning,
         cache_retention: options.cache_retention,
@@ -604,6 +619,7 @@ fn process_proxy_event(
                     name: tool_name,
                     arguments: Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 }),
             )?;
             partial_jsons.insert(content_index, String::new());
@@ -634,16 +650,27 @@ fn process_proxy_event(
             }))
         }
 
-        ProxyAssistantMessageEvent::ToolCallEnd { content_index } => {
-            // :336-348 — drop `partialJson` and emit the finished call; a
-            // toolcall_end for non-toolCall content is silently skipped (:347).
+        ProxyAssistantMessageEvent::ToolCallEnd {
+            content_index,
+            tool_call,
+        } => {
+            // :338-350 — the frame's server-authoritative `toolCall` replaces
+            // the accumulated block (`Object.assign(content,
+            // proxyEvent.toolCall)`, :341; full replacement is equivalent
+            // because `ToolCall` covers every assignable field) and the
+            // transient `partialJson` is dropped (`delete`, :342). A
+            // toolcall_end for non-toolCall content is silently skipped
+            // (:347).
             partial_jsons.remove(&content_index);
-            match partial.content.get(content_index) {
-                Some(AssistantContent::ToolCall(call)) => Ok(Some(StreamEvent::ToolCallEnd {
-                    content_index,
-                    tool_call: call.clone(),
-                    partial: partial.clone(),
-                })),
+            match partial.content.get_mut(content_index) {
+                Some(AssistantContent::ToolCall(call)) => {
+                    *call = tool_call;
+                    Ok(Some(StreamEvent::ToolCallEnd {
+                        content_index,
+                        tool_call: call.clone(),
+                        partial: partial.clone(),
+                    }))
+                }
                 _ => Ok(None),
             }
         }
@@ -654,6 +681,10 @@ fn process_proxy_event(
                 DoneReason::Stop => StopReason::Stop,
                 DoneReason::Length => StopReason::Length,
                 DoneReason::ToolUse => StopReason::ToolUse,
+                // Placeholder variant (R2.1.1); the shared enum accepts it on
+                // the wire (see `DoneReason` docs), so map it explicitly
+                // instead of rejecting the frame.
+                DoneReason::Deferred => StopReason::Deferred,
             };
             partial.usage = usage;
             Ok(Some(StreamEvent::Done {
@@ -722,6 +753,9 @@ fn initial_partial(model: &Model) -> AssistantMessage {
         usage: Usage::default(),
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -806,8 +840,17 @@ mod tests {
                 },
             ),
             (
-                r#"{"type":"toolcall_end","contentIndex":3}"#,
-                ProxyAssistantMessageEvent::ToolCallEnd { content_index: 3 },
+                r#"{"type":"toolcall_end","contentIndex":3,"toolCall":{"type":"toolCall","id":"c1","name":"bash","arguments":{}}}"#,
+                ProxyAssistantMessageEvent::ToolCallEnd {
+                    content_index: 3,
+                    tool_call: ToolCall {
+                        id: "c1".to_owned(),
+                        name: "bash".to_owned(),
+                        arguments: Map::new(),
+                        thought_signature: None,
+                        namespace: None,
+                    },
+                },
             ),
             (
                 r#"{"type":"done","reason":"stop","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}"#,
@@ -889,6 +932,7 @@ mod tests {
                 name: "bash".to_owned(),
                 arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
                 thought_signature: None,
+                namespace: None,
             })
         );
 
@@ -901,8 +945,23 @@ mod tests {
             &mut partial_jsons,
         )
         .expect("delta processes");
+        // The frame carries the server-authoritative finished call
+        // (proxy.ts:46); it replaces the accumulated block (:341).
+        let finished = ToolCall {
+            id: "c1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: json!({"cmd": "ls -la"})
+                .as_object()
+                .expect("object")
+                .clone(),
+            thought_signature: None,
+            namespace: None,
+        };
         let end = process_proxy_event(
-            ProxyAssistantMessageEvent::ToolCallEnd { content_index: 0 },
+            ProxyAssistantMessageEvent::ToolCallEnd {
+                content_index: 0,
+                tool_call: finished.clone(),
+            },
             &mut partial,
             &mut partial_jsons,
         )
@@ -910,13 +969,7 @@ mod tests {
         let StreamEvent::ToolCallEnd { tool_call, .. } = end.expect("end event") else {
             panic!("expected ToolCallEnd");
         };
-        assert_eq!(
-            tool_call.arguments,
-            json!({"cmd": "ls -la"})
-                .as_object()
-                .expect("object")
-                .clone()
-        );
+        assert_eq!(tool_call, finished);
         assert!(
             partial_jsons.is_empty(),
             "partialJson dropped at toolcall_end"
@@ -938,6 +991,7 @@ mod tests {
             max_tokens: 4096,
             headers: None,
             compat: None,
+            sampling_params: None,
         }
     }
 }

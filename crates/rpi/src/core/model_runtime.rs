@@ -1603,6 +1603,7 @@ fn json_model_to_model(
             None => provider_compat.cloned(),
         },
         id: model.id,
+        sampling_params: None,
     })
 }
 
@@ -1653,6 +1654,7 @@ fn config_model_to_model(
         headers: model.headers.clone(),
         id: model.id,
         compat: model.compat.clone(),
+        sampling_params: None,
     })
 }
 

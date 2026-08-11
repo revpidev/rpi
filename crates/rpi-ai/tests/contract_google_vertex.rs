@@ -190,7 +190,10 @@ fn user_text(text: &str) -> Message {
 
 fn api_key_options() -> StreamOptions {
     StreamOptions {
-        api_key: Some("AIzaSyExampleRealisticLookingApiKey123456".to_owned()),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some("AIzaSyExampleRealisticLookingApiKey123456".to_owned()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }
@@ -807,11 +810,14 @@ async fn test_error_flow_stream_ends_without_finish_reason() {
 fn adc_options(credential_path: &std::path::Path, token_url: &str) -> GoogleVertexOptions {
     GoogleVertexOptions {
         stream: StreamOptions {
-            api_key: Some(GCP_VERTEX_CREDENTIALS_MARKER.to_owned()),
-            env: Some(env_with(&[(
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                credential_path.to_str().expect("utf8 path"),
-            )])),
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some(GCP_VERTEX_CREDENTIALS_MARKER.to_owned()),
+                env: Some(env_with(&[(
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    credential_path.to_str().expect("utf8 path"),
+                )])),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         project: Some("test-project".to_owned()),
@@ -980,11 +986,14 @@ async fn test_adc_missing_credential_file_error() {
     let model = model("https://proxy.example.com");
     let options = GoogleVertexOptions {
         stream: StreamOptions {
-            api_key: Some(GCP_VERTEX_CREDENTIALS_MARKER.to_owned()),
-            env: Some(env_with(&[(
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "/nonexistent/adc-credentials.json",
-            )])),
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some(GCP_VERTEX_CREDENTIALS_MARKER.to_owned()),
+                env: Some(env_with(&[(
+                    "GOOGLE_APPLICATION_CREDENTIALS",
+                    "/nonexistent/adc-credentials.json",
+                )])),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         project: Some("test-project".to_owned()),
@@ -1014,8 +1023,11 @@ async fn test_adc_missing_project_and_location_errors() {
     // Missing project: upstream throws before any HTTP.
     let options = GoogleVertexOptions {
         stream: StreamOptions {
-            api_key: Some("<authenticated>".to_owned()),
-            env: Some(env.clone()),
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some("<authenticated>".to_owned()),
+                env: Some(env.clone()),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         location: Some("us-central1".to_owned()),
@@ -1033,8 +1045,11 @@ async fn test_adc_missing_project_and_location_errors() {
     // Missing location.
     let options = GoogleVertexOptions {
         stream: StreamOptions {
-            api_key: Some("<authenticated>".to_owned()),
-            env: Some(env),
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some("<authenticated>".to_owned()),
+                env: Some(env),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         project: Some("test-project".to_owned()),

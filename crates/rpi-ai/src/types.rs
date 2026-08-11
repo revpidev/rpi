@@ -1,4 +1,4 @@
-//! Port of `packages/ai/src/types.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/types.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Core wire types: messages, content blocks, usage, tools, models (with
 //! compat matrices), stream options and the assistant stream event protocol.
@@ -18,6 +18,19 @@
 //! - `onPayload` / `onResponse` callbacks become `Arc<dyn Fn>` returning boxed
 //!   futures; they are absent from serialized form (StreamOptions is internal,
 //!   never on the wire).
+//! - TS interface inheritance `StreamOptions extends ProviderRequestOptions`
+//!   (v0.84, R2.8.1) becomes composition: [`StreamOptions`] owns a
+//!   [`ProviderRequestOptions`] in its `request` field and implements
+//!   `Deref`/`DerefMut` to it, so field access paths (`options.timeout_ms`)
+//!   read exactly like upstream. Constructing the request-scoped fields uses
+//!   the nested struct literal.
+//! - `FetchFunction = typeof globalThis.fetch` becomes the neutral
+//!   [`FetchFn`] channel over [`FetchRequest`]/[`FetchResponse`] value types
+//!   (rpi has no global fetch to mirror; the shape is mock-friendly). Channel
+//!   only: no adapter consumes it yet (R2.7.4 wiring lands in T20/T26).
+//! - `TelemetryContext` (pi-telemetry) is an opaque placeholder unit struct:
+//!   the telemetry pipeline is [DEFER] (v0.11 requirements §1.2); only the
+//!   `ProviderRequestOptions.telemetry_context` field position is kept.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,6 +38,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::Stream;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -275,28 +289,78 @@ pub type OnPayloadCallback =
 pub type OnResponseCallback =
     Arc<dyn Fn(ProviderResponse, &Model) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// `StreamOptions` — base options all providers share.
+/// `TelemetryContext` placeholder (pi-telemetry is [DEFER], v0.11 requirements
+/// §1.2). Opaque unit struct: keeps the
+/// [`ProviderRequestOptions::telemetry_context`] field position and pass-through
+/// channel without implementing any telemetry pipeline (G4 red line).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct TelemetryContext;
+
+/// Wire-level HTTP request handed to a custom [`FetchFn`] (R2.7.4). Neutral
+/// value type (no reqwest coupling in the public type layer); adapters
+/// translate their built request into this shape when a custom fetch is set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FetchRequest {
+    pub method: String,
+    pub url: String,
+    /// Header pairs in wire order; duplicate names are allowed.
+    pub headers: Vec<(String, String)>,
+    pub body: Option<Vec<u8>>,
+}
+
+/// Error returned by a custom [`FetchFn`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("custom fetch failed: {0}")]
+pub struct FetchError(pub String);
+
+/// Streaming HTTP response returned by a custom [`FetchFn`]. The body is a
+/// byte-chunk stream so SSE adapters can parse incrementally.
+pub struct FetchResponse {
+    pub status: u16,
+    /// Header pairs in wire order; duplicate names are allowed.
+    pub headers: Vec<(String, String)>,
+    pub body: Pin<Box<dyn Stream<Item = Result<Vec<u8>, FetchError>> + Send>>,
+}
+
+impl fmt::Debug for FetchResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FetchResponse")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &"<stream>")
+            .finish()
+    }
+}
+
+/// `FetchFunction` (`typeof globalThis.fetch`) — optional custom HTTP transport
+/// for provider requests (R2.7.4). Does not affect WebSocket transports.
+///
+/// Channel placeholder: no adapter consumes this yet; the per-request wiring
+/// (and the Google-side rejection of non-default fetch) lands with the
+/// provider tasks (T20/T26).
+pub type FetchFn = Arc<
+    dyn Fn(FetchRequest) -> Pin<Box<dyn Future<Output = Result<FetchResponse, FetchError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// `ProviderRequestOptions` — authentication, HTTP transport, and lifecycle
+/// callbacks shared by provider requests (v0.84, R2.8.1).
 ///
 /// Internal type (never serialized); field docs mirror upstream.
 #[derive(Clone, Default)]
-pub struct StreamOptions {
-    pub temperature: Option<f64>,
-    pub max_tokens: Option<u32>,
-    /// Reasoning level for reasoning-capable models. Upstream carries this on
-    /// `SimpleStreamOptions`; the rpi-agent `StreamFn` shape (design §4.4)
-    /// takes plain `StreamOptions`, so the channel lives here instead
-    /// (compaction `createSummarizationOptions`, compaction.ts:539-553).
-    /// `ModelThinkingLevel` (off-inclusive) because the compaction caller
-    /// passes the agent-side thinking level.
-    pub reasoning: Option<ModelThinkingLevel>,
+pub struct ProviderRequestOptions {
     pub signal: Option<CancellationToken>,
+    /// Explicit parent context for telemetry produced by this logical request.
+    /// Placeholder only — the telemetry pipeline is [DEFER] (v0.11
+    /// requirements §1.2).
+    pub telemetry_context: Option<TelemetryContext>,
     pub api_key: Option<String>,
-    /// Preferred transport for providers that support multiple transports.
-    pub transport: Option<Transport>,
-    /// Prompt cache retention preference. Default: `Short`.
-    pub cache_retention: Option<CacheRetention>,
-    /// Optional session identifier for providers that support session-based caching.
-    pub session_id: Option<String>,
+    /// Optional fetch implementation for provider HTTP requests (R2.7.4).
+    /// Channel placeholder — see [`FetchFn`].
+    pub fetch: Option<FetchFn>,
+    /// Provider-scoped environment values, taking precedence over process.env.
+    pub env: Option<ProviderEnv>,
     pub on_payload: Option<OnPayloadCallback>,
     pub on_response: Option<OnResponseCallback>,
     /// Custom HTTP headers, merged over provider defaults; `None` suppresses a
@@ -305,33 +369,24 @@ pub struct StreamOptions {
     pub headers: Option<ProviderHeaders>,
     /// HTTP request timeout in milliseconds.
     pub timeout_ms: Option<u64>,
-    /// WebSocket connect (handshake) timeout in milliseconds.
-    pub websocket_connect_timeout_ms: Option<u64>,
     /// Maximum client-side retry attempts.
     pub max_retries: Option<u32>,
     /// Maximum delay (ms) to wait for a server-requested long retry wait.
     /// Default: 60000; 0 disables the cap.
     pub max_retry_delay_ms: Option<u64>,
-    /// Optional metadata; providers extract the fields they understand.
-    pub metadata: Option<serde_json::Map<String, Value>>,
-    /// Provider-scoped environment values, taking precedence over process.env.
-    pub env: Option<ProviderEnv>,
 }
 
-// Manual Debug: the `on_payload` / `on_response` trait objects are not Debug.
-// `api_key` and header values are redacted — credentials must never appear in
-// Debug output (coding-standards §11.1/§11.2).
-impl fmt::Debug for StreamOptions {
+// Manual Debug: the `on_payload` / `on_response` / `fetch` trait objects are
+// not Debug. `api_key` and header values are redacted — credentials must never
+// appear in Debug output (coding-standards §11.1/§11.2).
+impl fmt::Debug for ProviderRequestOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StreamOptions")
-            .field("temperature", &self.temperature)
-            .field("max_tokens", &self.max_tokens)
-            .field("reasoning", &self.reasoning)
+        f.debug_struct("ProviderRequestOptions")
             .field("signal", &self.signal)
+            .field("telemetry_context", &self.telemetry_context)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
-            .field("transport", &self.transport)
-            .field("cache_retention", &self.cache_retention)
-            .field("session_id", &self.session_id)
+            .field("fetch", &self.fetch.as_ref().map(|_| "<callback>"))
+            .field("env", &self.env)
             .field(
                 "on_payload",
                 &self.on_payload.as_ref().map(|_| "<callback>"),
@@ -345,14 +400,93 @@ impl fmt::Debug for StreamOptions {
                 &self.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
             )
             .field("timeout_ms", &self.timeout_ms)
+            .field("max_retries", &self.max_retries)
+            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
+            .finish()
+    }
+}
+
+/// `StreamOptions extends ProviderRequestOptions` — base options all providers
+/// share, plus the chat-sampling and transport knobs.
+///
+/// TS interface inheritance is expressed as composition (see file header):
+/// the inherited fields live in [`StreamOptions::request`] and are reachable
+/// directly via `Deref`/`DerefMut`, e.g. `options.timeout_ms`.
+///
+/// Internal type (never serialized); field docs mirror upstream.
+#[derive(Clone, Default)]
+pub struct StreamOptions {
+    /// The inherited `ProviderRequestOptions` (`signal`, `api_key`, `fetch`,
+    /// `env`, `on_payload`, `on_response`, `headers`, `timeout_ms`,
+    /// `max_retries`, `max_retry_delay_ms`, `telemetry_context`).
+    pub request: ProviderRequestOptions,
+    pub temperature: Option<f64>,
+    /// Arbitrary sampling parameters merged into the request body as-is, after
+    /// the named request fields, so keys here override them (R2.1.4). Merged
+    /// over `Model.sampling_params` per key. Only OpenAI-compatible adapters
+    /// apply it (merge semantics land in T20; this is the type channel).
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
+    pub max_tokens: Option<u32>,
+    /// Reasoning level for reasoning-capable models. Upstream carries this on
+    /// `SimpleStreamOptions`; the rpi-agent `StreamFn` shape (design §4.4)
+    /// takes plain `StreamOptions`, so the channel lives here instead
+    /// (compaction `createSummarizationOptions`, compaction.ts:539-553).
+    /// `ModelThinkingLevel` (off-inclusive) because the compaction caller
+    /// passes the agent-side thinking level.
+    pub reasoning: Option<ModelThinkingLevel>,
+    /// Preferred transport for providers that support multiple transports.
+    pub transport: Option<Transport>,
+    /// Prompt cache retention preference. Default: `Short`.
+    pub cache_retention: Option<CacheRetention>,
+    /// Optional session identifier for providers that support session-based caching.
+    pub session_id: Option<String>,
+    /// WebSocket connect (handshake) timeout in milliseconds.
+    pub websocket_connect_timeout_ms: Option<u64>,
+    /// Optional metadata; providers extract the fields they understand.
+    pub metadata: Option<serde_json::Map<String, Value>>,
+}
+
+impl std::ops::Deref for StreamOptions {
+    type Target = ProviderRequestOptions;
+
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
+}
+
+impl std::ops::DerefMut for StreamOptions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.request
+    }
+}
+
+impl From<ProviderRequestOptions> for StreamOptions {
+    fn from(request: ProviderRequestOptions) -> Self {
+        StreamOptions {
+            request,
+            ..StreamOptions::default()
+        }
+    }
+}
+
+// Manual Debug: delegates the inherited fields to `ProviderRequestOptions`'s
+// redacting Debug impl (coding-standards §11.1/§11.2).
+impl fmt::Debug for StreamOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamOptions")
+            .field("request", &self.request)
+            .field("temperature", &self.temperature)
+            .field("sampling_params", &self.sampling_params)
+            .field("max_tokens", &self.max_tokens)
+            .field("reasoning", &self.reasoning)
+            .field("transport", &self.transport)
+            .field("cache_retention", &self.cache_retention)
+            .field("session_id", &self.session_id)
             .field(
                 "websocket_connect_timeout_ms",
                 &self.websocket_connect_timeout_ms,
             )
-            .field("max_retries", &self.max_retries)
-            .field("max_retry_delay_ms", &self.max_retry_delay_ms)
             .field("metadata", &self.metadata)
-            .field("env", &self.env)
             .finish()
     }
 }
@@ -477,6 +611,11 @@ pub struct ToolCall {
     /// Google-specific: opaque signature for reusing thought context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// OpenAI Responses namespace for calls to dynamically loaded or
+    /// namespaced tools (v0.84, R2.1.3). Preserved across streaming, proxy
+    /// (`toolcall_end` frames) and replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 
 /// Serde `with` module that serializes a [`ToolCall`] with its upstream
@@ -788,11 +927,18 @@ impl fmt::Debug for ImagesOptions {
     }
 }
 
-/// `StopReason = "pending" | "stop" | "length" | "toolUse" | "error" | "aborted"`.
+/// `StopReason = "pending" | "stop" | "length" | "toolUse" | "error" |
+/// "aborted" | "deferred"`.
 ///
 /// `pending` exists in the type but is transient only: it is never persisted
 /// to session JSONL (only `message_end` persists, and partials never produce
 /// `message_end`) — requirements §4.1.
+///
+/// `deferred` (v0.84, R2.1.1) marks a request handed off to a provider-side
+/// background/deferred lifecycle. The lifecycle itself is [DEFER] (R2.2.1):
+/// no rpi provider produces it, but every protocol/serialization layer must
+/// handle the variant explicitly (upstream server protocol v1 rejects it
+/// rather than silently swallowing it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StopReason {
     #[serde(rename = "pending")]
@@ -807,6 +953,33 @@ pub enum StopReason {
     Error,
     #[serde(rename = "aborted")]
     Aborted,
+    #[serde(rename = "deferred")]
+    Deferred,
+}
+
+/// `DeferredHandle` (v0.84, R2.1.2/R2.2.1) — durable handle to a
+/// provider-side deferred response.
+///
+/// **Type placeholder only**: `fetchDeferred`/`cancelDeferred` and the `wait`
+/// long-poll semantics are [DEFER] (R2.2.1); this struct exists so
+/// `AssistantMessage.deferred` round-trips on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeferredHandle {
+    pub provider: String,
+    pub model_id: String,
+    pub api: String,
+    /// Provider token, such as a response id or batch id plus row id.
+    pub id: String,
+    /// Unix timestamp in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_after_ms: Option<u64>,
+    /// Provider conversion data required to reconstruct the final assistant
+    /// message. Arbitrary JSON (upstream `JsonValue`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// `UserMessage`.
@@ -842,8 +1015,25 @@ pub struct AssistantMessage {
     pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// Handle to a provider-side deferred response when `stop_reason` is
+    /// `Deferred` (v0.84, R2.1.2). Type placeholder only — the deferred
+    /// request lifecycle is [DEFER] (R2.2.1). Boxed to keep the `Message`
+    /// enum small (`clippy::large_enum_variant`); the serde shape is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<Box<DeferredHandle>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// The provider's raw, unmapped stop reason (v0.84, R2.1.2). Populated by
+    /// the adapters (Anthropic/Google/Bedrock/Mistral/OpenAI completions and
+    /// responses) in T19/T20.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_stop_reason: Option<String>,
+    /// Provider indication of whether the model explicitly ended its turn
+    /// (v0.84, R2.1.2; Codex debugging). Preserved for debugging and does not
+    /// affect agent control flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_turn: Option<bool>,
     /// Unix timestamp in milliseconds.
     pub timestamp: i64,
 }
@@ -1005,7 +1195,13 @@ pub struct Context {
 // Stream events (AssistantMessageEvent)
 // ---------------------------------------------------------------------------
 
-/// `Extract<StopReason, "stop" | "length" | "toolUse">` — reason of a `done` event.
+/// `Extract<StopReason, "stop" | "length" | "toolUse" | "deferred">` — reason
+/// of a `done` event.
+///
+/// Note: the proxy frame protocol (`packages/agent/src/proxy.ts`) narrows this
+/// to `"stop" | "length" | "toolUse"`. The shared Rust enum accepts `deferred`
+/// in proxy frames too, which only widens parse tolerance — upstream does no
+/// runtime validation either (TS types are erased), so behavior is identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DoneReason {
     #[serde(rename = "stop")]
@@ -1014,6 +1210,8 @@ pub enum DoneReason {
     Length,
     #[serde(rename = "toolUse")]
     ToolUse,
+    #[serde(rename = "deferred")]
+    Deferred,
 }
 
 /// `Extract<StopReason, "aborted" | "error">` — reason of an `error` event.
@@ -1163,6 +1361,10 @@ pub struct Model {
     pub cost: ModelCost,
     pub context_window: u32,
     pub max_tokens: u32,
+    /// Default sampling parameters for this model (v0.84, R2.1.4). See
+    /// [`StreamOptions::sampling_params`]; per-request keys override these.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     /// Compatibility overrides; which fields apply is governed by `api`
@@ -1506,7 +1708,10 @@ mod tests {
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            deferred: None,
             error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
             timestamp: 0,
         }
     }
@@ -1584,6 +1789,7 @@ mod tests {
             name: "bash".to_owned(),
             arguments,
             thought_signature: Some("sig".to_owned()),
+            namespace: None,
         };
         let ev = StreamEvent::ToolCallEnd {
             content_index: 2,
@@ -1598,6 +1804,38 @@ mod tests {
                 r#"{{"type":"toolcall_end","contentIndex":2,"toolCall":{{"type":"toolCall","id":"c1","name":"bash","arguments":{{"cmd":"ls"}},"thoughtSignature":"sig"}},"partial":{PARTIAL_JSON}}}"#
             )
         );
+        let back: StreamEvent = serde_json::from_str(&to_json(&ev)).expect("roundtrip");
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn tool_call_namespace_round_trip() {
+        // v0.84 (R2.1.3): `namespace` is preserved across streaming, proxy and
+        // replay; absent namespaces are omitted on the wire (no stray null).
+        let call = ToolCall {
+            id: "c1".to_owned(),
+            name: "search".to_owned(),
+            arguments: Map::new(),
+            thought_signature: None,
+            namespace: Some("dynamic_tools".to_owned()),
+        };
+        let v: Value = serde_json::from_str(&to_json(&call)).expect("parse");
+        assert_eq!(v["namespace"], json!("dynamic_tools"));
+
+        let bare = ToolCall {
+            namespace: None,
+            ..call.clone()
+        };
+        let v: Value = serde_json::from_str(&to_json(&bare)).expect("parse");
+        assert!(v.get("namespace").is_none(), "absent namespace is omitted");
+
+        let ev = StreamEvent::ToolCallEnd {
+            content_index: 0,
+            tool_call: call,
+            partial: partial(),
+        };
+        let v: Value = serde_json::from_str(&to_json(&ev)).expect("parse");
+        assert_eq!(v["toolCall"]["namespace"], json!("dynamic_tools"));
         let back: StreamEvent = serde_json::from_str(&to_json(&ev)).expect("roundtrip");
         assert_eq!(back, ev);
     }
@@ -1741,6 +1979,7 @@ mod tests {
                 name: "n".to_owned(),
                 arguments: Map::new(),
                 thought_signature: Some("s".to_owned()),
+                namespace: None,
             }),
         ];
         msg.usage.cache_write1h = Some(5);
@@ -1775,10 +2014,179 @@ mod tests {
             (StopReason::ToolUse, "toolUse"),
             (StopReason::Error, "error"),
             (StopReason::Aborted, "aborted"),
+            (StopReason::Deferred, "deferred"),
         ];
         for (reason, expected) in cases {
             assert_eq!(to_json(&reason), format!("\"{expected}\""));
+            let back: StopReason =
+                serde_json::from_str(&format!("\"{expected}\"")).expect("roundtrip");
+            assert_eq!(back, reason);
         }
+    }
+
+    #[test]
+    fn done_reason_literals() {
+        // Upstream: Extract<StopReason, "stop" | "length" | "toolUse" |
+        // "deferred"> (types.ts, v0.84).
+        let cases = [
+            (DoneReason::Stop, "stop"),
+            (DoneReason::Length, "length"),
+            (DoneReason::ToolUse, "toolUse"),
+            (DoneReason::Deferred, "deferred"),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(to_json(&reason), format!("\"{expected}\""));
+            let back: DoneReason =
+                serde_json::from_str(&format!("\"{expected}\"")).expect("roundtrip");
+            assert_eq!(back, reason);
+        }
+    }
+
+    #[test]
+    fn deferred_handle_shape() {
+        // Field-for-field against upstream `DeferredHandle` (types.ts, v0.84):
+        // provider/modelId/api/id required; expiresAt/pollAfterMs/data optional
+        // and omitted when absent; `data` carries arbitrary JSON.
+        let full: DeferredHandle = serde_json::from_value(json!({
+            "provider": "openai",
+            "modelId": "gpt-5.6",
+            "api": "openai-responses",
+            "id": "resp_123",
+            "expiresAt": 1760000000000i64,
+            "pollAfterMs": 5000,
+            "data": {"rowId": 7, "tags": ["a", null, true]}
+        }))
+        .expect("deserialize full handle");
+        assert_eq!(full.expires_at, Some(1_760_000_000_000));
+        assert_eq!(full.poll_after_ms, Some(5_000));
+        assert_eq!(
+            full.data,
+            Some(json!({"rowId": 7, "tags": ["a", null, true]}))
+        );
+        let v: Value = serde_json::from_str(&to_json(&full)).expect("re-parse");
+        assert_eq!(v["modelId"], json!("gpt-5.6"));
+        assert_eq!(v["pollAfterMs"], json!(5000));
+
+        let bare = DeferredHandle {
+            provider: "openai".to_owned(),
+            model_id: "gpt-5.6".to_owned(),
+            api: "openai-responses".to_owned(),
+            id: "resp_123".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        };
+        assert_eq!(
+            to_json(&bare),
+            r#"{"provider":"openai","modelId":"gpt-5.6","api":"openai-responses","id":"resp_123"}"#
+        );
+    }
+
+    #[test]
+    fn assistant_message_v084_fields_three_state() {
+        // v0.84 additions (R2.1.1/R2.1.2): `deferred` sits between `stopReason`
+        // and `errorMessage`, `rawStopReason`/`endTurn` after `errorMessage`
+        // (upstream property order, types.ts).
+        let mut msg = partial();
+        msg.stop_reason = StopReason::Deferred;
+        msg.deferred = Some(Box::new(DeferredHandle {
+            provider: "openai".to_owned(),
+            model_id: "gpt-5.6".to_owned(),
+            api: "openai-responses".to_owned(),
+            id: "resp_123".to_owned(),
+            expires_at: None,
+            poll_after_ms: None,
+            data: None,
+        }));
+        msg.raw_stop_reason = Some("background".to_owned());
+        msg.end_turn = Some(false);
+
+        let v: Value = serde_json::from_str(&to_json(&msg)).expect("parse");
+        assert_eq!(v["stopReason"], json!("deferred"));
+        assert_eq!(v["deferred"]["id"], json!("resp_123"));
+        assert_eq!(v["rawStopReason"], json!("background"));
+        assert_eq!(v["endTurn"], json!(false));
+
+        let back: AssistantMessage = serde_json::from_str(&to_json(&msg)).expect("roundtrip");
+        assert_eq!(back, msg);
+
+        // Absent state: no stray nulls (already pinned by PARTIAL_JSON, which
+        // `partial()` — all-None new fields — serializes to unchanged).
+        let v: Value = serde_json::from_str(&to_json(&partial())).expect("parse");
+        for key in ["deferred", "rawStopReason", "endTurn"] {
+            assert!(v.get(key).is_none(), "absent {key} is omitted");
+        }
+    }
+
+    #[test]
+    fn model_sampling_params_shape() {
+        // v0.84 (R2.1.4): `Model.samplingParams` sits between `maxTokens` and
+        // `headers`; absent when unset.
+        let model_json = json!({
+            "id": "m1",
+            "name": "M One",
+            "api": "openai-completions",
+            "provider": "openai",
+            "baseUrl": "https://api.example.com",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.5, "cacheWrite": 1.5},
+            "contextWindow": 1000000,
+            "maxTokens": 64000,
+            "samplingParams": {"top_p": 0.9, "min_p": 0.05}
+        });
+        let model: Model = serde_json::from_value(model_json.clone()).expect("deserialize");
+        assert_eq!(
+            model.sampling_params.as_ref().expect("present")["top_p"],
+            json!(0.9)
+        );
+        let serialized: Value = serde_json::from_str(&to_json(&model)).expect("re-parse");
+        assert_eq!(serialized, model_json);
+    }
+
+    #[test]
+    fn stream_options_deref_reaches_request_fields() {
+        // TS `StreamOptions extends ProviderRequestOptions` is composition +
+        // Deref here: inherited fields read/write through `StreamOptions`
+        // directly, matching upstream access paths.
+        let mut options = StreamOptions {
+            temperature: Some(0.5),
+            ..StreamOptions::default()
+        };
+        assert!(options.api_key.is_none());
+        options.api_key = Some("sk-test".to_owned());
+        options.timeout_ms = Some(30_000);
+        assert_eq!(options.request.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(options.request.timeout_ms, Some(30_000));
+
+        let request = ProviderRequestOptions {
+            max_retries: Some(3),
+            ..ProviderRequestOptions::default()
+        };
+        let options = StreamOptions::from(request);
+        assert_eq!(options.max_retries, Some(3));
+        assert!(options.temperature.is_none());
+    }
+
+    #[test]
+    fn stream_options_debug_redacts_credentials() {
+        // coding-standards §11.1/§11.2: api_key and header values never appear
+        // in Debug output, through both the direct and the delegated impl.
+        let mut headers = ProviderHeaders::new();
+        headers.insert("authorization".to_owned(), Some("Bearer sekrit".to_owned()));
+        let options = StreamOptions {
+            request: ProviderRequestOptions {
+                api_key: Some("sk-sekrit".to_owned()),
+                headers: Some(headers),
+                ..ProviderRequestOptions::default()
+            },
+            ..StreamOptions::default()
+        };
+        let debug = format!("{options:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("sk-sekrit"));
+        assert!(!debug.contains("Bearer sekrit"));
+        assert!(debug.contains("authorization"));
     }
 
     #[test]

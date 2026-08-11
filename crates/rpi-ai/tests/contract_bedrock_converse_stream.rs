@@ -191,7 +191,10 @@ fn scoped_env(pairs: &[(&str, &str)]) -> ProviderEnv {
 fn sigv4_options(env: ProviderEnv) -> BedrockOptions {
     BedrockOptions {
         stream: StreamOptions {
-            env: Some(env),
+            request: rpi_ai::ProviderRequestOptions {
+                env: Some(env),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         ..BedrockOptions::default()
@@ -1040,6 +1043,7 @@ async fn test_convert_messages_empty_text_placeholder() {
                 name: "tool".to_owned(),
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
+                namespace: None,
             },
         )],
         api: ApiKind::from(ApiKind::BEDROCK_CONVERSE_STREAM),
@@ -1052,6 +1056,9 @@ async fn test_convert_messages_empty_text_placeholder() {
         stop_reason: StopReason::ToolUse,
         error_message: None,
         timestamp: 0,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     });
     let (payload, _) = capture_payload(
         &model,
@@ -1098,6 +1105,9 @@ async fn test_convert_messages_assistant_blank_and_thinking() {
         stop_reason: StopReason::Stop,
         error_message: None,
         timestamp: 0,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     });
     let (payload, _) =
         capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
@@ -1441,14 +1451,17 @@ async fn test_stream_simple_budget_path_payload() {
     let slot = captured.clone();
     let simple = rpi_ai::types::SimpleStreamOptions {
         stream: StreamOptions {
-            env: Some(test_env()),
-            on_payload: Some(Arc::new(move |payload, _model| {
-                let slot = slot.clone();
-                Box::pin(async move {
-                    *slot.lock().expect("payload slot") = payload;
-                    None
-                })
-            })),
+            request: rpi_ai::ProviderRequestOptions {
+                env: Some(test_env()),
+                on_payload: Some(Arc::new(move |payload, _model| {
+                    let slot = slot.clone();
+                    Box::pin(async move {
+                        *slot.lock().expect("payload slot") = payload;
+                        None
+                    })
+                })),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         reasoning: Some(ThinkingLevel::High),
@@ -1485,14 +1498,17 @@ async fn test_stream_simple_budget_path_payload() {
     let slot = captured2.clone();
     let simple = rpi_ai::types::SimpleStreamOptions {
         stream: StreamOptions {
-            env: Some(test_env()),
-            on_payload: Some(Arc::new(move |payload, _model| {
-                let slot = slot.clone();
-                Box::pin(async move {
-                    *slot.lock().expect("payload slot") = payload;
-                    None
-                })
-            })),
+            request: rpi_ai::ProviderRequestOptions {
+                env: Some(test_env()),
+                on_payload: Some(Arc::new(move |payload, _model| {
+                    let slot = slot.clone();
+                    Box::pin(async move {
+                        *slot.lock().expect("payload slot") = payload;
+                        None
+                    })
+                })),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         reasoning: Some(ThinkingLevel::Xhigh),

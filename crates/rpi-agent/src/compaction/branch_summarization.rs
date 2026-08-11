@@ -393,10 +393,13 @@ pub async fn generate_branch_summary(
     };
     let request_options = StreamOptions {
         max_tokens: Some(2048),
-        signal: args.signal.clone(),
-        api_key: args.api_key.clone(),
-        headers: args.headers.clone(),
-        env: args.env.clone(),
+        request: rpi_ai::ProviderRequestOptions {
+            signal: args.signal.clone(),
+            api_key: args.api_key.clone(),
+            headers: args.headers.clone(),
+            env: args.env.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let response = complete_summarization(

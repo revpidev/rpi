@@ -1176,6 +1176,9 @@ mod tests {
                 stop_reason: StopReason::Pending,
                 error_message: None,
                 timestamp: 0,
+                deferred: None,
+                end_turn: None,
+                raw_stop_reason: None,
             };
             stream.push(StreamEvent::Start {
                 partial: partial.clone(),
@@ -1183,7 +1186,7 @@ mod tests {
             // Surface the resolved api key in the final message so tests can
             // assert auth application happened.
             partial.stop_reason = StopReason::Stop;
-            partial.error_message = options.and_then(|o| o.api_key);
+            partial.error_message = options.and_then(|o| o.request.api_key);
             stream.push(StreamEvent::Done {
                 reason: DoneReason::Stop,
                 message: partial,

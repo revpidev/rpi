@@ -1,7 +1,10 @@
 //! Port of `packages/ai/src/auth/helpers.ts` @ pi 0.82.1 (2efa728) —
 //! `envApiKeyAuth` only (`lazyOAuth` exists to keep Node-only flow code out
 //! of browser bundles; rpi is a native binary and has no bundle-splitting
-//! constraint, so it is not ported).
+//! constraint, so it is not ported). Because there is no `lazyOAuth` wrapper,
+//! the wrapper-level `isSubscription` flag (auth/helpers.ts:40-59 @ 4181f66)
+//! lives directly on the five `OAuthAuth` impls instead
+//! (`OAuthAuth::is_subscription`).
 
 use super::interaction::{AuthInteraction, AuthPrompt};
 use super::resolve::ModelsError;

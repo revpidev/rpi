@@ -132,6 +132,7 @@ mod tests {
                 name: name.to_owned(),
                 arguments: Map::new(),
                 thought_signature: None,
+                namespace: None,
             })],
             api: crate::types::ApiKind::from(crate::types::ApiKind::ANTHROPIC_MESSAGES),
             provider: "anthropic".to_owned(),
@@ -143,6 +144,9 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             error_message: None,
             timestamp: 1,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 

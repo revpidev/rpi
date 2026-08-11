@@ -380,6 +380,11 @@ impl OAuthAuth for AnthropicOAuth {
         "Anthropic (Claude Pro/Max)"
     }
 
+    /// `isSubscription: true` (providers/anthropic.ts:52 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `loginAnthropic`: PKCE → callback server (`expected_state = verifier`)
     /// → notify `auth_url` → race the `manual_code` prompt against the
     /// callback (first settle cancels the other) → token exchange.

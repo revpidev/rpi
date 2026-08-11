@@ -1180,6 +1180,7 @@ impl<'a> StreamProcessor<'a> {
                     .to_owned(),
                 arguments: Map::new(),
                 thought_signature: None,
+                namespace: None,
             }));
         let content_index = self.output.content.len() - 1;
         self.blocks_by_bedrock_index.insert(index, content_index);
@@ -1394,6 +1395,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1627,7 +1631,10 @@ fn finalize(options: &BedrockOptions, output: &AssistantMessage) -> Result<DoneR
         return Err("Request was aborted".to_owned());
     }
     match output.stop_reason {
-        StopReason::Pending => Err(format_bedrock_error(
+        // `Deferred` shares the `Pending` arm: no rpi provider produces it
+        // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
+        // treated as "stream ended without a usable stop reason".
+        StopReason::Pending | StopReason::Deferred => Err(format_bedrock_error(
             None,
             None,
             None,

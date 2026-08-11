@@ -184,7 +184,10 @@ fn user_text(text: &str) -> Message {
 
 fn options() -> StreamOptions {
     StreamOptions {
-        api_key: Some("test-key".to_owned()),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }
@@ -530,7 +533,10 @@ async fn test_azure_deployment_name_resolution_over_wire() {
     )]
     .into();
     let opts = StreamOptions {
-        env: Some(env),
+        request: rpi_ai::ProviderRequestOptions {
+            env: Some(env),
+            ..options().request
+        },
         ..options()
     };
     let events =
@@ -552,7 +558,10 @@ async fn test_azure_deployment_name_resolution_over_wire() {
         &context(vec![user_text("hi")]),
         AzureOpenAIResponsesOptions {
             stream: StreamOptions {
-                env: Some(env),
+                request: rpi_ai::ProviderRequestOptions {
+                    env: Some(env),
+                    ..options().request
+                },
                 ..options()
             },
             azure_deployment_name: Some("explicit-deployment".to_owned()),
@@ -663,7 +672,10 @@ fn test_azure_config_resolution_defaults() {
     .into();
     let options = AzureOpenAIResponsesOptions {
         stream: StreamOptions {
-            env: Some(env),
+            request: rpi_ai::ProviderRequestOptions {
+                env: Some(env),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         },
         ..AzureOpenAIResponsesOptions::default()

@@ -153,12 +153,15 @@ fn model_and_options(
     }))
     .expect("model");
     let options = StreamOptions {
-        api_key: if api_key.is_empty() {
-            None
-        } else {
-            Some(api_key)
-        },
         max_tokens: Some(64),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key)
+            },
+            ..Default::default()
+        },
         ..StreamOptions::default()
     };
     (model, options)

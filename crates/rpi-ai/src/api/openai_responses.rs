@@ -391,6 +391,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 

@@ -610,10 +610,13 @@ fn create_summarization_options(
     StreamOptions {
         max_tokens: Some(max_tokens.min(u32::MAX as u64) as u32),
         reasoning,
-        signal: args.signal.clone(),
-        api_key: args.api_key.clone(),
-        headers: args.headers.clone(),
-        env: args.env.clone(),
+        request: rpi_ai::ProviderRequestOptions {
+            signal: args.signal.clone(),
+            api_key: args.api_key.clone(),
+            headers: args.headers.clone(),
+            env: args.env.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -646,6 +649,9 @@ async fn stream_final_message(
         stop_reason: StopReason::Error,
         error_message: Some("Stream ended without a terminal done/error event".to_owned()),
         timestamp: now_millis(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 

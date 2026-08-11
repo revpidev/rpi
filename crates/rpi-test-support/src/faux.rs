@@ -94,6 +94,7 @@ pub fn faux_tool_call(
         name: name.into(),
         arguments,
         thought_signature: None,
+        namespace: None,
     })
 }
 
@@ -123,6 +124,9 @@ pub fn faux_assistant_message(
         stop_reason: options.stop_reason.unwrap_or(StopReason::Stop),
         error_message: options.error_message,
         timestamp: options.timestamp.unwrap_or(0),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -281,6 +285,7 @@ impl FauxProvider {
                 max_tokens: d.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
                 headers: None,
                 compat: None,
+                sampling_params: None,
             })
             .collect();
 
@@ -577,6 +582,9 @@ fn create_error_message(
         stop_reason: StopReason::Error,
         error_message: Some(error.to_owned()),
         timestamp: 0,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -732,6 +740,7 @@ async fn stream_with_deltas(
                     name: call.name.clone(),
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 }));
                 let _ = tx.send(StreamEvent::ToolCallStart {
                     content_index: index,
@@ -761,7 +770,13 @@ async fn stream_with_deltas(
         }
     }
 
-    if message.stop_reason == StopReason::Pending {
+    // `Deferred` shares the `Pending` path (R2.1.1): the faux provider never
+    // produces it, but if a scripted response carried it, it is an incomplete
+    // response just like a missing stop reason.
+    if matches!(
+        message.stop_reason,
+        StopReason::Pending | StopReason::Deferred
+    ) {
         let err = create_error_message(
             "Faux response ended without a stop reason",
             message.api.as_str(),
@@ -795,7 +810,9 @@ async fn stream_with_deltas(
             };
             let _ = tx.send(StreamEvent::Done { reason, message });
         }
-        StopReason::Pending => unreachable!("pending handled above"),
+        StopReason::Pending | StopReason::Deferred => {
+            unreachable!("pending/deferred handled above")
+        }
     }
 }
 
@@ -1111,7 +1128,10 @@ mod tests {
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
         let options = StreamOptions {
-            signal: Some(token),
+            request: rpi_ai::ProviderRequestOptions {
+                signal: Some(token),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let events = collect(provider.stream_fn()(model, user_context("hi"), options)).await;

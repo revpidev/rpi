@@ -43,6 +43,7 @@ fn test_model() -> Model {
         max_tokens: 4096,
         headers: None,
         compat: None,
+        sampling_params: None,
     }
 }
 
@@ -58,10 +59,12 @@ fn test_context() -> Context {
     }
 }
 
-/// All ten whitelisted fields set, so the options whitelist is fully asserted.
+/// All eleven whitelisted fields set, so the options whitelist is fully
+/// asserted.
 fn test_options(proxy_url: &str) -> ProxyStreamOptions {
     ProxyStreamOptions {
         temperature: Some(0.7),
+        sampling_params: Some(json!({"top_p": 0.9}).as_object().expect("object").clone()),
         max_tokens: Some(100),
         reasoning: Some(ThinkingLevel::High),
         cache_retention: Some(CacheRetention::Short),
@@ -273,7 +276,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
         r#"{"type":"thinking_delta","contentIndex":2,"delta":"reasoning"}"#,
         r#"{"type":"thinking_end","contentIndex":2,"contentSignature":"sig-t"}"#,
         r#"{"type":"text_end","contentIndex":0,"contentSignature":"sig-x"}"#,
-        r#"{"type":"toolcall_end","contentIndex":1}"#,
+        r#"{"type":"toolcall_end","contentIndex":1,"toolCall":{"type":"toolCall","id":"call_1","name":"bash","arguments":{"cmd":"ls -la"}}}"#,
         &format!(r#"{{"type":"done","reason":"stop","usage":{USAGE_JSON}}}"#),
     ]);
 
@@ -299,8 +302,8 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
     assert_eq!(body["context"]["systemPrompt"], "sys");
     assert_eq!(body["context"]["messages"][0]["role"], "user");
     assert_eq!(body["context"]["messages"][0]["content"], "hello");
-    // Whitelist: exactly the ten serializable fields, nothing else
-    // (`buildProxyRequestOptions`, :101-114).
+    // Whitelist: exactly the eleven serializable fields, nothing else
+    // (`buildProxyRequestOptions`, :102-115).
     let options = body["options"].as_object().expect("options object");
     let mut keys: Vec<&String> = options.keys().collect();
     keys.sort();
@@ -313,6 +316,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             "maxTokens",
             "metadata",
             "reasoning",
+            "samplingParams",
             "sessionId",
             "temperature",
             "thinkingBudgets",
@@ -320,6 +324,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
         ]
     );
     assert_eq!(options["temperature"], json!(0.7));
+    assert_eq!(options["samplingParams"], json!({"top_p": 0.9}));
     assert_eq!(options["maxTokens"], json!(100));
     assert_eq!(options["reasoning"], json!("high"));
     assert_eq!(options["cacheRetention"], json!("short"));
@@ -396,6 +401,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             name: "bash".to_owned(),
             arguments: json!({}).as_object().expect("object").clone(),
             thought_signature: None,
+            namespace: None,
         })
     );
 
@@ -436,6 +442,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
             name: "bash".to_owned(),
             arguments: json!({"cmd": "ls"}).as_object().expect("object").clone(),
             thought_signature: None,
+            namespace: None,
         })
     );
 
@@ -475,6 +482,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
                 .expect("object")
                 .clone(),
             thought_signature: None,
+            namespace: None,
         })
     );
 
@@ -582,6 +590,7 @@ async fn test_request_shape_whitelist_and_full_event_sequence() {
                 .expect("object")
                 .clone(),
             thought_signature: None,
+            namespace: None,
         })
     );
     assert_eq!(
@@ -983,7 +992,7 @@ async fn test_toolcall_end_on_non_toolcall_content_is_skipped() {
         vec![Step::Write(sse(&[
             r#"{"type":"start"}"#,
             r#"{"type":"text_start","contentIndex":0}"#,
-            r#"{"type":"toolcall_end","contentIndex":0}"#,
+            r#"{"type":"toolcall_end","contentIndex":0,"toolCall":{"type":"toolCall","id":"c1","name":"bash","arguments":{}}}"#,
             &format!(r#"{{"type":"done","reason":"length","usage":{USAGE_JSON}}}"#),
         ]))],
     )
@@ -1009,6 +1018,59 @@ async fn test_toolcall_end_on_non_toolcall_content_is_skipped() {
         AssistantContent::Text(TextContent {
             text: String::new(),
             text_signature: None,
+        })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// toolcall_end merge semantics (proxy.test.ts:34-82 @ 4181f66)
+// ---------------------------------------------------------------------------
+
+/// Port of upstream `streamProxy > preserves tool-call metadata received only
+/// on toolcall_end` (packages/agent/test/proxy.test.ts:34-82 @ 4181f66): the
+/// server-authoritative `toolCall` on the `toolcall_end` frame replaces the
+/// accumulated block, so metadata that only exists server-side (here
+/// `namespace`) survives into both the event and the final message.
+#[tokio::test]
+async fn preserves_tool_call_metadata_received_only_on_toolcall_end() {
+    let body = sse(&[
+        r#"{"type":"start"}"#,
+        r#"{"type":"toolcall_start","contentIndex":0,"id":"call_test|fc_test","toolName":"lookup"}"#,
+        r#"{"type":"toolcall_delta","contentIndex":0,"delta":"{\"value\":\"hello\"}"}"#,
+        r#"{"type":"toolcall_end","contentIndex":0,"toolCall":{"type":"toolCall","id":"call_test|fc_test","name":"lookup","arguments":{"value":"hello"},"namespace":"dynamic_tools"}}"#,
+        &format!(r#"{{"type":"done","reason":"toolUse","usage":{USAGE_JSON}}}"#),
+    ]);
+    let server = start_server(200, "OK", "text/event-stream", vec![Step::Write(body)]).await;
+    let stream = stream_proxy(
+        &test_model(),
+        &test_context(),
+        test_options(&server.base_url),
+    );
+    let events = collect(stream).await;
+
+    let end_event = events
+        .iter()
+        .find(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+        .expect("toolcall_end event");
+    let StreamEvent::ToolCallEnd { tool_call, .. } = end_event else {
+        unreachable!();
+    };
+    assert_eq!(tool_call.namespace.as_deref(), Some("dynamic_tools"));
+
+    let StreamEvent::Done { message, .. } = events.last().expect("done event") else {
+        panic!("expected Done, got {:?}", events.last());
+    };
+    assert_eq!(
+        message.content[0],
+        AssistantContent::ToolCall(ToolCall {
+            id: "call_test|fc_test".to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({"value": "hello"})
+                .as_object()
+                .expect("object")
+                .clone(),
+            thought_signature: None,
+            namespace: Some("dynamic_tools".to_owned()),
         })
     );
 }

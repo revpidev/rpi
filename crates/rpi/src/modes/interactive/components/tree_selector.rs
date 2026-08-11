@@ -2648,6 +2648,9 @@ mod tests {
                 stop_reason,
                 error_message: error_message.map(str::to_owned),
                 timestamp: 1,
+                deferred: None,
+                end_turn: None,
+                raw_stop_reason: None,
             }),
         )
     }
@@ -2658,6 +2661,7 @@ mod tests {
             name: name.to_owned(),
             arguments: arguments.as_object().cloned().unwrap_or_default(),
             thought_signature: None,
+            namespace: None,
         })
     }
 

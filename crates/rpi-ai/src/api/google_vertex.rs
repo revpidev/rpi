@@ -579,6 +579,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -750,6 +753,7 @@ impl<'a> StreamProcessor<'a> {
                 .and_then(Value::as_str)
                 .filter(|signature| !signature.is_empty())
                 .map(str::to_owned),
+            namespace: None,
         };
 
         self.output
@@ -1036,7 +1040,12 @@ fn finish_processor(
         return Err("Request was aborted".to_owned());
     }
     match processor.output.stop_reason {
-        StopReason::Pending => Err("Google Vertex stream ended without a finish reason".to_owned()),
+        // `Deferred` shares the `Pending` arm: no rpi provider produces it
+        // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
+        // treated as "stream ended without a usable finish reason".
+        StopReason::Pending | StopReason::Deferred => {
+            Err("Google Vertex stream ended without a finish reason".to_owned())
+        }
         StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),

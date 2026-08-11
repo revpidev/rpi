@@ -830,6 +830,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1767,7 +1770,10 @@ mod tests {
         );
         // 0 disables the cap.
         let options = StreamOptions {
-            max_retry_delay_ms: Some(0),
+            request: crate::types::ProviderRequestOptions {
+                max_retry_delay_ms: Some(0),
+                ..Default::default()
+            },
             ..StreamOptions::default()
         };
         assert_eq!(

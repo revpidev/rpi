@@ -1211,6 +1211,7 @@ impl<'a> StreamProcessor<'a> {
                                     .cloned()
                                     .unwrap_or_default(),
                                 thought_signature: None,
+                                namespace: None,
                             },
                         ));
                         self.block_states.push(BlockState {
@@ -1389,7 +1390,12 @@ impl<'a> StreamProcessor<'a> {
             return Err("Request was aborted".to_owned());
         }
         match self.output.stop_reason {
-            StopReason::Pending => Err("Anthropic stream ended without a stop reason".to_owned()),
+            // `Deferred` shares the `Pending` arm: no rpi provider produces it
+            // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
+            // treated as "stream ended without a usable stop reason".
+            StopReason::Pending | StopReason::Deferred => {
+                Err("Anthropic stream ended without a stop reason".to_owned())
+            }
             StopReason::Aborted | StopReason::Error => Err(self
                 .output
                 .error_message
@@ -1423,6 +1429,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1798,6 +1807,9 @@ pub(crate) mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
             timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -2208,6 +2220,7 @@ pub(crate) mod tests {
                 name: "bash".to_owned(),
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
+                namespace: None,
             })],
             "anthropic",
             "claude-sonnet-4-5",
@@ -2425,6 +2438,7 @@ pub(crate) mod tests {
                     name: "bash".to_owned(),
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 "openai",
                 "gpt-5",
@@ -2454,6 +2468,7 @@ pub(crate) mod tests {
                     name: "read".to_owned(),
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",
@@ -2499,6 +2514,7 @@ pub(crate) mod tests {
                     name: "Read".to_owned(),
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",
@@ -2530,6 +2546,7 @@ pub(crate) mod tests {
                     name: "base_tool".to_owned(),
                     arguments: serde_json::Map::new(),
                     thought_signature: None,
+                    namespace: None,
                 })],
                 "anthropic",
                 "claude-sonnet-4-5",

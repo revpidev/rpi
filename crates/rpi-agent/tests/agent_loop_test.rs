@@ -51,6 +51,7 @@ fn test_model() -> Model {
         max_tokens: 2048,
         headers: None,
         compat: None,
+        sampling_params: None,
     }
 }
 
@@ -101,6 +102,9 @@ fn assistant_message(content: Vec<AssistantContent>, stop_reason: StopReason) ->
         stop_reason,
         error_message: None,
         timestamp: 2,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -120,6 +124,7 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantContent {
         name: name.to_owned(),
         arguments: arguments.as_object().expect("arguments object").clone(),
         thought_signature: None,
+        namespace: None,
     })
 }
 
@@ -169,7 +174,9 @@ fn mock_stream_fn(script: Vec<AssistantMessage>) -> (StreamFn, Arc<Mutex<MockScr
                 reason: DoneReason::ToolUse,
                 message,
             },
-            StopReason::Pending => panic!("scripted message needs a terminal stop reason"),
+            StopReason::Pending | StopReason::Deferred => {
+                panic!("scripted message needs a terminal stop reason")
+            }
         };
         futures::stream::iter(vec![event]).boxed()
     });

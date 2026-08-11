@@ -209,5 +209,7 @@ fn stop_reason_str(reason: StopReason) -> &'static str {
         StopReason::Error => "error",
         StopReason::Aborted => "aborted",
         StopReason::Pending => "pending",
+        // Placeholder variant (R2.1.1); mapped to its wire name explicitly.
+        StopReason::Deferred => "deferred",
     }
 }

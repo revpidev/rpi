@@ -143,6 +143,9 @@ fn create_failure_message(model: &Model, error_message: &str, aborted: bool) -> 
         },
         error_message: Some(error_message.to_owned()),
         timestamp: now_millis(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1022,16 +1025,9 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                     let simple = SimpleStreamOptions {
                         stream: StreamOptions {
                             cache_retention: request_options.cache_retention,
-                            headers: request_options.headers.map(|headers| {
-                                headers.into_iter().map(|(k, v)| (k, Some(v))).collect()
-                            }),
-                            max_retries: request_options.max_retries,
-                            max_retry_delay_ms: request_options.max_retry_delay_ms,
                             metadata: request_options
                                 .metadata
                                 .map(|metadata| metadata.into_iter().collect()),
-                            on_payload: Some(on_payload),
-                            on_response: Some(on_response),
                             // The loop binds `reasoning` into `StreamOptions`
                             // (agent_loop.rs:828); keep it there so providers that
                             // read the plain stream options see it, and mirror it
@@ -1039,10 +1035,20 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                             // `reasoning` at the simple-options level,
                             // agent-harness.ts:421).
                             reasoning: options.reasoning,
-                            signal: options.signal.clone(),
                             session_id: Some(session_id),
-                            timeout_ms: request_options.timeout_ms,
                             transport: request_options.transport,
+                            request: rpi_ai::ProviderRequestOptions {
+                                headers: request_options.headers.map(|headers| {
+                                    headers.into_iter().map(|(k, v)| (k, Some(v))).collect()
+                                }),
+                                max_retries: request_options.max_retries,
+                                max_retry_delay_ms: request_options.max_retry_delay_ms,
+                                on_payload: Some(on_payload),
+                                on_response: Some(on_response),
+                                signal: options.signal.clone(),
+                                timeout_ms: request_options.timeout_ms,
+                                ..Default::default()
+                            },
                             ..Default::default()
                         },
                         reasoning: options.reasoning.and_then(thinking_level_from_model_level),

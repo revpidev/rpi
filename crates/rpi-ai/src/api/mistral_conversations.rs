@@ -935,6 +935,7 @@ impl<'a> StreamProcessor<'a> {
                         name: tool_call.function.name.clone(),
                         arguments: Map::new(),
                         thought_signature: None,
+                        namespace: None,
                     }));
                 let content_index = self.output.content.len() - 1;
                 self.tool_blocks_by_key.insert(key.clone(), content_index);
@@ -1013,6 +1014,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -1167,7 +1171,12 @@ fn finalize(options: &MistralOptions, output: &AssistantMessage) -> Result<DoneR
         return Err("Request was aborted".to_owned());
     }
     match output.stop_reason {
-        StopReason::Pending => Err("Mistral stream ended without a finish reason".to_owned()),
+        // `Deferred` shares the `Pending` arm: no rpi provider produces it
+        // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
+        // treated as "stream ended without a usable finish reason".
+        StopReason::Pending | StopReason::Deferred => {
+            Err("Mistral stream ended without a finish reason".to_owned())
+        }
         StopReason::Aborted | StopReason::Error => Err("An unknown error occurred".to_owned()),
         StopReason::Stop => Ok(DoneReason::Stop),
         StopReason::Length => Ok(DoneReason::Length),
@@ -1362,7 +1371,10 @@ mod tests {
     fn options() -> MistralOptions {
         MistralOptions {
             stream: StreamOptions {
-                api_key: Some("test-key".to_owned()),
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             ..MistralOptions::default()
@@ -1719,6 +1731,7 @@ mod tests {
                     name: "bash".to_owned(),
                     arguments: serde_json::from_value(json!({"cmd": "ls"})).expect("map"),
                     thought_signature: None,
+                    namespace: None,
                 }),
             ],
             api: ApiKind::from(ApiKind::MISTRAL_CONVERSATIONS),
@@ -1731,6 +1744,9 @@ mod tests {
             stop_reason: StopReason::ToolUse,
             error_message: None,
             timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         });
         let converted = to_chat_messages(&[assistant], false);
         assert_eq!(converted.len(), 1);
@@ -1764,6 +1780,9 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
             timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         });
         assert!(to_chat_messages(&[empty], false).is_empty());
     }
@@ -2006,7 +2025,10 @@ mod tests {
         let captured_clone = captured.clone();
         let mut simple = SimpleStreamOptions {
             stream: StreamOptions {
-                api_key: Some("fake-key".to_owned()),
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("fake-key".to_owned()),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             reasoning,

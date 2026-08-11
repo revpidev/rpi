@@ -62,6 +62,9 @@ fn assistant_text(text: &str) -> AssistantMessage {
         stop_reason: StopReason::Stop,
         error_message: None,
         timestamp: 2,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -100,6 +103,7 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantContent {
         name: name.to_owned(),
         arguments: arguments.as_object().expect("arguments object").clone(),
         thought_signature: None,
+        namespace: None,
     })
 }
 

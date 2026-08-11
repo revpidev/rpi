@@ -464,9 +464,12 @@ fn default_hooks(sse_body: &'static str) -> (HandshakeHook, RequestHook, HttpHoo
 
 fn sse_options(session_id: Option<&str>) -> StreamOptions {
     StreamOptions {
-        api_key: Some(mock_token()),
         transport: Some(Transport::Sse),
         session_id: session_id.map(str::to_owned),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some(mock_token()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }
@@ -873,9 +876,12 @@ async fn test_invalid_token_error() {
 
 fn ws_options(session_id: Option<&str>, transport: Transport) -> StreamOptions {
     StreamOptions {
-        api_key: Some(mock_token()),
         transport: Some(transport),
         session_id: session_id.map(str::to_owned),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some(mock_token()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }

@@ -363,6 +363,9 @@ mod tests {
             stop_reason,
             error_message: None,
             timestamp: 1,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -372,6 +375,7 @@ mod tests {
             name: name.to_owned(),
             arguments: Map::new(),
             thought_signature: None,
+            namespace: None,
         })
     }
 
@@ -575,6 +579,7 @@ mod tests {
                     name: "read".to_owned(),
                     arguments: args,
                     thought_signature: Some("ts".to_owned()),
+                    namespace: None,
                 })],
             ),
             tool_result("call_long|item_id_with|pipes", "read"),

@@ -481,6 +481,9 @@ fn capture_stream_fn(texts: &[&str]) -> Capture {
                     stop_reason: StopReason::Stop,
                     error_message: None,
                     timestamp: 99,
+                    deferred: None,
+                    end_turn: None,
+                    raw_stop_reason: None,
                 };
                 let stream = futures::stream::iter(vec![StreamEvent::Done {
                     reason: DoneReason::Stop,

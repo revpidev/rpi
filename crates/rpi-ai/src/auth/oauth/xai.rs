@@ -416,6 +416,11 @@ impl OAuthAuth for XaiOAuth {
         "xAI (Grok/X subscription)"
     }
 
+    /// `isSubscription: true` (providers/xai.ts:17 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `login` — device code flow (RFC 8628), no prompt.
     async fn login(
         &self,

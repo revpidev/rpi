@@ -991,6 +991,7 @@ mod tests {
             max_tokens: 8192,
             headers: None,
             compat: None,
+            sampling_params: None,
         }
     }
 

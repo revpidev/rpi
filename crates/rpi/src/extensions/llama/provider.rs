@@ -136,6 +136,7 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
             supports_strict_mode: Some(false),
             ..Default::default()
         }),
+        sampling_params: None,
     })
 }
 

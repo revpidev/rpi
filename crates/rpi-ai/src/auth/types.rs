@@ -298,6 +298,14 @@ pub trait OAuthAuth: Send + Sync {
     /// Display name, e.g. "Anthropic (Claude Pro/Max)".
     fn name(&self) -> &str;
 
+    /// `isSubscription?` (packages/ai/src/auth/types.ts:210-211 @ 4181f66,
+    /// v0.84): whether access through this auth method is backed by a
+    /// provider subscription. Metadata only — drives the footer "(sub)"
+    /// badge upstream; no auth-flow behavior reads it. Default `false`.
+    fn is_subscription(&self) -> bool {
+        false
+    }
+
     /// `login` — interactive OAuth flow (PKCE / device code / localhost
     /// callback). Required upstream; the default here errors so partial
     /// implementations stay constructible until T04 part 2 wires the flows.

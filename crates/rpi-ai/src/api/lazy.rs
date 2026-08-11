@@ -34,6 +34,9 @@ pub fn create_setup_error_message(
         stop_reason: StopReason::Error,
         error_message: Some(error_message.to_owned()),
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 

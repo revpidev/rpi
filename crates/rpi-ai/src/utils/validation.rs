@@ -372,6 +372,7 @@ mod tests {
             name: "bash".to_owned(),
             arguments: arguments.as_object().cloned().unwrap_or_default(),
             thought_signature: None,
+            namespace: None,
         }
     }
 

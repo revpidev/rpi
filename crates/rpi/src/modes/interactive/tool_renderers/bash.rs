@@ -603,7 +603,10 @@ mod tests {
         assert!(stripped.contains("Full output:"), "stripped: {stripped}");
         assert!(stripped.contains("/tmp/pi-bash-"), "stripped: {stripped}");
         // The full path survives the wrap (not truncated away).
-        assert!(stripped.contains("76d578ae3f748c37"), "stripped: {stripped}");
+        assert!(
+            stripped.contains("76d578ae3f748c37"),
+            "stripped: {stripped}"
+        );
         assert!(stripped.contains("24 lines shown"), "stripped: {stripped}");
     }
 
@@ -616,9 +619,11 @@ mod tests {
         let renderer = BashToolRenderer;
         let long_line = "x".repeat(200);
         let result = ToolResultState {
-            content: vec![crate::modes::interactive::components::tool_execution::ToolResultContentLoose::text(
-                format!("{long_line}\nshort"),
-            )],
+            content: vec![
+                crate::modes::interactive::components::tool_execution::ToolResultContentLoose::text(
+                    format!("{long_line}\nshort"),
+                ),
+            ],
             is_error: false,
             details: None,
         };

@@ -413,6 +413,9 @@ fn initial_output(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -802,7 +805,10 @@ mod tests {
         .into();
         let options = AzureOpenAIResponsesOptions {
             stream: StreamOptions {
-                env: Some(env),
+                request: crate::types::ProviderRequestOptions {
+                    env: Some(env),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             ..AzureOpenAIResponsesOptions::default()
@@ -946,7 +952,10 @@ mod tests {
         .into();
         let options = AzureOpenAIResponsesOptions {
             stream: StreamOptions {
-                env: Some(env),
+                request: crate::types::ProviderRequestOptions {
+                    env: Some(env),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             ..AzureOpenAIResponsesOptions::default()
@@ -963,7 +972,10 @@ mod tests {
         .into();
         let options = AzureOpenAIResponsesOptions {
             stream: StreamOptions {
-                env: Some(env),
+                request: crate::types::ProviderRequestOptions {
+                    env: Some(env),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             ..AzureOpenAIResponsesOptions::default()

@@ -152,6 +152,9 @@ fn create_assistant_message(text: &str) -> AgentMessage {
         stop_reason: StopReason::Stop,
         error_message: None,
         timestamp: 2,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     })
 }
 

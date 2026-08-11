@@ -249,7 +249,10 @@ async fn result(stream: &AssistantMessageEventStream) -> rpi_ai::types::Assistan
 
 fn api_key_options() -> StreamOptions {
     StreamOptions {
-        api_key: Some("test-key".to_owned()),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }
@@ -284,14 +287,17 @@ async fn test_streams_text_and_tool_calls_and_resolves_the_terminal_message() {
         &context(),
         PiMessagesOptions {
             stream: StreamOptions {
-                api_key: Some("test-key".to_owned()),
                 session_id: Some("session-1".to_owned()),
                 max_tokens: Some(100),
-                headers: Some(
-                    [("x-custom".to_owned(), Some("1".to_owned()))]
-                        .into_iter()
-                        .collect(),
-                ),
+                request: rpi_ai::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    headers: Some(
+                        [("x-custom".to_owned(), Some("1".to_owned()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             tool_choice: Some(json!("auto")),
@@ -436,12 +442,15 @@ async fn test_appends_debug_1_and_reports_response_headers_via_on_response() {
         &context(),
         PiMessagesOptions {
             stream: StreamOptions {
-                on_response: Some(Arc::new(move |response, _model| {
-                    let observed = observed_clone.clone();
-                    Box::pin(async move {
-                        *observed.lock().unwrap_or_else(|e| e.into_inner()) = Some(response);
-                    })
-                })),
+                request: rpi_ai::ProviderRequestOptions {
+                    on_response: Some(Arc::new(move |response, _model| {
+                        let observed = observed_clone.clone();
+                        Box::pin(async move {
+                            *observed.lock().unwrap_or_else(|e| e.into_inner()) = Some(response);
+                        })
+                    })),
+                    ..api_key_options().request
+                },
                 ..api_key_options()
             },
             debug: Some(true),
@@ -483,7 +492,10 @@ async fn test_surfaces_backend_error_responses_with_diagnostics() {
         &context(),
         PiMessagesOptions {
             stream: StreamOptions {
-                api_key: Some("stale".to_owned()),
+                request: rpi_ai::ProviderRequestOptions {
+                    api_key: Some("stale".to_owned()),
+                    ..Default::default()
+                },
                 ..StreamOptions::default()
             },
             ..PiMessagesOptions::default()

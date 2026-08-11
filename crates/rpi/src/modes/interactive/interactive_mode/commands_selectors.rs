@@ -3088,6 +3088,7 @@ mod tests {
                 max_tokens: 64_000,
                 headers: None,
                 compat: None,
+                sampling_params: None,
             },
             Model {
                 id: "m1".into(),
@@ -3103,6 +3104,7 @@ mod tests {
                 max_tokens: 64_000,
                 headers: None,
                 compat: None,
+                sampling_params: None,
             },
             Model {
                 id: "m1".into(),
@@ -3118,6 +3120,7 @@ mod tests {
                 max_tokens: 64_000,
                 headers: None,
                 compat: None,
+                sampling_params: None,
             },
         ];
         // Canonical provider/id.
@@ -3298,6 +3301,9 @@ mod tests {
             stop_reason,
             error_message: None,
             timestamp: 1_700_000_000_000,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 

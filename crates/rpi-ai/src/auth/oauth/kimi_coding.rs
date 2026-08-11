@@ -505,6 +505,11 @@ impl OAuthAuth for KimiCodingOAuth {
         "Kimi Code (subscription)"
     }
 
+    /// `isSubscription: true` (providers/kimi-coding.ts:16 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `login` — device code flow (RFC 8628), no prompt (upstream "Kimi Code
     /// login should not prompt").
     async fn login(

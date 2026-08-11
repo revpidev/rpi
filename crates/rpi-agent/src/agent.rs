@@ -116,6 +116,7 @@ fn default_model() -> Model {
         max_tokens: 0,
         headers: None,
         compat: None,
+        sampling_params: None,
     }
 }
 
@@ -717,10 +718,13 @@ impl Agent {
             thinking_budgets: self.thinking_budgets.clone(),
             stream_options: StreamOptions {
                 session_id: self.session_id.clone(),
-                on_payload: self.on_payload.clone(),
-                on_response: self.on_response.clone(),
                 transport: Some(self.transport),
-                max_retry_delay_ms: self.max_retry_delay_ms,
+                request: rpi_ai::ProviderRequestOptions {
+                    on_payload: self.on_payload.clone(),
+                    on_response: self.on_response.clone(),
+                    max_retry_delay_ms: self.max_retry_delay_ms,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             tool_execution: self.tool_execution,
@@ -819,6 +823,9 @@ impl Agent {
             },
             error_message: Some(error.to_string()),
             timestamp: now_millis(),
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         };
         let message = AgentMessage::Assistant(failure_message);
         let state = self.state.clone();

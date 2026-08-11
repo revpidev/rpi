@@ -576,6 +576,11 @@ impl OAuthAuth for GitHubCopilotOAuth {
         "GitHub Copilot"
     }
 
+    /// `isSubscription: true` (providers/github-copilot.ts:16 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     async fn login(
         &self,
         interaction: &dyn AuthInteraction,

@@ -102,6 +102,7 @@ mod tests {
             max_tokens: 100,
             headers: None,
             compat: None,
+            sampling_params: None,
         }
     }
 

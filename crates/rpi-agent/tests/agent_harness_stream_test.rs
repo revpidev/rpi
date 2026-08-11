@@ -277,7 +277,7 @@ async fn test_stream_options_snapshot_before_provider_request_hooks() {
     assert_eq!(captured.max_retry_delay_ms, Some(3000));
     assert_eq!(captured.session_id.as_deref(), Some("session-1"));
     assert_eq!(captured.cache_retention, Some(CacheRetention::None));
-    let captured_headers: ProviderHeaders = captured.headers.expect("headers");
+    let captured_headers: ProviderHeaders = captured.request.headers.expect("headers");
     assert_eq!(
         captured_headers,
         HashMap::from([
@@ -397,7 +397,7 @@ async fn test_provider_request_patch_chaining_and_deletion() {
     // scalar clears, so it stays at the base value (file header note).
     assert_eq!(captured.timeout_ms, Some(1000));
     assert_eq!(captured.max_retries, Some(2));
-    let captured_headers: ProviderHeaders = captured.headers.expect("headers");
+    let captured_headers: ProviderHeaders = captured.request.headers.expect("headers");
     assert_eq!(
         captured_headers,
         HashMap::from([

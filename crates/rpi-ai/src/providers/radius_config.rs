@@ -129,6 +129,7 @@ pub fn get_radius_models_from_config(
             max_tokens: model.max_tokens,
             headers: None,
             compat: None,
+            sampling_params: None,
         })
         .collect()
 }

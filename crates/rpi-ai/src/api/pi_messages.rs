@@ -327,6 +327,9 @@ fn initial_partial(model: &Model) -> AssistantMessage {
         stop_reason: StopReason::Pending,
         error_message: None,
         timestamp: now_ms(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     }
 }
 
@@ -367,6 +370,9 @@ impl EventConverter {
                     DoneReason::Stop => StopReason::Stop,
                     DoneReason::Length => StopReason::Length,
                     DoneReason::ToolUse => StopReason::ToolUse,
+                    // Placeholder variant (R2.1.1); no rpi provider produces
+                    // it, but the mapping is explicit rather than swallowed.
+                    DoneReason::Deferred => StopReason::Deferred,
                 };
                 self.partial.usage = usage;
                 self.partial.response_id = response_id;
@@ -509,6 +515,7 @@ impl EventConverter {
                         name: tool_name,
                         arguments: Map::new(),
                         thought_signature: None,
+                        namespace: None,
                     });
                 self.tool_json.insert(content_index, String::new());
                 StreamEvent::ToolCallStart {

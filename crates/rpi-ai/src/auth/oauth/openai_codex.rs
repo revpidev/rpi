@@ -943,6 +943,11 @@ impl OAuthAuth for OpenAiCodexOAuth {
         "OpenAI (ChatGPT Plus/Pro)"
     }
 
+    /// `isSubscription: true` (providers/openai-codex.ts:15 @ 4181f66).
+    fn is_subscription(&self) -> bool {
+        true
+    }
+
     /// `login` — select the login method first (`browser` default /
     /// `device_code`), then run the chosen flow.
     async fn login(

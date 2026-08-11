@@ -877,6 +877,9 @@ async fn stream_assistant_response(
         stop_reason: StopReason::Error,
         error_message: Some("Stream ended without a terminal done/error event".to_owned()),
         timestamp: now_millis(),
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
     };
     finalize_streamed_message(context, final_message, added_partial, emit).await
 }

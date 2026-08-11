@@ -4234,6 +4234,9 @@ mod tests {
             stop_reason,
             error_message: None,
             timestamp: 1_700_000_000_000,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         }
     }
 
@@ -4251,6 +4254,9 @@ mod tests {
             stop_reason,
             error_message: None,
             timestamp: 1_700_000_000_000,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 
@@ -4267,6 +4273,7 @@ mod tests {
             name: name.to_string(),
             arguments: serde_json::Map::new(),
             thought_signature: None,
+            namespace: None,
         })
     }
 
@@ -4653,6 +4660,7 @@ mod tests {
                     name: "read".to_string(),
                     arguments: args.clone(),
                     thought_signature: None,
+                    namespace: None,
                 }),
             ],
             StopReason::Pending,
@@ -4699,6 +4707,7 @@ mod tests {
                     .cloned()
                     .unwrap_or_default(),
                     thought_signature: None,
+                    namespace: None,
                 }),
             ],
             StopReason::Pending,

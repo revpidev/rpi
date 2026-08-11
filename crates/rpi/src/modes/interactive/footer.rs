@@ -593,6 +593,9 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
             timestamp: 1_700_000_000_000,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         })
     }
 

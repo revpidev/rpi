@@ -245,6 +245,9 @@ mod tests {
             stop_reason,
             error_message: error_message.map(str::to_owned),
             timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         }
     }
 

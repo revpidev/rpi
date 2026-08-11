@@ -184,7 +184,10 @@ fn user_text(text: &str) -> Message {
 
 fn options() -> StreamOptions {
     StreamOptions {
-        api_key: Some("test-key".to_owned()),
+        request: rpi_ai::ProviderRequestOptions {
+            api_key: Some("test-key".to_owned()),
+            ..Default::default()
+        },
         ..StreamOptions::default()
     }
 }

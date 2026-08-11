@@ -777,6 +777,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             .to_owned(),
                         arguments: Map::new(),
                         thought_signature: None,
+                        namespace: None,
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -822,6 +823,7 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         name: name.to_owned(),
                         arguments,
                         thought_signature: None,
+                        namespace: None,
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -1840,6 +1842,9 @@ mod tests {
             stop_reason: StopReason::Pending,
             error_message: None,
             timestamp: 0,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
         }
     }
 

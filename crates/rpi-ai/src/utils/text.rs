@@ -95,6 +95,7 @@ mod tests {
                 name: "read".to_owned(),
                 arguments: serde_json::Map::new(),
                 thought_signature: None,
+                namespace: None,
             }),
             AssistantContent::Text(TextContent {
                 text: "y".to_owned(),
