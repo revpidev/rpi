@@ -8,8 +8,6 @@
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?logo=rust&logoColor=white)](./Cargo.toml)
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
-[![GitHub stars](https://img.shields.io/github/stars/revpidev/rpi)](https://github.com/revpidev/rpi)
-[![GitHub issues](https://img.shields.io/github/issues/revpidev/rpi)](https://github.com/revpidev/rpi)
 
 Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent](https://github.com/earendil-works/pi)：继承了 Pi 的架构，早期行为与上游保持对拍一致；但 rpi 是独立项目，后续发展可能与 Pi 产生偏差。编译产出为单个静态二进制，不依赖 Node、Python 或任何运行时。
 

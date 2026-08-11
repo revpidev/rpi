@@ -8,8 +8,6 @@
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?logo=rust&logoColor=white)](./Cargo.toml)
 [![Platform: Linux · macOS · Windows](https://img.shields.io/badge/Platform-Linux%C2%B7macOS%C2%B7Windows-lightgrey)]()
 [![Build](https://img.shields.io/github/actions/workflow/status/revpidev/rpi/build.yml)](https://github.com/revpidev/rpi/actions/workflows/build.yml)
-[![GitHub stars](https://img.shields.io/github/stars/revpidev/rpi)](https://github.com/revpidev/rpi)
-[![GitHub issues](https://img.shields.io/github/issues/revpidev/rpi)](https://github.com/revpidev/rpi)
 
 Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding agent](https://github.com/earendil-works/pi). It inherits Pi's architecture, and early behavior is kept in parity with upstream — but rpi is an independent project, and the two may diverge as it evolves. It compiles to a single static binary with no Node, Python, or other runtime dependency.
 
