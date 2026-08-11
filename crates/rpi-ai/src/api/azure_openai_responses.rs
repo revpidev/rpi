@@ -64,6 +64,7 @@ use crate::types::{
     AssistantMessage, Context, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Usage,
 };
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
@@ -386,6 +387,14 @@ pub fn build_params(
         }
     }
 
+    // 25a2c8dcf (#7568): merged last so custom keys override the named
+    // request fields.
+    if let Some(sampling_params) = &options.stream.sampling_params {
+        for (key, value) in sampling_params {
+            params[key.clone()] = value.clone();
+        }
+    }
+
     Ok(params)
 }
 
@@ -479,21 +488,11 @@ async fn run(
                 .headers(header_map.clone())
                 .json(&params);
             let signal = options.stream.signal.clone();
+            let fetch = options.stream.fetch.clone();
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -518,11 +517,7 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => Err(error.into_provider_error_info()),
                 }
             }
         },
@@ -1021,6 +1016,41 @@ mod tests {
     }
 
     // -- build_params ----------------------------------------------------------------
+
+    /// Upstream sampling-options.test.ts (25a2c8dcf @ 4181f66, #7568),
+    /// azure-openai-responses leg: sampling params merge last, overriding
+    /// named request fields.
+    #[test]
+    fn test_build_params_sampling_params_merged_last() {
+        let m = model(json!({"reasoning": false}));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+        let options = AzureOpenAIResponsesOptions {
+            stream: StreamOptions {
+                temperature: Some(0.0),
+                sampling_params: Some(
+                    [
+                        ("top_p".to_owned(), json!(0.95)),
+                        ("top_k".to_owned(), json!(0)),
+                        ("min_p".to_owned(), json!(0)),
+                        ("temperature".to_owned(), json!(1.0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..StreamOptions::default()
+            },
+            ..AzureOpenAIResponsesOptions::default()
+        };
+        let params = params_for(&m, &ctx, &options);
+        assert_eq!(params["top_p"], json!(0.95));
+        assert_eq!(params["top_k"], json!(0));
+        assert_eq!(params["min_p"], json!(0));
+        assert_eq!(params["temperature"], json!(1.0));
+
+        let plain = params_for(&m, &ctx, &AzureOpenAIResponsesOptions::default());
+        assert!(plain.get("top_p").is_none());
+        assert!(plain.get("temperature").is_none());
+    }
 
     #[test]
     fn test_build_params_minimal_key_order() {

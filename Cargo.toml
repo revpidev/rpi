@@ -38,6 +38,11 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# reqwest transitive deps promoted to direct (precedent: ring): the per-request
+# custom fetch channel (R2.7.4, T20) bridges `FetchResponse` back into
+# `reqwest::Response` via `http::Response` + `Body::wrap_stream`.
+http = "1"
+bytes = "1"
 jsonschema = "0.33"
 regex = "1"
 url = "2"

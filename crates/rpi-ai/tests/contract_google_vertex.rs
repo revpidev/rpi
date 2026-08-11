@@ -803,6 +803,63 @@ async fn test_error_flow_stream_ends_without_finish_reason() {
 }
 
 // ---------------------------------------------------------------------------
+// Retry wiring (b9d360a2c @ 4181f66, #7471; upstream blueprint
+// google-shared-retry.test.ts — the shared-helper intents are covered in
+// contract_google_generative_ai.rs): the initial Vertex request runs under
+// the shared provider retry policy, opt-in via `maxRetries`.
+// ---------------------------------------------------------------------------
+
+/// 429 before the first token is retried when `max_retries` is set.
+#[tokio::test]
+async fn test_vertex_retries_retryable_status_with_max_retries() {
+    let (base_url, mut rx) = serve(vec![
+        json_response(
+            429,
+            "{\"error\":{\"code\":429,\"message\":\"quota\",\"status\":\"RESOURCE_EXHAUSTED\"}}",
+        ),
+        sse(VERTEX_TEXT_SSE),
+    ])
+    .await;
+    let mut options = api_key_options();
+    options.max_retries = Some(1);
+    let events = collect(stream(
+        &model(&base_url),
+        &context(vec![user_text("hi")]),
+        vertex_options(options),
+    ))
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "expected done after retry, got {events:?}"
+    );
+    assert!(rx.recv().await.is_some(), "first request");
+    assert!(rx.recv().await.is_some(), "retried request");
+}
+
+/// A non-retryable status is terminal even with `max_retries` set.
+#[tokio::test]
+async fn test_vertex_does_not_retry_non_retryable_status() {
+    let (base_url, mut rx) = serve(vec![json_response(
+        400,
+        "{\"error\":{\"code\":400,\"message\":\"Invalid JSON payload\",\"status\":\"INVALID_ARGUMENT\"}}",
+    )])
+    .await;
+    let mut options = api_key_options();
+    options.max_retries = Some(2);
+    let events = collect(stream(
+        &model(&base_url),
+        &context(vec![user_text("hi")]),
+        vertex_options(options),
+    ))
+    .await;
+
+    assert_eq!(event_kinds(&events), ["error"]);
+    assert!(rx.recv().await.is_some(), "first request");
+    assert!(rx.recv().await.is_none(), "400 is not in the retryable set");
+}
+
+// ---------------------------------------------------------------------------
 // Raw stop reasons (google-raw-stop-reason.test.ts: 23cb385b6, text unified
 // by 5a2539a7b @ 4181f66)
 // ---------------------------------------------------------------------------

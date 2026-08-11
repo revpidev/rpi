@@ -44,7 +44,8 @@ use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses::{apply_service_tier_pricing, OPENAI_TOOL_CALL_PROVIDERS};
 use crate::api::openai_responses_shared::{
     convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
+    ConvertResponsesToolsOptions, ResponsesDeferredToolsMode, ResponsesStreamOptions,
+    ResponsesStreamProcessor,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
@@ -55,6 +56,7 @@ use crate::types::{
     ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, Transport,
     Usage,
 };
+use crate::utils::custom_fetch::{send_provider_request, SendFailure};
 use crate::utils::deferred_tools::split_deferred_tools_identity;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::headers_to_record;
@@ -427,10 +429,22 @@ pub fn build_request_body(
     let supports_open_ai_grammar_tools = compat
         .and_then(|compat| compat.supports_open_ai_grammar_tools)
         .unwrap_or(false);
-    let supports_tool_search = compat
+    // e47b8e37a (#7709): `supportsAdditionalTools` wins over
+    // `supportsToolSearch`; neither means deferred tools are not split out.
+    let deferred_tools_mode = if compat
+        .and_then(|compat| compat.supports_additional_tools)
+        .unwrap_or(false)
+    {
+        Some(ResponsesDeferredToolsMode::AdditionalTools)
+    } else if compat
         .and_then(|compat| compat.supports_tool_search)
-        .unwrap_or(false);
-    let tool_placement = split_deferred_tools_identity(context, supports_tool_search);
+        .unwrap_or(false)
+    {
+        Some(ResponsesDeferredToolsMode::ToolSearch)
+    } else {
+        None
+    };
+    let tool_placement = split_deferred_tools_identity(context, deferred_tools_mode.is_some());
     let tool_options = ConvertResponsesToolsOptions {
         strict: None,
         supports_strict_mode: Some(supports_strict_mode),
@@ -445,6 +459,7 @@ pub fn build_request_body(
             include_system_prompt: false,
             grammar_tool_input_properties: Some(grammar_tool_input_properties),
             deferred_tools: Some(&tool_placement.deferred),
+            deferred_tools_mode,
             tool_options: tool_options.clone(),
         },
     )?;
@@ -579,7 +594,15 @@ fn is_terminal_event(event: &Value) -> bool {
 /// One iteration of the upstream `mapCodexEvents` generator: `Ok(Some(event))`
 /// to forward (terminal events normalized to `response.completed`),
 /// `Ok(None)` to skip, `Err` for `error` / `response.failed` events.
-fn map_codex_event(event: &Value) -> Result<Option<Value>, CodexError> {
+///
+/// c3e7bc60a (#7766): a boolean `response.end_turn` on terminal events is
+/// preserved into `end_turn` (upstream writes `output.endTurn`; the borrow of
+/// `output` sits with the stream processor here, so the value is handed out
+/// through `end_turn` and assigned by the caller).
+fn map_codex_event(
+    event: &Value,
+    end_turn: &mut Option<bool>,
+) -> Result<Option<Value>, CodexError> {
     let Some(event_type) = event.get("type").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -619,6 +642,14 @@ fn map_codex_event(event: &Value) -> Result<Option<Value>, CodexError> {
         event_type,
         "response.done" | "response.completed" | "response.incomplete"
     ) {
+        // c3e7bc60a: `typeof response?.end_turn === "boolean"` → output.endTurn.
+        if let Some(value) = event
+            .get("response")
+            .and_then(|response| response.get("end_turn"))
+            .and_then(Value::as_bool)
+        {
+            *end_turn = Some(value);
+        }
         let mut mapped = event.clone();
         if let Some(object) = mapped.as_object_mut() {
             object.insert("type".to_owned(), json!("response.completed"));
@@ -708,8 +739,8 @@ fn get_cached_websocket_input_delta(
 
 /// `buildCachedWebSocketRequestBody`: on baseline mismatch or a missing
 /// response id the continuation is cleared and the full body is sent.
-fn build_cached_websocket_request_body(session_id: &str, body: &Value) -> Value {
-    let Some(continuation) = ws_cache::continuation_for(session_id) else {
+fn build_cached_websocket_request_body(session_id: &str, account_id: &str, body: &Value) -> Value {
+    let Some(continuation) = ws_cache::continuation_for(session_id, account_id) else {
         return body.clone();
     };
     let delta = get_cached_websocket_input_delta(body, &continuation);
@@ -726,7 +757,7 @@ fn build_cached_websocket_request_body(session_id: &str, body: &Value) -> Value 
             Value::Object(request)
         }
         _ => {
-            ws_cache::set_continuation(session_id, None);
+            ws_cache::set_continuation(session_id, account_id, None);
             body.clone()
         }
     }
@@ -941,6 +972,7 @@ async fn process_websocket_stream(
     idle_timeout_ms: Option<u64>,
     websocket_connect_timeout_ms: Option<u64>,
     cache_session_id: Option<&str>,
+    account_id: &str,
     grammar_tool_input_properties: &HashMap<String, String>,
     options: &OpenAiCodexResponsesOptions,
 ) -> Result<(), CodexError> {
@@ -951,6 +983,7 @@ async fn process_websocket_stream(
         cache_key,
     } = ws_cache::acquire(
         cache_session_id,
+        account_id,
         url,
         headers,
         websocket_connect_timeout_ms,
@@ -965,7 +998,9 @@ async fn process_websocket_stream(
     // still works via connection-scoped previous_response_id state.
     let full_body = body.clone();
     let request_body = match (use_cached_context, &cache_key) {
-        (true, Some(session_id)) => build_cached_websocket_request_body(session_id, &full_body),
+        (true, Some((session_id, account_id))) => {
+            build_cached_websocket_request_body(session_id, account_id, &full_body)
+        }
         _ => full_body.clone(),
     };
 
@@ -1012,6 +1047,7 @@ async fn process_websocket_stream(
         let model_id = model.id.clone();
         let mut started = false;
         let start_partial = output.clone();
+        let mut codex_end_turn: Option<bool> = None;
         {
             let mut processor = ResponsesStreamProcessor::new(
                 &mut *output,
@@ -1026,7 +1062,7 @@ async fn process_websocket_stream(
                 },
             );
             let mut on_event = |event: Value| -> Result<bool, CodexError> {
-                let Some(mapped) = map_codex_event(&event)? else {
+                let Some(mapped) = map_codex_event(&event, &mut codex_end_turn)? else {
                     return Ok(false);
                 };
                 // `startWebSocketOutputOnFirstEvent`: the start event fires on
@@ -1056,6 +1092,10 @@ async fn process_websocket_stream(
             )
             .await?;
         }
+        // c3e7bc60a: assigned after the processor releases its `output` borrow.
+        if let Some(end_turn) = codex_end_turn {
+            output.end_turn = Some(end_turn);
+        }
 
         if options
             .stream
@@ -1066,7 +1106,7 @@ async fn process_websocket_stream(
             keep_connection = false;
         } else if use_cached_context && cache_key.is_some() && output.response_id.is_some() {
             // invariant: checked is_some() above
-            let session_id = cache_key.clone().unwrap();
+            let (session_id, account_id) = cache_key.clone().unwrap();
             let response_context = Context {
                 system_prompt: None,
                 messages: vec![Message::Assistant(output.clone())],
@@ -1093,6 +1133,7 @@ async fn process_websocket_stream(
             .collect();
             ws_cache::set_continuation(
                 &session_id,
+                &account_id,
                 Some(ws_cache::CachedWebSocketContinuationState {
                     last_request_body: full_body.clone(),
                     // invariant: checked is_some() above
@@ -1106,8 +1147,8 @@ async fn process_websocket_stream(
     .await;
 
     if result.is_err() {
-        if let Some(session_id) = &cache_key {
-            ws_cache::set_continuation(session_id, None);
+        if let Some((session_id, account_id)) = &cache_key {
+            ws_cache::set_continuation(session_id, account_id, None);
         }
         keep_connection = false;
     }
@@ -1207,6 +1248,7 @@ async fn run(
                 http_timeout_ms,
                 websocket_connect_timeout_ms,
                 cache_session_id,
+                &account_id,
                 &grammar_tool_input_properties,
                 options,
             )
@@ -1285,23 +1327,22 @@ async fn run(
             let header_timeout = http_timeout_ms.filter(|timeout| *timeout > 0);
             deadline = header_timeout
                 .map(|timeout| tokio::time::Instant::now() + Duration::from_millis(timeout));
-            let send = client
-                .post(&url)
-                .headers(sse_header_map.clone())
-                .body(sse_body.clone())
-                .send();
+            // 027a58479 (R2.7.4): `(options?.fetch ?? globalThis.fetch)` — the
+            // custom fetch channel applies to this SSE HTTP request only; the
+            // WebSocket transport above is unaffected (types.ts fetch doc).
+            let send = send_provider_request(
+                client
+                    .post(&url)
+                    .headers(sse_header_map.clone())
+                    .body(sse_body.clone()),
+                options.stream.fetch.as_ref(),
+                signal.as_ref(),
+            );
             let send_future = async {
-                match &signal {
-                    Some(signal) => {
-                        tokio::select! {
-                            outcome = send => outcome.map_err(|error| CodexError::Transport(error.to_string())),
-                            () = signal.cancelled() => Err(CodexError::Aborted),
-                        }
-                    }
-                    None => send
-                        .await
-                        .map_err(|error| CodexError::Transport(error.to_string())),
-                }
+                send.await.map_err(|error| match error {
+                    SendFailure::Aborted => CodexError::Aborted,
+                    other => CodexError::Transport(other.message()),
+                })
             };
             let http_response = match header_timeout {
                 Some(timeout) => {
@@ -1408,6 +1449,7 @@ async fn run(
     let mut decoder = SseDecoder::new();
     let mut byte_stream = response.bytes_stream();
     let mut terminal_seen = false;
+    let mut codex_end_turn: Option<bool> = None;
     'body: loop {
         if aborted() {
             return Err(CodexError::Aborted);
@@ -1432,7 +1474,7 @@ async fn run(
             let event: Value = serde_json::from_str(data).map_err(|error| {
                 CodexError::Protocol(format!("Invalid Codex SSE JSON: {error}"))
             })?;
-            let Some(mapped) = map_codex_event(&event)? else {
+            let Some(mapped) = map_codex_event(&event, &mut codex_end_turn)? else {
                 continue;
             };
             terminal_seen = is_terminal_event(&mapped);
@@ -1455,7 +1497,7 @@ async fn run(
             let event: Value = serde_json::from_str(data).map_err(|error| {
                 CodexError::Protocol(format!("Invalid Codex SSE JSON: {error}"))
             })?;
-            let Some(mapped) = map_codex_event(&event)? else {
+            let Some(mapped) = map_codex_event(&event, &mut codex_end_turn)? else {
                 continue;
             };
             terminal_seen = is_terminal_event(&mapped);
@@ -1471,6 +1513,10 @@ async fn run(
     // processor's terminal-event check (`finish`) is intentionally not called:
     // upstream Codex relies on `assertSuccessfulOutput` instead.
     drop(processor);
+    // c3e7bc60a: preserve `response.end_turn` for debugging.
+    if let Some(end_turn) = codex_end_turn {
+        output.end_turn = Some(end_turn);
+    }
 
     if aborted() {
         return Err(CodexError::Aborted);
@@ -1786,25 +1832,34 @@ mod tests {
 
     #[test]
     fn test_map_codex_event_error_and_failed() {
-        let error = map_codex_event(&json!({
-            "type": "error",
-            "error": {"code": "some_code", "message": "boom"}
-        }));
+        let error = map_codex_event(
+            &json!({
+                "type": "error",
+                "error": {"code": "some_code", "message": "boom"}
+            }),
+            &mut None,
+        );
         assert!(
             matches!(&error, Err(CodexError::Api { message, code }) if message == "Codex error: boom" && code.as_deref() == Some("some_code")),
             "{error:?}"
         );
 
-        let error = map_codex_event(&json!({
-            "type": "response.failed",
-            "response": {"error": {"code": "dead", "message": "it failed"}}
-        }));
+        let error = map_codex_event(
+            &json!({
+                "type": "response.failed",
+                "response": {"error": {"code": "dead", "message": "it failed"}}
+            }),
+            &mut None,
+        );
         assert!(
             matches!(&error, Err(CodexError::Api { message, code }) if message == "it failed" && code.as_deref() == Some("dead")),
             "{error:?}"
         );
 
-        let error = map_codex_event(&json!({"type": "response.failed", "response": {}}));
+        let error = map_codex_event(
+            &json!({"type": "response.failed", "response": {}}),
+            &mut None,
+        );
         assert!(
             matches!(&error, Err(CodexError::Api { message, .. }) if message == "Codex response failed"),
             "{error:?}"
@@ -1814,10 +1869,13 @@ mod tests {
     #[test]
     fn test_map_codex_event_terminal_normalization() {
         for event_type in ["response.done", "response.completed", "response.incomplete"] {
-            let mapped = map_codex_event(&json!({
-                "type": event_type,
-                "response": {"id": "resp_1", "status": "completed"}
-            }))
+            let mapped = map_codex_event(
+                &json!({
+                    "type": event_type,
+                    "response": {"id": "resp_1", "status": "completed"}
+                }),
+                &mut None,
+            )
             .expect("ok")
             .expect("event");
             assert_eq!(mapped["type"], json!("response.completed"));
@@ -1825,20 +1883,76 @@ mod tests {
             assert!(is_terminal_event(&mapped));
         }
         // Unknown status is dropped (upstream `normalizeCodexStatus` → undefined).
-        let mapped = map_codex_event(&json!({
-            "type": "response.completed",
-            "response": {"id": "resp_1", "status": "bogus"}
-        }))
+        let mapped = map_codex_event(
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "bogus"}
+            }),
+            &mut None,
+        )
         .expect("ok")
         .expect("event");
         assert!(mapped["response"].get("status").is_none());
 
         // Non-terminal events pass through; typeless events are skipped.
-        let passthrough = map_codex_event(&json!({"type": "codex.rate_limits", "x": 1}))
+        let passthrough = map_codex_event(&json!({"type": "codex.rate_limits", "x": 1}), &mut None)
             .expect("ok")
             .expect("event");
         assert_eq!(passthrough["type"], json!("codex.rate_limits"));
-        assert!(map_codex_event(&json!({"x": 1})).expect("ok").is_none());
+        assert!(map_codex_event(&json!({"x": 1}), &mut None)
+            .expect("ok")
+            .is_none());
+    }
+
+    /// c3e7bc60a @ 4181f66 (#7766): a boolean `response.end_turn` on
+    /// `response.done` / `.completed` / `.incomplete` is preserved for
+    /// debugging; non-boolean or absent values leave it unset.
+    #[test]
+    fn test_map_codex_event_end_turn() {
+        for event_type in ["response.done", "response.completed", "response.incomplete"] {
+            let mut end_turn = None;
+            map_codex_event(
+                &json!({
+                    "type": event_type,
+                    "response": {"id": "resp_1", "status": "completed", "end_turn": false}
+                }),
+                &mut end_turn,
+            )
+            .expect("ok");
+            assert_eq!(end_turn, Some(false), "{event_type}");
+        }
+        // A true value is preserved as-is.
+        let mut end_turn = None;
+        map_codex_event(
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "completed", "end_turn": true}
+            }),
+            &mut end_turn,
+        )
+        .expect("ok");
+        assert_eq!(end_turn, Some(true));
+
+        // Absent or non-boolean `end_turn` is ignored.
+        let mut end_turn = None;
+        map_codex_event(
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "completed"}
+            }),
+            &mut end_turn,
+        )
+        .expect("ok");
+        assert_eq!(end_turn, None);
+        map_codex_event(
+            &json!({
+                "type": "response.completed",
+                "response": {"id": "resp_1", "status": "completed", "end_turn": "yes"}
+            }),
+            &mut end_turn,
+        )
+        .expect("ok");
+        assert_eq!(end_turn, None);
     }
 
     // -- Cached input deltas -------------------------------------------------------
@@ -1970,6 +2084,78 @@ mod tests {
             body["reasoning"],
             json!({"effort": "none", "summary": "detailed"})
         );
+    }
+
+    /// e47b8e37a @ 4181f66 (#7709), upstream deferred-tools.test.ts "selects
+    /// additional tools, tool search, or top-level tools for Codex models"
+    /// (compat flags inlined; the catalog entries are T26 scope).
+    #[test]
+    fn test_build_request_body_deferred_tools_mode_selection() {
+        let ctx = || {
+            common::context(
+                vec![
+                    common::same_model_assistant(json!([
+                        {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
+                    ])),
+                    common::tool_result(
+                        "call_1|fc_1",
+                        json!([{"type": "text", "text": "ok"}]),
+                        json!({"addedToolNames": ["late_tool"]}),
+                    ),
+                ],
+                Some(vec![common::tool("base_tool"), common::tool("late_tool")]),
+            )
+        };
+        let options = OpenAiCodexResponsesOptions::default();
+        let top_level_names = |body: &Value| -> Vec<String> {
+            body["tools"]
+                .as_array()
+                .expect("tools")
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        // supportsAdditionalTools (GPT-5.6 family): message-anchored
+        // additional_tools, no tool-search pair.
+        let m = model(json!({
+            "compat": {"supportsOpenAIGrammarTools": true, "supportsAdditionalTools": true}
+        }));
+        let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
+        assert_eq!(top_level_names(&body), vec!["base_tool"]);
+        let input = body["input"].as_array().expect("input");
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == json!("additional_tools")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_output")));
+
+        // supportsToolSearch only: the client tool-search pair.
+        let m = model(json!({
+            "compat": {"supportsOpenAIGrammarTools": true, "supportsToolSearch": true}
+        }));
+        let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
+        assert_eq!(top_level_names(&body), vec!["base_tool"]);
+        let input = body["input"].as_array().expect("input");
+        assert!(input
+            .iter()
+            .any(|item| item["type"] == json!("tool_search_output")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("additional_tools")));
+
+        // Neither (gpt-5.3-codex-spark shape): every tool stays top-level.
+        let m = model(json!({"compat": {"supportsOpenAIGrammarTools": true}}));
+        let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
+        assert_eq!(top_level_names(&body), vec!["base_tool", "late_tool"]);
+        let input = body["input"].as_array().expect("input");
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("additional_tools")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_output")));
     }
 
     // -- Error parsing -------------------------------------------------------------

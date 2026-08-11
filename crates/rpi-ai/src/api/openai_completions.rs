@@ -45,7 +45,7 @@ use crate::api::constrained_sampling::{
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::lazy::immediate_error_stream;
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
-use crate::api::simple_options::build_base_options;
+use crate::api::simple_options::{build_base_options, MIN_ANSWER_TOKENS};
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
@@ -53,10 +53,11 @@ use crate::types::{
     ChatTemplateKwargVarKind, Context, DeferredToolsMode, DoneReason, ErrorReason, InputModality,
     MaxTokensField, Message, Model, ModelThinkingLevel, OpenRouterRouting, ProviderHeaders,
     ProviderResponse, Role, SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, TextContent, ThinkingContent, ThinkingFormat, Tool, ToolCall, ToolResultContent,
-    Usage, UserContent, UserContentBlock, VercelGatewayRouting,
+    StreamOptions, TextContent, ThinkingBudgets, ThinkingContent, ThinkingFormat, Tool, ToolCall,
+    ToolResultContent, Usage, UserContent, UserContentBlock, VercelGatewayRouting,
 };
 use crate::utils::cost::calculate_cost;
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
@@ -83,6 +84,9 @@ pub struct OpenAICompletionsOptions {
     pub stream: StreamOptions,
     pub reasoning_effort: Option<ModelThinkingLevel>,
     pub tool_choice: Option<Value>,
+    /// Token budgets per thinking level. Only used when
+    /// `compat.supports_thinking_token_budget` is set (d07889da0).
+    pub thinking_budgets: Option<ThinkingBudgets>,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +193,13 @@ pub struct ResolvedOpenAICompletionsCompat {
     pub open_router_routing: OpenRouterRouting,
     pub vercel_gateway_routing: VercelGatewayRouting,
     pub chat_template_kwargs: std::collections::BTreeMap<String, ChatTemplateKwargValue>,
+    /// d07889da0-era field (Baseten provider commit c1019d920): threaded
+    /// through `detectCompat`/`getCompat`; the `baseten` thinking branch that
+    /// consumes it is T26 scope.
+    pub chat_template_args: std::collections::BTreeMap<String, ChatTemplateKwargValue>,
     pub zai_tool_stream: bool,
+    /// d07889da0 (#7638): vLLM top-level `thinking_token_budget` opt-in.
+    pub supports_thinking_token_budget: bool,
     pub supports_strict_mode: bool,
     pub supports_open_ai_grammar_tools: bool,
     pub cache_control_format: Option<CacheControlFormat>,
@@ -240,15 +250,22 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         || is_cloudflare_ai_gateway
         || is_ant_ling;
 
+    // c185d4123: DeepSeek endpoints take `max_tokens`, not
+    // `max_completion_tokens` (declared before `use_max_tokens`, upstream
+    // declaration order).
+    let is_deepseek = provider == "deepseek" || base_url.contains("deepseek.com");
+    // 2fe21b407 (#7174) + c185d4123: Z.AI and DeepSeek join the `max_tokens`
+    // list (both ignore `max_completion_tokens`).
     let use_max_tokens = base_url.contains("chutes.ai")
+        || is_deepseek
         || is_moonshot
         || is_cloudflare_ai_gateway
         || is_together
         || is_nvidia
-        || is_ant_ling;
+        || is_ant_ling
+        || is_zai;
 
     let is_grok = provider == "xai" || base_url.contains("api.x.ai");
-    let is_deepseek = provider == "deepseek" || base_url.contains("deepseek.com");
     let is_openrouter_developer_role_model =
         is_openrouter && (model.id.starts_with("anthropic/") || model.id.starts_with("openai/"));
     let cache_control_format = if provider == "openrouter" && model.id.starts_with("anthropic/") {
@@ -295,7 +312,9 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         open_router_routing: OpenRouterRouting::default(),
         vercel_gateway_routing: VercelGatewayRouting::default(),
         chat_template_kwargs: Default::default(),
+        chat_template_args: Default::default(),
         zai_tool_stream: false,
+        supports_thinking_token_budget: false,
         supports_strict_mode: !is_moonshot
             && !is_together
             && !is_cloudflare_ai_gateway
@@ -362,7 +381,14 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
             .chat_template_kwargs
             .clone()
             .unwrap_or(detected.chat_template_kwargs),
+        chat_template_args: compat
+            .chat_template_args
+            .clone()
+            .unwrap_or(detected.chat_template_args),
         zai_tool_stream: compat.zai_tool_stream.unwrap_or(detected.zai_tool_stream),
+        supports_thinking_token_budget: compat
+            .supports_thinking_token_budget
+            .unwrap_or(detected.supports_thinking_token_budget),
         supports_strict_mode: compat
             .supports_strict_mode
             .unwrap_or(detected.supports_strict_mode),
@@ -1185,6 +1211,55 @@ pub fn build_params(
 
     apply_thinking_params(&mut params, model, options.reasoning_effort, compat);
 
+    // d07889da0 (#7638): vLLM caps reasoning with a top-level
+    // `thinking_token_budget`. Independent of thinkingFormat: the same server
+    // can serve zai, qwen or chat-template models. Reasoning and the answer
+    // share max_tokens here, so an uncapped reasoning phase can consume the
+    // whole response and leave no answer and no tool call.
+    if compat.supports_thinking_token_budget && model.reasoning {
+        if let Some(effort) = options.reasoning_effort {
+            // `clampReasoning`: xhigh/max use the high budget.
+            let level = match effort {
+                ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max => ModelThinkingLevel::High,
+                other => other,
+            };
+            let defaults = ThinkingBudgets {
+                minimal: Some(1024),
+                low: Some(2048),
+                medium: Some(8192),
+                high: Some(16384),
+            };
+            let budget_for = |budgets: &ThinkingBudgets| match level {
+                ModelThinkingLevel::Minimal => budgets.minimal,
+                ModelThinkingLevel::Low => budgets.low,
+                ModelThinkingLevel::Medium => budgets.medium,
+                ModelThinkingLevel::High => budgets.high,
+                // Off is not a valid upstream `reasoningEffort`; xhigh/max
+                // were clamped above.
+                _ => None,
+            };
+            let level_budget = options
+                .thinking_budgets
+                .as_ref()
+                .and_then(budget_for)
+                .or_else(|| budget_for(&defaults));
+            if let Some(level_budget) = level_budget {
+                let ceiling = params
+                    .get("max_tokens")
+                    .or_else(|| params.get("max_completion_tokens"))
+                    .and_then(json_u64)
+                    .unwrap_or(u64::from(model.max_tokens));
+                // Always leave room for the answer, otherwise the budget
+                // recreates the bug it prevents.
+                let budget = u64::from(level_budget)
+                    .min(ceiling.saturating_sub(u64::from(MIN_ANSWER_TOKENS)));
+                if budget > 0 {
+                    params.insert("thinking_token_budget".to_owned(), json!(budget));
+                }
+            }
+        }
+    }
+
     // OpenRouter provider routing preferences (read from model.compat
     // directly, like upstream — not from the resolved compat).
     if let Some(routing) = model
@@ -1213,6 +1288,14 @@ pub fn build_params(
                 "providerOptions".to_owned(),
                 json!({"gateway": Value::Object(gateway)}),
             );
+        }
+    }
+
+    // 25a2c8dcf (#7568): merged last so custom keys override the named
+    // request fields.
+    if let Some(sampling_params) = &options.stream.sampling_params {
+        for (key, value) in sampling_params {
+            params.insert(key.clone(), value.clone());
         }
     }
 
@@ -1248,6 +1331,17 @@ fn apply_thinking_params(
             "enable_thinking".to_owned(),
             json!(reasoning_effort.is_some()),
         );
+        // 4c1a0b92e (#6998/#6951): qwen thinking models also take
+        // `reasoning_effort` (mapped through thinkingLevelMap, JS `??`
+        // semantics) when the provider supports it.
+        if let Some(effort) = reasoning_effort {
+            if compat.supports_reasoning_effort {
+                params.insert(
+                    "reasoning_effort".to_owned(),
+                    json!(mapped_or_level_name(model, effort)),
+                );
+            }
+        }
     } else if compat.thinking_format == ThinkingFormat::QwenChatTemplate && model.reasoning {
         params.insert(
             "chat_template_kwargs".to_owned(),
@@ -2198,21 +2292,11 @@ async fn run(
         || {
             let request = client.post(&url).headers(header_map.clone()).json(&params);
             let signal = options.stream.signal.clone();
+            let fetch = options.stream.fetch.clone();
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -2255,11 +2339,7 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => Err(error.into_provider_error_info()),
                 }
             }
         },
@@ -2400,6 +2480,7 @@ pub fn stream_simple(
             stream: base,
             reasoning_effort,
             tool_choice: None,
+            thinking_budgets: options.and_then(|o| o.thinking_budgets),
         },
     )
 }
@@ -2571,11 +2652,14 @@ pub(crate) mod tests {
         assert!(!compat.supports_store);
         assert!(!compat.supports_reasoning_effort);
         assert!(!compat.supports_developer_role);
+        // 2fe21b407 (#7174): Z.AI ignores `max_completion_tokens`.
+        assert_eq!(compat.max_tokens_field, MaxTokensField::MaxTokens);
         // baseUrl-only detection works too.
         let by_url = detect_compat(&make_model(
             json!({"baseUrl": "https://api.z.ai/api/paas/v4"}),
         ));
         assert_eq!(by_url.thinking_format, ThinkingFormat::Zai);
+        assert_eq!(by_url.max_tokens_field, MaxTokensField::MaxTokens);
     }
 
     #[test]
@@ -2626,6 +2710,12 @@ pub(crate) mod tests {
         assert!(!compat.supports_store);
         // deepseek is not in the reasoning-effort exclusion list.
         assert!(compat.supports_reasoning_effort);
+        // c185d4123: DeepSeek APIs take `max_tokens`.
+        assert_eq!(compat.max_tokens_field, MaxTokensField::MaxTokens);
+        let by_url = detect_compat(&make_model(json!({
+            "provider": "custom", "baseUrl": "https://api.deepseek.com/v1"
+        })));
+        assert_eq!(by_url.max_tokens_field, MaxTokensField::MaxTokens);
     }
 
     #[test]
@@ -3583,6 +3673,205 @@ mod build_and_stream_tests {
         assert!(params.get("max_completion_tokens").is_none());
     }
 
+    /// Upstream: "sends max_tokens for built-in and custom DeepSeek API
+    /// models" (c185d4123 @ 4181f66; runtime detection half — the catalog
+    /// `maxTokensField` entries are T26) and "sends max_tokens for Z.AI
+    /// completions models" (2fe21b407, #7174). `maxTokens: 123` mirrors the
+    /// upstream assertion value.
+    #[test]
+    fn test_build_params_max_tokens_field_deepseek_zai() {
+        let ctx = context(vec![user_text("hi")], None);
+        let opts = options(StreamOptions {
+            max_tokens: Some(123),
+            ..StreamOptions::default()
+        });
+        let cases = [
+            // Native provider id.
+            json!({"provider": "deepseek", "baseUrl": "https://api.deepseek.com"}),
+            // Custom provider whose baseUrl points at DeepSeek.
+            json!({"provider": "custom-deepseek", "baseUrl": "https://api.deepseek.com"}),
+            json!({"provider": "zai"}),
+            json!({"provider": "zai-coding-cn", "baseUrl": "https://open.bigmodel.cn/api/paas/v4"}),
+            json!({"provider": "custom-zai", "baseUrl": "https://api.z.ai/api/paas/v4"}),
+        ];
+        for extra in cases {
+            let model = make_model(extra);
+            let params = params_for(&model, &ctx, &opts, CacheRetention::Short);
+            assert_eq!(params["max_tokens"], json!(123), "model: {}", model.id);
+            assert!(
+                params.get("max_completion_tokens").is_none(),
+                "model: {}",
+                model.id
+            );
+        }
+    }
+
+    /// Upstream sampling-options.test.ts (25a2c8dcf @ 4181f66, #7568):
+    /// "merges stream-option sampling params into the request body" +
+    /// "overrides named request fields" (sampling params merge last, so their
+    /// keys win over named parameters like `temperature`). The model-level →
+    /// request-level merge half lives in simple_options.rs tests.
+    #[test]
+    fn test_build_params_sampling_params_merged_last() {
+        let ctx = context(vec![user_text("hi")], None);
+        let mut opts = options(StreamOptions {
+            temperature: Some(0.0),
+            sampling_params: Some(
+                [
+                    ("top_p".to_owned(), json!(0.95)),
+                    ("top_k".to_owned(), json!(0)),
+                    ("min_p".to_owned(), json!(0)),
+                    ("temperature".to_owned(), json!(1.0)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..StreamOptions::default()
+        });
+        opts.tool_choice = None;
+        let model = make_model(json!({}));
+        let params = params_for(&model, &ctx, &opts, CacheRetention::Short);
+        assert_eq!(params["top_p"], json!(0.95));
+        assert_eq!(params["top_k"], json!(0));
+        assert_eq!(params["min_p"], json!(0));
+        // Custom keys override the named request fields.
+        assert_eq!(params["temperature"], json!(1.0));
+
+        // Without sampling params nothing extra appears (upstream "omits
+        // sampling params when neither options nor model set them").
+        let plain = params_for(
+            &model,
+            &ctx,
+            &options(StreamOptions::default()),
+            CacheRetention::Short,
+        );
+        assert!(plain.get("top_p").is_none());
+        assert!(plain.get("temperature").is_none());
+    }
+
+    /// Upstream openai-completions-thinking-token-budget.test.ts (d07889da0
+    /// @ 4181f66, #7638): vLLM `thinking_token_budget` levels, clamps, and
+    /// the MIN_ANSWER_TOKENS = 1024 reserve.
+    #[test]
+    fn test_build_params_thinking_token_budget() {
+        let ctx = context(vec![user_text("hi")], None);
+        // vLLM-served reasoning model: reasoning and the answer share
+        // max_tokens (upstream `vllmModel`).
+        let vllm = make_model(json!({
+            "id": "zai-org/glm-5.2",
+            "provider": "local-vllm",
+            "baseUrl": "http://localhost:8000/v1",
+            "maxTokens": 16384,
+            "compat": {"thinkingFormat": "zai", "supportsThinkingTokenBudget": true}
+        }));
+        let with_effort =
+            |effort: ModelThinkingLevel, budgets: ThinkingBudgets, max_tokens: Option<u32>| {
+                OpenAICompletionsOptions {
+                    stream: StreamOptions {
+                        max_tokens,
+                        ..StreamOptions::default()
+                    },
+                    reasoning_effort: Some(effort),
+                    tool_choice: None,
+                    thinking_budgets: Some(budgets),
+                }
+            };
+        let no_budgets = ThinkingBudgets::default();
+
+        // "sends the configured budget for the requested level".
+        let params = params_for(
+            &vllm,
+            &ctx,
+            &with_effort(
+                ModelThinkingLevel::Medium,
+                ThinkingBudgets {
+                    medium: Some(4096),
+                    ..ThinkingBudgets::default()
+                },
+                None,
+            ),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["thinking_token_budget"], json!(4096));
+
+        // "omits the budget when the compat flag is not set".
+        let no_flag = make_model(json!({
+            "id": "zai-org/glm-5.2",
+            "provider": "local-vllm",
+            "baseUrl": "http://localhost:8000/v1",
+            "maxTokens": 16384,
+            "compat": {"thinkingFormat": "zai"}
+        }));
+        let params = params_for(
+            &no_flag,
+            &ctx,
+            &with_effort(
+                ModelThinkingLevel::Medium,
+                ThinkingBudgets {
+                    medium: Some(4096),
+                    ..ThinkingBudgets::default()
+                },
+                None,
+            ),
+            CacheRetention::Short,
+        );
+        assert!(params.get("thinking_token_budget").is_none());
+
+        // "omits the budget when thinking is off".
+        let mut opts = options(StreamOptions::default());
+        opts.thinking_budgets = Some(ThinkingBudgets {
+            high: Some(8192),
+            ..ThinkingBudgets::default()
+        });
+        let params = params_for(&vllm, &ctx, &opts, CacheRetention::Short);
+        assert!(params.get("thinking_token_budget").is_none());
+
+        // "clamps xhigh and max to the high budget".
+        for level in [ModelThinkingLevel::Xhigh, ModelThinkingLevel::Max] {
+            let params = params_for(
+                &vllm,
+                &ctx,
+                &with_effort(
+                    level,
+                    ThinkingBudgets {
+                        high: Some(8192),
+                        ..ThinkingBudgets::default()
+                    },
+                    None,
+                ),
+                CacheRetention::Short,
+            );
+            assert_eq!(params["thinking_token_budget"], json!(8192), "{level:?}");
+        }
+
+        // "leaves room for the answer when the budget meets the response
+        // ceiling": default high budget (16384) equals the model ceiling.
+        let params = params_for(
+            &vllm,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High, no_budgets, None),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["thinking_token_budget"], json!(16384 - 1024));
+
+        // "uses the caller max_tokens as the ceiling when it is lower than
+        // the model cap".
+        let params = params_for(
+            &vllm,
+            &ctx,
+            &with_effort(
+                ModelThinkingLevel::High,
+                ThinkingBudgets {
+                    high: Some(8192),
+                    ..ThinkingBudgets::default()
+                },
+                Some(4096),
+            ),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["thinking_token_budget"], json!(4096 - 1024));
+    }
+
     #[test]
     fn test_build_params_tools_and_tool_stream() {
         let ctx = context(vec![user_text("hi")], Some(vec![tool("bash")]));
@@ -3619,6 +3908,85 @@ mod build_and_stream_tests {
         assert_eq!(params["tool_choice"], json!("required"));
     }
 
+    /// Upstream qwen-token-plan-models.test.ts (4c1a0b92e @ 4181f66,
+    /// #6998/#6951), runtime half (catalog assertions are T26): "sends Qwen
+    /// thinking fields", "sends Qwen reasoning_effort", "sends qwen3.8 max
+    /// reasoning_effort".
+    #[test]
+    fn test_build_params_qwen_reasoning_effort() {
+        let ctx = context(vec![user_text("hi")], None);
+        let with_effort = |effort: ModelThinkingLevel| OpenAICompletionsOptions {
+            stream: StreamOptions::default(),
+            reasoning_effort: Some(effort),
+            tool_choice: None,
+            thinking_budgets: None,
+        };
+
+        // Token-plan thinking models: high/max mapped, the rest null.
+        let qwen = make_model(json!({
+            "provider": "qwen-token-plan",
+            "compat": {"thinkingFormat": "qwen"},
+            "thinkingLevelMap": {"minimal": null, "low": null, "medium": null, "high": "high", "xhigh": null, "max": "max"}
+        }));
+        let params = params_for(
+            &qwen,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["enable_thinking"], json!(true));
+        assert_eq!(params["reasoning_effort"], json!("high"));
+        assert!(params.get("thinking").is_none());
+
+        // qwen3.8-style map: xhigh mapped, high null (null falls back to the
+        // level name — JS `??` semantics).
+        let qwen38 = make_model(json!({
+            "provider": "qwen-token-plan",
+            "compat": {"thinkingFormat": "qwen"},
+            "thinkingLevelMap": {"minimal": null, "low": "low", "medium": "medium", "high": null, "xhigh": "xhigh", "max": null}
+        }));
+        let params = params_for(
+            &qwen38,
+            &ctx,
+            &with_effort(ModelThinkingLevel::Xhigh),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["enable_thinking"], json!(true));
+        assert_eq!(params["reasoning_effort"], json!("xhigh"));
+        assert!(params.get("thinking").is_none());
+        let params = params_for(
+            &qwen38,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["reasoning_effort"], json!("high"));
+
+        // Providers without reasoning-effort support only get enable_thinking.
+        let qwen_no_effort = make_model(json!({
+            "provider": "qwen-token-plan",
+            "compat": {"thinkingFormat": "qwen", "supportsReasoningEffort": false}
+        }));
+        let params = params_for(
+            &qwen_no_effort,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["enable_thinking"], json!(true));
+        assert!(params.get("reasoning_effort").is_none());
+
+        // Thinking off: enable_thinking false, no reasoning_effort.
+        let params = params_for(
+            &qwen,
+            &ctx,
+            &options(StreamOptions::default()),
+            CacheRetention::Short,
+        );
+        assert_eq!(params["enable_thinking"], json!(false));
+        assert!(params.get("reasoning_effort").is_none());
+    }
+
     #[test]
     fn test_build_params_thinking_formats() {
         let ctx = context(vec![user_text("hi")], None);
@@ -3626,6 +3994,7 @@ mod build_and_stream_tests {
             stream: StreamOptions::default(),
             reasoning_effort: Some(effort),
             tool_choice: None,
+            thinking_budgets: None,
         };
         let no_effort = options(StreamOptions::default());
 

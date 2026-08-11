@@ -11,6 +11,10 @@ use crate::utils::estimate::estimate_context_tokens;
 pub const CONTEXT_SAFETY_TOKENS: u64 = 4096;
 pub const MIN_MAX_TOKENS: u32 = 1;
 
+/// `MIN_ANSWER_TOKENS` (d07889da0): tokens always left for the answer when a
+/// thinking budget shares the response ceiling.
+pub const MIN_ANSWER_TOKENS: u32 = 1024;
+
 /// `clampMaxTokensToContext`: `contextWindow - estimate - 4096` safety margin,
 /// `available` floored at 1. No outer floor — an explicit `maxTokens` of 0
 /// stays 0 (upstream `Math.min(maxTokens, Math.max(1, available))`).
@@ -39,6 +43,21 @@ pub fn build_base_options(
     let mut stream = options.map(|o| o.stream.clone()).unwrap_or_default();
     stream.max_tokens = Some(clamp_max_tokens_to_context(model, context, base_max_tokens));
     stream.api_key = api_key.or_else(|| options.and_then(|o| o.stream.api_key.clone()));
+    // 25a2c8dcf (#7568): `{...model.samplingParams, ...options?.samplingParams}`
+    // when either is set — per-request keys override model-level keys.
+    let option_sampling_params = stream.sampling_params.take();
+    stream.sampling_params = if model.sampling_params.is_none() && option_sampling_params.is_none()
+    {
+        None
+    } else {
+        let mut merged = model.sampling_params.clone().unwrap_or_default();
+        if let Some(option_params) = option_sampling_params {
+            for (key, value) in option_params {
+                merged.insert(key, value);
+            }
+        }
+        Some(merged)
+    };
     stream
 }
 
@@ -78,7 +97,6 @@ pub fn adjust_max_tokens_for_thinking(
         high: custom_budgets.and_then(|b| b.high).or(defaults.high),
     };
 
-    const MIN_OUTPUT_TOKENS: u32 = 1024;
     let level = clamp_reasoning(Some(reasoning_level)).unwrap_or(reasoning_level);
     let mut thinking_budget = match level {
         ThinkingLevel::Minimal => budgets.minimal.unwrap_or(1024),
@@ -94,7 +112,7 @@ pub fn adjust_max_tokens_for_thinking(
     };
 
     if max_tokens <= thinking_budget {
-        thinking_budget = max_tokens.saturating_sub(MIN_OUTPUT_TOKENS);
+        thinking_budget = max_tokens.saturating_sub(MIN_ANSWER_TOKENS);
     }
 
     ThinkingMaxTokens {
@@ -202,5 +220,86 @@ mod tests {
         let result =
             adjust_max_tokens_for_thinking(Some(1024), 128_000, ThinkingLevel::Low, Some(&budgets));
         assert_eq!(result.thinking_budget, 555);
+    }
+
+    // -- samplingParams merge (25a2c8dcf @ 4181f66, #7568) --------------------
+
+    fn sampling_params(
+        pairs: &[(&str, serde_json::Value)],
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        Some(
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+        )
+    }
+
+    fn options_with_sampling(
+        sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> SimpleStreamOptions {
+        SimpleStreamOptions {
+            stream: StreamOptions {
+                sampling_params,
+                ..StreamOptions::default()
+            },
+            reasoning: None,
+            thinking_budgets: None,
+        }
+    }
+
+    /// Upstream sampling-options.test.ts: "omits sampling params when neither
+    /// options nor model set them".
+    #[test]
+    fn test_build_base_options_sampling_params_unset() {
+        let model = make_model(128_000, 8192);
+        let base = build_base_options(&model, &context_with_text("hi"), None, None);
+        assert_eq!(base.sampling_params, None);
+    }
+
+    /// Upstream: "applies model-level sampling params".
+    #[test]
+    fn test_build_base_options_sampling_params_model_level() {
+        let mut model = make_model(128_000, 8192);
+        model.sampling_params =
+            sampling_params(&[("temperature", json!(1)), ("top_p", json!(0.95))]);
+        let base = build_base_options(&model, &context_with_text("hi"), None, None);
+        assert_eq!(
+            base.sampling_params,
+            sampling_params(&[("temperature", json!(1)), ("top_p", json!(0.95))])
+        );
+    }
+
+    /// Upstream: "merges stream-option keys over model-level keys".
+    #[test]
+    fn test_build_base_options_sampling_params_request_over_model() {
+        let mut model = make_model(128_000, 8192);
+        model.sampling_params = sampling_params(&[("top_p", json!(0.95)), ("min_p", json!(0.05))]);
+        let options = options_with_sampling(sampling_params(&[("top_p", json!(0.5))]));
+        let base = build_base_options(&model, &context_with_text("hi"), Some(&options), None);
+        assert_eq!(
+            base.sampling_params,
+            sampling_params(&[("top_p", json!(0.5)), ("min_p", json!(0.05))])
+        );
+    }
+
+    /// Stream-option-only sampling params pass through.
+    #[test]
+    fn test_build_base_options_sampling_params_request_only() {
+        let model = make_model(128_000, 8192);
+        let options = options_with_sampling(sampling_params(&[
+            ("top_p", json!(0.95)),
+            ("top_k", json!(0)),
+            ("min_p", json!(0)),
+        ]));
+        let base = build_base_options(&model, &context_with_text("hi"), Some(&options), None);
+        assert_eq!(
+            base.sampling_params,
+            sampling_params(&[
+                ("top_p", json!(0.95)),
+                ("top_k", json!(0)),
+                ("min_p", json!(0))
+            ])
+        );
     }
 }

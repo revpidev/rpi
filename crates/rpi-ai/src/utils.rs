@@ -4,6 +4,7 @@
 //! `api/`); `cost` holds `calculateCost` (upstream `models.ts`).
 
 pub mod cost;
+pub mod custom_fetch;
 pub mod deferred_tools;
 pub mod error_body;
 pub mod estimate;

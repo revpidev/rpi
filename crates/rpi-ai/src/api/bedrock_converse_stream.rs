@@ -2,7 +2,8 @@
 //! (`bedrock-converse-stream.lazy.ts` is the upstream dynamic-import wrapper;
 //! rpi adapters are linked statically, so there is no lazy counterpart.)
 //! Stream-termination semantics (rawStopReason, unknown-reason error text)
-//! updated to 4181f66 (637737ca7, 5a2539a7b).
+//! updated to 4181f66 (637737ca7, 5a2539a7b); failure diagnostics
+//! (`bedrock_response_failure`) added at 4181f66 (70bbe47a9, #7286).
 //!
 //! Amazon Bedrock ConverseStream adapter: SigV4 vs bearer-token auth, region /
 //! endpoint resolution, the reserved-header whitelist for caller headers,
@@ -56,7 +57,7 @@
 //!   server-side instead of at `atob`).
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use futures::StreamExt;
 use regex::Regex;
@@ -72,10 +73,10 @@ use crate::api::simple_options::{
 };
 use crate::models::ProviderStreams;
 use crate::types::{
-    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context, DoneReason,
-    ErrorReason, Message, Model, ProviderEnv, ProviderHeaders, ProviderResponse,
-    SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel,
-    Tool, ToolResultContent, Usage, UserContent, UserContentBlock,
+    AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
+    Context, DoneReason, ErrorReason, Message, Model, ProviderEnv, ProviderHeaders,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets,
+    ThinkingLevel, Tool, ToolResultContent, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::error_body::NormalizedProviderError;
@@ -1008,6 +1009,97 @@ fn extract_error_message(body: Option<&str>) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Failure diagnostics (70bbe47a9, #7286)
+// ---------------------------------------------------------------------------
+
+/// The SDK error metadata (`$metadata`) rpi analogue: HTTP status, modeled
+/// error code, and request id captured alongside a failed turn for the
+/// `bedrock_response_failure` diagnostic. Written by [`run`] (initial-request
+/// failures and unmodeled mid-stream error frames), read by [`stream`] when
+/// the turn ends in `stopReason: "error"`.
+#[derive(Debug, Default)]
+struct BedrockFailureMetadata {
+    /// HTTP status of the failed initial response (`$metadata.httpStatusCode`).
+    status: Option<u16>,
+    /// Modeled AWS error code — the SDK puts it on `error.name` for service
+    /// exceptions (via `x-amzn-errortype` / body `__type`) and for unmodeled
+    /// mid-stream errors (via the frame's `:error-code`).
+    error_code: Option<String>,
+    /// Request id of the failed initial response (`$metadata.requestId`).
+    request_id: Option<String>,
+    /// Request id of the initial (successful) response, kept outside the
+    /// failure arms so a mid-stream failure stays correlatable: exceptions
+    /// delivered as stream events carry no HTTP metadata of their own.
+    response_request_id: Option<String>,
+}
+
+/// Over-long header-derived values are dropped rather than truncated: a
+/// truncated request id is not a request id (70bbe47a9).
+const MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS: usize = 200;
+
+/// `normalizeDiagnosticValue` (70bbe47a9). Counts Unicode scalars; JS counts
+/// UTF-16 units — request ids and AWS error codes are ASCII in practice.
+fn normalize_diagnostic_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// `extractBedrockErrorCode` (70bbe47a9): all 13 modeled Bedrock errors end
+/// in `Exception`; that suffix is the gate — it excludes transport failures
+/// such as `TimeoutError` and the SDK's `Unknown` placeholder without
+/// enumerating them.
+fn extract_bedrock_error_code(name: Option<&str>) -> Option<String> {
+    let name = name?;
+    if !name.ends_with("Exception") {
+        return None;
+    }
+    normalize_diagnostic_value(name)
+}
+
+/// `appendBedrockFailureDiagnostic` (70bbe47a9): structured metadata
+/// alongside `errorMessage`, which stays byte-identical because
+/// `isRetryableAssistantError` classifies retries by string-matching it.
+/// Unknown fields are omitted, never guessed: a modeled mid-stream exception
+/// reaches the handler as a bare object literal upstream, leaving only the
+/// fallback request id. `details` only, as the throw is not always an
+/// `Error`.
+fn append_bedrock_failure_diagnostic(
+    output: &mut AssistantMessage,
+    metadata: &BedrockFailureMetadata,
+) {
+    let mut details = Map::new();
+    if let Some(status) = metadata.status {
+        details.insert("status".to_owned(), json!(status));
+    }
+    if let Some(error_code) = extract_bedrock_error_code(metadata.error_code.as_deref()) {
+        details.insert("errorCode".to_owned(), json!(error_code));
+    }
+    let request_id = metadata
+        .request_id
+        .as_deref()
+        .and_then(normalize_diagnostic_value)
+        .or_else(|| metadata.response_request_id.clone());
+    if let Some(request_id) = request_id {
+        details.insert("requestId".to_owned(), json!(request_id));
+    }
+    if details.is_empty() {
+        return;
+    }
+    output
+        .diagnostics
+        .get_or_insert_with(Vec::new)
+        .push(AssistantMessageDiagnostic {
+            kind: "bedrock_response_failure".to_owned(),
+            timestamp: now_ms(),
+            error: None,
+            details: Some(details),
+        });
+}
+
+// ---------------------------------------------------------------------------
 // Stop-reason mapping
 // ---------------------------------------------------------------------------
 
@@ -1044,15 +1136,24 @@ struct StreamProcessor<'a> {
     blocks_by_bedrock_index: HashMap<u64, usize>,
     /// Tool-call partial JSON by content index.
     partial_json: HashMap<usize, String>,
+    /// Mid-stream failure metadata sink (70bbe47a9): unmodeled error frames
+    /// contribute their `:error-code` to the `bedrock_response_failure`
+    /// diagnostic.
+    failure: Arc<Mutex<BedrockFailureMetadata>>,
 }
 
 impl<'a> StreamProcessor<'a> {
-    fn new(output: &'a mut AssistantMessage, model: &'a Model) -> Self {
+    fn new(
+        output: &'a mut AssistantMessage,
+        model: &'a Model,
+        failure: Arc<Mutex<BedrockFailureMetadata>>,
+    ) -> Self {
         Self {
             output,
             model,
             blocks_by_bedrock_index: HashMap::new(),
             partial_json: HashMap::new(),
+            failure,
         }
     }
 
@@ -1084,10 +1185,18 @@ impl<'a> StreamProcessor<'a> {
             }
             Some("error") => {
                 // Unmodeled error: plain message, no exception prefix.
-                let message = message
+                // 70bbe47a9: this branch throws a real `Error` named after
+                // the frame's `:error-code` upstream — keep it for the
+                // diagnostic. A modeled exception frame (the "exception" arm
+                // above) surfaces as a bare object literal upstream, so its
+                // code is genuinely unavailable and nothing is recorded.
+                if let Ok(mut guard) = self.failure.lock() {
+                    guard.error_code = message.header_str(":error-code").map(str::to_owned);
+                }
+                let error_message = message
                     .header_str(":error-message")
                     .unwrap_or("UnknownError");
-                Err(format_bedrock_error(None, None, None, message))
+                Err(format_bedrock_error(None, None, None, error_message))
             }
             Some("event") => {
                 let event_type = message.header_str(":event-type").unwrap_or("");
@@ -1428,13 +1537,16 @@ fn host_header(endpoint: &str) -> Result<String, String> {
 
 /// The streaming body: everything that runs inside upstream's async IIFE.
 /// Errors return the upstream `formatBedrockError` output; `output` carries
-/// the partial message either way.
+/// the partial message either way. Provider-failure metadata for the
+/// `bedrock_response_failure` diagnostic (70bbe47a9) accumulates in
+/// `failure`.
 async fn run(
     model: &Model,
     context: &Context,
     options: &BedrockOptions,
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
+    failure: Arc<Mutex<BedrockFailureMetadata>>,
 ) -> Result<DoneReason, String> {
     let config = resolve_bedrock_config(model, options);
     let cache_retention =
@@ -1524,7 +1636,16 @@ async fn run(
                 .headers(header_map.clone())
                 .body(body_bytes.clone());
             let signal = options.stream.signal.clone();
+            let failure = Arc::clone(&failure);
             async move {
+                // 70bbe47a9: each attempt starts clean — the diagnostic
+                // describes the final failure, like the SDK exception that
+                // surfaces upstream after its own retries.
+                if let Ok(mut guard) = failure.lock() {
+                    guard.status = None;
+                    guard.error_code = None;
+                    guard.request_id = None;
+                }
                 let send = request.send();
                 let result = match &signal {
                     Some(token) => tokio::select! {
@@ -1550,6 +1671,14 @@ async fn run(
                             let body = response.text().await.unwrap_or_default();
                             let exception_name =
                                 resolve_error_code(Some(&response_headers), Some(&body));
+                            // 70bbe47a9: `$metadata` capture for the
+                            // `bedrock_response_failure` diagnostic.
+                            if let Ok(mut guard) = failure.lock() {
+                                guard.status = Some(status);
+                                guard.error_code = exception_name.clone();
+                                guard.request_id =
+                                    response_headers.get("x-amzn-requestid").cloned();
+                            }
                             let message = extract_error_message(Some(&body))
                                 .unwrap_or_else(|| format!("Request failed with status {status}"));
                             Err(ProviderErrorInfo {
@@ -1589,6 +1718,17 @@ async fn run(
     .await
     .map_err(|error| error.message())?;
 
+    // 70bbe47a9: kept so the error path can still correlate a mid-stream
+    // failure — exceptions delivered as stream events carry no HTTP metadata
+    // of their own.
+    if let Ok(mut guard) = failure.lock() {
+        guard.response_request_id = response
+            .headers()
+            .get("x-amzn-requestid")
+            .and_then(|value| value.to_str().ok())
+            .and_then(normalize_diagnostic_value);
+    }
+
     if let Some(on_response) = &options.stream.on_response {
         // Upstream only surfaces the request id from `$metadata`.
         let mut headers = HashMap::new();
@@ -1609,7 +1749,7 @@ async fn run(
         .await;
     }
 
-    let mut processor = StreamProcessor::new(output, model);
+    let mut processor = StreamProcessor::new(output, model, failure);
     let mut decoder = EventStreamDecoder::new();
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk) = byte_stream.next().await {
@@ -1680,8 +1820,18 @@ pub fn stream(
     let context = context.clone();
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
+        let failure = Arc::new(Mutex::new(BedrockFailureMetadata::default()));
         let mut output = initial_output(&model);
-        match run(&model, &context, &options, &mut output, &task_stream).await {
+        match run(
+            &model,
+            &context,
+            &options,
+            &mut output,
+            &task_stream,
+            failure.clone(),
+        )
+        .await
+        {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
                     reason,
@@ -1697,6 +1847,13 @@ pub fn stream(
                     StopReason::Error
                 };
                 output.error_message = Some(message);
+                // 70bbe47a9: structured provider-failure metadata; aborted
+                // turns emit no diagnostic.
+                if !aborted {
+                    if let Ok(guard) = failure.lock() {
+                        append_bedrock_failure_diagnostic(&mut output, &guard);
+                    }
+                }
                 task_stream.push(StreamEvent::Error {
                     reason: if aborted {
                         ErrorReason::Aborted

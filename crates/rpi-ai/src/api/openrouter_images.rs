@@ -42,6 +42,7 @@ use crate::types::{
     AssistantImages, ImageContent, ImagesContext, ImagesModel, ImagesOptions, ImagesOutputContent,
     ImagesOutputModality, ImagesStopReason, ProviderHeaders, TextContent, Usage, UsageCost,
 };
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::headers::{headers_to_record, merge_headers, provider_headers_to_header_map};
 use crate::utils::provider_retry::{
@@ -135,21 +136,11 @@ async fn generate_images_inner(
         || {
             let request = client.post(&url).headers(header_map.clone()).json(&params);
             let signal = options.and_then(|options| options.signal.clone());
+            let fetch = options.and_then(|options| options.fetch.clone());
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -171,11 +162,7 @@ async fn generate_images_inner(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => Err(error.into_provider_error_info()),
                 }
             }
         },

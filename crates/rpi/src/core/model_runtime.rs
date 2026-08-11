@@ -189,6 +189,8 @@ pub struct ProviderConfigModel {
     pub cost: Option<rpi_ai::types::ModelCost>,
     pub context_window: u32,
     pub max_tokens: u32,
+    /// 25a2c8dcf (#7568): rides the `...definition` spread upstream.
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     pub headers: Option<BTreeMap<String, String>>,
     pub compat: Option<rpi_ai::types::ModelCompat>,
 }
@@ -578,7 +580,7 @@ impl Provider for RefreshDelegatingProvider {
 }
 
 /// `mergeCompat` (provider-composer.ts:78-98): shallow field override, with
-/// the three nested objects merged key-wise. Implemented over the serialized
+/// the four nested objects merged key-wise. Implemented over the serialized
 /// form so the field list tracks `ModelCompat` automatically.
 fn merge_compat(base: Option<&ModelCompat>, override_: &ModelCompat) -> ModelCompat {
     let base_value = base.and_then(|base| serde_json::to_value(base).ok());
@@ -598,6 +600,7 @@ fn merge_compat(base: Option<&ModelCompat>, override_: &ModelCompat) -> ModelCom
         "openRouterRouting",
         "vercelGatewayRouting",
         "chatTemplateKwargs",
+        "chatTemplateArgs",
     ] {
         let base_nested = base_map.get(key).and_then(serde_json::Value::as_object);
         let override_nested = override_map.get(key).and_then(serde_json::Value::as_object);
@@ -652,6 +655,17 @@ fn apply_model_override(mut model: Model, override_: &ModelsJsonModelOverride) -
     }
     if let Some(max_tokens) = override_.max_tokens {
         model.max_tokens = max_tokens as u32;
+    }
+    // 25a2c8dcf (#7568): `{...model.samplingParams, ...override.samplingParams}`
+    // — per-key override, absent override keeps the model value.
+    if let Some(override_sampling) = &override_.sampling_params {
+        model.sampling_params = Some(match model.sampling_params.take() {
+            Some(mut base) => {
+                base.extend(override_sampling.clone());
+                base
+            }
+            None => override_sampling.clone(),
+        });
     }
     if let Some(compat) = &override_.compat {
         model.compat = Some(merge_compat(model.compat.as_ref(), compat));
@@ -1594,6 +1608,7 @@ fn json_model_to_model(
         cost: model.cost.clone().unwrap_or_default(),
         context_window: model.context_window.unwrap_or(128000.0) as u32,
         max_tokens: model.max_tokens.unwrap_or(16384.0) as u32,
+        sampling_params: model.sampling_params.clone(),
         headers: model
             .headers
             .as_ref()
@@ -1603,7 +1618,6 @@ fn json_model_to_model(
             None => provider_compat.cloned(),
         },
         id: model.id,
-        sampling_params: None,
     })
 }
 
@@ -1651,10 +1665,10 @@ fn config_model_to_model(
         cost: model.cost.clone().unwrap_or_default(),
         context_window: model.context_window,
         max_tokens: model.max_tokens,
+        sampling_params: model.sampling_params.clone(),
         headers: model.headers.clone(),
         id: model.id,
         compat: model.compat.clone(),
-        sampling_params: None,
     })
 }
 
@@ -1955,6 +1969,68 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(model.context_window, 64000);
         assert_eq!(model.max_tokens, 4096);
+    }
+
+    /// Upstream model-registry.test.ts (25a2c8dcf @ 4181f66, #7568): "custom
+    /// model and model override carry sampling params".
+    #[tokio::test]
+    async fn sampling_params_carry_through_models_json() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "RPI_TEST_COMPOSE_SAMPLING_KEY",
+                "models": [
+                    {"id": "sampling-model", "samplingParams": {"temperature": 1, "top_p": 0.95, "top_k": 0}},
+                    {"id": "plain-model"}
+                ],
+                "modelOverrides": {
+                    "plain-model": {"samplingParams": {"top_p": 0.9}}
+                }
+            }}}"#,
+        )
+        .await;
+        let custom = runtime
+            .get_model("custom", "sampling-model")
+            .expect("model");
+        assert_eq!(
+            custom.sampling_params.as_ref().expect("samplingParams")["temperature"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            custom.sampling_params.as_ref().expect("samplingParams")["top_p"],
+            serde_json::json!(0.95)
+        );
+        assert_eq!(
+            custom.sampling_params.as_ref().expect("samplingParams")["top_k"],
+            serde_json::json!(0)
+        );
+
+        let plain = runtime.get_model("custom", "plain-model").expect("model");
+        assert_eq!(
+            plain.sampling_params.as_ref().expect("samplingParams")["top_p"],
+            serde_json::json!(0.9)
+        );
+
+        // An override merges key-wise over the model-level params.
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "RPI_TEST_COMPOSE_SAMPLING_KEY",
+                "models": [
+                    {"id": "m1", "samplingParams": {"top_p": 0.95, "min_p": 0.05}}
+                ],
+                "modelOverrides": {
+                    "m1": {"samplingParams": {"top_p": 0.5}}
+                }
+            }}}"#,
+        )
+        .await;
+        let merged = runtime.get_model("custom", "m1").expect("model");
+        let params = merged.sampling_params.as_ref().expect("samplingParams");
+        assert_eq!(params["top_p"], serde_json::json!(0.5));
+        assert_eq!(params["min_p"], serde_json::json!(0.05));
     }
 
     /// Provider-level `headers` and `authHeader` wrap auth resolution, so the

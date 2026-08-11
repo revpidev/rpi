@@ -1,38 +1,58 @@
-//! Port of `packages/ai/src/api/mistral-conversations.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/api/mistral-conversations.ts` @ pi 4181f66, which
+//! since 9dd90a497 uses a native transport (direct POST + bespoke SSE reader)
+//! instead of the `@mistralai/mistralai` SDK.
 //! (`mistral-conversations.lazy.ts` is the upstream dynamic-import wrapper;
 //! rpi adapters are linked statically, so there is no lazy counterpart.)
 //! Stream-termination semantics (rawStopReason, unmapped-reason error stops)
-//! updated to 4181f66 (5a53f086e, 5a2539a7b).
+//! per 5a53f086e / 5a2539a7b @ 4181f66.
 //!
-//! Mistral Chat Completions adapter (`chat.stream`): request construction
-//! (promptMode vs reasoningEffort reasoning selection, `promptCacheKey` /
-//! `x-affinity` prompt caching, tool schemas), the 9-char tool-call id
-//! normalizer, SSE stream decoding into [`StreamEvent`]s, cached-token
-//! accounting across the six usage field variants, and `stream_simple`
-//! reasoning mapping.
+//! Mistral Chat Completions adapter: request construction (promptMode vs
+//! reasoningEffort reasoning selection, `promptCacheKey` / `x-affinity`
+//! prompt caching, tool schemas), the camelCase payload + `to_mistral_wire_payload`
+//! snake_case remap at send time, the 9-char tool-call id normalizer, SSE
+//! stream decoding into [`StreamEvent`]s, cached-token accounting across the
+//! six usage field variants, and `stream_simple` reasoning mapping.
 //!
 //! Intentional differences (upstream deviations, D-021):
-//! - HTTP is a direct reqwest call, not the `@mistralai/mistralai` SDK; the
-//!   SDK's `user-agent` and telemetry headers are not sent, and there is no
-//!   SDK default timeout (callers set `StreamOptions::timeout_ms`).
-//! - `on_payload` sees the wire (snake_case) JSON body, not the SDK's
-//!   camelCase request object (consistent with the other rpi adapters).
-//! - SSE chunks are decoded with strict `serde_json` into the chunk structs
-//!   (the SDK uses zod schemas); parse failures read
-//!   `Could not parse Mistral SSE chunk: {error}; data={data}` instead of the
-//!   SDK's `SDKValidationError` text. Content chunks are inspected as JSON
-//!   values, so unknown chunk types are ignored rather than rejected.
-//! - Error formatting keeps the upstream `Mistral API error ({status}): …`
-//!   shape, but the no-body fallback message is
-//!   `Request failed with status {status}` (the SDK would interpolate its own
-//!   `SDKError` message); transport errors carry the reqwest message.
-//! - The `x-affinity` caller-override check is case-insensitive (upstream
-//!   checks the exact lowercase key on the merged header record).
+//! - HTTP is a direct reqwest call (upstream uses `fetch`); transport errors
+//!   carry the reqwest message, and reqwest discards the server-sent reason
+//!   phrase, so `StatusCode::canonical_reason` (the standard phrase) stands
+//!   in for the upstream `MistralHttpError`'s `statusText`.
+//! - SSE framing uses the shared rpi [`SseDecoder`] (line-based) rather than
+//!   upstream's bespoke boundary-regex reader (`findMistralEventBoundary`);
+//!   the two split events identically for every line-ending combination.
+//!   `data:` values strip one leading space where upstream `trimStart`s all
+//!   whitespace — immaterial once the payload reaches JSON parsing.
+//! - Chunk JSON is decoded strictly with `serde_json` into the chunk structs
+//!   (upstream's native transport validates only that the payload is a record
+//!   with a `choices` array). Field-level failures read
+//!   `Could not parse Mistral SSE chunk: {error}; data={data}` where upstream
+//!   would surface the raw `JSON.parse` SyntaxError text; the structural
+//!   check matches upstream's `Invalid Mistral streaming event` verbatim.
+//! - Request timeouts map reqwest's timeout to
+//!   `The operation was aborted due to timeout` — the Node `TimeoutError`
+//!   DOMException text upstream's `formatMistralError` surfaces when the
+//!   `AbortSignal.timeout` fires. The 60s default matches
+//!   `options?.timeoutMs ?? 60_000`.
+//! - `retry_provider_request` is an rpi-wide opt-in wrapper (upstream's
+//!   native transport never retries; callers set
+//!   `StreamOptions::max_retries` to enable it).
+//! - `AbortSignal.any` / reader-cancel plumbing is modeled with `select!` on
+//!   the body stream; upstream's `Mistral response has no body` branch is
+//!   unreachable (reqwest always exposes a body stream).
 //! - `stripSymbolKeys` is a no-op: `serde_json::Value` cannot carry the
 //!   TypeBox symbol keys the upstream helper strips.
 //! - `partialArgs` lives in a processor-side scratch map (rpi's [`ToolCall`]
 //!   has no such field); it never leaves the processor, matching upstream's
 //!   delete-before-finish semantics.
+//!
+//! Former D-021 deviations closed by upstream's de-SDK move (9dd90a497):
+//! the SDK's `user-agent`/telemetry headers and SDK default timeout no longer
+//! exist upstream (rpi now applies the same native 60s default); `on_payload`
+//! sees the same camelCase payload upstream exposes (the snake_case mapping
+//! moved to `to_mistral_wire_payload` at send time); and the `x-affinity`
+//! caller-override check is case-insensitive on both sides
+//! (`hasMistralHeaderOverride`).
 
 use std::collections::HashMap;
 
@@ -51,6 +71,7 @@ use crate::types::{
     ToolResultContent, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
+use crate::utils::custom_fetch::{send_provider_request, SendFailure};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
@@ -58,7 +79,7 @@ use crate::utils::headers::{
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
-    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions,
+    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions, RetryError,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -69,6 +90,12 @@ use crate::utils::transform_messages::transform_messages;
 
 const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
 const MAX_MISTRAL_ERROR_BODY_CHARS: usize = 4000;
+/// Upstream default request timeout: `AbortSignal.timeout(options?.timeoutMs
+/// ?? 60_000)` (9dd90a497).
+const DEFAULT_MISTRAL_TIMEOUT_MS: u64 = 60_000;
+/// The Node `TimeoutError` DOMException message upstream surfaces via
+/// `formatMistralError` when the timeout signal fires (Node ≥ 22).
+const MISTRAL_TIMEOUT_MESSAGE: &str = "The operation was aborted due to timeout";
 
 // ---------------------------------------------------------------------------
 // Options
@@ -190,9 +217,10 @@ fn truncate_error_text(text: &str, max_chars: usize) -> String {
     )
 }
 
-/// `formatMistralError` for the direct-HTTP port: the SDK's `statusCode` /
-/// `body` arrive as the HTTP status and raw response body. `fallback` plays
-/// the role of the SDK `error.message`.
+/// `formatMistralError`: the native transport's `MistralHttpError.statusCode`
+/// / `body` arrive as the HTTP status and raw response body. `fallback` plays
+/// the role of the `Error.message` (`statusText || "Request failed with
+/// status {statusCode}"` upstream).
 fn format_mistral_error(status: Option<u16>, body: Option<&str>, fallback: &str) -> String {
     let body_text = body.map(str::trim).filter(|text| !text.is_empty());
     match (status, body_text) {
@@ -215,9 +243,11 @@ fn should_use_prompt_caching(options: &StreamOptions) -> bool {
     options.cache_retention != Some(CacheRetention::None) && options.session_id.is_some()
 }
 
-/// `buildRequestOptions` (header construction only) plus the SDK's auth and
-/// `Accept` headers. Mistral infrastructure uses `x-affinity` for KV-cache
-/// reuse (prefix caching); an explicit caller-provided value wins.
+/// `buildMistralHeaders` (9dd90a497). Mistral infrastructure uses
+/// `x-affinity` for KV-cache reuse (prefix caching); an explicit
+/// caller-provided value wins, and a `None` (null) override counts as
+/// explicit — it suppresses the automatic header
+/// (`hasMistralHeaderOverride`, case-insensitive on both sides).
 fn build_request_headers(
     model: &Model,
     api_key: &str,
@@ -228,6 +258,10 @@ fn build_request_headers(
         (
             "authorization".to_owned(),
             Some(format!("Bearer {api_key}")),
+        ),
+        (
+            "content-type".to_owned(),
+            Some("application/json".to_owned()),
         ),
     ]
     .into();
@@ -255,8 +289,10 @@ fn build_request_headers(
 // Payload construction
 // ---------------------------------------------------------------------------
 
-/// `buildChatPayload`. Note the system prompt is prepended to `messages`
-/// (upstream `unshift`), not sent as a separate field.
+/// `buildChatPayload`: builds the camelCase payload that `onPayload`
+/// observes; [`to_mistral_wire_payload`] remaps it to snake_case at send
+/// time. Note the system prompt is prepended to `messages` (upstream
+/// `unshift`), not sent as a separate field.
 fn build_chat_payload(
     model: &Model,
     context: &Context,
@@ -284,24 +320,115 @@ fn build_chat_payload(
         payload.insert("temperature".to_owned(), json!(temperature));
     }
     if let Some(max_tokens) = options.stream.max_tokens {
-        payload.insert("max_tokens".to_owned(), json!(max_tokens));
+        payload.insert("maxTokens".to_owned(), json!(max_tokens));
     }
     if let Some(tool_choice) = &options.tool_choice {
-        payload.insert("tool_choice".to_owned(), map_tool_choice(tool_choice));
+        payload.insert("toolChoice".to_owned(), map_tool_choice(tool_choice));
     }
     if let Some(prompt_mode) = &options.prompt_mode {
-        payload.insert("prompt_mode".to_owned(), json!(prompt_mode.as_str()));
+        payload.insert("promptMode".to_owned(), json!(prompt_mode.as_str()));
     }
     if let Some(reasoning_effort) = &options.reasoning_effort {
-        payload.insert("reasoning_effort".to_owned(), json!(reasoning_effort));
+        payload.insert("reasoningEffort".to_owned(), json!(reasoning_effort));
     }
     if should_use_prompt_caching(&options.stream) {
         if let Some(session_id) = &options.stream.session_id {
-            payload.insert("prompt_cache_key".to_owned(), json!(session_id));
+            payload.insert("promptCacheKey".to_owned(), json!(session_id));
         }
     }
 
     Ok(Value::Object(payload))
+}
+
+/// `toMistralWirePayload` (9dd90a497): remap the camelCase payload to the
+/// snake_case wire format just before sending, including the nested
+/// `response_format.json_schema.schemaDefinition` → `schema` remap.
+fn to_mistral_wire_payload(payload: &Value) -> Value {
+    const REMAPS: [(&str, &str); 12] = [
+        ("topP", "top_p"),
+        ("maxTokens", "max_tokens"),
+        ("randomSeed", "random_seed"),
+        ("responseFormat", "response_format"),
+        ("toolChoice", "tool_choice"),
+        ("presencePenalty", "presence_penalty"),
+        ("frequencyPenalty", "frequency_penalty"),
+        ("parallelToolCalls", "parallel_tool_calls"),
+        ("reasoningEffort", "reasoning_effort"),
+        ("promptMode", "prompt_mode"),
+        ("promptCacheKey", "prompt_cache_key"),
+        ("safePrompt", "safe_prompt"),
+    ];
+    let Value::Object(object) = payload else {
+        return payload.clone();
+    };
+    let mut wire = object.clone();
+    for (source, target) in REMAPS {
+        remap_mistral_property(&mut wire, source, target);
+    }
+    if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+        wire.insert(
+            "messages".to_owned(),
+            Value::Array(messages.iter().map(to_mistral_wire_message).collect()),
+        );
+    }
+    if let Some(Value::Object(mut wire_response_format)) = wire.get("response_format").cloned() {
+        remap_mistral_property(&mut wire_response_format, "jsonSchema", "json_schema");
+        if let Some(Value::Object(mut wire_json_schema)) =
+            wire_response_format.get("json_schema").cloned()
+        {
+            remap_mistral_property(&mut wire_json_schema, "schemaDefinition", "schema");
+            wire_response_format.insert("json_schema".to_owned(), Value::Object(wire_json_schema));
+        }
+        wire.insert(
+            "response_format".to_owned(),
+            Value::Object(wire_response_format),
+        );
+    }
+    Value::Object(wire)
+}
+
+/// `toMistralWireMessage`.
+fn to_mistral_wire_message(message: &Value) -> Value {
+    let Value::Object(object) = message else {
+        return message.clone();
+    };
+    let mut wire = object.clone();
+    remap_mistral_property(&mut wire, "toolCalls", "tool_calls");
+    remap_mistral_property(&mut wire, "toolCallId", "tool_call_id");
+    if let Some(content) = object.get("content").and_then(Value::as_array) {
+        wire.insert(
+            "content".to_owned(),
+            Value::Array(content.iter().map(to_mistral_wire_content_chunk).collect()),
+        );
+    }
+    Value::Object(wire)
+}
+
+/// `toMistralWireContentChunk`.
+fn to_mistral_wire_content_chunk(chunk: &Value) -> Value {
+    const REMAPS: [(&str, &str); 6] = [
+        ("imageUrl", "image_url"),
+        ("documentUrl", "document_url"),
+        ("documentName", "document_name"),
+        ("fileId", "file_id"),
+        ("referenceIds", "reference_ids"),
+        ("inputAudio", "input_audio"),
+    ];
+    let Value::Object(object) = chunk else {
+        return chunk.clone();
+    };
+    let mut wire = object.clone();
+    for (source, target) in REMAPS {
+        remap_mistral_property(&mut wire, source, target);
+    }
+    Value::Object(wire)
+}
+
+/// `remapMistralProperty`: move `source` to `target` when present.
+fn remap_mistral_property(record: &mut Map<String, Value>, source: &str, target: &str) {
+    if let Some(value) = record.remove(source) {
+        record.insert(target.to_owned(), value);
+    }
 }
 
 /// `toFunctionTools`. `stripSymbolKeys` is a no-op here: `serde_json::Value`
@@ -325,8 +452,9 @@ fn to_function_tools(tools: &[Tool]) -> Result<Vec<Value>, String> {
 }
 
 /// `toChatMessages`: user / assistant / tool conversion to Mistral chat
-/// messages (assistant thinking replays as `thinking` chunks; tool results
-/// carry `tool_call_id` + `name`).
+/// messages in the camelCase payload shape (assistant thinking replays as
+/// `thinking` chunks; tool results carry `toolCallId` + `name`; the
+/// snake_case remap happens in [`to_mistral_wire_payload`]).
 fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
 
@@ -352,7 +480,7 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                             }),
                             UserContentBlock::Image(image) => json!({
                                 "type": "image_url",
-                                "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
+                                "imageUrl": format!("data:{};base64,{}", image.mime_type, image.data),
                             }),
                         })
                         .collect();
@@ -400,6 +528,7 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                                     "arguments": serde_json::to_string(&call.arguments)
                                         .unwrap_or_else(|_| "{}".to_owned()),
                                 },
+                                "index": 0,
                             }));
                         }
                         _ => {}
@@ -411,11 +540,12 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                 }
                 let mut assistant_message = Map::new();
                 assistant_message.insert("role".to_owned(), json!("assistant"));
+                assistant_message.insert("prefix".to_owned(), json!(false));
                 if !content_parts.is_empty() {
                     assistant_message.insert("content".to_owned(), Value::Array(content_parts));
                 }
                 if !tool_calls.is_empty() {
-                    assistant_message.insert("tool_calls".to_owned(), Value::Array(tool_calls));
+                    assistant_message.insert("toolCalls".to_owned(), Value::Array(tool_calls));
                 }
                 result.push(Value::Object(assistant_message));
             }
@@ -445,14 +575,14 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                         if let ToolResultContent::Image(image) = part {
                             tool_content.push(json!({
                                 "type": "image_url",
-                                "image_url": format!("data:{};base64,{}", image.mime_type, image.data),
+                                "imageUrl": format!("data:{};base64,{}", image.mime_type, image.data),
                             }));
                         }
                     }
                 }
                 result.push(json!({
                     "role": "tool",
-                    "tool_call_id": tool_msg.tool_call_id,
+                    "toolCallId": tool_msg.tool_call_id,
                     "name": tool_msg.tool_name,
                     "content": tool_content,
                 }));
@@ -810,21 +940,29 @@ impl<'a> StreamProcessor<'a> {
         });
     }
 
-    /// Per-SSE-event body: `[DONE]` sentinel, strict chunk parse, dispatch.
+    /// `parseMistralEvent` (9dd90a497): empty data is skipped, the `[DONE]`
+    /// sentinel ends the stream, the payload must be a record with a
+    /// `choices` array (`Invalid Mistral streaming event`), then the strict
+    /// chunk decode runs.
     fn handle_sse(
         &mut self,
         sse: &ServerSentEvent,
         events: &AssistantMessageEventStream,
     ) -> Result<SseOutcome, String> {
-        if sse.data.trim() == "[DONE]" {
+        let data = sse.data.trim();
+        if data.is_empty() {
+            return Ok(SseOutcome::Chunk);
+        }
+        if data == "[DONE]" {
             return Ok(SseOutcome::Done);
         }
-        let chunk: CompletionChunk = serde_json::from_str(&sse.data).map_err(|error| {
-            format!(
-                "Could not parse Mistral SSE chunk: {error}; data={}",
-                sse.data
-            )
-        })?;
+        let value: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Could not parse Mistral SSE chunk: {error}; data={data}"))?;
+        if !value.is_object() || !value.get("choices").is_some_and(Value::is_array) {
+            return Err("Invalid Mistral streaming event".to_owned());
+        }
+        let chunk: CompletionChunk = serde_json::from_value(value)
+            .map_err(|error| format!("Could not parse Mistral SSE chunk: {error}; data={data}"))?;
         self.handle_chunk(&chunk, events);
         Ok(SseOutcome::Chunk)
     }
@@ -833,7 +971,7 @@ impl<'a> StreamProcessor<'a> {
     fn handle_chunk(&mut self, chunk: &CompletionChunk, events: &AssistantMessageEventStream) {
         // Keep the first non-empty response id (`output.responseId ||= chunk.id`).
         if self.output.response_id.as_deref().unwrap_or("").is_empty() {
-            if let Some(id) = &chunk.id {
+            if let Some(id) = chunk.id.as_ref().filter(|id| !id.is_empty()) {
                 self.output.response_id = Some(id.clone());
             }
         }
@@ -1063,6 +1201,9 @@ async fn run(
             payload = next_payload;
         }
     }
+    // `JSON.stringify(toMistralWirePayload(payload))` (9dd90a497).
+    let wire_payload = to_mistral_wire_payload(&payload);
+    let body = serde_json::to_string(&wire_payload).map_err(|error| error.to_string())?;
 
     let headers = build_request_headers(model, api_key, options);
     let url = format!(
@@ -1071,30 +1212,27 @@ async fn run(
     );
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder = reqwest::Client::builder();
-    if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
-    }
+    // Upstream: `AbortSignal.timeout(options?.timeoutMs ?? 60_000)`; the
+    // reqwest timeout likewise covers the whole body stream.
+    let timeout_ms = options
+        .stream
+        .timeout_ms
+        .unwrap_or(DEFAULT_MISTRAL_TIMEOUT_MS);
+    client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
     let response = retry_provider_request(
         || {
-            let request = client.post(&url).headers(header_map.clone()).json(&payload);
+            let request = client
+                .post(&url)
+                .headers(header_map.clone())
+                .body(body.clone());
             let signal = options.stream.signal.clone();
+            let fetch = options.stream.fetch.clone();
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -1102,9 +1240,16 @@ async fn run(
                             Ok(response)
                         } else {
                             let status = status.as_u16();
+                            // `MistralHttpError`: `statusText || "Request
+                            // failed with status {statusCode}"` (reqwest sees
+                            // only the standard reason phrase).
+                            let fallback = response
+                                .status()
+                                .canonical_reason()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| format!("Request failed with status {status}"));
                             let response_headers = headers_to_record(response.headers());
                             let body = response.text().await.unwrap_or_default();
-                            let fallback = format!("Request failed with status {status}");
                             Err(ProviderErrorInfo {
                                 status: Some(status),
                                 headers: Some(response_headers),
@@ -1112,14 +1257,23 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: format_mistral_error(
-                            error.status().map(|status| status.as_u16()),
-                            None,
-                            &error.to_string(),
-                        ),
+                    Err(error) => Err(match error {
+                        // The timeout mapping only exists on the reqwest
+                        // default path; a custom fetch owns its own timing.
+                        SendFailure::Reqwest(error) => ProviderErrorInfo {
+                            status: error.status().map(|status| status.as_u16()),
+                            headers: None,
+                            message: if error.is_timeout() {
+                                MISTRAL_TIMEOUT_MESSAGE.to_owned()
+                            } else {
+                                format_mistral_error(
+                                    error.status().map(|status| status.as_u16()),
+                                    None,
+                                    &error.to_string(),
+                                )
+                            },
+                        },
+                        other => other.into_provider_error_info(),
                     }),
                 }
             }
@@ -1130,8 +1284,29 @@ async fn run(
         },
         options.stream.signal.as_ref(),
     )
-    .await
-    .map_err(|error| error.message())?;
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            // 9dd90a497: `onResponse` observes the HTTP response before the
+            // `!response.ok` throw, so it also fires for error statuses.
+            if let RetryError::Provider(info) = &error {
+                if let (Some(on_response), Some(status)) =
+                    (&options.stream.on_response, info.status)
+                {
+                    on_response(
+                        ProviderResponse {
+                            status,
+                            headers: info.headers.clone().unwrap_or_default(),
+                        },
+                        model,
+                    )
+                    .await;
+                }
+            }
+            return Err(error.message());
+        }
+    };
 
     if let Some(on_response) = &options.stream.on_response {
         on_response(
@@ -1151,19 +1326,27 @@ async fn run(
     let mut processor = StreamProcessor::new(output, model);
     let mut decoder = SseDecoder::new();
     let mut byte_stream = response.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
-        if options
-            .stream
-            .signal
-            .as_ref()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            return Err("Request was aborted".to_owned());
-        }
-        let bytes = chunk.map_err(|error| error.to_string())?;
+    loop {
+        // Upstream checks the abort signal around every `reader.read()`;
+        // `select!` lets the cancellation fire while waiting for a chunk.
+        let next = match &options.stream.signal {
+            Some(token) => tokio::select! {
+                outcome = byte_stream.next() => outcome,
+                () = token.cancelled() => return Err("Request was aborted".to_owned()),
+            },
+            None => byte_stream.next().await,
+        };
+        let Some(chunk) = next else { break };
+        let bytes = chunk.map_err(|error| {
+            if error.is_timeout() {
+                MISTRAL_TIMEOUT_MESSAGE.to_owned()
+            } else {
+                error.to_string()
+            }
+        })?;
         for sse in decoder.feed(&bytes) {
             if processor.handle_sse(&sse, events)? == SseOutcome::Done {
-                // `[DONE]` terminates the stream (SDK `chatStream.ts:170`).
+                // `[DONE]` terminates the stream (`parseMistralEvent`).
                 processor.finish(events);
                 return finalize(options, processor.output);
             }
@@ -1570,6 +1753,11 @@ mod tests {
             headers.get("authorization").and_then(|v| v.as_deref()),
             Some("Bearer test-key")
         );
+        // 9dd90a497: the native transport sets content-type explicitly.
+        assert_eq!(
+            headers.get("content-type").and_then(|v| v.as_deref()),
+            Some("application/json")
+        );
 
         // Caller-provided value wins (case-insensitively).
         opts.stream.headers = Some([("X-Affinity".to_owned(), Some("custom".to_owned()))].into());
@@ -1600,13 +1788,14 @@ mod tests {
         opts.stream.session_id = Some("session-123".to_owned());
         let payload =
             build_chat_payload(&model, &ctx, &ctx.messages.clone(), &opts).expect("payload");
-        assert_eq!(payload["prompt_cache_key"], json!("session-123"));
+        // 9dd90a497: the payload is camelCase until `toMistralWirePayload`.
+        assert_eq!(payload["promptCacheKey"], json!("session-123"));
 
         // Cache retention disabled: key omitted.
         opts.stream.cache_retention = Some(CacheRetention::None);
         let payload =
             build_chat_payload(&model, &ctx, &ctx.messages.clone(), &opts).expect("payload");
-        assert!(payload.get("prompt_cache_key").is_none());
+        assert!(payload.get("promptCacheKey").is_none());
     }
 
     #[test]
@@ -1621,6 +1810,193 @@ mod tests {
         assert_eq!(messages[1], json!({"role": "user", "content": "hi"}));
         assert_eq!(payload["model"], json!("mistral-large-latest"));
         assert_eq!(payload["stream"], json!(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire payload remap (toMistralWirePayload, 9dd90a497)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_to_mistral_wire_payload_remaps_camel_case_keys() {
+        // mistral-http-transport.test.ts "serializes SDK-style payloads to
+        // the Mistral wire format": every known camelCase key is remapped,
+        // the source key deleted, unknown keys pass through.
+        let payload = json!({
+            "model": "mistral-large-latest",
+            "stream": true,
+            "messages": [],
+            "temperature": 0.5,
+            "topP": 0.9,
+            "maxTokens": 123,
+            "randomSeed": 42,
+            "toolChoice": {"type": "function", "function": {"name": "lookup"}},
+            "presencePenalty": 0.1,
+            "frequencyPenalty": 0.2,
+            "parallelToolCalls": true,
+            "reasoningEffort": "high",
+            "promptMode": "reasoning",
+            "promptCacheKey": "session-1",
+            "safePrompt": true,
+            "unknownKey": {"nested": true},
+        });
+        let wire = to_mistral_wire_payload(&payload);
+        assert_eq!(wire["top_p"], json!(0.9));
+        assert_eq!(wire["max_tokens"], json!(123));
+        assert_eq!(wire["random_seed"], json!(42));
+        assert_eq!(
+            wire["tool_choice"],
+            json!({"type": "function", "function": {"name": "lookup"}})
+        );
+        assert_eq!(wire["presence_penalty"], json!(0.1));
+        assert_eq!(wire["frequency_penalty"], json!(0.2));
+        assert_eq!(wire["parallel_tool_calls"], json!(true));
+        assert_eq!(wire["reasoning_effort"], json!("high"));
+        assert_eq!(wire["prompt_mode"], json!("reasoning"));
+        assert_eq!(wire["prompt_cache_key"], json!("session-1"));
+        assert_eq!(wire["safe_prompt"], json!(true));
+        // Already-snake / unknown keys pass through untouched.
+        assert_eq!(wire["temperature"], json!(0.5));
+        assert_eq!(wire["unknownKey"], json!({"nested": true}));
+        for source in [
+            "topP",
+            "maxTokens",
+            "randomSeed",
+            "toolChoice",
+            "presencePenalty",
+            "frequencyPenalty",
+            "parallelToolCalls",
+            "reasoningEffort",
+            "promptMode",
+            "promptCacheKey",
+            "safePrompt",
+        ] {
+            assert!(wire.get(source).is_none(), "{source} must be deleted");
+        }
+    }
+
+    #[test]
+    fn test_to_mistral_wire_payload_nested_response_format() {
+        // mistral-http-transport.test.ts: `responseFormat.jsonSchema.
+        // schemaDefinition` remaps to `response_format.json_schema.schema`;
+        // the user-supplied schema body keeps its own key casing.
+        let payload = json!({
+            "messages": [],
+            "responseFormat": {
+                "type": "json_schema",
+                "jsonSchema": {
+                    "name": "result",
+                    "schemaDefinition": {
+                        "type": "object",
+                        "properties": {"maxTokens": {"type": "number"}},
+                    },
+                },
+            },
+        });
+        let wire = to_mistral_wire_payload(&payload);
+        assert_eq!(
+            wire["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "result",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"maxTokens": {"type": "number"}},
+                    },
+                },
+            })
+        );
+        assert!(wire.get("responseFormat").is_none());
+    }
+
+    #[test]
+    fn test_to_mistral_wire_message_and_content_chunk() {
+        // `toolCalls`/`toolCallId` and the content-chunk keys remap; other
+        // fields (role, name, prefix, index) pass through.
+        let payload = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "prefix": false,
+                    "content": [
+                        {"type": "text", "text": "answer"},
+                        {"type": "image_url", "imageUrl": "data:image/png;base64,aGVsbG8="},
+                    ],
+                    "toolCalls": [{
+                        "id": "abc123456",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                        "index": 0,
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "toolCallId": "abc123456",
+                    "name": "lookup",
+                    "content": [
+                        {"type": "text", "text": "found"},
+                        {"type": "image_url", "imageUrl": "data:image/png;base64,aGVsbG8="},
+                    ],
+                },
+            ],
+        });
+        let wire = to_mistral_wire_payload(&payload);
+        assert_eq!(
+            wire["messages"],
+            json!([
+                {
+                    "role": "assistant",
+                    "prefix": false,
+                    "content": [
+                        {"type": "text", "text": "answer"},
+                        {"type": "image_url", "image_url": "data:image/png;base64,aGVsbG8="},
+                    ],
+                    "tool_calls": [{
+                        "id": "abc123456",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                        "index": 0,
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "abc123456",
+                    "name": "lookup",
+                    "content": [
+                        {"type": "text", "text": "found"},
+                        {"type": "image_url", "image_url": "data:image/png;base64,aGVsbG8="},
+                    ],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn test_to_mistral_wire_content_chunk_extra_keys() {
+        // The remaining four remap pairs (`toMistralWireContentChunk`).
+        let chunk = json!({
+            "type": "document_url",
+            "documentUrl": "https://example.com/d.pdf",
+            "documentName": "d.pdf",
+            "fileId": "file-1",
+            "referenceIds": [1, 2],
+            "inputAudio": "aXVkaW8=",
+        });
+        let wire = to_mistral_wire_content_chunk(&chunk);
+        assert_eq!(wire["document_url"], json!("https://example.com/d.pdf"));
+        assert_eq!(wire["document_name"], json!("d.pdf"));
+        assert_eq!(wire["file_id"], json!("file-1"));
+        assert_eq!(wire["reference_ids"], json!([1, 2]));
+        assert_eq!(wire["input_audio"], json!("aXVkaW8="));
+        for source in [
+            "documentUrl",
+            "documentName",
+            "fileId",
+            "referenceIds",
+            "inputAudio",
+        ] {
+            assert!(wire.get(source).is_none(), "{source} must be deleted");
+        }
     }
 
     #[test]
@@ -1789,6 +2165,7 @@ mod tests {
         });
         let converted = to_chat_messages(&[assistant], false);
         assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0]["prefix"], json!(false));
         assert_eq!(
             converted[0]["content"],
             json!([
@@ -1796,12 +2173,14 @@ mod tests {
                 {"type": "text", "text": "answer"},
             ])
         );
+        // 9dd90a497: camelCase `toolCalls` with a wire `index: 0` entry.
         assert_eq!(
-            converted[0]["tool_calls"],
+            converted[0]["toolCalls"],
             json!([{
                 "id": "abc123XYZ",
                 "type": "function",
                 "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"},
+                "index": 0,
             }])
         );
 
@@ -1833,7 +2212,7 @@ mod tests {
             converted[0],
             json!({
                 "role": "tool",
-                "tool_call_id": "id1",
+                "toolCallId": "id1",
                 "name": "t",
                 "content": [{"type": "text", "text": "result body"}],
             })
@@ -1882,6 +2261,70 @@ mod tests {
     // -----------------------------------------------------------------------
     // Stream processing
     // -----------------------------------------------------------------------
+
+    /// Drives `handle_sse` over one raw SSE payload; returns the error if any.
+    fn run_handle_sse(model: &Model, sse_payload: &str) -> Result<(), String> {
+        let events = AssistantMessageEventStream::new();
+        let mut output = initial_output(model);
+        let mut processor = StreamProcessor::new(&mut output, model);
+        let mut decoder = SseDecoder::new();
+        for sse in decoder.feed(sse_payload.as_bytes()) {
+            processor.handle_sse(&sse, &events)?;
+        }
+        for sse in decoder.finish() {
+            processor.handle_sse(&sse, &events)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_handle_sse_skips_empty_data_events() {
+        // 9dd90a497 `parseMistralEvent`: events whose joined `data:` payload
+        // is empty are skipped, not parsed.
+        let model = make_model(json!({}));
+        run_handle_sse(&model, "data:\n\nevent: ping\n\ndata:   \n\n").expect("empty events");
+    }
+
+    #[test]
+    fn test_handle_sse_multiline_data_joined() {
+        // Multi-line `data:` payloads join with `\n` before parsing.
+        let model = make_model(json!({}));
+        run_handle_sse(
+            &model,
+            "data: {\"id\":\"cmpl-1\",\ndata: \"choices\":[]}\n\ndata: [DONE]\n\n",
+        )
+        .expect("multiline data");
+    }
+
+    #[test]
+    fn test_handle_sse_rejects_payload_without_choices() {
+        // 9dd90a497 `parseMistralEvent`: non-record payloads or records
+        // without a `choices` array fail with this exact message.
+        let model = make_model(json!({}));
+        for payload in [
+            "data: {\"id\":\"cmpl-1\"}\n\n",
+            "data: {\"id\":\"cmpl-1\",\"choices\":{}}\n\n",
+            "data: 42\n\n",
+            "data: [1,2]\n\n",
+        ] {
+            let error = run_handle_sse(&model, payload).expect_err("invalid event");
+            assert_eq!(error, "Invalid Mistral streaming event", "{payload}");
+        }
+    }
+
+    #[test]
+    fn test_handle_sse_malformed_json_names_the_data() {
+        // rpi deviation (D-021): strict serde decode names the serde error
+        // and the offending payload where upstream surfaces the raw
+        // `JSON.parse` SyntaxError text.
+        let model = make_model(json!({}));
+        let error = run_handle_sse(&model, "data: {oops\n\n").expect_err("malformed");
+        assert!(
+            error.starts_with("Could not parse Mistral SSE chunk: "),
+            "{error}"
+        );
+        assert!(error.ends_with("; data={oops"), "{error}");
+    }
 
     #[test]
     fn test_processor_text_stream_with_cached_usage() {
@@ -2057,8 +2500,9 @@ mod tests {
     }
 
     /// Captures the payload stream_simple builds, via an unreachable server
-    /// (the upstream mistral-reasoning-mode.test.ts technique, minus
-    /// `onPayload` — the payload hook is covered by the other adapters).
+    /// (the upstream mistral-reasoning-mode.test.ts technique). The captured
+    /// payload is the pre-send camelCase shape (9dd90a497); the wire remap
+    /// itself is covered by the mistral-http-transport contract tests.
     async fn capture_payload(model: &Model, reasoning: Option<ThinkingLevel>) -> Value {
         let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
         let captured_clone = captured.clone();
@@ -2093,17 +2537,18 @@ mod tests {
     #[tokio::test]
     async fn test_stream_simple_reasoning_effort_models() {
         // mistral-reasoning-mode.test.ts: reasoning_effort for Small 4 / Medium 3.5.
+        // (9dd90a497: the captured payload is camelCase until the wire remap.)
         for id in ["mistral-small-2603", "mistral-medium-3.5"] {
             let model = reasoning_model(id);
             let payload = capture_payload(&model, Some(ThinkingLevel::Medium)).await;
-            assert_eq!(payload["reasoning_effort"], json!("high"), "{id}");
-            assert!(payload.get("prompt_mode").is_none(), "{id}");
+            assert_eq!(payload["reasoningEffort"], json!("high"), "{id}");
+            assert!(payload.get("promptMode").is_none(), "{id}");
         }
         // Thinking off: no reasoning controls at all.
         let model = reasoning_model("mistral-small-2603");
         let payload = capture_payload(&model, None).await;
-        assert!(payload.get("reasoning_effort").is_none());
-        assert!(payload.get("prompt_mode").is_none());
+        assert!(payload.get("reasoningEffort").is_none());
+        assert!(payload.get("promptMode").is_none());
     }
 
     #[tokio::test]
@@ -2111,7 +2556,7 @@ mod tests {
         // mistral-reasoning-mode.test.ts: prompt_mode for Magistral models.
         let model = reasoning_model("magistral-medium-latest");
         let payload = capture_payload(&model, Some(ThinkingLevel::Medium)).await;
-        assert_eq!(payload["prompt_mode"], json!("reasoning"));
-        assert!(payload.get("reasoning_effort").is_none());
+        assert_eq!(payload["promptMode"], json!("reasoning"));
+        assert!(payload.get("reasoningEffort").is_none());
     }
 }

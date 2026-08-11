@@ -131,7 +131,10 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
             supports_store: Some(false),
             supports_developer_role: Some(false),
             supports_reasoning_effort: Some(false),
-            supports_usage_in_streaming: Some(false),
+            // 0c32e83a3 (#7258): llama-server supports
+            // `stream_options.include_usage` since b2b6b55a59 (Sep 2025); any
+            // server new enough for router mode sends the final usage chunk.
+            supports_usage_in_streaming: Some(true),
             max_tokens_field: Some(MaxTokensField::MaxTokens),
             supports_strict_mode: Some(false),
             ..Default::default()
@@ -520,7 +523,8 @@ mod tests {
         assert_eq!(compat.supports_store, Some(false));
         assert_eq!(compat.supports_developer_role, Some(false));
         assert_eq!(compat.supports_reasoning_effort, Some(false));
-        assert_eq!(compat.supports_usage_in_streaming, Some(false));
+        // 0c32e83a3: llama.cpp streams usage since llama-server b2b6b55a59.
+        assert_eq!(compat.supports_usage_in_streaming, Some(true));
         assert_eq!(compat.supports_strict_mode, Some(false));
         assert_eq!(compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
     }

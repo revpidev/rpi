@@ -45,7 +45,8 @@ use crate::api::openai_completions::{
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses_shared::{
     convert_responses_messages, convert_responses_tools, ConvertResponsesMessagesOptions,
-    ConvertResponsesToolsOptions, ResponsesStreamOptions, ResponsesStreamProcessor,
+    ConvertResponsesToolsOptions, ResponsesDeferredToolsMode, ResponsesStreamOptions,
+    ResponsesStreamProcessor,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
@@ -55,6 +56,7 @@ use crate::types::{
     ProviderHeaders, ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason,
     StreamEvent, StreamOptions, Usage,
 };
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::deferred_tools::split_deferred_tools_identity;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -119,6 +121,8 @@ pub struct ResolvedOpenAIResponsesCompat {
     pub supports_long_cache_retention: bool,
     pub supports_strict_mode: bool,
     pub supports_open_ai_grammar_tools: bool,
+    /// e47b8e37a (#7709): message-anchored `additional_tools` input items.
+    pub supports_additional_tools: bool,
     pub supports_tool_search: bool,
     pub supports_explicit_prompt_cache_mode: bool,
 }
@@ -141,6 +145,9 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAIResponsesCompat {
             .unwrap_or(false),
         supports_open_ai_grammar_tools: compat
             .and_then(|compat| compat.supports_open_ai_grammar_tools)
+            .unwrap_or(false),
+        supports_additional_tools: compat
+            .and_then(|compat| compat.supports_additional_tools)
             .unwrap_or(false),
         supports_tool_search: compat
             .and_then(|compat| compat.supports_tool_search)
@@ -242,7 +249,16 @@ pub fn build_params(
     compat: &ResolvedOpenAIResponsesCompat,
     grammar_tool_input_properties: &HashMap<String, String>,
 ) -> Result<Value, String> {
-    let tool_placement = split_deferred_tools_identity(context, compat.supports_tool_search);
+    // e47b8e37a (#7709): additional_tools-capable models (GPT-5.6 family)
+    // prefer message-anchored input items over client tool search.
+    let deferred_tools_mode = if compat.supports_additional_tools {
+        Some(ResponsesDeferredToolsMode::AdditionalTools)
+    } else if compat.supports_tool_search {
+        Some(ResponsesDeferredToolsMode::ToolSearch)
+    } else {
+        None
+    };
+    let tool_placement = split_deferred_tools_identity(context, deferred_tools_mode.is_some());
     let tool_options = ConvertResponsesToolsOptions {
         supports_strict_mode: Some(compat.supports_strict_mode),
         supports_open_ai_grammar_tools: Some(compat.supports_open_ai_grammar_tools),
@@ -255,6 +271,7 @@ pub fn build_params(
         &ConvertResponsesMessagesOptions {
             grammar_tool_input_properties: Some(grammar_tool_input_properties),
             deferred_tools: Some(&tool_placement.deferred),
+            deferred_tools_mode,
             tool_options: tool_options.clone(),
             ..ConvertResponsesMessagesOptions::default()
         },
@@ -327,6 +344,14 @@ pub fn build_params(
         }
         if model.provider == "xai" {
             params["include"] = json!(["reasoning.encrypted_content"]);
+        }
+    }
+
+    // 25a2c8dcf (#7568): merged last so custom keys override the named
+    // request fields.
+    if let Some(sampling_params) = &options.stream.sampling_params {
+        for (key, value) in sampling_params {
+            params[key.clone()] = value.clone();
         }
     }
 
@@ -458,21 +483,11 @@ async fn run(
         || {
             let request = client.post(&url).headers(header_map.clone()).json(&params);
             let signal = options.stream.signal.clone();
+            let fetch = options.stream.fetch.clone();
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -497,11 +512,7 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => Err(error.into_provider_error_info()),
                 }
             }
         },
@@ -812,6 +823,141 @@ mod tests {
         assert!(compat.supports_open_ai_grammar_tools);
         assert!(compat.supports_tool_search);
         assert!(compat.supports_explicit_prompt_cache_mode);
+    }
+
+    // -- sampling params (25a2c8dcf @ 4181f66, #7568) -------------------------
+
+    /// Upstream sampling-options.test.ts, openai-responses leg: sampling
+    /// params merge into the request body last, overriding named fields.
+    #[test]
+    fn test_build_params_sampling_params_merged_last() {
+        let m = model(json!({}));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+        let options = OpenAIResponsesOptions {
+            stream: StreamOptions {
+                temperature: Some(0.0),
+                sampling_params: Some(
+                    [
+                        ("top_p".to_owned(), json!(0.95)),
+                        ("top_k".to_owned(), json!(0)),
+                        ("min_p".to_owned(), json!(0)),
+                        ("temperature".to_owned(), json!(1.0)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..StreamOptions::default()
+            },
+            ..OpenAIResponsesOptions::default()
+        };
+        let params = params_for(&m, &ctx, &options);
+        assert_eq!(params["top_p"], json!(0.95));
+        assert_eq!(params["top_k"], json!(0));
+        assert_eq!(params["min_p"], json!(0));
+        assert_eq!(params["temperature"], json!(1.0));
+
+        let plain = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
+        assert!(plain.get("top_p").is_none());
+        assert!(plain.get("temperature").is_none());
+    }
+
+    // -- deferred tools mode (e47b8e37a @ 4181f66, #7709) ----------------------
+
+    /// One base_tool call whose result marks late_tool as transcript-loaded;
+    /// both tools are in `Context.tools`.
+    fn deferred_tools_context() -> Context {
+        common::context(
+            vec![
+                common::same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
+                ])),
+                common::tool_result(
+                    "call_1|fc_1",
+                    json!([{"type": "text", "text": "ok"}]),
+                    json!({"addedToolNames": ["late_tool"]}),
+                ),
+            ],
+            Some(vec![common::tool("base_tool"), common::tool("late_tool")]),
+        )
+    }
+
+    fn top_level_tool_names(params: &Value) -> Vec<&str> {
+        params["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect()
+    }
+
+    /// Upstream deferred-tools.test.ts: "loads an OpenAI Responses tool
+    /// through additional_tools" + "falls back to client tool search when
+    /// additional_tools is unsupported" + "leaves providers without deferred
+    /// loading unchanged" (adapter-level mode selection).
+    #[test]
+    fn test_build_params_deferred_tools_mode_selection() {
+        let ctx = deferred_tools_context();
+
+        // supportsAdditionalTools: the deferred tool rides a message-anchored
+        // additional_tools item (no defer_loading, no tool-search pair).
+        let m = model(json!({"compat": {"supportsAdditionalTools": true}}));
+        let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
+        assert_eq!(top_level_tool_names(&params), vec!["base_tool"]);
+        let input = params["input"].as_array().expect("input");
+        let additional = input
+            .iter()
+            .find(|item| item["type"] == json!("additional_tools"))
+            .expect("additional_tools");
+        assert_eq!(additional["role"], json!("developer"));
+        assert_eq!(additional["tools"][0]["type"], json!("function"));
+        assert_eq!(additional["tools"][0]["name"], json!("late_tool"));
+        assert!(additional["tools"][0].get("defer_loading").is_none());
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_call")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_output")));
+
+        // additional_tools unsupported + tool search supported: client
+        // tool-search fallback.
+        let m = model(
+            json!({"compat": {"supportsAdditionalTools": false, "supportsToolSearch": true}}),
+        );
+        let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
+        assert_eq!(top_level_tool_names(&params), vec!["base_tool"]);
+        let input = params["input"].as_array().expect("input");
+        let search_call = input
+            .iter()
+            .find(|item| item["type"] == json!("tool_search_call"))
+            .expect("tool_search_call");
+        let search_output = input
+            .iter()
+            .find(|item| item["type"] == json!("tool_search_output"))
+            .expect("tool_search_output");
+        assert_eq!(search_call["execution"], json!("client"));
+        assert_eq!(search_call["status"], json!("completed"));
+        assert_eq!(search_output["call_id"], search_call["call_id"]);
+        assert_eq!(search_output["tools"][0]["name"], json!("late_tool"));
+        assert_eq!(search_output["tools"][0]["defer_loading"], json!(true));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("additional_tools")));
+
+        // Neither flag: every tool stays top-level, no replay items.
+        let m = model(json!({}));
+        let params = params_for(&m, &ctx, &OpenAIResponsesOptions::default());
+        assert_eq!(
+            top_level_tool_names(&params),
+            vec!["base_tool", "late_tool"]
+        );
+        let input = params["input"].as_array().expect("input");
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("additional_tools")));
+        assert!(input
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_output")));
     }
 
     // -- client headers ---------------------------------------------------------

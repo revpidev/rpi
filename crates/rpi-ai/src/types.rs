@@ -335,9 +335,12 @@ impl fmt::Debug for FetchResponse {
 /// `FetchFunction` (`typeof globalThis.fetch`) — optional custom HTTP transport
 /// for provider requests (R2.7.4). Does not affect WebSocket transports.
 ///
-/// Channel placeholder: no adapter consumes this yet; the per-request wiring
-/// (and the Google-side rejection of non-default fetch) lands with the
-/// provider tasks (T20/T26).
+/// Adapters consume this through `utils::custom_fetch::send_provider_request`
+/// (T20 Wave D): the built reqwest request is translated into [`FetchRequest`]
+/// and the response bridged back, leaving the default reqwest path untouched.
+/// The Google adapters reject any injected fetch instead (they have no fetch
+/// indirection to thread it through — upstream `fetch !== globalThis.fetch`
+/// check; rpi has no ambient global fetch, so any `Some` is non-default).
 pub type FetchFn = Arc<
     dyn Fn(FetchRequest) -> Pin<Box<dyn Future<Output = Result<FetchResponse, FetchError>> + Send>>
         + Send
@@ -357,7 +360,7 @@ pub struct ProviderRequestOptions {
     pub telemetry_context: Option<TelemetryContext>,
     pub api_key: Option<String>,
     /// Optional fetch implementation for provider HTTP requests (R2.7.4).
-    /// Channel placeholder — see [`FetchFn`].
+    /// Defaults to the built-in reqwest transport — see [`FetchFn`].
     pub fetch: Option<FetchFn>,
     /// Provider-scoped environment values, taking precedence over process.env.
     pub env: Option<ProviderEnv>,
@@ -881,6 +884,9 @@ pub type ImagesOnResponseCallback = Arc<
 pub struct ImagesOptions {
     pub signal: Option<CancellationToken>,
     pub api_key: Option<String>,
+    /// Optional fetch implementation for provider HTTP requests (R2.7.4;
+    /// upstream `ImagesOptions.fetch`, 027a58479). See [`FetchFn`].
+    pub fetch: Option<FetchFn>,
     /// Provider-scoped environment values; precedence over process.env.
     pub env: Option<ProviderEnv>,
     pub on_payload: Option<ImagesOnPayloadCallback>,
@@ -906,6 +912,7 @@ impl fmt::Debug for ImagesOptions {
         f.debug_struct("ImagesOptions")
             .field("signal", &self.signal)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("fetch", &self.fetch.as_ref().map(|_| "<callback>"))
             .field("env", &self.env)
             .field(
                 "on_payload",
@@ -1483,6 +1490,11 @@ pub struct ModelCompat {
     /// `chat-template`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<std::collections::BTreeMap<String, ChatTemplateKwargValue>>,
+    /// Arguments sent as `chat_template_args` when `thinking_format` is
+    /// `baseten` (the Baseten thinking branch itself is T26 scope; the field
+    /// is threaded through here so models.json entries round-trip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_args: Option<std::collections::BTreeMap<String, ChatTemplateKwargValue>>,
     /// OpenRouter routing preferences, sent as the `provider` request field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_router_routing: Option<OpenRouterRouting>,
@@ -1492,6 +1504,12 @@ pub struct ModelCompat {
     /// Whether z.ai supports top-level `tool_stream: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zai_tool_stream: Option<bool>,
+    /// Whether the provider supports top-level `thinking_token_budget` to cap
+    /// reasoning tokens (vLLM). Reasoning and the answer share `max_tokens`
+    /// on these endpoints, so without a budget a reasoning-heavy turn can
+    /// consume the whole response and emit no answer. Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_token_budget: Option<bool>,
     /// Whether the provider supports OpenAI custom tools with Lark/regex
     /// grammar formats. Also in OpenAIResponsesCompat.
     #[serde(rename = "supportsOpenAIGrammarTools")]
@@ -1521,6 +1539,10 @@ pub struct ModelCompat {
     pub supports_long_cache_retention: Option<bool>,
 
     // --- OpenAIResponsesCompat only ---
+    /// Whether the model supports message-anchored `additional_tools` input
+    /// items. Default: false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_additional_tools: Option<bool>,
     /// Whether the model supports client-executed tool search for deferred tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_tool_search: Option<bool>,

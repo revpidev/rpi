@@ -2,6 +2,8 @@
 //! the upstream suites `google-shared-convert-tools.test.ts`,
 //! `google-shared-gemini3-unsigned-tool-call.test.ts`,
 //! `google-shared-image-tool-result-routing.test.ts`,
+//! `google-shared-signed-empty-blocks.test.ts` (6138f5a07 @ 4181f66),
+//! `google-shared-retry.test.ts` (b9d360a2c @ 4181f66),
 //! `google-thinking-disable.test.ts` (E2E intent ported to wire-shape
 //! assertions — upstream's live tests are env-gated) and
 //! `google-thinking-signature.test.ts`, plus the requirements §5.2 anchors:
@@ -82,6 +84,52 @@ async fn serve(script: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<Capt
                 "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        }
+    });
+    (format!("http://{addr}"), rx)
+}
+
+/// Scripted response for [`serve_with_response_headers`]: status, extra
+/// response headers, body.
+type ScriptedResponse = (u16, Vec<(&'static str, &'static str)>, &'static str);
+
+/// `serve` variant whose responses carry extra headers (the retry-after
+/// test needs a `retry-after` response header).
+async fn serve_with_response_headers(
+    script: Vec<ScriptedResponse>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tx, rx) = mpsc::channel(script.len().max(1));
+    tokio::spawn(async move {
+        for (status, extra_headers, body) in script {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let request = read_request(&mut socket).await;
+            tx.send(request).await.expect("send captured request");
+            let reason = match status {
+                200 => "OK",
+                400 => "Bad Request",
+                429 => "Too Many Requests",
+                _ => "Status",
+            };
+            let content_type = if status == 200 {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            let mut response =
+                format!("HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\n");
+            for (name, value) in extra_headers {
+                response.push_str(&format!("{name}: {value}\r\n"));
+            }
+            response.push_str(&format!(
+                "content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            ));
             socket
                 .write_all(response.as_bytes())
                 .await
@@ -1013,7 +1061,21 @@ fn tool_call_context(model: &Model, thought_signature: Option<&str>) -> Context 
         "stopReason": "toolUse", "timestamp": 0
     }))
     .expect("assistant");
-    context(vec![user_text("Hi"), assistant])
+    // cbaca6038: the upstream context carries the matching tool results so
+    // function-response ids are covered too.
+    let tool_result = |id: &str, text: &str| -> Message {
+        serde_json::from_value(json!({
+            "role": "toolResult", "toolCallId": id, "toolName": "bash",
+            "content": [{"type": "text", "text": text}], "isError": false, "timestamp": 0
+        }))
+        .expect("toolResult")
+    };
+    context(vec![
+        user_text("Hi"),
+        assistant,
+        tool_result("call_1", "hi"),
+        tool_result("call_2", "files"),
+    ])
 }
 
 fn function_call_parts(contents: &[Value]) -> Vec<&Value> {
@@ -1027,6 +1089,60 @@ fn function_call_parts(contents: &[Value]) -> Vec<&Value> {
         .iter()
         .filter(|part| part.get("functionCall").is_some())
         .collect()
+}
+
+/// All `functionResponse` parts across turns.
+fn function_response_parts(contents: &[Value]) -> Vec<&Value> {
+    contents
+        .iter()
+        .flat_map(|content| {
+            content["parts"]
+                .as_array()
+                .map(|parts| parts.as_slice())
+                .unwrap_or(&[])
+        })
+        .filter(|part| part.get("functionResponse").is_some())
+        .collect()
+}
+
+/// cbaca6038: "preserves tool call IDs for $id via $api history" — Gemini
+/// 3.x+ requires explicit tool call IDs in function calls AND responses.
+#[test]
+fn test_convert_messages_preserves_tool_call_ids_for_gemini_3() {
+    let vertex_model = model_with_id(
+        "gemini-3-pro-preview",
+        "https://example.com",
+        json!({"api": "google-vertex", "provider": "google-vertex"}),
+    );
+    for model in [
+        gemini3_model("gemini-3-pro-preview"),
+        gemini3_model("gemini-3.6-flash"),
+        vertex_model,
+    ] {
+        let contents = convert_messages(&model, &tool_call_context(&model, None));
+        let function_call_ids: Vec<&str> = function_call_parts(&contents)
+            .iter()
+            .filter_map(|part| part["functionCall"]["id"].as_str())
+            .collect();
+        let function_response_ids: Vec<&str> = function_response_parts(&contents)
+            .iter()
+            .filter_map(|part| part["functionResponse"]["id"].as_str())
+            .collect();
+        assert_eq!(
+            function_call_ids,
+            ["call_1", "call_2"],
+            "function call ids for {} via {}",
+            model.id,
+            model.api.as_str()
+        );
+        assert_eq!(
+            function_response_ids,
+            ["call_1", "call_2"],
+            "function response ids for {} via {}",
+            model.id,
+            model.api.as_str()
+        );
+    }
 }
 
 #[test]
@@ -1059,6 +1175,8 @@ fn test_convert_messages_preserves_valid_signature_same_provider_model() {
 
 #[test]
 fn test_convert_messages_drops_signature_for_other_model() {
+    // cbaca6038: upstream "does not add a thoughtSignature for non-Gemini-3
+    // models" — Gemini < 3 also omits tool call ids on both sides.
     let model = gemini3_model("gemini-2.5-flash");
     let mut ctx_model = model.clone();
     ctx_model.id = "other-model".to_owned();
@@ -1067,10 +1185,149 @@ fn test_convert_messages_drops_signature_for_other_model() {
         &tool_call_context(&ctx_model, Some("AAAAAAAAAAAAAAAAAAAAAA==")),
     );
     let parts = function_call_parts(&contents);
-    assert!(!parts.is_empty());
+    assert_eq!(parts.len(), 2);
     assert!(parts
         .iter()
         .all(|part| part.get("thoughtSignature").is_none()));
+    assert!(parts
+        .iter()
+        .all(|part| part["functionCall"].get("id").is_none()));
+    let responses = function_response_parts(&contents);
+    assert_eq!(responses.len(), 2);
+    assert!(responses
+        .iter()
+        .all(|part| part["functionResponse"].get("id").is_none()));
+}
+
+// ---------------------------------------------------------------------------
+// Ported intent of upstream test: google-shared-signed-empty-blocks.test.ts
+// (6138f5a07 @ 4181f66, #7362)
+//
+// Gemini can attach `thoughtSignature` to a response part whose visible text
+// is empty (e.g. a thought burst preceding a function call) and requires the
+// signature echoed back on the next request. Dropping such blocks while
+// rebuilding history silently breaks the reasoning chain: the model then
+// intermittently ends a mid-task turn with a thought-only STOP and no tool
+// call. These tests pin the rule: an empty text/thinking block is skipped
+// only when it is UNSIGNED.
+// ---------------------------------------------------------------------------
+
+const VALID_SIG: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
+
+fn signed_empty_context(model: &Model, content: Value) -> Context {
+    let assistant: Message = serde_json::from_value(json!({
+        "role": "assistant",
+        "content": content,
+        "api": model.api, "provider": model.provider, "model": model.id,
+        "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                  "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+        "stopReason": "toolUse", "timestamp": 0
+    }))
+    .expect("assistant");
+    context(vec![user_text("Hi"), assistant])
+}
+
+fn model_turn_parts(contents: &[Value]) -> &[Value] {
+    contents
+        .iter()
+        .find(|content| content["role"] == json!("model"))
+        .and_then(|content| content["parts"].as_array())
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+fn signed_parts(contents: &[Value]) -> Vec<&Value> {
+    model_turn_parts(contents)
+        .iter()
+        .filter(|part| part["thoughtSignature"] == json!(VALID_SIG))
+        .collect()
+}
+
+/// Upstream: "keeps a signed empty thinking block so its signature is echoed
+/// back".
+#[test]
+fn test_convert_messages_keeps_signed_empty_thinking_block() {
+    let model = gemini3_model("gemini-3-pro-preview");
+    let contents = convert_messages(
+        &model,
+        &signed_empty_context(
+            &model,
+            json!([
+                {"type": "thinking", "thinking": "", "thinkingSignature": VALID_SIG},
+                {"type": "toolCall", "id": "call_1", "name": "bash", "arguments": {"command": "ls"}},
+            ]),
+        ),
+    );
+    let signed = signed_parts(&contents);
+    assert_eq!(signed.len(), 1);
+    assert_eq!(signed[0]["thought"], json!(true));
+}
+
+/// Upstream: "keeps a signed empty text block the same way".
+#[test]
+fn test_convert_messages_keeps_signed_empty_text_block() {
+    let model = gemini3_model("gemini-3-pro-preview");
+    let contents = convert_messages(
+        &model,
+        &signed_empty_context(
+            &model,
+            json!([
+                {"type": "text", "text": "", "textSignature": VALID_SIG},
+                {"type": "toolCall", "id": "call_1", "name": "bash", "arguments": {"command": "ls"}},
+            ]),
+        ),
+    );
+    assert_eq!(signed_parts(&contents).len(), 1);
+}
+
+/// Upstream: "still drops unsigned empty blocks".
+#[test]
+fn test_convert_messages_drops_unsigned_empty_blocks() {
+    let model = gemini3_model("gemini-3-pro-preview");
+    let contents = convert_messages(
+        &model,
+        &signed_empty_context(
+            &model,
+            json!([
+                {"type": "thinking", "thinking": ""},
+                {"type": "text", "text": "   "},
+                {"type": "toolCall", "id": "call_1", "name": "bash", "arguments": {"command": "ls"}},
+            ]),
+        ),
+    );
+    let parts = model_turn_parts(&contents);
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].get("functionCall").is_some());
+}
+
+/// Upstream: "still drops signed empty blocks from a different
+/// provider/model (signature unusable)".
+#[test]
+fn test_convert_messages_drops_signed_empty_blocks_for_other_model() {
+    let model = gemini3_model("gemini-3-pro-preview");
+    let mut ctx_model = model.clone();
+    ctx_model.id = "other-model".to_owned();
+    let contents = convert_messages(
+        &model,
+        &signed_empty_context(
+            &ctx_model,
+            json!([
+                {"type": "thinking", "thinking": "", "thinkingSignature": VALID_SIG},
+                {"type": "text", "text": "", "textSignature": VALID_SIG},
+                {"type": "toolCall", "id": "call_1", "name": "bash", "arguments": {"command": "ls"}},
+            ]),
+        ),
+    );
+    let parts = model_turn_parts(&contents);
+    assert_eq!(parts.len(), 1);
+    assert!(parts[0].get("functionCall").is_some());
+    let model_turn = contents
+        .iter()
+        .find(|content| content["role"] == json!("model"))
+        .expect("model turn");
+    assert!(!serde_json::to_string(model_turn)
+        .expect("json")
+        .contains(VALID_SIG));
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,7 +1434,110 @@ fn test_map_stop_reason() {
 
 #[test]
 fn test_requires_tool_call_id() {
-    assert!(requires_tool_call_id("claude-opus-4-1"));
+    // cbaca6038: Gemini 3.x+ requires explicit tool call IDs (before the
+    // change only claude-*/gpt-oss-* did).
+    assert!(!requires_tool_call_id("gemini-2.5-flash"));
+    assert!(requires_tool_call_id("gemini-3.6-flash"));
+    assert!(requires_tool_call_id("claude-sonnet-4-5"));
     assert!(requires_tool_call_id("gpt-oss-120b"));
-    assert!(!requires_tool_call_id("gemini-3-pro-preview"));
+}
+
+// ---------------------------------------------------------------------------
+// Ported intent of upstream test: google-shared-retry.test.ts
+// (b9d360a2c @ 4181f66, #7471) — the initial request runs under the shared
+// provider retry policy via `retryGoogleRequest` (opt-in via `maxRetries`).
+// Upstream drives the helper with a mocked SDK; rpi ports the intents to
+// wire-level scripted servers (the rpi helper has no SDK ApiError to
+// normalize — see google_shared.rs).
+// ---------------------------------------------------------------------------
+
+const GOOGLE_429_BODY: &str =
+    "{\"error\":{\"code\":429,\"message\":\"quota\",\"status\":\"RESOURCE_EXHAUSTED\"}}";
+const GOOGLE_400_BODY: &str =
+    "{\"error\":{\"code\":400,\"message\":\"bad request\",\"status\":\"INVALID_ARGUMENT\"}}";
+
+/// Upstream: "retries a headers-less SDK error with a retryable status".
+#[tokio::test]
+async fn test_google_retries_retryable_status_with_max_retries() {
+    let (base_url, mut captured) =
+        serve(vec![(429, GOOGLE_429_BODY), (200, GOOGLE_TEXT_SSE)]).await;
+    let m = model(&base_url);
+    let mut opts = options();
+    opts.max_retries = Some(1);
+    let events =
+        collect(GoogleGenerativeAi.stream(&m, &context(vec![user_text("hi")]), Some(opts))).await;
+
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "expected done after retry, got {events:?}"
+    );
+    assert!(captured.recv().await.is_some(), "first request");
+    assert!(captured.recv().await.is_some(), "retried request");
+}
+
+/// Upstream: "does not retry when maxRetries is unset".
+#[tokio::test]
+async fn test_google_does_not_retry_when_max_retries_unset() {
+    let (base_url, mut captured) = serve(vec![(429, GOOGLE_429_BODY)]).await;
+    let m = model(&base_url);
+    let events =
+        collect(GoogleGenerativeAi.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+            .await;
+
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(error.error_message.as_deref(), Some(GOOGLE_429_BODY));
+    assert!(captured.recv().await.is_some(), "first request");
+    assert!(
+        captured.recv().await.is_none(),
+        "no retry without maxRetries"
+    );
+}
+
+/// Upstream: "does not retry a non-retryable status".
+#[tokio::test]
+async fn test_google_does_not_retry_non_retryable_status() {
+    let (base_url, mut captured) = serve(vec![(400, GOOGLE_400_BODY)]).await;
+    let m = model(&base_url);
+    let mut opts = options();
+    opts.max_retries = Some(2);
+    let events =
+        collect(GoogleGenerativeAi.stream(&m, &context(vec![user_text("hi")]), Some(opts))).await;
+
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(error.error_message.as_deref(), Some(GOOGLE_400_BODY));
+    assert!(captured.recv().await.is_some(), "first request");
+    assert!(
+        captured.recv().await.is_none(),
+        "400 is not in the retryable set"
+    );
+}
+
+/// The retry-after channel (R2.4.2): the 429 response's `retry-after` header
+/// reaches the shared backoff policy through the captured response headers.
+/// (`retry-after: 0` keeps the test fast; the parsing/capping itself is
+/// pinned byte-for-byte in `utils::provider_retry` tests.)
+#[tokio::test]
+async fn test_google_retry_honors_retry_after_header() {
+    let (base_url, mut captured) = serve_with_response_headers(vec![
+        (429, vec![("retry-after", "0")], GOOGLE_429_BODY),
+        (200, vec![], GOOGLE_TEXT_SSE),
+    ])
+    .await;
+    let m = model(&base_url);
+    let mut opts = options();
+    opts.max_retries = Some(1);
+    let events =
+        collect(GoogleGenerativeAi.stream(&m, &context(vec![user_text("hi")]), Some(opts))).await;
+
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "expected done after server-directed retry, got {events:?}"
+    );
+    assert!(captured.recv().await.is_some(), "first request");
+    assert!(captured.recv().await.is_some(), "retried request");
 }

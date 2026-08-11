@@ -139,6 +139,18 @@ fn convert_tool_result_output(model: &Model, content: &[ToolResultContent]) -> V
 // Options
 // =============================================================================
 
+/// `ConvertResponsesMessagesOptions.deferredToolsMode` (e47b8e37a, #7709):
+/// how transcript-loaded deferred tools are replayed — GPT-5.6-family models
+/// take message-anchored `additional_tools` input items; tool-search models
+/// take the client-executed `tool_search_call`/`tool_search_output` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponsesDeferredToolsMode {
+    /// `"additional-tools"`.
+    AdditionalTools,
+    /// `"tool-search"`.
+    ToolSearch,
+}
+
 /// `ConvertResponsesToolsOptions`. Upstream defaults apply in
 /// [`convert_responses_tools`]: `strict` → false, `supportsStrictMode` →
 /// true, `supportsOpenAIGrammarTools` → false.
@@ -158,6 +170,8 @@ pub struct ConvertResponsesMessagesOptions<'a> {
     /// Deferred tools keyed by name, insertion-ordered (upstream
     /// `ReadonlyMap<string, Tool>`).
     pub deferred_tools: Option<&'a [(String, Tool)]>,
+    /// e47b8e37a: deferred-tool replay mode; `None` emits no replay items.
+    pub deferred_tools_mode: Option<ResponsesDeferredToolsMode>,
     pub tool_options: ConvertResponsesToolsOptions,
 }
 
@@ -167,6 +181,7 @@ impl Default for ConvertResponsesMessagesOptions<'_> {
             include_system_prompt: true,
             grammar_tool_input_properties: None,
             deferred_tools: None,
+            deferred_tools_mode: None,
             tool_options: ConvertResponsesToolsOptions::default(),
         }
     }
@@ -301,6 +316,11 @@ pub fn convert_responses_messages(
             },
             Message::Assistant(assistant) => {
                 let mut output: Vec<Value> = Vec::new();
+                // 02bd2d1c6 (#7709): namespace replay is allowed for same-model
+                // messages or tools loaded through a deferred-tool marker.
+                let is_same_model = assistant.model == model.id
+                    && assistant.provider == model.provider
+                    && assistant.api == model.api;
                 let is_different_model = assistant.model != model.id
                     && assistant.provider == model.provider
                     && assistant.api == model.api;
@@ -374,6 +394,13 @@ pub fn convert_responses_messages(
                                 item_id = None;
                             }
 
+                            // 02bd2d1c6: `isSameModel ||
+                            // options?.deferredTools?.has(toolCall.name)`.
+                            let can_replay_namespace = is_same_model
+                                || options.deferred_tools.is_some_and(|deferred| {
+                                    deferred.iter().any(|(name, _)| *name == tool_call.name)
+                                });
+
                             if let Some(property) = custom_input_property {
                                 let input = get_grammar_tool_input(
                                     &tool_call.name,
@@ -389,6 +416,11 @@ pub fn convert_responses_messages(
                                 if let Some(item_id) = item_id {
                                     item["id"] = json!(item_id);
                                 }
+                                if can_replay_namespace {
+                                    if let Some(namespace) = &tool_call.namespace {
+                                        item["namespace"] = json!(namespace);
+                                    }
+                                }
                                 output.push(item);
                             } else {
                                 let mut item = json!({
@@ -400,6 +432,11 @@ pub fn convert_responses_messages(
                                 });
                                 if let Some(item_id) = item_id {
                                     item["id"] = json!(item_id);
+                                }
+                                if can_replay_namespace {
+                                    if let Some(namespace) = &tool_call.namespace {
+                                        item["namespace"] = json!(namespace);
+                                    }
                                 }
                                 output.push(item);
                             }
@@ -448,7 +485,21 @@ pub fn convert_responses_messages(
                     loaded_tool_names.insert(name.clone());
                     deferred_tools.push(tool.clone());
                 }
-                if !deferred_tools.is_empty() {
+                if !deferred_tools.is_empty()
+                    && options.deferred_tools_mode
+                        == Some(ResponsesDeferredToolsMode::AdditionalTools)
+                {
+                    // e47b8e37a (#7709): GPT-5.6-family models take the
+                    // message-anchored `additional_tools` input item; tools
+                    // are NOT marked defer_loading here.
+                    messages.push(json!({
+                        "type": "additional_tools",
+                        "role": "developer",
+                        "tools": convert_responses_tools(&deferred_tools, &options.tool_options)?,
+                    }));
+                } else if !deferred_tools.is_empty()
+                    && options.deferred_tools_mode == Some(ResponsesDeferredToolsMode::ToolSearch)
+                {
                     let names: Vec<&str> = deferred_tools
                         .iter()
                         .map(|tool| tool.name.as_str())
@@ -794,7 +845,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
                             .to_owned(),
                         arguments: Map::new(),
                         thought_signature: None,
-                        namespace: None,
+                        // 02bd2d1c6 (#7709): preserve the Responses namespace.
+                        namespace: item
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -840,7 +895,11 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         name: name.to_owned(),
                         arguments,
                         thought_signature: None,
-                        namespace: None,
+                        // 02bd2d1c6 (#7709): preserve the Responses namespace.
+                        namespace: item
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     }));
                 let slot = Slot::ToolCall {
                     content_index: self.output.content.len() - 1,
@@ -1285,6 +1344,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                                 }
                             };
                             block.arguments = parse_streaming_json(Some(source));
+                            // 02bd2d1c6: a namespace on the done item wins.
+                            if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+                                block.namespace = Some(namespace.to_owned());
+                            }
                             events.push(StreamEvent::ToolCallEnd {
                                 content_index,
                                 tool_call: block.clone(),
@@ -1322,6 +1385,10 @@ impl<'a> ResponsesStreamProcessor<'a> {
                         if let Some(AssistantContent::ToolCall(block)) =
                             self.output.content.get_mut(content_index)
                         {
+                            // 02bd2d1c6: a namespace on the done item wins.
+                            if let Some(namespace) = item.get("namespace").and_then(Value::as_str) {
+                                block.namespace = Some(namespace.to_owned());
+                            }
                             events.push(StreamEvent::ToolCallEnd {
                                 content_index,
                                 tool_call: block.clone(),
@@ -1786,6 +1853,8 @@ mod tests {
         let deferred: Vec<(String, Tool)> = vec![("web_search".to_owned(), search_tool)];
         let options = ConvertResponsesMessagesOptions {
             deferred_tools: Some(&deferred),
+            // e47b8e37a: the tool-search replay pair is gated on the mode.
+            deferred_tools_mode: Some(ResponsesDeferredToolsMode::ToolSearch),
             ..ConvertResponsesMessagesOptions::default()
         };
         let ctx = common::context(
@@ -1813,6 +1882,265 @@ mod tests {
         assert_eq!(out[3]["call_id"], out[2]["call_id"]);
         assert_eq!(out[3]["tools"][0]["name"], json!("web_search"));
         assert_eq!(out[3]["tools"][0]["defer_loading"], json!(true));
+    }
+
+    /// e47b8e37a @ 4181f66 (#7709), upstream deferred-tools.test.ts "loads an
+    /// OpenAI Responses tool through additional_tools": the GPT-5.6-family
+    /// replay is a message-anchored `additional_tools` input item without
+    /// `defer_loading`, and no tool-search items are emitted.
+    #[test]
+    fn test_convert_additional_tools_deferred() {
+        let deferred: Vec<(String, Tool)> =
+            vec![("late_tool".to_owned(), common::tool("late_tool"))];
+        let options = ConvertResponsesMessagesOptions {
+            deferred_tools: Some(&deferred),
+            deferred_tools_mode: Some(ResponsesDeferredToolsMode::AdditionalTools),
+            ..ConvertResponsesMessagesOptions::default()
+        };
+        let ctx = common::context(
+            vec![
+                same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
+                ])),
+                common::tool_result(
+                    "call_1|fc_1",
+                    json!([{"type": "text", "text": "ok"}]),
+                    json!({"addedToolNames": ["late_tool"]}),
+                ),
+            ],
+            None,
+        );
+        let out = convert(&model(json!({})), &ctx, &options);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2]["type"], json!("additional_tools"));
+        assert_eq!(out[2]["role"], json!("developer"));
+        assert_eq!(out[2]["tools"][0]["type"], json!("function"));
+        assert_eq!(out[2]["tools"][0]["name"], json!("late_tool"));
+        assert!(out[2]["tools"][0].get("defer_loading").is_none());
+        assert!(out
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_call")));
+        assert!(out
+            .iter()
+            .all(|item| item["type"] != json!("tool_search_output")));
+
+        // No mode: deferred tools are not replayed at all.
+        let options = ConvertResponsesMessagesOptions {
+            deferred_tools: Some(&deferred),
+            ..ConvertResponsesMessagesOptions::default()
+        };
+        let out = convert(&model(json!({})), &ctx, &options);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// e47b8e37a @ 4181f66 (#7709), upstream "preserves an additional_tools
+    /// marker after the loaded tool is used": exactly one marker, anchored
+    /// before the loaded tool's function_call.
+    #[test]
+    fn test_convert_additional_tools_marker_preserved_after_use() {
+        let deferred: Vec<(String, Tool)> =
+            vec![("late_tool".to_owned(), common::tool("late_tool"))];
+        let options = ConvertResponsesMessagesOptions {
+            deferred_tools: Some(&deferred),
+            deferred_tools_mode: Some(ResponsesDeferredToolsMode::AdditionalTools),
+            ..ConvertResponsesMessagesOptions::default()
+        };
+        let ctx = common::context(
+            vec![
+                same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_1|fc_1", "name": "base_tool", "arguments": {}}
+                ])),
+                common::tool_result(
+                    "call_1|fc_1",
+                    json!([{"type": "text", "text": "ok"}]),
+                    json!({"addedToolNames": ["late_tool"]}),
+                ),
+                same_model_assistant(json!([
+                    {"type": "toolCall", "id": "call_late|fc_late", "name": "late_tool", "arguments": {}}
+                ])),
+                common::tool_result(
+                    "call_late|fc_late",
+                    json!([{"type": "text", "text": "done"}]),
+                    json!({}),
+                ),
+            ],
+            None,
+        );
+        let out = convert(&model(json!({})), &ctx, &options);
+        let marker_indexes: Vec<usize> = out
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item["type"] == json!("additional_tools"))
+            .map(|(index, _)| index)
+            .collect();
+        let late_call_index = out
+            .iter()
+            .position(|item| {
+                item["type"] == json!("function_call") && item["name"] == json!("late_tool")
+            })
+            .expect("late_tool function_call");
+        assert_eq!(marker_indexes.len(), 1);
+        assert!(marker_indexes[0] < late_call_index);
+    }
+
+    // -- namespace replay (02bd2d1c6 @ 4181f66, #7709) -------------------------
+
+    /// Upstream openai-responses-namespace.test.ts: "round-trips a function
+    /// namespace received only on output_item.done".
+    #[test]
+    fn test_namespace_round_trip_function_call() {
+        let raw = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "function_call", "id": "fc_test", "call_id": "call_test",
+                            "name": "lookup", "arguments": ""}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "function_call", "id": "fc_test", "call_id": "call_test",
+                            "name": "lookup", "arguments": "{\"value\":\"hello\"}",
+                            "namespace": "dynamic_tools"}}),
+            json!({"type": "response.completed", "response": {"id": "resp_test", "status": "completed"}}),
+        ];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &no_grammar(), &raw);
+        assert_eq!(result, Ok(()));
+        let AssistantContent::ToolCall(tool_call) = &output.content[0] else {
+            panic!("expected toolCall block");
+        };
+        assert_eq!(tool_call.id, "call_test|fc_test");
+        assert_eq!(tool_call.name, "lookup");
+        assert_eq!(
+            serde_json::to_value(&tool_call.arguments).expect("json"),
+            json!({"value": "hello"})
+        );
+        assert_eq!(tool_call.namespace.as_deref(), Some("dynamic_tools"));
+
+        // Same-model replay keeps the namespace.
+        let ctx = common::context(vec![Message::Assistant(output)], None);
+        let out = convert(&m, &ctx, &default_options());
+        let function_call = out
+            .iter()
+            .find(|item| item["type"] == json!("function_call"))
+            .expect("function_call");
+        assert_eq!(function_call["id"], json!("fc_test"));
+        assert_eq!(function_call["call_id"], json!("call_test"));
+        assert_eq!(function_call["name"], json!("lookup"));
+        assert_eq!(function_call["arguments"], json!("{\"value\":\"hello\"}"));
+        assert_eq!(function_call["namespace"], json!("dynamic_tools"));
+    }
+
+    /// Upstream: "round-trips a custom-tool namespace received only on
+    /// output_item.done".
+    #[test]
+    fn test_namespace_round_trip_custom_tool_call() {
+        let grammar_props = HashMap::from([("query".to_owned(), "input".to_owned())]);
+        let raw = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "id": "ctc_test", "call_id": "call_test",
+                            "name": "query", "input": ""}}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "id": "ctc_test", "call_id": "call_test",
+                            "name": "query", "input": "hello", "namespace": "dynamic_tools"}}),
+            json!({"type": "response.completed", "response": {"id": "resp_test", "status": "completed"}}),
+        ];
+        let m = model(json!({}));
+        let (_events, result, output) = replay(&m, &grammar_props, &raw);
+        assert_eq!(result, Ok(()));
+        let AssistantContent::ToolCall(tool_call) = &output.content[0] else {
+            panic!("expected toolCall block");
+        };
+        assert_eq!(tool_call.id, "call_test|ctc_test");
+        assert_eq!(tool_call.name, "query");
+        assert_eq!(
+            serde_json::to_value(&tool_call.arguments).expect("json"),
+            json!({"input": "hello"})
+        );
+        assert_eq!(tool_call.namespace.as_deref(), Some("dynamic_tools"));
+
+        let ctx = common::context(vec![Message::Assistant(output)], None);
+        let options = ConvertResponsesMessagesOptions {
+            grammar_tool_input_properties: Some(&grammar_props),
+            ..ConvertResponsesMessagesOptions::default()
+        };
+        let out = convert(&m, &ctx, &options);
+        let custom_call = out
+            .iter()
+            .find(|item| item["type"] == json!("custom_tool_call"))
+            .expect("custom_tool_call");
+        assert_eq!(custom_call["id"], json!("ctc_test"));
+        assert_eq!(custom_call["call_id"], json!("call_test"));
+        assert_eq!(custom_call["name"], json!("query"));
+        assert_eq!(custom_call["input"], json!("hello"));
+        assert_eq!(custom_call["namespace"], json!("dynamic_tools"));
+    }
+
+    /// Upstream: "drops namespaces when the target cannot replay their load
+    /// items" (different model id, different provider, or a target without
+    /// the deferred tool in scope).
+    #[test]
+    fn test_namespace_dropped_when_target_cannot_replay() {
+        let ctx = common::context(
+            vec![same_model_assistant(json!([
+                {"type": "toolCall", "id": "call_function|fc_test", "name": "lookup",
+                 "arguments": {"value": "hello"}, "namespace": "dynamic_tools"},
+                {"type": "toolCall", "id": "call_custom|ctc_test", "name": "query",
+                 "arguments": {"input": "hello"}, "namespace": "dynamic_tools"}
+            ]))],
+            None,
+        );
+        let grammar_props = HashMap::from([("query".to_owned(), "input".to_owned())]);
+        let targets = [
+            // Same provider/api, different model id.
+            model(json!({"id": "gpt-5.2"})),
+            // Different provider.
+            model(json!({"provider": "azure-openai-responses"})),
+            // Codex target.
+            model(json!({
+                "api": "openai-codex-responses", "provider": "openai-codex",
+                "id": "gpt-5.3-codex-spark"
+            })),
+        ];
+        for target in &targets {
+            let options = ConvertResponsesMessagesOptions {
+                grammar_tool_input_properties: Some(&grammar_props),
+                ..ConvertResponsesMessagesOptions::default()
+            };
+            let out = convert(target, &ctx, &options);
+            let function_call = out
+                .iter()
+                .find(|item| item["type"] == json!("function_call"))
+                .expect("function_call");
+            let custom_call = out
+                .iter()
+                .find(|item| item["type"] == json!("custom_tool_call"))
+                .expect("custom_tool_call");
+            assert!(
+                function_call.get("namespace").is_none(),
+                "target {}",
+                target.id
+            );
+            assert!(
+                custom_call.get("namespace").is_none(),
+                "target {}",
+                target.id
+            );
+        }
+    }
+
+    /// Upstream: "does not add a namespace to ordinary function calls".
+    #[test]
+    fn test_namespace_absent_on_ordinary_function_calls() {
+        let ctx = common::context(
+            vec![same_model_assistant(json!([
+                {"type": "toolCall", "id": "call_test|fc_test", "name": "lookup",
+                 "arguments": {"value": "hello"}}
+            ]))],
+            None,
+        );
+        let out = convert(&model(json!({})), &ctx, &default_options());
+        let function_call = out
+            .iter()
+            .find(|item| item["type"] == json!("function_call"))
+            .expect("function_call");
+        assert!(function_call.get("namespace").is_none());
     }
 
     // -- tool conversion ------------------------------------------------------

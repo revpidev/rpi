@@ -1,12 +1,14 @@
-//! Port of `packages/ai/src/api/google-shared.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/api/google-shared.ts` @ pi 0.82.1 (2efa728);
+//! signed-empty-block retention, Gemini 3 tool call IDs, and the GenAI
+//! request retry helper updated to 4181f66 (6138f5a07, cbaca6038, b9d360a2c).
 //!
 //! Shared utilities for the Google Generative AI (and later Vertex) adapters:
 //! thinking-part detection, thought-signature retention/validation, message
 //! conversion to Gemini `Content[]` (function-response merging, multimodal
 //! function-response routing for Gemini 3+), tool conversion
 //! (`parametersJsonSchema` vs legacy OpenAPI `parameters` with meta-key
-//! stripping), strict tool sampling / function-calling-mode resolution, and
-//! finish-reason mapping.
+//! stripping), strict tool sampling / function-calling-mode resolution,
+//! finish-reason mapping, and the initial-request retry wrapper.
 //!
 //! Intentional differences (upstream deviations):
 //! - Converted messages are plain [`serde_json::Value`] parts shaped like the
@@ -19,8 +21,11 @@ use serde_json::{json, Value};
 
 use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::types::{
-    AssistantContent, Context, InputModality, Message, Model, StopReason, Tool, ToolResultContent,
-    UserContent, UserContentBlock,
+    AssistantContent, Context, InputModality, Message, Model, StopReason, StreamOptions, Tool,
+    ToolResultContent, UserContent, UserContentBlock,
+};
+use crate::utils::provider_retry::{
+    retry_provider_request, ProviderErrorInfo, ProviderRetryOptions, RetryError,
 };
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::transform_messages::transform_messages;
@@ -99,9 +104,14 @@ fn resolve_thought_signature(
 }
 
 /// `requiresToolCallId`: models via Google APIs that require explicit tool
-/// call IDs in function calls/responses.
+/// call IDs in function calls/responses. Extended to Gemini 3.x+ by
+/// cbaca6038 (#7494): Gemini 3 echoes tool call IDs and rejects histories
+/// that drop them.
 pub fn requires_tool_call_id(model_id: &str) -> bool {
-    model_id.starts_with("claude-") || model_id.starts_with("gpt-oss-")
+    let gemini_major_version = get_gemini_major_version(model_id);
+    model_id.starts_with("claude-")
+        || model_id.starts_with("gpt-oss-")
+        || gemini_major_version.is_some_and(|major| major >= 3)
 }
 
 /// `getGeminiMajorVersion` (`/^gemini(?:-live)?-(\d+)/` on the lowercase id).
@@ -191,40 +201,59 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                 for block in &assistant.content {
                     match block {
                         AssistantContent::Text(text) => {
-                            // Skip empty text blocks.
-                            if text.text.trim().is_empty() {
+                            // 6138f5a07 (#7362): skip empty text blocks —
+                            // unless they carry a thought signature. Gemini can
+                            // attach the signature to a part whose visible text
+                            // is empty and requires it echoed back; dropping it
+                            // breaks the reasoning chain and the model
+                            // intermittently ends mid-task turns with a
+                            // thought-only STOP (empty completion, no tool
+                            // call).
+                            let thought_signature = resolve_thought_signature(
+                                is_same_provider_and_model,
+                                text.text_signature.as_deref(),
+                            );
+                            if text.text.trim().is_empty() && thought_signature.is_none() {
                                 continue;
                             }
                             let mut part = json!({"text": sanitize_surrogates(&text.text)});
-                            if let Some(signature) = resolve_thought_signature(
-                                is_same_provider_and_model,
-                                text.text_signature.as_deref(),
-                            ) {
+                            if let Some(signature) = thought_signature {
                                 part["thoughtSignature"] = json!(signature);
                             }
                             parts.push(part);
                         }
                         AssistantContent::Thinking(thinking) => {
-                            // Skip empty thinking blocks.
-                            if thinking.thinking.trim().is_empty() {
-                                continue;
-                            }
                             // Same provider AND same model: keep as a thought
                             // part; otherwise convert to plain text (no tags to
                             // avoid the model mimicking them).
                             if is_same_provider_and_model {
+                                let thought_signature = resolve_thought_signature(
+                                    is_same_provider_and_model,
+                                    thinking.thinking_signature.as_deref(),
+                                );
+                                // Same rule as text blocks (6138f5a07): an
+                                // empty thinking block is dropped only when it
+                                // carries no signature (mirrors the anthropic
+                                // converter's handling).
+                                if thinking.thinking.trim().is_empty()
+                                    && thought_signature.is_none()
+                                {
+                                    continue;
+                                }
                                 let mut part = json!({
                                     "thought": true,
                                     "text": sanitize_surrogates(&thinking.thinking),
                                 });
-                                if let Some(signature) = resolve_thought_signature(
-                                    is_same_provider_and_model,
-                                    thinking.thinking_signature.as_deref(),
-                                ) {
+                                if let Some(signature) = thought_signature {
                                     part["thoughtSignature"] = json!(signature);
                                 }
                                 parts.push(part);
                             } else {
+                                // Cross-provider/model: the signature is
+                                // unusable, empty blocks stay dropped.
+                                if thinking.thinking.trim().is_empty() {
+                                    continue;
+                                }
                                 parts
                                     .push(json!({"text": sanitize_surrogates(&thinking.thinking)}));
                             }
@@ -499,4 +528,34 @@ pub fn map_stop_reason_string(reason: &str) -> StopReason {
         "MAX_TOKENS" => StopReason::Length,
         _ => StopReason::Error,
     }
+}
+
+/// `retryGoogleRequest` (b9d360a2c, #7471): run the initial Google GenAI
+/// request under the shared provider retry policy (408/409/429/5xx with
+/// backoff, honoring retry-after), mirroring how the Anthropic and OpenAI
+/// adapters wrap their initial request in `retryProviderRequest`.
+///
+/// Upstream additionally normalizes the `@google/genai` SDK's `ApiError`
+/// (which has `status` but no `headers` property) so `retryProviderRequest`'s
+/// provider-error guard recognizes it; rpi adapters construct
+/// [`ProviderErrorInfo`] from the raw reqwest response, which always carries
+/// both fields, so no normalization is needed here. Opt-in via
+/// `StreamOptions::max_retries`; the default (unset) performs no retries.
+pub async fn retry_google_request<T, F, Fut>(
+    request: F,
+    options: &StreamOptions,
+) -> Result<T, RetryError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, ProviderErrorInfo>>,
+{
+    retry_provider_request(
+        request,
+        ProviderRetryOptions {
+            max_retries: options.max_retries,
+            max_retry_delay_ms: options.max_retry_delay_ms,
+        },
+        options.signal.as_ref(),
+    )
+    .await
 }

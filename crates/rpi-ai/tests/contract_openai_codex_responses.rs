@@ -362,10 +362,14 @@ async fn handle_ws(
 static WS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn mock_token() -> String {
+    mock_token_for("acc_test")
+}
+
+fn mock_token_for(account_id: &str) -> String {
     use base64::Engine;
     let payload = base64::engine::general_purpose::STANDARD.encode(
         serde_json::to_string(&json!({
-            "https://api.openai.com/auth": {"chatgpt_account_id": "acc_test"}
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
         }))
         .expect("json"),
     );
@@ -452,6 +456,53 @@ fn ws_text_events(response_id: &str, text: &str) -> Vec<Value> {
                "response": {"id": response_id, "status": "completed",
                             "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}}}),
     ]
+}
+
+/// `ws_text_events` with a terminal `end_turn` flag (c3e7bc60a).
+fn ws_text_events_end_turn(response_id: &str, text: &str, end_turn: bool) -> Vec<Value> {
+    vec![
+        json!({"type": "response.created", "response": {"id": response_id}}),
+        json!({"type": "response.output_item.added", "output_index": 0,
+               "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "in_progress", "content": []}}),
+        json!({"type": "response.output_item.done", "output_index": 0,
+               "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": text}]}}),
+        json!({"type": "response.completed",
+               "response": {"id": response_id, "status": "completed", "end_turn": end_turn,
+                            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}}}),
+    ]
+}
+
+/// `sse_payload_with` with a terminal `end_turn` flag (c3e7bc60a).
+fn sse_payload_end_turn(text: &str, end_turn: bool) -> String {
+    format!(
+        "{}\n\n",
+        [
+            format!(
+                "data: {}",
+                json!({"type": "response.output_item.added", "output_index": 0,
+                       "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "in_progress", "content": []}})
+            ),
+            format!(
+                "data: {}",
+                json!({"type": "response.output_text.delta", "output_index": 0, "delta": text})
+            ),
+            format!(
+                "data: {}",
+                json!({"type": "response.output_item.done", "output_index": 0,
+                       "item": {"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                                "content": [{"type": "output_text", "text": text}]}})
+            ),
+            format!(
+                "data: {}",
+                json!({"type": "response.completed",
+                       "response": {"id": "resp_1", "status": "completed", "end_turn": end_turn,
+                                    "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8,
+                                              "input_tokens_details": {"cached_tokens": 0}}}})
+            ),
+        ]
+        .join("\n\n")
+    )
 }
 
 fn default_hooks(sse_body: &'static str) -> (HandshakeHook, RequestHook, HttpHook) {
@@ -944,6 +995,78 @@ async fn test_websocket_basic_flow() {
     reset_openai_codex_websocket_debug_stats(Some("sess-ws"));
 }
 
+/// Upstream c3e7bc60a @ 4181f66 (#7766): a boolean `response.end_turn` on the
+/// terminal event is preserved as `AssistantMessage.end_turn` (debugging aid,
+/// no control-flow effect) — the `expect(result.endTurn).toBe(false)`
+/// assertions of openai-codex-stream.test.ts, over both transports.
+#[tokio::test]
+async fn test_end_turn_preserved() {
+    let _guard = WS_TEST_LOCK.lock().await;
+
+    // SSE transport: end_turn: false is preserved (not dropped as falsy).
+    let (handshake, request, http) = default_hooks(sse_payload_end_turn("Hello", false).leak());
+    let mut backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+    let message = codex_stream(
+        &m,
+        &context(vec![user_text("Say hello")]),
+        OpenAiCodexResponsesOptions {
+            stream: sse_options(Some("sess-et-sse")),
+            ..OpenAiCodexResponsesOptions::default()
+        },
+    )
+    .result()
+    .await
+    .expect("sse result");
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.end_turn, Some(false));
+    let _ = backend.next_http().await;
+
+    // WebSocket transport: same extraction from the WS terminal event.
+    let (handshake, request, http) = (
+        accept_all(),
+        ws_hook(|_, _, _| ws_text_events_end_turn("resp_et", "Hello", false)),
+        http_fixed(200, sse_payload("unused")),
+    );
+    let mut backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+    let message = codex_stream(
+        &m,
+        &context(vec![user_text("Say hello")]),
+        OpenAiCodexResponsesOptions {
+            stream: ws_options(Some("sess-et-ws"), Transport::Websocket),
+            ..OpenAiCodexResponsesOptions::default()
+        },
+    )
+    .result()
+    .await
+    .expect("ws result");
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.end_turn, Some(false));
+    let _ = backend.next_ws_request().await;
+
+    // No end_turn on the terminal event: the field stays unset.
+    let (handshake, request, http) = default_hooks(sse_payload("Hello").leak());
+    let backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+    let message = codex_stream(
+        &m,
+        &context(vec![user_text("Say hello")]),
+        OpenAiCodexResponsesOptions {
+            stream: sse_options(None),
+            ..OpenAiCodexResponsesOptions::default()
+        },
+    )
+    .result()
+    .await
+    .expect("plain result");
+    assert_eq!(message.end_turn, None);
+    drop(backend);
+
+    close_openai_codex_web_socket_sessions(Some("sess-et-ws")).await;
+    reset_openai_codex_websocket_debug_stats(Some("sess-et-ws"));
+}
+
 /// Upstream: "sends only response input deltas in websocket-cached mode"
 /// (simplified to text messages; the delta mechanics are identical).
 #[tokio::test]
@@ -1055,6 +1178,87 @@ async fn test_websocket_cached_delta_and_reuse() {
     close_openai_codex_web_socket_sessions(Some(session)).await;
     reset_openai_codex_websocket_debug_stats(Some(session));
     assert_eq!(backend.http_requests.load(Ordering::SeqCst), 0);
+}
+
+/// Upstream: "scopes cached websockets to the authenticated account"
+/// (cfe6b6a05 @ 4181f66, #7284): rotating accounts must not reuse a socket
+/// authenticated by another account; the pool is keyed `sessionId →
+/// accountId`.
+#[tokio::test]
+async fn test_websocket_cache_scoped_to_account() {
+    let _guard = WS_TEST_LOCK.lock().await;
+    let session = "shared-session";
+    reset_openai_codex_websocket_debug_stats(Some(session));
+
+    let (handshake, request, http) = (
+        accept_all(),
+        ws_hook(|conn, req, _| ws_text_events(&format!("resp_{conn}_{req}"), "Hello")),
+        http_fixed(500, "unexpected fetch".to_owned()),
+    );
+    let mut backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+    let ctx = context(vec![]);
+
+    for account in ["account-a", "account-b", "account-a"] {
+        let result = codex_stream(
+            &m,
+            &ctx,
+            OpenAiCodexResponsesOptions {
+                stream: StreamOptions {
+                    transport: Some(Transport::WebsocketCached),
+                    session_id: Some(session.to_owned()),
+                    request: rpi_ai::ProviderRequestOptions {
+                        api_key: Some(mock_token_for(account)),
+                        ..Default::default()
+                    },
+                    ..StreamOptions::default()
+                },
+                ..OpenAiCodexResponsesOptions::default()
+            },
+        )
+        .result()
+        .await
+        .expect("result");
+        assert_eq!(result.stop_reason, StopReason::Stop);
+    }
+
+    let header = |headers: &[(String, String)], name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    let (conn1, headers1) = backend.next_ws_open().await;
+    let (_c, _r, _frame1) = backend.next_ws_request().await;
+    let (conn2, headers2) = backend.next_ws_open().await;
+    let (_c, _r, _frame2) = backend.next_ws_request().await;
+    // The third request reuses account-a's connection.
+    let (conn3, _r, _frame3) = backend.next_ws_request().await;
+    assert_eq!((conn1, conn2, conn3), (1, 2, 1));
+    assert_eq!(
+        header(&headers1, "chatgpt-account-id").as_deref(),
+        Some("account-a")
+    );
+    assert_eq!(
+        header(&headers2, "chatgpt-account-id").as_deref(),
+        Some("account-b")
+    );
+    assert_eq!(
+        header(&headers1, "authorization").as_deref(),
+        Some(format!("Bearer {}", mock_token_for("account-a")).as_str())
+    );
+    assert_eq!(
+        header(&headers2, "authorization").as_deref(),
+        Some(format!("Bearer {}", mock_token_for("account-b")).as_str())
+    );
+    assert_eq!(backend.http_requests.load(Ordering::SeqCst), 0);
+
+    let stats = get_openai_codex_websocket_debug_stats(session).expect("stats");
+    assert_eq!(stats.connections_created, 2);
+    assert_eq!(stats.connections_reused, 1);
+
+    close_openai_codex_web_socket_sessions(Some(session)).await;
+    reset_openai_codex_websocket_debug_stats(Some(session));
 }
 
 /// Connection cache TTLs: reuse within the 5min idle TTL; eviction after it

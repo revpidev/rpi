@@ -2,7 +2,8 @@
 //! `google-vertex.lazy.ts`, which only defers the module import — rpi has no
 //! lazy-loading boundary) @ pi 0.82.1 (2efa728); stream-termination semantics
 //! (rawStopReason, provider-stopped error text) updated to 4181f66
-//! (23cb385b6, 5a2539a7b).
+//! (23cb385b6, 5a2539a7b); initial-request retry wiring updated to 4181f66
+//! (b9d360a2c, `retryGoogleRequest`).
 //!
 //! Google Vertex AI adapter: API-key (Vertex Express) or ADC authentication,
 //! project/location resolution, regional endpoint selection, request
@@ -49,9 +50,9 @@
 //!   `partToVertex` / `toolToVertex` / `functionDeclarationToVertex` pass
 //!   values through verbatim.
 //! - The SDK's `user-agent` / `x-goog-api-client` telemetry headers are not
-//!   sent, and the SDK performs no retries by default (pi never sets
-//!   `httpOptions.retryOptions`), so `StreamOptions::max_retries` is a no-op
-//!   here too.
+//!   sent. Retries go through
+//!   [`crate::api::google_shared::retry_google_request`] (b9d360a2c): opt-in
+//!   via `StreamOptions::max_retries`, unset means no retries.
 //!
 //! Other intentional differences:
 //! - `on_payload` still receives the SDK-level params shape
@@ -76,7 +77,7 @@ use crate::api::google_generative_ai::{
 };
 use crate::api::google_shared::{
     convert_messages, convert_tools, is_thinking_part, map_stop_reason,
-    resolve_google_function_calling_mode, retain_thought_signature,
+    resolve_google_function_calling_mode, retain_thought_signature, retry_google_request,
     supports_google_strict_tool_sampling, GoogleThinkingLevel,
 };
 use crate::api::simple_options::build_base_options;
@@ -92,6 +93,7 @@ use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
     headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
 };
+use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 
 // ---------------------------------------------------------------------------
@@ -898,6 +900,14 @@ async fn run(
     output: &mut AssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<DoneReason, String> {
+    // 027a58479: reject a custom fetch instead of silently bypassing it
+    // (upstream `options.fetch !== globalThis.fetch`; rpi has no ambient
+    // global fetch — the default reqwest transport is its analogue — so any
+    // injected fetch is non-default and rejected). Checked before auth
+    // resolution, matching the top of upstream's try block.
+    if options.stream.fetch.is_some() {
+        return Err("Custom fetch is not supported by the Google Vertex adapter".to_owned());
+    }
     // Upstream resolves auth at client-construction time, before buildParams:
     // a real API key selects the Vertex Express client; everything else falls
     // back to ADC, which requires project and location up front.
@@ -953,47 +963,81 @@ async fn run(
     }
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
-    // No retry: the pinned @google/genai SDK performs a plain fetch unless
-    // `httpOptions.retryOptions` is set, and pi never sets it.
-    let request = client.post(&url).headers(header_map).json(&body);
-    let send = request.send();
-    let result = match &options.stream.signal {
-        Some(token) => tokio::select! {
-            outcome = send => outcome,
-            () = token.cancelled() => {
-                return Err("Request was aborted".to_owned());
+    // b9d360a2c: the initial request runs under the shared provider retry
+    // policy via `retryGoogleRequest` (opt-in through `maxRetries`; default
+    // unchanged).
+    let response = retry_google_request(
+        || {
+            let request = client.post(&url).headers(header_map.clone()).json(&body);
+            let signal = options.stream.signal.clone();
+            async move {
+                let send = request.send();
+                let result = match &signal {
+                    Some(token) => tokio::select! {
+                        outcome = send => outcome,
+                        () = token.cancelled() => {
+                            return Err(ProviderErrorInfo {
+                                status: None,
+                                headers: None,
+                                message: "Request was aborted".to_owned(),
+                            });
+                        }
+                    },
+                    None => send.await,
+                };
+                match result {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            Ok(response)
+                        } else {
+                            let status_code = status.as_u16();
+                            let reason = status.canonical_reason().unwrap_or_default().to_owned();
+                            let is_json = response
+                                .headers()
+                                .get(reqwest::header::CONTENT_TYPE)
+                                .and_then(|value| value.to_str().ok())
+                                .is_some_and(|content_type| {
+                                    content_type.contains("application/json")
+                                });
+                            let response_headers = headers_to_record(response.headers());
+                            let body_text = response.text().await.unwrap_or_default();
+                            // SDK `throwErrorIfNotOK`: the message is the
+                            // stringified error body (JSON bodies verbatim;
+                            // non-JSON wrapped in an error object).
+                            let message = if is_json {
+                                body_text
+                            } else {
+                                serde_json::to_string(&json!({
+                                    "error": {
+                                        "message": body_text,
+                                        "code": status_code,
+                                        "status": reason,
+                                    }
+                                }))
+                                .unwrap_or_else(|_| "{}".to_owned())
+                            };
+                            Err(ProviderErrorInfo {
+                                status: Some(status_code),
+                                headers: Some(response_headers),
+                                message,
+                            })
+                        }
+                    }
+                    Err(error) => Err(ProviderErrorInfo {
+                        status: error.status().map(|status| status.as_u16()),
+                        headers: None,
+                        message: error.to_string(),
+                    }),
+                }
             }
         },
-        None => send.await,
-    };
-    let response = result.map_err(|error| error.to_string())?;
+        &options.stream,
+    )
+    .await
+    .map_err(|error| error.message())?;
 
     let status = response.status();
-    if !status.is_success() {
-        let status_code = status.as_u16();
-        let reason = status.canonical_reason().unwrap_or_default().to_owned();
-        let is_json = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|content_type| content_type.contains("application/json"));
-        let body_text = response.text().await.unwrap_or_default();
-        // SDK `throwErrorIfNotOK`: the message is the stringified error body
-        // (JSON bodies verbatim; non-JSON wrapped in an error object).
-        let message = if is_json {
-            body_text
-        } else {
-            serde_json::to_string(&json!({
-                "error": {
-                    "message": body_text,
-                    "code": status_code,
-                    "status": reason,
-                }
-            }))
-            .unwrap_or_else(|_| "{}".to_owned())
-        };
-        return Err(message);
-    }
 
     if let Some(on_response) = &options.stream.on_response {
         on_response(

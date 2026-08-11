@@ -41,6 +41,7 @@ use crate::types::{
     ToolResultMessage, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -1141,9 +1142,16 @@ impl<'a> StreamProcessor<'a> {
                 let block = &event["content_block"];
                 match block.get("type").and_then(Value::as_str) {
                     Some("text") => {
+                        // 59ad3dead: the initial `text` of a content_block_start
+                        // is part of the content, not a delta preamble — keep it.
+                        let initial_text = block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
                         self.output.content.push(AssistantContent::Text(
                             crate::types::TextContent {
-                                text: String::new(),
+                                text: initial_text,
                                 text_signature: None,
                             },
                         ));
@@ -1157,10 +1165,22 @@ impl<'a> StreamProcessor<'a> {
                         });
                     }
                     Some("thinking") => {
+                        // 59ad3dead: keep the initial `thinking`/`signature`
+                        // carried by content_block_start.
                         self.output.content.push(AssistantContent::Thinking(
                             crate::types::ThinkingContent {
-                                thinking: String::new(),
-                                thinking_signature: Some(String::new()),
+                                thinking: block
+                                    .get("thinking")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                thinking_signature: Some(
+                                    block
+                                        .get("signature")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned(),
+                                ),
                                 redacted: None,
                             },
                         ));
@@ -1503,21 +1523,11 @@ async fn run(
         || {
             let request = client.post(&url).headers(header_map.clone()).json(&params);
             let signal = options.stream.signal.clone();
+            let fetch = options.stream.fetch.clone();
             async move {
-                let send = request.send();
-                let result = match &signal {
-                    Some(token) => tokio::select! {
-                        outcome = send => outcome,
-                        () = token.cancelled() => {
-                            return Err(ProviderErrorInfo {
-                                status: None,
-                                headers: None,
-                                message: "Request was aborted".to_owned(),
-                            });
-                        }
-                    },
-                    None => send.await,
-                };
+                // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
+                // keeps the reqwest default path unchanged.
+                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -1539,11 +1549,7 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    Err(error) => Err(error.into_provider_error_info()),
                 }
             }
         },
@@ -2840,6 +2846,63 @@ pub(crate) mod tests {
                 "toolcall_delta",
                 "toolcall_end",
             ]
+        );
+    }
+
+    /// Ported intent of `anthropic-sse-parsing.test.ts` @ 4181f66:
+    /// "preserves content from content_block_start events" (59ad3dead,
+    /// #7358). The initial `text`/`thinking`/`signature` carried by
+    /// content_block_start must survive into the final message.
+    #[test]
+    fn test_stream_processor_preserves_content_block_start_content() {
+        let model = make_model(json!({}));
+        let bytes = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_initial_content\",\"usage\":{\"input_tokens\":12,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Initial text\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" plus delta\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n",
+            "\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"Initial thinking\",\"signature\":\"initial signature\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\" plus delta\"}}\n",
+            "\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"signature_delta\",\"signature\":\" plus delta\"}}\n",
+            "\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n",
+            "\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}\n",
+            "\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n",
+            "\n",
+        );
+        let (_, reason, output) = drive_sse(&model, bytes.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+
+        assert_eq!(output.content.len(), 2);
+        let AssistantContent::Text(text) = &output.content[0] else {
+            panic!("expected text block, got {:?}", output.content[0]);
+        };
+        assert_eq!(text.text, "Initial text plus delta");
+        let AssistantContent::Thinking(thinking) = &output.content[1] else {
+            panic!("expected thinking block, got {:?}", output.content[1]);
+        };
+        assert_eq!(thinking.thinking, "Initial thinking plus delta");
+        assert_eq!(
+            thinking.thinking_signature.as_deref(),
+            Some("initial signature plus delta")
         );
     }
 

@@ -51,6 +51,7 @@ use crate::types::{
     NumberOrString, ProviderEnv, ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent,
     StreamOptions, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage,
 };
+use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_env::get_provider_env_value;
@@ -819,17 +820,11 @@ async fn run(
         serde_json::to_string(&payload).map_err(|error| StreamFailure::plain(error.to_string()))?;
     let request = client.post(url.clone()).headers(headers).body(body);
     let signal = options.stream.signal.clone();
-    let send = request.send();
-    let response = match &signal {
-        Some(token) => tokio::select! {
-            outcome = send => outcome,
-            () = token.cancelled() => {
-                return Err(StreamFailure::plain("Request was aborted"));
-            }
-        },
-        None => send.await,
-    }
-    .map_err(|error| StreamFailure::plain(error.to_string()))?;
+    // 027a58479 (R2.7.4): per-request custom fetch channel; `None` keeps the
+    // reqwest default path unchanged.
+    let response = send_provider_request(request, options.stream.fetch.as_ref(), signal.as_ref())
+        .await
+        .map_err(|error| StreamFailure::plain(error.message()))?;
 
     // Upstream invokes `onResponse` before the `response.ok` check.
     if let Some(on_response) = &options.stream.on_response {

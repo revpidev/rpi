@@ -10,12 +10,15 @@
 //! Upstream intents ported: `bedrock-convert-messages.test.ts`,
 //! `bedrock-custom-headers.test.ts`, `bedrock-endpoint-resolution.test.ts`,
 //! `bedrock-thinking-payload.test.ts` (the endpoint/behavior parts of
-//! `bedrock-models.test.ts` land with the catalog in W4).
+//! `bedrock-models.test.ts` land with the catalog in W4), and
+//! `bedrock-error-metadata.test.ts` (70bbe47a9 @ 4181f66).
 
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use rpi_ai::api::bedrock::event_stream::{event_frame, exception_frame};
+use rpi_ai::api::bedrock::event_stream::{
+    encode_message, event_frame, exception_frame, HeaderValue,
+};
 use rpi_ai::api::bedrock::sigv4::{self, SigV4Credentials};
 use rpi_ai::api::bedrock_converse_stream::{
     filtered_custom_headers, format_bedrock_error, get_standard_bedrock_endpoint_region,
@@ -24,8 +27,9 @@ use rpi_ai::api::bedrock_converse_stream::{
     EMPTY_TEXT_PLACEHOLDER,
 };
 use rpi_ai::types::{
-    ApiKind, AssistantMessage, Context, DoneReason, Message, Model, ProviderEnv, StopReason,
-    StreamEvent, StreamOptions, ThinkingLevel, ToolResultMessage, ToolResultRole,
+    ApiKind, AssistantMessage, AssistantMessageDiagnostic, Context, DoneReason, Message, Model,
+    ProviderEnv, StopReason, StreamEvent, StreamOptions, ThinkingLevel, ToolResultMessage,
+    ToolResultRole,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +64,23 @@ async fn serve(
     content_type: &'static str,
     body: Vec<u8>,
 ) -> (String, mpsc::Receiver<CapturedRequest>) {
+    serve_with_headers(
+        status,
+        content_type,
+        vec![("x-amzn-requestid", "req-123".to_owned())],
+        body,
+    )
+    .await
+}
+
+/// `serve` with caller-controlled response headers (error-metadata tests need
+/// specific `x-amzn-errortype` / `x-amzn-requestid` values).
+async fn serve_with_headers(
+    status: u16,
+    content_type: &'static str,
+    extra_headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = mpsc::channel(1);
@@ -70,12 +91,18 @@ async fn serve(
         let reason = match status {
             200 => "OK",
             400 => "Bad Request",
+            403 => "Forbidden",
             _ => "Status",
         };
-        let response = format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\nx-amzn-requestid: req-123\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        let mut response =
+            format!("HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\n");
+        for (name, value) in &extra_headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+        }
+        response.push_str(&format!(
+            "content-length: {}\r\nconnection: close\r\n\r\n",
             body.len()
-        );
+        ));
         socket
             .write_all(response.as_bytes())
             .await
@@ -727,6 +754,283 @@ async fn test_message_start_user_role_is_error() {
     assert_eq!(
         error.error_message,
         Some("Unexpected assistant message start but got user message start instead".to_owned())
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ported intent of upstream test: bedrock-error-metadata.test.ts
+// (70bbe47a9 @ 4181f66, #7286) — `bedrock_response_failure` diagnostics.
+// ---------------------------------------------------------------------------
+
+const DIAGNOSTIC_TYPE: &str = "bedrock_response_failure";
+const VALIDATION_MESSAGE: &str = "The provided model identifier is invalid.";
+const REQUEST_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+fn find_diagnostic(message: &AssistantMessage) -> Option<&AssistantMessageDiagnostic> {
+    message
+        .diagnostics
+        .as_ref()?
+        .iter()
+        .find(|diagnostic| diagnostic.kind == DIAGNOSTIC_TYPE)
+}
+
+fn details_json(diagnostic: &AssistantMessageDiagnostic) -> Value {
+    Value::Object(diagnostic.details.clone().unwrap_or_default())
+}
+
+/// Drives the adapter against a scripted response with caller-controlled
+/// headers and returns the terminal error message.
+async fn drive_error_with_headers(
+    status: u16,
+    content_type: &'static str,
+    extra_headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+) -> AssistantMessage {
+    let (base_url, _rx) = serve_with_headers(status, content_type, extra_headers, body).await;
+    let mut model = claude_model("http://unused");
+    model.base_url = base_url;
+    let events: Vec<StreamEvent> = stream(
+        &model,
+        &context(vec![user_text("hello")]),
+        no_cache_options(),
+    )
+    .collect()
+    .await;
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    error.clone()
+}
+
+/// A `:message-type: error` frame (the unmodeled mid-stream error path).
+fn error_frame(error_code: &str, error_message: &str) -> Vec<u8> {
+    encode_message(
+        &[
+            (
+                ":message-type".to_owned(),
+                HeaderValue::String("error".to_owned()),
+            ),
+            (
+                ":error-code".to_owned(),
+                HeaderValue::String(error_code.to_owned()),
+            ),
+            (
+                ":error-message".to_owned(),
+                HeaderValue::String(error_message.to_owned()),
+            ),
+        ],
+        b"{}",
+    )
+}
+
+/// A 200 event-stream response carrying `REQUEST_ID` that starts the message
+/// and then fails mid-stream with the given trailing frame.
+async fn drive_mid_stream_failure(trailing_frame: Vec<u8>) -> AssistantMessage {
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    body.extend_from_slice(&trailing_frame);
+    drive_error_with_headers(
+        200,
+        "application/vnd.amazon.eventstream",
+        vec![("x-amzn-requestid", REQUEST_ID.to_owned())],
+        body,
+    )
+    .await
+}
+
+/// Upstream: "records status, error code and request id for a non-2xx from
+/// client.send()".
+#[tokio::test]
+async fn test_bedrock_diagnostic_records_status_error_code_and_request_id() {
+    let error = drive_error_with_headers(
+        400,
+        "application/json",
+        vec![
+            ("x-amzn-errortype", "ValidationException".to_owned()),
+            ("x-amzn-requestid", REQUEST_ID.to_owned()),
+        ],
+        json!({"message": VALIDATION_MESSAGE})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+
+    assert_eq!(error.stop_reason, StopReason::Error);
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(
+        details_json(diagnostic),
+        json!({"status": 400, "errorCode": "ValidationException", "requestId": REQUEST_ID})
+    );
+    assert!(diagnostic.error.is_none());
+    // Wire shape: exactly `details` / `timestamp` / `type` keys.
+    let value = serde_json::to_value(diagnostic).expect("diagnostic json");
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("diagnostic object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["details", "timestamp", "type"]);
+}
+
+/// Upstream: "leaves errorMessage untouched so retry classification is
+/// unaffected". NOTE: rpi's composition is the documented D-026 reqwest
+/// variant — `status: body` surfaced from the raw response instead of the
+/// SDK exception message (upstream's `$response.body` stream probing has no
+/// reqwest analogue). The pinned intent is byte-identity with the pre-change
+/// behavior, which this assertion locks.
+#[tokio::test]
+async fn test_bedrock_diagnostic_leaves_error_message_untouched() {
+    let error = drive_error_with_headers(
+        400,
+        "application/json",
+        vec![
+            ("x-amzn-errortype", "ValidationException".to_owned()),
+            ("x-amzn-requestid", REQUEST_ID.to_owned()),
+        ],
+        json!({"message": VALIDATION_MESSAGE})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        error.error_message,
+        Some(format!(
+            "Validation error: 400: {{\"message\":\"{VALIDATION_MESSAGE}\"}}"
+        ))
+    );
+}
+
+/// Upstream: "reports only the request id for a modeled mid-stream
+/// exception" (the SDK throws a bare object literal here, so the code is
+/// genuinely unavailable; the initial response's request id is the
+/// fallback).
+#[tokio::test]
+async fn test_bedrock_diagnostic_modeled_mid_stream_exception_reports_only_request_id() {
+    let error = drive_mid_stream_failure(exception_frame(
+        "throttlingException",
+        r#"{"message":"Too many requests, please wait."}"#,
+    ))
+    .await;
+
+    assert_eq!(error.stop_reason, StopReason::Error);
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(details_json(diagnostic), json!({"requestId": REQUEST_ID}));
+}
+
+/// Upstream: "captures the error code for an unmodeled mid-stream error"
+/// (this branch throws a real `Error` named after the frame's
+/// `:error-code`).
+#[tokio::test]
+async fn test_bedrock_diagnostic_unmodeled_mid_stream_error_captures_code() {
+    let error = drive_mid_stream_failure(error_frame(
+        "ModelStreamErrorException",
+        "Model stream terminated unexpectedly.",
+    ))
+    .await;
+
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(
+        details_json(diagnostic),
+        json!({"errorCode": "ModelStreamErrorException", "requestId": REQUEST_ID})
+    );
+}
+
+/// Upstream: "does not report a transport failure name as a provider error
+/// code" (modeled codes end in `Exception`; `TimeoutError` does not).
+#[tokio::test]
+async fn test_bedrock_diagnostic_transport_name_is_not_an_error_code() {
+    let error = drive_mid_stream_failure(error_frame(
+        "TimeoutError",
+        "Connection timed out after 1000 ms",
+    ))
+    .await;
+
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(details_json(diagnostic), json!({"requestId": REQUEST_ID}));
+}
+
+/// Upstream: "emits no diagnostic when the failure carries no provider
+/// metadata" (a transport failure: connection refused, no status/headers).
+#[tokio::test]
+async fn test_bedrock_diagnostic_absent_without_provider_metadata() {
+    let model = claude_model("http://127.0.0.1:1");
+    let mut options = no_cache_options();
+    // No retries: the diagnostic must reflect the single failed attempt.
+    options.stream.max_retries = Some(0);
+    let events: Vec<StreamEvent> = stream(&model, &context(vec![user_text("hello")]), options)
+        .collect()
+        .await;
+    let Some(StreamEvent::Error { error, .. }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert!(error.error_message.is_some());
+    assert!(find_diagnostic(error).is_none());
+}
+
+/// Upstream: "emits no diagnostic for an aborted turn".
+#[tokio::test]
+async fn test_bedrock_diagnostic_absent_for_aborted_turn() {
+    let model = claude_model("http://127.0.0.1:1");
+    let token = tokio_util::sync::CancellationToken::new();
+    token.cancel();
+    let mut options = no_cache_options();
+    options.stream.signal = Some(token);
+    let events: Vec<StreamEvent> = stream(&model, &context(vec![user_text("hello")]), options)
+        .collect()
+        .await;
+    let Some(StreamEvent::Error { error, reason }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+
+    assert_eq!(*reason, rpi_ai::types::ErrorReason::Aborted);
+    assert_eq!(error.stop_reason, StopReason::Aborted);
+    assert!(find_diagnostic(error).is_none());
+}
+
+/// Upstream: "drops header-derived values that exceed the length bound"
+/// (over-long values are dropped, never truncated).
+#[tokio::test]
+async fn test_bedrock_diagnostic_drops_over_long_values() {
+    let error = drive_error_with_headers(
+        400,
+        "application/json",
+        vec![
+            ("x-amzn-errortype", format!("{}Exception", "E".repeat(5000))),
+            ("x-amzn-requestid", "R".repeat(5000)),
+        ],
+        json!({"message": VALIDATION_MESSAGE})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(details_json(diagnostic), json!({"status": 400}));
+}
+
+/// Upstream: "omits the SDK's Unknown placeholder instead of reporting it as
+/// a code".
+#[tokio::test]
+async fn test_bedrock_diagnostic_omits_unknown_placeholder() {
+    let error = drive_error_with_headers(
+        403,
+        "application/json",
+        vec![
+            ("x-amzn-errortype", "Unknown".to_owned()),
+            ("x-amzn-requestid", REQUEST_ID.to_owned()),
+        ],
+        json!({"message": "Forbidden"}).to_string().into_bytes(),
+    )
+    .await;
+
+    let diagnostic = find_diagnostic(&error).expect("diagnostic");
+    assert_eq!(
+        details_json(diagnostic),
+        json!({"status": 403, "requestId": REQUEST_ID})
     );
 }
 

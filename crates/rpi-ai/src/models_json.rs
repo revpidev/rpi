@@ -213,6 +213,8 @@ pub struct ModelsJsonModelOverride {
     pub cost: Option<ModelsJsonModelOverrideCost>,
     pub context_window: Option<f64>,
     pub max_tokens: Option<f64>,
+    /// 25a2c8dcf (#7568): default sampling parameters for this model.
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<ModelCompat>,
 }
@@ -231,6 +233,8 @@ pub struct ModelsJsonModel {
     pub cost: Option<ModelCost>,
     pub context_window: Option<f64>,
     pub max_tokens: Option<f64>,
+    /// 25a2c8dcf (#7568): default sampling parameters for this model.
+    pub sampling_params: Option<serde_json::Map<String, Value>>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<ModelCompat>,
 }

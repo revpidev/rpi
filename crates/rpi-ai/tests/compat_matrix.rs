@@ -69,6 +69,9 @@ fn test_detect_compat_zai_hits() {
     expected.supports_developer_role = false;
     expected.supports_reasoning_effort = false;
     expected.thinking_format = ThinkingFormat::Zai;
+    // 2fe21b407 (#7174): Z.AI ignores `max_completion_tokens` — the runtime
+    // detection now sends `max_tokens` (T20 Wave C; was MaxCompletionTokens).
+    expected.max_tokens_field = MaxTokensField::MaxTokens;
 
     // Provider-id hits.
     for provider in ["zai", "zai-coding-cn"] {
@@ -239,6 +242,9 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     let mut deepseek = cerebras.clone();
     deepseek.thinking_format = ThinkingFormat::Deepseek;
     deepseek.requires_reasoning_content_on_assistant_messages = true;
+    // c185d4123: DeepSeek APIs take `max_tokens` (T20 Wave C; was
+    // MaxCompletionTokens).
+    deepseek.max_tokens_field = MaxTokensField::MaxTokens;
     let model = make_model("deepseek", "https://api.deepseek.com/v1", "deepseek-chat");
     assert_eq!(detect_compat(&model), deepseek);
     let model = make_model("custom", "https://api.deepseek.com/v1", "deepseek-chat");

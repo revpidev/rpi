@@ -1,7 +1,12 @@
 //! Codex WebSocket session cache: 5min/55min dual-TTL connection reuse,
 //! per-session permanent SSE fallback, debug stats, and session resource
 //! cleanup (port of the cache half of
-//! `packages/ai/src/api/openai-codex-responses.ts` @ pi 0.82.1 (2efa728)).
+//! `packages/ai/src/api/openai-codex-responses.ts` @ pi 4181f66).
+//!
+//! Connections are pooled per `sessionId → accountId` (cfe6b6a05, #7284):
+//! rotating accounts must not reuse a socket authenticated by another
+//! account. Debug stats and the SSE-fallback set stay keyed by session id
+//! only, matching upstream.
 //!
 //! State-machine notes live in [`crate::api::codex_ws`].
 
@@ -77,12 +82,31 @@ struct CacheEntry {
     continuation: Option<CachedWebSocketContinuationState>,
 }
 
-static SESSION_CACHE: LazyLock<Mutex<HashMap<String, CacheEntry>>> =
+static SESSION_CACHE: LazyLock<Mutex<HashMap<String, HashMap<String, CacheEntry>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn cache() -> std::sync::MutexGuard<'static, HashMap<String, CacheEntry>> {
+fn cache() -> std::sync::MutexGuard<'static, HashMap<String, HashMap<String, CacheEntry>>> {
     ensure_cleanup_registered();
     SESSION_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Upstream `accountEntries.delete(accountId)` plus
+/// `if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId)`.
+fn remove_account_entry(
+    cache: &mut HashMap<String, HashMap<String, CacheEntry>>,
+    session_id: &str,
+    account_id: &str,
+) -> Option<CacheEntry> {
+    let entry = cache
+        .get_mut(session_id)
+        .and_then(|account_entries| account_entries.remove(account_id));
+    if cache
+        .get(session_id)
+        .is_some_and(|account_entries| account_entries.is_empty())
+    {
+        cache.remove(session_id);
+    }
+    entry
 }
 
 /// `isWebSocketSessionExpired`.
@@ -100,10 +124,10 @@ pub struct AcquiredWebSocket {
     /// Message consumed by the liveness probe; deliver before reading.
     pub pending: Option<Message>,
     pub reused: bool,
-    /// The session this connection is (or will be) cached under. `None` for
-    /// one-shot connections (no session id, or the cached entry was busy) —
-    /// [`release`] closes those.
-    pub cache_key: Option<String>,
+    /// The `(session_id, account_id)` this connection is (or will be) cached
+    /// under. `None` for one-shot connections (no session id, or the cached
+    /// entry was busy) — [`release`] closes those.
+    pub cache_key: Option<(String, String)>,
 }
 
 /// Non-blocking reusability probe, standing in for upstream's `readyState`
@@ -145,6 +169,7 @@ impl From<Option<Option<Result<Message, tokio_tungstenite::tungstenite::Error>>>
 /// `acquireWebSocket`.
 pub async fn acquire(
     session_id: Option<&str>,
+    account_id: &str,
     url: &str,
     headers: &reqwest::header::HeaderMap,
     connect_timeout_ms: Option<u64>,
@@ -175,16 +200,22 @@ pub async fn acquire(
 
     let take = {
         let mut cache = cache();
-        if !cache.contains_key(session_id) {
+        let cached = cache
+            .get(session_id)
+            .is_some_and(|account_entries| account_entries.contains_key(account_id));
+        if !cached {
             CachedTake::Fresh
         } else {
             // invariant: contains_key checked immediately above
-            let entry = cache.get_mut(session_id).unwrap();
+            let entry = cache
+                .get_mut(session_id)
+                .and_then(|account_entries| account_entries.get_mut(account_id))
+                .unwrap();
             // Invalidate any pending idle-expiry task (upstream clearTimeout).
             entry.idle_generation += 1;
             if !entry.busy && is_session_expired(entry) {
                 let socket = entry.socket.take();
-                cache.remove(session_id);
+                remove_account_entry(&mut cache, session_id, account_id);
                 CachedTake::Expired { socket }
             } else if !entry.busy && entry.socket.is_some() {
                 entry.busy = true;
@@ -198,7 +229,7 @@ pub async fn acquire(
             } else {
                 // Idle entry without a socket cannot happen (socket is only
                 // None while busy); treat as dead and drop the entry.
-                cache.remove(session_id);
+                remove_account_entry(&mut cache, session_id, account_id);
                 CachedTake::Fresh
             }
         }
@@ -215,7 +246,7 @@ pub async fn acquire(
                     socket,
                     pending: Some(message),
                     reused: true,
-                    cache_key: Some(session_id.to_owned()),
+                    cache_key: Some((session_id.to_owned(), account_id.to_owned())),
                 });
             }
             match probe(&mut socket) {
@@ -223,20 +254,21 @@ pub async fn acquire(
                     socket,
                     pending: None,
                     reused: true,
-                    cache_key: Some(session_id.to_owned()),
+                    cache_key: Some((session_id.to_owned(), account_id.to_owned())),
                 }),
                 ProbeResult::AliveWithMessage(message) => Ok(AcquiredWebSocket {
                     socket,
                     pending: Some(message),
                     reused: true,
-                    cache_key: Some(session_id.to_owned()),
+                    cache_key: Some((session_id.to_owned(), account_id.to_owned())),
                 }),
                 ProbeResult::Dead => {
                     close_silently(&mut socket, 1000, "done").await;
-                    cache().remove(session_id);
+                    remove_account_entry(&mut cache(), session_id, account_id);
                     // Fall through to a fresh cached connection.
                     Box::pin(acquire(
                         Some(session_id),
+                        account_id,
                         url,
                         headers,
                         connect_timeout_ms,
@@ -252,6 +284,7 @@ pub async fn acquire(
             }
             Box::pin(acquire(
                 Some(session_id),
+                account_id,
                 url,
                 headers,
                 connect_timeout_ms,
@@ -272,8 +305,8 @@ pub async fn acquire(
         }
         CachedTake::Fresh => {
             let socket = super::connect(url, headers, connect_timeout_ms, signal).await?;
-            cache().insert(
-                session_id.to_owned(),
+            cache().entry(session_id.to_owned()).or_default().insert(
+                account_id.to_owned(),
                 CacheEntry {
                     socket: None,
                     pending: None,
@@ -287,7 +320,7 @@ pub async fn acquire(
                 socket,
                 pending: None,
                 reused: false,
-                cache_key: Some(session_id.to_owned()),
+                cache_key: Some((session_id.to_owned(), account_id.to_owned())),
             })
         }
     }
@@ -296,12 +329,12 @@ pub async fn acquire(
 /// `release({ keep })`: returns the socket to the cache (scheduling the idle
 /// expiry) or closes and evicts it.
 pub async fn release(
-    cache_key: Option<String>,
+    cache_key: Option<(String, String)>,
     socket: WsStream,
     pending: Option<Message>,
     keep: bool,
 ) {
-    let Some(session_id) = cache_key else {
+    let Some((session_id, account_id)) = cache_key else {
         let mut socket = socket;
         close_silently(&mut socket, 1000, "done").await;
         return;
@@ -311,7 +344,10 @@ pub async fn release(
         let mut close_socket = None;
         let generation = {
             let mut cache = cache();
-            match cache.get_mut(&session_id) {
+            match cache
+                .get_mut(&session_id)
+                .and_then(|account_entries| account_entries.get_mut(&account_id))
+            {
                 Some(entry) if entry.busy => {
                     entry.socket = Some(socket);
                     entry.pending = pending;
@@ -327,7 +363,7 @@ pub async fn release(
             }
         };
         if let Some(generation) = generation {
-            schedule_idle_expiry(session_id, generation);
+            schedule_idle_expiry(session_id, account_id, generation);
         }
         if let Some(mut socket) = close_socket {
             close_silently(&mut socket, 1000, "done").await;
@@ -336,14 +372,14 @@ pub async fn release(
     }
 
     // Not kept: evict the entry (if still ours) and close.
-    cache().remove(&session_id);
+    remove_account_entry(&mut cache(), &session_id, &account_id);
     let mut socket = socket;
     close_silently(&mut socket, 1000, "done").await;
 }
 
 /// `scheduleSessionWebSocketExpiry`: spawned timer task; fires only when the
 /// entry is still idle at the same generation (upstream re-checks `busy`).
-fn schedule_idle_expiry(session_id: String, generation: u64) {
+fn schedule_idle_expiry(session_id: String, account_id: String, generation: u64) {
     let ttl = ttls().0;
     tokio::spawn(async move {
         tokio::time::sleep(ttl).await;
@@ -351,11 +387,12 @@ fn schedule_idle_expiry(session_id: String, generation: u64) {
             let mut cache = cache();
             // Upstream re-checks `entry.busy` when the timer fires.
             let evict = matches!(
-                cache.get(&session_id),
+                cache.get(&session_id).and_then(|account_entries| account_entries.get(&account_id)),
                 Some(entry) if !entry.busy && entry.idle_generation == generation
             );
             if evict {
-                cache.remove(&session_id).and_then(|entry| entry.socket)
+                remove_account_entry(&mut cache, &session_id, &account_id)
+                    .and_then(|entry| entry.socket)
             } else {
                 None
             }
@@ -371,16 +408,27 @@ fn schedule_idle_expiry(session_id: String, generation: u64) {
 // ---------------------------------------------------------------------------
 
 /// Reads a clone of the entry's continuation state.
-pub fn continuation_for(session_id: &str) -> Option<CachedWebSocketContinuationState> {
+pub fn continuation_for(
+    session_id: &str,
+    account_id: &str,
+) -> Option<CachedWebSocketContinuationState> {
     cache()
         .get(session_id)
+        .and_then(|account_entries| account_entries.get(account_id))
         .and_then(|entry| entry.continuation.clone())
 }
 
 /// Sets or clears the entry's continuation state (no-op when the entry is
 /// gone, e.g. after `close_sessions`).
-pub fn set_continuation(session_id: &str, value: Option<CachedWebSocketContinuationState>) {
-    if let Some(entry) = cache().get_mut(session_id) {
+pub fn set_continuation(
+    session_id: &str,
+    account_id: &str,
+    value: Option<CachedWebSocketContinuationState>,
+) {
+    if let Some(entry) = cache()
+        .get_mut(session_id)
+        .and_then(|account_entries| account_entries.get_mut(account_id))
+    {
         entry.continuation = value;
     }
 }
@@ -501,12 +549,14 @@ pub async fn close_openai_codex_web_socket_sessions(session_id: Option<&str>) {
         match session_id {
             Some(session_id) => cache
                 .remove(session_id)
-                .and_then(|entry| entry.socket)
                 .into_iter()
+                .flat_map(|account_entries| account_entries.into_values())
+                .filter_map(|entry| entry.socket)
                 .collect(),
             None => cache
                 .drain()
-                .filter_map(|(_, entry)| entry.socket)
+                .flat_map(|(_, account_entries)| account_entries.into_values())
+                .filter_map(|entry| entry.socket)
                 .collect(),
         }
     };
@@ -524,12 +574,14 @@ fn close_sessions_sync(session_id: Option<&str>) {
         match session_id {
             Some(session_id) => cache
                 .remove(session_id)
-                .and_then(|entry| entry.socket)
                 .into_iter()
+                .flat_map(|account_entries| account_entries.into_values())
+                .filter_map(|entry| entry.socket)
                 .collect(),
             None => cache
                 .drain()
-                .filter_map(|(_, entry)| entry.socket)
+                .flat_map(|(_, account_entries)| account_entries.into_values())
+                .filter_map(|entry| entry.socket)
                 .collect(),
         }
     };

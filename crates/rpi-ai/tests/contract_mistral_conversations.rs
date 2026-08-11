@@ -3,21 +3,31 @@
 //! streams, and assert both sides of the contract — the request shape
 //! (method / path / key headers / body JSON) and the emitted `StreamEvent`
 //! sequence. Mirrors `contract_adapters.rs`; the SSE payloads are recorded in
-//! the upstream Mistral wire format (`@mistralai/mistralai` chunk schemas).
+//! the upstream Mistral wire format (native transport since 9dd90a497).
+//!
+//! The `mistral_http_transport_*` tests port
+//! `packages/ai/test/mistral-http-transport.test.ts` @ 4181f66 (added by
+//! 9dd90a497), one Rust test per upstream `it(...)`, with the injected-fetch
+//! mocks replaced by the scripted server (coding standards §12.4).
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
-use rpi_ai::api::mistral_conversations::MistralConversations;
+use rpi_ai::api::mistral_conversations::{
+    stream as stream_mistral, MistralConversations, MistralOptions, MistralPromptMode,
+    MistralToolChoice,
+};
 use rpi_ai::models::ProviderStreams;
 use rpi_ai::types::{
-    ApiKind, CacheRetention, Context, Message, Model, SimpleStreamOptions, StopReason, StreamEvent,
-    StreamOptions, ThinkingLevel,
+    ApiKind, CacheRetention, Context, Message, Model, ProviderHeaders, SimpleStreamOptions,
+    StopReason, StreamEvent, StreamOptions, ThinkingLevel,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
 // Scripted HTTP server
@@ -45,39 +55,114 @@ impl CapturedRequest {
     }
 }
 
-/// Serves the scripted `(status, body)` responses, one per connection, on a
-/// loopback port. Returns the base URL and a channel of captured requests.
-async fn serve(script: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<CapturedRequest>) {
+/// A scripted response for [`serve_responses`].
+enum ScriptedResponse {
+    /// Complete response written in one go, with extra headers allowed.
+    Full {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+    },
+    /// 200 SSE response dribbled one byte per write, so transport chunks
+    /// split SSE frames and UTF-8 sequences arbitrarily
+    /// (`createBytewiseSseResponse` upstream).
+    Dribble(&'static str),
+    /// 200 response headers, then nothing: the body never arrives and the
+    /// socket is held until the client disconnects (abort/timeout tests).
+    Hang,
+}
+
+/// Serves the scripted responses, one per connection, on a loopback port.
+/// Returns the base URL and a channel of captured requests.
+async fn serve_responses(
+    script: Vec<ScriptedResponse>,
+) -> (String, mpsc::Receiver<CapturedRequest>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = mpsc::channel(script.len().max(1));
     tokio::spawn(async move {
-        for (status, body) in script {
+        for response in script {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let request = read_request(&mut socket).await;
             tx.send(request).await.expect("send captured request");
-            let reason = match status {
-                200 => "OK",
-                400 => "Bad Request",
-                429 => "Too Many Requests",
-                _ => "Status",
-            };
-            let content_type = if status == 200 {
-                "text/event-stream"
-            } else {
-                "application/json"
-            };
-            let response = format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("write response");
+            match response {
+                ScriptedResponse::Full {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    let reason = match status {
+                        200 => "OK",
+                        400 => "Bad Request",
+                        403 => "Forbidden",
+                        429 => "Too Many Requests",
+                        _ => "Status",
+                    };
+                    let content_type = if status == 200 {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    };
+                    let mut head = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in headers {
+                        head.push_str(&format!("{name}: {value}\r\n"));
+                    }
+                    socket
+                        .write_all(format!("{head}\r\n{body}").as_bytes())
+                        .await
+                        .expect("write response");
+                }
+                ScriptedResponse::Dribble(body) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    socket.write_all(head.as_bytes()).await.expect("write head");
+                    for byte in body.as_bytes() {
+                        if socket.write_all(&[*byte]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                ScriptedResponse::Hang => {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n",
+                        )
+                        .await
+                        .expect("write head");
+                    // Hold the socket open until the client goes away.
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                }
+            }
         }
     });
     (format!("http://{addr}"), rx)
+}
+
+/// Serves the scripted `(status, body)` responses, one per connection, on a
+/// loopback port. Returns the base URL and a channel of captured requests.
+async fn serve(script: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<CapturedRequest>) {
+    serve_responses(
+        script
+            .into_iter()
+            .map(|(status, body)| ScriptedResponse::Full {
+                status,
+                headers: Vec::new(),
+                body,
+            })
+            .collect(),
+    )
+    .await
 }
 
 async fn read_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
@@ -473,8 +558,7 @@ async fn preserves_raw_mistral_finish_reasons_for_successful_stops() {
 }
 
 /// mistral-raw-stop-reason.test.ts: "preserves raw Mistral finish reasons for
-/// provider error stops". (The upstream mock yields the SDK's camelCase
-/// `finishReason`; on the wire — which rpi parses — it is `finish_reason`.)
+/// provider error stops".
 #[tokio::test]
 async fn preserves_raw_mistral_finish_reasons_for_provider_error_stops() {
     const ERROR_SSE: &str = concat!(
@@ -580,4 +664,496 @@ async fn test_mistral_tool_schema_strict_serialization() {
         json!("string")
     );
     assert_eq!(event_kinds(&events).last(), Some(&"done"));
+}
+
+// ---------------------------------------------------------------------------
+// mistral-http-transport.test.ts @ 4181f66 (added by 9dd90a497, "fix(ai):
+// replace Mistral SDK with native transport"). One Rust test per upstream
+// `it(...)`; the injected-fetch mocks become the scripted server.
+// ---------------------------------------------------------------------------
+
+/// Upstream `createTerminalEvent()` + `[DONE]`, framed with CRLF boundaries
+/// like `createSseResponse`.
+const TERMINAL_SSE: &str = concat!(
+    "data: {\"id\":\"mistral-response-id\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\r\n",
+    "\r\n",
+    "data: [DONE]\r\n",
+    "\r\n",
+);
+
+/// mistral-http-transport.test.ts: "serializes SDK-style payloads to the
+/// Mistral wire format".
+#[tokio::test]
+async fn mistral_http_transport_serializes_sdk_style_payloads_to_the_mistral_wire_format() {
+    let (base_url, mut captured) = serve_responses(vec![ScriptedResponse::Full {
+        status: 200,
+        headers: vec![("x-request-id", "request-1")],
+        body: TERMINAL_SSE,
+    }])
+    .await;
+    let m = model(
+        "mistral-large-latest",
+        &base_url,
+        json!({"input": ["text", "image"]}),
+    );
+    let ctx = Context {
+        system_prompt: Some("Be precise".to_owned()),
+        messages: vec![serde_json::from_value(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            ],
+            "timestamp": 1
+        }))
+        .expect("user")],
+        tools: Some(vec![serde_json::from_value(json!({
+            "name": "lookup",
+            "description": "Look something up",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}
+        }))
+        .expect("tool")]),
+    };
+
+    let captured_payload = Arc::new(Mutex::new(None::<Value>));
+    let captured_response = Arc::new(Mutex::new(None::<(u16, _)>));
+    let mut opts = MistralOptions {
+        stream: StreamOptions {
+            request: rpi_ai::ProviderRequestOptions {
+                api_key: Some("secret".to_owned()),
+                ..Default::default()
+            },
+            ..StreamOptions::default()
+        },
+        tool_choice: Some(MistralToolChoice::Function {
+            name: "lookup".to_owned(),
+        }),
+        prompt_mode: Some(MistralPromptMode::Reasoning),
+        reasoning_effort: Some("high".to_owned()),
+    };
+    opts.stream.headers = Some(ProviderHeaders::from([(
+        "x-custom".to_owned(),
+        Some("value".to_owned()),
+    )]));
+    opts.stream.max_tokens = Some(123);
+    opts.stream.session_id = Some("session-1".to_owned());
+    let payload_slot = captured_payload.clone();
+    opts.stream.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
+        let payload_slot = payload_slot.clone();
+        Box::pin(async move {
+            *payload_slot.lock().expect("lock") = Some(payload.clone());
+            let mut next = payload.as_object().cloned().expect("payload object");
+            // The upstream callback spreads the camelCase payload and adds
+            // camelCase extras, which the wire remap must snake_case.
+            next.insert("topP".to_owned(), json!(0.9));
+            next.insert("randomSeed".to_owned(), json!(42));
+            next.insert(
+                "responseFormat".to_owned(),
+                json!({
+                    "type": "json_schema",
+                    "jsonSchema": {
+                        "name": "result",
+                        "schemaDefinition": {
+                            "type": "object",
+                            "properties": {"maxTokens": {"type": "number"}},
+                        },
+                    },
+                }),
+            );
+            next.insert("presencePenalty".to_owned(), json!(0.1));
+            next.insert("frequencyPenalty".to_owned(), json!(0.2));
+            next.insert("parallelToolCalls".to_owned(), json!(true));
+            next.insert("safePrompt".to_owned(), json!(true));
+            Some(Value::Object(next))
+        })
+    }));
+    let response_slot = captured_response.clone();
+    opts.stream.on_response = Some(Arc::new(
+        move |response: rpi_ai::types::ProviderResponse, _model: &Model| {
+            let response_slot = response_slot.clone();
+            Box::pin(async move {
+                *response_slot.lock().expect("lock") = Some((response.status, response.headers));
+            })
+        },
+    ));
+
+    let events = collect(stream_mistral(&m, &ctx, opts)).await;
+
+    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(*reason, rpi_ai::types::DoneReason::Stop);
+    assert_eq!(message.stop_reason, StopReason::Stop);
+
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(request.header("authorization"), Some("Bearer secret"));
+    assert_eq!(request.header("accept"), Some("text/event-stream"));
+    assert_eq!(request.header("content-type"), Some("application/json"));
+    assert_eq!(request.header("x-affinity"), Some("session-1"));
+    assert_eq!(request.header("x-custom"), Some("value"));
+
+    // `onPayload` observes the camelCase payload (9dd90a497).
+    let callback_payload = captured_payload
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("payload");
+    assert_eq!(callback_payload["maxTokens"], json!(123));
+    assert_eq!(callback_payload["promptMode"], json!("reasoning"));
+    assert_eq!(callback_payload["promptCacheKey"], json!("session-1"));
+
+    let (status, headers) = captured_response
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("on_response");
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("text/event-stream")
+    );
+    assert_eq!(
+        headers.get("x-request-id").map(String::as_str),
+        Some("request-1")
+    );
+
+    // The wire body is snake_case (`toMistralWirePayload`), camelCase gone.
+    let wire = request.body_json();
+    assert_eq!(wire["max_tokens"], json!(123));
+    assert_eq!(wire["prompt_mode"], json!("reasoning"));
+    assert_eq!(wire["reasoning_effort"], json!("high"));
+    assert_eq!(
+        wire["tool_choice"],
+        json!({"type": "function", "function": {"name": "lookup"}})
+    );
+    assert_eq!(wire["prompt_cache_key"], json!("session-1"));
+    assert_eq!(wire["top_p"], json!(0.9));
+    assert_eq!(wire["random_seed"], json!(42));
+    assert_eq!(wire["presence_penalty"], json!(0.1));
+    assert_eq!(wire["frequency_penalty"], json!(0.2));
+    assert_eq!(wire["parallel_tool_calls"], json!(true));
+    assert_eq!(wire["safe_prompt"], json!(true));
+    assert_eq!(
+        wire["response_format"],
+        json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "result",
+                "schema": {
+                    "type": "object",
+                    "properties": {"maxTokens": {"type": "number"}},
+                },
+            },
+        })
+    );
+    assert!(wire.get("maxTokens").is_none());
+    assert!(wire.get("promptMode").is_none());
+    assert!(wire.get("promptCacheKey").is_none());
+    assert_eq!(
+        wire["messages"],
+        json!([
+            {"role": "system", "content": "Be precise"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": "data:image/png;base64,aGVsbG8="},
+                ],
+            },
+        ])
+    );
+}
+
+/// mistral-http-transport.test.ts: "serializes assistant thinking, tool
+/// calls, and tool results for replay".
+#[tokio::test]
+async fn mistral_http_transport_serializes_assistant_thinking_tool_calls_and_tool_results_for_replay(
+) {
+    let (base_url, mut captured) = serve_responses(vec![ScriptedResponse::Full {
+        status: 200,
+        headers: Vec::new(),
+        body: TERMINAL_SSE,
+    }])
+    .await;
+    let m = model(
+        "mistral-large-latest",
+        &base_url,
+        json!({"input": ["text", "image"]}),
+    );
+    let history: Vec<Message> = serde_json::from_value(json!([
+        {
+            "role": "assistant", "api": "mistral-conversations", "provider": "mistral",
+            "model": "mistral-large-latest", "timestamp": 1, "stopReason": "toolUse",
+            "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                      "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0}},
+            "content": [
+                {"type": "thinking", "thinking": "reason"},
+                {"type": "text", "text": "answer"},
+                {"type": "toolCall", "id": "abc123456", "name": "lookup", "arguments": {"query": "pi"}},
+            ]
+        },
+        {
+            "role": "toolResult", "toolCallId": "abc123456", "toolName": "lookup",
+            "content": [
+                {"type": "text", "text": "found"},
+                {"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"},
+            ],
+            "isError": false, "timestamp": 2
+        }
+    ]))
+    .expect("history");
+
+    let events = collect(stream_mistral(&m, &context(history), {
+        let mut opts = MistralOptions::default();
+        opts.stream.request.api_key = Some("test".to_owned());
+        opts
+    }))
+    .await;
+
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(message.stop_reason, StopReason::Stop);
+
+    let request = captured.recv().await.expect("request captured");
+    let wire = request.body_json();
+    assert_eq!(
+        wire["messages"],
+        json!([
+            {
+                "role": "assistant",
+                "prefix": false,
+                "content": [
+                    {"type": "thinking", "thinking": [{"type": "text", "text": "reason"}]},
+                    {"type": "text", "text": "answer"},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "abc123456",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{\"query\":\"pi\"}"},
+                        "index": 0,
+                    },
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "abc123456",
+                "name": "lookup",
+                "content": [
+                    {"type": "text", "text": "found"},
+                    {"type": "image_url", "image_url": "data:image/png;base64,aGVsbG8="},
+                ],
+            },
+        ])
+    );
+}
+
+/// mistral-http-transport.test.ts: "parses native thinking, text, tool
+/// calls, and cached-token usage".
+#[tokio::test]
+async fn mistral_http_transport_parses_native_thinking_text_tool_calls_and_cached_token_usage() {
+    const NATIVE_SSE: &str = concat!(
+        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":[{\"type\":\"thinking\",\"thinking\":[{\"type\":\"text\",\"text\":\"reason\"}]}]}}]}\r\n",
+        "\r\n",
+        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"answer\"}]}}]}\r\n",
+        "\r\n",
+        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"tool_calls\":[{\"id\":\"abc123456\",\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\"}}]}}]}\r\n",
+        "\r\n",
+        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{\"tool_calls\":[{\"id\":\"abc123456\",\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"\\\"pi\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\r\n",
+        "\r\n",
+        "data: [DONE]\r\n",
+        "\r\n",
+    );
+    let (base_url, mut captured) = serve(vec![(200, NATIVE_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events = collect(MistralConversations.stream(
+        &m,
+        &context(vec![user_text("hello")]),
+        Some(options()),
+    ))
+    .await;
+
+    captured.recv().await.expect("request captured");
+    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(*reason, rpi_ai::types::DoneReason::ToolUse);
+    assert_eq!(message.stop_reason, StopReason::ToolUse);
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(message.response_id.as_deref(), Some("response-1"));
+    assert_eq!(message.content.len(), 3);
+    match &message.content[0] {
+        rpi_ai::types::AssistantContent::Thinking(thinking) => {
+            assert_eq!(thinking.thinking, "reason")
+        }
+        other => panic!("expected thinking block, got {other:?}"),
+    }
+    match &message.content[1] {
+        rpi_ai::types::AssistantContent::Text(text) => assert_eq!(text.text, "answer"),
+        other => panic!("expected text block, got {other:?}"),
+    }
+    match &message.content[2] {
+        rpi_ai::types::AssistantContent::ToolCall(call) => {
+            assert_eq!(call.id, "abc123456");
+            assert_eq!(call.name, "lookup");
+            assert_eq!(
+                serde_json::Value::Object(call.arguments.clone()),
+                json!({"query": "pi"})
+            );
+        }
+        other => panic!("expected tool call block, got {other:?}"),
+    }
+    assert_eq!(message.usage.input, 7);
+    assert_eq!(message.usage.output, 4);
+    assert_eq!(message.usage.cache_read, 3);
+    assert_eq!(message.usage.cache_write, 0);
+    assert_eq!(message.usage.total_tokens, 14);
+}
+
+/// mistral-http-transport.test.ts: "parses SSE and UTF-8 sequences split
+/// across transport chunks".
+#[tokio::test]
+async fn mistral_http_transport_parses_sse_and_utf_8_sequences_split_across_transport_chunks() {
+    const BYTEWISE_SSE: &str = concat!(
+        "data: {\"id\":\"response-bytewise\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{\"content\":\"héllo 🌍\"}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\r\n",
+        "\r\n",
+        "data: [DONE]\r\n",
+        "\r\n",
+    );
+    let (base_url, mut captured) =
+        serve_responses(vec![ScriptedResponse::Dribble(BYTEWISE_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events = collect(MistralConversations.stream(
+        &m,
+        &context(vec![user_text("hello")]),
+        Some(options()),
+    ))
+    .await;
+
+    captured.recv().await.expect("request captured");
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(message.content.len(), 1);
+    match &message.content[0] {
+        rpi_ai::types::AssistantContent::Text(text) => assert_eq!(text.text, "héllo 🌍"),
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
+/// mistral-http-transport.test.ts: "honors case-insensitive header overrides
+/// and explicit affinity suppression".
+#[tokio::test]
+async fn mistral_http_transport_honors_case_insensitive_header_overrides_and_explicit_affinity_suppression(
+) {
+    let (base_url, mut captured) = serve_responses(vec![ScriptedResponse::Full {
+        status: 200,
+        headers: Vec::new(),
+        body: TERMINAL_SSE,
+    }])
+    .await;
+    let m = model(
+        "mistral-large-latest",
+        &base_url,
+        json!({"headers": {"Authorization": "Bearer model-key", "X-Affinity": "model-affinity"}}),
+    );
+    let mut opts = options();
+    opts.request.api_key = Some("request-key".to_owned());
+    opts.session_id = Some("automatic-affinity".to_owned());
+    // `null` overrides delete the header and count as explicit x-affinity.
+    opts.headers = Some(ProviderHeaders::from([
+        ("authorization".to_owned(), None),
+        ("x-affinity".to_owned(), None),
+    ]));
+    let events =
+        collect(MistralConversations.stream(&m, &context(vec![user_text("hello")]), Some(opts)))
+            .await;
+
+    let request = captured.recv().await.expect("request captured");
+    assert!(request.header("authorization").is_none());
+    assert!(request.header("x-affinity").is_none());
+    assert_eq!(event_kinds(&events).last(), Some(&"done"));
+}
+
+/// mistral-http-transport.test.ts: "aborts while waiting for an SSE chunk".
+#[tokio::test]
+async fn mistral_http_transport_aborts_while_waiting_for_an_sse_chunk() {
+    let (base_url, _captured) = serve_responses(vec![ScriptedResponse::Hang]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let token = CancellationToken::new();
+    let mut opts = options();
+    opts.signal = Some(token.clone());
+    let handle = tokio::spawn(collect(MistralConversations.stream(
+        &m,
+        &context(vec![user_text("hello")]),
+        Some(opts),
+    )));
+    // Abort after the request is in flight, while the body never arrives.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    token.cancel();
+    let events = handle.await.expect("collect task");
+
+    // Upstream asserts only the aborted stop reason; whether `start` was
+    // already emitted depends on how far the request got before the cancel.
+    let Some(StreamEvent::Error { reason, error }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(*reason, rpi_ai::types::ErrorReason::Aborted);
+    assert_eq!(error.stop_reason, StopReason::Aborted);
+}
+
+/// mistral-http-transport.test.ts: "applies the request timeout while
+/// waiting for an SSE chunk".
+#[tokio::test]
+async fn mistral_http_transport_applies_the_request_timeout_while_waiting_for_an_sse_chunk() {
+    let (base_url, _captured) = serve_responses(vec![ScriptedResponse::Hang]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let mut opts = options();
+    opts.timeout_ms = Some(5);
+    let events =
+        collect(MistralConversations.stream(&m, &context(vec![user_text("hello")]), Some(opts)))
+            .await;
+
+    // `start` may or may not precede the error depending on whether the
+    // response headers beat the 5ms timeout.
+    let Some(StreamEvent::Error { reason, error }) = events.last() else {
+        panic!("expected error event, got {events:?}");
+    };
+    assert_eq!(*reason, rpi_ai::types::ErrorReason::Error);
+    assert_eq!(error.stop_reason, StopReason::Error);
+    // Upstream surfaces the Node `TimeoutError` DOMException text
+    // ("The operation was aborted due to timeout", matched by `/timeout/i`).
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("The operation was aborted due to timeout")
+    );
+}
+
+/// mistral-http-transport.test.ts: "preserves HTTP status and response
+/// bodies in errors".
+#[tokio::test]
+async fn mistral_http_transport_preserves_http_status_and_response_bodies_in_errors() {
+    let error_body = "{\"message\":\"blocked by gateway\"}";
+    let (base_url, mut captured) = serve(vec![(403, error_body)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events = collect(MistralConversations.stream(
+        &m,
+        &context(vec![user_text("hello")]),
+        Some(options()),
+    ))
+    .await;
+
+    captured.recv().await.expect("request captured");
+    assert_eq!(event_kinds(&events), vec!["error"]);
+    let StreamEvent::Error { error, .. } = &events[0] else {
+        panic!("expected error event");
+    };
+    assert_eq!(error.stop_reason, StopReason::Error);
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("Mistral API error (403): {\"message\":\"blocked by gateway\"}")
+    );
 }
