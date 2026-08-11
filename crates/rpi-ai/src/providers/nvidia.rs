@@ -28,5 +28,6 @@ pub fn nvidia_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("nvidia").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }

@@ -37,6 +37,7 @@ pub fn cloudflare_ai_gateway_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("cloudflare-ai-gateway").to_vec(),
         api: ProviderApi::Map(api_map()),
+        ..Default::default()
     })
 }
 

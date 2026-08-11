@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
-use rpi_ai::models::{merge_models, now_millis, InflightRefresh, Provider, RefreshModelsContext};
+use rpi_ai::models::{
+    merge_models, now_millis, InflightRefresh, ModelsPublication, Provider, RefreshModelsContext,
+};
 use rpi_ai::models_store::ModelsStoreEntry;
 use rpi_ai::types::{Context, Model, ProviderHeaders, SimpleStreamOptions, StreamOptions};
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
@@ -53,12 +55,6 @@ pub fn model_catalog_endpoint(settings_url: Option<&str>) -> Option<String> {
         settings_url,
         DEFAULT_CATALOG_BASE_URL,
     )
-}
-
-/// Store errors surface as `ModelsError("model_source", …)` on the refresh
-/// path (same mapping as `Models::refresh`).
-fn store_error(error: rpi_ai::error::AiError) -> ModelsError {
-    ModelsError::new(ModelsErrorCode::ModelSource, error.to_string())
 }
 
 /// `remoteModels` (remote-catalog-provider.ts:32-41): the stored overlay is
@@ -237,7 +233,9 @@ impl Provider for RemoteCatalogProvider {
         Some(Box::pin(async move {
             inflight
                 .join_or_run(async move {
-                    let stored = context.store.read().await.map_err(store_error)?;
+                    // The stored snapshot is already captured by the caller
+                    // (models.ts:375-383 @ 4181f66) — no async read needed.
+                    let stored = context.stored.clone();
                     {
                         let mut dynamic = dynamic_models.lock().unwrap_or_else(|e| e.into_inner());
                         *dynamic = remote_models(stored.as_ref(), local_generated_at)
@@ -246,9 +244,7 @@ impl Provider for RemoteCatalogProvider {
                             .collect();
                     }
 
-                    if !context.allow_network
-                        || context.signal.as_ref().is_some_and(|t| t.is_cancelled())
-                    {
+                    if !context.allow_network || context.signal.is_cancelled() {
                         return Ok(());
                     }
                     // The 4-hour freshness window (remote-catalog-provider.ts:
@@ -261,7 +257,7 @@ impl Provider for RemoteCatalogProvider {
                         stored.last_modified.is_some()
                             && now_millis() - checked_at < REMOTE_CATALOG_REFRESH_INTERVAL_MS
                     });
-                    if !context.force && within_ttl {
+                    if !context.force.unwrap_or(false) && within_ttl {
                         return Ok(());
                     }
 
@@ -280,8 +276,8 @@ impl Provider for RemoteCatalogProvider {
                     if let Some(validator) = &validator {
                         request = request.header(reqwest::header::IF_NONE_MATCH, validator);
                     }
-                    let response = send_with_signal(request, context.signal.as_ref()).await?;
-                    if context.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
+                    let response = send_with_signal(request, Some(&context.signal)).await?;
+                    if context.signal.is_cancelled() {
                         return Ok(());
                     }
                     let checked_at = now_millis();
@@ -290,14 +286,17 @@ impl Provider for RemoteCatalogProvider {
                     // overlay, so only the freshness window moves.
                     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                         if let Some(stored) = &stored {
+                            let entry = ModelsStoreEntry {
+                                checked_at: Some(checked_at),
+                                ..stored.clone()
+                            };
                             context
-                                .store
-                                .write(ModelsStoreEntry {
-                                    checked_at: Some(checked_at),
-                                    ..stored.clone()
+                                .publish
+                                .publish(ModelsPublication {
+                                    persist: Some(Some(entry)),
+                                    update: None,
                                 })
-                                .await
-                                .map_err(store_error)?;
+                                .await?;
                         }
                         return Ok(());
                     }
@@ -308,19 +307,22 @@ impl Provider for RemoteCatalogProvider {
                         // Unavailable overlay: drop the validator so the next
                         // refresh re-downloads instead of 304-ing forever
                         // (remote-catalog-provider.ts:90-98).
+                        let entry = ModelsStoreEntry {
+                            models: stored
+                                .as_ref()
+                                .map(|stored| stored.models.clone())
+                                .unwrap_or_default(),
+                            last_modified: Some(0),
+                            checked_at: Some(checked_at),
+                            etag: None,
+                        };
                         context
-                            .store
-                            .write(ModelsStoreEntry {
-                                models: stored
-                                    .as_ref()
-                                    .map(|stored| stored.models.clone())
-                                    .unwrap_or_default(),
-                                last_modified: Some(0),
-                                checked_at: Some(checked_at),
-                                etag: None,
+                            .publish
+                            .publish(ModelsPublication {
+                                persist: Some(Some(entry)),
+                                update: None,
                             })
-                            .await
-                            .map_err(store_error)?;
+                            .await?;
                         return Ok(());
                     }
                     if !status.is_success() {
@@ -328,19 +330,22 @@ impl Provider for RemoteCatalogProvider {
                         // validator stay valid, so keep the etag and let the
                         // next refresh revalidate instead of downloading the
                         // catalog (remote-catalog-provider.ts:99-104).
+                        let entry = ModelsStoreEntry {
+                            models: stored
+                                .as_ref()
+                                .map(|stored| stored.models.clone())
+                                .unwrap_or_default(),
+                            last_modified: stored.as_ref().and_then(|s| s.last_modified),
+                            checked_at: Some(checked_at),
+                            etag: stored.as_ref().and_then(|s| s.etag.clone()),
+                        };
                         context
-                            .store
-                            .write(ModelsStoreEntry {
-                                models: stored
-                                    .as_ref()
-                                    .map(|stored| stored.models.clone())
-                                    .unwrap_or_default(),
-                                last_modified: stored.as_ref().and_then(|s| s.last_modified),
-                                checked_at: Some(checked_at),
-                                etag: stored.as_ref().and_then(|s| s.etag.clone()),
+                            .publish
+                            .publish(ModelsPublication {
+                                persist: Some(Some(entry)),
+                                update: None,
                             })
-                            .await
-                            .map_err(store_error)?;
+                            .await?;
                         return Err(ModelsError::new(
                             ModelsErrorCode::ModelSource,
                             format!("Model catalog request failed for {}: {status}", inner.id()),
@@ -365,7 +370,7 @@ impl Provider for RemoteCatalogProvider {
                     let refreshed = parse_catalog(inner.id(), &body).map_err(|message| {
                         ModelsError::new(ModelsErrorCode::ModelSource, message)
                     })?;
-                    if context.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
+                    if context.signal.is_cancelled() {
                         return Ok(());
                     }
                     let entry = ModelsStoreEntry {
@@ -374,9 +379,18 @@ impl Provider for RemoteCatalogProvider {
                         checked_at: Some(checked_at),
                         etag,
                     };
-                    *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) =
-                        remote_models(Some(&entry), local_generated_at);
-                    context.store.write(entry).await.map_err(store_error)
+                    let dynamic_models = dynamic_models.clone();
+                    let overlay = remote_models(Some(&entry), local_generated_at);
+                    context
+                        .publish
+                        .publish(ModelsPublication {
+                            persist: Some(Some(entry)),
+                            update: Some(Box::new(move || {
+                                *dynamic_models.lock().unwrap_or_else(|e| e.into_inner()) = overlay;
+                            })),
+                        })
+                        .await?;
+                    Ok(())
                 })
                 .await
         }))
@@ -461,10 +475,8 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use rpi_ai::models::{RefreshModelsContext, ScopedModelsStore};
-    use rpi_ai::models_store::{
-        InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ProviderModelsStore,
-    };
+    use rpi_ai::models::{PublishHandle, PublishShared, RefreshModelsContext};
+    use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore, ModelsStoreEntry};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
@@ -500,28 +512,62 @@ mod tests {
                 api: rpi_ai::models::ProviderApi::Single(Arc::new(
                     rpi_ai::api::openai_completions::OpenAiCompletions,
                 )),
+                ..Default::default()
             });
         with_remote_catalog(inner, Some(catalog_base_url.to_owned()), local_generated_at)
     }
 
-    async fn scoped_store(store: Arc<dyn ModelsStore>) -> Arc<dyn ProviderModelsStore> {
-        Arc::new(ScopedModelsStore::new(store, "test-provider"))
-    }
-
-    fn context(store: Arc<dyn ProviderModelsStore>) -> RefreshModelsContext {
+    async fn make_context(
+        store: Arc<dyn ModelsStore>,
+        allow_network: bool,
+        force: bool,
+    ) -> RefreshModelsContext {
+        let stored = store.read("test-provider", None).await.unwrap_or(None);
+        let signal = CancellationToken::new();
+        let shared = Arc::new(PublishShared {
+            provider_id: "test-provider".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: Arc::new(std::sync::RwLock::new(
+                [("test-provider".to_owned(), 1u64)].into(),
+            )),
+        });
         RefreshModelsContext {
             credential: None,
-            store,
-            allow_network: true,
-            force: false,
-            signal: None,
+            stored,
+            publish: PublishHandle { shared },
+            allow_network,
+            force: if allow_network { Some(force) } else { None },
+            signal,
         }
     }
 
-    fn context_offline(store: Arc<dyn ProviderModelsStore>) -> RefreshModelsContext {
+    async fn make_context_with_signal(
+        store: Arc<dyn ModelsStore>,
+        allow_network: bool,
+        force: bool,
+        signal: CancellationToken,
+    ) -> RefreshModelsContext {
+        let stored = store.read("test-provider", None).await.unwrap_or(None);
+        let shared = Arc::new(PublishShared {
+            provider_id: "test-provider".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: Arc::new(std::sync::RwLock::new(
+                [("test-provider".to_owned(), 1u64)].into(),
+            )),
+        });
         RefreshModelsContext {
-            allow_network: false,
-            ..context(store)
+            credential: None,
+            stored,
+            publish: PublishHandle { shared },
+            allow_network,
+            force: if allow_network { Some(force) } else { None },
+            signal,
         }
     }
 
@@ -720,20 +766,19 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh");
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh (ttl)");
         provider
-            .refresh_models(RefreshModelsContext { force: true, ..ctx })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("forced refresh");
@@ -741,7 +786,7 @@ mod tests {
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["static", "dynamic"]);
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -780,10 +825,9 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, Some(local_generated_at));
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh");
@@ -791,14 +835,14 @@ mod tests {
         assert_eq!(ids, ["static"]);
 
         provider
-            .refresh_models(RefreshModelsContext { force: true, ..ctx })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("forced refresh");
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["static", "newer"]);
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -822,17 +866,16 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh");
         let requests = server.requests();
         assert_eq!(requests[0].if_none_match, None);
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -840,10 +883,7 @@ mod tests {
 
         let checked_at = stored.checked_at;
         provider
-            .refresh_models(RefreshModelsContext {
-                force: true,
-                ..ctx.clone()
-            })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("forced refresh");
@@ -853,7 +893,7 @@ mod tests {
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["static", "dynamic"]);
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -880,21 +920,20 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh");
         provider
-            .refresh_models(RefreshModelsContext { force: true, ..ctx })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("501 resolves");
 
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -924,25 +963,21 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("refresh");
         let error = provider
-            .refresh_models(RefreshModelsContext {
-                force: true,
-                ..ctx.clone()
-            })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect_err("429 rejects");
         assert!(error.message.contains("429"), "message: {}", error.message);
 
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -951,7 +986,7 @@ mod tests {
         assert_eq!(ids, ["dynamic"]);
 
         provider
-            .refresh_models(RefreshModelsContext { force: true, ..ctx })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("304 revalidation");
@@ -979,14 +1014,14 @@ mod tests {
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
 
         provider
-            .refresh_models(context(scoped_store(store.clone()).await))
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("501 resolves");
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["static"]);
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -1008,12 +1043,13 @@ mod tests {
                     checked_at: Some(now_millis()),
                     etag: Some("\"catalog-1\"".to_owned()),
                 },
+                None,
             )
             .await
             .expect("write");
         let provider = test_provider("http://catalog.invalid", None);
         provider
-            .refresh_models(context_offline(scoped_store(store).await))
+            .refresh_models(make_context(store, false, false).await)
             .expect("refresh")
             .await
             .expect("offline refresh");
@@ -1035,7 +1071,7 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store).await);
+        let ctx = make_context(store.clone(), true, false).await;
         let provider = Arc::new(provider);
 
         let provider_a = provider.clone();
@@ -1073,6 +1109,7 @@ mod tests {
                     checked_at: Some(now_millis() - REMOTE_CATALOG_REFRESH_INTERVAL_MS * 2),
                     etag: None,
                 },
+                None,
             )
             .await
             .expect("write");
@@ -1084,16 +1121,13 @@ mod tests {
             token_for_abort.cancel();
         });
         let result = provider
-            .refresh_models(RefreshModelsContext {
-                signal: Some(token),
-                ..context(scoped_store(store.clone()).await)
-            })
+            .refresh_models(make_context_with_signal(store.clone(), true, true, token).await)
             .expect("refresh")
             .await;
         abort.await.expect("abort");
         assert!(result.is_err());
         let stored = store
-            .read("test-provider")
+            .read("test-provider", None)
             .await
             .expect("read")
             .expect("entry");
@@ -1115,15 +1149,14 @@ mod tests {
         .await;
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-        let ctx = context(scoped_store(store.clone()).await);
 
         provider
-            .refresh_models(ctx.clone())
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect("array catalog");
         provider
-            .refresh_models(RefreshModelsContext { force: true, ..ctx })
+            .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
             .expect("object catalog");
@@ -1139,7 +1172,7 @@ mod tests {
         let provider = test_provider(&server.url, None);
         let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
         let error = provider
-            .refresh_models(context(scoped_store(store).await))
+            .refresh_models(make_context(store.clone(), true, false).await)
             .expect("refresh")
             .await
             .expect_err("invalid catalog");

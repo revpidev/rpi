@@ -49,6 +49,7 @@ pub fn github_copilot_provider() -> Arc<dyn Provider> {
             },
             models: get_builtin_models("github-copilot").to_vec(),
             api: ProviderApi::Map(api_map()),
+            ..Default::default()
         }),
     })
 }

@@ -29,6 +29,7 @@ pub fn cloudflare_workers_ai_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("cloudflare-workers-ai").to_vec(),
         api: ProviderApi::Single(cloudflare_streams(Arc::new(OpenAiCompletions))),
+        ..Default::default()
     })
 }
 

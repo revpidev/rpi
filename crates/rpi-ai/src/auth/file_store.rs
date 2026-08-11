@@ -38,8 +38,8 @@ use tokio::sync::{Mutex, RwLock};
 use super::config_value::resolve_config_value;
 use super::resolve::{ModelsError, ModelsErrorCode};
 use super::types::{
-    ApiKeyCredential, BoxFutureSend, Credential, CredentialInfo, CredentialStore, CredentialType,
-    ModifyFn,
+    ApiKeyCredential, AuthOperationOptions, BoxFutureSend, Credential, CredentialInfo,
+    CredentialStore, CredentialType, ModifyFn,
 };
 
 /// `AuthStorageData = Record<string, Credential>`.
@@ -511,7 +511,11 @@ impl CredentialStore for FileCredentialStore {
     /// `read` — serves the snapshot; `api_key` entries with a configured key
     /// resolve it through the config-value DSL (command results cached
     /// process-wide, see `config_value.rs`). OAuth entries return unchanged.
-    async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+    async fn read(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError> {
         let data = self.data.read().await;
         let Some(value) = data.get(provider_id) else {
             return Ok(None);
@@ -536,7 +540,10 @@ impl CredentialStore for FileCredentialStore {
     /// Entries whose `type` tag is not a known credential type (newer
     /// shapes) are skipped: the closed [`CredentialType`] enum cannot
     /// represent them.
-    async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
+    async fn list(
+        &self,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Vec<CredentialInfo>, ModelsError> {
         Ok(self
             .data
             .read()
@@ -568,9 +575,19 @@ impl CredentialStore for FileCredentialStore {
         &self,
         provider_id: &str,
         f: ModifyFn,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError> {
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let lock = self.provider_lock(provider_id).await;
-        let _guard = lock.lock().await;
+        // T21b: queue-cancellable — cancel during lock-wait rejects without
+        // running the task; after lock acquisition, re-check before executing
+        // (credential-store.ts:14-28 @ 4181f66).
+        let _guard = tokio::select! {
+            biased;
+            _ = super::credential_store::cancel_future(options) => return Err(ModelsError::aborted()),
+            guard = lock.lock() => guard,
+        };
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let provider = provider_id.to_owned();
         let (snapshot, credential) = self
             .backend
@@ -623,9 +640,22 @@ impl CredentialStore for FileCredentialStore {
     }
 
     /// `delete` — serialized against `modify` (same locks).
-    async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
+    async fn delete(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), ModelsError> {
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let lock = self.provider_lock(provider_id).await;
-        let _guard = lock.lock().await;
+        // T21b: queue-cancellable — cancel during lock-wait rejects without
+        // running the task; after lock acquisition, re-check before executing
+        // (credential-store.ts:14-28 @ 4181f66).
+        let _guard = tokio::select! {
+            biased;
+            _ = super::credential_store::cancel_future(options) => return Err(ModelsError::aborted()),
+            guard = lock.lock() => guard,
+        };
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let provider = provider_id.to_owned();
         let snapshot = self
             .backend
@@ -745,7 +775,7 @@ mod tests {
         );
         let storage = FileCredentialStore::new(&auth_path);
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("environment-key"))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -761,7 +791,7 @@ mod tests {
         );
         let storage = FileCredentialStore::new(&auth_path);
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("command-key"))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -785,7 +815,7 @@ mod tests {
             credential.clone(),
         )]));
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(credential)
         );
     }
@@ -805,7 +835,7 @@ mod tests {
             }),
         );
         let storage = FileCredentialStore::new(&auth_path);
-        let credential = match storage.read("anthropic").await.expect("read") {
+        let credential = match storage.read("anthropic", None).await.expect("read") {
             Some(Credential::ApiKey(credential)) => credential,
             other => panic!("expected api_key credential, got {other:?}"),
         };
@@ -841,6 +871,7 @@ mod tests {
             .modify(
                 "anthropic",
                 modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
             )
             .await
             .expect("modify");
@@ -866,13 +897,13 @@ mod tests {
         let storage = FileCredentialStore::new(&auth_path);
         assert_eq!(
             storage
-                .modify("anthropic", modify_fn(|_| Ok(None)))
+                .modify("anthropic", modify_fn(|_| Ok(None)), None)
                 .await
                 .expect("modify"),
             Some(api_key_credential("stored"))
         );
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("stored"))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -888,11 +919,13 @@ mod tests {
         let (one, two) = tokio::join!(
             first.modify(
                 "anthropic",
-                modify_fn(|_| Ok(Some(api_key_credential("anthropic-key"))))
+                modify_fn(|_| Ok(Some(api_key_credential("anthropic-key")))),
+                None,
             ),
             second.modify(
                 "openai",
-                modify_fn(|_| Ok(Some(api_key_credential("openai-key"))))
+                modify_fn(|_| Ok(Some(api_key_credential("openai-key")))),
+                None,
             ),
         );
         one.expect("first modify");
@@ -927,8 +960,8 @@ mod tests {
                 "google": { "type": "api_key", "key": "external-key" }
             }),
         );
-        storage.delete("anthropic").await.expect("delete");
-        let mut list = storage.list().await.expect("list");
+        storage.delete("anthropic", None).await.expect("delete");
+        let mut list = storage.list(None).await.expect("list");
         list.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         assert_eq!(
             list,
@@ -943,13 +976,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(storage.read("anthropic").await.expect("read"), None);
+        assert_eq!(storage.read("anthropic", None).await.expect("read"), None);
         assert_eq!(
-            storage.read("openai").await.expect("read"),
+            storage.read("openai", None).await.expect("read"),
             Some(api_key_credential("openai-key"))
         );
         assert_eq!(
-            storage.read("google").await.expect("read"),
+            storage.read("google", None).await.expect("read"),
             Some(api_key_credential("external-key"))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -962,22 +995,23 @@ mod tests {
             api_key_credential("initial"),
         )]));
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("initial"))
         );
         storage
             .modify(
                 "anthropic",
                 modify_fn(|_| Ok(Some(api_key_credential("updated")))),
+                None,
             )
             .await
             .expect("modify");
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("updated"))
         );
-        storage.delete("anthropic").await.expect("delete");
-        assert!(storage.list().await.expect("list").is_empty());
+        storage.delete("anthropic", None).await.expect("delete");
+        assert!(storage.list(None).await.expect("list").is_empty());
     }
 
     #[tokio::test]
@@ -1013,7 +1047,11 @@ mod tests {
         blocker.try_lock_exclusive().expect("lock");
 
         let error = storage
-            .modify("openai", modify_fn(|_| Ok(Some(api_key_credential("new")))))
+            .modify(
+                "openai",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
             .await
             .expect_err("lock unavailable");
         assert!(error
@@ -1027,7 +1065,11 @@ mod tests {
         blocker.unlock().expect("unlock");
         drop(blocker);
         storage
-            .modify("openai", modify_fn(|_| Ok(Some(api_key_credential("new")))))
+            .modify(
+                "openai",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
             .await
             .expect("modify after release");
         assert_eq!(
@@ -1051,7 +1093,11 @@ mod tests {
         let storage = FileCredentialStore::new(&auth_path);
         std::fs::write(&auth_path, "{invalid-json").expect("corrupt");
         storage
-            .modify("openai", modify_fn(|_| Ok(Some(api_key_credential("new")))))
+            .modify(
+                "openai",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
             .await
             .expect_err("malformed JSON must fail");
         assert_eq!(
@@ -1097,6 +1143,7 @@ mod tests {
             .modify(
                 "anthropic",
                 modify_fn(|_| Ok(Some(api_key_credential("key")))),
+                None,
             )
             .await
             .expect("modify");
@@ -1127,7 +1174,7 @@ mod tests {
             }),
         );
         let storage = FileCredentialStore::new(&auth_path);
-        let list = storage.list().await.expect("list");
+        let list = storage.list(None).await.expect("list");
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].provider_id, "anthropic");
         assert!(!marker.exists(), "list() must not execute commands");
@@ -1167,6 +1214,7 @@ mod tests {
                                 Ok(Some(api_key_credential(&format!("v{}", n + 1))))
                             })
                         }),
+                        None,
                     )
                     .await
             }));
@@ -1179,7 +1227,7 @@ mod tests {
             json!({ "anthropic": { "type": "api_key", "key": "v10" } })
         );
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("v10"))
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1203,14 +1251,14 @@ mod tests {
         );
         storage.reload().await;
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("new"))
         );
 
         std::fs::write(&auth_path, "{invalid-json").expect("corrupt");
         storage.reload().await;
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("new")),
             "reload failure must preserve the last valid snapshot"
         );
@@ -1296,11 +1344,11 @@ mod tests {
         std::fs::write(&auth_path, AUTH_DSL_FIXTURE).expect("write fixture");
         let storage = FileCredentialStore::new(&auth_path);
         assert_eq!(
-            storage.read("anthropic").await.expect("read"),
+            storage.read("anthropic", None).await.expect("read"),
             Some(api_key_credential("fixture-env-key"))
         );
         assert_eq!(
-            storage.read("openai").await.expect("read"),
+            storage.read("openai", None).await.expect("read"),
             Some(api_key_credential("fixture-command-key"))
         );
         let _ = std::fs::remove_dir_all(&dir);

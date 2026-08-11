@@ -23,5 +23,6 @@ pub fn openai_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("openai").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiResponses)),
+        ..Default::default()
     })
 }

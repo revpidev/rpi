@@ -23,5 +23,6 @@ pub fn mistral_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("mistral").to_vec(),
         api: ProviderApi::Single(Arc::new(MistralConversations)),
+        ..Default::default()
     })
 }

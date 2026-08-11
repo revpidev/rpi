@@ -34,5 +34,6 @@ pub fn kimi_coding_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("kimi-coding").to_vec(),
         api: ProviderApi::Single(Arc::new(AnthropicMessages)),
+        ..Default::default()
     })
 }

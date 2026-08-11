@@ -57,8 +57,9 @@ use rpi_ai::auth::resolve::{
     resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode,
 };
 use rpi_ai::auth::types::{
-    ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthResult, AuthType, Credential,
-    CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext, ModifyFn, ProviderAuth,
+    ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthOperationOptions, AuthResult,
+    AuthType, Credential, CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext,
+    ModifyFn, ProviderAuth,
 };
 use rpi_ai::models::{
     create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions,
@@ -132,18 +133,25 @@ impl RuntimeCredentials {
 
 #[async_trait::async_trait]
 impl CredentialStore for RuntimeCredentials {
-    async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+    async fn read(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError> {
         if let Some(key) = self.runtime_override(provider_id) {
             return Ok(Some(Credential::ApiKey(ApiKeyCredential {
                 key: Some(key),
                 env: None,
             })));
         }
-        self.store.read(provider_id).await
+        self.store.read(provider_id, options).await
     }
 
-    async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
-        let mut entries: Vec<CredentialInfo> = self.store.list().await?;
+    async fn list(
+        &self,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Vec<CredentialInfo>, ModelsError> {
+        let mut entries: Vec<CredentialInfo> = self.store.list(options).await?;
         for provider_id in self.override_provider_ids() {
             if !entries.iter().any(|entry| entry.provider_id == provider_id) {
                 entries.push(CredentialInfo {
@@ -159,13 +167,18 @@ impl CredentialStore for RuntimeCredentials {
         &self,
         provider_id: &str,
         f: ModifyFn,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError> {
-        self.store.modify(provider_id, f).await
+        self.store.modify(provider_id, f, options).await
     }
 
-    async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
+    async fn delete(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), ModelsError> {
         self.remove_runtime_api_key(provider_id);
-        self.store.delete(provider_id).await
+        self.store.delete(provider_id, options).await
     }
 }
 
@@ -814,6 +827,7 @@ impl ModelRuntime {
                 allow_network: Some(refresh_from_network),
                 force: None,
                 signal: token,
+                ..Default::default()
             }))
             .await;
         // The refresh result (errors/abort) is intentionally not surfaced:
@@ -976,6 +990,7 @@ impl ModelRuntime {
             auth,
             models,
             api: ProviderApi::Single(streams),
+            ..Default::default()
         });
         // Overlays keep the base's dynamic catalog refresh
         // (provider-composer.ts:475-478).
@@ -1056,7 +1071,7 @@ impl ModelRuntime {
     ) -> Result<Option<AuthCheck>, ModelsError> {
         let credential = self
             .credentials
-            .read(provider.id())
+            .read(provider.id(), None)
             .await
             .map_err(|error| {
                 ModelsError::with_cause(
@@ -1131,7 +1146,7 @@ impl ModelRuntime {
         }
         let stored: HashSet<String> = self
             .credentials
-            .list()
+            .list(None)
             .await?
             .into_iter()
             .map(|entry| entry.provider_id)
@@ -1149,7 +1164,7 @@ impl ModelRuntime {
             }
             let credential = self
                 .credentials
-                .read(provider.id())
+                .read(provider.id(), None)
                 .await
                 .map_err(|error| {
                     ModelsError::with_cause(
@@ -1296,6 +1311,7 @@ impl ModelRuntime {
                 Some(&AuthResolutionOverrides {
                     api_key: overrides.api_key.clone(),
                     env: overrides.env.clone(),
+                    ..Default::default()
                 }),
             )
             .await
@@ -1326,13 +1342,14 @@ impl ModelRuntime {
             allow_network: Some(self.model_network_enabled),
             force: None,
             signal: None,
+            ..Default::default()
         }))
         .await;
     }
 
     /// `listCredentials` (model-runtime.ts:422-424).
     pub async fn list_credentials(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
-        self.credentials.list().await
+        self.credentials.list(None).await
     }
 
     /// `login` (model-runtime.ts:503-507): run the provider's login through
@@ -1360,6 +1377,7 @@ impl ModelRuntime {
             allow_network: Some(self.model_network_enabled),
             force: None,
             signal: Some(signal),
+            ..Default::default()
         }))
         .await;
         Ok(credential)
@@ -1377,6 +1395,7 @@ impl ModelRuntime {
             allow_network: Some(self.model_network_enabled),
             force: None,
             signal: Some(signal),
+            ..Default::default()
         }))
         .await;
         Ok(())
@@ -1446,6 +1465,7 @@ impl ModelRuntime {
             ),
             force: options.as_ref().and_then(|o| o.force),
             signal: options.as_ref().and_then(|o| o.signal.clone()),
+            ..Default::default()
         };
         let result = self.models.refresh(Some(refresh_options)).await;
         self.update_model_snapshot();
@@ -1476,6 +1496,7 @@ impl ModelRuntime {
             allow_network: Some(false),
             force: None,
             signal: None,
+            ..Default::default()
         }))
         .await;
         Ok(())
@@ -1507,6 +1528,7 @@ impl ModelRuntime {
             allow_network: Some(false),
             force: None,
             signal: None,
+            ..Default::default()
         }))
         .await;
         Ok(())
@@ -1522,6 +1544,7 @@ impl ModelRuntime {
             allow_network: Some(false),
             force: None,
             signal: None,
+            ..Default::default()
         }))
         .await;
     }
@@ -1682,10 +1705,37 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
-    use rpi_ai::models::ScopedModelsStore;
-    use rpi_ai::models_store::ProviderModelsStore;
+    use rpi_ai::models::{PublishHandle, PublishShared};
 
     use super::*;
+
+    /// Build a minimal `RefreshModelsContext` for probing whether a provider
+    /// implements `refresh_models`. Never actually awaited.
+    async fn make_probe_context(
+        store: Arc<dyn ModelsStore>,
+        provider_id: &str,
+    ) -> RefreshModelsContext {
+        let stored = store.read(provider_id, None).await.unwrap_or(None);
+        let signal = CancellationToken::new();
+        let shared = Arc::new(PublishShared {
+            provider_id: provider_id.to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store,
+            chain: Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: Arc::new(std::sync::RwLock::new(
+                [(provider_id.to_owned(), 1u64)].into(),
+            )),
+        });
+        RefreshModelsContext {
+            credential: None,
+            stored,
+            publish: PublishHandle { shared },
+            allow_network: false,
+            force: None,
+            signal,
+        }
+    }
 
     struct TempDir(PathBuf);
 
@@ -1781,17 +1831,8 @@ mod tests {
             runtime.get_providers().len(),
             rpi_ai::providers::BUILTIN_PROVIDERS.len()
         );
-        let store: Arc<dyn ProviderModelsStore> = Arc::new(ScopedModelsStore::new(
-            Arc::new(InMemoryModelsStore::new()),
-            "deepseek",
-        ));
-        let probe = RefreshModelsContext {
-            credential: None,
-            store,
-            allow_network: false,
-            force: false,
-            signal: None,
-        };
+        let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
+        let probe = make_probe_context(store, "deepseek").await;
         let deepseek = runtime.get_provider("deepseek").expect("deepseek");
         assert!(
             deepseek.refresh_models(probe).is_none(),
@@ -1816,17 +1857,8 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let store: Arc<dyn ProviderModelsStore> = Arc::new(ScopedModelsStore::new(
-            Arc::new(InMemoryModelsStore::new()),
-            "deepseek",
-        ));
-        let probe = RefreshModelsContext {
-            credential: None,
-            store,
-            allow_network: false,
-            force: false,
-            signal: None,
-        };
+        let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
+        let probe = make_probe_context(store, "deepseek").await;
         let deepseek = runtime.get_provider("deepseek").expect("deepseek");
         assert!(
             deepseek.refresh_models(probe).is_some(),
@@ -1834,17 +1866,9 @@ mod tests {
         );
         // radius stays dynamic and passes through unwrapped.
         let radius = runtime.get_provider("radius").expect("radius");
+        let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
         assert!(radius
-            .refresh_models(RefreshModelsContext {
-                credential: None,
-                store: Arc::new(ScopedModelsStore::new(
-                    Arc::new(InMemoryModelsStore::new()),
-                    "radius",
-                )),
-                allow_network: false,
-                force: false,
-                signal: None,
-            })
+            .refresh_models(make_probe_context(store, "radius").await)
             .is_some());
     }
 
@@ -2161,6 +2185,7 @@ mod tests {
             },
             models: vec![],
             api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
         });
         runtime
             .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
@@ -2239,6 +2264,7 @@ mod tests {
             },
             models: vec![],
             api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
         });
         runtime
             .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
@@ -2307,6 +2333,7 @@ mod tests {
             },
             models: vec![],
             api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
         });
         runtime
             .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
@@ -2328,6 +2355,7 @@ mod tests {
                 allow_network: Some(true),
                 force: Some(true),
                 signal: Some(token),
+                ..Default::default()
             }))
             .await;
         timeout.await.expect("timeout task");
@@ -2390,6 +2418,7 @@ mod tests {
                     let credential = credential.clone();
                     Box::pin(async move { Ok(Some(credential)) })
                 }),
+                None,
             )
             .await
             .expect("modify");

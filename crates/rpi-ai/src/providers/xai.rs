@@ -46,5 +46,6 @@ pub fn xai_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("xai").to_vec(),
         api: ProviderApi::Map(api),
+        ..Default::default()
     })
 }

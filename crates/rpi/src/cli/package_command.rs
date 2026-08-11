@@ -275,6 +275,7 @@ async fn refresh_model_catalogs() -> Result<(), String> {
             allow_network: Some(true),
             force: Some(true),
             signal: Some(token),
+            ..Default::default()
         }))
         .await;
     timeout.abort();

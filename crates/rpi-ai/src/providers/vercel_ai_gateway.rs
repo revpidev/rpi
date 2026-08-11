@@ -24,5 +24,6 @@ pub fn vercel_ai_gateway_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("vercel-ai-gateway").to_vec(),
         api: ProviderApi::Single(Arc::new(AnthropicMessages)),
+        ..Default::default()
     })
 }

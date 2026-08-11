@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::resolve::ModelsError;
-use super::types::{Credential, CredentialInfo, CredentialStore, ModifyFn};
+use super::types::{AuthOperationOptions, Credential, CredentialInfo, CredentialStore, ModifyFn};
 
 /// `InMemoryCredentialStore` — apps inject persistent stores (T04).
 #[derive(Default)]
@@ -36,11 +36,18 @@ impl InMemoryCredentialStore {
 
 #[async_trait::async_trait]
 impl CredentialStore for InMemoryCredentialStore {
-    async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+    async fn read(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError> {
         Ok(self.credentials.lock().await.get(provider_id).cloned())
     }
 
-    async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
+    async fn list(
+        &self,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Vec<CredentialInfo>, ModelsError> {
         Ok(self
             .credentials
             .lock()
@@ -57,9 +64,20 @@ impl CredentialStore for InMemoryCredentialStore {
         &self,
         provider_id: &str,
         f: ModifyFn,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError> {
+        // T21b: a cancelled modify queued behind another mutation rejects
+        // without ever running its task (credential-store.ts:14-28 @ 4181f66).
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let lock = self.provider_lock(provider_id).await;
-        let _guard = lock.lock().await;
+        // Queue-cancellable: cancel during lock-wait rejects without running
+        // the task; after lock acquisition, re-check before executing.
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel_future(options) => return Err(ModelsError::aborted()),
+            guard = lock.lock() => guard,
+        };
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let current = self.credentials.lock().await.get(provider_id).cloned();
         let next = f(current.clone()).await?;
         if let Some(next) = next {
@@ -72,10 +90,36 @@ impl CredentialStore for InMemoryCredentialStore {
         Ok(self.credentials.lock().await.get(provider_id).cloned())
     }
 
-    async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
+    async fn delete(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), ModelsError> {
+        // T21b: a cancelled delete queued behind another mutation rejects
+        // without ever running its task (credential-store.ts:14-28 @ 4181f66).
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let lock = self.provider_lock(provider_id).await;
-        let _guard = lock.lock().await;
+        // Queue-cancellable: cancel during lock-wait rejects without running
+        // the task; after lock acquisition, re-check before executing.
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel_future(options) => return Err(ModelsError::aborted()),
+            guard = lock.lock() => guard,
+        };
+        AuthOperationOptions::throw_if_cancelled(options)?;
         self.credentials.lock().await.remove(provider_id);
         Ok(())
+    }
+}
+
+/// Boxed future that resolves when the cancellation token in `options` fires,
+/// or never when there is no token. Used in `select!` to cancel a queued
+/// `modify`/`delete` while it waits for the per-provider lock.
+pub(crate) fn cancel_future(
+    options: Option<&AuthOperationOptions>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    match options.and_then(|o| o.signal.as_ref()) {
+        Some(token) => Box::pin(token.cancelled()),
+        None => Box::pin(std::future::pending()),
     }
 }

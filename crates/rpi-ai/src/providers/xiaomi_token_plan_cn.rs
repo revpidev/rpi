@@ -29,5 +29,6 @@ pub fn xiaomi_token_plan_cn_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("xiaomi-token-plan-cn").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }

@@ -30,5 +30,6 @@ pub fn openrouter_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("openrouter").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }

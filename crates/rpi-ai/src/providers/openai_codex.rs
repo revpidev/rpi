@@ -27,5 +27,6 @@ pub fn openai_codex_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("openai-codex").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCodexResponses)),
+        ..Default::default()
     })
 }

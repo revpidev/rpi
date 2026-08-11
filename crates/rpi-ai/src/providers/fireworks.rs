@@ -48,5 +48,6 @@ pub fn fireworks_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("fireworks").to_vec(),
         api: ProviderApi::Map(api),
+        ..Default::default()
     })
 }

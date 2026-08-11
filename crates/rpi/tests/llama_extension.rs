@@ -17,10 +17,38 @@ use rpi::extensions::llama::{
     NotifyLevel, ProgressState,
 };
 use rpi_ai::auth::{AuthResult, Credential, ModelAuth, ModelsError};
-use rpi_ai::models::{RefreshModelsContext, ScopedModelsStore};
-use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore, ProviderModelsStore};
+use rpi_ai::models::{PublishHandle, PublishShared, RefreshModelsContext};
+use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore};
 use rpi_ai::types::ProviderEnv;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Build a test `RefreshModelsContext` for the llama provider tests.
+async fn make_llama_context(
+    store: Arc<dyn ModelsStore>,
+    credential: Option<Credential>,
+    allow_network: bool,
+) -> RefreshModelsContext {
+    let stored = store.read(LLAMA_PROVIDER_ID, None).await.unwrap_or(None);
+    let signal = tokio_util::sync::CancellationToken::new();
+    let shared = Arc::new(PublishShared {
+        provider_id: LLAMA_PROVIDER_ID.to_owned(),
+        generation: 1,
+        signal: signal.clone(),
+        store,
+        chain: Arc::new(tokio::sync::Mutex::new(None)),
+        refresh_generations: Arc::new(std::sync::RwLock::new(
+            [(LLAMA_PROVIDER_ID.to_owned(), 1u64)].into(),
+        )),
+    });
+    RefreshModelsContext {
+        credential,
+        stored,
+        publish: PublishHandle { shared },
+        allow_network,
+        force: if allow_network { Some(false) } else { None },
+        signal,
+    }
+}
 
 // -------------------------------------------------------------------------
 // Scripted loopback server (llama.cpp router + Hugging Face API)
@@ -424,8 +452,6 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
     .await;
 
     let store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::new());
-    let scoped: Arc<dyn ProviderModelsStore> =
-        Arc::new(ScopedModelsStore::new(store.clone(), LLAMA_PROVIDER_ID));
     let credential = Credential::ApiKey(rpi_ai::auth::ApiKeyCredential {
         key: Some("local".to_owned()),
         env: Some(ProviderEnv::from([(
@@ -437,13 +463,7 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
     let first = create_llama_provider();
     first
         .provider()
-        .refresh_models(RefreshModelsContext {
-            credential: Some(credential.clone()),
-            store: scoped.clone(),
-            allow_network: true,
-            force: false,
-            signal: None,
-        })
+        .refresh_models(make_llama_context(store.clone(), Some(credential.clone()), true).await)
         .expect("refresh")
         .await
         .expect("refresh");
@@ -455,7 +475,7 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
         .collect();
     assert_eq!(ids, ["loaded"]);
     let cached = store
-        .read(LLAMA_PROVIDER_ID)
+        .read(LLAMA_PROVIDER_ID, None)
         .await
         .expect("read")
         .expect("entry");
@@ -466,13 +486,7 @@ async fn persists_and_restores_loaded_models_for_cache_only_startup_refreshes() 
     let second = create_llama_provider();
     second
         .provider()
-        .refresh_models(RefreshModelsContext {
-            credential: Some(credential),
-            store: scoped,
-            allow_network: false,
-            force: false,
-            signal: None,
-        })
+        .refresh_models(make_llama_context(store, Some(credential), false).await)
         .expect("refresh")
         .await
         .expect("refresh");

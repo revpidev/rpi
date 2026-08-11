@@ -1284,6 +1284,7 @@ mod tests {
                 api: ProviderApi::Single(Arc::new(
                     rpi_ai::api::openai_completions::OpenAiCompletions,
                 )),
+                ..Default::default()
             }))
             .await
             .expect("register provider");
@@ -1566,6 +1567,7 @@ mod tests {
                 api: ProviderApi::Single(Arc::new(
                     rpi_ai::api::openai_completions::OpenAiCompletions,
                 )),
+                ..Default::default()
             }))
             .await
             .expect("register provider");

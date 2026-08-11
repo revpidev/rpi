@@ -24,5 +24,6 @@ pub fn anthropic_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("anthropic").to_vec(),
         api: ProviderApi::Single(Arc::new(AnthropicMessages)),
+        ..Default::default()
     })
 }

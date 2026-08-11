@@ -30,6 +30,7 @@ async fn resolve_provider_auth_with_stored_oauth_credential_derives_api_key() {
                     })))
                 })
             }),
+            None,
         )
         .await
         .expect("seed credential");

@@ -26,5 +26,6 @@ pub fn ant_ling_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("ant-ling").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }

@@ -235,5 +235,6 @@ pub fn google_vertex_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("google-vertex").to_vec(),
         api: ProviderApi::Single(Arc::new(GoogleVertex)),
+        ..Default::default()
     })
 }

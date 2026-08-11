@@ -223,5 +223,6 @@ pub fn amazon_bedrock_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("amazon-bedrock").to_vec(),
         api: ProviderApi::Single(Arc::new(BedrockConverseStream)),
+        ..Default::default()
     })
 }

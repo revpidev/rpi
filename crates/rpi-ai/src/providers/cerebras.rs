@@ -28,5 +28,6 @@ pub fn cerebras_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("cerebras").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }

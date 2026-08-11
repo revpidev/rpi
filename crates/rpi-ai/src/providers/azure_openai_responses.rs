@@ -25,5 +25,6 @@ pub fn azure_openai_responses_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("azure-openai-responses").to_vec(),
         api: ProviderApi::Single(Arc::new(AzureOpenAiResponses)),
+        ..Default::default()
     })
 }

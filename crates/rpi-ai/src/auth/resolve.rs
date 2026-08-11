@@ -22,6 +22,7 @@ pub enum ModelsErrorCode {
     Stream,
     Auth,
     Oauth,
+    Aborted,
 }
 
 impl ModelsErrorCode {
@@ -33,6 +34,7 @@ impl ModelsErrorCode {
             ModelsErrorCode::Stream => "stream",
             ModelsErrorCode::Auth => "auth",
             ModelsErrorCode::Oauth => "oauth",
+            ModelsErrorCode::Aborted => "aborted",
         }
     }
 }
@@ -50,6 +52,12 @@ impl ModelsError {
             code,
             message: message.into(),
         }
+    }
+
+    /// `signal.throwIfAborted()` equivalent — a cancelled operation rejects
+    /// with this.
+    pub fn aborted() -> Self {
+        Self::new(ModelsErrorCode::Aborted, "Operation aborted")
     }
 
     /// `withCauseDetail`: callers surface `message` only, so keep the
@@ -74,12 +82,22 @@ impl std::fmt::Display for ModelsError {
 
 impl std::error::Error for ModelsError {}
 
-/// `AuthResolutionOverrides`.
+/// `AuthResolutionOverrides` (auth/resolve.ts:18-24 @ 4181f66).
 #[derive(Debug, Clone, Default)]
 pub struct AuthResolutionOverrides {
     pub api_key: Option<String>,
     pub env: Option<ProviderEnv>,
+    /// Require this much remaining OAuth-token validity; defaults to five
+    /// minutes (upstream: callers can only *raise* the floor).
+    pub min_oauth_validity_ms: Option<u64>,
 }
+
+/// `DEFAULT_OAUTH_MINIMUM_VALIDITY_MS` (auth/resolve.ts:119 @ 4181f66).
+const DEFAULT_OAUTH_MINIMUM_VALIDITY_MS: i64 = 5 * 60 * 1000;
+
+/// `DEFAULT_OAUTH_REFRESH_TIMEOUT_MS` (auth/resolve.ts:120 @ 4181f66).
+const DEFAULT_OAUTH_REFRESH_TIMEOUT_MS: std::time::Duration =
+    std::time::Duration::from_millis(15_000);
 
 /// `overlayEnvAuthContext`: request-scoped env overrides win over the base.
 struct OverlayEnvAuthContext<'a> {
@@ -146,6 +164,8 @@ pub async fn resolve_provider_auth(
                     provider_id,
                     oauth.clone(),
                     oauth_credential,
+                    overrides.and_then(|o| o.min_oauth_validity_ms),
+                    DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
                 )
                 .await;
             }
@@ -187,71 +207,121 @@ pub async fn resolve_provider_auth(
     }
 }
 
-/// `resolveStoredOAuth`: double-checked locking — valid tokens cost zero
-/// locks; expired tokens lock, re-check under the lock, refresh once, persist
-/// before release.
+/// `resolveStoredOAuth` (auth/resolve.ts:127-179 @ 4181f66): double-checked
+/// locking — tokens with more than five minutes remaining cost zero locks;
+/// expiring tokens lock, re-check expiry under the lock, refresh once under
+/// a hard timeout, persist the rotated credential before release.
+///
+/// `refresh_timeout` is a private injection point for tests; public callers
+/// pass [`DEFAULT_OAUTH_REFRESH_TIMEOUT_MS`].
 async fn resolve_stored_oauth(
     credentials: &Arc<dyn CredentialStore>,
     provider_id: &str,
     oauth: Arc<dyn super::types::OAuthAuth>,
     stored: &OAuthCredential,
+    min_oauth_validity_ms: Option<u64>,
+    refresh_timeout: std::time::Duration,
 ) -> Result<Option<AuthResult>, ModelsError> {
-    let mut credential = stored.clone();
+    // Upstream: `minimumValidityMs = max(DEFAULT, minOAuthValidityMs ?? 0)` —
+    // callers can only *raise* the floor (auth/resolve.ts:135).
+    let minimum_validity_ms =
+        DEFAULT_OAUTH_MINIMUM_VALIDITY_MS.max(min_oauth_validity_ms.unwrap_or(0) as i64);
 
-    if now_ms() >= credential.expires {
-        let provider_id_owned = provider_id.to_owned();
-        let oauth_for_refresh = oauth.clone();
-        let post = credentials
-            .modify(
-                provider_id,
-                Arc::new(move |current| {
-                    let provider_id = provider_id_owned.clone();
-                    let oauth = oauth_for_refresh.clone();
-                    Box::pin(async move {
-                        let Some(Credential::OAuth(current)) = current else {
-                            return Ok(None); // logged out meanwhile
-                        };
-                        if now_ms() < current.expires {
-                            return Ok(None); // another process/request refreshed
-                        }
-                        oauth
-                            .refresh(&current, None)
-                            .await
-                            .map_err(|error| {
-                                ModelsError::with_cause(
-                                    ModelsErrorCode::Oauth,
-                                    format!("OAuth refresh failed for {provider_id}"),
-                                    &error.message,
-                                )
-                            })
-                            .map(|c| Some(Credential::OAuth(c)))
-                    })
-                }),
-            )
-            .await
-            .map_err(|error| match error.code {
-                ModelsErrorCode::Oauth => error,
-                _ => ModelsError::with_cause(
-                    ModelsErrorCode::Auth,
-                    format!("Credential store modify failed for {provider_id}"),
-                    &error.message,
-                ),
-            })?;
-        let Some(Credential::OAuth(post)) = post else {
-            return Ok(None); // logged out meanwhile
-        };
-        credential = post;
+    // auth/resolve.ts:136 — `expiresSoon(c) = Date.now() + minimumValidityMs >= c.expires`.
+    fn expires_soon(credential: &OAuthCredential, minimum_validity_ms: i64) -> bool {
+        now_ms() + minimum_validity_ms >= credential.expires
     }
 
-    oauth
-        .to_auth(&credential)
+    let credential = stored.clone();
+
+    // Valid token → straight to `to_auth`, zero modify/locks
+    // (auth/resolve.ts:139 "not expiresSoon" fast path).
+    if !expires_soon(&credential, minimum_validity_ms) {
+        return to_auth_result(&oauth, &credential, provider_id)
+            .await
+            .map(Some);
+    }
+
+    // Optimistic check said expiring; the authoritative check runs under the
+    // lock (auth/resolve.ts:142-163).
+    let provider_id_owned = provider_id.to_owned();
+    let oauth_for_refresh = oauth.clone();
+    let post = credentials
+        .modify(
+            provider_id,
+            Arc::new(move |current| {
+                let provider_id = provider_id_owned.clone();
+                let oauth = oauth_for_refresh.clone();
+                let minimum = minimum_validity_ms;
+                let timeout_dur = refresh_timeout;
+                Box::pin(async move {
+                    let Some(Credential::OAuth(current)) = current else {
+                        return Ok(None); // logged out meanwhile
+                    };
+                    if !expires_soon(&current, minimum) {
+                        return Ok(None); // another process/request refreshed
+                    }
+                    // Refresh under a hard timeout (auth/resolve.ts:149-153).
+                    // Upstream: `AbortSignal.any([signal, AbortSignal.timeout(15000)])`.
+                    match tokio::time::timeout(timeout_dur, oauth.refresh(&current, None)).await {
+                        Ok(Ok(refreshed)) => Ok(Some(Credential::OAuth(refreshed))),
+                        Ok(Err(error)) => Err(ModelsError::with_cause(
+                            ModelsErrorCode::Oauth,
+                            format!("OAuth refresh failed for {provider_id}"),
+                            &error.message,
+                        )),
+                        Err(_elapsed) => Err(ModelsError::with_cause(
+                            ModelsErrorCode::Oauth,
+                            format!("OAuth refresh failed for {provider_id}"),
+                            "refresh timed out",
+                        )),
+                    }
+                })
+            }),
+            None,
+        )
         .await
-        .map(|auth| {
-            Some(AuthResult {
-                auth,
-                env: None,
-                source: Some("OAuth".to_owned()),
-            })
+        .map_err(|error| match error.code {
+            ModelsErrorCode::Oauth => error,
+            _ => ModelsError::with_cause(
+                ModelsErrorCode::Auth,
+                format!("Credential store modify failed for {provider_id}"),
+                &error.message,
+            ),
+        })?;
+    let Some(Credential::OAuth(post)) = post else {
+        return Ok(None); // logged out meanwhile
+    };
+    let credential = post;
+
+    // Explicit callers (e.g. bearer-token export) require the requested
+    // minimum after the refresh; the default five-minute path does not
+    // impose a contract (auth/resolve.ts:169-171).
+    if min_oauth_validity_ms.is_some() && expires_soon(&credential, minimum_validity_ms) {
+        return Err(ModelsError::new(
+            ModelsErrorCode::Oauth,
+            format!("OAuth refresh returned a token that expires too soon for {provider_id}"),
+        ));
+    }
+
+    to_auth_result(&oauth, &credential, provider_id)
+        .await
+        .map(Some)
+}
+
+/// Derive request auth from a valid OAuth credential (auth/resolve.ts:174-178).
+async fn to_auth_result(
+    oauth: &Arc<dyn super::types::OAuthAuth>,
+    credential: &OAuthCredential,
+    provider_id: &str,
+) -> Result<AuthResult, ModelsError> {
+    oauth
+        .to_auth(credential)
+        .await
+        .map(|auth| AuthResult {
+            auth,
+            env: None,
+            source: Some("OAuth".to_owned()),
         })
         .map_err(|error| {
             ModelsError::with_cause(
@@ -284,7 +354,7 @@ async fn read_credential(
     credentials: &Arc<dyn CredentialStore>,
     provider_id: &str,
 ) -> Result<Option<Credential>, ModelsError> {
-    credentials.read(provider_id).await.map_err(|error| {
+    credentials.read(provider_id, None).await.map_err(|error| {
         ModelsError::with_cause(
             ModelsErrorCode::Auth,
             format!("Credential store read failed for {provider_id}"),
@@ -312,7 +382,7 @@ mod tests {
     //! env。
 
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use serde_json::Map;
@@ -321,7 +391,8 @@ mod tests {
     use super::*;
     use crate::auth::credential_store::InMemoryCredentialStore;
     use crate::auth::types::{
-        ApiKeyAuth, CredentialInfo, CredentialStore, ModelAuth, ModifyFn, OAuthAuth,
+        ApiKeyAuth, AuthOperationOptions, CredentialInfo, CredentialStore, ModelAuth, ModifyFn,
+        OAuthAuth,
     };
 
     const ENV_VAR: &str = "TEST_RESOLVE_API_KEY";
@@ -435,9 +506,20 @@ mod tests {
 
     /// Counts `refresh` calls; `to_auth` derives `apiKey = access` like the
     /// upstream anthropic OAuth handler.
+    ///
+    /// `refresh_expires_delta_ms` controls the expiry of the refreshed token
+    /// (default: 1 hour, well above the five-minute window).
+    ///
+    /// When `block_on_refresh` is `true`, refresh signals start then blocks
+    /// until [`FakeOAuthAuth::release`] is called — used by timeout/concurrency
+    /// tests.
     struct FakeOAuthAuth {
         refresh_calls: AtomicUsize,
         refresh_error: Option<String>,
+        refresh_expires_delta_ms: i64,
+        block_on_refresh: AtomicBool,
+        refresh_started: tokio::sync::Notify,
+        refresh_release: tokio::sync::Notify,
     }
 
     impl FakeOAuthAuth {
@@ -445,6 +527,10 @@ mod tests {
             Self {
                 refresh_calls: AtomicUsize::new(0),
                 refresh_error: None,
+                refresh_expires_delta_ms: 60 * 60_000,
+                block_on_refresh: AtomicBool::new(false),
+                refresh_started: tokio::sync::Notify::new(),
+                refresh_release: tokio::sync::Notify::new(),
             }
         }
 
@@ -452,7 +538,23 @@ mod tests {
             Self {
                 refresh_calls: AtomicUsize::new(0),
                 refresh_error: Some(message.to_owned()),
+                refresh_expires_delta_ms: 60 * 60_000,
+                block_on_refresh: AtomicBool::new(false),
+                refresh_started: tokio::sync::Notify::new(),
+                refresh_release: tokio::sync::Notify::new(),
             }
+        }
+
+        /// Refreshed token expires in `delta_ms` from now.
+        fn with_refresh_expiry(mut self, delta_ms: i64) -> Self {
+            self.refresh_expires_delta_ms = delta_ms;
+            self
+        }
+
+        /// When enabled, refresh signals start then blocks until released.
+        fn blocking(self) -> Self {
+            self.block_on_refresh.store(true, Ordering::SeqCst);
+            self
         }
 
         fn refresh_calls(&self) -> usize {
@@ -472,12 +574,16 @@ mod tests {
             _signal: Option<&CancellationToken>,
         ) -> Result<OAuthCredential, ModelsError> {
             self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            self.refresh_started.notify_one();
+            if self.block_on_refresh.load(Ordering::SeqCst) {
+                self.refresh_release.notified().await;
+            }
             match &self.refresh_error {
                 Some(message) => Err(ModelsError::new(ModelsErrorCode::Oauth, message.clone())),
                 None => Ok(OAuthCredential {
                     refresh: credential.refresh.clone(),
                     access: "refreshed-access".to_owned(),
-                    expires: now_ms() + 60_000,
+                    expires: now_ms() + self.refresh_expires_delta_ms,
                     extra: Map::new(),
                 }),
             }
@@ -510,25 +616,131 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CredentialStore for CountingStore {
-        async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
+        async fn read(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            self.inner.read(provider_id).await
+            self.inner.read(provider_id, options).await
         }
 
-        async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
-            self.inner.list().await
+        async fn list(
+            &self,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Vec<CredentialInfo>, ModelsError> {
+            self.inner.list(options).await
         }
 
         async fn modify(
             &self,
             provider_id: &str,
             f: ModifyFn,
+            options: Option<&AuthOperationOptions>,
         ) -> Result<Option<Credential>, ModelsError> {
-            self.inner.modify(provider_id, f).await
+            self.inner.modify(provider_id, f, options).await
         }
 
-        async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
-            self.inner.delete(provider_id).await
+        async fn delete(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<(), ModelsError> {
+            self.inner.delete(provider_id, options).await
+        }
+    }
+
+    /// `CredentialStore` wrapper counting `modify` calls (valid tokens must
+    /// resolve without touching modify, resolve.ts:965-988).
+    struct ModifyCountingStore {
+        inner: InMemoryCredentialStore,
+        modifies: AtomicUsize,
+    }
+
+    impl ModifyCountingStore {
+        fn new(inner: InMemoryCredentialStore) -> Self {
+            Self {
+                inner,
+                modifies: AtomicUsize::new(0),
+            }
+        }
+
+        fn modifies(&self) -> usize {
+            self.modifies.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CredentialStore for ModifyCountingStore {
+        async fn read(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            self.inner.read(provider_id, options).await
+        }
+
+        async fn list(
+            &self,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Vec<CredentialInfo>, ModelsError> {
+            self.inner.list(options).await
+        }
+
+        async fn modify(
+            &self,
+            provider_id: &str,
+            f: ModifyFn,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            self.modifies.fetch_add(1, Ordering::SeqCst);
+            self.inner.modify(provider_id, f, options).await
+        }
+
+        async fn delete(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<(), ModelsError> {
+            self.inner.delete(provider_id, options).await
+        }
+    }
+
+    /// A store whose read/modify always fail — for wrapping failures test.
+    struct FailingStore;
+
+    #[async_trait::async_trait]
+    impl CredentialStore for FailingStore {
+        async fn read(
+            &self,
+            _provider_id: &str,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            Err(ModelsError::new(ModelsErrorCode::Auth, "disk on fire"))
+        }
+
+        async fn list(
+            &self,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Vec<CredentialInfo>, ModelsError> {
+            Ok(Vec::new())
+        }
+
+        async fn modify(
+            &self,
+            _provider_id: &str,
+            _f: ModifyFn,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            Err(ModelsError::new(ModelsErrorCode::Auth, "disk on fire"))
+        }
+
+        async fn delete(
+            &self,
+            _provider_id: &str,
+            _options: Option<&AuthOperationOptions>,
+        ) -> Result<(), ModelsError> {
+            Ok(())
         }
     }
 
@@ -551,18 +763,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl CredentialStore for SwapOnModifyStore {
-        async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError> {
-            self.inner.read(provider_id).await
+        async fn read(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Option<Credential>, ModelsError> {
+            self.inner.read(provider_id, options).await
         }
 
-        async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError> {
-            self.inner.list().await
+        async fn list(
+            &self,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<Vec<CredentialInfo>, ModelsError> {
+            self.inner.list(options).await
         }
 
         async fn modify(
             &self,
             provider_id: &str,
             f: ModifyFn,
+            options: Option<&AuthOperationOptions>,
         ) -> Result<Option<Credential>, ModelsError> {
             let swap = self.swap.lock().expect("swap").take();
             if let Some(credential) = swap {
@@ -574,14 +794,19 @@ mod tests {
                             let swapped = swapped.clone();
                             Box::pin(async move { Ok(Some(swapped)) })
                         }),
+                        options,
                     )
                     .await?;
             }
-            self.inner.modify(provider_id, f).await
+            self.inner.modify(provider_id, f, options).await
         }
 
-        async fn delete(&self, provider_id: &str) -> Result<(), ModelsError> {
-            self.inner.delete(provider_id).await
+        async fn delete(
+            &self,
+            provider_id: &str,
+            options: Option<&AuthOperationOptions>,
+        ) -> Result<(), ModelsError> {
+            self.inner.delete(provider_id, options).await
         }
     }
 
@@ -615,6 +840,7 @@ mod tests {
                     let stored = stored.clone();
                     Box::pin(async move { Ok(Some(stored)) })
                 }),
+                None,
             )
             .await
             .expect("seed store");
@@ -651,7 +877,7 @@ mod tests {
             &auth_context,
             Some(&AuthResolutionOverrides {
                 api_key: Some("explicit-key".to_owned()),
-                env: None,
+                ..Default::default()
             }),
         )
         .await
@@ -795,7 +1021,10 @@ mod tests {
         );
         assert_eq!(oauth.refresh_calls(), 1);
         // Credential preserved (the modify callback error does not write back), for re-login.
-        assert_eq!(credentials.read("test").await.expect("read"), Some(expired));
+        assert_eq!(
+            credentials.read("test", None).await.expect("read"),
+            Some(expired)
+        );
     }
 
     /// Self-check: double check inside the modify lock — if the lock finds the
@@ -804,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_refresh_is_double_checked_under_the_store_lock() {
         let expired = oauth_credential("expired-access", 0);
-        let fresh = oauth_credential("fresh-access", now_ms() + 60_000);
+        let fresh = oauth_credential("fresh-access", now_ms() + 600_000); // > 5 min window
         let store = SwapOnModifyStore::new(store_with("test", expired).await, fresh);
         let credentials: Arc<dyn CredentialStore> = Arc::new(store);
         let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
@@ -823,5 +1052,487 @@ mod tests {
             0,
             "double check under the lock must skip refresh"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // T21b required tests (blueprint: models-runtime.test.ts L887-1038)
+    // ------------------------------------------------------------------
+
+    /// `refreshes oauth credentials with less than five minutes remaining`
+    /// (models-runtime.test.ts:887): 1 minute remaining → trigger refresh
+    /// exactly once.
+    #[tokio::test]
+    async fn refreshes_oauth_credentials_with_less_than_five_minutes_remaining() {
+        let credentials: Arc<dyn CredentialStore> = Arc::new(
+            store_with(
+                "p1",
+                oauth_credential("old-token", now_ms() + 60_000), // 1 min remaining
+            )
+            .await,
+        );
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let result = resolve_provider_auth("p1", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("refreshed-access"));
+        assert_eq!(oauth.refresh_calls(), 1);
+    }
+
+    /// `honors a caller's longer OAuth minimum validity` (L907):
+    /// min_oauth_validity_ms=30min + 10min remaining → trigger refresh.
+    #[tokio::test]
+    async fn honors_a_callers_longer_oauth_minimum_validity() {
+        let credentials: Arc<dyn CredentialStore> = Arc::new(
+            store_with(
+                "p1",
+                oauth_credential("old-token", now_ms() + 10 * 60_000), // 10 min remaining
+            )
+            .await,
+        );
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let result = resolve_provider_auth(
+            "p1",
+            &auth,
+            &credentials,
+            &auth_context,
+            Some(&AuthResolutionOverrides {
+                min_oauth_validity_ms: Some(30 * 60_000), // 30 min
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("resolve")
+        .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("refreshed-access"));
+        assert_eq!(oauth.refresh_calls(), 1);
+    }
+
+    /// `rejects_with_code_oauth_when_refresh_fails_preserving_the_stored_credential`
+    /// (L927): refresh error → code=oauth; stored credential preserved.
+    #[tokio::test]
+    async fn rejects_with_code_oauth_when_refresh_fails_preserving_the_stored_credential() {
+        let expired = oauth_credential("old", 0);
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", expired.clone()).await);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::failing("invalid_grant"));
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let error = resolve_provider_auth("p1", &auth, &credentials, &auth_context, None)
+            .await
+            .expect_err("refresh failure must error");
+
+        assert_eq!(error.code, ModelsErrorCode::Oauth);
+        assert!(
+            error.message.contains("OAuth refresh failed for p1"),
+            "unexpected message: {error}"
+        );
+        assert_eq!(oauth.refresh_calls(), 1);
+        // Credential preserved for retry / re-login
+        assert_eq!(
+            credentials.read("p1", None).await.expect("read"),
+            Some(expired)
+        );
+    }
+
+    /// `serializes_concurrent_oauth_refreshes_through_store_modify_no_double_refresh`
+    /// (L943): two concurrent resolutions → refresh only once.
+    #[tokio::test]
+    async fn serializes_concurrent_oauth_refreshes_through_store_modify_no_double_refresh() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", oauth_credential("old", 0)).await);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let (a, b) = tokio::join!(
+            resolve_provider_auth("p1", &auth, &credentials, &auth_context, None),
+            resolve_provider_auth("p1", &auth, &credentials, &auth_context, None),
+        );
+
+        let a = a.expect("resolve a").expect("configured");
+        let b = b.expect("resolve b").expect("configured");
+        assert_eq!(a.auth.api_key.as_deref(), Some("refreshed-access"));
+        assert_eq!(b.auth.api_key.as_deref(), Some("refreshed-access"));
+        assert_eq!(oauth.refresh_calls(), 1, "no double refresh");
+    }
+
+    /// `valid_oauth_tokens_resolve_without_touching_modify` (L965):
+    /// >5min validity → modify 0 times (counting store).
+    #[tokio::test]
+    async fn valid_oauth_tokens_resolve_without_touching_modify() {
+        let store = store_with(
+            "p1",
+            oauth_credential("valid", now_ms() + 10 * 60_000), // 10 min
+        )
+        .await;
+        let counting = Arc::new(ModifyCountingStore::new(store));
+        let credentials: Arc<dyn CredentialStore> = counting.clone();
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let result = resolve_provider_auth("p1", &auth, &credentials, &auth_context, None)
+            .await
+            .expect("resolve")
+            .expect("configured");
+
+        assert_eq!(result.auth.api_key.as_deref(), Some("valid"));
+        assert_eq!(counting.modifies(), 0, "valid token must not touch modify");
+    }
+
+    /// `keeps_the_underlying_reason_in_wrapped_oauth_refresh_errors`
+    /// (L1018): message contains the underlying cause.
+    #[tokio::test]
+    async fn keeps_the_underlying_reason_in_wrapped_oauth_refresh_errors() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", oauth_credential("old", 0)).await);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let oauth = Arc::new(FakeOAuthAuth::failing(
+            "token refresh failed (400): invalid_grant",
+        ));
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let error = resolve_provider_auth("p1", &auth, &credentials, &auth_context, None)
+            .await
+            .expect_err("must error");
+
+        assert!(
+            error
+                .message
+                .contains("token refresh failed (400): invalid_grant"),
+            "message must keep underlying reason: {error}"
+        );
+    }
+
+    /// `wraps_credential_store_failures_in_models_error` (L990):
+    /// read/modify failure → code=auth.
+    #[tokio::test]
+    async fn wraps_credential_store_failures_in_models_error() {
+        let credentials: Arc<dyn CredentialStore> = Arc::new(FailingStore);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        let auth = provider_auth(
+            Some(Arc::new(FakeApiKeyAuth::new())), // triggers readCredential
+            None,
+        );
+
+        // read failure → code=auth
+        let error = resolve_provider_auth("p1", &auth, &credentials, &auth_context, None)
+            .await
+            .expect_err("read failure must error");
+        assert_eq!(error.code, ModelsErrorCode::Auth);
+
+        // modify failure during refresh → code=auth
+        let oauth = Arc::new(FakeOAuthAuth::succeeding());
+        let oauth_auth = provider_auth(None, Some(oauth.clone()));
+        let error = resolve_provider_auth("p1", &oauth_auth, &credentials, &auth_context, None)
+            .await
+            .expect_err("modify failure must error");
+        assert_eq!(error.code, ModelsErrorCode::Auth);
+    }
+
+    /// `bounds_oauth_refreshes_and_releases_the_credential_store_lock_after_timeout`:
+    /// inject 50ms timeout, refresh hangs → reject code=oauth; a subsequent
+    /// modify completes immediately (lock released).
+    #[tokio::test]
+    async fn bounds_oauth_refreshes_and_releases_the_credential_store_lock_after_timeout() {
+        // We must call resolve_stored_oauth directly with an injected timeout
+        // since resolve_provider_auth hardcodes DEFAULT_OAUTH_REFRESH_TIMEOUT_MS.
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", oauth_credential("old", 0)).await);
+        let oauth: Arc<dyn OAuthAuth> = Arc::new(FakeOAuthAuth::succeeding().blocking());
+
+        // 50ms timeout — the refresh hangs, so this must time out.
+        let stored_cred = oauth_credential("old", 0);
+        let Credential::OAuth(stored_oauth) = stored_cred else {
+            panic!("expected OAuth credential");
+        };
+        let error = resolve_stored_oauth(
+            &credentials,
+            "p1",
+            oauth.clone(),
+            &stored_oauth,
+            None,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect_err("refresh must time out");
+
+        assert_eq!(error.code, ModelsErrorCode::Oauth);
+        assert!(error.message.contains("OAuth refresh failed for p1"));
+
+        // Lock released: a subsequent modify completes immediately.
+        let result = credentials
+            .modify(
+                "p1",
+                Arc::new(|_| {
+                    Box::pin(async {
+                        Ok(Some(Credential::ApiKey(ApiKeyCredential {
+                            key: Some("post-timeout".to_owned()),
+                            env: None,
+                        })))
+                    })
+                }),
+                None,
+            )
+            .await
+            .expect("modify after timeout");
+        assert!(result.is_some());
+    }
+
+    /// `explicit_min_oauth_validity_rejects_a_refreshed_token_that_expires_too_soon`:
+    /// explicit min_oauth_validity_ms, refresh returns a token still below
+    /// the minimum → "expires too soon".
+    #[tokio::test]
+    async fn explicit_min_oauth_validity_rejects_a_refreshed_token_that_expires_too_soon() {
+        let credentials: Arc<dyn CredentialStore> =
+            Arc::new(store_with("p1", oauth_credential("old", 0)).await);
+        let auth_context: Arc<dyn AuthContext> = Arc::new(RecordingAuthContext::empty());
+        // Refresh returns a token expiring in 1 min — below the explicit 30 min floor.
+        let oauth = Arc::new(FakeOAuthAuth::succeeding().with_refresh_expiry(60_000));
+        let auth = provider_auth(None, Some(oauth.clone()));
+
+        let error = resolve_provider_auth(
+            "p1",
+            &auth,
+            &credentials,
+            &auth_context,
+            Some(&AuthResolutionOverrides {
+                min_oauth_validity_ms: Some(30 * 60_000),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect_err("must reject");
+
+        assert_eq!(error.code, ModelsErrorCode::Oauth);
+        assert!(error.message.contains("expires too soon"));
+    }
+}
+
+#[cfg(test)]
+mod tests_credential_queue {
+    //! T21b test 10 & 11: credential store queue cancellation + login started.
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::credential_store::InMemoryCredentialStore;
+    use super::super::types::{AuthOperationOptions, Credential, CredentialStore};
+
+    /// `cancels_queued_credential_mutations_without_running_them_later`
+    /// (L704): first modify holds the lock (blocked), second modify queued
+    /// then cancelled → second's task never runs; first completes normally.
+    #[tokio::test]
+    async fn cancels_queued_credential_mutations_without_running_them_later() {
+        let store = Arc::new(InMemoryCredentialStore::new());
+
+        // First modify: holds the lock until released.
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+
+        let first_started_inner = first_started.clone();
+        let release_first_inner = release_first.clone();
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .modify(
+                        "p1",
+                        Arc::new(move |_| {
+                            let release = release_first_inner.clone();
+                            let started = first_started_inner.clone();
+                            Box::pin(async move {
+                                started.notify_one();
+                                release.notified().await;
+                                Ok(Some(Credential::ApiKey(
+                                    super::super::types::ApiKeyCredential {
+                                        key: Some("first".to_owned()),
+                                        env: None,
+                                    },
+                                )))
+                            })
+                        }),
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        // Wait until the first modify has the lock and is blocked.
+        first_started.notified().await;
+
+        // Second modify: queued behind the first, then cancelled.
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let second_ran_inner = second_ran.clone();
+        let token = CancellationToken::new();
+        let second = {
+            let store = store.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                store
+                    .modify(
+                        "p1",
+                        Arc::new(move |_| {
+                            let ran = second_ran_inner.clone();
+                            Box::pin(async move {
+                                ran.store(true, Ordering::SeqCst);
+                                Ok(Some(Credential::ApiKey(
+                                    super::super::types::ApiKeyCredential {
+                                        key: Some("second".to_owned()),
+                                        env: None,
+                                    },
+                                )))
+                            })
+                        }),
+                        Some(&AuthOperationOptions::with_signal(token)),
+                    )
+                    .await
+            })
+        };
+
+        // Let the second task's cancel future get polled.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        token.cancel();
+
+        // Second must reject with aborted.
+        let second_result = second.await.expect("join");
+        assert!(
+            second_result.is_err(),
+            "second modify must reject after cancellation"
+        );
+        let err = second_result.unwrap_err();
+        assert_eq!(err.code, super::ModelsErrorCode::Aborted);
+
+        // Release the first; it should complete.
+        release_first.notify_one();
+        first.await.expect("join").expect("first modify");
+
+        // Give the task queue a chance to drain.
+        tokio::task::yield_now().await;
+
+        // Second's task never ran.
+        assert!(
+            !second_ran.load(Ordering::SeqCst),
+            "second modify task must never run"
+        );
+
+        // Store has the first credential.
+        let stored = store.read("p1", None).await.expect("read");
+        assert!(stored.is_some());
+    }
+}
+
+#[cfg(test)]
+mod tests_file_queue {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::super::file_store::FileCredentialStore;
+    use super::super::types::{
+        ApiKeyCredential, AuthOperationOptions, Credential, CredentialStore,
+    };
+
+    #[tokio::test]
+    async fn cancels_queued_credential_mutations_without_running_them_later_file_store() {
+        let store = Arc::new(FileCredentialStore::in_memory(HashMap::new()));
+
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+
+        let release_first_inner = release_first.clone();
+        let first_started_inner = first_started.clone();
+        let first = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .modify(
+                        "p1",
+                        {
+                            let release = release_first_inner.clone();
+                            let started = first_started_inner.clone();
+                            Arc::new(move |_| {
+                                let release = release.clone();
+                                let started = started.clone();
+                                Box::pin(async move {
+                                    started.notify_one();
+                                    release.notified().await;
+                                    Ok(Some(Credential::ApiKey(ApiKeyCredential {
+                                        key: Some("first".to_owned()),
+                                        env: None,
+                                    })))
+                                })
+                            })
+                        },
+                        None,
+                    )
+                    .await
+            })
+        };
+
+        first_started.notified().await;
+
+        let second_ran = Arc::new(AtomicBool::new(false));
+        let second_ran_inner = second_ran.clone();
+        let token = CancellationToken::new();
+        let second = {
+            let store = store.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                store
+                    .modify(
+                        "p1",
+                        {
+                            let ran = second_ran_inner.clone();
+                            Arc::new(move |_| {
+                                let ran = ran.clone();
+                                Box::pin(async move {
+                                    ran.store(true, Ordering::SeqCst);
+                                    Ok(Some(Credential::ApiKey(ApiKeyCredential {
+                                        key: Some("second".to_owned()),
+                                        env: None,
+                                    })))
+                                })
+                            })
+                        },
+                        Some(&AuthOperationOptions::with_signal(token)),
+                    )
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        token.cancel();
+
+        let second_result = second.await.expect("join");
+        assert!(second_result.is_err());
+        assert_eq!(
+            second_result.unwrap_err().code,
+            super::ModelsErrorCode::Aborted
+        );
+
+        release_first.notify_one();
+        first.await.expect("join").expect("first");
+
+        tokio::task::yield_now().await;
+        assert!(!second_ran.load(Ordering::SeqCst));
     }
 }

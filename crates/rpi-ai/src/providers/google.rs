@@ -23,5 +23,6 @@ pub fn google_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("google").to_vec(),
         api: ProviderApi::Single(Arc::new(GoogleGenerativeAi)),
+        ..Default::default()
     })
 }

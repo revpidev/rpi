@@ -151,15 +151,52 @@ pub type ModifyFn = Arc<
         + Sync,
 >;
 
+/// `AuthOperationOptions` (auth/types.ts:45-48 @ 4181f66) — optional
+/// cancellation for public auth and credential operations. The upstream
+/// `AbortSignal` becomes a `CancellationToken` (project convention).
+#[derive(Debug, Clone, Default)]
+pub struct AuthOperationOptions {
+    pub signal: Option<CancellationToken>,
+}
+
+impl AuthOperationOptions {
+    pub fn with_signal(signal: CancellationToken) -> Self {
+        Self {
+            signal: Some(signal),
+        }
+    }
+
+    /// `signal.throwIfAborted()` equivalent.
+    pub(crate) fn throw_if_cancelled(options: Option<&Self>) -> Result<(), ModelsError> {
+        if options
+            .and_then(|options| options.signal.as_ref())
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(ModelsError::aborted());
+        }
+        Ok(())
+    }
+}
+
 /// `CredentialStore` — app-owned credential storage keyed by provider id.
-/// `modify` is the only write path (serialized read-modify-write).
+/// `modify` is the only write path (serialized read-modify-write). All
+/// operations accept optional cancellation (auth/types.ts:65-94 @ 4181f66):
+/// a cancelled `modify`/`delete` queued behind another mutation rejects
+/// without ever running its task.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
     /// Read the stored credential, possibly expired. `None` for missing.
-    async fn read(&self, provider_id: &str) -> Result<Option<Credential>, ModelsError>;
+    async fn read(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError>;
 
     /// List stored credential metadata without resolving or exposing secrets.
-    async fn list(&self) -> Result<Vec<CredentialInfo>, ModelsError>;
+    async fn list(
+        &self,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Vec<CredentialInfo>, ModelsError>;
 
     /// Serialized write — the only write path. Resolves with the post-write
     /// credential (current when the callback returns `None`).
@@ -167,10 +204,15 @@ pub trait CredentialStore: Send + Sync {
         &self,
         provider_id: &str,
         f: ModifyFn,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError>;
 
     /// Remove a credential (logout). Serialized against `modify`.
-    async fn delete(&self, provider_id: &str) -> Result<(), ModelsError>;
+    async fn delete(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), ModelsError>;
 }
 
 /// `AuthContext` — environment access for auth resolution (injectable).

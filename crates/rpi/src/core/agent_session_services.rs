@@ -190,6 +190,7 @@ pub async fn create_agent_session_services(
             allow_network: Some(false),
             force: None,
             signal: None,
+            ..Default::default()
         }))
         .await;
     // `options.extension_flag_values`: applied post-load by the caller

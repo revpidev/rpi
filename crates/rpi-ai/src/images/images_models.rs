@@ -415,6 +415,7 @@ impl ImagesModels {
                 Some(&AuthResolutionOverrides {
                     api_key: options.and_then(|o| o.api_key.clone()),
                     env: options.and_then(|o| o.env.clone()),
+                    ..Default::default()
                 }),
             )
             .await?;
@@ -727,7 +728,7 @@ mod tests {
                 &model,
                 Some(&AuthResolutionOverrides {
                     api_key: Some("explicit-key".to_owned()),
-                    env: None,
+                    ..Default::default()
                 }),
             )
             .await

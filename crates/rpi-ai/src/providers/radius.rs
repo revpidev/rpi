@@ -30,7 +30,7 @@ use crate::api::pi_messages::PiMessages;
 use crate::auth::oauth::radius::RadiusOAuth;
 use crate::auth::{env_api_key_auth, Credential, ModelsError, ProviderAuth};
 use crate::models::{
-    ai_error_to_models_error, create_provider, now_millis, CreateProviderOptions, InflightRefresh,
+    create_provider, now_millis, CreateProviderOptions, InflightRefresh, ModelsPublication,
     Provider, ProviderApi, RefreshModelsContext,
 };
 use crate::models_store::ModelsStoreEntry;
@@ -81,6 +81,7 @@ pub fn radius_provider_with(options: RadiusProviderOptions) -> Arc<RadiusProvide
         // — empty without an OAuth credential's cached gateway config.
         models: get_radius_models(&id, None),
         api: ProviderApi::Single(Arc::new(PiMessages)),
+        ..Default::default()
     });
     Arc::new(RadiusProvider {
         inner,
@@ -160,19 +161,22 @@ impl Provider for RadiusProvider {
         Some(Box::pin(async move {
             inflight
                 .join_or_run(async move {
-                    let stored = context
-                        .store
-                        .read()
-                        .await
-                        .map_err(ai_error_to_models_error)?;
-                    if let Some(stored) = &stored {
-                        *models.lock().unwrap_or_else(|e| e.into_inner()) = stored
+                    // Phase 1: restore from the stored snapshot
+                    // (models.ts:375-383 @ 4181f66).
+                    let stored = context.stored.clone();
+                    let dynamic = if let Some(stored) = &stored {
+                        stored
                             .models
                             .iter()
                             .filter(|model| model.provider == id)
                             .cloned()
-                            .collect();
-                    }
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Apply the restored overlay to the in-memory models.
+                    *models.lock().unwrap_or_else(|e| e.into_inner()) = dynamic.clone();
 
                     // Import catalogs cached by the pre-ModelsStore Radius
                     // implementation (radius.ts:42-49).
@@ -180,24 +184,29 @@ impl Provider for RadiusProvider {
                         if let Some(Credential::OAuth(oauth)) = &context.credential {
                             let legacy = get_radius_models(&id, Some(oauth));
                             if !legacy.is_empty() {
-                                *models.lock().unwrap_or_else(|e| e.into_inner()) = legacy.clone();
+                                let legacy_clone = legacy.clone();
+                                let models_for_update = models.clone();
                                 context
-                                    .store
-                                    .write(ModelsStoreEntry {
-                                        models: legacy,
-                                        last_modified: None,
-                                        checked_at: Some(now_millis()),
-                                        etag: None,
+                                    .publish
+                                    .publish(ModelsPublication {
+                                        persist: Some(Some(ModelsStoreEntry {
+                                            models: legacy,
+                                            last_modified: None,
+                                            checked_at: Some(now_millis()),
+                                            etag: None,
+                                        })),
+                                        update: Some(Box::new(move || {
+                                            *models_for_update
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner()) = legacy_clone;
+                                        })),
                                     })
-                                    .await
-                                    .map_err(ai_error_to_models_error)?;
+                                    .await?;
                             }
                         }
                     }
 
-                    if !context.allow_network
-                        || context.signal.as_ref().is_some_and(|t| t.is_cancelled())
-                    {
+                    if !context.allow_network || context.signal.is_cancelled() {
                         return Ok(());
                     }
                     let api_key = match &context.credential {
@@ -208,24 +217,31 @@ impl Provider for RadiusProvider {
                     let config = load_radius_gateway_config(
                         &gateway,
                         api_key.as_deref(),
-                        context.signal.as_ref(),
+                        Some(&context.signal),
                     )
                     .await?;
-                    if context.signal.as_ref().is_some_and(|t| t.is_cancelled()) {
+                    if context.signal.is_cancelled() {
                         return Ok(());
                     }
                     let refreshed = get_radius_models_from_config(&id, &config);
-                    *models.lock().unwrap_or_else(|e| e.into_inner()) = refreshed.clone();
+                    let refreshed_clone = refreshed.clone();
+                    let models_clone = models.clone();
                     context
-                        .store
-                        .write(ModelsStoreEntry {
-                            models: refreshed,
-                            last_modified: None,
-                            checked_at: Some(now_millis()),
-                            etag: None,
+                        .publish
+                        .publish(ModelsPublication {
+                            persist: Some(Some(ModelsStoreEntry {
+                                models: refreshed,
+                                last_modified: None,
+                                checked_at: Some(now_millis()),
+                                etag: None,
+                            })),
+                            update: Some(Box::new(move || {
+                                *models_clone.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    refreshed_clone;
+                            })),
                         })
-                        .await
-                        .map_err(ai_error_to_models_error)
+                        .await?;
+                    Ok(())
                 })
                 .await
         }))
@@ -388,10 +404,34 @@ mod tests {
         })
     }
 
-    async fn scoped_store(
+    /// Build a test `RefreshModelsContext` with the new publish/store API.
+    async fn make_context(
         store: Arc<dyn crate::models_store::ModelsStore>,
-    ) -> Arc<dyn crate::models_store::ProviderModelsStore> {
-        Arc::new(crate::models::ScopedModelsStore::new(store, "radius"))
+        credential: Option<Credential>,
+        allow_network: bool,
+        force: bool,
+    ) -> crate::models::RefreshModelsContext {
+        use crate::models::{PublishHandle, PublishShared};
+        let stored = store.read("radius", None).await.unwrap_or(None);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let shared = std::sync::Arc::new(PublishShared {
+            provider_id: "radius".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: std::sync::Arc::new(std::sync::RwLock::new(
+                [("radius".to_owned(), 1u64)].into(),
+            )),
+        });
+        crate::models::RefreshModelsContext {
+            credential,
+            stored,
+            publish: PublishHandle { shared },
+            allow_network,
+            force: if allow_network { Some(force) } else { None },
+            signal,
+        }
     }
 
     #[tokio::test]
@@ -407,6 +447,7 @@ mod tests {
                     checked_at: Some(now_millis()),
                     etag: None,
                 },
+                None,
             )
             .await
             .expect("write");
@@ -414,13 +455,8 @@ mod tests {
             gateway: Some("http://127.0.0.1:1".to_owned()), // unreachable: must not be fetched
             ..Default::default()
         });
-        let context = crate::models::RefreshModelsContext {
-            credential: Some(oauth_credential("access-token")),
-            store: scoped_store(store).await,
-            allow_network: false,
-            force: false,
-            signal: None,
-        };
+        let context =
+            make_context(store, Some(oauth_credential("access-token")), false, false).await;
         provider
             .refresh_models(context)
             .expect("refresh")
@@ -440,13 +476,13 @@ mod tests {
             gateway: Some(gateway.url.clone()),
             ..Default::default()
         });
-        let context = crate::models::RefreshModelsContext {
-            credential: Some(oauth_credential("access-token")),
-            store: scoped_store(store.clone()).await,
-            allow_network: true,
-            force: true,
-            signal: None,
-        };
+        let context = make_context(
+            store.clone(),
+            Some(oauth_credential("access-token")),
+            true,
+            true,
+        )
+        .await;
         provider
             .refresh_models(context)
             .expect("refresh")
@@ -460,7 +496,11 @@ mod tests {
         );
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["radius-large".to_owned()]);
-        let stored = store.read("radius").await.expect("read").expect("entry");
+        let stored = store
+            .read("radius", None)
+            .await
+            .expect("read")
+            .expect("entry");
         assert_eq!(stored.models.len(), 1);
         assert!(stored.checked_at.is_some());
         assert_eq!(stored.models[0].base_url, "https://radius.pi.dev/api");
@@ -487,13 +527,7 @@ mod tests {
             gateway: Some("http://127.0.0.1:1".to_owned()),
             ..Default::default()
         });
-        let context = crate::models::RefreshModelsContext {
-            credential: Some(credential),
-            store: scoped_store(store.clone()).await,
-            allow_network: false,
-            force: false,
-            signal: None,
-        };
+        let context = make_context(store.clone(), Some(credential), false, false).await;
         provider
             .refresh_models(context)
             .expect("refresh")
@@ -502,7 +536,7 @@ mod tests {
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["radius-large".to_owned()]);
         // The legacy catalog is persisted for future refreshes.
-        assert!(store.read("radius").await.expect("read").is_some());
+        assert!(store.read("radius", None).await.expect("read").is_some());
     }
 
     #[tokio::test]
@@ -520,6 +554,7 @@ mod tests {
                     checked_at: Some(now_millis()),
                     etag: None,
                 },
+                None,
             )
             .await
             .expect("write");
@@ -528,13 +563,7 @@ mod tests {
             gateway: Some(gateway.url.clone()),
             ..Default::default()
         });
-        let context = crate::models::RefreshModelsContext {
-            credential: Some(oauth_credential("access-token")),
-            store: scoped_store(store).await,
-            allow_network: true,
-            force: true,
-            signal: None,
-        };
+        let context = make_context(store, Some(oauth_credential("access-token")), true, true).await;
         assert!(provider
             .refresh_models(context)
             .expect("refresh")

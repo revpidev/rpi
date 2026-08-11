@@ -32,6 +32,7 @@ pub fn opencode_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("opencode").to_vec(),
         api: ProviderApi::Map(api_map()),
+        ..Default::default()
     })
 }
 

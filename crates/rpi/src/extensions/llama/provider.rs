@@ -34,7 +34,6 @@ use rpi_ai::types::{
     SimpleStreamOptions, StreamOptions,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
-use tokio_util::sync::CancellationToken;
 
 use super::client::{
     llama_inference_url, normalize_llama_server_url, LlamaClient, LlamaError, LlamaModelInfo,
@@ -49,10 +48,6 @@ pub const DEFAULT_LLAMA_SERVER_URL: &str = "http://127.0.0.1:8080";
 
 fn lock(models: &Mutex<Vec<Model>>) -> std::sync::MutexGuard<'_, Vec<Model>> {
     models.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-fn store_error(error: rpi_ai::error::AiError) -> ModelsError {
-    ModelsError::new(ModelsErrorCode::ModelSource, error.to_string())
 }
 
 fn auth_error(error: LlamaError) -> ModelsError {
@@ -221,23 +216,23 @@ impl Provider for LlamaProvider {
     ) -> Option<Pin<Box<dyn Future<Output = Result<(), ModelsError>> + Send + '_>>> {
         let this = self;
         Some(Box::pin(async move {
-            let stored = context.store.read().await.map_err(store_error)?;
-            if let Some(stored) = stored {
+            // The stored snapshot is already captured by the caller
+            // (models.ts:375-383 @ 4181f66) — no async read needed.
+            let stored = context.stored.clone();
+            if let Some(stored) = &stored {
                 *lock(&this.models) = stored
                     .models
-                    .into_iter()
+                    .iter()
                     .filter(|model| {
                         model.provider == LLAMA_PROVIDER_ID
                             && model.api.as_str() == ApiKind::OPENAI_COMPLETIONS
                     })
+                    .cloned()
                     .collect();
             }
 
             let network_allowed = context.allow_network
-                && !context
-                    .signal
-                    .as_ref()
-                    .is_some_and(CancellationToken::is_cancelled)
+                && !context.signal.is_cancelled()
                 && matches!(context.credential.as_ref(), Some(Credential::ApiKey(_)));
             if !network_allowed {
                 return Ok(());
@@ -252,27 +247,25 @@ impl Provider for LlamaProvider {
             let client =
                 LlamaClient::new(&server_url, credential.key.as_deref()).map_err(auth_error)?;
             let catalog = client
-                .list(false, context.signal.as_ref())
+                .list(false, Some(&context.signal))
                 .await
                 .map_err(auth_error)?;
             this.set_catalog(&catalog, &server_url)
                 .map_err(auth_error)?;
-            if !context
-                .signal
-                .as_ref()
-                .is_some_and(CancellationToken::is_cancelled)
-            {
+            if !context.signal.is_cancelled() {
                 let models = lock(&this.models).clone();
                 context
-                    .store
-                    .write(ModelsStoreEntry {
-                        models,
-                        last_modified: None,
-                        checked_at: Some(now_millis()),
-                        etag: None,
+                    .publish
+                    .publish(rpi_ai::models::ModelsPublication {
+                        persist: Some(Some(ModelsStoreEntry {
+                            models,
+                            last_modified: None,
+                            checked_at: Some(now_millis()),
+                            etag: None,
+                        })),
+                        update: None,
                     })
-                    .await
-                    .map_err(store_error)?;
+                    .await?;
             }
             Ok(())
         }))

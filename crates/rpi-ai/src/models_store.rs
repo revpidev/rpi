@@ -1,6 +1,6 @@
-//! Port of `packages/ai/src/models-store.ts` @ pi 0.82.1 (2efa728), plus a
-//! JSON-file-backed persistence skeleton (T03; the remote overlay/refresh
-//! flow lands with T13).
+//! Port of `packages/ai/src/models-store.ts` @ 4181f66 (v0.84.1+) — T21a
+//! updated the trait to accept `AuthOperationOptions` (cancellation) on every
+//! operation, matching the upstream v0.84.0 signature.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use super::error::AiError;
+use crate::auth::types::AuthOperationOptions;
 use crate::types::Model;
 
 /// `ModelsStoreEntry`.
@@ -28,20 +29,44 @@ pub struct ModelsStoreEntry {
     pub etag: Option<String>,
 }
 
-/// `ModelsStore` — persistent model catalogs keyed by provider ID.
+/// `ModelsStore` — persistent model catalogs keyed by provider ID
+/// (models-store.ts @ 4181f66). Operations accept optional cancellation
+/// matching the upstream `AuthOperationOptions` signature.
 #[async_trait::async_trait]
 pub trait ModelsStore: Send + Sync {
-    async fn read(&self, provider_id: &str) -> Result<Option<ModelsStoreEntry>, AiError>;
-    async fn write(&self, provider_id: &str, entry: ModelsStoreEntry) -> Result<(), AiError>;
-    async fn delete(&self, provider_id: &str) -> Result<(), AiError>;
+    async fn read(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<ModelsStoreEntry>, AiError>;
+    async fn write(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError>;
+    async fn delete(
+        &self,
+        provider_id: &str,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError>;
 }
 
-/// `ProviderModelsStore` — store scoped to one provider.
+/// `ProviderModelsStore` — store scoped to one provider. Kept for backward
+/// compat with test helpers and external callers; the new `RefreshModelsContext`
+/// uses `ModelsStore` directly.
 #[async_trait::async_trait]
 pub trait ProviderModelsStore: Send + Sync {
-    async fn read(&self) -> Result<Option<ModelsStoreEntry>, AiError>;
-    async fn write(&self, entry: ModelsStoreEntry) -> Result<(), AiError>;
-    async fn delete(&self) -> Result<(), AiError>;
+    async fn read(
+        &self,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<ModelsStoreEntry>, AiError>;
+    async fn write(
+        &self,
+        entry: ModelsStoreEntry,
+        options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError>;
+    async fn delete(&self, options: Option<&AuthOperationOptions>) -> Result<(), AiError>;
 }
 
 /// `InMemoryModelsStore`.
@@ -58,7 +83,11 @@ impl InMemoryModelsStore {
 
 #[async_trait::async_trait]
 impl ModelsStore for InMemoryModelsStore {
-    async fn read(&self, provider_id: &str) -> Result<Option<ModelsStoreEntry>, AiError> {
+    async fn read(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<ModelsStoreEntry>, AiError> {
         Ok(self
             .entries
             .lock()
@@ -67,7 +96,12 @@ impl ModelsStore for InMemoryModelsStore {
             .cloned())
     }
 
-    async fn write(&self, provider_id: &str, entry: ModelsStoreEntry) -> Result<(), AiError> {
+    async fn write(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -75,7 +109,11 @@ impl ModelsStore for InMemoryModelsStore {
         Ok(())
     }
 
-    async fn delete(&self, provider_id: &str) -> Result<(), AiError> {
+    async fn delete(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError> {
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -173,7 +211,11 @@ struct JsonFileModelsStoreFile {
 
 #[async_trait::async_trait]
 impl ModelsStore for JsonFileModelsStore {
-    async fn read(&self, provider_id: &str) -> Result<Option<ModelsStoreEntry>, AiError> {
+    async fn read(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<Option<ModelsStoreEntry>, AiError> {
         Ok(self
             .state
             .lock()
@@ -182,7 +224,12 @@ impl ModelsStore for JsonFileModelsStore {
             .cloned())
     }
 
-    async fn write(&self, provider_id: &str, entry: ModelsStoreEntry) -> Result<(), AiError> {
+    async fn write(
+        &self,
+        provider_id: &str,
+        entry: ModelsStoreEntry,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -190,7 +237,11 @@ impl ModelsStore for JsonFileModelsStore {
         self.persist().await
     }
 
-    async fn delete(&self, provider_id: &str) -> Result<(), AiError> {
+    async fn delete(
+        &self,
+        provider_id: &str,
+        _options: Option<&AuthOperationOptions>,
+    ) -> Result<(), AiError> {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -216,13 +267,19 @@ mod tests {
             checked_at: Some(2),
             etag: Some("\"abc\"".to_owned()),
         };
-        store.write("openai", entry.clone()).await.expect("write");
+        store
+            .write("openai", entry.clone(), None)
+            .await
+            .expect("write");
         let loaded = JsonFileModelsStore::load(path.clone())
             .await
             .expect("reload");
-        assert_eq!(loaded.read("openai").await.expect("read"), Some(entry));
-        loaded.delete("openai").await.expect("delete");
-        assert_eq!(loaded.read("openai").await.expect("read"), None);
+        assert_eq!(
+            loaded.read("openai", None).await.expect("read"),
+            Some(entry)
+        );
+        loaded.delete("openai", None).await.expect("delete");
+        assert_eq!(loaded.read("openai", None).await.expect("read"), None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -253,6 +310,7 @@ mod tests {
                             checked_at: Some(index),
                             etag: None,
                         },
+                        None,
                     )
                     .await
             }));
@@ -266,7 +324,7 @@ mod tests {
         for index in 0..16 {
             assert!(
                 loaded
-                    .read(&format!("provider-{index}"))
+                    .read(&format!("provider-{index}"), None)
                     .await
                     .expect("read")
                     .is_some(),

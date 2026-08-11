@@ -28,5 +28,6 @@ pub fn deepseek_provider() -> Arc<dyn Provider> {
         },
         models: get_builtin_models("deepseek").to_vec(),
         api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
     })
 }
