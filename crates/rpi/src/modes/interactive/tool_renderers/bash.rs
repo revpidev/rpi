@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::{Component, RenderHandle};
-use rpi_tui::utils::truncate_to_width;
+use rpi_tui::utils::{truncate_to_width, wrap_text_with_ansi};
 use serde_json::Value;
 
 use super::render_utils::{invalid_arg_text, str_value};
@@ -216,9 +216,11 @@ impl Component for BashResultRenderComponent {
 
         if !self.styled_output.is_empty() {
             if self.expanded {
-                // `new Text(`\n${styledOutput}`)` (bash.ts:270).
+                // `new Text(`\n${styledOutput}`)` (bash.ts:270): the upstream
+                // `Text` component wraps at width, so long tool-output lines
+                // wrap instead of overflowing the terminal.
                 lines.push(String::new());
-                lines.extend(self.styled_output.split('\n').map(str::to_string));
+                lines.extend(wrap_text_with_ansi(&self.styled_output, width));
             } else {
                 let preview = self.preview(width);
                 lines.push(String::new());
@@ -240,9 +242,13 @@ impl Component for BashResultRenderComponent {
         }
 
         if let Some(warnings) = &self.warnings {
-            // `new Text(`\n${warning}`)` (bash.ts:311).
+            // `new Text(`\n${warning}`)` (bash.ts:311): wrap at width — a
+            // long full-output path would otherwise exceed the terminal
+            // width and trip the renderer's width guard (tui.rs).
             lines.push(String::new());
-            lines.extend(warnings.split('\n').map(str::to_string));
+            for warning in warnings.split('\n') {
+                lines.extend(wrap_text_with_ansi(warning, width));
+            }
         }
 
         let timing = lock_recover(&self.state.timing);
@@ -548,6 +554,93 @@ mod tests {
             .expect("result component");
         let stripped = strip_ansi(&component.render(80).join("\n"));
         assert!(stripped.contains("Took 0."), "stripped: {stripped}");
+    }
+
+    #[test]
+    fn warnings_wrap_at_terminal_width_with_long_full_output_path() {
+        // Regression: a long `fullOutputPath` used to be pushed as a raw
+        // line, exceeding the terminal width and panicking the renderer
+        // (tui.rs width guard: `Rendered line … exceeds terminal width`).
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = BashToolRenderer;
+        let long_path = format!("/tmp/pi-bash-{}.log", "76d578ae3f748c37".repeat(6));
+        let result = ToolResultState {
+            content: vec![],
+            is_error: false,
+            details: Some(json!({
+                "truncation": {
+                    "truncated": true,
+                    "truncatedBy": "bytes",
+                    "outputLines": 24,
+                    "maxBytes": 51200
+                },
+                "fullOutputPath": long_path
+            })),
+        };
+        let context = context(&state);
+        let component = renderer
+            .render_result(
+                &result,
+                ResultRenderOptions {
+                    expanded: false,
+                    is_partial: false,
+                },
+                &theme,
+                &context,
+            )
+            .expect("result component");
+        // The warnings line must wrap so every rendered line fits the
+        // width (the un-truncated line was 91 > 79 in the reported crash).
+        for (index, line) in component.render(79).iter().enumerate() {
+            assert!(
+                rpi_tui::utils::visible_width(line) <= 79,
+                "line {index} exceeds width: w={} {line:?}",
+                rpi_tui::utils::visible_width(line)
+            );
+        }
+        let stripped = strip_ansi(&component.render(79).join("\n"));
+        assert!(stripped.contains("Full output:"), "stripped: {stripped}");
+        assert!(stripped.contains("/tmp/pi-bash-"), "stripped: {stripped}");
+        // The full path survives the wrap (not truncated away).
+        assert!(stripped.contains("76d578ae3f748c37"), "stripped: {stripped}");
+        assert!(stripped.contains("24 lines shown"), "stripped: {stripped}");
+    }
+
+    #[test]
+    fn expanded_output_wraps_long_lines_at_terminal_width() {
+        // Regression: expanded mode pushed output lines raw; a long line
+        // would trip the renderer's width guard. Upstream wraps via `Text`.
+        let theme = theme();
+        let state = RendererStateSlot::default();
+        let renderer = BashToolRenderer;
+        let long_line = "x".repeat(200);
+        let result = ToolResultState {
+            content: vec![crate::modes::interactive::components::tool_execution::ToolResultContentLoose::text(
+                format!("{long_line}\nshort"),
+            )],
+            is_error: false,
+            details: None,
+        };
+        let context = context(&state);
+        let component = renderer
+            .render_result(
+                &result,
+                ResultRenderOptions {
+                    expanded: true,
+                    is_partial: false,
+                },
+                &theme,
+                &context,
+            )
+            .expect("result component");
+        for (index, line) in component.render(79).iter().enumerate() {
+            assert!(
+                rpi_tui::utils::visible_width(line) <= 79,
+                "line {index} exceeds width: w={} {line:?}",
+                rpi_tui::utils::visible_width(line)
+            );
+        }
     }
 
     #[test]
