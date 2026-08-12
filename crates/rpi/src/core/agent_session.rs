@@ -373,9 +373,15 @@ struct AgentSessionInner {
     session_start_event: SessionStartEvent,
 
     compaction: tokio::sync::Mutex<CompactionRunner>,
-    /// Shared compaction abort handle: works while the runner mutex is held
-    /// by an in-flight compaction (`AbortController` upstream).
+    /// Shared manual-compaction abort handle: works while the runner mutex is
+    /// held by an in-flight compaction (`_compactionAbortController`
+    /// upstream, agent-session.ts:327). The prompt rejection reads only this
+    /// cell (agent-session.ts:1133).
     compaction_abort: crate::core::compaction_runner::AbortTokenCell,
+    /// Shared auto-compaction abort handle (`_autoCompactionAbortController`
+    /// upstream, agent-session.ts:328): cancelled by `abort_compaction` but
+    /// never consulted by the prompt rejection.
+    auto_compaction_abort: crate::core::compaction_runner::AbortTokenCell,
 
     listeners: Mutex<Vec<(u64, AgentSessionEventListener)>>,
     next_listener_id: AtomicU64,
@@ -489,6 +495,7 @@ impl AgentSession {
         // shared runner slot (read per emit, swap-safe).
         compaction.set_extension_runner(config.extension_runner_ref.clone());
         let compaction_abort = compaction.abort_token_cell();
+        let auto_compaction_abort = compaction.auto_abort_token_cell();
 
         let inner = Arc::new(AgentSessionInner {
             agent: config.agent,
@@ -500,6 +507,7 @@ impl AgentSession {
             session_start_event: config.session_start_event,
             compaction: tokio::sync::Mutex::new(compaction),
             compaction_abort,
+            auto_compaction_abort,
             listeners: Mutex::new(Vec::new()),
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
@@ -1431,9 +1439,10 @@ impl AgentSession {
             }
 
             // Reject prompts while manual compaction is in progress
-            // (agent-session.ts:1133-1137 @ 8eda4f5b2). The abort-token cell
-            // is `Some` only during compaction; auto-compaction holds the
-            // runner mutex but the token is also set there.
+            // (agent-session.ts:1133-1137 @ 8eda4f5b2). Upstream checks only
+            // `_compactionAbortController` here; auto compaction rides the
+            // separate `auto_compaction_abort` cell (agent-session.ts:328) and
+            // must not reject prompts.
             if !self
                 .inner
                 .compaction_abort
@@ -2213,11 +2222,15 @@ impl AgentSession {
             .await
     }
 
-    /// `abortCompaction` (agent-session.ts:1930-1933). Cancels through the
-    /// shared token, so it also works while a compaction holds the runner
-    /// mutex (upstream aborts an AbortController directly).
+    /// `abortCompaction` (agent-session.ts:1938-1941). Cancels both the
+    /// manual and the auto controller through the shared cells, so it also
+    /// works while a compaction holds the runner mutex (upstream aborts the
+    /// AbortControllers directly).
     pub fn abort_compaction(&self) {
         if let Some(token) = lock(&self.inner.compaction_abort).as_ref() {
+            token.cancel();
+        }
+        if let Some(token) = lock(&self.inner.auto_compaction_abort).as_ref() {
             token.cancel();
         }
     }

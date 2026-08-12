@@ -3,15 +3,17 @@
 //! `compact()` error paths (:1799-1807/:1868-1870). The happy path is
 //! covered by the `parity_compaction_test.rs` parity suite.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rpi::core::compaction_runner::{CompactionEvent, CompactionRunner};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi_agent::compaction::CompactionSettings;
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::types::ThinkingLevel;
-use rpi_agent::{Agent, AgentOptions, InitialAgentState};
-use rpi_ai::types::{AssistantMessage, StopReason, Usage};
+use rpi_agent::{Agent, AgentOptions, InitialAgentState, StreamFn};
+use rpi_ai::types::{AssistantMessage, StopReason, StreamEvent, Usage};
 use rpi_test_support::faux::{
     faux_assistant_message, FauxAssistantOptions, FauxModelDefinition, FauxProvider,
     FauxProviderOptions, FauxResponseStep,
@@ -887,4 +889,202 @@ fn seed_turn_via_runner(
     messages.push(user_msg);
     messages.push(AgentMessage::Assistant(assistant_msg));
     agent.set_messages(messages);
+}
+
+// ---------------------------------------------------------------------------
+// T23.1: separate abort cells for manual vs auto compaction
+// ---------------------------------------------------------------------------
+
+/// Wrap the faux provider's stream fn with a one-shot gate: the first stream
+/// signals `entered` and holds until `release` fires, so a test can inspect
+/// the abort cells while a compaction is in flight. Later streams pass
+/// through (a second gate wait would deadlock after a single release).
+fn gated_stream_fn(
+    provider: &Arc<FauxProvider>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> StreamFn {
+    use futures::StreamExt;
+
+    let inner = provider.stream_fn();
+    let gate_once = Arc::new(AtomicBool::new(false));
+    Arc::new(move |model, context, options| {
+        let tail = inner(model, context, options);
+        let entered = entered.clone();
+        let release = release.clone();
+        let gate_once = gate_once.clone();
+        let gate = futures::stream::once(async move {
+            if !gate_once.swap(true, Ordering::SeqCst) {
+                entered.notify_one();
+                release.notified().await;
+            }
+        })
+        .filter_map(|()| futures::future::ready(Option::<StreamEvent>::None));
+        Box::pin(gate.chain(tail)) as rpi_agent::BoxStream<'static, StreamEvent>
+    })
+}
+
+fn cell_is_some(cell: &rpi::core::compaction_runner::AbortTokenCell) -> bool {
+    cell.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Manual compaction marks only the manual cell. The prompt rejection reads
+/// exactly this cell (`AgentSession::prompt` consults `compaction_abort`,
+/// agent-session.ts:1133), so prompts are rejected while it is `Some`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_marks_only_the_manual_abort_cell() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(65536),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+    let agent = Arc::new(Agent::new(AgentOptions::new(provider.stream_fn())));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        gated_stream_fn(&provider, entered.clone(), release.clone()),
+        ThinkingLevel::Off,
+        Arc::new(|_| {}),
+    );
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q1 {}", "x".repeat(80)),
+        &format!("a1 {}", "y".repeat(80)),
+        100,
+    );
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q2 {}", "x".repeat(80)),
+        "a2",
+        100,
+    );
+    seed_turn_via_runner(&mut runner, &agent, "q3", "a3", 100);
+
+    let manual_cell = runner.abort_token_cell();
+    let auto_cell = runner.auto_abort_token_cell();
+    let task = tokio::spawn(async move {
+        let mut runner = runner;
+        runner.compact(Some("focus")).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("summarization stream entered");
+    assert!(
+        cell_is_some(&manual_cell),
+        "manual cell must be set during manual compaction — prompts are rejected"
+    );
+    assert!(
+        !cell_is_some(&auto_cell),
+        "manual compaction must not touch the auto cell"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("compact join timed out")
+        .expect("compact task panicked")
+        .expect("manual compact succeeds");
+    assert!(
+        !cell_is_some(&manual_cell),
+        "manual cell cleared afterwards"
+    );
+    assert!(!cell_is_some(&auto_cell), "auto cell still untouched");
+}
+
+/// Auto compaction marks only the AUTO cell, never the manual one — so an
+/// in-flight auto compaction does not make `prompt` reject
+/// (agent-session.ts:1133 checks only `_compactionAbortController`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_compact_marks_only_the_auto_abort_cell() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(65536),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+    let mut agent_opts = AgentOptions::new(provider.stream_fn());
+    agent_opts.initial_state = InitialAgentState {
+        model: Some(model.clone()),
+        thinking_level: Some(ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let agent = Arc::new(Agent::new(agent_opts));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        gated_stream_fn(&provider, entered.clone(), release.clone()),
+        ThinkingLevel::Off,
+        Arc::new(|_| {}),
+    );
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q {}", "x".repeat(80)),
+        &format!("a {}", "y".repeat(80)),
+        5000,
+    );
+
+    let manual_cell = runner.abort_token_cell();
+    let auto_cell = runner.auto_abort_token_cell();
+    // Trigger auto-compaction via a threshold message (9000 > 8192-4096).
+    let task = tokio::spawn(async move {
+        let mut runner = runner;
+        runner
+            .check_compaction(&assistant("done", StopReason::Stop, 9000, now_ms()), true)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(15), entered.notified())
+        .await
+        .expect("summarization stream entered");
+    assert!(
+        cell_is_some(&auto_cell),
+        "auto cell must be set during auto compaction"
+    );
+    assert!(
+        !cell_is_some(&manual_cell),
+        "auto compaction must not mark the manual cell — prompts must not be rejected"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(15), task)
+        .await
+        .expect("check_compaction join timed out")
+        .expect("check_compaction task panicked");
+    assert!(!cell_is_some(&auto_cell), "auto cell cleared afterwards");
+    assert!(!cell_is_some(&manual_cell), "manual cell still untouched");
 }

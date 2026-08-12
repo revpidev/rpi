@@ -78,13 +78,17 @@ pub fn is_newer_package_version(candidate: &str, current: &str) -> bool {
 }
 
 /// Injectable HTTP GET (upstream `fetch`). `Ok(None)` maps to upstream's
-/// `!response.ok` → `undefined`; transport failures are `Err`.
+/// `!response.ok` → `undefined`; transport failures are `Err`. `retry`
+/// mirrors upstream `options.retry` (version-check.ts:97-108): `true` allows
+/// two retries (the `--self` update path, package-manager-cli.ts:479),
+/// `false` is a single attempt (the startup path passes no retry).
 pub trait LatestVersionTransport: Send + Sync {
     fn get<'a>(
         &'a self,
         url: &'a str,
         user_agent: &'a str,
         timeout: Duration,
+        retry: bool,
     ) -> BoxFuture<'a, Result<Option<String>, String>>;
 }
 
@@ -93,7 +97,9 @@ pub trait LatestVersionTransport: Send + Sync {
 ///
 /// Uses [`fetch_with_retry`] (46b53b995) for bounded immediate retry on
 /// transient failures — this is the management-plane HTTP helper used by
-/// version-check / catalog / managed-tool / package downloads.
+/// version-check / catalog / managed-tool / package downloads. Retry count
+/// follows the caller's `retry` flag (upstream `maxRetries: options.retry ?
+/// 2 : 0`, version-check.ts:66).
 pub struct ReqwestLatestVersionTransport;
 
 impl LatestVersionTransport for ReqwestLatestVersionTransport {
@@ -102,6 +108,7 @@ impl LatestVersionTransport for ReqwestLatestVersionTransport {
         url: &'a str,
         user_agent: &'a str,
         timeout: Duration,
+        retry: bool,
     ) -> BoxFuture<'a, Result<Option<String>, String>> {
         Box::pin(async move {
             let client = reqwest::Client::builder()
@@ -123,6 +130,7 @@ impl LatestVersionTransport for ReqwestLatestVersionTransport {
                 },
                 None,
                 &crate::utils::management_http::FetchRetryOptions {
+                    max_retries: Some(if retry { 2 } else { 0 }),
                     timeout: Some(timeout),
                     ..Default::default()
                 },
@@ -137,7 +145,8 @@ impl LatestVersionTransport for ReqwestLatestVersionTransport {
 }
 
 /// `getLatestPiRelease` (version-check.ts:30-61) with the default URL and
-/// timeout; `RPI_OFFLINE` short-circuits to `None`.
+/// timeout; `RPI_OFFLINE` short-circuits to `None`. Like the upstream
+/// zero-options call, this does not retry (`maxRetries: 0`).
 pub async fn get_latest_rpi_release(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
@@ -148,24 +157,28 @@ pub async fn get_latest_rpi_release(
         LATEST_VERSION_URL,
         DEFAULT_VERSION_CHECK_TIMEOUT,
         crate::core::package_manager::is_offline_mode_enabled(),
+        false,
     )
     .await
 }
 
-/// [`get_latest_rpi_release`] with explicit URL / timeout / offline flag
-/// (test seam; also the W6a endpoint-override call site).
+/// [`get_latest_rpi_release`] with explicit URL / timeout / offline flag /
+/// retry policy (test seam; also the W6a endpoint-override call site).
+/// `retry` is upstream `options.retry` (version-check.ts:30): the `--self`
+/// update path passes `true`, the startup path `false`.
 pub async fn get_latest_rpi_release_with(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
     url: &str,
     timeout: Duration,
     offline: bool,
+    retry: bool,
 ) -> Result<Option<LatestRpiRelease>, String> {
     if offline {
         return Ok(None);
     }
     let Some(body) = transport
-        .get(url, &rpi_user_agent(current_version), timeout)
+        .get(url, &rpi_user_agent(current_version), timeout, retry)
         .await?
     else {
         return Ok(None);
@@ -227,7 +240,8 @@ pub fn startup_version_check_url(settings_url: Option<&str>) -> Option<String> {
 /// `checkForNewPiVersion` (version-check.ts:70-81): `None` unless the probe
 /// reports a strictly newer version; every transport/parse failure is
 /// swallowed (upstream `try/catch`). `url` is the resolved startup probe
-/// URL — `None` disables the check with zero network traffic.
+/// URL — `None` disables the check with zero network traffic. The startup
+/// path never retries (upstream passes no `retry`, version-check.ts:101).
 pub async fn check_for_new_rpi_release(
     current_version: &str,
     transport: &dyn LatestVersionTransport,
@@ -239,6 +253,7 @@ pub async fn check_for_new_rpi_release(
         transport,
         url,
         DEFAULT_VERSION_CHECK_TIMEOUT,
+        false,
         false,
     )
     .await
@@ -261,7 +276,7 @@ mod tests {
     use std::sync::Mutex;
 
     struct ScriptedTransport {
-        calls: Mutex<Vec<(String, String)>>,
+        calls: Mutex<Vec<(String, String, bool)>>,
         response: Result<Option<String>, String>,
     }
 
@@ -272,6 +287,15 @@ mod tests {
                 response,
             }
         }
+
+        fn retry_flags(&self) -> Vec<bool> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|(_, _, retry)| *retry)
+                .collect()
+        }
     }
 
     impl LatestVersionTransport for ScriptedTransport {
@@ -280,11 +304,13 @@ mod tests {
             url: &'a str,
             user_agent: &'a str,
             _timeout: Duration,
+            retry: bool,
         ) -> BoxFuture<'a, Result<Option<String>, String>> {
-            self.calls
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((url.to_string(), user_agent.to_string()));
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).push((
+                url.to_string(),
+                user_agent.to_string(),
+                retry,
+            ));
             let response = self.response.clone();
             Box::pin(async move { response })
         }
@@ -346,6 +372,7 @@ mod tests {
             LATEST_VERSION_URL,
             DEFAULT_VERSION_CHECK_TIMEOUT,
             true,
+            false,
         )
         .await
         .expect("offline result");
@@ -498,5 +525,37 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty());
+    }
+
+    /// T23.4: the startup probe never retries (upstream `checkForNewPiVersion`
+    /// passes no `retry` → `maxRetries: 0`, version-check.ts:97-108); only
+    /// callers that opt in (the `--self` update path) get retries.
+    #[tokio::test]
+    async fn startup_check_disables_retry_unless_the_caller_opts_in() {
+        let transport =
+            ScriptedTransport::responds(Ok(Some(r#"{"version": "9.9.9"}"#.to_string())));
+        check_for_new_rpi_release("1.0.0", &transport, Some(LATEST_VERSION_URL)).await;
+        assert_eq!(transport.retry_flags(), vec![false]);
+
+        let transport =
+            ScriptedTransport::responds(Ok(Some(r#"{"version": "9.9.9"}"#.to_string())));
+        get_latest_rpi_release("1.0.0", &transport)
+            .await
+            .expect("release");
+        assert_eq!(transport.retry_flags(), vec![false]);
+
+        let transport =
+            ScriptedTransport::responds(Ok(Some(r#"{"version": "9.9.9"}"#.to_string())));
+        get_latest_rpi_release_with(
+            "1.0.0",
+            &transport,
+            LATEST_VERSION_URL,
+            DEFAULT_VERSION_CHECK_TIMEOUT,
+            false,
+            true,
+        )
+        .await
+        .expect("release");
+        assert_eq!(transport.retry_flags(), vec![true]);
     }
 }

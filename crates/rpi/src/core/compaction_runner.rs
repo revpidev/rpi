@@ -148,7 +148,15 @@ pub struct CompactionRunner {
     thinking_level: ThinkingLevel,
     emit: CompactionEventSink,
     overflow_recovery_attempted: bool,
+    /// Manual compaction's token — upstream `_compactionAbortController`
+    /// (agent-session.ts:327). The prompt rejection reads only this cell
+    /// (agent-session.ts:1133).
     active_token: AbortTokenCell,
+    /// Auto compaction's token — upstream `_autoCompactionAbortController`
+    /// (agent-session.ts:328). Kept separate from the manual cell so an
+    /// in-flight auto compaction does not make `prompt` reject
+    /// (agent-session.ts:1133 checks only the manual controller).
+    auto_active_token: AbortTokenCell,
     /// Extension runner slot (T15 W2): read per emit so a runner swap
     /// (session replacement / reload) takes effect without rebuilding the
     /// runner. `None` in bare test fixtures = no extensions.
@@ -178,6 +186,7 @@ impl CompactionRunner {
             emit,
             overflow_recovery_attempted: false,
             active_token: AbortTokenCell::default(),
+            auto_active_token: AbortTokenCell::default(),
             extension_runner: None,
         }
     }
@@ -198,9 +207,17 @@ impl CompactionRunner {
             .map(crate::core::extensions::read_runner)
     }
 
-    /// Shared abort handle (see [`AbortTokenCell`]).
+    /// Shared abort handle for the manual path (see [`AbortTokenCell`]).
     pub fn abort_token_cell(&self) -> AbortTokenCell {
         self.active_token.clone()
+    }
+
+    /// Shared abort handle for the auto-compaction path (upstream keeps a
+    /// second controller, `_autoCompactionAbortController`,
+    /// agent-session.ts:328). `abortCompaction` cancels both, but the prompt
+    /// rejection must NOT consult this one (agent-session.ts:1133).
+    pub fn auto_abort_token_cell(&self) -> AbortTokenCell {
+        self.auto_active_token.clone()
     }
 
     /// Lock the shared session (poison-tolerant, like the rest of the
@@ -247,9 +264,13 @@ impl CompactionRunner {
         self.overflow_recovery_attempted = false;
     }
 
-    /// `abortCompaction()` (agent-session.ts:1930-1933).
+    /// `abortCompaction()` (agent-session.ts:1938-1941): cancels both the
+    /// manual and the auto controller.
     pub fn abort_compaction(&self) {
         if let Some(token) = lock_abort(&self.active_token).as_ref() {
+            token.cancel();
+        }
+        if let Some(token) = lock_abort(&self.auto_active_token).as_ref() {
             token.cancel();
         }
     }
@@ -657,7 +678,7 @@ impl CompactionRunner {
             };
 
             self.emit(CompactionEvent::CompactionStart { reason });
-            *lock_abort(&self.active_token) = Some(token.clone());
+            *lock_abort(&self.auto_active_token) = Some(token.clone());
             started = true;
 
             // Extension-provided compaction (agent-session.ts:2079-2105).
@@ -676,7 +697,7 @@ impl CompactionRunner {
                     // Extension cancel (agent-session.ts:2085-2092).
                     // Clear idle state before compaction_end so listeners can
                     // submit queued prompts (agent-session.ts:1907-1908 @ 3852cb2b8).
-                    *lock_abort(&self.active_token) = None;
+                    *lock_abort(&self.auto_active_token) = None;
                     self.emit(CompactionEvent::CompactionEnd {
                         reason,
                         result: None,
@@ -709,7 +730,7 @@ impl CompactionRunner {
 
             if token.is_cancelled() {
                 // Clear idle state before compaction_end (3852cb2b8).
-                *lock_abort(&self.active_token) = None;
+                *lock_abort(&self.auto_active_token) = None;
                 self.emit(CompactionEvent::CompactionEnd {
                     reason,
                     result: None,
@@ -725,7 +746,7 @@ impl CompactionRunner {
                 .await?;
             // Clear idle state before compaction_end so listeners can submit
             // queued prompts (agent-session.ts:1907-1908 @ 3852cb2b8).
-            *lock_abort(&self.active_token) = None;
+            *lock_abort(&self.auto_active_token) = None;
             self.emit(CompactionEvent::CompactionEnd {
                 reason,
                 result: Some(Box::new(result)),
@@ -760,7 +781,7 @@ impl CompactionRunner {
         }
         .await;
 
-        *lock_abort(&self.active_token) = None;
+        *lock_abort(&self.auto_active_token) = None;
 
         match outcome {
             Ok(should_continue) => should_continue,

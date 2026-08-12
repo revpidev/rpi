@@ -235,6 +235,7 @@ impl crate::core::version_check::LatestVersionTransport for NoopLatestVersionTra
         _url: &'a str,
         _user_agent: &'a str,
         _timeout: Duration,
+        _retry: bool,
     ) -> Pin<Box<dyn futures::Future<Output = Result<Option<String>, String>> + Send + 'a>> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move { Ok(None) })

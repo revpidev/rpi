@@ -869,12 +869,15 @@ async fn w3_events_bus_cross_extension_pub_sub() {
     let listener = InlineExtension::Anonymous(Arc::new(move |api| {
         let sink = sink.clone();
         // An unsubscribe handle that is never called keeps the subscription.
-        let _unsub = api.events().on(
-            "my-channel",
-            Arc::new(move |data| {
-                sink.lock().unwrap_or_else(|e| e.into_inner()).push(data);
-            }),
-        );
+        let _unsub = api
+            .events()
+            .on(
+                "my-channel",
+                Arc::new(move |data| {
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push(data);
+                }),
+            )
+            .expect("events.on while active");
         std::mem::forget(_unsub);
         Box::pin(async { Ok(()) })
     }));

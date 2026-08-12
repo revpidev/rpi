@@ -323,6 +323,9 @@ async fn get_self_update_plan(
         url,
         DEFAULT_VERSION_CHECK_TIMEOUT,
         crate::core::package_manager::is_offline_mode_enabled(),
+        // The update path retries (package-manager-cli.ts:479 passes
+        // `{ retry: true }`), unlike the startup check.
+        true,
     )
     .await
     .map_err(|message| format!("Could not determine latest {APP_NAME} version: {message}"))?;
@@ -1828,6 +1831,7 @@ mod update_cli_tests {
             url: &'a str,
             _user_agent: &'a str,
             _timeout: Duration,
+            _retry: bool,
         ) -> BoxFuture<'a, Result<Option<String>, String>> {
             self.calls.lock().unwrap().push(url.to_string());
             let response = self.response.clone();

@@ -137,11 +137,12 @@ impl TrackedEventBus {
         Ok(())
     }
 
-    /// `events.on` (loader.ts:414-417 after 6ca423447).
-    pub fn on(&self, channel: &str, handler: BusHandler) -> Unsubscribe {
-        self.runtime.assert_active().ok();
+    /// `events.on` (loader.ts:414-417 after 6ca423447): like upstream, a
+    /// stale context throws instead of registering (T23.2).
+    pub fn on(&self, channel: &str, handler: BusHandler) -> Result<Unsubscribe, ExtError> {
+        self.runtime.assert_active()?;
         let unsubscribe = self.bus.on(channel, handler);
-        self.runtime.track_event_bus_subscription(unsubscribe)
+        Ok(self.runtime.track_event_bus_subscription(unsubscribe))
     }
 }
 
@@ -2019,5 +2020,51 @@ impl ExtensionApi {
     /// `pi.events` (loader.ts:389 + 6ca423447 tracking wrapper).
     pub fn events(&self) -> TrackedEventBus {
         TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T23.2: `events.on` on a stale context must fail instead of silently
+    /// registering (upstream throws via `assertActive`, loader.ts:414-417).
+    #[test]
+    fn tracked_event_bus_on_rejects_stale_context() {
+        let runtime = ExtensionRuntime::new();
+        let bus = TrackedEventBus::new(runtime.event_bus(), runtime.clone());
+
+        let received = Arc::new(std::sync::Mutex::new(0u32));
+        let sink = received.clone();
+        // Active context: registration succeeds.
+        let _unsub = bus
+            .on("chan", Arc::new(move |_| *sink.lock().unwrap() += 1))
+            .expect("on while active");
+
+        runtime.invalidate(Some("extension unloaded".to_owned()));
+        assert!(runtime.is_stale());
+
+        // Stale context: the error surfaces and nothing is registered.
+        let error = bus
+            .on(
+                "chan",
+                Arc::new(move |_| panic!("stale handler must not run")),
+            )
+            .err()
+            .expect("on must fail when stale");
+        assert!(matches!(error, ExtError::Stale(_)));
+        assert_eq!(
+            error.to_string(),
+            "stale extension context: extension unloaded"
+        );
+
+        // invalidate() drained tracked subscriptions, and the rejected `on`
+        // added no handler: an emit delivers nothing.
+        runtime.event_bus().emit("chan", Value::Null);
+        assert_eq!(*received.lock().unwrap(), 0);
     }
 }

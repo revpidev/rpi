@@ -1418,12 +1418,15 @@ async fn runner_invalidate_unsubscribes_extension_event_bus_subscription() {
     let sink = received.clone();
     let host = host_with(vec![inline_ext("ext-a", move |api| {
         let sink = sink.clone();
-        let _unsub = api.events().on(
-            "my-channel",
-            Arc::new(move |data| {
-                sink.lock().unwrap().push(data);
-            }),
-        );
+        let _unsub = api
+            .events()
+            .on(
+                "my-channel",
+                Arc::new(move |data| {
+                    sink.lock().unwrap().push(data);
+                }),
+            )
+            .expect("events.on while active");
         // The tracked wrapper handles lifecycle — forget the handle so it
         // stays subscribed until invalidate().
         std::mem::forget(_unsub);
