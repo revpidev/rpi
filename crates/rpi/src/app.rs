@@ -596,6 +596,11 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         if first == "self-uninstall" {
             return crate::cli::package_command::run_self_uninstall(&args);
         }
+        if first == "auth" {
+            if let Some(exit_code) = crate::cli::run_auth::run_auth(&args).await {
+                return exit_code;
+            }
+        }
         if crate::cli::package_command::parse_package_command(&args).is_some() {
             return crate::cli::package_command::run_package_command(&args);
         }

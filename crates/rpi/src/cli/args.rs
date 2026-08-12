@@ -416,7 +416,8 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   {APP_NAME} self-uninstall [--purge]  Uninstall this rpi binary installation
   {APP_NAME} list                      List installed extensions from settings
   {APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  {APP_NAME} <command> --help          Show help for install/remove/uninstall/update/self-uninstall/list/config
+  {APP_NAME} auth <command>            Print credentials or check provider readiness
+  {APP_NAME} <command> --help          Show help for install/remove/uninstall/update/self-uninstall/list/config/auth
 
 {options_bold}
   --provider <name>              Provider name (default: google)
@@ -464,6 +465,12 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
 Extensions can register additional flags (e.g., --plan from plan-mode extension).{extension_flags_text}
 
 {examples_bold}
+  # Print a provider API key for an external client
+  {APP_NAME} auth print-api-key --provider openai
+
+  # Print an OAuth bearer token for an external client (refreshes if expired)
+  {APP_NAME} auth print-bearer-token --provider openai-codex
+
   # Interactive mode
   {APP_NAME}
 

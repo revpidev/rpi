@@ -455,7 +455,7 @@ impl LlamaHost for InteractiveLlamaHost {
         self.ui
             .session()
             .model_runtime()
-            .get_provider_auth(crate::extensions::llama::LLAMA_PROVIDER_ID)
+            .get_provider_auth(crate::extensions::llama::LLAMA_PROVIDER_ID, None)
             .await
     }
 

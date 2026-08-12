@@ -104,6 +104,12 @@ impl RuntimeCredentials {
         }
     }
 
+    /// Returns a clone of the inner credential store handle (for direct
+    /// read-only access by auth CLI commands).
+    pub fn store_clone(&self) -> Arc<dyn CredentialStore> {
+        Arc::clone(&self.store)
+    }
+
     pub fn set_runtime_api_key(&self, provider_id: &str, api_key: &str) {
         write(&self.overrides).insert(provider_id.to_owned(), api_key.to_owned());
     }
@@ -355,11 +361,14 @@ pub struct CreateModelRuntimeOptions {
     pub model_refresh_timeout_ms: Option<u64>,
 }
 
-/// `ModelRuntimeAuthOverrides` (model-runtime.ts:72-75).
+/// `ModelRuntimeAuthOverrides` (model-runtime.ts:72-75 + 84-89 @ 4181f66).
 #[derive(Debug, Clone, Default)]
 pub struct ModelRuntimeAuthOverrides {
     pub api_key: Option<String>,
     pub env: Option<ProviderEnv>,
+    /// Require this much remaining OAuth-token validity; defaults to five
+    /// minutes (model-runtime.ts:88, auth/resolve.ts:119).
+    pub min_oauth_validity_ms: Option<u64>,
 }
 
 // ============================================================================
@@ -1331,6 +1340,17 @@ impl ModelRuntime {
         self.models.get_provider(provider_id)
     }
 
+    /// Returns the credential store backing this runtime. Used by the auth
+    /// CLI commands' `--credentials` path (`getProviderCredential`,
+    /// auth-check.ts:55-64) to read stored credentials without triggering a
+    /// refresh.
+    pub fn credential_store(&self) -> Arc<dyn CredentialStore> {
+        // RuntimeCredentials delegates read/list to the wrapped store; for the
+        // auth check path the store is accessed directly (no runtime overrides
+        // apply).
+        self.credentials.store_clone()
+    }
+
     pub fn get_models(&self, provider_id: Option<&str>) -> Vec<Model> {
         self.models.get_models(provider_id)
     }
@@ -1446,7 +1466,7 @@ impl ModelRuntime {
                 Some(&AuthResolutionOverrides {
                     api_key: overrides.api_key.clone(),
                     env: overrides.env.clone(),
-                    ..Default::default()
+                    min_oauth_validity_ms: overrides.min_oauth_validity_ms,
                 }),
             )
             .await
@@ -1454,12 +1474,14 @@ impl ModelRuntime {
 
     /// `getAuth(providerId)` (model-runtime.ts:380 string arm) — provider-level
     /// auth resolution without a model (the llama.cpp extension's
-    /// `modelRegistry.getProviderAuth`, T14 W6b).
+    /// `modelRegistry.getProviderAuth`, T14 W6b). Also used by the auth
+    /// credential-print commands (`rpi auth print-bearer-token`).
     pub async fn get_provider_auth(
         &self,
         provider_id: &str,
+        overrides: Option<&AuthResolutionOverrides>,
     ) -> Result<Option<AuthResult>, ModelsError> {
-        self.models.get_provider_auth(provider_id, None).await
+        self.models.get_provider_auth(provider_id, overrides).await
     }
 
     /// Returns the per-provider credential serialization mutex, creating it
