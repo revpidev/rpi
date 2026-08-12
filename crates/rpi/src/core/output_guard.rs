@@ -22,8 +22,10 @@
 //!
 //! Write-error handling: upstream's chain catch exits the process with code 1
 //! (output-guard.ts:90-92). A library cannot `process::exit`, so rpi records
-//! the first error instead; the mode entry points turn a recorded error into
-//! exit code 1 at the natural end of the run.
+//! the first error instead and fires [`RawStdout::error_notify`]; rpc mode
+//! selects on that notification to break its main loop and exit 1 immediately
+//! (T18b), while print mode maps a recorded error to exit code 1 at the
+//! natural end of the run.
 //!
 //! Intentional differences:
 //! - No `takeOverStdout`/`restoreStdout` (TUI stderr redirection is an
@@ -47,12 +49,16 @@ struct RawStdoutInner {
 #[derive(Clone)]
 pub struct RawStdout {
     inner: Arc<Mutex<RawStdoutInner>>,
+    /// Fired (once, via `notify_one`'s stored permit) when the first
+    /// write/flush error is recorded (T18b); see [`Self::error_notify`].
+    error_notify: Arc<tokio::sync::Notify>,
 }
 
 impl RawStdout {
     pub fn new(out: Box<dyn Write + Send>) -> Self {
         RawStdout {
             inner: Arc::new(Mutex::new(RawStdoutInner { out, error: None })),
+            error_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -71,6 +77,8 @@ impl RawStdout {
         }
         if let Err(error) = inner.out.write_all(text.as_bytes()) {
             inner.error = Some(error);
+            drop(inner);
+            self.error_notify.notify_one();
         }
     }
 
@@ -81,8 +89,20 @@ impl RawStdout {
         if let Err(error) = inner.out.flush() {
             if inner.error.is_none() {
                 inner.error = Some(error);
+                drop(inner);
+                self.error_notify.notify_one();
             }
         }
+    }
+
+    /// Notify handle fired when the first write/flush error is recorded
+    /// (T18b): mode main loops select on it to exit 1 as soon as the write
+    /// path breaks, matching upstream's `process.exit(1)` the moment the
+    /// write chain rejects (output-guard.ts:90-92). `notify_one` stores a
+    /// permit, so a consumer that starts waiting after the error was
+    /// recorded still observes it.
+    pub fn error_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.error_notify.clone()
     }
 
     /// Whether a write/flush has failed (modes map this to exit code 1,
@@ -164,5 +184,18 @@ mod tests {
         raw.write("more\n");
         raw.flush();
         assert!(raw.has_error());
+    }
+
+    #[tokio::test]
+    async fn first_error_fires_error_notify_with_stored_permit() {
+        // T18b: rpc mode's main loop selects on this notification to exit 1
+        // immediately. `notify_one` stores a permit, so a consumer that
+        // starts waiting only after the error was recorded still observes it.
+        let raw = RawStdout::new(Box::new(BrokenPipe));
+        let notify = raw.error_notify();
+        raw.write("boom\n");
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("error notify fires after the first recorded error");
     }
 }

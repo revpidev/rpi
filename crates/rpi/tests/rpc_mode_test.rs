@@ -218,6 +218,38 @@ async fn boot(
     provider_options: FauxProviderOptions,
     responses: Vec<FauxResponseStep>,
 ) -> RpcSession {
+    let (runtime, provider, cwd) = boot_runtime(&tmp, provider_options, responses).await;
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (_read_half, stdin) = tokio::io::split(client_io);
+    let server_io = tokio::io::BufReader::new(server_io);
+    let buf = SharedBuf::default();
+    let writer_buf = buf.clone();
+    let handle =
+        tokio::spawn(async move { run_rpc_mode(runtime, server_io, Box::new(writer_buf)).await });
+
+    RpcSession {
+        provider,
+        tmp,
+        cwd,
+        stdin: Some(stdin),
+        buf,
+        cursor: 0,
+        handle: Some(handle),
+    }
+}
+
+/// Runtime half of [`boot`] (T18 tests that need a custom stdout writer):
+/// real `AgentSessionRuntime` + FauxProvider, in-memory session.
+async fn boot_runtime(
+    tmp: &TempDir,
+    provider_options: FauxProviderOptions,
+    responses: Vec<FauxResponseStep>,
+) -> (
+    rpi::core::agent_session_runtime::AgentSessionRuntime,
+    Arc<FauxProvider>,
+    PathBuf,
+) {
     let cwd = tmp.path().join("cwd");
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&cwd).expect("cwd");
@@ -292,23 +324,7 @@ async fn boot(
     .await
     .expect("create runtime");
 
-    let (client_io, server_io) = tokio::io::duplex(1 << 16);
-    let (_read_half, stdin) = tokio::io::split(client_io);
-    let server_io = tokio::io::BufReader::new(server_io);
-    let buf = SharedBuf::default();
-    let writer_buf = buf.clone();
-    let handle =
-        tokio::spawn(async move { run_rpc_mode(runtime, server_io, Box::new(writer_buf)).await });
-
-    RpcSession {
-        provider,
-        tmp,
-        cwd,
-        stdin: Some(stdin),
-        buf,
-        cursor: 0,
-        handle: Some(handle),
-    }
+    (runtime, provider, cwd)
 }
 
 /// Default boot: two-model catalog, fresh temp dirs.
@@ -1245,4 +1261,87 @@ fn rpi_rpc_bin_end_to_end() {
     assert_eq!(response["command"], "get_state");
     assert_eq!(response["success"], true);
     assert_eq!(response["data"]["model"]["id"], "faux-1");
+}
+
+// ---------------------------------------------------------------------------
+// T18: shutdown timing — write errors and in-flight prompts
+// ---------------------------------------------------------------------------
+
+/// T18b: a broken stdout breaks the input loop immediately with exit code 1
+/// (upstream's write-chain catch exits the moment the write rejects,
+/// output-guard.ts:90-92) instead of running on until stdin EOF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stdout_write_error_exits_1_immediately() {
+    struct FailingWriter;
+    impl Write for FailingWriter {
+        fn write(&mut self, _data: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let tmp = TempDir::new();
+    let (runtime, _provider, _cwd) = boot_runtime(
+        &tmp,
+        FauxProviderOptions {
+            models: Some(default_models()),
+            ..Default::default()
+        },
+        Vec::new(),
+    )
+    .await;
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let (_read_half, mut stdin) = tokio::io::split(client_io);
+    let server_io = tokio::io::BufReader::new(server_io);
+    let handle =
+        tokio::spawn(
+            async move { run_rpc_mode(runtime, server_io, Box::new(FailingWriter)).await },
+        );
+
+    // A command whose response write fails. stdin stays OPEN: the loop must
+    // break on the write-error notification, not on EOF.
+    stdin
+        .write_all(b"{\"id\":\"g1\",\"type\":\"get_state\"}\n")
+        .await
+        .expect("write command");
+    stdin.flush().await.expect("flush command");
+    let code = tokio::time::timeout(Duration::from_secs(15), handle)
+        .await
+        .expect("rpc must exit on a write error even without stdin EOF")
+        .expect("rpc task panicked");
+    assert_eq!(code, 1);
+    drop(stdin);
+}
+
+/// T18a: stdin EOF with a prompt still in flight — shutdown drains the
+/// prompt continuation, so the terminal prompt response lands on the wire
+/// before the mode returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_in_flight_at_eof_still_lands_its_response() {
+    let mut rpc = start_rpc(vec![assistant("Hello from faux!")]).await;
+    rpc.send(&json!({"id": "p1", "type": "prompt", "message": "hi"}))
+        .await;
+    // EOF immediately after the command: the prompt continuation is spawned
+    // by the command task and may still be running when the input loop
+    // breaks; shutdown must wait it out.
+    let code = rpc.close_and_wait().await;
+    assert_eq!(code, 0);
+    let out = String::from_utf8(rpc.buf.bytes()).expect("utf8 output");
+    let response = out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|value| {
+            value.get("type").and_then(Value::as_str) == Some("response")
+                && value.get("id").and_then(Value::as_str) == Some("p1")
+        });
+    assert!(
+        response.is_some(),
+        "prompt response must land before shutdown returns; output:\n{out}"
+    );
 }

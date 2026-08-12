@@ -670,6 +670,12 @@ struct RpcState {
     output: RawStdout,
     /// Shutdown trigger for the main loop.
     shutdown: mpsc::UnboundedSender<i32>,
+    /// In-flight prompt continuations (T18a): the `prompt` command reports
+    /// asynchronously (the response rides the preflight observer), so its
+    /// task spawns outside `command_tasks`; shutdown drains this set after
+    /// the command tasks so a terminal prompt response is never lost when
+    /// stdin EOF arrives with a prompt in flight.
+    prompt_tasks: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
 }
 
 impl RpcState {
@@ -800,7 +806,11 @@ async fn dispatch(
             let output = state.output.clone();
             let response_id = id.clone();
             let prompt_output = state.output.clone();
-            tokio::spawn(async move {
+            // T18a: spawn into the tracked set, not a bare `tokio::spawn` —
+            // shutdown drains it (after dispose has aborted the run) so the
+            // terminal response lands even when stdin EOF cut the run short.
+            // `handle_command` still returns immediately (async acceptance).
+            state.prompt_tasks.lock().await.spawn(async move {
                 let result = session
                     .prompt(
                         &message,
@@ -1227,6 +1237,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
         shutdown_requested: AtomicBool::new(false),
         output: output.clone(),
         shutdown: shutdown_tx,
+        prompt_tasks: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
     });
 
     // `runtimeHost.setRebindSession` (rpc-mode.ts:312-314).
@@ -1273,6 +1284,15 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     // flight (upstream fires `void handleInputLine(line)` per record). The
     // tasks are tracked so shutdown can wait out their responses (below).
     let mut command_tasks = tokio::task::JoinSet::new();
+    // T18b: a recorded stdout write error breaks the loop with exit code 1
+    // the moment it happens (upstream's write-chain catch exits the process
+    // immediately, output-guard.ts:90-92), instead of only surfacing at the
+    // natural end of the run. The pinned `notified()` future keeps the arm
+    // registered across iterations; `notify_one`'s stored permit covers an
+    // error recorded before the first poll.
+    let output_error = output.error_notify();
+    let output_error_notified = output_error.notified();
+    tokio::pin!(output_error_notified);
     let exit_code = loop {
         tokio::select! {
             record = read_record(&mut input) => {
@@ -1315,6 +1335,9 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
             code = shutdown_rx.recv() => {
                 break code.unwrap_or(0);
             }
+            _ = &mut output_error_notified => {
+                break 1;
+            }
         }
     };
 
@@ -1333,6 +1356,7 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     {
         unsubscribe();
     }
+    let prompt_tasks = state.prompt_tasks.clone();
     drop(state);
     drop(runtime);
     drop(initial_session);
@@ -1342,6 +1366,15 @@ pub async fn run_rpc_mode<R: AsyncBufRead + Unpin>(
     // with direct writes the wait must be explicit. Dispose ran first, so
     // in-flight prompts have already been aborted and every task terminates.
     while command_tasks.join_next().await.is_some() {}
+    // T18a: prompt continuations spawn outside `command_tasks` (async
+    // acceptance — `handleCommand` returns `undefined` upstream,
+    // rpc-mode.ts:393-415). Drain them after the command tasks (which spawn
+    // them) so a terminal prompt response is never lost when stdin EOF or a
+    // write error cut the run short.
+    {
+        let mut prompt_tasks = prompt_tasks.lock().await;
+        while prompt_tasks.join_next().await.is_some() {}
+    }
     // `flushRawStdout` (rpc-mode.ts `shutdown`); a recorded write error maps
     // to exit code 1 (upstream exits 1 on write-chain rejection,
     // output-guard.ts:90-92).
