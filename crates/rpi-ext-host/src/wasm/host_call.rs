@@ -379,7 +379,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         }),
                         false,
                     ) {
-                        Ok(result) => result.as_str().map(str::to_owned).unwrap_or_default(),
+                        // markdown-transform.ts:19-23: non-string Ok return
+                        // preserves the current markdown (do not assign).
+                        Ok(result) => result
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| markdown.to_owned()),
                         Err(_) => markdown,
                     }
                 }))
@@ -545,16 +550,20 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .to_owned();
             let forward = state.forward.clone();
             let bus_channel = channel.clone();
-            let _unsubscribe = state.api.events().on(
-                &channel,
-                Arc::new(move |data| {
-                    forward.dispatch_forget(json!({
-                        "kind": "bus",
-                        "channel": bus_channel,
-                        "data": data,
-                    }));
-                }),
-            );
+            let _unsubscribe = state
+                .api
+                .events()
+                .on(
+                    &channel,
+                    Arc::new(move |data| {
+                        forward.dispatch_forget(json!({
+                            "kind": "bus",
+                            "channel": bus_channel,
+                            "data": data,
+                        }));
+                    }),
+                )
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
             // 6ca423447: subscriptions are tracked by the runtime and
             // auto-unsubscribed on `invalidate()`. The handle is dropped —
             // calling it would unsubscribe immediately, and keeping it alive

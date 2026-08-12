@@ -1470,14 +1470,23 @@ impl ModelRuntime {
     }
 
     /// `getCompatibilityRequestConfig(model)` (model-registry.ts:95-100
-    /// @ 4181f66): returns the model's `auth_header` / `headers` fields for
-    /// the no-auth fallback of `getApiKeyAndHeaders`. The `auth_header` flag
-    /// is always `true` for models without explicit configuration
-    /// (model defaults from the catalog don't carry it; only provider
-    /// config-form overrides do, via `ProviderConfigInput.auth_header`).
+    /// @ 4181f66 → resolveCompatibilityRequestConfig provider-composer.ts:
+    /// 543-556): returns the model's `auth_header` / `headers` fields for
+    /// the no-auth fallback of `getApiKeyAndHeaders`. `auth_header` follows
+    /// the same precedence as `compose_provider`: extension
+    /// `ProviderConfigInput.auth_header` → models.json provider
+    /// `auth_header` → default `false`.
     pub fn get_compatibility_request_config(&self, model: &Model) -> CompatibilityRequestConfig {
+        let extension = lock(&self.extension_providers)
+            .get(&model.provider)
+            .cloned();
+        let config = lock(&self.config).get_provider(&model.provider).cloned();
+        let auth_header = extension
+            .and_then(|e| e.auth_header)
+            .or_else(|| config.and_then(|c| c.auth_header))
+            .unwrap_or(false);
         CompatibilityRequestConfig {
-            auth_header: true,
+            auth_header,
             headers: model
                 .headers
                 .as_ref()
@@ -3041,6 +3050,152 @@ mod tests {
             "runtime API key should be set after concurrent operations"
         );
         std::env::remove_var(ENV_KEY);
+    }
+
+    /// get_compatibility_request_config reads auth_header from extension /
+    /// config (M3, provider-composer.ts:543-556) — default is `false`.
+    #[tokio::test]
+    async fn compatibility_config_auth_header_defaults_false() {
+        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        // No extension or models.json override: auth_header must be false,
+        // not the hardcoded true that preceded M3.
+        let model = Model {
+            id: "test-model".to_owned(),
+            name: "Test".to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: "missing-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: Default::default(),
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+        };
+        let compat = runtime.get_compatibility_request_config(&model);
+        assert!(
+            !compat.auth_header,
+            "auth_header defaults to false (was hardcoded true)"
+        );
+    }
+
+    /// get_compatibility_request_config: models.json provider `authHeader: true`
+    /// surfaces in the compat config.
+    #[tokio::test]
+    async fn compatibility_config_auth_header_from_models_json() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "RPI_TEST_COMPAT_MJSON_KEY",
+                "authHeader": true,
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        let model = runtime.get_model("custom", "m1").expect("model m1");
+        let compat = runtime.get_compatibility_request_config(&model);
+        assert!(
+            compat.auth_header,
+            "auth_header true from models.json provider config"
+        );
+    }
+
+    /// get_compatibility_request_config: extension provider `authHeader: true`
+    /// takes precedence and surfaces in the compat config.
+    #[tokio::test]
+    async fn compatibility_config_auth_header_from_extension_provider() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "RPI_TEST_COMPAT_EXT_KEY",
+                "authHeader": false,
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        // Register an extension provider overlay with auth_header: true — this
+        // must win over the models.json false.
+        runtime
+            .register_provider(
+                "custom",
+                ProviderConfigInput {
+                    auth_header: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("register extension overlay");
+        let model = runtime.get_model("custom", "m1").expect("model m1");
+        let compat = runtime.get_compatibility_request_config(&model);
+        assert!(
+            compat.auth_header,
+            "extension auth_header overrides models.json"
+        );
+    }
+
+    /// get_compatibility_request_config: model-level static headers are
+    /// preserved (model-registry.test.ts:168-179).
+    #[tokio::test]
+    async fn compatibility_config_preserves_model_headers() {
+        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("X-Static-Model".to_owned(), "static-value".to_owned());
+        let model = Model {
+            id: "test-model".to_owned(),
+            name: "Test".to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: "missing-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: Default::default(),
+            context_window: 1000,
+            max_tokens: 100,
+            headers: Some(headers),
+            compat: None,
+            sampling_params: None,
+        };
+        let compat = runtime.get_compatibility_request_config(&model);
+        assert_eq!(
+            compat.headers.get("X-Static-Model"),
+            Some(&Some("static-value".to_owned())),
+            "model-level static headers preserved"
+        );
+    }
+
+    /// get_auth fallback to Ok(None) for a missing provider, combined with
+    /// auth_header default false → the no-auth fallback path used by
+    /// getApiKeyAndHeaders (model-registry.ts:67-72). This mirrors the
+    /// upstream assertion: `{ ok: true, headers }` with no apiKey key.
+    #[tokio::test]
+    async fn get_auth_returns_none_for_missing_provider() {
+        let (_tmp, runtime) = runtime_with_models_json(r#"{"providers": {}}"#).await;
+        let model = Model {
+            id: "test-model".to_owned(),
+            name: "Test".to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: "missing-provider".to_owned(),
+            base_url: String::new(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![],
+            cost: Default::default(),
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+        };
+        let auth = runtime.get_auth(&model, None).await.unwrap();
+        assert!(auth.is_none(), "missing provider → Ok(None)");
+        let compat = runtime.get_compatibility_request_config(&model);
+        assert!(!compat.auth_header, "default auth_header false");
     }
 
     /// Minimal model fixture for the 7027 regression test (same shape as the

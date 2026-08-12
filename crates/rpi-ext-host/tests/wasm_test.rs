@@ -527,3 +527,73 @@ async fn wasm_blocking_render_roundtrip_times_out_when_guest_busy() {
     }
     assert!(resumed.is_ok(), "guest resumes after the action resolves");
 }
+
+// ============================================================================
+// T27.1: markdown transformer non-string return preserves content
+// (markdown-transform.ts:19-23)
+// ============================================================================
+
+/// Guest that registers a markdown transformer on init. For every dispatch
+/// (including `markdownTransform`), returns `{"ok":true}` — a non-string
+/// JSON value. The host's transformer closure must preserve the original
+/// markdown, not replace it with an empty string.
+const MD_TRANSFORM_GUEST_WAT: &str = r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $pack (param $ptr i32) (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+      (i64.extend_i32_u (call $strlen (local.get $ptr)))))
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func (export "rpi_extension_init") (result i64)
+    (drop (call $host_call (i32.const 16) (call $strlen (i32.const 16))))
+    (return (call $pack (i32.const 512))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (return (call $pack (i32.const 1024))))
+  (data (i32.const 16) "{\"call\":\"registerMarkdownTransformer\",\"args\":{}}\00")
+  (data (i32.const 512) "{\"ok\":true}\00")
+  (data (i32.const 1024) "{\"ok\":true}\00")
+)
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t271_markdown_transformer_non_string_return_preserves_content() {
+    let tmp = TempDir::new("md-transform");
+    let wasm = tmp.write_guest(
+        "md-transform",
+        MD_TRANSFORM_GUEST_WAT,
+        Some(r#"{"name":"md-transform","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["ui"],"rpiAbi":1}"#),
+    );
+    let (host, errors) = host_loading(&[wasm]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let extension = host.core().extensions()[0].clone();
+    let transformer = extension
+        .markdown_transformer()
+        .expect("markdown transformer registered");
+
+    // The guest returns {"ok":true} for every dispatch — a non-string value.
+    // markdown-transform.ts:19-23: `if (typeof transformed === "string")`
+    // must skip the assignment and preserve the input.
+    let input = "# Hello World\n\nThis is original content.".to_owned();
+    let result = transformer(input.clone(), Default::default());
+    assert_eq!(
+        result, input,
+        "non-string return must preserve original markdown (was clearing to empty string)"
+    );
+}

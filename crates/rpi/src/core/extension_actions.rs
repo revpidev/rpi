@@ -345,9 +345,10 @@ impl HostActions for SessionHostActions {
     }
 
     /// `ctx.modelRegistry.getApiKeyAndHeaders(model)` (model-registry.ts:64-93
-    /// @ 4181f66). **#7030**: null header deletion markers MUST pass through
-    /// unchanged — we serialize `AuthResult` without stripping `None`/`null`
-    /// from the `ProviderHeaders` map.
+    /// @ 4181f66). Aligns with upstream key-omission semantics: JS
+    /// `JSON.stringify` drops `undefined` keys, so `apiKey`/`headers`/`baseUrl`
+    /// /`env` are each omitted when absent. **#7030**: null header deletion
+    /// markers inside the headers map still serialize as JSON `null`.
     async fn get_api_key_and_headers(&self, model: Value) -> Value {
         let Some(session) = self.session() else {
             return serde_json::json!({"ok": false, "error": "session is gone"});
@@ -362,17 +363,22 @@ impl HostActions for SessionHostActions {
         match runtime.get_auth(&model, None).await {
             Ok(Some(auth_result)) => {
                 let auth = &auth_result.auth;
-                // #7030: Preserve null header deletion markers exactly.
-                // ProviderHeaders = HashMap<String, Option<String>>; None
-                // values are the deletion markers — they must serialize as
-                // JSON `null`, not be stripped.
-                let headers_map: std::collections::HashMap<String, Option<String>> =
-                    auth.headers.clone().unwrap_or_default();
-                let mut result = serde_json::json!({
-                    "ok": true,
-                    "apiKey": auth.api_key,
-                    "headers": headers_map,
-                });
+                // model-registry.ts:74-80: success branch emits `{ ok, apiKey,
+                // headers, baseUrl?, env }` but JS `JSON.stringify` omits
+                // `undefined` keys — so apiKey/headers/baseUrl/env are each
+                // omitted when absent. #7030: null header deletion markers
+                // inside the headers map are still serialized as `null`.
+                let mut result = serde_json::json!({"ok": true});
+                if let Some(api_key) = &auth.api_key {
+                    result["apiKey"] = serde_json::json!(api_key);
+                }
+                if let Some(headers) = &auth.headers {
+                    if !headers.is_empty() {
+                        let headers_map: std::collections::HashMap<String, Option<String>> =
+                            headers.clone();
+                        result["headers"] = serde_json::json!(headers_map);
+                    }
+                }
                 if let Some(base_url) = &auth.base_url {
                     result["baseUrl"] = serde_json::json!(base_url);
                 }
@@ -387,14 +393,15 @@ impl HostActions for SessionHostActions {
                 if compat.auth_header {
                     serde_json::json!({"ok": false, "error": format!("No API key found for \"{}\"", model.provider)})
                 } else {
-                    // Return headers without API key (extension can still use
-                    // provider-specific headers).
-                    let headers_map: std::collections::HashMap<String, Option<String>> = compat
-                        .headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    serde_json::json!({"ok": true, "headers": headers_map})
+                    // model-registry.ts:72: `{ ok: true, headers }` — `headers`
+                    // is omitted when the map is empty (JS `undefined`).
+                    if compat.headers.is_empty() {
+                        serde_json::json!({"ok": true})
+                    } else {
+                        let headers_map: std::collections::HashMap<String, Option<String>> =
+                            compat.headers.clone();
+                        serde_json::json!({"ok": true, "headers": headers_map})
+                    }
                 }
             }
             Err(error) => serde_json::json!({"ok": false, "error": error.message}),
