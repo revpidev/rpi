@@ -117,9 +117,12 @@ pub fn requires_tool_call_id(model_id: &str) -> bool {
 /// `getGeminiMajorVersion` (`/^gemini(?:-live)?-(\d+)/` on the lowercase id).
 fn get_gemini_major_version(model_id: &str) -> Option<u32> {
     let id = model_id.to_lowercase();
+    // Order matters: "gemini-live-" must be tried before "gemini-",
+    // otherwise "gemini-live-3-001" is stripped to "live-3-001" and the
+    // version parse fails (upstream regex `/^gemini(?:-live)?-(\d+)/`).
     let rest = id
-        .strip_prefix("gemini-")
-        .or_else(|| id.strip_prefix("gemini-live-"))?;
+        .strip_prefix("gemini-live-")
+        .or_else(|| id.strip_prefix("gemini-"))?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
         return None;
@@ -558,4 +561,42 @@ where
         options.signal.as_ref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `gemini-live-*` must parse as Gemini versions: the `gemini-live-`
+    /// prefix is tried before `gemini-` (upstream
+    /// `/^gemini(?:-live)?-(\d+)/` on google-shared.ts:81).
+    #[test]
+    fn get_gemini_major_version_live_prefix() {
+        assert_eq!(get_gemini_major_version("gemini-live-3-001"), Some(3));
+        assert_eq!(get_gemini_major_version("gemini-live-2-001"), Some(2));
+    }
+
+    /// Fractional versions parse as their leading major digits
+    /// (`gemini-2.5-pro` → 2), anchoring the existing behavior.
+    #[test]
+    fn get_gemini_major_version_plain_prefix() {
+        assert_eq!(get_gemini_major_version("gemini-2.5-pro"), Some(2));
+        assert_eq!(get_gemini_major_version("gemini-3-pro"), Some(3));
+    }
+
+    #[test]
+    fn get_gemini_major_version_non_gemini() {
+        assert_eq!(get_gemini_major_version("claude-sonnet"), None);
+        assert_eq!(get_gemini_major_version("gemini-"), None);
+        assert_eq!(get_gemini_major_version("gemini-live-"), None);
+    }
+
+    /// `requires_tool_call_id`: gemini-live-3+ requires tool call IDs
+    /// (bug: wrong prefix order made this return false).
+    #[test]
+    fn requires_tool_call_id_live_gemini3() {
+        assert!(requires_tool_call_id("gemini-live-3-001"));
+        assert!(!requires_tool_call_id("gemini-live-2-001"));
+        assert!(!requires_tool_call_id("gemini-2.5-pro"));
+    }
 }

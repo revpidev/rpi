@@ -1,11 +1,12 @@
-//! Port of `packages/ai/src/image-models.generated.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/ai/src/image-models.generated.ts` @ pi 0.84.0 (a5f43bf8a).
 //!
 //! The image-generation catalog (upstream `IMAGE_MODELS`), transcribed
 //! structure-identically from the checked-in TS literal: one provider
-//! (`openrouter`) with 40 image models. Upstream generates this file via
+//! (`openrouter`). Upstream generates this file via
 //! `scripts/generate-image-models.ts` (a dev-time OpenRouter catalog
 //! fetch); the Rust side keeps the same checked-in-literal approach and
-//! does not port the script (deviation D-036).
+//! does not port the script (deviation D-037). The model count is not
+//! hardcoded — it is verified by the image catalog parity test.
 
 use std::sync::OnceLock;
 
@@ -130,7 +131,7 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                             input: 0.3,
                             output: 2.5,
                             cache_read: 0.03,
-                            cache_write: 0.08333333333333334,
+                            cache_write: 0.0833333333333333,
                         },
                         tiers: None,
                     },
@@ -479,6 +480,44 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                     headers: None,
                 },
                 ImagesModel {
+                    id: "qwen/qwen-image-3".to_owned(),
+                    name: "Qwen: Qwen Image 3".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "qwen/qwen-image-3-pro".to_owned(),
+                    name: "Qwen: Qwen Image 3 Pro".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
                     id: "recraft/recraft-v3".to_owned(),
                     name: "Recraft: Recraft V3".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
@@ -765,7 +804,7 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 },
                 ImagesModel {
                     id: "x-ai/grok-imagine-image-quality".to_owned(),
-                    name: "xAI: Grok Imagine Image Quality".to_owned(),
+                    name: "SpaceXAI: Grok Imagine Image Quality".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
