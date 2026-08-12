@@ -10,10 +10,11 @@
 //! 3. If provider not found → `not_ready` (`provider_not_found`).
 //! 4. `checkAuth(provider)` → `None` → `not_ready` (`credentials_not_configured`).
 //! 5. If `refresh` and `getAuth(provider)` returns `None` → `not_ready`
-//!    (`credentials_not_configured`).
+//!    (`credentials_not_configured`); if `getAuth` *throws* → `invalid`
+//!    (`invalid_state`) (the try/catch covers steps 4–5).
 //! 6. Otherwise → `ready` with `authType`.
 //!
-//! Any thrown error → `invalid` (`invalid_state`).
+//! Any thrown error from `checkAuth`/`getAuth` → `invalid` (`invalid_state`).
 //!
 //! Intentional differences: none.
 
@@ -139,21 +140,34 @@ pub async fn check_provider_auth(
     }
 
     // Step 4-6: check auth, optionally refresh (auth-check.ts:43-52).
+    // Upstream wraps the whole block in try/catch: any thrown error →
+    // `invalid/invalid_state`, only a falsy return value → `not_ready`.
     match model_runtime.check_auth(&provider).await {
         Ok(Some(auth)) => {
             // Step 5: if refresh, verify getAuth succeeds (auth-check.ts:46-48).
-            if refresh
-                && model_runtime
-                    .get_provider_auth(&provider, None)
-                    .await
-                    .is_err()
-            {
-                return Ok(AuthCheckResult {
-                    status: AuthCheckStatus::NotReady,
-                    provider,
-                    reason: Some(AuthCheckReason::CredentialsNotConfigured),
-                    auth_type: None,
-                });
+            // Upstream: `!(await modelRuntime.getAuth(provider))` — a *thrown*
+            // error propagates to the catch (→ invalid), only a *falsy*
+            // (None) return maps to not_ready/credentials_not_configured.
+            if refresh {
+                match model_runtime.get_provider_auth(&provider, None).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        return Ok(AuthCheckResult {
+                            status: AuthCheckStatus::NotReady,
+                            provider,
+                            reason: Some(AuthCheckReason::CredentialsNotConfigured),
+                            auth_type: None,
+                        });
+                    }
+                    Err(_) => {
+                        return Ok(AuthCheckResult {
+                            status: AuthCheckStatus::Invalid,
+                            provider,
+                            reason: Some(AuthCheckReason::InvalidState),
+                            auth_type: None,
+                        });
+                    }
+                }
             }
             // Step 6: ready (auth-check.ts:49).
             let auth_type = match auth.kind {

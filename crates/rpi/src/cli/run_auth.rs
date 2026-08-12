@@ -63,7 +63,9 @@ pub async fn run_auth(args: &[String]) -> Option<i32> {
         return Some(1);
     }
 
-    // Step 5: diagnostics (main.ts:165-167).
+    // Step 5: diagnostics (main.ts:165-167 + 212).
+    // Upstream throws diagnostics into the outer catch — exit code is
+    // command.kind === "check" ? 2 : 1.
     if !parsed.diagnostics.is_empty() {
         let message = parsed
             .diagnostics
@@ -72,7 +74,11 @@ pub async fn run_auth(args: &[String]) -> Option<i32> {
             .collect::<Vec<_>>()
             .join("\n");
         eprintln!("Error: {message}");
-        return Some(1);
+        return Some(if command.kind == AuthCommandKind::Check {
+            2
+        } else {
+            1
+        });
     }
 
     // Step 6: dispatch by kind (main.ts:168-213).
@@ -171,12 +177,13 @@ async fn run_check(parsed: &crate::cli::args::Args, command: &AuthCommand) -> Op
                             None,
                         ),
                         Err(_) => (
+                            // main.ts:197-203: inner catch — any thrown error
+                            // (read failure, OAuth refresh failure, …) maps to
+                            // invalid/invalid_state (exit 2), NOT not_ready.
                             AuthCheckResult {
-                                status: super::auth_check::AuthCheckStatus::NotReady,
+                                status: super::auth_check::AuthCheckStatus::Invalid,
                                 provider: result.provider.clone(),
-                                reason: Some(
-                                    super::auth_check::AuthCheckReason::CredentialNotAvailable,
-                                ),
+                                reason: Some(super::auth_check::AuthCheckReason::InvalidState),
                                 auth_type: None,
                             },
                             None,

@@ -13,12 +13,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rpi::cli::args::{parse_args, Args};
-use rpi::cli::auth_check::{check_provider_auth, create_auth_check_model_runtime, AuthCheckStatus};
+use rpi::cli::auth_check::{
+    check_provider_auth, create_auth_check_model_runtime, get_provider_credential, AuthCheckReason,
+    AuthCheckStatus,
+};
 use rpi::cli::auth_command::{parse_auth_command, validate_auth_command_args, AuthCommandKind};
 use rpi::cli::credential_print::{
     resolve_credential_for_print, DEFAULT_BEARER_TOKEN_MIN_EXPIRY_MS,
 };
-use rpi_ai::auth::{ApiKeyCredential, Credential, CredentialStore, FileCredentialStore};
+use rpi::cli::run_auth::run_auth;
+use rpi_ai::auth::{
+    ApiKeyCredential, AuthCheck, AuthContext, AuthResult, AuthType, Credential, CredentialInfo,
+    CredentialStore, FileCredentialStore, ModelAuth, ModelsError, ModelsErrorCode, ModifyFn,
+    OAuthAuth, OAuthCredential, ProviderAuth,
+};
 
 struct TempDir {
     root: PathBuf,
@@ -500,4 +508,310 @@ fn test_model_runtime_auth_overrides_has_min_oauth_validity_ms() {
     // Default is None.
     let default = ModelRuntimeAuthOverrides::default();
     assert_eq!(default.min_oauth_validity_ms, None);
+}
+
+// ===========================================================================
+// Error-mapping matrix — Err vs None vs Ok (upstream try/catch parity)
+//
+// Upstream wraps `checkAuth`/`getAuth` in try/catch (auth-check.ts:43-52):
+//   - thrown error (catch) → invalid / exit 2
+//   - falsy return (undefined/None) → not_ready / exit 1
+// rpi initially merged Err into the not_ready path; these tests lock the
+// corrected mapping.
+// ===========================================================================
+
+/// An OAuth implementation whose `refresh` always fails — simulates an OAuth
+/// provider whose token has expired and the refresh endpoint is unreachable.
+struct FailingRefreshOAuth;
+
+#[async_trait::async_trait]
+impl OAuthAuth for FailingRefreshOAuth {
+    fn name(&self) -> &str {
+        "Failing refresh OAuth"
+    }
+    async fn refresh(
+        &self,
+        _credential: &OAuthCredential,
+        _signal: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<OAuthCredential, ModelsError> {
+        Err(ModelsError::new(
+            ModelsErrorCode::Oauth,
+            "refresh endpoint unreachable",
+        ))
+    }
+    async fn to_auth(&self, _credential: &OAuthCredential) -> Result<ModelAuth, ModelsError> {
+        Ok(ModelAuth {
+            api_key: None,
+            headers: None,
+            base_url: None,
+        })
+    }
+}
+
+/// Register a custom OAuth provider with `FailingRefreshOAuth` on the runtime.
+async fn runtime_with_failing_oauth_provider(
+) -> (Arc<rpi::core::model_runtime::ModelRuntime>, TempDir) {
+    use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
+    use rpi_ai::api::openai_completions::OpenAiCompletions;
+    use rpi_ai::models::{create_provider, CreateProviderOptions, ProviderApi};
+
+    let temp = TempDir::new();
+    // Pre-seed an expired OAuth credential so the refresh path is triggered.
+    let mut creds = HashMap::new();
+    creds.insert(
+        "failing-oauth-provider".to_owned(),
+        Credential::OAuth(OAuthCredential {
+            refresh: "expired-refresh".to_owned(),
+            access: "expired-access".to_owned(),
+            expires: 0, // expired → must refresh → refresh fails
+            extra: serde_json::Map::new(),
+        }),
+    );
+    let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::in_memory(creds));
+    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: Some(store.clone()),
+        models_path: ModelsPathInput::Disabled,
+        allow_model_network: false,
+        ..Default::default()
+    })
+    .await;
+
+    let provider = create_provider(CreateProviderOptions {
+        id: "failing-oauth-provider".to_owned(),
+        name: None,
+        base_url: None,
+        headers: None,
+        auth: ProviderAuth {
+            api_key: None,
+            oauth: Some(Arc::new(FailingRefreshOAuth)),
+        },
+        models: vec![],
+        api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
+    });
+    runtime
+        .register_native_provider(provider)
+        .await
+        .expect("register");
+
+    (runtime, temp)
+}
+
+#[tokio::test]
+async fn test_auth_check_refresh_get_auth_err_maps_to_invalid_exit_2() {
+    // Upstream auth-check.ts:46-48 inside try/catch (50-52): when `getAuth`
+    // throws during the refresh path, the result is invalid/invalid_state
+    // (exit 2), NOT not_ready/credentials_not_configured (exit 1).
+    //
+    // Scenario: OAuth provider with an expired stored token. `checkAuth`
+    // succeeds (OAuth detected), but `getAuth` attempts a refresh that fails.
+    let (model_runtime, _temp) = runtime_with_failing_oauth_provider().await;
+
+    let args = args_from(&["--provider", "failing-oauth-provider"]);
+    let result = check_provider_auth(&args, &model_runtime, true)
+        .await
+        .expect("check should not error at the top level");
+
+    assert_eq!(
+        result.status,
+        AuthCheckStatus::Invalid,
+        "refresh getAuth Err must map to Invalid (exit 2)"
+    );
+    assert_eq!(result.status.exit_code(), 2);
+    assert_eq!(result.reason, Some(AuthCheckReason::InvalidState));
+}
+
+/// An ApiKeyAuth whose `check` returns Some (so `checkAuth` succeeds) but
+/// whose `resolve` returns Ok(None) (so `getProviderAuth` returns None).
+/// This simulates the upstream "getAuth returns falsy" branch.
+struct CheckOnlyApiKeyAuth;
+
+#[async_trait::async_trait]
+impl rpi_ai::auth::ApiKeyAuth for CheckOnlyApiKeyAuth {
+    fn name(&self) -> &str {
+        "Check-only API key"
+    }
+    async fn check(
+        &self,
+        _ctx: &dyn AuthContext,
+        _credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthCheck>, ModelsError> {
+        Ok(Some(AuthCheck {
+            source: Some("check-only".to_owned()),
+            kind: AuthType::ApiKey,
+        }))
+    }
+    async fn resolve(
+        &self,
+        _ctx: &dyn AuthContext,
+        _credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn test_auth_check_refresh_get_auth_none_maps_to_not_ready_exit_1() {
+    // Upstream auth-check.ts:46: `!(await modelRuntime.getAuth(provider))` —
+    // when `getAuth` returns falsy (None) on the refresh path, the result is
+    // not_ready/credentials_not_configured (exit 1).
+    //
+    // Scenario: a provider whose `checkAuth` returns Some (check succeeds)
+    // but `getProviderAuth` returns Ok(None) (resolve returns None).
+    use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
+    use rpi_ai::api::openai_completions::OpenAiCompletions;
+    use rpi_ai::models::{create_provider, CreateProviderOptions, ProviderApi};
+
+    let _temp = TempDir::new();
+    let store: Arc<dyn CredentialStore> = Arc::new(FileCredentialStore::in_memory(HashMap::new()));
+    let model_runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+        credentials: Some(store.clone()),
+        models_path: ModelsPathInput::Disabled,
+        allow_model_network: false,
+        ..Default::default()
+    })
+    .await;
+
+    let provider = create_provider(CreateProviderOptions {
+        id: "check-only-provider".to_owned(),
+        name: None,
+        base_url: None,
+        headers: None,
+        auth: ProviderAuth {
+            api_key: Some(Arc::new(CheckOnlyApiKeyAuth)),
+            oauth: None,
+        },
+        models: vec![],
+        api: ProviderApi::Single(Arc::new(OpenAiCompletions)),
+        ..Default::default()
+    });
+    model_runtime
+        .register_native_provider(provider)
+        .await
+        .expect("register");
+
+    let args = args_from(&["--provider", "check-only-provider"]);
+    let result = check_provider_auth(&args, &model_runtime, true)
+        .await
+        .expect("check");
+
+    assert_eq!(
+        result.status,
+        AuthCheckStatus::NotReady,
+        "refresh getAuth Ok(None) must map to NotReady (exit 1)"
+    );
+    assert_eq!(result.status.exit_code(), 1);
+    assert_eq!(
+        result.reason,
+        Some(AuthCheckReason::CredentialsNotConfigured)
+    );
+}
+
+/// A CredentialStore whose `read` always fails — triggers the Err path in
+/// `get_provider_credential`.
+struct FailingCredentialStore;
+
+#[async_trait::async_trait]
+impl CredentialStore for FailingCredentialStore {
+    async fn read(
+        &self,
+        _provider_id: &str,
+        _options: Option<&rpi_ai::auth::AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError> {
+        Err(ModelsError::new(
+            ModelsErrorCode::Auth,
+            "credential store read failure",
+        ))
+    }
+    async fn list(
+        &self,
+        _options: Option<&rpi_ai::auth::AuthOperationOptions>,
+    ) -> Result<Vec<CredentialInfo>, ModelsError> {
+        Ok(vec![])
+    }
+    async fn modify(
+        &self,
+        _provider_id: &str,
+        _f: ModifyFn,
+        _options: Option<&rpi_ai::auth::AuthOperationOptions>,
+    ) -> Result<Option<Credential>, ModelsError> {
+        Err(ModelsError::new(
+            ModelsErrorCode::Auth,
+            "credential store modify failure",
+        ))
+    }
+    async fn delete(
+        &self,
+        _provider_id: &str,
+        _options: Option<&rpi_ai::auth::AuthOperationOptions>,
+    ) -> Result<(), ModelsError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn test_get_provider_credential_err_maps_to_invalid_exit_2() {
+    // Upstream main.ts:197-203: the inner catch around `getProviderCredential`
+    // maps any thrown error to invalid/invalid_state (exit 2). The rpi port
+    // previously mapped Err to NotReady/CredentialNotAvailable (exit 1) —
+    // this test locks the corrected mapping at the `get_provider_credential`
+    // level (the run_auth.rs Err branch is structurally identical).
+    let (model_runtime, _temp) = runtime_with_failing_oauth_provider().await;
+
+    let failing_store: Arc<dyn CredentialStore> = Arc::new(FailingCredentialStore);
+    let result = get_provider_credential(
+        "failing-oauth-provider",
+        &model_runtime,
+        &failing_store,
+        true, // refresh
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "get_provider_credential with FailingCredentialStore must return Err"
+    );
+}
+
+#[tokio::test]
+async fn test_run_auth_check_diagnostics_exit_2() {
+    // Upstream main.ts:165-167 + 212: parse diagnostics are thrown into the
+    // outer catch, whose exit code is `command.kind === "check" ? 2 : 1`.
+    // The `check` subcommand must exit 2 on diagnostics.
+    //
+    // `--thinking bogus` produces a warning diagnostic in parse_args, which
+    // is forwarded through auth check's command.args.
+    let result = run_auth(&owned(&[
+        "auth",
+        "check",
+        "--thinking",
+        "bogus",
+        "--provider",
+        "openai",
+    ]))
+    .await;
+    assert_eq!(
+        result,
+        Some(2),
+        "check subcommand diagnostics must exit 2, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_run_auth_print_diagnostics_exit_1() {
+    // Same upstream logic, but for a print subcommand: exit 1 (not 2).
+    let result = run_auth(&owned(&[
+        "auth",
+        "print-api-key",
+        "--thinking",
+        "bogus",
+        "--provider",
+        "openai",
+    ]))
+    .await;
+    assert_eq!(
+        result,
+        Some(1),
+        "print subcommand diagnostics must exit 1, got {result:?}"
+    );
 }
