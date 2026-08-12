@@ -337,33 +337,24 @@ const THINKING_LEVELS: [ThinkingLevel; 5] = [
 /// grep.ts:132, find.ts:118, ls.ts:104). The bash guideline follows the
 /// `RPI_` env rename (ADR-0001).
 fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
-    match name {
-        "read" => Some("Read file contents"),
-        "bash" => Some("Execute bash commands (ls, grep, find, etc.)"),
-        "edit" => Some(
-            "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
-        ),
-        "write" => Some("Create or overwrite files"),
-        "grep" => Some("Search file contents for patterns (respects .gitignore)"),
-        "find" => Some("Find files by glob pattern (respects .gitignore)"),
-        "ls" => Some("List directory contents"),
-        _ => None,
-    }
+    Some(match name {
+        "read" => crate::tools::READ_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "bash" => crate::tools::BASH_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "edit" => crate::tools::EDIT_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "write" => crate::tools::WRITE_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "grep" => crate::tools::GREP_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "find" => crate::tools::FIND_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        "ls" => crate::tools::LS_TOOL_SYSTEM_PROMPT_CONTRIBUTION.snippet,
+        _ => return None,
+    })
 }
 
 fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
     match name {
-        "read" => &["Use read to examine files instead of cat or sed."],
-        // Softened from imperative to descriptive (upstream 4e64de695 / #7128,
-        // bash.ts:47): "You can inspect PI_* environment variables ...".
-        "bash" => &["You can inspect RPI_* environment variables for current model and session details."],
-        "edit" => &[
-            "Use edit for precise changes (edits[].oldText must match exactly)",
-            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
-            "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
-            "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-        ],
-        "write" => &["Use write only for new files or complete rewrites."],
+        "read" => crate::tools::READ_TOOL_SYSTEM_PROMPT_CONTRIBUTION.guidelines,
+        "bash" => crate::tools::BASH_TOOL_SYSTEM_PROMPT_CONTRIBUTION.guidelines,
+        "edit" => crate::tools::EDIT_TOOL_SYSTEM_PROMPT_CONTRIBUTION.guidelines,
+        "write" => crate::tools::WRITE_TOOL_SYSTEM_PROMPT_CONTRIBUTION.guidelines,
         _ => &[],
     }
 }

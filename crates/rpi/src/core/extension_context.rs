@@ -131,6 +131,60 @@ impl ContextActions for SessionContextActions {
             .map(|session| session.system_prompt_options_json())
             .unwrap_or_default()
     }
+
+    // -- v0.11 additions (types.ts @ 4181f66) -------------------------------
+
+    /// `getScopedModels` (runner.ts:706-709 @ 4181f66): read-only snapshot
+    /// of the resolved model scope. The session holds `scoped_models:
+    /// Vec<ScopedModel>` from the model resolver.
+    fn get_scoped_models(&self) -> Vec<rpi_ext_host::types::ScopedModel> {
+        self.session()
+            .map(|session| {
+                session
+                    .scoped_models()
+                    .iter()
+                    .map(|sm| rpi_ext_host::types::ScopedModel {
+                        model: serde_json::to_value(&sm.model).unwrap_or(Value::Null),
+                        thinking_level: sm
+                            .thinking_level
+                            .as_ref()
+                            .and_then(|tl| serde_json::to_value(tl).ok())
+                            .and_then(|v| v.as_str().map(str::to_owned)),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `getSystemPromptSource` (resource-loader.ts:327-329, T24).
+    fn get_system_prompt_source_path(&self) -> Option<String> {
+        self.session().and_then(|session| {
+            session
+                .resource_loader()
+                .lock()
+                .ok()?
+                .get_system_prompt_source()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
+    }
+
+    /// `getAppendSystemPromptSources` (resource-loader.ts:335-337, T24).
+    fn get_append_system_prompt_source_paths(&self) -> Vec<String> {
+        self.session()
+            .and_then(|session| {
+                Some(
+                    session
+                        .resource_loader()
+                        .lock()
+                        .ok()?
+                        .get_append_system_prompt_sources()
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// `ExtensionCommandContextActions` backed by the shared runtime handle

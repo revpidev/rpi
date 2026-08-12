@@ -371,6 +371,15 @@ pub struct ModelRuntimeAuthOverrides {
     pub min_oauth_validity_ms: Option<u64>,
 }
 
+/// `CompatibilityRequestConfig` (model-registry.ts:95-100 @ 4181f66) —
+/// the model's `authHeader` / `headers` fields, used by the no-auth fallback
+/// branch of `getApiKeyAndHeaders`.
+#[derive(Debug, Clone, Default)]
+pub struct CompatibilityRequestConfig {
+    pub auth_header: bool,
+    pub headers: std::collections::HashMap<String, Option<String>>,
+}
+
 // ============================================================================
 // ModelRuntime
 // ============================================================================
@@ -1448,6 +1457,37 @@ impl ModelRuntime {
         read(&self.snapshot)
             .configured_providers
             .contains(provider_id)
+    }
+
+    /// `find(provider, modelId)` (model-registry.ts:70-72 @ 4181f66):
+    /// provider + model-id lookup within the available snapshot.
+    pub fn find_model(&self, provider: &str, model_id: &str) -> Option<Model> {
+        read(&self.snapshot)
+            .available
+            .iter()
+            .find(|model| model.provider == provider && model.id == model_id)
+            .cloned()
+    }
+
+    /// `getCompatibilityRequestConfig(model)` (model-registry.ts:95-100
+    /// @ 4181f66): returns the model's `auth_header` / `headers` fields for
+    /// the no-auth fallback of `getApiKeyAndHeaders`. The `auth_header` flag
+    /// is always `true` for models without explicit configuration
+    /// (model defaults from the catalog don't carry it; only provider
+    /// config-form overrides do, via `ProviderConfigInput.auth_header`).
+    pub fn get_compatibility_request_config(&self, model: &Model) -> CompatibilityRequestConfig {
+        CompatibilityRequestConfig {
+            auth_header: true,
+            headers: model
+                .headers
+                .as_ref()
+                .map(|h| {
+                    h.iter()
+                        .map(|(k, v)| (k.clone(), Some(v.clone())))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
     }
 
     /// `getAuth(model, overrides)` (model-runtime.ts:374-396). Provider-level

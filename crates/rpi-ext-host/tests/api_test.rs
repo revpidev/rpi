@@ -143,6 +143,40 @@ impl HostActions for MockActions {
     }
 
     async fn unregister_provider(&self, _name: &str) {}
+
+    async fn model_registry_complete(
+        &self,
+        _model: Value,
+        _context: Value,
+        _options: Option<Value>,
+    ) -> Option<Value> {
+        None
+    }
+
+    fn model_registry_find(&self, _provider: &str, _model_id: &str) -> Option<Value> {
+        None
+    }
+
+    fn model_registry_has_configured_auth(&self, _provider_id: &str) -> bool {
+        false
+    }
+
+    async fn get_api_key_and_headers(&self, _model: Value) -> Value {
+        serde_json::json!({"ok": false, "error": "not configured"})
+    }
+
+    async fn set_runtime_api_key(
+        &self,
+        _provider_id: &str,
+        _api_key: &str,
+        _options: Option<rpi_ext_host::types::AuthOperationOptions>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn remove_runtime_api_key(&self, _provider_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn inline_ext(
@@ -680,4 +714,136 @@ fn api_invalidate_first_message_wins_for_unsubscribe_drain() {
     runtime.invalidate(Some("second".to_owned()));
     assert_eq!(*count.lock().unwrap(), 1, "handler ran exactly once");
     assert!(runtime.is_stale());
+}
+
+// ===========================================================================
+// v0.11 additions: ToolCallEventResult.terminate, registerMarkdownTransformer,
+// scoped_models, model_registry, #7030 null passthrough
+// ===========================================================================
+
+#[test]
+fn tool_call_event_result_has_terminate_field() {
+    // ToolCallEventResult must serialize/deserialize with `terminate` field
+    // (types.ts:1071-1080 @ 4181f66, #7715).
+    let result = ext::ToolCallEventResult {
+        block: Some(true),
+        reason: Some("blocked".to_owned()),
+        terminate: Some(true),
+    };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["block"], true);
+    assert_eq!(json["reason"], "blocked");
+    assert_eq!(json["terminate"], true);
+
+    // Round-trip.
+    let back: ext::ToolCallEventResult = serde_json::from_value(json).unwrap();
+    assert_eq!(back.terminate, Some(true));
+}
+
+#[test]
+fn tool_call_event_result_terminate_defaults_to_none() {
+    // Missing `terminate` field deserializes to None.
+    let json = json!({"block": true, "reason": "blocked"});
+    let result: ext::ToolCallEventResult = serde_json::from_value(json).unwrap();
+    assert_eq!(result.terminate, None);
+}
+
+#[test]
+fn register_markdown_transformer_via_host() {
+    // registerMarkdownTransformer (loader.ts:309-312 @ 4181f66): one per
+    // extension, last registration wins. Tested at the LoadedExtension level.
+    let extension = Arc::new(rpi_ext_host::api::LoadedExtension::new(
+        "<md-ext>",
+        "/test-cwd",
+    ));
+    let transformer: Arc<dyn Fn(String, ext::MarkdownTransformContext) -> String + Send + Sync> =
+        Arc::new(|md, _| format!("transformed:{md}"));
+    extension.set_markdown_transformer(transformer);
+    assert!(extension.markdown_transformer().is_some());
+
+    // Re-register: last wins.
+    let transformer2: Arc<dyn Fn(String, ext::MarkdownTransformContext) -> String + Send + Sync> =
+        Arc::new(|md, _| format!("new:{md}"));
+    extension.set_markdown_transformer(transformer2);
+    let stored = extension.markdown_transformer().expect("transformer set");
+    assert_eq!(stored("hello".to_owned(), Default::default()), "new:hello");
+}
+
+#[test]
+fn scoped_model_serializes_with_camel_case() {
+    let model = json!({"id": "claude-3.5-sonnet", "provider": "anthropic"});
+    let scoped = ext::ScopedModel {
+        model,
+        thinking_level: Some("high".to_owned()),
+    };
+    let json_val = serde_json::to_value(&scoped).unwrap();
+    assert_eq!(json_val["thinkingLevel"], "high");
+    assert!(json_val["model"].is_object());
+
+    // Without thinking level.
+    let scoped2 = ext::ScopedModel {
+        model: json!({"id": "gpt-4"}),
+        thinking_level: None,
+    };
+    let json2 = serde_json::to_value(&scoped2).unwrap();
+    assert!(json2.as_object().unwrap().get("thinkingLevel").is_none());
+}
+
+#[test]
+fn resolved_request_auth_ok_variant_serializes_with_tag() {
+    // ResolvedRequestAuth must serialize with `"ok": true/false`
+    // (model-registry.ts:17-25 @ 4181f66).
+    let ok = ext::ResolvedRequestAuth::ok(
+        Some("sk-xxx".to_owned()),
+        None,
+        Some("https://api.example.com".to_owned()),
+        None,
+    );
+    let json_val = serde_json::to_value(&ok).unwrap();
+    assert_eq!(json_val["ok"], true);
+    assert_eq!(json_val["apiKey"], "sk-xxx");
+    assert_eq!(json_val["baseUrl"], "https://api.example.com");
+}
+
+#[test]
+fn resolved_request_auth_err_variant_serializes_with_tag() {
+    let err = ext::ResolvedRequestAuth::err("No API key found".to_owned());
+    let json_val = serde_json::to_value(&err).unwrap();
+    assert_eq!(json_val["ok"], false);
+    assert_eq!(json_val["error"], "No API key found");
+}
+
+#[test]
+fn resolved_request_auth_preserves_null_header_values_7030() {
+    // #7030: null header deletion markers MUST be preserved in serialization.
+    // This prevents placeholder OpenAI credentials from being sent through
+    // Cloudflare AI Gateway — a `null` Authorization header signals "delete
+    // the default Authorization", which must not become empty string or be
+    // stripped.
+    let mut headers: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    headers.insert("Authorization".to_owned(), None); // null = deletion marker
+    headers.insert(
+        "cf-aig-authorization".to_owned(),
+        Some("Bearer token".to_owned()),
+    );
+
+    let auth = ext::ResolvedRequestAuth::ok(Some("sk-test".to_owned()), Some(headers), None, None);
+    let json_val = serde_json::to_value(&auth).unwrap();
+
+    // The Authorization null must survive serialization.
+    assert_eq!(
+        json_val["headers"]["Authorization"],
+        serde_json::Value::Null
+    );
+    assert_eq!(json_val["headers"]["cf-aig-authorization"], "Bearer token");
+
+    // Round-trip: null must survive deserialization.
+    let back: ext::ResolvedRequestAuth = serde_json::from_value(json_val).unwrap();
+    let headers = back.headers.expect("headers present");
+    assert_eq!(headers.get("Authorization"), Some(&None));
+    assert_eq!(
+        headers.get("cf-aig-authorization").cloned(),
+        Some(Some("Bearer token".to_owned()))
+    );
 }

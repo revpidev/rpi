@@ -225,6 +225,75 @@ pub(crate) fn random_hex_16() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Tool system prompt contributions (tools/*.ts @ 4181f66, commit 9ab91fb93)
+// ---------------------------------------------------------------------------
+
+/// `{ snippet, guidelines }` shape — upstream's per-tool system prompt
+/// contribution exposed to extensions (types.ts:1546-1548 @ 4181f66,
+/// commit `9ab91fb93`).
+#[derive(Debug, Clone)]
+pub struct ToolSystemPromptContribution {
+    pub snippet: &'static str,
+    pub guidelines: &'static [&'static str],
+}
+
+/// `bashToolSystemPromptContribution` (bash.ts:45-48 @ 4181f66).
+pub const BASH_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Execute bash commands (ls, grep, find, etc.)",
+        guidelines: &[
+            "You can inspect RPI_* environment variables for current model and session details.",
+        ],
+    };
+
+/// `readToolSystemPromptContribution` (read.ts:26-29 @ 4181f66).
+pub const READ_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Read file contents",
+        guidelines: &["Use read to examine files instead of cat or sed."],
+    };
+
+/// `editToolSystemPromptContribution` (edit.ts:55-62 @ 4181f66).
+pub const EDIT_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+        guidelines: &[
+            "Use edit for precise changes (edits[].oldText must match exactly)",
+            "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
+            "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
+            "Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+        ],
+    };
+
+/// `writeToolSystemPromptContribution` (write.ts:19-22 @ 4181f66).
+pub const WRITE_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Create or overwrite files",
+        guidelines: &["Use write only for new files or complete rewrites."],
+    };
+
+/// `grepToolSystemPromptContribution` (grep.ts:38-41 @ 4181f66).
+pub const GREP_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Search file contents for patterns (respects .gitignore)",
+        guidelines: &[],
+    };
+
+/// `findToolSystemPromptContribution` (find.ts:37-40 @ 4181f66).
+pub const FIND_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "Find files by glob pattern (respects .gitignore)",
+        guidelines: &[],
+    };
+
+/// `lsToolSystemPromptContribution` (ls.ts:19-22 @ 4181f66).
+pub const LS_TOOL_SYSTEM_PROMPT_CONTRIBUTION: ToolSystemPromptContribution =
+    ToolSystemPromptContribution {
+        snippet: "List directory contents",
+        guidelines: &[],
+    };
+
+// ---------------------------------------------------------------------------
 // test helpers shared across tool submodules
 // ---------------------------------------------------------------------------
 

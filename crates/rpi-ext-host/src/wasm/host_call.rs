@@ -26,12 +26,17 @@ pub fn required_capability(method: &str) -> Option<Capability> {
         "on" | "getFlag" => return None,
         "registerTool" => Capability::Tools,
         "registerCommand" | "registerShortcut" | "registerFlag" => Capability::Commands,
-        "registerMessageRenderer" | "registerEntryRenderer" => Capability::Ui,
+        "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
+            Capability::Ui
+        }
         "exec" => Capability::Exec,
         "registerProvider" | "unregisterProvider" => Capability::Provider,
         "events.emit" | "events.on" => Capability::Events,
         m if m.starts_with("ui.") => Capability::Ui,
         m if m.starts_with("command.") => Capability::Session,
+        // v0.11 additions (ctx.scopedModels / ctx.modelRegistry.* /
+        // ctx.setRuntimeApiKey / ctx.removeRuntimeApiKey /
+        // ctx.getSystemPromptSource / ctx.getAppendSystemPromptSources)
         _ => Capability::Session,
     })
 }
@@ -352,6 +357,36 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             Ok(Value::Null)
         }
 
+        // v0.11: registerMarkdownTransformer (types.ts:1292 @ 4181f66).
+        // Chained Markdown source transformer — TUI rendering wiring is T29;
+        // the host stores one transformer per extension. The guest dispatch
+        // for `render` kind "markdownTransform" is handled by the forward
+        // path (same as message/entry renderers).
+        "registerMarkdownTransformer" => {
+            let forward = state.forward.clone();
+            state
+                .api
+                .register_markdown_transformer(Arc::new(move |markdown, context| {
+                    let forward = forward.clone();
+                    // On error, return the input unchanged (upstream
+                    // applyMarkdownTransformers catches and continues).
+                    match forward.dispatch_blocking(
+                        json!({
+                            "kind": "render",
+                            "what": "markdownTransform",
+                            "markdown": markdown,
+                            "context": context,
+                        }),
+                        false,
+                    ) {
+                        Ok(result) => result.as_str().map(str::to_owned).unwrap_or_default(),
+                        Err(_) => markdown,
+                    }
+                }))
+                .map_err(|e| ("stale", e.to_string()))?;
+            Ok(Value::Null)
+        }
+
         // ------------------------------------------------------------------
         // Actions (HostActions)
         // ------------------------------------------------------------------
@@ -609,6 +644,109 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     on_error: None,
                 })
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+
+        // --------------------------------------------------------------
+        // v0.11 context additions (types.ts @ 4181f66)
+        // --------------------------------------------------------------
+        "ctx.scopedModels" => {
+            let scoped = state
+                .api
+                .context()
+                .scoped_models()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(serde_json::to_value(&scoped).unwrap_or(Value::Null))
+        }
+        "ctx.getSystemPromptSource" => {
+            let path = state
+                .api
+                .context()
+                .get_system_prompt_source()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(match path {
+                Some(p) => json!(p),
+                None => Value::Null,
+            })
+        }
+        "ctx.getAppendSystemPromptSources" => {
+            let paths = state
+                .api
+                .context()
+                .get_append_system_prompt_sources()
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(serde_json::to_value(&paths).unwrap_or_else(|_| json!([])))
+        }
+        "ctx.modelRegistry.complete" => {
+            let model = args
+                .get("model")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing model".to_owned()))?;
+            let context = args
+                .get("context")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing context".to_owned()))?;
+            let options = args.get("options").cloned();
+            let api = state.api.clone();
+            let result = block_on(&state.async_handle.clone(), async move {
+                api.model_registry_complete(model, context, options).await
+            })?;
+            let result = result.map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(result.unwrap_or(Value::Null))
+        }
+        "ctx.modelRegistry.find" => {
+            let provider = str_arg(&args, "provider").unwrap_or_default();
+            let model_id = str_arg(&args, "modelId").unwrap_or_default();
+            let result = state
+                .api
+                .model_registry_find(provider, model_id)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(result.unwrap_or(Value::Null))
+        }
+        "ctx.modelRegistry.hasConfiguredAuth" => {
+            let provider_id = str_arg(&args, "providerId").unwrap_or_default();
+            let result = state
+                .api
+                .model_registry_has_configured_auth(provider_id)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(json!(result))
+        }
+        "ctx.modelRegistry.getApiKeyAndHeaders" => {
+            // #7030: null header deletion markers MUST pass through unchanged.
+            let model = args
+                .get("model")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "missing model".to_owned()))?;
+            let api = state.api.clone();
+            let result = block_on(&state.async_handle.clone(), async move {
+                api.get_api_key_and_headers(model).await
+            })?;
+            let result = result.map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(result)
+        }
+        "ctx.setRuntimeApiKey" => {
+            let provider_id = str_arg(&args, "providerId")
+                .ok_or_else(|| ("invalidRequest", "missing providerId".to_owned()))?
+                .to_owned();
+            let api_key = str_arg(&args, "apiKey")
+                .ok_or_else(|| ("invalidRequest", "missing apiKey".to_owned()))?
+                .to_owned();
+            let api = state.api.clone();
+            block_on(&state.async_handle.clone(), async move {
+                api.set_runtime_api_key(&provider_id, &api_key, None).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(Value::Null)
+        }
+        "ctx.removeRuntimeApiKey" => {
+            let provider_id = str_arg(&args, "providerId")
+                .ok_or_else(|| ("invalidRequest", "missing providerId".to_owned()))?
+                .to_owned();
+            let api = state.api.clone();
+            block_on(&state.async_handle.clone(), async move {
+                api.remove_runtime_api_key(&provider_id).await
+            })?
+            .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
 

@@ -426,6 +426,40 @@ impl rpi_ext_host::api::HostActions for BlockingExecActions {
         Ok(())
     }
     async fn unregister_provider(&self, _name: &str) {}
+
+    async fn model_registry_complete(
+        &self,
+        _model: serde_json::Value,
+        _context: serde_json::Value,
+        _options: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn model_registry_find(&self, _provider: &str, _model_id: &str) -> Option<serde_json::Value> {
+        None
+    }
+
+    fn model_registry_has_configured_auth(&self, _provider_id: &str) -> bool {
+        false
+    }
+
+    async fn get_api_key_and_headers(&self, _model: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"ok": false, "error": "not configured"})
+    }
+
+    async fn set_runtime_api_key(
+        &self,
+        _provider_id: &str,
+        _api_key: &str,
+        _options: Option<rpi_ext_host::types::AuthOperationOptions>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn remove_runtime_api_key(&self, _provider_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// When a guest blocks on a host action (dialog, etc.), the TUI thread's render

@@ -306,6 +306,130 @@ impl HostActions for SessionHostActions {
             session.model_runtime().unregister_provider(name).await;
         }
     }
+
+    // -- v0.11 model-registry actions (model-registry.ts @ 4181f66) ---------
+
+    /// `ctx.modelRegistry.complete(model, context, options?)`
+    /// (model-registry.ts:138-142 @ 4181f66). `options` is accepted but not
+    /// deserialized — the extension host call path passes `None` (the full
+    /// `StreamOptions` includes non-serializable callback fields).
+    async fn model_registry_complete(
+        &self,
+        model: Value,
+        context: Value,
+        _options: Option<Value>,
+    ) -> Option<Value> {
+        let session = self.session()?;
+        let model: rpi_ai::types::Model = serde_json::from_value(model).ok()?;
+        let context: rpi_ai::types::Context = serde_json::from_value(context).ok()?;
+        let message = session
+            .model_runtime()
+            .complete(&model, &context, None)
+            .await?;
+        serde_json::to_value(message).ok()
+    }
+
+    /// `ctx.modelRegistry.find(provider, modelId)` (model-registry.ts:70).
+    fn model_registry_find(&self, provider: &str, model_id: &str) -> Option<Value> {
+        let session = self.session()?;
+        let model = session.model_runtime().find_model(provider, model_id)?;
+        serde_json::to_value(model).ok()
+    }
+
+    /// `ctx.modelRegistry.hasConfiguredAuth(providerId)`
+    /// (model-registry.ts:76).
+    fn model_registry_has_configured_auth(&self, provider_id: &str) -> bool {
+        self.session()
+            .map(|session| session.model_runtime().has_configured_auth(provider_id))
+            .unwrap_or(false)
+    }
+
+    /// `ctx.modelRegistry.getApiKeyAndHeaders(model)` (model-registry.ts:64-93
+    /// @ 4181f66). **#7030**: null header deletion markers MUST pass through
+    /// unchanged — we serialize `AuthResult` without stripping `None`/`null`
+    /// from the `ProviderHeaders` map.
+    async fn get_api_key_and_headers(&self, model: Value) -> Value {
+        let Some(session) = self.session() else {
+            return serde_json::json!({"ok": false, "error": "session is gone"});
+        };
+        let model: rpi_ai::types::Model = match serde_json::from_value(model) {
+            Ok(m) => m,
+            Err(e) => {
+                return serde_json::json!({"ok": false, "error": e.to_string()});
+            }
+        };
+        let runtime = session.model_runtime();
+        match runtime.get_auth(&model, None).await {
+            Ok(Some(auth_result)) => {
+                let auth = &auth_result.auth;
+                // #7030: Preserve null header deletion markers exactly.
+                // ProviderHeaders = HashMap<String, Option<String>>; None
+                // values are the deletion markers — they must serialize as
+                // JSON `null`, not be stripped.
+                let headers_map: std::collections::HashMap<String, Option<String>> =
+                    auth.headers.clone().unwrap_or_default();
+                let mut result = serde_json::json!({
+                    "ok": true,
+                    "apiKey": auth.api_key,
+                    "headers": headers_map,
+                });
+                if let Some(base_url) = &auth.base_url {
+                    result["baseUrl"] = serde_json::json!(base_url);
+                }
+                if let Some(env) = &auth_result.env {
+                    result["env"] = serde_json::json!(env);
+                }
+                result
+            }
+            Ok(None) => {
+                // No auth resolved: check if provider requires an auth header
+                let compat = runtime.get_compatibility_request_config(&model);
+                if compat.auth_header {
+                    serde_json::json!({"ok": false, "error": format!("No API key found for \"{}\"", model.provider)})
+                } else {
+                    // Return headers without API key (extension can still use
+                    // provider-specific headers).
+                    let headers_map: std::collections::HashMap<String, Option<String>> = compat
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    serde_json::json!({"ok": true, "headers": headers_map})
+                }
+            }
+            Err(error) => serde_json::json!({"ok": false, "error": error.message}),
+        }
+    }
+
+    /// `ctx.setRuntimeApiKey(providerId, apiKey)` (model-runtime.ts:536-547
+    /// @ 4181f66) — async, serialized per-provider.
+    async fn set_runtime_api_key(
+        &self,
+        provider_id: &str,
+        api_key: &str,
+        _options: Option<rpi_ext_host::types::AuthOperationOptions>,
+    ) -> Result<(), String> {
+        let Some(session) = self.session() else {
+            return Err("session is gone".to_owned());
+        };
+        session
+            .model_runtime()
+            .set_runtime_api_key(provider_id, api_key)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// `ctx.removeRuntimeApiKey(providerId)` (model-runtime.ts:549-560).
+    async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), String> {
+        let Some(session) = self.session() else {
+            return Err("session is gone".to_owned());
+        };
+        session
+            .model_runtime()
+            .remove_runtime_api_key(provider_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// `sendUserMessage` content normalization (agent-session.ts:1476-1492):

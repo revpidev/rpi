@@ -729,7 +729,9 @@ pub struct ToolCallEvent {
     pub input: Value,
 }
 
-/// `ToolCallEventResult` (types.ts:1065-1069).
+/// `ToolCallEventResult` (types.ts:1071-1080 @ 4181f66). `terminate` added
+/// in #7715 (v0.84): hint to stop after the current tool batch when this call
+/// is blocked; only effective when every finalized result in the batch sets it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallEventResult {
@@ -737,6 +739,8 @@ pub struct ToolCallEventResult {
     pub block: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminate: Option<bool>,
 }
 
 /// `ToolResultEvent` (types.ts:908-967; union collapsed, see header).
@@ -1173,3 +1177,112 @@ pub fn stamp_event_type(value: &mut Value, event_type: &str) {
         map.insert("type".to_owned(), Value::String(event_type.to_owned()));
     }
 }
+
+// ============================================================================
+// v0.11 additions (types.ts @ 4181f66)
+// ============================================================================
+
+/// `MarkdownTransformContext` (types.ts:1147-1153 @ 4181f66).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownTransformContext {
+    /// `"user" | "assistant" | "assistant-thinking"`
+    pub message_type: String,
+    pub is_streaming: bool,
+    pub available_width: usize,
+}
+
+/// `MarkdownTransformer` (types.ts:1153 @ 4181f66): chained, width-aware
+/// Markdown source transformer. Host dispatches as a `render` kind message;
+/// the guest returns the transformed string. TUI rendering wiring is T29.
+pub type MarkdownTransformerFn =
+    Arc<dyn Fn(String, MarkdownTransformContext) -> String + Send + Sync>;
+
+/// `ResolvedRequestAuth` (model-registry.ts:17-25 @ 4181f66) — return type
+/// of `getApiKeyAndHeaders`. Upstream is a discriminated union on `ok: true |
+/// false`; Rust carries it as a struct since serde's `tag` attribute cannot
+/// emit boolean tag values. The wire shape is `{ ok: true, apiKey?, headers?,
+/// baseUrl?, env? } | { ok: false, error: "..." }`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedRequestAuth {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, Option<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ResolvedRequestAuth {
+    pub fn ok(
+        api_key: Option<String>,
+        headers: Option<HashMap<String, Option<String>>>,
+        base_url: Option<String>,
+        env: Option<HashMap<String, String>>,
+    ) -> Self {
+        ResolvedRequestAuth {
+            ok: true,
+            api_key,
+            headers,
+            base_url,
+            env,
+            error: None,
+        }
+    }
+
+    pub fn err(error: String) -> Self {
+        ResolvedRequestAuth {
+            ok: false,
+            api_key: None,
+            headers: None,
+            base_url: None,
+            env: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// `ScopedModel` (model-resolver.ts:63-66 @ 4181f66) — resolved model scope
+/// entry exposed via `ctx.scopedModels`. Carried as JSON (`Model` + optional
+/// `thinkingLevel`) because the host does not interpret the model body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedModel {
+    pub model: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+}
+
+/// `AuthOperationOptions` (packages/ai/src/auth/types.ts:46-48 @ 4181f66).
+#[derive(Debug, Clone, Default)]
+pub struct AuthOperationOptions {
+    pub signal: Option<CancellationToken>,
+}
+
+// ============================================================================
+// TUI type placeholders (types.ts @ 4181f66; wiring deferred to T28/T32)
+// ============================================================================
+
+/// `TuiMode` (pi-tui tui.ts:284 @ 4181f66): `"regular" | "fullscreen"`.
+/// Placeholder type — TUI trait wiring is T28.
+pub type TuiMode = str;
+
+/// `TuiStopOptions` (pi-tui tui.ts @ 4181f66): `{ preserveScreen?: boolean }`.
+/// Placeholder — TUI wiring in T28.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TuiStopOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preserve_screen: Option<bool>,
+}
+
+/// `TuiMainScreen` — placeholder for the trait-object type that T28 will
+/// define. Extensions receive `ctx.ui.theme()` etc.; the TUI type surface
+/// is not directly callable from extensions yet (T28/T32).
+pub type TuiMainScreenRef = Value;

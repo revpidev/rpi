@@ -341,6 +341,45 @@ pub trait HostActions: Send + Sync {
 
     /// `unregisterProvider` post-bind direct call (runner.ts:401-407).
     async fn unregister_provider(&self, name: &str);
+
+    // -- v0.11 additions (model-registry.ts @ 4181f66) -----------------------
+
+    /// `ctx.modelRegistry.complete(model, context, options)` — extension
+    /// LLM call entry (model-registry.ts:138-142). Returns `AssistantMessage`
+    /// JSON or `None` on failure.
+    async fn model_registry_complete(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Option<Value>;
+
+    /// `ctx.modelRegistry.find(provider, modelId)` — provider+id lookup
+    /// (model-registry.ts:70). Returns `Model` JSON or `None`.
+    fn model_registry_find(&self, provider: &str, model_id: &str) -> Option<Value>;
+
+    /// `ctx.modelRegistry.hasConfiguredAuth(model)` — auth check
+    /// (model-registry.ts:76). `provider_id` is the provider string.
+    fn model_registry_has_configured_auth(&self, provider_id: &str) -> bool;
+
+    /// `ctx.modelRegistry.getApiKeyAndHeaders(model)` — auth resolution
+    /// (model-registry.ts:64-93 @ 4181f66). Returns `ResolvedRequestAuth`
+    /// JSON. **#7030**: `headers` may contain `null` deletion markers that
+    /// MUST be passed through unchanged to prevent placeholder credential
+    /// leakage through AI Gateway.
+    async fn get_api_key_and_headers(&self, model: Value) -> Value;
+
+    /// `ctx.setRuntimeApiKey(providerId, apiKey)` (model-runtime.ts:536-547
+    /// @ 4181f66) — async, serialized per-provider, with auth cancellation.
+    async fn set_runtime_api_key(
+        &self,
+        provider_id: &str,
+        api_key: &str,
+        options: Option<crate::types::AuthOperationOptions>,
+    ) -> Result<(), String>;
+
+    /// `ctx.removeRuntimeApiKey(providerId)` (model-runtime.ts:549-560).
+    async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), String>;
 }
 
 // ============================================================================
@@ -580,7 +619,7 @@ pub struct CompactOptions {
     pub on_error: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
-/// `ExtensionContextActions` (types.ts:1612-1628) — session-bound context
+/// `ExtensionContextActions` (types.ts:1612-1628 @ 4181f66) — session-bound context
 /// methods behind `ctx.*`. Unbound methods fall back to the upstream
 /// runner defaults (runner.ts:275-285).
 #[async_trait::async_trait]
@@ -602,6 +641,27 @@ pub trait ContextActions: Send + Sync {
     /// `getSystemPromptOptions` (types.ts:1627) — `BuildSystemPromptOptions`
     /// JSON.
     fn get_system_prompt_options(&self) -> Value;
+    // -- v0.11 additions (types.ts @ 4181f66) ------------------------------
+
+    /// `getScopedModels` (types.ts:1649 @ 4181f66, runner.ts:706-709):
+    /// read-only snapshot of the session's resolved model scope. Default
+    /// empty when unbound (runner.ts:278).
+    fn get_scoped_models(&self) -> Vec<crate::types::ScopedModel> {
+        Vec::new()
+    }
+
+    /// `getSystemPromptSource` (resource-loader.ts:327-329, T24): resolved
+    /// filesystem path of the system prompt source. Default `None`.
+    fn get_system_prompt_source_path(&self) -> Option<String> {
+        None
+    }
+
+    /// `getAppendSystemPromptSources` (resource-loader.ts:335-337, T24):
+    /// resolved filesystem paths of append system prompt sources. Default
+    /// empty.
+    fn get_append_system_prompt_source_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -1126,6 +1186,32 @@ impl ExtensionContext {
             .context_actions()
             .map_or_else(String::new, |actions| actions.get_system_prompt()))
     }
+
+    /// `ctx.scopedModels` (runner.ts:706-709 @ 4181f66) — read-only snapshot
+    /// of the resolved model scope. Default empty when unbound.
+    pub fn scoped_models(&self) -> Result<Vec<crate::types::ScopedModel>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .map(|actions| actions.get_scoped_models())
+            .unwrap_or_default())
+    }
+
+    /// `ctx.getSystemPromptSource()` — resolved filesystem path
+    /// (resource-loader.ts:327-329, T24). Default `None`.
+    pub fn get_system_prompt_source(&self) -> Result<Option<String>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .and_then(|actions| actions.get_system_prompt_source_path()))
+    }
+
+    /// `ctx.getAppendSystemPromptSources()` — resolved filesystem paths
+    /// (resource-loader.ts:335-337, T24). Default empty.
+    pub fn get_append_system_prompt_sources(&self) -> Result<Vec<String>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .map(|actions| actions.get_append_system_prompt_source_paths())
+            .unwrap_or_default())
+    }
 }
 
 // ============================================================================
@@ -1313,6 +1399,9 @@ pub struct LoadedExtension {
     commands: RwLock<InsertionMap<RegisteredCommand>>,
     flags: RwLock<InsertionMap<ExtensionFlag>>,
     shortcuts: RwLock<InsertionMap<ExtensionShortcut>>,
+    /// `extension.markdownTransformer` (types.ts:1703 @ 4181f66): one
+    /// transformer per extension, chained in load order by the runner.
+    markdown_transformer: RwLock<Option<crate::types::MarkdownTransformerFn>>,
     /// The live wasm guest backing this extension (L1; T15 W6). Owns the
     /// guest thread; dropping the extension shuts it down.
     wasm_guest: RwLock<Option<crate::wasm::WasmGuest>>,
@@ -1354,6 +1443,7 @@ impl LoadedExtension {
             commands: RwLock::new(InsertionMap::new()),
             flags: RwLock::new(InsertionMap::new()),
             shortcuts: RwLock::new(InsertionMap::new()),
+            markdown_transformer: RwLock::new(None),
             wasm_guest: RwLock::new(None),
             native_plugin: RwLock::new(None),
         }
@@ -1403,6 +1493,18 @@ impl LoadedExtension {
         read(&self.handlers)
             .get(event)
             .is_some_and(|handlers| !handlers.is_empty())
+    }
+
+    /// `extension.markdownTransformer = transformer` (loader.ts:309-312
+    /// @ 4181f66). One per extension — last call wins.
+    pub fn set_markdown_transformer(&self, transformer: crate::types::MarkdownTransformerFn) {
+        *write(&self.markdown_transformer) = Some(transformer);
+    }
+
+    /// `getMarkdownTransformers()` flatMap source (runner.ts:589-591
+    /// @ 4181f66).
+    pub fn markdown_transformer(&self) -> Option<crate::types::MarkdownTransformerFn> {
+        read(&self.markdown_transformer).clone()
     }
 
     pub(crate) fn insert_tool(&self, tool: RegisteredTool) {
@@ -1673,6 +1775,19 @@ impl ExtensionApi {
         Ok(())
     }
 
+    /// `pi.registerMarkdownTransformer(transformer)` (loader.ts:309-312,
+    /// types.ts:1292 @ 4181f66). One transformer per extension; chained in
+    /// load order by `runner.getMarkdownTransformers()`. TUI rendering
+    /// wiring is T29.
+    pub fn register_markdown_transformer(
+        &self,
+        transformer: crate::types::MarkdownTransformerFn,
+    ) -> Result<(), ExtError> {
+        self.runtime.assert_active()?;
+        self.extension.set_markdown_transformer(transformer);
+        Ok(())
+    }
+
     // -- actions (loader.ts:304-387, delegated to HostActions) ---------------
 
     /// `pi.sendMessage(message, options)` (loader.ts:304-307).
@@ -1817,6 +1932,87 @@ impl ExtensionApi {
     pub async fn unregister_provider(&self, name: &str) -> Result<(), ExtError> {
         self.runtime.assert_active()?;
         self.runtime.unregister_provider(name).await;
+        Ok(())
+    }
+
+    // -- v0.11 model-registry actions (model-registry.ts @ 4181f66) ---------
+
+    /// `ctx.modelRegistry.complete(model, context, options?)` — extension
+    /// LLM call entry (model-registry.ts:138-142).
+    pub async fn model_registry_complete(
+        &self,
+        model: Value,
+        context: Value,
+        options: Option<Value>,
+    ) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_complete(model, context, options)
+            .await)
+    }
+
+    /// `ctx.modelRegistry.find(provider, modelId)` (model-registry.ts:70).
+    pub fn model_registry_find(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Result<Option<Value>, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_find(provider, model_id))
+    }
+
+    /// `ctx.modelRegistry.hasConfiguredAuth(providerId)`
+    /// (model-registry.ts:76).
+    pub fn model_registry_has_configured_auth(&self, provider_id: &str) -> Result<bool, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .model_registry_has_configured_auth(provider_id))
+    }
+
+    /// `ctx.modelRegistry.getApiKeyAndHeaders(model)` (model-registry.ts:64-93).
+    /// Returns `ResolvedRequestAuth` JSON. **#7030**: null header deletion
+    /// markers are passed through unchanged.
+    pub async fn get_api_key_and_headers(&self, model: Value) -> Result<Value, ExtError> {
+        self.runtime.assert_active()?;
+        Ok(self
+            .runtime
+            .require_actions()?
+            .get_api_key_and_headers(model)
+            .await)
+    }
+
+    /// `ctx.setRuntimeApiKey(providerId, apiKey)` (model-runtime.ts:536-547
+    /// @ 4181f66) — async, serialized, with auth cancellation options.
+    pub async fn set_runtime_api_key(
+        &self,
+        provider_id: &str,
+        api_key: &str,
+        options: Option<crate::types::AuthOperationOptions>,
+    ) -> Result<(), ExtError> {
+        self.runtime.assert_active()?;
+        self.runtime
+            .require_actions()?
+            .set_runtime_api_key(provider_id, api_key, options)
+            .await
+            .map_err(ExtError::Call)?;
+        Ok(())
+    }
+
+    /// `ctx.removeRuntimeApiKey(providerId)` (model-runtime.ts:549-560).
+    pub async fn remove_runtime_api_key(&self, provider_id: &str) -> Result<(), ExtError> {
+        self.runtime.assert_active()?;
+        self.runtime
+            .require_actions()?
+            .remove_runtime_api_key(provider_id)
+            .await
+            .map_err(ExtError::Call)?;
         Ok(())
     }
 
