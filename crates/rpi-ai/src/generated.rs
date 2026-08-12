@@ -15,7 +15,7 @@
 //! Intentional differences:
 //! - Upstream generates TS literals (`models.generated.ts`); we embed the
 //!   vendored JSON and parse with serde at first access (build-time codegen of
-//!   1153 model literals was rejected as compile-time noise). Data content is
+//!   1217 model literals was rejected as compile-time noise). Data content is
 //!   identical — verified field-by-field against the upstream JSONs in
 //!   `tests/model_catalog.rs`.
 //! - Upstream `getBuiltinModels(unknown)` returns `[]`; mirrored here as an
@@ -195,13 +195,13 @@ mod tests {
     fn test_catalog_loads_all_vendored_providers() {
         let catalog = builtin_catalog().expect("vendored catalog parses");
         assert_eq!(catalog.providers().len(), CATALOG_PROVIDER_DATA.len());
-        assert_eq!(catalog.providers().len(), 37);
+        assert_eq!(catalog.providers().len(), 39);
         let total: usize = catalog
             .providers()
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        assert_eq!(total, 1153);
+        assert_eq!(total, 1217);
         // The dynamic radius provider has no catalog entry (upstream all.ts).
         assert!(!catalog.providers().contains(&"radius"));
     }
@@ -229,10 +229,10 @@ mod tests {
     fn test_parse_iso8601_millis() {
         assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00.841Z"), Some(841));
-        // 2026-07-30T01:56:27.841Z cross-checked against `date -u -d ... +%s%3N`.
+        // 2026-08-11T04:37:23.682Z cross-checked against `date -u -d ... +%s%3N`.
         assert_eq!(
-            parse_iso8601_millis("2026-07-30T01:56:27.841Z"),
-            Some(1785376587841)
+            parse_iso8601_millis("2026-08-11T04:37:23.682Z"),
+            Some(1786423043682)
         );
         assert_eq!(
             parse_iso8601_millis("2026-02-28T23:59:59.5Z"),

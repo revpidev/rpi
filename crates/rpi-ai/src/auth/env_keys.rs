@@ -38,8 +38,10 @@ fn get_api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
 
     match provider {
         "ant-ling" => Some(&["ANT_LING_API_KEY"]),
+        "baseten" => Some(&["BASETEN_API_KEY"]),
         "qwen-token-plan" => Some(&["QWEN_TOKEN_PLAN_API_KEY"]),
         "qwen-token-plan-cn" => Some(&["QWEN_TOKEN_PLAN_CN_API_KEY"]),
+        "qwen-token-plan-individual" => Some(&["QWEN_TOKEN_PLAN_API_KEY"]),
         "openai" => Some(&["OPENAI_API_KEY"]),
         "azure-openai-responses" => Some(&["AZURE_OPENAI_API_KEY"]),
         "nvidia" => Some(&["NVIDIA_API_KEY"]),

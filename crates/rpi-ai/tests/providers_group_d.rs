@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        16,
+        17,
     ),
     spec(
         groq_provider,
@@ -102,7 +102,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.groq.com/openai/v1",
         "Groq API key",
         "GROQ_API_KEY",
-        7,
+        6,
     ),
     spec(
         huggingface_provider,
@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        51,
+        58,
     ),
     spec(
         nvidia_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        30,
+        29,
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        17,
+        18,
     ),
     spec(
         xai_provider,

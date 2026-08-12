@@ -1,6 +1,8 @@
-//! Port of `packages/ai/src/providers/opencode-go.ts` @ pi 0.82.1 (2efa728)
-//! — OpenCode Zen Go: mixed 3-API dispatch on `model.api`
+//! Port of `packages/ai/src/providers/opencode-go.ts` @ pi `05558a792` / `4181f66`
+//! — OpenCode Go: mixed 3-API dispatch on `model.api`
 //! (`anthropic-messages` / `openai-completions` / `openai-responses`).
+//! Display name changed from "OpenCode Zen Go" to "OpenCode Go" in
+//! `05558a792` (#7157).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +21,7 @@ use crate::types::ApiKind;
 pub fn opencode_go_provider() -> Arc<dyn Provider> {
     create_provider(CreateProviderOptions {
         id: "opencode-go".to_owned(),
-        name: Some("OpenCode Zen Go".to_owned()),
+        name: Some("OpenCode Go".to_owned()),
         base_url: None,
         headers: None,
         auth: ProviderAuth {

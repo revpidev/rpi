@@ -1,8 +1,9 @@
-//! Port of `packages/ai/src/auth/oauth/github-copilot.ts` @ pi 0.82.1
-//! (2efa728) — GitHub Copilot OAuth: RFC 8628 device code flow against
-//! github.com or a GitHub Enterprise domain, GitHub-token → Copilot-token
-//! exchange, post-login policy-enable for every catalog model, and the
-//! per-account `baseUrl` / `availableModelIds` derivation.
+//! Port of `packages/ai/src/auth/oauth/github-copilot.ts` @ pi `4181f66`
+//! (v0.84.1+, incorporating `14cc26e86` / #7672) — GitHub Copilot OAuth:
+//! RFC 8628 device code flow against github.com or a GitHub Enterprise domain,
+//! GitHub-token → Copilot-token exchange, post-login policy-enable for every
+//! catalog model, and the per-account `baseUrl` / `availableModelIds`
+//! derivation with Individual-endpoint policy fallback.
 //!
 //! Test seams (upstream stubs the global `fetch`; here the seam is a
 //! constructor field, minimal-intrusion — same precedent as
@@ -140,39 +141,55 @@ fn get_github_copilot_base_url(token: Option<&str>, enterprise_domain: Option<&s
     }
 }
 
-/// `isSelectableCopilotModel` — picker-enabled, policy not `disabled`,
-/// `tool_calls` not explicitly unsupported.
-fn is_selectable_copilot_model(item: &Value) -> bool {
-    let Some(object) = item.as_object() else {
-        return false;
-    };
-    let policy_state = object
-        .get("policy")
-        .and_then(|policy| policy.get("state"))
-        .and_then(Value::as_str);
-    let tool_calls = object
-        .get("capabilities")
-        .and_then(|capabilities| capabilities.get("supports"))
-        .and_then(|supports| supports.get("tool_calls"))
-        .and_then(Value::as_bool);
-    object.get("model_picker_enabled").and_then(Value::as_bool) == Some(true)
-        && policy_state != Some("disabled")
-        && tool_calls != Some(false)
-}
-
 /// `parseAvailableCopilotModelIds` — `data` must be an array
-/// ("Invalid Copilot models response"); selectable items contribute their
-/// string `id`.
-fn parse_available_copilot_model_ids(raw: &Value) -> Result<Vec<String>, ModelsError> {
+/// ("Invalid Copilot models response"). Collects two sets:
+/// `picker_ids` (model_picker_enabled == true, policy not disabled) and
+/// `policy_enabled_ids` (policy.state == "enabled"). When `picker_ids` is
+/// non-empty it is returned; otherwise, if `allow_policy_fallback` is true,
+/// `policy_enabled_ids` is returned (Individual-endpoint fallback for
+/// accounts whose picker flags are all false despite explicit enabled
+/// policies). Port of `14cc26e86` (#7672).
+fn parse_available_copilot_model_ids(
+    raw: &Value,
+    allow_policy_fallback: bool,
+) -> Result<Vec<String>, ModelsError> {
     let data = raw.get("data").and_then(Value::as_array);
     let Some(data) = data else {
         return Err(error("Invalid Copilot models response"));
     };
-    Ok(data
-        .iter()
-        .filter(|item| is_selectable_copilot_model(item))
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-        .collect())
+    let mut picker_ids: Vec<String> = Vec::new();
+    let mut policy_enabled_ids: Vec<String> = Vec::new();
+    for item in data {
+        let tool_calls = item
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("supports"))
+            .and_then(|supports| supports.get("tool_calls"))
+            .and_then(Value::as_bool);
+        if tool_calls == Some(false) {
+            continue;
+        }
+        let policy_state = item
+            .get("policy")
+            .and_then(|policy| policy.get("state"))
+            .and_then(Value::as_str);
+        let picker_enabled =
+            item.get("model_picker_enabled").and_then(Value::as_bool) == Some(true);
+        if picker_enabled && policy_state != Some("disabled") {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                picker_ids.push(id.to_owned());
+            }
+        }
+        if policy_state == Some("enabled") {
+            if let Some(id) = item.get("id").and_then(Value::as_str) {
+                policy_enabled_ids.push(id.to_owned());
+            }
+        }
+    }
+    if !picker_ids.is_empty() || !allow_policy_fallback {
+        Ok(picker_ids)
+    } else {
+        Ok(policy_enabled_ids)
+    }
 }
 
 /// `copilotEnterpriseDomain` — read/normalize the credential's
@@ -435,13 +452,20 @@ impl GitHubCopilotOAuth {
     }
 
     /// `fetchAvailableGitHubCopilotModelIds` — GET `{baseUrl}/models`
-    /// (5s timeout), filtered to the selectable picker catalog.
+    /// (5s timeout), filtered to the selectable picker catalog. The policy
+    /// fallback is limited to the Individual endpoint (some accounts return
+    /// false for every picker flag despite explicit enabled policies).
+    /// Port of `14cc26e86` (#7672).
     async fn fetch_available_model_ids(
         &self,
         copilot_token: &str,
         enterprise_domain: Option<&str>,
     ) -> Result<Vec<String>, ModelsError> {
         let base_url = get_github_copilot_base_url(Some(copilot_token), enterprise_domain);
+        // Some Individual accounts return false for every picker flag despite
+        // explicit enabled policies. Limit the fallback to that endpoint so
+        // other account types keep strict picker semantics.
+        let allow_policy_fallback = base_url == "https://api.individual.githubcopilot.com";
         let mut request = self
             .client
             .get(self.rewrite(format!("{base_url}/models")))
@@ -456,7 +480,7 @@ impl GitHubCopilotOAuth {
             request = request.header(name, value);
         }
         let raw = self.fetch_json(request).await?;
-        parse_available_copilot_model_ids(&raw)
+        parse_available_copilot_model_ids(&raw, allow_policy_fallback)
     }
 
     /// `enableGitHubCopilotModel` — POST `{baseUrl}/models/{id}/policy`
@@ -955,27 +979,89 @@ mod tests {
         );
     }
 
-    /// `parseAvailableCopilotModelIds` selection rules + the non-array error.
+    /// `parseAvailableCopilotModelIds` selection rules, the policy fallback,
+    /// and the non-array error. Port of `14cc26e86` (#7672).
     #[test]
     fn parse_available_model_ids_filters() {
-        let ids = parse_available_copilot_model_ids(&picker_models_response()).expect("ids");
+        // Default: picker wins (gpt-4.1 is the only picker-enabled model
+        // with policy not disabled).
+        let ids = parse_available_copilot_model_ids(&picker_models_response(), false).expect("ids");
         assert_eq!(ids, vec!["gpt-4.1".to_owned()]);
 
         // tool_calls explicitly unsupported drops the model.
-        let ids = parse_available_copilot_model_ids(&json!({
-            "data": [
-                { "id": "no-tools", "model_picker_enabled": true,
-                  "capabilities": { "supports": { "tool_calls": false } } },
-                { "id": "kept", "model_picker_enabled": true },
-                { "model_picker_enabled": true },
-            ]
-        }))
+        let ids = parse_available_copilot_model_ids(
+            &json!({
+                "data": [
+                    { "id": "no-tools", "model_picker_enabled": true,
+                      "capabilities": { "supports": { "tool_calls": false } } },
+                    { "id": "kept", "model_picker_enabled": true },
+                    { "model_picker_enabled": true },
+                ]
+            }),
+            false,
+        )
         .expect("ids");
         assert_eq!(ids, vec!["kept".to_owned()]);
 
-        let error =
-            parse_available_copilot_model_ids(&json!({ "data": {} })).expect_err("non-array data");
+        let error = parse_available_copilot_model_ids(&json!({ "data": {} }), false)
+            .expect_err("non-array data");
         assert_eq!(error.message, "Invalid Copilot models response");
+    }
+
+    /// All picker flags false on Individual endpoint → policy fallback returns
+    /// policy-enabled models (14cc26e86).
+    #[test]
+    fn parse_available_model_ids_policy_fallback_individual() {
+        let ids = parse_available_copilot_model_ids(
+            &json!({
+                "data": [
+                    { "id": "gpt-5", "model_picker_enabled": false,
+                      "policy": { "state": "enabled" } },
+                    { "id": "claude", "model_picker_enabled": false,
+                      "policy": { "state": "enabled" } },
+                    { "id": "disabled-model", "model_picker_enabled": false,
+                      "policy": { "state": "disabled" } },
+                ]
+            }),
+            true, // allow_policy_fallback (Individual endpoint)
+        )
+        .expect("ids");
+        assert_eq!(ids, vec!["gpt-5".to_owned(), "claude".to_owned()]);
+    }
+
+    /// All picker flags false on enterprise endpoint → strict (empty result),
+    /// even with enabled policies.
+    #[test]
+    fn parse_available_model_ids_no_fallback_enterprise() {
+        let ids = parse_available_copilot_model_ids(
+            &json!({
+                "data": [
+                    { "id": "gpt-5", "model_picker_enabled": false,
+                      "policy": { "state": "enabled" } },
+                ]
+            }),
+            false, // no fallback (enterprise endpoint)
+        )
+        .expect("ids");
+        assert!(ids.is_empty());
+    }
+
+    /// Mixed picker → picker wins even with policy enabled.
+    #[test]
+    fn parse_available_model_ids_picker_wins_over_policy() {
+        let ids = parse_available_copilot_model_ids(
+            &json!({
+                "data": [
+                    { "id": "picker-model", "model_picker_enabled": true,
+                      "policy": { "state": "enabled" } },
+                    { "id": "policy-only-model", "model_picker_enabled": false,
+                      "policy": { "state": "enabled" } },
+                ]
+            }),
+            true,
+        )
+        .expect("ids");
+        assert_eq!(ids, vec!["picker-model".to_owned()]);
     }
 
     // ----- flow tests against the mock -----

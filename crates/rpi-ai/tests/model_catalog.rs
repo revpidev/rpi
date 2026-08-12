@@ -12,7 +12,10 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use rpi_ai::auth::{find_env_keys, get_env_api_key};
 use rpi_ai::generated::{builtin_catalog, get_builtin_model_data_generated_at, get_builtin_models};
+use rpi_ai::types::{InputModality, MaxTokensField};
+use rpi_ai::types::{ProviderEnv, ThinkingFormat};
 use sha2::Digest;
 
 fn data_dir() -> PathBuf {
@@ -54,7 +57,7 @@ fn test_vendored_files_match_manifest_sha256() {
     )
     .expect("manifest json");
     let files = manifest["files"].as_object().expect("files");
-    assert_eq!(files.len(), 37);
+    assert_eq!(files.len(), 39);
     for (name, hash) in files {
         let bytes = std::fs::read(data_dir().join(name)).expect("vendored file");
         assert_eq!(
@@ -69,7 +72,7 @@ fn test_vendored_files_match_manifest_sha256() {
 fn test_vendored_set_matches_upstream_file_set() {
     let vendored = provider_files(&data_dir());
     let upstream = provider_files(&upstream_data_dir());
-    assert_eq!(vendored.len(), 37);
+    assert_eq!(vendored.len(), 39);
     assert_eq!(
         vendored.keys().collect::<Vec<_>>(),
         upstream.keys().collect::<Vec<_>>(),
@@ -142,7 +145,7 @@ fn test_catalog_field_by_field_against_upstream() {
             total += 1;
         }
     }
-    assert_eq!(total, 1153);
+    assert_eq!(total, 1217);
 }
 
 #[test]
@@ -154,9 +157,296 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-07-30T01:56:27.841Z); update on catalog refresh.
+    // (2026-08-11T04:37:23.682Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_785_376_587_841)
+        Some(1_786_423_043_682)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T26: Baseten golden tests (port of baseten-models.test.ts @ c1019d920)
+// ---------------------------------------------------------------------------
+
+fn get_model(provider: &str, id: &str) -> rpi_ai::types::Model {
+    get_builtin_models(provider)
+        .iter()
+        .find(|m| m.id == id)
+        .unwrap_or_else(|| panic!("model {provider}/{id} not found"))
+        .clone()
+}
+
+/// "registers GLM 5.2 as the default OpenAI-compatible reasoning model"
+/// (baseten-models.test.ts).
+#[test]
+fn test_baseten_glm52_reasoning_model_fields() {
+    let model = get_model("baseten", "zai-org/GLM-5.2");
+    assert_eq!(model.api.as_str(), "openai-completions");
+    assert_eq!(model.provider, "baseten");
+    assert_eq!(model.base_url, "https://inference.baseten.co/v1");
+    assert!(model.reasoning);
+    // thinkingLevelMap: off→none, high→high, max→max (rest null)
+    let tlm = model.thinking_level_map.as_ref().expect("thinkingLevelMap");
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::Off),
+        Some(&Some("none".to_owned()))
+    );
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::High),
+        Some(&Some("high".to_owned()))
+    );
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::Max),
+        Some(&Some("max".to_owned()))
+    );
+    assert_eq!(model.input, vec![InputModality::Text]);
+    assert_eq!(model.context_window, 1048576);
+    assert_eq!(model.max_tokens, 262144);
+    assert_eq!(model.cost.rates.input, 1.4);
+    assert_eq!(model.cost.rates.output, 4.4);
+    assert_eq!(model.cost.rates.cache_read, 0.3);
+    assert_eq!(model.cost.rates.cache_write, 0.0);
+
+    let compat = model.compat.as_ref().expect("compat");
+    assert_eq!(compat.supports_store, Some(false));
+    assert_eq!(compat.supports_developer_role, Some(false));
+    assert_eq!(compat.supports_reasoning_effort, Some(true));
+    assert_eq!(compat.supports_usage_in_streaming, Some(true));
+    assert_eq!(compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
+    assert_eq!(compat.supports_strict_mode, Some(true));
+    assert_eq!(compat.supports_long_cache_retention, Some(false));
+    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Baseten));
+    // chatTemplateArgs: { enable_thinking: { $var: "thinking.enabled" } }
+    let cta = compat
+        .chat_template_args
+        .as_ref()
+        .expect("chatTemplateArgs");
+    assert!(cta.contains_key("enable_thinking"));
+}
+
+/// "models Kimi K2.6 reasoning as an explicit off/on toggle"
+/// (baseten-models.test.ts).
+#[test]
+fn test_baseten_kimi_k26_toggle_thinking() {
+    let model = get_model("baseten", "moonshotai/Kimi-K2.6");
+    let tlm = model.thinking_level_map.as_ref().expect("thinkingLevelMap");
+    // off→off, high→high (rest null): explicit off/on toggle
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::Off),
+        Some(&Some("off".to_owned()))
+    );
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::High),
+        Some(&Some("high".to_owned()))
+    );
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::Max),
+        Some(&None)
+    );
+
+    let compat = model.compat.as_ref().expect("compat");
+    assert_eq!(compat.supports_reasoning_effort, Some(false));
+    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Baseten));
+    assert!(compat.chat_template_args.is_some());
+}
+
+/// "resolves BASETEN_API_KEY from the environment" (baseten-models.test.ts).
+#[test]
+fn test_baseten_env_key_resolution() {
+    let env = ProviderEnv::from([("BASETEN_API_KEY".to_owned(), "test-baseten-key".to_owned())]);
+    assert_eq!(
+        find_env_keys("baseten", Some(&env)),
+        Some(vec!["BASETEN_API_KEY".to_owned()])
+    );
+    assert_eq!(
+        get_env_api_key("baseten", Some(&env)).as_deref(),
+        Some("test-baseten-key")
+    );
+}
+
+/// All 16 Baseten models are non-deprecated (the generator's
+/// `processBasetenModels` skips status=="deprecated").
+#[test]
+fn test_baseten_deprecated_models_filtered() {
+    let models = get_builtin_models("baseten");
+    // 16 models = upstream catalog after deprecated filtering.
+    assert_eq!(
+        models.len(),
+        16,
+        "Baseten should have 16 non-deprecated models"
+    );
+    // No model name or id contains "deprecated".
+    for model in models.iter() {
+        assert!(
+            !model.id.to_lowercase().contains("deprecat")
+                && !model.name.to_lowercase().contains("deprecat"),
+            "deprecated model leaked: {}",
+            model.id
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T26: Qwen Token Plan Individual strict whitelist
+// (port of generate-models-strict.test.ts @ c03d78bdc)
+// ---------------------------------------------------------------------------
+
+/// The upstream `QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS` whitelist has exactly 7
+/// IDs; the vendored catalog must match. Upstream drift = explicit failure.
+/// Port of `assertExactModelIds` intent (generate-models-strict.test.ts).
+#[test]
+fn test_qwen_token_plan_individual_whitelist_exact() {
+    const EXPECTED: &[&str] = &[
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-pro",
+        "glm-5.2",
+        "qwen3.6-flash",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.8-max",
+    ];
+    let models = get_builtin_models("qwen-token-plan-individual");
+    let mut actual: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    actual.sort();
+    let mut expected: Vec<&str> = EXPECTED.to_vec();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "qwen-token-plan-individual whitelist diverged"
+    );
+    assert_eq!(models.len(), 7);
+}
+
+/// Individual variant shares QWEN_TOKEN_PLAN_API_KEY and the international
+/// endpoint (port of qwen-token-plan-individual.ts).
+#[test]
+fn test_qwen_token_plan_individual_shares_api_key() {
+    let env = ProviderEnv::from([(
+        "QWEN_TOKEN_PLAN_API_KEY".to_owned(),
+        "shared-key".to_owned(),
+    )]);
+    assert_eq!(
+        find_env_keys("qwen-token-plan-individual", Some(&env)),
+        Some(vec!["QWEN_TOKEN_PLAN_API_KEY".to_owned()])
+    );
+    let models = get_builtin_models("qwen-token-plan-individual");
+    let first = models.first().expect("has models");
+    assert_eq!(
+        first.base_url,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T26: Catalog correction assertions (8 items, data baked into vendored JSON)
+// ---------------------------------------------------------------------------
+
+/// 1. qwen3.8-max-preview → qwen3.8-max (2f7f75a20, #7670).
+#[test]
+fn test_correction_qwen38_max_rename() {
+    let models = get_builtin_models("qwen-token-plan-individual");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"qwen3.8-max"),
+        "qwen3.8-max should be present"
+    );
+    assert!(
+        !ids.contains(&"qwen3.8-max-preview"),
+        "qwen3.8-max-preview should be absent"
+    );
+}
+
+/// 2. Copilot Grok 4.5 routed via Responses API (720f0e8ee, #7560).
+#[test]
+fn test_correction_copilot_grok45_responses() {
+    let model = get_model("github-copilot", "grok-4.5");
+    assert_eq!(model.api.as_str(), "openai-responses");
+}
+
+/// 3. Fireworks Kimi K3: openai-completions + reasoning-effort + deferred
+///    tools (a688e257c, #7199).
+#[test]
+fn test_correction_fireworks_kimi_k3_compat() {
+    let model = get_model("fireworks", "accounts/fireworks/models/kimi-k3");
+    assert_eq!(model.api.as_str(), "openai-completions");
+    let compat = model.compat.as_ref().expect("compat");
+    assert_eq!(compat.thinking_format, Some(ThinkingFormat::Openai));
+    assert_eq!(
+        compat.requires_reasoning_content_on_assistant_messages,
+        Some(true)
+    );
+    assert_eq!(
+        compat.deferred_tools_mode,
+        Some(rpi_ai::types::DeferredToolsMode::Kimi)
+    );
+    assert_eq!(compat.send_session_affinity_headers, Some(true));
+}
+
+/// 4. Fireworks GLM 5.2: session affinity + no long cache retention
+///    (b9497c8c1, #7676).
+#[test]
+fn test_correction_fireworks_glm52_session_affinity() {
+    let model = get_model("fireworks", "accounts/fireworks/models/glm-5p2");
+    assert_eq!(model.api.as_str(), "openai-completions");
+    let compat = model.compat.as_ref().expect("compat");
+    assert_eq!(compat.send_session_affinity_headers, Some(true));
+    assert_eq!(compat.supports_long_cache_retention, Some(false));
+}
+
+/// 5. GPT-5.6 Terra/Luna price reduction (b889a0ce3).
+#[test]
+fn test_correction_gpt56_pricing() {
+    let luna = get_model("openai", "gpt-5.6-luna");
+    assert_eq!(luna.cost.rates.input, 0.2);
+    assert_eq!(luna.cost.rates.output, 1.2);
+    assert_eq!(luna.cost.rates.cache_read, 0.02);
+    assert_eq!(luna.cost.rates.cache_write, 0.25);
+
+    let terra = get_model("openai", "gpt-5.6-terra");
+    assert_eq!(terra.cost.rates.input, 2.0);
+    assert_eq!(terra.cost.rates.output, 12.0);
+    assert_eq!(terra.cost.rates.cache_read, 0.2);
+    assert_eq!(terra.cost.rates.cache_write, 2.5);
+}
+
+/// 6. Groq Qwen reasoning override → qwen/qwen3.6-27b (71f6c25c3).
+#[test]
+fn test_correction_groq_qwen_reasoning_override() {
+    let model = get_model("groq", "qwen/qwen3.6-27b");
+    let tlm = model.thinking_level_map.as_ref().expect("thinkingLevelMap");
+    assert_eq!(
+        tlm.get(&rpi_ai::types::ModelThinkingLevel::High),
+        Some(&Some("default".to_owned()))
+    );
+    // The old qwen/qwen3-32b should be absent.
+    let models = get_builtin_models("groq");
+    assert!(
+        !models.iter().any(|m| m.id == "qwen/qwen3-32b"),
+        "old qwen/qwen3-32b should be replaced by qwen/qwen3.6-27b"
+    );
+}
+
+/// 7. OpenCode Go display name (05558a792, #7157).
+#[test]
+fn test_correction_opencode_go_display_name() {
+    let go_provider = rpi_ai::providers::builtin_providers()
+        .into_iter()
+        .find(|p| p.id() == "opencode-go")
+        .expect("opencode-go provider");
+    assert_eq!(go_provider.name(), "OpenCode Go");
+}
+
+/// 8. Copilot policy fallback is tested in auth/oauth/github_copilot.rs
+///    (parse_available_model_ids_policy_fallback_* tests). This test
+///    verifies the Individual-endpoint base URL is correct.
+#[test]
+fn test_correction_copilot_individual_endpoint() {
+    let copilot = rpi_ai::providers::builtin_providers()
+        .into_iter()
+        .find(|p| p.id() == "github-copilot")
+        .expect("github-copilot provider");
+    assert_eq!(
+        copilot.base_url(),
+        Some("https://api.individual.githubcopilot.com")
     );
 }

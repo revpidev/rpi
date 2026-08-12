@@ -1,12 +1,12 @@
-//! Port of `packages/ai/src/providers/all.ts` @ pi 0.82.1 (2efa728) — T13 W4
-//! phase 1: the built-in provider registry (38 factory ids, upstream
+//! Port of `packages/ai/src/providers/all.ts` @ pi 0.84.1 (`4181f66`) — T13 W4
+//! phase 1: the built-in provider registry (40 factory ids, upstream
 //! registration order) and the catalog data path.
 //!
 //! Factory implementations (`xxxProvider()` per upstream `providers/xxx.ts`)
 //! landed in the follow-up W4 waves as `src/providers/<id>.rs` files.
 //!
 //! Intentional differences:
-//! - Upstream `builtinProviders()` constructs all 38 providers; the Rust
+//! - Upstream `builtinProviders()` constructs all 40 providers; the Rust
 //!   `builtin_providers()` does the same now that every W4 wave has landed
 //!   (while waves were in flight it yielded only the ported subset).
 //! - The `openrouter-images` image-generation provider is part of the images
@@ -20,6 +20,7 @@ pub mod amazon_bedrock;
 pub mod ant_ling;
 pub mod anthropic;
 pub mod azure_openai_responses;
+pub mod baseten;
 pub mod cerebras;
 pub mod cloudflare_ai_gateway;
 pub mod cloudflare_stream;
@@ -45,6 +46,7 @@ pub mod opencode_go;
 pub mod openrouter;
 pub mod qwen_token_plan;
 pub mod qwen_token_plan_cn;
+pub mod qwen_token_plan_individual;
 pub mod radius;
 pub mod radius_config;
 pub mod together;
@@ -95,6 +97,11 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         id: "azure-openai-responses",
         in_catalog: true,
         factory: Some(azure_openai_responses::azure_openai_responses_provider),
+    },
+    BuiltinProviderSpec {
+        id: "baseten",
+        in_catalog: true,
+        factory: Some(baseten::baseten_provider),
     },
     BuiltinProviderSpec {
         id: "cerebras",
@@ -217,6 +224,11 @@ pub static BUILTIN_PROVIDERS: &[BuiltinProviderSpec] = &[
         factory: Some(qwen_token_plan_cn::qwen_token_plan_cn_provider),
     },
     BuiltinProviderSpec {
+        id: "qwen-token-plan-individual",
+        in_catalog: true,
+        factory: Some(qwen_token_plan_individual::qwen_token_plan_individual_provider),
+    },
+    BuiltinProviderSpec {
         id: "radius",
         in_catalog: false,
         factory: Some(radius::radius_provider),
@@ -302,12 +314,13 @@ mod tests {
     use super::*;
     use crate::generated::{builtin_catalog, get_builtin_models};
 
-    /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ 2efa728.
-    const UPSTREAM_ORDER: [&str; 38] = [
+    /// Upstream `builtinProviders()` order, transcribed from `all.ts` @ 4181f66.
+    const UPSTREAM_ORDER: [&str; 40] = [
         "amazon-bedrock",
         "ant-ling",
         "anthropic",
         "azure-openai-responses",
+        "baseten",
         "cerebras",
         "cloudflare-ai-gateway",
         "cloudflare-workers-ai",
@@ -332,6 +345,7 @@ mod tests {
         "openrouter",
         "qwen-token-plan",
         "qwen-token-plan-cn",
+        "qwen-token-plan-individual",
         "radius",
         "together",
         "vercel-ai-gateway",
@@ -370,7 +384,7 @@ mod tests {
                 assert!(!catalog.providers().contains(&spec.id));
             }
         }
-        // 37 catalog entries = 38 registry entries minus dynamic radius.
+        // 39 catalog entries = 40 registry entries minus dynamic radius.
         assert_eq!(catalog.providers().len(), BUILTIN_PROVIDERS.len() - 1);
     }
 
@@ -388,11 +402,12 @@ mod tests {
         // Group C wave: 10 factories; group D wave: 12 more; group A wave:
         // 8 more; group B wave (this): 8 more. Other waves add their own ids
         // here as they land.
-        const PORTED: [&str; 38] = [
+        const PORTED: [&str; 40] = [
             "amazon-bedrock",
             "ant-ling",
             "anthropic",
             "azure-openai-responses",
+            "baseten",
             "cerebras",
             "cloudflare-ai-gateway",
             "cloudflare-workers-ai",
@@ -417,6 +432,7 @@ mod tests {
             "openrouter",
             "qwen-token-plan",
             "qwen-token-plan-cn",
+            "qwen-token-plan-individual",
             "radius",
             "together",
             "vercel-ai-gateway",

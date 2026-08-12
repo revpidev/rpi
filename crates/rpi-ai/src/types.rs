@@ -1389,7 +1389,7 @@ pub enum MaxTokensField {
     MaxTokens,
 }
 
-/// `OpenAICompletionsCompat.thinkingFormat` (10 values).
+/// `OpenAICompletionsCompat.thinkingFormat` (11 values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingFormat {
     /// Uses `reasoning_effort`. Default.
@@ -1419,6 +1419,11 @@ pub enum ThinkingFormat {
     /// Uses top-level `thinking: string`.
     #[serde(rename = "string-thinking")]
     StringThinking,
+    /// Uses `chat_template_args` (Baseten-specific) plus optional
+    /// `reasoning_effort` when the model supports it.
+    /// Port of `openai-completions.ts:779` @ `c1019d920` / `4181f66`.
+    #[serde(rename = "baseten")]
+    Baseten,
     /// Uses `reasoning: { effort }` only when the mapped effort is non-null.
     #[serde(rename = "ant-ling")]
     AntLing,

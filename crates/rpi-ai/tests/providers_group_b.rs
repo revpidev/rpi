@@ -427,7 +427,7 @@ async fn test_opencode_go_factory_config_and_auth() {
     assert_factory_basics(
         &provider,
         "opencode-go",
-        "OpenCode Zen Go",
+        "OpenCode Go",
         None,
         &[
             ApiKind::ANTHROPIC_MESSAGES,

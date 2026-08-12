@@ -271,10 +271,11 @@ fn test_catalog_zai_tool_stream_baked() {
     // Merged over detection: zaiToolStream survives get_compat.
     assert!(get_compat(glm47).zai_tool_stream);
 
-    // Older GLM 4.5 family does not support tool streaming.
-    let glm45 = get_builtin_model("zai", "glm-4.5-air").expect("glm-4.5-air");
-    assert_eq!(glm45.compat.as_ref().and_then(|c| c.zai_tool_stream), None);
-    assert!(!get_compat(glm45).zai_tool_stream);
+    // Older GLM 4.5 family has been retired upstream; all remaining zai
+    // models (glm-4.7, glm-5-turbo, glm-5.2, glm-5.2-highspeed) support
+    // tool streaming. Verify glm-5-turbo as a second positive case.
+    let glm5t = get_builtin_model("zai", "glm-5-turbo").expect("glm-5-turbo");
+    assert!(get_compat(glm5t).zai_tool_stream);
 
     // GLM 5.2 fixed thinking level map.
     let glm52 = get_builtin_model("zai", "glm-5.2").expect("glm-5.2");

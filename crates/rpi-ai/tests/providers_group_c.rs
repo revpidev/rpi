@@ -191,7 +191,8 @@ async fn auth_resolves_the_env_key() {
 }
 
 /// Upstream `openai-completions-tool-choice.test.ts`: `zaiToolStream` is set
-/// on the newer GLM models, absent on `glm-4.5-air` — for both Z.AI regions.
+/// on all current GLM models — for both Z.AI regions. The older GLM 4.5
+/// family has been retired upstream (catalog refresh @ 4181f66).
 #[test]
 fn zai_tool_stream_compat_is_baked_into_the_catalog() {
     for factory in [
@@ -209,16 +210,9 @@ fn zai_tool_stream_compat_is_baked_into_the_catalog() {
                 .as_ref()
                 .and_then(|compat| compat.zai_tool_stream)
         };
-        for id in [
-            "glm-5.1",
-            "glm-4.7",
-            "glm-5-turbo",
-            "glm-5.2",
-            "glm-5v-turbo",
-        ] {
+        for id in ["glm-4.7", "glm-5-turbo", "glm-5.2", "glm-5.2-highspeed"] {
             assert_eq!(zai_tool_stream(id), Some(true), "{id}");
         }
-        assert_eq!(zai_tool_stream("glm-4.5-air"), None);
     }
 }
 
@@ -298,10 +292,11 @@ fn kimi_coding_oauth_slot_wired() {
 /// models and omit the image-generation models.
 #[test]
 fn qwen_token_plan_exposes_text_models_only() {
-    const TEXT_MODELS: [&str; 15] = [
+    const TEXT_MODELS: [&str; 16] = [
         "MiniMax-M2.5",
         "deepseek-v3.2",
         "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
         "glm-5",
         "glm-5.1",
@@ -313,7 +308,7 @@ fn qwen_token_plan_exposes_text_models_only() {
         "qwen3.6-plus",
         "qwen3.7-max",
         "qwen3.7-plus",
-        "qwen3.8-max-preview",
+        "qwen3.8-max",
     ];
     const IMAGE_MODELS: [&str; 4] = [
         "qwen-image-2.0",

@@ -924,15 +924,18 @@ pub fn convert_tools(
 // Chat template kwargs (thinkingFormat "chat-template")
 // ---------------------------------------------------------------------------
 
-/// `buildChatTemplateKwargs`: resolves each configured kwarg; `None` when no
-/// kwarg survives resolution.
-fn build_chat_template_kwargs(
+/// `buildChatTemplateValues` (upstream `openai-completions.ts:892`): resolves
+/// each configured kwarg/arg; `None` when no entry survives resolution.
+/// Parameterized over the source map so both `chat_template_kwargs` and
+/// `chat_template_args` share one implementation (Baseten uses the latter,
+/// `openai-completions.ts:784` @ `c1019d920`).
+fn build_chat_template_values(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
-    compat: &ResolvedOpenAICompletionsCompat,
+    values: &std::collections::BTreeMap<String, ChatTemplateKwargValue>,
 ) -> Option<Value> {
     let mut kwargs = Map::new();
-    for (key, value) in &compat.chat_template_kwargs {
+    for (key, value) in values {
         if let Some(resolved) = resolve_chat_template_kwarg_value(model, reasoning_effort, value) {
             kwargs.insert(key.clone(), resolved);
         }
@@ -942,6 +945,24 @@ fn build_chat_template_kwargs(
     } else {
         Some(Value::Object(kwargs))
     }
+}
+
+/// `chat_template_kwargs` resolution (chat-template thinkingFormat).
+fn build_chat_template_kwargs(
+    model: &Model,
+    reasoning_effort: Option<ModelThinkingLevel>,
+    compat: &ResolvedOpenAICompletionsCompat,
+) -> Option<Value> {
+    build_chat_template_values(model, reasoning_effort, &compat.chat_template_kwargs)
+}
+
+/// `chat_template_args` resolution (baseten thinkingFormat).
+fn build_chat_template_args(
+    model: &Model,
+    reasoning_effort: Option<ModelThinkingLevel>,
+    compat: &ResolvedOpenAICompletionsCompat,
+) -> Option<Value> {
+    build_chat_template_values(model, reasoning_effort, &compat.chat_template_args)
 }
 
 /// `resolveChatTemplateKwargValue`: scalars pass through; `$var` refs resolve
@@ -1353,6 +1374,32 @@ fn apply_thinking_params(
     } else if compat.thinking_format == ThinkingFormat::ChatTemplate && model.reasoning {
         if let Some(kwargs) = build_chat_template_kwargs(model, reasoning_effort, compat) {
             params.insert("chat_template_kwargs".to_owned(), kwargs);
+        }
+    } else if compat.thinking_format == ThinkingFormat::Baseten && model.reasoning {
+        // Port of `openai-completions.ts:779-796` @ c1019d920 / 4181f66.
+        // Baseten sends `chat_template_args` (resolved from compat) plus
+        // `reasoning_effort` when the model supports it.
+        if let Some(args) = build_chat_template_args(model, reasoning_effort, compat) {
+            params.insert("chat_template_args".to_owned(), args);
+        }
+        if compat.supports_reasoning_effort {
+            // mappedEffort === undefined ? requestedEffort : mappedEffort
+            let effort: Option<Option<String>> = match reasoning_effort {
+                Some(level) => Some(
+                    match model
+                        .thinking_level_map
+                        .as_ref()
+                        .and_then(|map| map.get(&level))
+                    {
+                        Some(mapped) => mapped.clone(),
+                        None => Some(level.as_str().to_owned()),
+                    },
+                ),
+                None => off_value(model),
+            };
+            if let Some(Some(effort_str)) = effort {
+                params.insert("reasoning_effort".to_owned(), json!(effort_str));
+            }
         }
     } else if compat.thinking_format == ThinkingFormat::Deepseek && model.reasoning {
         if reasoning_effort.is_some() {
@@ -4150,6 +4197,61 @@ mod build_and_stream_tests {
         );
         assert_eq!(params["reasoning"], json!({"enabled": true}));
         assert_eq!(params["reasoning_effort"], json!("high"));
+
+        // baseten (c1019d920): chat_template_args with enable_thinking +
+        // reasoning_effort when supported.
+        let baseten_glm52 = make_model(json!({
+            "compat": {
+                "thinkingFormat": "baseten",
+                "supportsReasoningEffort": true,
+                "chatTemplateArgs": {
+                    "enable_thinking": {"$var": "thinking.enabled"}
+                }
+            },
+            "thinkingLevelMap": {"off": "none", "high": "high", "max": "max"}
+        }));
+        // With reasoning=high: enable_thinking=true, reasoning_effort="high".
+        let params = params_for(
+            &baseten_glm52,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High),
+            CacheRetention::Short,
+        );
+        assert_eq!(
+            params["chat_template_args"],
+            json!({"enable_thinking": true})
+        );
+        assert_eq!(params["reasoning_effort"], json!("high"));
+        // With thinking off: enable_thinking=false, reasoning_effort="none".
+        let params = params_for(&baseten_glm52, &ctx, &no_effort, CacheRetention::Short);
+        assert_eq!(
+            params["chat_template_args"],
+            json!({"enable_thinking": false})
+        );
+        assert_eq!(params["reasoning_effort"], json!("none"));
+
+        // baseten toggle-only (e.g. Kimi K2.6): no reasoning_effort support.
+        let baseten_toggle = make_model(json!({
+            "compat": {
+                "thinkingFormat": "baseten",
+                "supportsReasoningEffort": false,
+                "chatTemplateArgs": {
+                    "enable_thinking": {"$var": "thinking.enabled"}
+                }
+            },
+            "thinkingLevelMap": {"off": "off", "high": "high"}
+        }));
+        let params = params_for(
+            &baseten_toggle,
+            &ctx,
+            &with_effort(ModelThinkingLevel::High),
+            CacheRetention::Short,
+        );
+        assert_eq!(
+            params["chat_template_args"],
+            json!({"enable_thinking": true})
+        );
+        assert!(params.get("reasoning_effort").is_none());
 
         // string-thinking: plain string; off default "none".
         let string_thinking = make_model(json!({"compat": {"thinkingFormat": "string-thinking"}}));
