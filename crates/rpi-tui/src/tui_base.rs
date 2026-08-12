@@ -288,8 +288,8 @@ impl TuiBase {
     /// frame (tui.ts:784-786).
     fn request_immediate_render(&self) {
         let mut schedule = lock_shared(&self.schedule);
-        // Upstream `cancelRenderTimer` (tui.ts:777).
-        schedule.deadline = None;
+        // Overwriting the deadline doubles as upstream `cancelRenderTimer`
+        // (tui.ts:777): a queued throttled frame is preempted by `now`.
         schedule.requested = true;
         schedule.deadline = Some(Instant::now());
     }
