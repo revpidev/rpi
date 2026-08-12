@@ -204,7 +204,7 @@ impl Provider for RadiusProvider {
                             if !legacy.is_empty() {
                                 let legacy_clone = legacy.clone();
                                 let models_for_update = models.clone();
-                                context
+                                let applied = context
                                     .publish
                                     .publish(ModelsPublication {
                                         persist: Some(Some(ModelsStoreEntry {
@@ -220,6 +220,12 @@ impl Provider for RadiusProvider {
                                         })),
                                     })
                                     .await?;
+                                // radius.ts:49-62: a stale generation or
+                                // cancelled signal aborts the rest of the
+                                // refresh here as well.
+                                if !applied {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -645,5 +651,60 @@ mod tests {
             .expect("refresh");
         // The stale phase-1 restore must not overwrite the in-memory list.
         assert!(provider.get_models().is_empty());
+    }
+
+    /// The legacy credential-catalog import goes through the publish gate
+    /// too (radius.ts:49-62): with a stale generation the update is skipped
+    /// and the refresh returns early without touching the in-memory list or
+    /// the store.
+    #[tokio::test]
+    async fn legacy_import_skips_update_on_stale_generation() {
+        use crate::models::{PublishHandle, PublishShared};
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "gatewayConfig".to_owned(),
+            gateway_config_json("https://radius.pi.dev/api"),
+        );
+        let credential = Credential::OAuth(crate::auth::OAuthCredential {
+            refresh: "r".to_owned(),
+            access: "a".to_owned(),
+            expires: i64::MAX,
+            extra,
+        });
+        let store: Arc<dyn crate::models_store::ModelsStore> =
+            Arc::new(crate::models_store::InMemoryModelsStore::new());
+        let provider = radius_provider_with(RadiusProviderOptions {
+            gateway: Some("http://127.0.0.1:1".to_owned()), // unreachable: must not be fetched
+            ..Default::default()
+        });
+        let signal = tokio_util::sync::CancellationToken::new();
+        // Context captured generation 1; a newer refresh bumped it to 2.
+        let shared = std::sync::Arc::new(PublishShared {
+            provider_id: "radius".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: std::sync::Arc::new(std::sync::RwLock::new(
+                [("radius".to_owned(), 2u64)].into(),
+            )),
+        });
+        let context = crate::models::RefreshModelsContext {
+            credential: Some(credential),
+            stored: None,
+            publish: PublishHandle { shared },
+            allow_network: false,
+            force: None,
+            signal,
+        };
+        provider
+            .refresh_models(context)
+            .expect("refresh")
+            .await
+            .expect("refresh");
+        // The stale legacy import must neither overwrite the in-memory
+        // list nor persist the catalog.
+        assert!(provider.get_models().is_empty());
+        assert!(store.read("radius", None).await.expect("read").is_none());
     }
 }
