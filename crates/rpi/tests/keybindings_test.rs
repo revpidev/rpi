@@ -308,14 +308,17 @@ fn test_config_ordering_extras_alphabetical() {
     assert_eq!(keys[2].as_str(), "zzz_unknown");
 }
 
-// --- All 73 default keys spot-checks (docs/keybindings.md parity) ---------
+// --- All 75 default keys spot-checks (docs/keybindings.md parity) ---------
 
 #[test]
 fn test_all_tui_editor_defaults() {
     let mgr = KeybindingsManager::new();
-    // Check all 21 tui.editor.* defaults
+    // Check all 23 tui.editor.* defaults
     assert_eq!(mgr.get_keys("tui.editor.cursorUp"), vec!["up"]);
     assert_eq!(mgr.get_keys("tui.editor.cursorDown"), vec!["down"]);
+    // Dedicated prompt-history actions are unbound by default (16ad96ae8).
+    assert!(mgr.get_keys("tui.editor.historyPrevious").is_empty());
+    assert!(mgr.get_keys("tui.editor.historyNext").is_empty());
     assert_eq!(
         mgr.get_keys("tui.editor.cursorLeft"),
         vec!["left", "ctrl+b"]
@@ -334,16 +337,22 @@ fn test_all_tui_editor_defaults() {
     );
     assert_eq!(
         mgr.get_keys("tui.editor.cursorLineStart"),
-        vec!["home", "ctrl+a"]
+        vec!["home", "ctrl+home", "ctrl+a"]
     );
     assert_eq!(
         mgr.get_keys("tui.editor.cursorLineEnd"),
-        vec!["end", "ctrl+e"]
+        vec!["end", "ctrl+end", "ctrl+e"]
     );
     assert_eq!(mgr.get_keys("tui.editor.jumpForward"), vec!["ctrl+]"]);
     assert_eq!(mgr.get_keys("tui.editor.jumpBackward"), vec!["ctrl+alt+]"]);
-    assert_eq!(mgr.get_keys("tui.editor.pageUp"), vec!["pageUp"]);
-    assert_eq!(mgr.get_keys("tui.editor.pageDown"), vec!["pageDown"]);
+    assert_eq!(
+        mgr.get_keys("tui.editor.pageUp"),
+        vec!["pageUp", "ctrl+pageUp"]
+    );
+    assert_eq!(
+        mgr.get_keys("tui.editor.pageDown"),
+        vec!["pageDown", "ctrl+pageDown"]
+    );
     assert_eq!(
         mgr.get_keys("tui.editor.deleteCharBackward"),
         vec!["backspace"]

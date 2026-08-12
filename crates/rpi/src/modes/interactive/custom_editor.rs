@@ -1,6 +1,8 @@
 //! Custom editor with app-level keybinding dispatch — port of
 //! `packages/coding-agent/src/modes/interactive/components/custom-editor.ts`
-//! @ pi 0.82.1 (2efa728).
+//! @ pi 0.82.1 (2efa728), with the prompt-history precedence block tracking
+//! 4181f66 (16ad96ae8: explicit `tui.editor.historyPrevious`/`historyNext`
+//! bindings dispatch to the editor before app actions).
 //!
 //! Intentional differences:
 //! - Upstream extends the `Editor` class and is placed in the tree directly;
@@ -207,6 +209,16 @@ impl CustomEditor {
             }
         }
 
+        // Explicit history bindings take precedence over app actions while the
+        // editor is focused (custom-editor.ts:69-75 @ 4181f66, 16ad96ae8).
+        // This lets users bind Ctrl+P even though it cycles models by default.
+        if read.matches_id(data, "tui.editor.historyPrevious")
+            || read.matches_id(data, "tui.editor.historyNext")
+        {
+            self.editor.handle_input(data);
+            return;
+        }
+
         // All other app actions (custom-editor.ts:70-75).
         for (action, handler) in self.action_handlers.iter_mut() {
             if *action != "app.interrupt" && *action != "app.exit" && read.matches_id(data, action)
@@ -283,8 +295,14 @@ impl Focusable for CustomEditorRegion {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::MutexGuard;
 
-    /// Install the full 73-entry keybinding table (the ids the dispatch
+    /// Serializes the tests in this module: every test installs the global
+    /// keybinding registry (and one test installs user overrides), and cargo
+    /// runs them on parallel threads.
+    static KEYBINDINGS_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Install the full 75-entry keybinding table (the ids the dispatch
     /// checks are all default bindings, so the full table is equivalent to
     /// the previously-used custom manager — and identical across parallel
     /// test threads, avoiding global-manager races).
@@ -295,10 +313,12 @@ mod tests {
     struct Harness {
         editor: Arc<Mutex<CustomEditor>>,
         _tui: TuiMainScreen,
+        _keybindings_guard: MutexGuard<'static, ()>,
     }
 
     impl Harness {
         fn new() -> Self {
+            let guard = KEYBINDINGS_LOCK.lock().unwrap();
             install_keybindings();
             let tui = TuiMainScreen::new(Box::new(super::super::test_support::TestTerminal::new()));
             let editor = Arc::new(Mutex::new(CustomEditor::new(
@@ -311,7 +331,11 @@ mod tests {
                 },
                 EditorOptions::default(),
             )));
-            Self { editor, _tui: tui }
+            Self {
+                editor,
+                _tui: tui,
+                _keybindings_guard: guard,
+            }
         }
 
         fn dispatch(&self, data: &str) {
@@ -425,5 +449,90 @@ mod tests {
         h.dispatch("\r");
         assert_eq!(*submitted.lock().unwrap(), vec!["hello".to_string()]);
         assert_eq!(h.editor.lock().unwrap().get_text(), "");
+    }
+
+    // --- CustomEditor prompt history keybindings
+    //     (custom-editor-history-keybindings.test.ts @ 4181f66, 16ad96ae8) ---
+
+    #[test]
+    fn gives_an_explicit_history_binding_precedence_over_model_cycling() {
+        use rpi_tui::keybindings::{
+            KeyBindingValue as TuiKeyBindingValue, KeybindingsConfig as TuiKeybindingsConfig,
+        };
+
+        let _guard = KEYBINDINGS_LOCK.lock().unwrap();
+
+        // Install the full table with the history actions user-bound
+        // (mirror of `install_global_keybindings` with a user config).
+        // Re-installable: other test binaries' helpers reinstall the default
+        // global, so the dispatch below re-installs right before each key.
+        let install_custom = || {
+            let definitions: Vec<(String, rpi_tui::keybindings::KeybindingDefinition)> =
+                crate::core::keybindings::keybinding_definitions()
+                    .iter()
+                    .map(|(id, definition)| {
+                        (
+                            id.clone(),
+                            rpi_tui::keybindings::KeybindingDefinition {
+                                default_keys: match &definition.default_keys {
+                                    crate::core::keybindings::KeyBindingValue::Single(key) => {
+                                        TuiKeyBindingValue::Single(key.clone())
+                                    }
+                                    crate::core::keybindings::KeyBindingValue::Multiple(keys) => {
+                                        TuiKeyBindingValue::Multiple(keys.clone())
+                                    }
+                                },
+                                description: Some(definition.description),
+                            },
+                        )
+                    })
+                    .collect();
+            let mut user_bindings = TuiKeybindingsConfig::new();
+            user_bindings.insert(
+                "tui.editor.historyPrevious".to_string(),
+                TuiKeyBindingValue::Single("ctrl+p".to_string()),
+            );
+            user_bindings.insert(
+                "tui.editor.historyNext".to_string(),
+                TuiKeyBindingValue::Single("ctrl+n".to_string()),
+            );
+            rpi_tui::keybindings::set_keybindings(rpi_tui::keybindings::KeybindingsManager::new(
+                definitions,
+                user_bindings,
+            ));
+        };
+
+        install_custom();
+        let tui = TuiMainScreen::new(Box::new(super::super::test_support::TestTerminal::new()));
+        let editor = Arc::new(Mutex::new(CustomEditor::new(
+            tui.clone(),
+            EditorTheme {
+                border_color: Box::new(|text: &str| text.to_string()),
+                select_list: Arc::new(rpi_tui::components::select_list::SelectListTheme::identity()),
+            },
+            EditorOptions::default(),
+        )));
+        let model_cycles = Arc::new(AtomicUsize::new(0));
+        let cycles = model_cycles.clone();
+        lock_editor(&editor).on_action(
+            "app.model.cycleForward",
+            Box::new(move || {
+                cycles.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        lock_editor(&editor).add_to_history("previous prompt");
+        lock_editor(&editor).set_text("draft");
+
+        install_custom();
+        lock_editor(&editor).handle_input("\u{10}"); // Ctrl+P
+        assert_eq!(lock_editor(&editor).get_text(), "previous prompt");
+        assert_eq!(model_cycles.load(Ordering::SeqCst), 0);
+
+        install_custom();
+        lock_editor(&editor).handle_input("\u{e}"); // Ctrl+N
+        assert_eq!(lock_editor(&editor).get_text(), "draft");
+
+        // Restore the default table (upstream `afterEach`).
+        install_keybindings();
     }
 }

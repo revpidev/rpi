@@ -3398,6 +3398,19 @@ impl Component for Editor {
             return;
         }
 
+        // Dedicated history actions always browse entries instead of moving
+        // the cursor (editor.ts:767-778 @ 4181f66, 16ad96ae8).
+        if kb.matches(&data, Keybinding::EditorHistoryPrevious) {
+            self.cancel_autocomplete();
+            self.navigate_history(-1);
+            return;
+        }
+        if kb.matches(&data, Keybinding::EditorHistoryNext) {
+            self.cancel_autocomplete();
+            self.navigate_history(1);
+            return;
+        }
+
         // Cursor movement actions.
         if kb.matches(&data, Keybinding::EditorCursorLineStart) {
             self.move_to_line_start();
@@ -3919,6 +3932,61 @@ mod tests {
 
         editor.handle_input("\x1b[B"); // draft
         assert_eq!(editor.get_text(), "draft");
+    }
+
+    // --- Editor prompt history keybindings
+    //     (editor-history-keybindings.test.ts @ 4181f66, 16ad96ae8) ----------
+
+    /// Serializes tests that replace the process-global keybinding registry
+    /// (cargo runs tests on parallel threads).
+    static KEYBINDINGS_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn browses_history_directly_without_first_moving_the_cursor() {
+        use crate::keybindings::{
+            set_keybindings, tui_keybindings, KeyBindingValue, KeybindingsConfig,
+            KeybindingsManager,
+        };
+
+        let _guard = KEYBINDINGS_LOCK.lock().unwrap();
+        let mut user_bindings = KeybindingsConfig::new();
+        user_bindings.insert(
+            "tui.editor.historyPrevious".to_string(),
+            KeyBindingValue::Single("ctrl+p".to_string()),
+        );
+        user_bindings.insert(
+            "tui.editor.historyNext".to_string(),
+            KeyBindingValue::Single("ctrl+n".to_string()),
+        );
+        set_keybindings(KeybindingsManager::new(
+            tui_keybindings().to_vec(),
+            user_bindings,
+        ));
+
+        let mut editor = editor();
+        editor.add_to_history("older prompt");
+        editor.add_to_history("newer\nmultiline prompt");
+        editor.set_text("draft");
+        editor.handle_input("\x1b[D");
+        editor.handle_input("\x1b[D");
+
+        editor.handle_input("\x10"); // Ctrl+P
+        assert_eq!(editor.get_text(), "newer\nmultiline prompt");
+        assert_cursor(&editor, 0, 0);
+
+        editor.handle_input("\x10"); // Ctrl+P
+        assert_eq!(editor.get_text(), "older prompt");
+
+        editor.handle_input("\x0e"); // Ctrl+N
+        assert_eq!(editor.get_text(), "newer\nmultiline prompt");
+        assert_cursor(&editor, 1, 16);
+
+        editor.handle_input("\x0e"); // Ctrl+N
+        assert_eq!(editor.get_text(), "draft");
+        assert_cursor(&editor, 0, 3);
+
+        // Restore the default table (upstream `afterEach`).
+        set_keybindings(KeybindingsManager::with_defaults());
     }
 
     #[test]

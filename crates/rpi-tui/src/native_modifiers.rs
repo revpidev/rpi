@@ -1,12 +1,16 @@
-//! Port of `packages/tui/src/native-modifiers.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/native-modifiers.ts` @ pi 0.82.1 (2efa728),
+//! with the platform gating tracking the 4181f66 revision (73dd066ee added
+//! the win32 helper path).
 //!
 //! Intentional differences:
-//! - The upstream loads a native Node addon
-//!   (`native/darwin/prebuilds/darwin-<arch>/darwin-modifiers.node`) to query
-//!   macOS modifier key state; no equivalent native binding is bundled in this
-//!   Rust port, so `is_native_modifier_pressed` always returns `false` (the
-//!   upstream behavior whenever the addon is unavailable). The platform/arch
-//!   gating logic of `loadNativeModifiersHelper` is preserved in
+//! - The upstream loads a native Node addon to query modifier key state
+//!   (`native/darwin/prebuilds/darwin-<arch>/darwin-modifiers.node` on macOS,
+//!   `native/win32/prebuilds/win32-<arch>/win32-console-mode.node` on Windows
+//!   since 73dd066ee); no equivalent native binding is bundled in this Rust
+//!   port, so `is_native_modifier_pressed` always returns `false` — the
+//!   upstream behavior whenever the addon is unavailable (ADR-0004 keeps the
+//!   addon-missing fallback branch). The platform/arch gating logic of
+//!   `loadNativeModifiersHelper` is preserved in
 //!   `load_native_modifiers_helper`.
 //! - `ModifierKey` is an enum instead of a string-literal union;
 //!   `ModifierKey::name()` returns the upstream byte values
@@ -45,17 +49,20 @@ impl ModifierKey {
 }
 
 /// Ports the platform/arch gating of `loadNativeModifiersHelper`
-/// (native-modifiers.ts:21-49): non-darwin platforms and unsupported arches
-/// (anything but x64/arm64) yield no helper. The native Node addon itself
-/// cannot be loaded in Rust, so the helper is never available.
+/// (native-modifiers.ts:21-53 @ 4181f66): upstream resolves an addon path on
+/// darwin and — since 73dd066ee — on win32; other platforms and unsupported
+/// arches (anything but x64/arm64) yield no helper. Neither native addon has
+/// a Rust equivalent bundled here, so the helper is never available
+/// (ADR-0004: keep the upstream addon-missing fallback branch).
 fn load_native_modifiers_helper() -> Option<()> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(any(target_os = "macos", windows)) {
         return None;
     }
     if !matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
         return None;
     }
-    // No Rust equivalent of the `darwin-modifiers.node` binding is bundled.
+    // No Rust equivalent of the `darwin-modifiers.node` /
+    // `win32-console-mode.node` bindings is bundled.
     None
 }
 

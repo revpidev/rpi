@@ -2,10 +2,13 @@
 //! `packages/coding-agent/src/core/keybindings.ts` @ pi 0.82.1 (2efa728)
 //! and `packages/tui/src/keybindings.ts`.
 //!
-//! Provides the full keybinding definitions table (73 namespace ids), the
+//! Provides the full keybinding definitions table (75 namespace ids), the
 //! legacy-name migration table (59 entries), config-file loading with
 //! migration, conflict detection, and the [`KeybindingsManager`] that merges
-//! defaults with user overrides.
+//! defaults with user overrides. The 33 `tui.editor.*`/`tui.input.*`/`tui.select.*`
+//! defaults track `packages/tui/src/keybindings.ts` @ 4181f66 (b0d382e25 +
+//! 16ad96ae8: ctrl+home/end/pageUp/pageDown aliases and the unbound-by-default
+//! `historyPrevious`/`historyNext` actions).
 //!
 //! Intentional differences:
 //! - `matchesKey` (Kitty keyboard protocol parser from `tui/src/keys.ts`) is
@@ -204,7 +207,7 @@ pub fn migrate_key_name(key: &str) -> &str {
 }
 
 // ===========================================================================
-// Keybinding Definitions (73 = 31 tui.* + 42 app.*)
+// Keybinding Definitions (75 = 33 tui.* + 42 app.*)
 // ===========================================================================
 
 static DEFINITIONS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
@@ -219,15 +222,27 @@ fn m(keys: &[&'static str]) -> KeyBindingValue {
     KeyBindingValue::Multiple(keys.iter().map(|k| k.to_string()).collect())
 }
 
-/// Build the full definitions table (73 entries, platform-specific defaults).
+/// Build the full definitions table (75 entries, platform-specific defaults).
 ///
-/// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:54-134
-/// + coding-agent/src/core/keybindings.ts:64-207).
+/// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:65-180
+/// @ 4181f66 + coding-agent/src/core/keybindings.ts:64-207).
 fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
     vec![
-        // ---- tui.editor.* (21) ----
+        // ---- tui.editor.* (23) ----
         ("tui.editor.cursorUp", s("up"), "Move cursor up"),
         ("tui.editor.cursorDown", s("down"), "Move cursor down"),
+        // Dedicated prompt-history actions; unbound by default (16ad96ae8,
+        // tui/src/keybindings.ts:68-75 @ 4181f66).
+        (
+            "tui.editor.historyPrevious",
+            m(&[]),
+            "Select previous prompt history entry",
+        ),
+        (
+            "tui.editor.historyNext",
+            m(&[]),
+            "Select next prompt history entry",
+        ),
         (
             "tui.editor.cursorLeft",
             m(&["left", "ctrl+b"]),
@@ -250,12 +265,12 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ),
         (
             "tui.editor.cursorLineStart",
-            m(&["home", "ctrl+a"]),
+            m(&["home", "ctrl+home", "ctrl+a"]),
             "Move to line start",
         ),
         (
             "tui.editor.cursorLineEnd",
-            m(&["end", "ctrl+e"]),
+            m(&["end", "ctrl+end", "ctrl+e"]),
             "Move to line end",
         ),
         (
@@ -268,8 +283,16 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             s("ctrl+alt+]"),
             "Jump backward to character",
         ),
-        ("tui.editor.pageUp", s("pageUp"), "Page up"),
-        ("tui.editor.pageDown", s("pageDown"), "Page down"),
+        (
+            "tui.editor.pageUp",
+            m(&["pageUp", "ctrl+pageUp"]),
+            "Page up",
+        ),
+        (
+            "tui.editor.pageDown",
+            m(&["pageDown", "ctrl+pageDown"]),
+            "Page down",
+        ),
         (
             "tui.editor.deleteCharBackward",
             s("backspace"),
@@ -847,7 +870,7 @@ mod tests {
     #[test]
     fn test_definitions_count() {
         let defs = keybinding_definitions();
-        assert_eq!(defs.len(), 73, "expected 73 keybinding definitions");
+        assert_eq!(defs.len(), 75, "expected 75 keybinding definitions");
     }
 
     #[test]

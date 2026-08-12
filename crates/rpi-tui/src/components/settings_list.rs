@@ -445,7 +445,17 @@ impl Component for SettingsList {
             } else {
                 self.selected_index + 1
             };
-        } else if kb.matches(data, Keybinding::SelectConfirm) || data == " " {
+        } else if kb.matches(data, Keybinding::SelectConfirm)
+            || (data == " "
+                && (!self.search_enabled
+                    || self
+                        .search_input
+                        .as_ref()
+                        .is_some_and(|search_input| search_input.get_value().is_empty())))
+        {
+            // Space only activates when no search query is entered; with an
+            // active query it is part of the search text (settings-list.ts:
+            // 185-189 @ 4181f66, bf4a90d81).
             self.activate_item();
         } else if kb.matches(data, Keybinding::SelectCancel) {
             if let Some(on_cancel) = self.on_cancel.as_mut() {
@@ -453,11 +463,9 @@ impl Component for SettingsList {
             }
         } else if self.search_enabled {
             if let Some(search_input) = self.search_input.as_mut() {
-                let sanitized = data.replace(' ', "");
-                if sanitized.is_empty() {
-                    return;
-                }
-                search_input.handle_input(&sanitized);
+                // The query is forwarded verbatim — spaces included
+                // (settings-list.ts:192-195 @ 4181f66, bf4a90d81).
+                search_input.handle_input(data);
                 let query = search_input.get_value().to_string();
                 self.apply_filter(&query);
             }
@@ -632,19 +640,61 @@ mod tests {
         assert!(lines[2].contains("No matching settings"));
     }
 
-    #[test]
-    fn search_ignores_spaces_in_input() {
+    /// `SettingsList` space handling (settings-list.test.ts @ 4181f66,
+    /// bf4a90d81): the searchable item used by both tests.
+    fn searchable_list(changes: Arc<StdMutex<Vec<(String, String)>>>) -> SettingsList {
         let mut settings = list(
-            vec![item("a", "alpha", "1")],
+            vec![SettingItem {
+                id: "ui-mode".into(),
+                label: "UI mode".into(),
+                description: None,
+                current_value: "regular".into(),
+                values: Some(vec!["regular".into(), "fullscreen".into()]),
+                submenu: None,
+            }],
             Some(SettingsListOptions {
                 enable_search: true,
             }),
         );
-        settings.handle_input("a");
+        settings.on_change = Some(Box::new(move |id, value| {
+            changes
+                .lock()
+                .unwrap()
+                .push((id.to_string(), value.to_string()));
+        }));
+        settings
+    }
+
+    #[test]
+    fn includes_spaces_in_an_active_search_instead_of_changing_the_selected_setting() {
+        let changes = Arc::new(StdMutex::new(Vec::new()));
+        let mut settings = searchable_list(Arc::clone(&changes));
+
+        for character in "UI mode".chars() {
+            settings.handle_input(&character.to_string());
+        }
+
+        assert_eq!(*changes.lock().unwrap(), Vec::new());
+        assert!(plain(settings.render(80))[0].contains("UI mode"));
+
+        settings.handle_input("\r");
+        assert_eq!(
+            *changes.lock().unwrap(),
+            vec![("ui-mode".to_string(), "fullscreen".to_string())]
+        );
+    }
+
+    #[test]
+    fn keeps_space_as_a_change_shortcut_before_a_search_query_is_entered() {
+        let changes = Arc::new(StdMutex::new(Vec::new()));
+        let mut settings = searchable_list(Arc::clone(&changes));
+
         settings.handle_input(" ");
-        // Space must not clear the filter; the value must not change either.
-        let lines = plain(settings.render(40));
-        assert!(lines.iter().any(|line| line.contains("alpha")));
+
+        assert_eq!(
+            *changes.lock().unwrap(),
+            vec![("ui-mode".to_string(), "fullscreen".to_string())]
+        );
     }
 
     #[test]

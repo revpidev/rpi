@@ -1,7 +1,10 @@
 //! Terminal image support: Kitty/iTerm2 graphics sequences, terminal
 //! capability detection, cell/image sizing (terminal-image.ts).
 //!
-//! Port of `packages/tui/src/terminal-image.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/terminal-image.ts` @ pi 0.82.1 (2efa728), with
+//! `detect_capabilities_with` tracking the 4181f66 revision (fa07e7bd9:
+//! Windows consoles fall back to truecolor when no terminal is positively
+//! identified).
 //!
 //! Intentional differences:
 //! - `probeTmuxHyperlinks` runs `tmux display-message` through `try_wait`
@@ -177,8 +180,19 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     detect_capabilities_with(probe_tmux_hyperlinks)
 }
 
-/// `detectCapabilities(tmuxForwardsHyperlink)` (terminal-image.ts:65-125).
+/// `detectCapabilities(tmuxForwardsHyperlink)` (terminal-image.ts:65-133
+/// @ 4181f66).
 pub fn detect_capabilities_with(
+    tmux_forwards_hyperlink: impl Fn() -> bool,
+) -> TerminalCapabilities {
+    // `isWindowsConsole = process.platform === "win32"` (terminal-image.ts:74).
+    detect_capabilities_inner(cfg!(windows), tmux_forwards_hyperlink)
+}
+
+/// Body of `detectCapabilities` with the platform check explicit so tests can
+/// exercise the Windows branch (upstream mocks `process.platform`).
+fn detect_capabilities_inner(
+    is_windows_console: bool,
     tmux_forwards_hyperlink: impl Fn() -> bool,
 ) -> TerminalCapabilities {
     let term_program = env_var("TERM_PROGRAM").to_lowercase();
@@ -275,6 +289,18 @@ pub fn detect_capabilities_with(
     }
 
     if terminal_emulator == "jetbrains-jediterm" {
+        return TerminalCapabilities {
+            images: None,
+            true_color: true,
+            hyperlinks: false,
+        };
+    }
+
+    // Windows Terminal does not always set WT_SESSION, for example when it
+    // hosts a cmd.exe launched directly from Win+R. Modern Windows consoles
+    // support truecolor; keep hyperlinks off unless we positively detected
+    // support above (terminal-image.ts:124-130 @ 4181f66, fa07e7bd9).
+    if is_windows_console {
         return TerminalCapabilities {
             images: None,
             true_color: true,
@@ -979,6 +1005,19 @@ mod tests {
     fn test_detect_capabilities_defaults_to_hyperlinks_false_for_unknown_terminals() {
         with_env(&[], || {
             let caps = detect_capabilities();
+            assert!(!caps.hyperlinks);
+            assert_eq!(caps.images, None);
+        });
+    }
+
+    #[test]
+    fn test_detect_capabilities_enables_truecolor_for_unidentified_windows_consoles() {
+        // terminal-image.ts:121-127 @ 4181f66 (fa07e7bd9): a Windows console
+        // that matches no known terminal (no WT_SESSION, no COLORTERM hint)
+        // still gets truecolor, with hyperlinks off.
+        with_env(&[("TERM", Some("xterm-256color"))], || {
+            let caps = detect_capabilities_inner(true, || false);
+            assert!(caps.true_color);
             assert!(!caps.hyperlinks);
             assert_eq!(caps.images, None);
         });

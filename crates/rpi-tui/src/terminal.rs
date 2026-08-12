@@ -43,11 +43,13 @@
 //!   raw mode does not set this flag and no native helper is bundled, so on
 //!   Windows Shift+Tab arrives as plain `\t` (same gap class as
 //!   `native_modifiers.rs`).
-//! - Apple Terminal Shift+Enter normalization is wired exactly like upstream
-//!   (`forwardInputSequence`, terminal.ts:309-318), but
+//! - Native Shift+Enter normalization (Apple Terminal on macOS, all consoles
+//!   on Windows — 73dd066ee) is wired exactly like upstream
+//!   (`forwardInputSequence`, terminal.ts:317-327 @ 4181f66), but
 //!   `is_native_modifier_pressed` always returns `false` in this port (see
-//!   `native_modifiers.rs`), so the normalization can never fire on macOS
-//!   until a native binding exists.
+//!   `native_modifiers.rs`; ADR-0004 keeps the upstream addon-missing fallback
+//!   branch), so the normalization can never fire until a native binding
+//!   exists.
 //! - `drain_input` observes pending input by consuming and discarding queued
 //!   channel events; upstream attaches a side listener that only timestamps
 //!   arrivals (terminal.ts:385-389). Both leave the drained bytes unhandled;
@@ -79,10 +81,14 @@ use crate::stdin_buffer::{StdinBuffer, StdinBufferEvent};
 const TERMINAL_PROGRESS_KEEPALIVE: Duration = Duration::from_millis(1000);
 /// `TERMINAL_PROGRESS_ACTIVE_SEQUENCE` (terminal.ts:12).
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE: &str = "\x1b]9;4;3\x07";
-/// `TERMINAL_PROGRESS_CLEAR_SEQUENCE` (terminal.ts:13).
-const TERMINAL_PROGRESS_CLEAR_SEQUENCE: &str = "\x1b]9;4;0;\x07";
-/// `APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE` (terminal.ts:14).
-const APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
+/// `TERMINAL_PROGRESS_CLEAR_SEQUENCE` (terminal.ts:13 @ 4181f66, e8a17822d):
+/// no parameter separator after the `0` — the trailing `;` form is rejected
+/// by strict OSC 9;4 parsers (#7581).
+const TERMINAL_PROGRESS_CLEAR_SEQUENCE: &str = "\x1b]9;4;0\x07";
+/// `NATIVE_SHIFT_ENTER_SEQUENCE` (terminal.ts:14 @ 4181f66; renamed from
+/// `APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE` in 73dd066ee when the Shift+Enter
+/// detection generalized to Windows consoles).
+const NATIVE_SHIFT_ENTER_SEQUENCE: &str = "\x1b[13;2u";
 /// `DESIRED_KITTY_KEYBOARD_PROTOCOL_FLAGS` (terminal.ts:15):
 /// 1 = disambiguate escape codes, 2 = report event types
 /// (press/repeat/release), 4 = report alternate keys (shifted key, base
@@ -149,16 +155,26 @@ pub fn is_apple_terminal_session() -> bool {
     cfg!(target_os = "macos") && std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal")
 }
 
-/// `normalizeAppleTerminalInput` (terminal.ts:44-47).
+/// `normalizeNativeShiftEnterInput` (terminal.ts:44-51 @ 4181f66, 73dd066ee).
+pub fn normalize_native_shift_enter_input<'a>(
+    data: &'a str,
+    should_detect_native_shift_enter: bool,
+    is_shift_pressed: bool,
+) -> Cow<'a, str> {
+    if should_detect_native_shift_enter && data == "\r" && is_shift_pressed {
+        return Cow::Borrowed(NATIVE_SHIFT_ENTER_SEQUENCE);
+    }
+    Cow::Borrowed(data)
+}
+
+/// `normalizeAppleTerminalInput` (terminal.ts:53-55 @ 4181f66, 73dd066ee):
+/// upstream keeps it as a thin wrapper over `normalizeNativeShiftEnterInput`.
 pub fn normalize_apple_terminal_input<'a>(
     data: &'a str,
     is_apple_terminal: bool,
     is_shift_pressed: bool,
 ) -> Cow<'a, str> {
-    if is_apple_terminal && data == "\r" && is_shift_pressed {
-        return Cow::Borrowed(APPLE_TERMINAL_SHIFT_ENTER_SEQUENCE);
-    }
-    Cow::Borrowed(data)
+    normalize_native_shift_enter_input(data, is_apple_terminal, is_shift_pressed)
 }
 
 /// Input handler injected into [`Terminal::start`] (upstream `onInput`).
@@ -641,16 +657,19 @@ impl<W: Write> ProcessTerminal<W> {
             Some(Instant::now() + KEYBOARD_PROTOCOL_RESPONSE_FRAGMENT_TIMEOUT);
     }
 
-    /// Upstream `forwardInputSequence` (terminal.ts:309-318).
+    /// Upstream `forwardInputSequence` (terminal.ts:317-327 @ 4181f66,
+    /// 73dd066ee): native Shift+Enter detection applies on Apple Terminal and
+    /// on Windows (`process.platform === "win32"` → `cfg!(windows)`).
     fn forward_input_sequence(&mut self, sequence: &str) {
         let Some(handler) = self.input_handler.as_mut() else {
             return;
         };
-        let is_apple_terminal = sequence == "\r" && is_apple_terminal_session();
-        let input = normalize_apple_terminal_input(
+        let should_detect_native_shift_enter =
+            sequence == "\r" && (is_apple_terminal_session() || cfg!(windows));
+        let input = normalize_native_shift_enter_input(
             sequence,
-            is_apple_terminal,
-            is_apple_terminal && is_native_modifier_pressed(ModifierKey::Shift),
+            should_detect_native_shift_enter,
+            should_detect_native_shift_enter && is_native_modifier_pressed(ModifierKey::Shift),
         );
         handler(&input);
     }
@@ -1138,6 +1157,36 @@ mod tests {
         }
     }
 
+    // --- normalizeNativeShiftEnterInput (upstream describe
+    //     "normalizeNativeShiftEnterInput", terminal.test.ts @ 4181f66, 73dd066ee) ---
+
+    #[test]
+    fn rewrites_return_to_csi_u_shift_enter_when_native_detection_enabled_and_shift_pressed() {
+        assert_eq!(
+            normalize_native_shift_enter_input("\r", true, true),
+            "\x1b[13;2u"
+        );
+    }
+
+    #[test]
+    fn leaves_return_unchanged_when_native_shift_detection_is_disabled() {
+        assert_eq!(normalize_native_shift_enter_input("\r", false, true), "\r");
+    }
+
+    #[test]
+    fn leaves_return_unchanged_when_shift_is_not_pressed() {
+        assert_eq!(normalize_native_shift_enter_input("\r", true, false), "\r");
+    }
+
+    #[test]
+    fn leaves_non_return_input_unchanged_for_native_detection() {
+        assert_eq!(
+            normalize_native_shift_enter_input("\x1b[13;2u", true, true),
+            "\x1b[13;2u"
+        );
+        assert_eq!(normalize_native_shift_enter_input("a", true, true), "a");
+    }
+
     // --- normalizeAppleTerminalInput (upstream describe "normalizeAppleTerminalInput") ---
 
     #[test]
@@ -1165,6 +1214,17 @@ mod tests {
             "\x1b[13;2u"
         );
         assert_eq!(normalize_apple_terminal_input("a", true, true), "a");
+    }
+
+    // --- ProcessTerminal progress (upstream describe "ProcessTerminal progress",
+    //     terminal.test.ts:212-230 @ 4181f66, e8a17822d) ---
+
+    #[test]
+    fn writes_a_valid_osc_9_4_clear_sequence() {
+        let writer = SharedWriter::default();
+        let mut terminal = ProcessTerminal::with_writer(writer.clone());
+        Terminal::set_progress(&mut terminal, false);
+        assert_eq!(writer.writes(), vec!["\x1b]9;4;0\x07".to_string()]);
     }
 
     // --- Kitty keyboard protocol negotiation (upstream describe "ProcessTerminal

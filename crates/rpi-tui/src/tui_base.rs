@@ -171,12 +171,16 @@ pub(crate) struct TerminalSizeCache {
 }
 
 /// Shared render-schedule update (upstream `requestRender` /
-/// `scheduleRender`, tui.ts:716-763).
+/// `scheduleRender`, tui.ts:765-817 @ 4181f66). The `force` path is upstream
+/// `requestRender(true)` = `resetRenderState` (caller's side) +
+/// `requestImmediateRender` (29d9f087c): reset happens in
+/// `TuiMainScreen::request_render`, the immediate arm is the deadline set
+/// here.
 pub(crate) fn schedule_render(schedule: &Arc<Mutex<RenderSchedule>>, force: bool, now: Instant) {
     let mut schedule = lock_shared(schedule);
     if force {
-        // Upstream clears the pending timer and renders on the next tick,
-        // bypassing the throttle.
+        // Upstream `requestImmediateRender` cancels the pending timer and
+        // renders on the next tick, bypassing the throttle (tui.ts:776-779).
         schedule.requested = true;
         schedule.deadline = Some(now);
         return;
@@ -272,6 +276,22 @@ impl TuiBase {
     /// `requestRender` from inside the engine (tui.ts:716).
     pub(crate) fn request_render(&self, force: bool) {
         schedule_render(&self.schedule, force, Instant::now());
+    }
+
+    /// `requestImmediateRender` (tui.ts:776-791 @ 4181f66, 29d9f087c): cancel
+    /// any queued throttled deadline and arm the render for the current tick.
+    /// The upstream `process.nextTick` dedup/preemption details
+    /// (`immediateRenderScheduled`, the second `cancelRenderTimer` inside the
+    /// callback) are covered by the tick model: a tick drains all queued input
+    /// before firing deadlines, so several inputs in one tick share this single
+    /// render, and `deadline = now` preempts a previously queued throttled
+    /// frame (tui.ts:784-786).
+    fn request_immediate_render(&self) {
+        let mut schedule = lock_shared(&self.schedule);
+        // Upstream `cancelRenderTimer` (tui.ts:777).
+        schedule.deadline = None;
+        schedule.requested = true;
+        schedule.deadline = Some(Instant::now());
     }
 
     /// `setFocus` (tui.ts:368-370).
@@ -1074,7 +1094,10 @@ impl TuiBase {
             return;
         }
         lock_component(&focused).handle_input(data);
-        self.request_render(false);
+        // Keyboard input is latency-sensitive. Avoid the throttled path,
+        // where even a zero delay can take a full 16ms tick on Windows
+        // (tui.ts:891-893 @ 4181f66, 29d9f087c).
+        self.request_immediate_render();
     }
 
     /// `consumeOsc11BackgroundResponse` (tui.ts:841-863).

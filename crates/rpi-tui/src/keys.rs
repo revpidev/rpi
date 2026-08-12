@@ -2256,6 +2256,22 @@ mod tests {
             assert!(matches_key("\x1b[2^", "ctrl+insert"));
             assert!(matches_key("\x1b[7$", "shift+home"));
         }
+
+        #[test]
+        fn matches_xterm_ctrl_modified_viewport_navigation() {
+            // keys.test.ts @ 4181f66 (b0d382e25): `\x1b[1;5H/F` parse via the
+            // Kitty home/end branch (keys.ts:641) and `\x1b[5;5~`/`\x1b[6;5~`
+            // via the functional-key branch (keys.ts:620).
+            let _globals = lock_globals();
+            assert!(matches_key("\x1b[1;5H", "ctrl+home"));
+            assert!(matches_key("\x1b[1;5F", "ctrl+end"));
+            assert!(matches_key("\x1b[5;5~", "ctrl+pageUp"));
+            assert!(matches_key("\x1b[6;5~", "ctrl+pageDown"));
+            assert_eq!(parse_key("\x1b[1;5H").as_deref(), Some("ctrl+home"));
+            assert_eq!(parse_key("\x1b[1;5F").as_deref(), Some("ctrl+end"));
+            assert_eq!(parse_key("\x1b[5;5~").as_deref(), Some("ctrl+pageUp"));
+            assert_eq!(parse_key("\x1b[6;5~").as_deref(), Some("ctrl+pageDown"));
+        }
     }
 
     mod decode_kitty_printable {

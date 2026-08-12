@@ -1,4 +1,7 @@
-//! Port of `packages/tui/src/keybindings.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/keybindings.ts` @ pi 0.82.1 (2efa728), with the
+//! editor keybinding table tracking the 4181f66 revision (b0d382e25:
+//! ctrl+home/end/pageUp/pageDown aliases; 16ad96ae8: `historyPrevious` /
+//! `historyNext` actions, unbound by default).
 //!
 //! Intentional differences:
 //! - `Keybinding` is a Rust enum mirroring the compile-time union
@@ -63,7 +66,8 @@ impl KeyBindingValue {
     }
 }
 
-/// A keybinding id (`Keybinding = keyof Keybindings`, keybindings.ts:7-44).
+/// A keybinding id (`Keybinding = keyof Keybindings`, keybindings.ts:7-53
+/// @ 4181f66; the 8 `tui.altScreen.*` ids land with T31).
 ///
 /// The upstream union type is compile-time only; the runtime ids are the
 /// `tui.*` strings ([`Keybinding::as_str`]), byte-identical to the
@@ -71,9 +75,11 @@ impl KeyBindingValue {
 /// interface declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Keybinding {
-    // Editor navigation and editing (keybindings.ts:8-29)
+    // Editor navigation and editing (keybindings.ts:8-31 @ 4181f66)
     EditorCursorUp,
     EditorCursorDown,
+    EditorHistoryPrevious,
+    EditorHistoryNext,
     EditorCursorLeft,
     EditorCursorRight,
     EditorCursorWordLeft,
@@ -93,12 +99,12 @@ pub enum Keybinding {
     EditorYank,
     EditorYankPop,
     EditorUndo,
-    // Generic input actions (keybindings.ts:31-34)
+    // Generic input actions (keybindings.ts:33-36 @ 4181f66)
     InputNewLine,
     InputSubmit,
     InputTab,
     InputCopy,
-    // Generic selection actions (keybindings.ts:36-41)
+    // Generic selection actions (keybindings.ts:38-43 @ 4181f66)
     SelectUp,
     SelectDown,
     SelectPageUp,
@@ -108,10 +114,14 @@ pub enum Keybinding {
 }
 
 impl Keybinding {
-    /// All 31 keybinding ids, in interface order (keybindings.ts:7-42).
-    pub const ALL: [Keybinding; 31] = [
+    /// All 33 keybinding ids, in interface order (keybindings.ts:7-42
+    /// @ 4181f66; the alt-screen ids at :44-52 land with the alt-screen
+    /// renderer, T31).
+    pub const ALL: [Keybinding; 33] = [
         Self::EditorCursorUp,
         Self::EditorCursorDown,
+        Self::EditorHistoryPrevious,
+        Self::EditorHistoryNext,
         Self::EditorCursorLeft,
         Self::EditorCursorRight,
         Self::EditorCursorWordLeft,
@@ -149,6 +159,8 @@ impl Keybinding {
         match self {
             Self::EditorCursorUp => "tui.editor.cursorUp",
             Self::EditorCursorDown => "tui.editor.cursorDown",
+            Self::EditorHistoryPrevious => "tui.editor.historyPrevious",
+            Self::EditorHistoryNext => "tui.editor.historyNext",
             Self::EditorCursorLeft => "tui.editor.cursorLeft",
             Self::EditorCursorRight => "tui.editor.cursorRight",
             Self::EditorCursorWordLeft => "tui.editor.cursorWordLeft",
@@ -188,6 +200,8 @@ impl Keybinding {
         Some(match id {
             "tui.editor.cursorUp" => Self::EditorCursorUp,
             "tui.editor.cursorDown" => Self::EditorCursorDown,
+            "tui.editor.historyPrevious" => Self::EditorHistoryPrevious,
+            "tui.editor.historyNext" => Self::EditorHistoryNext,
             "tui.editor.cursorLeft" => Self::EditorCursorLeft,
             "tui.editor.cursorRight" => Self::EditorCursorRight,
             "tui.editor.cursorWordLeft" => Self::EditorCursorWordLeft,
@@ -430,9 +444,10 @@ fn entry(
 
 static TUI_KEYBINDINGS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
 
-/// The default keybinding table (`TUI_KEYBINDINGS`, keybindings.ts:54-134) —
-/// all 31 `tui.*` keybinding ids with their default keys and descriptions,
-/// in upstream definition order.
+/// The default keybinding table (`TUI_KEYBINDINGS`, keybindings.ts:65-180
+/// @ 4181f66) — the 33 `tui.*` keybinding ids with their default keys and
+/// descriptions, in upstream definition order (the 8 `tui.altScreen.*` ids
+/// land with the alt-screen renderer, T31).
 pub fn tui_keybindings() -> &'static [(String, KeybindingDefinition)] {
     TUI_KEYBINDINGS
         .get_or_init(build_tui_keybindings)
@@ -441,9 +456,21 @@ pub fn tui_keybindings() -> &'static [(String, KeybindingDefinition)] {
 
 fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
     vec![
-        // ---- tui.editor.* (21) ----
+        // ---- tui.editor.* (23) ----
         entry("tui.editor.cursorUp", single("up"), "Move cursor up"),
         entry("tui.editor.cursorDown", single("down"), "Move cursor down"),
+        // Dedicated prompt-history actions; unbound by default (16ad96ae8,
+        // keybindings.ts:68-75 @ 4181f66).
+        entry(
+            "tui.editor.historyPrevious",
+            multiple(&[]),
+            "Select previous prompt history entry",
+        ),
+        entry(
+            "tui.editor.historyNext",
+            multiple(&[]),
+            "Select next prompt history entry",
+        ),
         entry(
             "tui.editor.cursorLeft",
             multiple(&["left", "ctrl+b"]),
@@ -466,12 +493,12 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
         ),
         entry(
             "tui.editor.cursorLineStart",
-            multiple(&["home", "ctrl+a"]),
+            multiple(&["home", "ctrl+home", "ctrl+a"]),
             "Move to line start",
         ),
         entry(
             "tui.editor.cursorLineEnd",
-            multiple(&["end", "ctrl+e"]),
+            multiple(&["end", "ctrl+end", "ctrl+e"]),
             "Move to line end",
         ),
         entry(
@@ -484,8 +511,16 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
             single("ctrl+alt+]"),
             "Jump backward to character",
         ),
-        entry("tui.editor.pageUp", single("pageUp"), "Page up"),
-        entry("tui.editor.pageDown", single("pageDown"), "Page down"),
+        entry(
+            "tui.editor.pageUp",
+            multiple(&["pageUp", "ctrl+pageUp"]),
+            "Page up",
+        ),
+        entry(
+            "tui.editor.pageDown",
+            multiple(&["pageDown", "ctrl+pageDown"]),
+            "Page down",
+        ),
         entry(
             "tui.editor.deleteCharBackward",
             single("backspace"),
@@ -997,11 +1032,51 @@ mod tests {
     }
 
     #[test]
+    fn binds_modified_and_unmodified_editor_viewport_navigation() {
+        // keybindings.test.ts @ 4181f66 (b0d382e25).
+        let keybindings = KeybindingsManager::with_defaults();
+
+        assert_eq!(
+            keybindings.get_keys(Keybinding::EditorCursorLineStart),
+            keys(&["home", "ctrl+home", "ctrl+a"])
+        );
+        assert_eq!(
+            keybindings.get_keys(Keybinding::EditorCursorLineEnd),
+            keys(&["end", "ctrl+end", "ctrl+e"])
+        );
+        assert_eq!(
+            keybindings.get_keys(Keybinding::EditorPageUp),
+            keys(&["pageUp", "ctrl+pageUp"])
+        );
+        assert_eq!(
+            keybindings.get_keys(Keybinding::EditorPageDown),
+            keys(&["pageDown", "ctrl+pageDown"])
+        );
+    }
+
+    #[test]
+    fn leaves_dedicated_prompt_history_navigation_unbound_by_default() {
+        // keybindings.test.ts @ 4181f66 (16ad96ae8).
+        let keybindings = KeybindingsManager::with_defaults();
+
+        assert!(keybindings
+            .get_keys(Keybinding::EditorHistoryPrevious)
+            .is_empty());
+        assert!(keybindings
+            .get_keys(Keybinding::EditorHistoryNext)
+            .is_empty());
+        // Unbound actions never match, so default keys keep their editor
+        // behavior (e.g. ctrl+p is not swallowed by a history action).
+        assert!(!keybindings.matches("\x10", Keybinding::EditorHistoryPrevious));
+        assert!(!keybindings.matches("\x0e", Keybinding::EditorHistoryNext));
+    }
+
+    #[test]
     fn get_resolved_bindings_uses_single_for_one_key_and_array_otherwise() {
         let keybindings = KeybindingsManager::with_defaults();
         let resolved = keybindings.get_resolved_bindings();
 
-        assert_eq!(resolved.len(), 31);
+        assert_eq!(resolved.len(), 33);
         assert_eq!(
             resolved.get("tui.editor.cursorUp"),
             Some(&KeyBindingValue::Single("up".to_string()))

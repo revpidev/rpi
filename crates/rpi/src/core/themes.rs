@@ -219,8 +219,9 @@ pub const CSI_16T_QUERY: &[u8] = b"\x1b[16t";
 /// `terminal.ts:12`). Sent as `OSC 9;4;3 ST`.
 pub const OSC_9_4_INDETERMINATE: &[u8] = b"\x1b]9;4;3\x07";
 
-/// OSC 9;4;0; — clear progress indicator (`terminal.ts:13`).
-pub const OSC_9_4_CLEAR: &[u8] = b"\x1b]9;4;0;\x07";
+/// OSC 9;4;0 — clear progress indicator (`terminal.ts:13` @ 4181f66,
+/// e8a17822d: no parameter separator after the `0`).
+pub const OSC_9_4_CLEAR: &[u8] = b"\x1b]9;4;0\x07";
 
 /// CSI ?2031h — enable terminal colour-scheme change notifications
 /// (`tui.ts:675`). The terminal pushes asynchronous `\x1b[?997;Nn` reports

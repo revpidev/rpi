@@ -1,6 +1,8 @@
 //! OSC 11 background color and color scheme report parsing (terminal-colors.ts).
 //!
-//! Port of `packages/tui/src/terminal-colors.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/terminal-colors.ts` @ pi 0.82.1 (2efa728), with
+//! `parse_terminal_color_scheme_report` tracking the 4181f66 revision
+//! (0e633790c: accept batched reports, last one wins).
 //!
 //! Intentional differences: none.
 
@@ -103,14 +105,29 @@ pub fn parse_osc11_background_color(data: &str) -> Option<RgbColor> {
     Some(RgbColor { r, g, b })
 }
 
-/// `parseTerminalColorSchemeReport` (terminal-colors.ts:67-73). The upstream
-/// regex has no flags, so the match is case-sensitive: a trailing `N` does not
-/// match.
+/// `parseTerminalColorSchemeReport` (terminal-colors.ts:67-73 @ 4181f66,
+/// 0e633790c). Matches the upstream regex `/^(?:\x1b\[\?997;(1|2)n)+$/`
+/// (terminal-colors.ts:29): one or more concatenated reports — terminals may
+/// batch the query reply and a change notification into one read. The JS
+/// capture group keeps the LAST iteration's digit, so the final report wins.
+/// The regex has no flags, so the match is case-sensitive: a trailing `N`
+/// does not match.
 pub fn parse_terminal_color_scheme_report(data: &str) -> Option<TerminalColorScheme> {
-    if data == "\x1b[?997;1n" {
-        Some(TerminalColorScheme::Dark)
-    } else if data == "\x1b[?997;2n" {
-        Some(TerminalColorScheme::Light)
+    let mut rest = data;
+    let mut last = None;
+    while let Some(report) = rest.strip_prefix("\x1b[?997;") {
+        if let Some(tail) = report.strip_prefix("1n") {
+            last = Some(TerminalColorScheme::Dark);
+            rest = tail;
+        } else {
+            let tail = report.strip_prefix("2n")?;
+            last = Some(TerminalColorScheme::Light);
+            rest = tail;
+        }
+    }
+    // `+` requires at least one report and the whole input must match (`$`).
+    if rest.is_empty() {
+        last
     } else {
         None
     }
@@ -165,9 +182,21 @@ mod tests {
             parse_terminal_color_scheme_report("\x1b[?997;2n"),
             Some(TerminalColorScheme::Light)
         );
+        // Batched reports (0e633790c, terminal-colors.test.ts:118-119): the
+        // last report wins.
+        assert_eq!(
+            parse_terminal_color_scheme_report("\x1b[?997;2n\x1b[?997;1n\x1b[?997;1n"),
+            Some(TerminalColorScheme::Dark)
+        );
+        assert_eq!(
+            parse_terminal_color_scheme_report("\x1b[?997;1n\x1b[?997;2n\x1b[?997;2n"),
+            Some(TerminalColorScheme::Light)
+        );
         assert_eq!(parse_terminal_color_scheme_report("\x1b[?997;3n"), None);
         assert_eq!(parse_terminal_color_scheme_report("\x1b[?996n"), None);
         assert_eq!(parse_terminal_color_scheme_report("x\x1b[?997;1n"), None);
+        // A valid report followed by trailing garbage fails the `$` anchor.
+        assert_eq!(parse_terminal_color_scheme_report("\x1b[?997;1nx"), None);
     }
 
     // Supplementary coverage (upstream tests these functions only indirectly
@@ -230,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_parse_terminal_color_scheme_report_rejects_uppercase_n() {
-        // Upstream `/^\x1b\[\?997;(1|2)n$/` has no flags — a trailing `N`
+        // Upstream `/^(?:\x1b\[\?997;(1|2)n)+$/` has no flags — a trailing `N`
         // must not match.
         assert_eq!(parse_terminal_color_scheme_report("\x1b[?997;1N"), None);
         assert_eq!(parse_terminal_color_scheme_report("\x1b[?997;2N"), None);

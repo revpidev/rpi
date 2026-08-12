@@ -687,12 +687,14 @@ impl TuiMainScreen {
         lock_shared(&self.pending).push(Box::new(move |inner| inner.stop_internal(options)));
     }
 
-    /// Upstream `requestRender(force)` (tui.ts:716).
+    /// Upstream `requestRender(force)` (tui.ts:765-774 @ 4181f66, 29d9f087c).
     ///
     /// Records render intent; the actual render happens on [`TuiMainScreen::tick`] once
     /// the deadline is reached (immediate for `force`, 16ms-throttled
     /// otherwise). With `force`, the previous frame state is reset so the
-    /// next render takes the full-clear path (tui.ts:717-738).
+    /// next render takes the full-clear path — upstream `resetRenderState` +
+    /// `requestImmediateRender` (tui.ts:766-770); the immediate arm is the
+    /// `deadline = now` set by the force branch of `schedule_render`.
     pub fn request_render(&self, force: bool) {
         if force {
             self.run_or_queue(TuiMainScreenInner::reset_render_state);
@@ -5912,6 +5914,70 @@ mod tests {
             terminal.get_writes().contains('b'),
             "render should fire once 16ms elapsed"
         );
+        tui.stop(TuiStopOptions::default());
+    }
+
+    // -------------------------------------------------------------------------
+    // TUI render scheduling (tui-render.test.ts:91-115, 29d9f087c)
+    // -------------------------------------------------------------------------
+
+    /// `InputComponent` (tui-render.test.ts:27-38): counts renders; handled
+    /// input replaces the rendered lines.
+    struct InputComponent {
+        lines: Arc<Mutex<Vec<String>>>,
+        render_count: Arc<Mutex<u64>>,
+    }
+
+    impl Component for InputComponent {
+        fn render(&self, _width: usize) -> Vec<String> {
+            *lock_shared(&self.render_count) += 1;
+            lock_shared(&self.lines).clone()
+        }
+
+        fn handle_input(&mut self, data: &str) {
+            *lock_shared(&self.lines) = vec![data.to_string()];
+        }
+    }
+
+    #[test]
+    fn renders_keyboard_input_without_waiting_for_a_throttled_frame() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = new_tui(&terminal);
+        let lines = Arc::new(Mutex::new(vec!["initial".to_string()]));
+        let render_count = Arc::new(Mutex::new(0u64));
+        let component = shared_component(InputComponent {
+            lines: Arc::clone(&lines),
+            render_count: Arc::clone(&render_count),
+        });
+        tui.add_child(component.clone());
+        tui.set_focus(Some(component));
+        tui.start();
+        settle(&tui);
+        let render_count_before_input = *lock_shared(&render_count);
+
+        // Queue a normal throttled render first. Keyboard input should preempt it.
+        *lock_shared(&lines) = vec!["pending".to_string()];
+        tui.request_render(false);
+        terminal.send_input("first");
+        terminal.send_input("second");
+        terminal.send_input("typed");
+        // Upstream awaits a single `process.nextTick`; here the first tick
+        // drains all queued inputs (arming the immediate deadline) and the
+        // second fires it — both well inside the 16ms throttle window of the
+        // queued frame.
+        tui.tick(Instant::now());
+        tui.tick(Instant::now());
+
+        assert_eq!(
+            *lock_shared(&render_count),
+            render_count_before_input + 1,
+            "three inputs in one tick render exactly once, without waiting for the throttled frame"
+        );
+        assert_eq!(*lock_shared(&lines), vec!["typed".to_string()]);
+        // The preempted throttled frame must not render a second time once its
+        // original deadline passes.
+        tui.tick(Instant::now() + Duration::from_millis(20));
+        assert_eq!(*lock_shared(&render_count), render_count_before_input + 1);
         tui.stop(TuiStopOptions::default());
     }
 

@@ -153,6 +153,14 @@ fn is_mark(c: char) -> bool {
     in_ranges(c as u32, MARK_RANGES)
 }
 
+/// Per-character test matching `terminalSpacingMarkRegex` (utils.ts:46-47,
+/// dfe47d3fb): `[\p{Spacing_Mark}--[U+1734 U+302E U+302F]]` plus 14
+/// non-spacing exceptions from legacy wcwidth tables. Marks that terminals
+/// allocate cells for when attached to a base character.
+fn is_terminal_spacing_mark_char(c: char) -> bool {
+    in_ranges(c as u32, TERMINAL_SPACING_MARK_RANGES)
+}
+
 /// Per-character `\p{Format}` (General_Category Cf, Unicode 16.0).
 fn is_format(c: char) -> bool {
     in_ranges(c as u32, FORMAT_RANGES)
@@ -225,12 +233,18 @@ fn is_npm_wide_zero_width(cp: u32) -> bool {
     )
 }
 
-/// Calculate the terminal width of a single grapheme cluster (utils.ts:167-211).
-/// Based on code from the string-width library, but includes a possible-emoji
-/// check to avoid running the RGI_Emoji check unnecessarily.
+/// Calculate the terminal width of a single grapheme cluster (utils.ts:174-235,
+/// dfe47d3fb). Based on code from the string-width library, but includes a
+/// possible-emoji check to avoid running the RGI_Emoji check unnecessarily.
 fn grapheme_width(segment: &str) -> usize {
     if segment == "\t" {
         return 3;
+    }
+
+    // Some marks occupy cells even without a base character
+    // (terminalSpacingMarkRegex; the cluster is all terminal-spacing marks).
+    if segment.chars().all(is_terminal_spacing_mark_char) {
+        return segment.chars().count();
     }
 
     // Zero-width clusters (zeroWidthRegex: every char DI/Cc/Mark).
@@ -258,18 +272,29 @@ fn grapheme_width(segment: &str) -> usize {
 
     let mut width = east_asian_width(cp as u32);
 
-    // Trailing halfwidth/fullwidth forms and AM vowels that segment with a base.
-    // (`segment.slice(1)` in the upstream iterates the code points after the
-    // first UTF-16 unit; for astral-first segments that is a lone surrogate
-    // which never contributes, so skipping the first character is equivalent.)
-    if segment.encode_utf16().count() > 1 {
-        for c in segment.chars().skip(1) {
+    // Intl.Segmenter can group multiple terminal-spacing code points into one
+    // grapheme. Count trailing visible code points that terminals may allocate
+    // cells for: Indic consonants after marks, halfwidth/fullwidth forms, and
+    // Thai/Lao AM vowels. (utils.ts:214-232; iterates the code points of the
+    // stripped `base` after the first one.)
+    let mut follows_mark = false;
+    for c in base.chars().skip(1) {
+        if is_terminal_spacing_mark_char(c) {
+            width += 1;
+            follows_mark = false;
+        } else if is_mark(c) {
+            follows_mark = true;
+        } else if !is_leading_non_printing_char(c) {
+            // `nonPrintingCharRegex` (utils.ts:42) is the same class as
+            // `leadingNonPrintingRegex`, so the helper is shared.
             let c = c as u32;
-            if (0xff00..=0xffef).contains(&c) {
+            if follows_mark || (0xff00..=0xffef).contains(&c) {
+                // halfwidth + fullwidth forms
                 width += east_asian_width(c);
             } else if c == 0x0e33 || c == 0x0eb3 {
                 width += 1;
             }
+            follows_mark = false;
         }
     }
 
@@ -361,8 +386,9 @@ fn truncate_fragment_to_width(text: &str, max_width: usize) -> (String, usize) {
     (result, width)
 }
 
-/// `finalizeTruncatedResult` (utils.ts:141-160): wrap the kept prefix and
-/// ellipsis in resets, optionally padding to `max_width`.
+/// `finalizeTruncatedResult` (utils.ts:147-167, b780d20aa + 229afb825): close
+/// any active OSC 8 hyperlink left open by the kept prefix, wrap the prefix
+/// and ellipsis in resets, optionally padding to `max_width`.
 fn finalize_truncated_result(
     prefix: &str,
     prefix_width: usize,
@@ -372,9 +398,11 @@ fn finalize_truncated_result(
     pad: bool,
 ) -> String {
     let reset = "\x1b[0m";
+    let hyperlink_close = get_active_osc8_close(prefix);
     let visible_width = prefix_width + ellipsis_width;
     let mut result = String::new();
     result.push_str(prefix);
+    result.push_str(&hyperlink_close);
     result.push_str(reset);
     if !ellipsis.is_empty() {
         result.push_str(ellipsis);
@@ -668,11 +696,39 @@ fn format_osc8_hyperlink(hyperlink: &ActiveHyperlink) -> String {
     }
 }
 
-/// `formatOsc8Close` (utils.ts:383-385).
+/// `formatOsc8Close` (utils.ts:478-480).
 fn format_osc8_close(terminator: Osc8Terminator) -> String {
     match terminator {
         Osc8Terminator::Bel => "\x1b]8;;\x07".to_string(),
         Osc8Terminator::St => "\x1b]8;;\x1b\\".to_string(),
+    }
+}
+
+/// `getActiveOsc8Close` (utils.ts:482-502, b780d20aa + 229afb825): if the kept
+/// prefix ends inside an active OSC 8 hyperlink, return the close sequence
+/// (preserving the original BEL/ST terminator); otherwise "".
+fn get_active_osc8_close(prefix: &str) -> String {
+    if !prefix.contains("\x1b]8;") {
+        return String::new();
+    }
+
+    let mut active_hyperlink: Option<ActiveHyperlink> = None;
+    let mut i = 0;
+    while i < prefix.len() {
+        if let Some(ansi) = extract_ansi_code(prefix, i) {
+            match parse_osc8_hyperlink(ansi.code) {
+                HyperlinkParse::NotHyperlink => {}
+                HyperlinkParse::Close => active_hyperlink = None,
+                HyperlinkParse::Open(h) => active_hyperlink = Some(h),
+            }
+            i += ansi.length;
+        } else {
+            i += 1;
+        }
+    }
+    match active_hyperlink {
+        Some(h) => format_osc8_close(h.terminator),
+        None => String::new(),
     }
 }
 
@@ -1331,7 +1387,7 @@ where
 /// Truncate text to fit within a maximum visible width, adding ellipsis if
 /// needed; optionally pad with spaces to reach exactly maxWidth. Properly
 /// handles ANSI escape codes (they don't count toward width).
-/// (utils.ts:936-1072, `truncateToWidth`)
+/// (utils.ts:1053-1189, `truncateToWidth`)
 ///
 /// - `text` - Text to truncate (may contain ANSI codes)
 /// - `max_width` - Maximum visible width
@@ -2132,6 +2188,203 @@ static CJK_BREAK_RANGES: &[(u32, u32)] = &[
     (0x2F800, 0x2FA1D),
     (0x30000, 0x3134A),
     (0x31350, 0x33479),
+];
+// terminalSpacingMarkRegex (utils.ts:46-47, dfe47d3fb) as evaluated by the runtime:
+// [\p{Spacing_Mark}--[\u1734\u302E\u302F]] plus the 14 non-spacing exceptions.
+static TERMINAL_SPACING_MARK_RANGES: &[(u32, u32)] = &[
+    (0x065F, 0x065F),
+    (0x0903, 0x0903),
+    (0x093B, 0x093B),
+    (0x093E, 0x0940),
+    (0x0949, 0x094C),
+    (0x094E, 0x094F),
+    (0x0982, 0x0983),
+    (0x09BE, 0x09C0),
+    (0x09C7, 0x09C8),
+    (0x09CB, 0x09CC),
+    (0x09D7, 0x09D7),
+    (0x0A03, 0x0A03),
+    (0x0A3E, 0x0A40),
+    (0x0A83, 0x0A83),
+    (0x0ABE, 0x0AC0),
+    (0x0AC9, 0x0AC9),
+    (0x0ACB, 0x0ACC),
+    (0x0B02, 0x0B03),
+    (0x0B3E, 0x0B3E),
+    (0x0B40, 0x0B40),
+    (0x0B47, 0x0B48),
+    (0x0B4B, 0x0B4C),
+    (0x0B57, 0x0B57),
+    (0x0BBE, 0x0BBF),
+    (0x0BC1, 0x0BC2),
+    (0x0BC6, 0x0BC8),
+    (0x0BCA, 0x0BCC),
+    (0x0BD7, 0x0BD7),
+    (0x0C01, 0x0C03),
+    (0x0C41, 0x0C44),
+    (0x0C82, 0x0C83),
+    (0x0CBE, 0x0CBE),
+    (0x0CC0, 0x0CC4),
+    (0x0CC7, 0x0CC8),
+    (0x0CCA, 0x0CCB),
+    (0x0CD5, 0x0CD6),
+    (0x0CF3, 0x0CF3),
+    (0x0D02, 0x0D03),
+    (0x0D3E, 0x0D40),
+    (0x0D46, 0x0D48),
+    (0x0D4A, 0x0D4C),
+    (0x0D57, 0x0D57),
+    (0x0D82, 0x0D83),
+    (0x0DCF, 0x0DD1),
+    (0x0DD8, 0x0DDF),
+    (0x0DF2, 0x0DF3),
+    (0x0F3E, 0x0F3F),
+    (0x0F7F, 0x0F7F),
+    (0x102B, 0x102C),
+    (0x1031, 0x1031),
+    (0x1033, 0x1035),
+    (0x1038, 0x1038),
+    (0x103A, 0x103E),
+    (0x1056, 0x1057),
+    (0x1062, 0x1064),
+    (0x1067, 0x106D),
+    (0x1083, 0x1084),
+    (0x1087, 0x108C),
+    (0x108F, 0x108F),
+    (0x109A, 0x109C),
+    (0x1715, 0x1715),
+    (0x17B6, 0x17B6),
+    (0x17BE, 0x17C5),
+    (0x17C7, 0x17C8),
+    (0x1923, 0x1926),
+    (0x1929, 0x192B),
+    (0x1930, 0x1931),
+    (0x1933, 0x1938),
+    (0x1A19, 0x1A1A),
+    (0x1A55, 0x1A55),
+    (0x1A57, 0x1A57),
+    (0x1A61, 0x1A61),
+    (0x1A63, 0x1A64),
+    (0x1A6D, 0x1A72),
+    (0x1B04, 0x1B04),
+    (0x1B35, 0x1B35),
+    (0x1B3B, 0x1B3B),
+    (0x1B3D, 0x1B41),
+    (0x1B43, 0x1B44),
+    (0x1B82, 0x1B82),
+    (0x1BA1, 0x1BA1),
+    (0x1BA6, 0x1BA7),
+    (0x1BAA, 0x1BAA),
+    (0x1BE7, 0x1BE7),
+    (0x1BEA, 0x1BEC),
+    (0x1BEE, 0x1BEE),
+    (0x1BF2, 0x1BF3),
+    (0x1C24, 0x1C2B),
+    (0x1C34, 0x1C35),
+    (0x1CE1, 0x1CE1),
+    (0x1CF7, 0x1CF7),
+    (0xA823, 0xA824),
+    (0xA827, 0xA827),
+    (0xA880, 0xA881),
+    (0xA8B4, 0xA8C3),
+    (0xA952, 0xA953),
+    (0xA983, 0xA983),
+    (0xA9B4, 0xA9B5),
+    (0xA9BA, 0xA9BB),
+    (0xA9BE, 0xA9C0),
+    (0xAA2F, 0xAA30),
+    (0xAA33, 0xAA34),
+    (0xAA4D, 0xAA4D),
+    (0xAA7B, 0xAA7B),
+    (0xAA7D, 0xAA7D),
+    (0xAAEB, 0xAAEB),
+    (0xAAEE, 0xAAEF),
+    (0xAAF5, 0xAAF5),
+    (0xABE3, 0xABE4),
+    (0xABE6, 0xABE7),
+    (0xABE9, 0xABEA),
+    (0xABEC, 0xABEC),
+    (0x11000, 0x11000),
+    (0x11002, 0x11002),
+    (0x11082, 0x11082),
+    (0x110B0, 0x110B2),
+    (0x110B7, 0x110B8),
+    (0x1112C, 0x1112C),
+    (0x11145, 0x11146),
+    (0x11182, 0x11182),
+    (0x111B3, 0x111B5),
+    (0x111BF, 0x111C0),
+    (0x111CE, 0x111CE),
+    (0x1122C, 0x1122E),
+    (0x11232, 0x11233),
+    (0x11235, 0x11235),
+    (0x112E0, 0x112E2),
+    (0x11302, 0x11303),
+    (0x1133E, 0x1133F),
+    (0x11341, 0x11344),
+    (0x11347, 0x11348),
+    (0x1134B, 0x1134D),
+    (0x11357, 0x11357),
+    (0x11362, 0x11363),
+    (0x113B8, 0x113BA),
+    (0x113C2, 0x113C2),
+    (0x113C5, 0x113C5),
+    (0x113C7, 0x113CA),
+    (0x113CC, 0x113CD),
+    (0x113CF, 0x113CF),
+    (0x11435, 0x11437),
+    (0x11440, 0x11441),
+    (0x11445, 0x11445),
+    (0x114B0, 0x114B2),
+    (0x114B9, 0x114B9),
+    (0x114BB, 0x114BE),
+    (0x114C1, 0x114C1),
+    (0x115AF, 0x115B1),
+    (0x115B8, 0x115BB),
+    (0x115BE, 0x115BE),
+    (0x11630, 0x11632),
+    (0x1163B, 0x1163C),
+    (0x1163E, 0x1163E),
+    (0x116AC, 0x116AC),
+    (0x116AE, 0x116AF),
+    (0x116B6, 0x116B6),
+    (0x1171E, 0x1171E),
+    (0x11720, 0x11721),
+    (0x11726, 0x11726),
+    (0x1182C, 0x1182E),
+    (0x11838, 0x11838),
+    (0x11930, 0x11935),
+    (0x11937, 0x11938),
+    (0x1193D, 0x1193D),
+    (0x11940, 0x11940),
+    (0x11942, 0x11942),
+    (0x119D1, 0x119D3),
+    (0x119DC, 0x119DF),
+    (0x119E4, 0x119E4),
+    (0x11A39, 0x11A39),
+    (0x11A57, 0x11A58),
+    (0x11A97, 0x11A97),
+    (0x11B61, 0x11B61),
+    (0x11B65, 0x11B65),
+    (0x11B67, 0x11B67),
+    (0x11C2F, 0x11C2F),
+    (0x11C3E, 0x11C3E),
+    (0x11CA9, 0x11CA9),
+    (0x11CB1, 0x11CB1),
+    (0x11CB4, 0x11CB4),
+    (0x11D8A, 0x11D8E),
+    (0x11D93, 0x11D94),
+    (0x11D96, 0x11D96),
+    (0x11EF5, 0x11EF6),
+    (0x11F03, 0x11F03),
+    (0x11F34, 0x11F35),
+    (0x11F3E, 0x11F3F),
+    (0x11F41, 0x11F41),
+    (0x1612A, 0x1612C),
+    (0x16F51, 0x16F87),
+    (0x16FF0, 0x16FF1),
+    (0x1D165, 0x1D166),
+    (0x1D16D, 0x1D172),
 ];
 // Single-codepoint RGI_Emoji as evaluated by the runtime.
 static EMOJI_PRESENTATION_RANGES: &[(u32, u32)] = &[
@@ -4995,11 +5248,102 @@ mod tests {
         assert_eq!(truncated, "🙂\t\x1b[0m…\x1b[0m ");
     }
 
+    // `closes a BEL-terminated OSC 8 link when truncating its label`
+    // (truncate-to-width.test.ts, b780d20aa + 229afb825), plus the
+    // ST-terminated variant.
+    #[test]
+    fn closes_a_bel_terminated_osc8_link_when_truncating_its_label() {
+        let open = "\x1b]8;;https://example.com\x07";
+        let close = "\x1b]8;;\x07";
+        let text = format!("{open}some-longer-label-here{close}");
+        assert_eq!(
+            truncate_to_width(&text, 15, "...", false),
+            format!("{open}some-longer-{close}\x1b[0m...\x1b[0m")
+        );
+    }
+
+    #[test]
+    fn closes_an_st_terminated_osc8_link_when_truncating_its_label() {
+        let open = "\x1b]8;;https://example.com\x1b\\";
+        let close = "\x1b]8;;\x1b\\";
+        let text = format!("{open}some-longer-label-here{close}");
+        assert_eq!(
+            truncate_to_width(&text, 15, "...", false),
+            format!("{open}some-longer-{close}\x1b[0m...\x1b[0m")
+        );
+    }
+
+    #[test]
+    fn does_not_emit_osc8_close_when_the_kept_prefix_has_no_open_hyperlink() {
+        // Fast path: no OSC 8 at all.
+        assert_eq!(
+            truncate_to_width("some-longer-label-here", 15, "...", false),
+            "some-longer-\x1b[0m...\x1b[0m"
+        );
+        // Hyperlink closed before the cut point.
+        let open = "\x1b]8;;https://example.com\x07";
+        let close = "\x1b]8;;\x07";
+        let text = format!("{open}ab{close}some-longer-label-here");
+        assert_eq!(
+            truncate_to_width(&text, 15, "...", false),
+            format!("{open}ab{close}some-longe\x1b[0m...\x1b[0m")
+        );
+    }
+
     // ---- visibleWidth (truncate-to-width.test.ts) ----
 
     #[test]
     fn counts_tabs_inline_and_skips_ansi_inline() {
         assert_eq!(visible_width("\t\x1b[31m界\x1b[0m"), 5);
+    }
+
+    // ---- grapheme width anchors (truncate-to-width.test.ts, dfe47d3fb) ----
+
+    #[test]
+    fn counts_indic_conjunct_spacing_code_points_within_grapheme_clusters() {
+        assert_eq!(visible_width("र्क"), 2);
+        assert_eq!(visible_width("नेटवर्क"), 5);
+        assert_eq!(visible_width("सर्वाधिकार सुरक्षित। ऑर्डर पर क्लिक करें"), 33);
+        assert_eq!(visible_width("র্ক"), 2);
+        assert_eq!(visible_width("ર્ક"), 2);
+        assert_eq!(visible_width("ର୍କ"), 2);
+        assert_eq!(visible_width("ర్క"), 2);
+        assert_eq!(visible_width("ര്‍ക"), 2);
+    }
+
+    #[test]
+    fn keeps_ordinary_combining_marks_zero_width() {
+        assert_eq!(visible_width("e\u{0301}"), 1);
+        assert_eq!(visible_width("čřžůú"), 5);
+        assert_eq!(visible_width("שָׁ"), 1);
+        assert_eq!(visible_width("بّ"), 1);
+        assert_eq!(visible_width("རྐ"), 1);
+        assert_eq!(visible_width("ᜠ᜴"), 1);
+        assert_eq!(visible_width("가〮"), 2);
+        assert_eq!(visible_width("가〯"), 2);
+    }
+
+    #[test]
+    fn keeps_cjk_and_japanese_width_accounting_unchanged() {
+        assert_eq!(visible_width("网络"), 4);
+        assert_eq!(visible_width("ネットワーク"), 12);
+        assert_eq!(visible_width("が"), 2);
+        assert_eq!(visible_width("か\u{3099}"), 2);
+    }
+
+    #[test]
+    fn counts_myanmar_marks_that_terminals_allocate_cells_for() {
+        assert_eq!(visible_width("ကာ"), 2);
+        assert_eq!(visible_width("ကေ"), 2);
+        assert_eq!(visible_width("က်"), 2);
+        assert_eq!(visible_width("ကျ"), 2);
+        assert_eq!(visible_width("ကြ"), 2);
+        assert_eq!(visible_width("ကဳ"), 2);
+        assert_eq!(visible_width("ကဴ"), 2);
+        assert_eq!(visible_width("ကဵ"), 2);
+        assert_eq!(visible_width("ကး"), 2);
+        assert_eq!(visible_width("ကို"), 1);
+        assert_eq!(visible_width("က္"), 1);
     }
 
     #[test]
