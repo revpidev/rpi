@@ -4754,6 +4754,93 @@ mod tests {
         manager.remove("git:github.com/user/repo", false).unwrap();
     }
 
+    #[test]
+    fn test_install_git_clean_failure_triggers_repair_then_rethrows() {
+        // `git clean -fdx` fails during marker-resume → best-effort
+        // repair_missing_git_dependencies runs npm install, then the original
+        // clean error is rethrown (b06dc76fd).
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        // package.json declares a dependency so has_missing_git_dependencies
+        // returns true (no node_modules/some-dep on disk).
+        write_file(
+            &target.join("package.json"),
+            r#"{"dependencies": {"some-dep": "^1.0.0"}}"#,
+        );
+        let marker = dirs
+            .agent_dir
+            .join("git/github.com/user/.repo.rpi-update-incomplete");
+        write_file(&marker, "");
+        let head = "a".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git" && request.args.first().map(String::as_str) == Some("clean")
+            {
+                return Err("git clean failed".to_string());
+            }
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                return Ok(head.clone());
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        let result = manager.install("git:github.com/user/repo@v1", false);
+        // Original clean error must be rethrown.
+        assert!(result.is_err(), "install should fail after clean failure");
+        assert!(
+            result.unwrap_err().contains("git clean failed"),
+            "rethrown error should be the clean error"
+        );
+        // repair_missing_git_dependencies should have run npm install
+        // (because has_missing_git_dependencies is true).
+        let npm_calls = runner.find_calls("npm", "install");
+        assert!(
+            !npm_calls.is_empty(),
+            "repair npm install should run after clean failure, got calls: {:?}",
+            runner.calls()
+        );
+    }
+
+    #[test]
+    fn test_install_git_unchanged_head_no_marker_triggers_defensive_repair() {
+        // HEAD unchanged, no marker → defensive repair_missing_git_dependencies
+        // runs npm install if deps are missing (b06dc76fd).
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        write_file(
+            &target.join("package.json"),
+            r#"{"dependencies": {"some-dep": "^1.0.0"}}"#,
+        );
+        // No marker present.
+        let head = "a".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                return Ok(head.clone());
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        manager
+            .install("git:github.com/user/repo@v1", false)
+            .unwrap();
+        // Defensive repair should have run npm install.
+        let npm_calls = runner.find_calls("npm", "install");
+        assert!(
+            !npm_calls.is_empty(),
+            "defensive repair npm install should run on unchanged head without marker, got calls: {:?}",
+            runner.calls()
+        );
+        // git clean should NOT have run (no marker → no clean+install).
+        let clean_calls = runner.find_calls("git", "clean");
+        assert!(
+            clean_calls.is_empty(),
+            "git clean should not run without marker"
+        );
+    }
+
     // --- read_pi_manifest type strictness (pi-manifest.ts) -------------------
 
     #[test]
