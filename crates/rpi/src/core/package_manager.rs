@@ -1,6 +1,7 @@
-//! Port of `packages/coding-agent/src/core/package-manager.ts` @ pi 0.82.1
-//! (2efa728) — package sources (npm/git/local), install/remove, settings
-//! persistence, identity dedupe, `package.json#pi` manifests, resource
+//! Port of `packages/coding-agent/src/core/package-manager.ts` @ pi 0.84.1+
+//! (4181f66) — package sources (npm/git/local), install/remove, settings
+//! persistence, identity dedupe, `package.json#pi` manifests (via
+//! `pi-manifest.ts`), resource
 //! filters, and the package slice of `resolve()`.
 //!
 //! Boundary with T09: top-level settings entries and auto-discovery of
@@ -1729,7 +1730,10 @@ impl DefaultPackageManager {
         self.run_npm_command(&args, None)
     }
 
-    /// `installGit` (package-manager.ts:1820-1845).
+    /// `installGit` (package-manager.ts:1820-1845, commits 0563a7c01 +
+    /// b06dc76fd): clone, checkout ref, install deps. Failure at any step
+    /// removes the residual target dir + empty git parents and rethrows.
+    /// A stale `.rpi-update-incomplete` marker is removed on entry.
     fn install_git(&self, source: &GitSource, scope: SourceScope) -> Result<(), String> {
         let target_dir = self.get_git_install_path(source, scope)?;
         if target_dir.exists() {
@@ -1739,23 +1743,41 @@ impl DefaultPackageManager {
             let target = self.get_local_git_update_target(&target_dir)?;
             return self.ensure_git_ref(&target_dir, &target.fetch_args_str(), &target.ref_);
         }
-        if let Some(git_root) = self.get_git_install_root(scope)? {
-            self.ensure_git_ignore(&git_root)?;
+        let git_root = self.get_git_install_root(scope)?;
+        if let Some(ref root) = git_root {
+            self.ensure_git_ignore(root)?;
         }
+
+        // Remove stale marker before a fresh clone (b06dc76fd).
+        let marker = self.get_git_update_marker_path(&target_dir);
+        let _ = std::fs::remove_file(&marker);
+
         if let Some(parent) = target_dir.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        self.runner.run(&CommandRequest::new(
-            "git",
-            &["clone", &source.repo, &target_dir.to_string_lossy()],
-        ))?;
-        if let Some(ref_) = &source.ref_ {
-            self.runner
-                .run(&CommandRequest::new("git", &["checkout", ref_]).with_cwd(&target_dir))?;
-        }
-        if target_dir.join("package.json").exists() {
-            self.run_npm_command(&self.get_git_dependency_install_args(), Some(&target_dir))?;
+        // Clone → checkout → npm install, wrapped in try/catch: failure
+        // cleans up the partial clone and rethrows (0563a7c01).
+        let result = (|| -> Result<(), String> {
+            self.runner.run(&CommandRequest::new(
+                "git",
+                &["clone", &source.repo, &target_dir.to_string_lossy()],
+            ))?;
+            if let Some(ref_) = &source.ref_ {
+                self.runner
+                    .run(&CommandRequest::new("git", &["checkout", ref_]).with_cwd(&target_dir))?;
+            }
+            if target_dir.join("package.json").exists() {
+                self.run_npm_command(&self.get_git_dependency_install_args(), Some(&target_dir))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_dir_all(&target_dir);
+            if let Some(ref root) = git_root {
+                self.prune_empty_git_parents(&target_dir, Some(root.clone()));
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -1776,9 +1798,98 @@ impl DefaultPackageManager {
         self.ensure_git_ref(&target_dir, &target.fetch_args_str(), &target.ref_)
     }
 
-    /// `ensureGitRef` (package-manager.ts:1863-1889): fetch only the target
-    /// ref, then hard-reset + clean and reinstall dependencies when HEAD
-    /// moves.
+    /// `hasMissingGitDependencies` (package-manager.ts, b06dc76fd): check
+    /// whether `node_modules/<dep>` is missing for any declared
+    /// `package.json#dependencies` entry. Path-traversal guard: skip deps
+    /// whose resolved path escapes `node_modules`.
+    fn has_missing_git_dependencies(&self, target_dir: &Path) -> bool {
+        let package_json_path = target_dir.join("package.json");
+        if !package_json_path.exists() {
+            return false;
+        }
+        let Ok(content) = std::fs::read_to_string(&package_json_path) else {
+            return false;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(&content) else {
+            return false;
+        };
+        let Some(deps) = parsed.get("dependencies") else {
+            return false;
+        };
+        if !deps.is_object() {
+            return false;
+        }
+        let Some(dep_map) = deps.as_object() else {
+            return false;
+        };
+        let node_modules = target_dir.join("node_modules");
+        for name in dep_map.keys() {
+            let dep_path = node_modules.join(name);
+            // Path-traversal guard (upstream: startsWith check).
+            if !dep_path.starts_with(&node_modules) {
+                continue;
+            }
+            if !dep_path.exists() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `repairMissingGitDependencies` (package-manager.ts, b06dc76fd): if
+    /// any dependency is missing, re-run npm install.
+    fn repair_missing_git_dependencies(&self, target_dir: &Path) -> Result<(), String> {
+        if !self.has_missing_git_dependencies(target_dir) {
+            return Ok(());
+        }
+        self.run_npm_command(&self.get_git_dependency_install_args(), Some(target_dir))
+    }
+
+    /// `getGitUpdateMarkerPath` (package-manager.ts, b06dc76fd):
+    /// `.<basename>.rpi-update-incomplete` in the parent directory. Upstream
+    /// uses `.pi-update-incomplete`; renamed per ADR-0001 (APP_NAME derived).
+    fn get_git_update_marker_path(&self, target_dir: &Path) -> PathBuf {
+        let basename = target_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let marker_name = format!(".{basename}.rpi-update-incomplete");
+        target_dir
+            .parent()
+            .map(|p| p.join(&marker_name))
+            .unwrap_or_else(|| PathBuf::from(marker_name))
+    }
+
+    /// `cleanAndInstallGitDependencies` (package-manager.ts, b06dc76fd):
+    /// `git clean -fdx`, then npm install. If clean fails, attempt to repair
+    /// missing deps (best-effort, errors swallowed) before rethrowing the
+    /// clean error so the extension isn't left in a broken state.
+    fn clean_and_install_git_dependencies(
+        &self,
+        target_dir: &Path,
+        marker_path: &Path,
+    ) -> Result<(), String> {
+        let clean_result = self
+            .runner
+            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir));
+        if let Err(error) = clean_result {
+            let _ = self.repair_missing_git_dependencies(target_dir);
+            return Err(error);
+        }
+        if target_dir.join("package.json").exists() {
+            self.run_npm_command(&self.get_git_dependency_install_args(), Some(target_dir))?;
+        }
+        let _ = std::fs::remove_file(marker_path);
+        Ok(())
+    }
+
+    /// `ensureGitRef` (package-manager.ts:1863-1889, commit b06dc76fd): fetch
+    /// only the target ref, then hard-reset + clean and reinstall dependencies
+    /// when HEAD moves. Marker-based resume: a `.rpi-update-incomplete`
+    /// marker signals a previously interrupted update — if HEAD hasn't moved
+    /// but the marker exists, the clean+install is retried (resume). If HEAD
+    /// hasn't moved and no marker exists, a defensive dependency repair is
+    /// run (handles broken state from a previously failed clean).
     fn ensure_git_ref(
         &self,
         target_dir: &Path,
@@ -1799,30 +1910,40 @@ impl DefaultPackageManager {
                 .with_cwd(target_dir)
                 .with_timeout(NETWORK_TIMEOUT),
         )?;
+        let marker_path = self.get_git_update_marker_path(target_dir);
+
         if local_head.trim() == target_head.trim() {
+            // HEAD unchanged — check for an interrupted update marker.
+            if marker_path.exists() {
+                // Resume the interrupted clean+install.
+                self.clean_and_install_git_dependencies(target_dir, &marker_path)?;
+            } else {
+                // Defensive: repair missing deps without a full clean.
+                self.repair_missing_git_dependencies(target_dir)?;
+            }
             return Ok(());
         }
+
+        // Write the marker before resetting; cleaned up on successful
+        // clean+install (b06dc76fd).
+        let _ = std::fs::write(&marker_path, "");
 
         self.runner.run(
             &CommandRequest::new("git", &["reset", "--hard", &commit_ref]).with_cwd(target_dir),
         )?;
-        // Clean untracked files (extensions should be pristine).
-        self.runner
-            .run(&CommandRequest::new("git", &["clean", "-fdx"]).with_cwd(target_dir))?;
-
-        if target_dir.join("package.json").exists() {
-            self.run_npm_command(&self.get_git_dependency_install_args(), Some(target_dir))?;
-        }
+        self.clean_and_install_git_dependencies(target_dir, &marker_path)?;
         Ok(())
     }
 
-    /// `removeGit` (package-manager.ts:1904-1909).
+    /// `removeGit` (package-manager.ts:1904-1909, commit b06dc76fd): remove
+    /// unconditionally (`rmSync --force` semantics), and clean up the marker.
     fn remove_git(&self, source: &GitSource, scope: SourceScope) -> Result<(), String> {
         let target_dir = self.get_git_install_path(source, scope)?;
-        if !target_dir.exists() {
-            return Ok(());
-        }
-        std::fs::remove_dir_all(&target_dir).map_err(|e| e.to_string())?;
+        let marker = self.get_git_update_marker_path(&target_dir);
+        // Upstream removed the `existsSync` guard (b06dc76fd): delete
+        // unconditionally, ignoring NotFound.
+        let _ = std::fs::remove_dir_all(&target_dir);
+        let _ = std::fs::remove_file(&marker);
         self.prune_empty_git_parents(&target_dir, self.get_git_install_root(scope)?);
         Ok(())
     }
@@ -3420,10 +3541,16 @@ fn has_glob_pattern(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 
-/// `readPiManifest` / `readPiManifestFile` (package-manager.ts:536-544,
-/// 2228-2241): `package.json#pi`; malformed JSON or a missing/non-object
-/// `pi` yields `None` — except a present non-null non-object `pi`, which
-/// upstream treats as a truthy manifest with no entries.
+/// `readPiManifest` / `readPiManifestFile` (pi-manifest.ts,
+/// package-manager.ts:536-544 / 2228-2241 @ pi 0.84.1+): `package.json#pi`;
+/// malformed JSON, a missing `pi`, or a non-object `pi` yields `None`.
+/// Individual resource fields are only collected when the value is a
+/// `string[]`; a non-array or non-string-element field is left `None`
+/// (upstream: field omitted from the manifest object).
+///
+/// Ported from the independent `src/core/pi-manifest.ts` (commit: new file
+/// at 4181f66). rpi keeps the function in this module rather than creating
+/// a separate file — the Rust workspace has no per-file export constraint.
 fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
     let package_json_path = package_root.join("package.json");
     if !package_json_path.exists() {
@@ -3431,17 +3558,32 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
     }
     let content = std::fs::read_to_string(package_json_path).ok()?;
     let parsed: Value = serde_json::from_str(&content).ok()?;
+    // isObject(pkg): must be a JSON object (not array / primitive / null).
+    if !parsed.is_object() {
+        return None;
+    }
     let pi = parsed.get("pi")?;
-    if pi.is_null() {
+    // isObject(pkg.pi): must be a JSON object (not array / primitive / null).
+    if !pi.is_object() {
         return None;
     }
     let string_array = |key: &str| -> Option<Vec<String>> {
-        pi.get(key).and_then(Value::as_array).map(|array| {
+        let entries = pi.get(key)?;
+        if !entries.is_array() {
+            return None;
+        }
+        let array = entries.as_array()?;
+        // Only collect when every element is a string; otherwise the field
+        // is omitted (upstream `Array.isArray && every typeof === "string"`).
+        if !array.iter().all(|v| v.is_string()) {
+            return None;
+        }
+        Some(
             array
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
+                .collect(),
+        )
     };
     Some(PiManifest {
         extensions: string_array("extensions"),
@@ -4488,6 +4630,190 @@ mod tests {
         assert!(!dirs.agent_dir.join("git/github.com/user").exists());
         assert!(!dirs.agent_dir.join("git/github.com").exists());
         assert!(dirs.agent_dir.join("git").exists());
+    }
+
+    // --- git install tolerance (b06dc76fd + 0563a7c01) -----------------------
+
+    #[test]
+    fn test_install_git_clone_failure_cleans_residual_dir() {
+        // clone fails → target dir should be cleaned up (0563a7c01).
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        let runner = FakeRunner::new(|request| {
+            if request.command == "git" && request.args.first().map(String::as_str) == Some("clone")
+            {
+                // Simulate clone partially populating the target then failing.
+                let target = PathBuf::from(request.args[2].clone());
+                std::fs::create_dir_all(&target).expect("create partial clone");
+                return Err("clone failed".to_string());
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner);
+        let result = manager.install("git:github.com/user/repo", false);
+        assert!(result.is_err(), "install should fail");
+        // Residual target dir must be cleaned up.
+        assert!(!target.exists(), "target dir should be cleaned on failure");
+    }
+
+    #[test]
+    fn test_install_git_marker_resume_on_unchanged_head() {
+        // HEAD unchanged but marker exists → clean+install runs (b06dc76fd).
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        write_file(&target.join("package.json"), "{}");
+        let marker = dirs
+            .agent_dir
+            .join("git/github.com/user/.repo.rpi-update-incomplete");
+        write_file(&marker, "");
+        let head = "a".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                return Ok(head.clone());
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner.clone());
+        manager
+            .install("git:github.com/user/repo@v1", false)
+            .unwrap();
+
+        // With marker present and HEAD unchanged, clean+install should run.
+        let calls = runner.calls();
+        assert!(
+            calls.iter().any(|c| {
+                c.command == "git" && c.args.first().map(String::as_str) == Some("clean")
+            }),
+            "git clean should run on marker resume"
+        );
+        assert!(
+            calls.iter().any(|c| c.command == "npm"),
+            "npm install should run on marker resume"
+        );
+        // Marker should be removed after successful clean+install.
+        assert!(!marker.exists(), "marker should be cleaned after resume");
+    }
+
+    #[test]
+    fn test_install_git_marker_written_before_reset() {
+        // HEAD moves → marker is written before reset, removed after success.
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        write_file(&target.join("package.json"), "{}");
+        let marker = dirs
+            .agent_dir
+            .join("git/github.com/user/.repo.rpi-update-incomplete");
+        let head = "a".repeat(40);
+        let fetched = "b".repeat(40);
+        let runner = FakeRunner::new(move |request| {
+            if request.command == "git"
+                && request.args.first().map(String::as_str) == Some("rev-parse")
+            {
+                if request.args.iter().any(|a| a == "HEAD") {
+                    return Ok(head.clone());
+                }
+                return Ok(fetched.clone());
+            }
+            Ok(String::new())
+        });
+        let manager = test_manager(&dirs, runner);
+        manager
+            .install("git:github.com/user/repo@v1", false)
+            .unwrap();
+        // After successful update, marker should not exist.
+        assert!(!marker.exists(), "marker should be cleaned after update");
+    }
+
+    #[test]
+    fn test_remove_git_cleans_marker() {
+        let dirs = TestDirs::new();
+        let target = dirs.agent_dir.join("git/github.com/user/repo");
+        write_file(&target.join("package.json"), "{}");
+        let marker = dirs
+            .agent_dir
+            .join("git/github.com/user/.repo.rpi-update-incomplete");
+        write_file(&marker, "");
+        let runner = FakeRunner::ok();
+        let manager = test_manager(&dirs, runner);
+
+        manager.remove("git:github.com/user/repo", false).unwrap();
+        assert!(!target.exists());
+        assert!(!marker.exists(), "marker should be cleaned on remove");
+    }
+
+    #[test]
+    fn test_remove_git_unconditional_no_error_on_missing() {
+        // remove_git no longer guards on existsSync (b06dc76fd) — should not
+        // error even if the target dir is already gone.
+        let dirs = TestDirs::new();
+        let runner = FakeRunner::ok();
+        let manager = test_manager(&dirs, runner);
+        // Target dir doesn't exist at all.
+        manager.remove("git:github.com/user/repo", false).unwrap();
+    }
+
+    // --- read_pi_manifest type strictness (pi-manifest.ts) -------------------
+
+    #[test]
+    fn test_read_pi_manifest_non_object_pi_treated_as_null() {
+        // Port of pi-manifest.ts isObject check: a non-object `pi` field
+        // must yield None (same as missing/null pi).
+        let dirs = TestDirs::new();
+        let pkg_dir = dirs.cwd.join("pkg");
+        write_file(
+            &pkg_dir.join("package.json"),
+            r#"{"name": "pkg", "pi": "not-an-object"}"#,
+        );
+        // read_pi_manifest is private; observable effect: same as missing pi.
+        // With no manifest and no convention dirs/files, collect_package_resources
+        // returns false and the dir itself is added as a raw extension entry.
+        let manager = test_manager(&dirs, FakeRunner::ok());
+        let resolved = manager
+            .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
+            .unwrap();
+        // The raw directory is added as a fallback extension entry.
+        assert_eq!(resolved.extensions.len(), 1);
+        assert_eq!(resolved.extensions[0].path, pkg_dir);
+    }
+
+    #[test]
+    fn test_read_pi_manifest_array_field_with_non_strings_omitted() {
+        // When a resource field has non-string elements, it is omitted from
+        // the manifest (treated as if the field were absent). The manifest is
+        // still a valid object, so collect_package_resources processes it —
+        // the invalid extensions field yields no extension entries, and the
+        // valid skills field is still picked up.
+        let dirs = TestDirs::new();
+        let pkg_dir = dirs.cwd.join("pkg");
+        write_file(
+            &pkg_dir.join("package.json"),
+            r#"{"name": "pkg", "pi": {"extensions": [123, "valid"], "skills": ["skills/useful.md"]}}"#,
+        );
+        write_file(
+            &pkg_dir.join("skills").join("useful.md"),
+            "---\nname: useful\ndescription: test\n---\nbody",
+        );
+        let manager = test_manager(&dirs, FakeRunner::ok());
+        let resolved = manager
+            .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
+            .unwrap();
+        // extensions field is invalid (non-string element) → None → no
+        // extension entries collected.
+        assert!(
+            resolved.extensions.is_empty(),
+            "invalid extensions field should yield no entries, got: {:?}",
+            resolved.extensions
+        );
+        // skills field is valid → skill entry collected.
+        assert!(
+            resolved
+                .skills
+                .iter()
+                .any(|r| r.path.ends_with("useful.md")),
+            "valid skills field should still be picked up"
+        );
     }
 
     #[test]

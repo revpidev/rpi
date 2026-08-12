@@ -2093,11 +2093,18 @@ impl InteractiveUi {
                     })
                 })
                 .collect();
-            let context_files: Vec<String> = loaded
-                .context_files
-                .iter()
-                .map(|file| file.path.display().to_string())
-                .collect();
+            // Context listing (interactive-mode.ts:1495): system prompt
+            // source → append system prompt sources → agents files.
+            let mut context_files: Vec<String> = Vec::new();
+            if let Some(path) = &loaded.system_prompt_source_path {
+                context_files.push(path.display().to_string());
+            }
+            for path in &loaded.append_system_prompt_source_paths {
+                context_files.push(path.display().to_string());
+            }
+            for file in &loaded.context_files {
+                context_files.push(file.path.display().to_string());
+            }
             let diagnostics: Vec<(String, Option<String>)> = loaded
                 .diagnostics
                 .iter()

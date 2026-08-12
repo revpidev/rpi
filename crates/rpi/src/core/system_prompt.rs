@@ -1,12 +1,15 @@
 //! Port of `packages/coding-agent/src/core/system-prompt.ts`
-//! @ pi 0.82.1 (2efa728), plus the context-file and system-prompt-source
+//! @ pi 0.84.1+ (4181f66), plus the context-file and system-prompt-source
 //! parts of `packages/coding-agent/src/core/resource-loader.ts`:
 //! `resolvePromptInput` (:50-65), `loadContextFileFromDir` (:67-86),
-//! `loadProjectContextFiles` (:88-123), `discoverSystemPromptFile`
-//! (:969-981) and `discoverAppendSystemPromptFile` (:983-995).
+//! `loadProjectContextFiles` (:88-123) with
+//! `findShadowedContextFile` (:100-116, commit cced6a21d),
+//! `discoverSystemPromptFile` (:969-981) and
+//! `discoverAppendSystemPromptFile` (:983-995).
 //!
-//! Context files: per directory the first hit of `AGENTS.md`, `AGENTS.MD`,
-//! `CLAUDE.md`, `CLAUDE.MD` (in that priority order) wins. Loading order is
+//! Context files: per directory the first hit of `AGENTS.override.md`,
+//! `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD` (in that priority order)
+//! wins. Loading order is
 //! the global agent dir first, then the full ancestor chain from the
 //! filesystem root down to cwd (NOT bounded by the git repo root),
 //! deduplicated by path, and independent of project trust. Loaded files are
@@ -51,8 +54,14 @@ pub struct ContextFile {
     pub content: String,
 }
 
-/// Candidate file names, in priority order (resource-loader.ts:68).
-const CONTEXT_FILE_CANDIDATES: [&str; 4] = ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+/// Candidate file names, in priority order (resource-loader.ts:71, commit 8ecf8a988).
+const CONTEXT_FILE_CANDIDATES: [&str; 5] = [
+    "AGENTS.override.md",
+    "AGENTS.md",
+    "AGENTS.MD",
+    "CLAUDE.md",
+    "CLAUDE.MD",
+];
 
 fn process_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
@@ -63,10 +72,10 @@ fn process_cwd() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// `loadContextFileFromDir` (resource-loader.ts:67-86): return the first
-/// readable candidate of `AGENTS.md` > `AGENTS.MD` > `CLAUDE.md` >
-/// `CLAUDE.MD` in `dir`. A candidate that exists but is not a file is
-/// skipped silently; a stat/read failure logs a warning and falls through
-/// to the next candidate (upstream `try/catch` around `statSync` +
+/// readable candidate of `AGENTS.override.md` > `AGENTS.md` > `AGENTS.MD` >
+/// `CLAUDE.md` > `CLAUDE.MD` in `dir`. A candidate that exists but is not a
+/// file is skipped silently; a stat/read failure logs a warning and falls
+/// through to the next candidate (upstream `try/catch` around `statSync` +
 /// `readFileSync`).
 pub fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
     for filename in CONTEXT_FILE_CANDIDATES {
@@ -95,12 +104,70 @@ pub fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
     None
 }
 
-/// `loadProjectContextFiles` (resource-loader.ts:88-123).
+/// `findShadowedContextFile` (resource-loader.ts:100-116, commit cced6a21d):
+/// in a **nested** linked worktree (`git worktree add ./feat`), the main
+/// checkout lives in an ancestor directory and may carry the same context
+/// file. Without dedup the file is loaded twice — once from the worktree
+/// root (ancestor walk) and once from the main checkout (also an ancestor).
+///
+/// Returns the canonicalized path of the shadowed file in the main repo
+/// root, if any. The caller skips a context file whose canonical path
+/// matches this value.
+///
+/// Returned canonicalized (realpath), because `git worktree add` writes the
+/// `.git` file's `gitdir:` target in realpath form while cwd may still be
+/// symlinked (macOS `/tmp` -> `/private/tmp`).
+fn find_shadowed_context_file(cwd: &Path) -> Option<PathBuf> {
+    let git_paths = crate::core::git_paths::find_git_paths(cwd)?;
+    let common_git_dir = canonicalize_path(&git_paths.common_git_dir);
+    let worktree_root = canonicalize_path(&git_paths.repo_dir);
+    let main_repo_root = common_git_dir.parent()?.to_path_buf();
+
+    // False for an ordinary repo, where the two are the same dir, and for a
+    // sibling worktree (`git worktree add ../feat`), whose main repo is not
+    // an ancestor.
+    if !worktree_root.starts_with(&main_repo_root) {
+        return None;
+    }
+    let separator_check = {
+        let mut prefix = main_repo_root.clone();
+        prefix.push(""); // adds trailing separator
+        worktree_root.starts_with(&main_repo_root)
+            && worktree_root != main_repo_root
+            && worktree_root.starts_with(prefix)
+    };
+    if !separator_check {
+        return None;
+    }
+
+    // dirname of the common git dir is the main worktree root only when that
+    // dir is itself checked out from the same repo. In a bare layout
+    // (`proj/.bare` + `proj/main`) it is just the directory holding `.bare`,
+    // which tracks nothing; a submodule's gitdir has no `commondir`, so it
+    // lands under `.git/modules`.
+    let main_git_path = canonicalize_path(&main_repo_root.join(".git"));
+    if main_git_path != common_git_dir {
+        return None;
+    }
+
+    let worktree_context = load_context_file_from_dir(&worktree_root)?;
+    let filename = worktree_context.path.file_name()?;
+    Some(main_repo_root.join(filename))
+}
+
+/// `canonicalizePath` (resource-loader.ts:95-98): `fs.realpathSync`.
+fn canonicalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// `loadProjectContextFiles` (resource-loader.ts:118-156, commit cced6a21d).
 ///
 /// Order: the global agent-dir context file first, then the ancestor chain
 /// from the filesystem root down to `cwd` (root side first, cwd last —
 /// upstream `unshift`). Paths are deduplicated; loading happens regardless
-/// of project trust.
+/// of project trust. In a nested linked worktree, a context file that
+/// shadows the worktree's own from the main checkout is skipped
+/// (see [`find_shadowed_context_file`]).
 pub fn load_project_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
     let resolved_cwd = resolve_path(&cwd.to_string_lossy(), &process_cwd());
     let resolved_agent_dir = resolve_path(&agent_dir.to_string_lossy(), &process_cwd());
@@ -114,11 +181,17 @@ pub fn load_project_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFi
     }
 
     let mut ancestor_context_files: Vec<ContextFile> = Vec::new();
+    let shadowed_context_file = find_shadowed_context_file(&resolved_cwd);
     let mut current_dir = resolved_cwd;
 
     loop {
-        if let Some(context_file) = load_context_file_from_dir(&current_dir) {
-            if !seen_paths.contains(&context_file.path) {
+        let context_file = load_context_file_from_dir(&current_dir);
+        let is_shadowed = match (&context_file, &shadowed_context_file) {
+            (Some(cf), Some(shadowed)) => canonicalize_path(&cf.path) == *shadowed,
+            _ => false,
+        };
+        if let Some(context_file) = context_file {
+            if !is_shadowed && !seen_paths.contains(&context_file.path) {
                 seen_paths.insert(context_file.path.clone());
                 // unshift: ancestors end up root-first, cwd last.
                 ancestor_context_files.insert(0, context_file);

@@ -1,5 +1,5 @@
-//! Port of `packages/coding-agent/src/core/resource-loader.ts` @ pi 0.82.1
-//! (2efa728): `DefaultResourceLoader` (:162-1043) — the unified resource
+//! Port of `packages/coding-agent/src/core/resource-loader.ts` @ pi 0.84.1+
+//! (4181f66): `DefaultResourceLoader` (:162-1043) — the unified resource
 //! discovery pipeline that wires settings, skills, prompt templates, themes
 //! and context files into one loaded set — plus the prompts/themes discovery
 //! subset of `core/package-manager.ts` (`resolve` :901-953,
@@ -7,6 +7,14 @@
 //! `collectFiles`/`collectAuto*Entries` :301-346, :462-530, `toResolvedPaths`
 //! :2527-2545) and the keybindings config-file migration of `migrations.ts`
 //! (`migrateKeybindingsConfigFile` :157-172).
+//!
+//! v0.11 additions (commits 66eead652, bff5ab717, cced6a21d):
+//! - `resourceMetadataByPath` preserved on the instance so
+//!   `extendResources` retains package source metadata after reload (#6968).
+//! - `systemPromptSourcePath` / `appendSystemPromptSourcePaths` captured on
+//!   `LoadedResources` for the interactive Context listing (#7266).
+//! - Shadowed context-file dedup in `loadProjectContextFiles` lives in
+//!   `system_prompt.rs` (uses `core/git_paths.rs`).
 //!
 //! Discovery order (coding-standards §10.2): global `~/.rpi/agent` → project
 //! `.rpi` (trust-gated) → settings-specified paths → CLI flags → packages.
@@ -130,6 +138,13 @@ pub struct LoadedResources {
     pub system_prompt: Option<String>,
     /// `--append-system-prompt` / discovered `APPEND_SYSTEM.md`, resolved.
     pub append_system_prompt: Vec<String>,
+    /// Resolved filesystem path of the system prompt source, when it is an
+    /// existing file (resource-loader.ts:528-529, commit bff5ab717). Inline
+    /// text sources have no path.
+    pub system_prompt_source_path: Option<PathBuf>,
+    /// Resolved filesystem paths of append system prompt sources that are
+    /// existing files (resource-loader.ts:542-544, commit bff5ab717).
+    pub append_system_prompt_source_paths: Vec<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +291,10 @@ pub struct DefaultResourceLoader {
     last_skill_paths: Vec<PathBuf>,
     last_prompt_paths: Vec<PathBuf>,
     last_theme_paths: Vec<PathBuf>,
+    /// `resourceMetadataByPath` (resource-loader.ts:248, commit 66eead652):
+    /// preserved across reloads so `extend_resources` can still resolve
+    /// package source metadata for skills/prompts/themes (#6968).
+    resource_metadata_by_path: Vec<(PathBuf, PathMetadata)>,
     loaded: bool,
 }
 
@@ -314,6 +333,7 @@ impl DefaultResourceLoader {
             last_skill_paths: Vec::new(),
             last_prompt_paths: Vec::new(),
             last_theme_paths: Vec::new(),
+            resource_metadata_by_path: Vec::new(),
             loaded: false,
         }
     }
@@ -355,6 +375,20 @@ impl DefaultResourceLoader {
         &self.theme_diagnostics
     }
 
+    /// `getSystemPromptSource` (resource-loader.ts:327-329, commit
+    /// bff5ab717): the resolved filesystem path of the system prompt source,
+    /// when it is an existing file.
+    pub fn get_system_prompt_source(&self) -> Option<&Path> {
+        self.resources.system_prompt_source_path.as_deref()
+    }
+
+    /// `getAppendSystemPromptSources` (resource-loader.ts:335-337, commit
+    /// bff5ab717): resolved filesystem paths of append system prompt sources
+    /// that are existing files.
+    pub fn get_append_system_prompt_sources(&self) -> &[PathBuf] {
+        &self.resources.append_system_prompt_source_paths
+    }
+
     pub fn is_project_trusted(&self) -> bool {
         self.settings_manager.is_project_trusted()
     }
@@ -387,8 +421,9 @@ impl DefaultResourceLoader {
         self.package_resources = package_resources;
     }
 
-    /// `reload()` (resource-loader.ts:341-493), minus extension/package
-    /// loading. All failures degrade to diagnostics — this never errors.
+    /// `reload()` (resource-loader.ts:341-493, commits 66eead652 + bff5ab717),
+    /// minus extension/package loading. All failures degrade to diagnostics —
+    /// this never errors.
     pub fn reload(&mut self) {
         self.settings_manager.reload();
         let trusted = self.settings_manager.is_project_trusted();
@@ -404,9 +439,36 @@ impl DefaultResourceLoader {
 
         self.reload_extensions();
 
+        // Reset the metadata map (resource-loader.ts:408, commit 66eead652).
+        self.resource_metadata_by_path.clear();
+        let mut metadata_by_path: Vec<(PathBuf, PathMetadata)> = Vec::new();
+        // Helper: first-write-wins (upstream `metadataByPath.has` guard).
+        let mut add_metadata = |path: PathBuf, meta: PathMetadata| {
+            if !metadata_by_path.iter().any(|(p, _)| p == &path) {
+                metadata_by_path.push((path, meta));
+            }
+        };
+
         // --- Skills (resource-loader.ts:419-432) ---
         let (skill_paths, skill_source_map) =
             self.compute_skill_paths(trusted, &global_skill_entries, &project_skill_entries);
+        // Preserve metadata for all discovered skill paths (enabled or not),
+        // mirroring upstream's `getEnabledResources` side effect
+        // (resource-loader.ts:416-423).
+        for (path, info) in &skill_source_map {
+            add_metadata(
+                path.clone(),
+                PathMetadata {
+                    source: match info.source.as_str() {
+                        "local" => MetadataSource::Local,
+                        _ => MetadataSource::Auto,
+                    },
+                    scope: info.scope,
+                    origin: info.origin,
+                    base_dir: info.base_dir.clone(),
+                },
+            );
+        }
         self.last_skill_paths = skill_paths.clone();
         self.update_skills_from_paths(&skill_paths, &skill_source_map);
         // resource-loader.ts:425-432: missing CLI skill paths (isLocalPath-gated).
@@ -441,6 +503,10 @@ impl DefaultResourceLoader {
                 package_resources: &self.package_resources.prompt_paths,
                 kind: FileResourceKind::Prompt,
             });
+            // Preserve metadata for all discovered prompt paths.
+            for r in &discovered {
+                add_metadata(r.path.clone(), r.metadata.clone());
+            }
             let enabled: Vec<PathBuf> = discovered
                 .into_iter()
                 .filter(|r| r.enabled)
@@ -485,6 +551,10 @@ impl DefaultResourceLoader {
                 package_resources: &self.package_resources.theme_paths,
                 kind: FileResourceKind::Theme,
             });
+            // Preserve metadata for all discovered theme paths.
+            for r in &discovered {
+                add_metadata(r.path.clone(), r.metadata.clone());
+            }
             let enabled: Vec<PathBuf> = discovered
                 .into_iter()
                 .filter(|r| r.enabled)
@@ -511,6 +581,10 @@ impl DefaultResourceLoader {
         }
         self.rebuild_diagnostics();
 
+        // Commit the metadata map so extend_resources can reuse it
+        // (resource-loader.ts:408-409, commit 66eead652).
+        self.resource_metadata_by_path = metadata_by_path;
+
         // --- Context files (resource-loader.ts:466-475) — loaded regardless of trust ---
         self.resources.context_files = if self.no_context_files {
             Vec::new()
@@ -518,7 +592,8 @@ impl DefaultResourceLoader {
             load_project_context_files(&self.cwd, &self.agent_dir)
         };
 
-        // --- System prompt sources (resource-loader.ts:477-491) ---
+        // --- System prompt sources (resource-loader.ts:477-491,
+        // commit bff5ab717 for source path capture) ---
         let system_prompt_input = match &self.system_prompt_source {
             Some(source) => Some(source.clone()),
             None => discover_system_prompt_file(&self.cwd, &self.agent_dir, trusted)
@@ -526,6 +601,12 @@ impl DefaultResourceLoader {
         };
         self.resources.system_prompt =
             resolve_prompt_input(system_prompt_input.as_deref(), "system prompt");
+        // Capture the source path only when it is an existing file
+        // (resource-loader.ts:528-529).
+        self.resources.system_prompt_source_path = system_prompt_input
+            .as_deref()
+            .filter(|s| Path::new(s).exists())
+            .map(|s| self.resolve_resource_path(s));
 
         let append_sources = match &self.append_system_prompt_source {
             Some(sources) => sources.clone(),
@@ -537,14 +618,22 @@ impl DefaultResourceLoader {
             .iter()
             .filter_map(|s| resolve_prompt_input(Some(s), "append system prompt"))
             .collect();
+        // Capture source paths for existing files
+        // (resource-loader.ts:542-544).
+        self.resources.append_system_prompt_source_paths = append_sources
+            .iter()
+            .filter(|s| Path::new(s).exists())
+            .map(|s| self.resolve_resource_path(s))
+            .collect();
 
         self.loaded = true;
     }
 
-    /// `extendResources` (resource-loader.ts:293-331) — the
+    /// `extendResources` (resource-loader.ts:293-331, commit 66eead652) — the
     /// `resources_discover` extension event hook (T15). Contributed paths
     /// merge into the last-loaded path sets and the affected resource types
-    /// reload.
+    /// reload. The preserved `resourceMetadataByPath` is reused so package
+    /// source metadata survives the hot-reload (#6968).
     pub fn extend_resources(&mut self, paths: &ResourceExtensionPaths) {
         let skill_entries: Vec<(PathBuf, SourceInfo)> = paths
             .skill_paths
@@ -569,11 +658,19 @@ impl DefaultResourceLoader {
         self.extension_theme_source_infos
             .extend(theme_entries.iter().cloned());
 
+        // Convert preserved PathMetadata → SourceInfo map for skills
+        // (resource-loader.ts:359, commit 66eead652).
+        let metadata_source_map: Vec<(PathBuf, SourceInfo)> = self
+            .resource_metadata_by_path
+            .iter()
+            .map(|(path, meta)| (path.clone(), create_source_info(path, meta)))
+            .collect();
+
         if !skill_entries.is_empty() {
             let new_paths: Vec<PathBuf> = skill_entries.iter().map(|(p, _)| p.clone()).collect();
             self.last_skill_paths = self.merge_paths(&self.last_skill_paths.clone(), &new_paths);
             let paths = self.last_skill_paths.clone();
-            self.update_skills_from_paths(&paths, &[]);
+            self.update_skills_from_paths(&paths, &metadata_source_map);
         }
         if !prompt_entries.is_empty() {
             let new_paths: Vec<PathBuf> = prompt_entries.iter().map(|(p, _)| p.clone()).collect();
@@ -857,12 +954,16 @@ fn resource_error(message: impl Into<String>, path: &Path) -> ResourceDiagnostic
 // ---------------------------------------------------------------------------
 
 /// `createSourceInfo` (source-info.ts:15-23) for discovered resources.
+/// Package-origin resources get `"package"` (upstream
+/// package-manager.ts:1252 uses the install source string; this slice uses
+/// the generic `"package"` label, matching `package_source_info`).
 fn create_source_info(path: &Path, metadata: &PathMetadata) -> SourceInfo {
     SourceInfo {
         path: path.to_path_buf(),
-        source: match metadata.source {
-            MetadataSource::Local => "local".to_string(),
-            MetadataSource::Auto => "auto".to_string(),
+        source: match (&metadata.source, &metadata.origin) {
+            (_, SourceOrigin::Package) => "package".to_string(),
+            (MetadataSource::Local, _) => "local".to_string(),
+            (MetadataSource::Auto, _) => "auto".to_string(),
         },
         scope: metadata.scope,
         origin: metadata.origin,

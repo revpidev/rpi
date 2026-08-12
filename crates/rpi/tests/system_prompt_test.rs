@@ -1,9 +1,10 @@
 //! Integration tests for `core::system_prompt` (port of `system-prompt.ts`
-//! and the context-file parts of `resource-loader.ts` @ pi 0.82.1
-//! (2efa728)): context-file candidate priority, ancestor-chain loading,
-//! SYSTEM.md / APPEND_SYSTEM.md trust gating, `--system-prompt` file-vs-
-//! inline resolution, and byte-exact prompt injection against a real
-//! filesystem.
+//! and the context-file parts of `resource-loader.ts` @ pi 0.84.1+
+//! (4181f66)): context-file candidate priority (incl. AGENTS.override.md,
+//! commit 8ecf8a988), ancestor-chain loading, worktree shadow dedup
+//! (commit cced6a21d), SYSTEM.md / APPEND_SYSTEM.md trust gating,
+//! `--system-prompt` file-vs-inline resolution, and byte-exact prompt
+//! injection against a real filesystem.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -60,20 +61,34 @@ impl Drop for TempDir {
 #[test]
 fn candidate_priority_agents_md_first() {
     let tmp = TempDir::new();
+    tmp.write("AGENTS.override.md", "override");
     tmp.write("AGENTS.md", "agents-md");
     tmp.write("AGENTS.MD", "agents-MD");
     tmp.write("CLAUDE.md", "claude-md");
     tmp.write("CLAUDE.MD", "claude-MD");
 
+    // AGENTS.override.md wins over all others (commit 8ecf8a988).
     let found = load_context_file_from_dir(tmp.path()).expect("a context file");
-    assert_eq!(found.path, tmp.path().join("AGENTS.md"));
-    assert_eq!(found.content, "agents-md");
+    assert_eq!(found.path, tmp.path().join("AGENTS.override.md"));
+    assert_eq!(found.content, "override");
+}
+
+#[test]
+fn candidate_priority_override_beats_agents_md() {
+    // AGENTS.override.md has highest priority — even over AGENTS.md.
+    let tmp = TempDir::new();
+    tmp.write("AGENTS.override.md", "override-content");
+    tmp.write("AGENTS.md", "agents-content");
+    let found = load_context_file_from_dir(tmp.path()).expect("a context file");
+    assert_eq!(found.path, tmp.path().join("AGENTS.override.md"));
+    assert_eq!(found.content, "override-content");
 }
 
 #[test]
 fn candidate_priority_full_order() {
     // Each case leaves exactly one candidate standing, in priority order.
     for (name, content) in [
+        ("AGENTS.md", "agents-md"),
         ("AGENTS.MD", "agents-MD"),
         ("CLAUDE.md", "claude-md"),
         ("CLAUDE.MD", "claude-MD"),
@@ -84,6 +99,17 @@ fn candidate_priority_full_order() {
         assert_eq!(found.path, tmp.path().join(name));
         assert_eq!(found.content, content);
     }
+
+    // AGENTS.override.md beats AGENTS.md when both exist.
+    let tmp = TempDir::new();
+    tmp.write("AGENTS.override.md", "override");
+    tmp.write("AGENTS.md", "agents-md");
+    assert_eq!(
+        load_context_file_from_dir(tmp.path())
+            .expect("found")
+            .content,
+        "override"
+    );
 
     // AGENTS.MD beats CLAUDE.md when both exist.
     let tmp = TempDir::new();
@@ -319,4 +345,99 @@ fn context_files_injected_byte_exact_into_default_prompt() {
         cwd.display(),
     );
     assert_eq!(prompt, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Nested worktree shadow dedup (commit cced6a21d)
+// ---------------------------------------------------------------------------
+
+/// Create a real git worktree fixture: a main repo at `main_repo` with a
+/// linked worktree at `main_repo/wt`. The worktree's `.git` file points to
+/// `.git/worktrees/wt/` which has a `commondir` pointing back to `.git/`.
+fn setup_nested_worktree(tmp: &TempDir) -> PathBuf {
+    let main_repo = tmp.path().join("main-repo");
+    let git_dir = main_repo.join(".git");
+    let wt_git_dir = git_dir.join("worktrees").join("wt");
+    std::fs::create_dir_all(&wt_git_dir).expect("wt git dir");
+    std::fs::write(wt_git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+    // commondir is relative to the per-worktree git dir → parent .git dir.
+    std::fs::write(wt_git_dir.join("commondir"), "../../\n").expect("commondir");
+
+    let worktree_root = main_repo.join("wt");
+    std::fs::create_dir_all(&worktree_root).expect("worktree root");
+    std::fs::write(
+        worktree_root.join(".git"),
+        format!("gitdir: {}\n", wt_git_dir.display()),
+    )
+    .expect("gitfile");
+
+    worktree_root
+}
+
+#[test]
+fn nested_worktree_shadows_main_repo_agents_md() {
+    let tmp = TempDir::new();
+    let worktree_root = setup_nested_worktree(&tmp);
+    let main_repo = tmp.path().join("main-repo");
+
+    // Both worktree root and main repo have AGENTS.md — the main repo's
+    // copy is a "shadow" that should be skipped in the ancestor walk.
+    std::fs::write(worktree_root.join("AGENTS.md"), "worktree rules").expect("write");
+    std::fs::write(main_repo.join("AGENTS.md"), "main repo rules").expect("write");
+
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
+
+    let files = load_project_context_files(&worktree_root, &agent_dir);
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    // Only the worktree's AGENTS.md should appear; the main repo's copy is
+    // shadowed and deduplicated.
+    assert!(
+        !contents.contains(&"main repo rules"),
+        "shadowed main-repo AGENTS.md should not appear, got: {:?}",
+        contents
+    );
+    assert!(contents.contains(&"worktree rules"));
+}
+
+#[test]
+fn nested_worktree_no_shadow_when_filenames_differ() {
+    let tmp = TempDir::new();
+    let worktree_root = setup_nested_worktree(&tmp);
+    let main_repo = tmp.path().join("main-repo");
+
+    // Worktree has AGENTS.md, main repo has CLAUDE.md — no shadow.
+    std::fs::write(worktree_root.join("AGENTS.md"), "worktree rules").expect("write");
+    std::fs::write(main_repo.join("CLAUDE.md"), "main repo rules").expect("write");
+
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
+
+    let files = load_project_context_files(&worktree_root, &agent_dir);
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    // Both should appear since they are different files (different names).
+    assert!(contents.contains(&"worktree rules"));
+    assert!(contents.contains(&"main repo rules"));
+}
+
+#[test]
+fn non_worktree_repo_has_no_shadow_dedup() {
+    // A regular repo (`.git` is a directory) should not trigger shadow dedup.
+    let tmp = TempDir::new();
+    let repo = tmp.path().join("repo");
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("git dir");
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD");
+
+    std::fs::write(repo.join("AGENTS.md"), "repo rules").expect("write");
+    std::fs::write(tmp.path().join("AGENTS.md"), "parent rules").expect("write");
+
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
+
+    let files = load_project_context_files(&repo, &agent_dir);
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    // Both files should appear — no shadowing in a regular repo.
+    assert!(contents.contains(&"repo rules"));
+    assert!(contents.contains(&"parent rules"));
 }

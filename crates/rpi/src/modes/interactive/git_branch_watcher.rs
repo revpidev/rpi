@@ -1,7 +1,7 @@
 //! Git branch watcher for the footer — the git slice of
-//! `core/footer-data-provider.ts` @ pi 0.82.1 (2efa728): `findGitPaths`
-//! (footer-data-provider.ts:16-48), `resolveBranchWithGitSync` (51-59),
-//! `resolveGitBranchSync` (239-251) and `setupGitWatcher` (307-381).
+//! `core/footer-data-provider.ts` @ pi 0.84.1+ (4181f66): `resolveBranchWithGitSync`
+//! (51-59), `resolveGitBranchSync` (239-251) and `setupGitWatcher` (307-381).
+//! `findGitPaths` and `GitPaths` are shared from `core/git_paths.rs`.
 //!
 //! The watcher is a polling thread (the `theme_watcher.rs` pattern): each
 //! tick it re-resolves the branch for the `FooterDataProvider`'s current cwd
@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::git_paths::find_git_paths;
+use crate::core::git_paths::GitPaths;
 use crate::modes::interactive::interactive_mode::{InteractiveUi, UiCommand};
 
 /// Poll interval for the git branch watcher. Upstream debounces `fs.watch`
@@ -39,67 +41,8 @@ use crate::modes::interactive::interactive_mode::{InteractiveUi, UiCommand};
 /// file is cheaper than that latency suggests.
 pub(crate) const GIT_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// `GitPaths` (footer-data-provider.ts:6-11).
-#[derive(Debug, Clone)]
-pub(crate) struct GitPaths {
-    repo_dir: PathBuf,
-    head_path: PathBuf,
-}
-
-/// JS `path.resolve(base, segment)`: absolute segments win, otherwise join.
-fn resolve_path(base: &Path, segment: &str) -> PathBuf {
-    let segment = Path::new(segment);
-    if segment.is_absolute() {
-        segment.to_path_buf()
-    } else {
-        base.join(segment)
-    }
-}
-
-/// `findGitPaths` (footer-data-provider.ts:16-48): walk up from `cwd`;
-/// handles both regular repos (`.git` is a directory) and worktrees (`.git`
-/// is a `gitdir: ` file). `commonGitDir` is unused locally (the reftable
-/// watchers are not ported, see the module header) and therefore dropped.
-pub(crate) fn find_git_paths(cwd: &Path) -> Option<GitPaths> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let git_path = current.join(".git");
-        if git_path.exists() {
-            // Upstream wraps the stat/read in try/catch → null; mirror by
-            // bailing out of the walk on IO errors.
-            let metadata = std::fs::metadata(&git_path).ok()?;
-            if metadata.is_file() {
-                let content = std::fs::read_to_string(&git_path).ok()?;
-                let content = content.trim();
-                if let Some(gitdir) = content.strip_prefix("gitdir: ") {
-                    let git_dir = resolve_path(current, gitdir.trim());
-                    let head_path = git_dir.join("HEAD");
-                    if !head_path.exists() {
-                        return None;
-                    }
-                    return Some(GitPaths {
-                        repo_dir: current.to_path_buf(),
-                        head_path,
-                    });
-                }
-                // A `.git` file without the `gitdir: ` prefix is not a
-                // worktree pointer: keep walking up (the upstream `if` falls
-                // through the same way).
-            } else if metadata.is_dir() {
-                let head_path = git_path.join("HEAD");
-                if !head_path.exists() {
-                    return None;
-                }
-                return Some(GitPaths {
-                    repo_dir: current.to_path_buf(),
-                    head_path,
-                });
-            }
-        }
-        dir = current.parent();
-    }
-    None
-}
+// `GitPaths` and `find_git_paths` now live in `core/git_paths.rs` (restored
+// `common_git_dir` for the context-file shadow dedup, commit cced6a21d).
 
 /// `resolveBranchWithGitSync` (footer-data-provider.ts:51-59): ask git for
 /// the current branch; `None` on detached HEAD or when git is unavailable.

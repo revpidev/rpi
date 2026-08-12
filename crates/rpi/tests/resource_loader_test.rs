@@ -577,6 +577,135 @@ fn extend_resources_loads_skills_and_prompts_with_extension_metadata() {
         .any(|(p, _)| p == &prompt_path));
 }
 
+#[test]
+fn extend_resources_preserves_package_source_metadata_after_reload() {
+    // #6968 scenario: after reload, extend_resources must still resolve
+    // package source metadata for skills. A skill contributed via
+    // package_resources should retain its "package" source attribution
+    // through the extend_resources hot-reload path.
+    let fixture = Fixture::new();
+
+    // Package skill.
+    let pkg_skill_dir = fixture._tmp.path().join("pkg-skills").join("pkg-skill");
+    let pkg_skill_path = pkg_skill_dir.join("SKILL.md");
+    write(&pkg_skill_path, &skill_md("pkg-skill", "Package skill"));
+
+    // Extension skill (contributed via extend_resources).
+    let ext_skill_dir = fixture._tmp.path().join("ext-skills").join("ext-skill");
+    let ext_skill_path = ext_skill_dir.join("SKILL.md");
+    write(&ext_skill_path, &skill_md("ext-skill", "Extension skill"));
+
+    let mut options = fixture.options();
+    options.package_resources.skill_paths.push(PackageResource {
+        path: pkg_skill_path.clone(),
+        enabled: true,
+        scope: SourceScope::User,
+        base_dir: None,
+    });
+    let mut loader = DefaultResourceLoader::new(options);
+    loader.reload();
+
+    // Before extend_resources: package skill is present.
+    let pkg_skill = loader
+        .resources()
+        .skills
+        .iter()
+        .find(|s| s.name == "pkg-skill")
+        .expect("package skill loaded");
+    assert_eq!(pkg_skill.source_info.source, "package");
+    assert_eq!(pkg_skill.source_info.origin, SourceOrigin::Package);
+
+    // Hot-reload via extend_resources.
+    loader.extend_resources(&ResourceExtensionPaths {
+        skill_paths: vec![ResourceExtensionPath {
+            path: ext_skill_dir.clone(),
+            source_info: extension_source_info("extension:ext", &ext_skill_dir),
+        }],
+        prompt_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    });
+
+    // After extend_resources: both skills present, package skill still has
+    // its "package" source metadata (#6968 regression check).
+    let pkg_skill = loader
+        .resources()
+        .skills
+        .iter()
+        .find(|s| s.name == "pkg-skill")
+        .expect("package skill still loaded after extend");
+    assert_eq!(
+        pkg_skill.source_info.source, "package",
+        "package source metadata must survive extend_resources (#6968)"
+    );
+    assert_eq!(pkg_skill.source_info.origin, SourceOrigin::Package);
+
+    let ext_skill = loader
+        .resources()
+        .skills
+        .iter()
+        .find(|s| s.name == "ext-skill")
+        .expect("extension skill loaded after extend");
+    assert_eq!(ext_skill.source_info.source, "extension:ext");
+}
+
+#[test]
+fn system_prompt_source_path_captured_for_existing_file() {
+    // bff5ab717: system prompt source path captured when file exists.
+    let fixture = Fixture::new();
+    let system_md = fixture.agent_dir.join("SYSTEM.md");
+    write(&system_md, "system prompt text");
+
+    let mut loader = DefaultResourceLoader::new(fixture.options());
+    loader.reload();
+
+    assert_eq!(
+        loader.get_system_prompt_source(),
+        Some(system_md.as_path()),
+        "source path should be captured for existing SYSTEM.md"
+    );
+    assert!(loader
+        .resources()
+        .system_prompt
+        .as_ref()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn system_prompt_source_path_none_for_inline_text() {
+    // Inline --system-prompt text has no source path.
+    let fixture = Fixture::new();
+    let mut options = fixture.options();
+    options.system_prompt = Some("inline prompt text".to_string());
+    let mut loader = DefaultResourceLoader::new(options);
+    loader.reload();
+
+    assert_eq!(
+        loader.get_system_prompt_source(),
+        None,
+        "inline system prompt should have no source path"
+    );
+    assert!(loader
+        .resources()
+        .system_prompt
+        .as_ref()
+        .is_some_and(|s| s == "inline prompt text"));
+}
+
+#[test]
+fn append_system_prompt_source_paths_captured() {
+    // bff5ab717: append system prompt source paths captured for files.
+    let fixture = Fixture::new();
+    let append_md = fixture.agent_dir.join("APPEND_SYSTEM.md");
+    write(&append_md, "append prompt text");
+
+    let mut loader = DefaultResourceLoader::new(fixture.options());
+    loader.reload();
+
+    let sources = loader.get_append_system_prompt_sources();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0], append_md);
+}
+
 // ---------------------------------------------------------------------------
 // Two-phase trust grouping (requirements §7.8, T14 wires the trust prompt)
 // ---------------------------------------------------------------------------
