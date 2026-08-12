@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, Tui};
+use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 use crate::core::settings_manager::SettingsManager;
 use crate::core::themes::load_theme;
@@ -97,7 +98,7 @@ pub(crate) async fn select_session_with_terminal(
     let theme = load_theme(&theme_name, None)
         .or_else(|_| load_theme("dark", None))
         .map_err(|error| RpiError::Resource(error.to_string()))?;
-    let ui = Tui::with_options(
+    let ui = TuiMainScreen::with_options(
         terminal,
         Some(settings.get_show_hardware_cursor()),
         Some(crate::config::get_agent_dir()),
@@ -163,7 +164,7 @@ pub(crate) async fn select_session_with_terminal(
 
     stop.store(true, Ordering::Relaxed);
     let _ = driver.join();
-    ui.stop();
+    ui.stop(TuiStopOptions::default());
 
     Ok(selected)
 }

@@ -87,8 +87,9 @@ use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
 use rpi_tui::tui::{
     shared_component_from_boxed, Component, Container, Focusable, RenderHandle, SharedComponent,
-    Tui,
+    TuiStopOptions,
 };
+use rpi_tui::tui_main_screen::TuiMainScreen;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
@@ -913,7 +914,7 @@ fn resolve_theme(session: &AgentSession) -> Arc<Theme> {
 /// `pub(crate)` so the slash-command handlers in `commands.rs` can
 /// extend it.
 pub(crate) struct InteractiveUi {
-    pub(crate) ui: Tui,
+    pub(crate) ui: TuiMainScreen,
     /// The bound session. Replaceable behind an `RwLock` so session
     /// switching (`/new`/`/resume`/`/clone`/`/fork`/`/import`) can rebind the
     /// shared `ui_state` (upstream `rebindCurrentSession`,
@@ -3190,7 +3191,7 @@ fn compaction_status_reason(reason: CompactionReason) -> CompactionStatusReason 
 /// `pub(crate)` for the command handlers in `commands.rs`.
 pub struct InteractiveMode {
     pub(crate) runtime: AgentSessionRuntime,
-    ui: Tui,
+    ui: TuiMainScreen,
     pub(crate) session: AgentSession,
     options: InteractiveModeOptions,
     pub(crate) ui_state: Arc<InteractiveUi>,
@@ -3237,7 +3238,7 @@ impl InteractiveMode {
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
         let clear_on_shrink = session.settings_manager(|settings| settings.get_clear_on_shrink());
-        let ui = Tui::with_options(terminal, Some(show_hardware_cursor), Some(agent_dir));
+        let ui = TuiMainScreen::with_options(terminal, Some(show_hardware_cursor), Some(agent_dir));
         ui.set_clear_on_shrink(clear_on_shrink);
         let render_handle = ui.render_handle();
         let cwd = session
@@ -4178,7 +4179,7 @@ impl InteractiveMode {
         }
 
         // Restore the terminal (raw mode off, cursor shown).
-        self.ui.stop();
+        self.ui.stop(TuiStopOptions::default());
 
         // Unsubscribe from session events (interactive-mode.ts:1735).
         if let Some(unsubscribe) = self.unsubscribe.take() {
@@ -6060,7 +6061,7 @@ mod tests {
     /// by a single tick.
     #[test]
     fn render_throttle_coalesces_requests() {
-        let tui = Tui::new(Box::new(TestTerminal::new()));
+        let tui = TuiMainScreen::new(Box::new(TestTerminal::new()));
         for _ in 0..10 {
             tui.request_render(false);
         }

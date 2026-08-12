@@ -26,6 +26,8 @@ pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
 pub mod tui;
+pub(crate) mod tui_base;
+pub mod tui_main_screen;
 pub mod undo_stack;
 pub mod utils;
 pub mod word_navigation;

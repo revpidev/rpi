@@ -65,7 +65,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rpi_tui::components::input::Input;
 use rpi_tui::components::text::Text;
 use rpi_tui::keybindings::get_keybindings;
-use rpi_tui::tui::{Component, Focusable, Tui};
+use rpi_tui::tui::{Component, Focusable};
+use rpi_tui::tui_main_screen::TuiMainScreen;
 use rpi_tui::utils::{truncate_to_width, visible_width};
 
 use crate::core::session_manager::{SessionInfo, SessionManager};
@@ -973,7 +974,7 @@ pub struct SessionSelectorComponent {
     top_border: DynamicBorder,
     bottom_border: DynamicBorder,
     theme: Arc<Theme>,
-    tui: Tui,
+    tui: TuiMainScreen,
     scope: SessionScope,
     sort_mode: SortMode,
     name_filter: NameFilter,
@@ -1014,7 +1015,7 @@ impl SessionSelectorComponent {
         cwd: PathBuf,
         session_dir: Option<PathBuf>,
         theme: Arc<Theme>,
-        tui: Tui,
+        tui: TuiMainScreen,
         on_select: Box<dyn FnMut(&str) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         on_exit: Box<dyn FnMut() + Send>,
@@ -1536,8 +1537,8 @@ mod tests {
         Arc::new(crate::core::themes::load_theme("dark", None).expect("builtin dark theme"))
     }
 
-    fn tui() -> Tui {
-        Tui::new(Box::new(TestTerminal::new()))
+    fn tui() -> TuiMainScreen {
+        TuiMainScreen::new(Box::new(TestTerminal::new()))
     }
 
     fn strip_ansi(input: &str) -> String {

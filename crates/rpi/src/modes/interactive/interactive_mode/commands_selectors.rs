@@ -41,7 +41,7 @@ use rpi_ai::auth::types::{AuthCheck, AuthType, BoxFutureSend, CredentialType};
 use rpi_ai::auth::{ModelsError, ModelsErrorCode};
 use rpi_ai::types::{Model, ModelThinkingLevel, ThinkingLevel};
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable};
+use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -2177,7 +2177,7 @@ impl InteractiveUi {
         #[cfg(unix)]
         {
             // Stop the TUI first so the terminal is usable while suspended.
-            self.ui.stop();
+            self.ui.stop(TuiStopOptions::default());
             // Signal the whole process group (pid 0), like upstream
             // `process.kill(0, "SIGTSTP")`.
             // SAFETY: kill(0, SIGTSTP) is a process-group signal with no

@@ -252,7 +252,7 @@ pub trait Terminal {
     }
 
     /// Lock-free wait handle for the terminal's event stream, available
-    /// after `start`. Lets [`Tui::pump`](crate::tui::Tui::pump) block on
+    /// after `start`. Lets [`TuiMainScreen::pump`](crate::tui_main_screen::TuiMainScreen::pump) block on
     /// input WITHOUT holding the terminal lock, so the driver's parked wait
     /// cannot starve blocking lockers on other threads (see the
     /// `SharedTerminal` note in tui.rs). `None` for terminals without a
@@ -263,7 +263,7 @@ pub trait Terminal {
     }
 
     /// Dispatch an event previously obtained from the [`Terminal::event_source`]
-    /// stream (the [`Tui::pump`](crate::tui::Tui::pump) path).
+    /// stream (the [`TuiMainScreen::pump`](crate::tui_main_screen::TuiMainScreen::pump) path).
     #[doc(hidden)]
     fn dispatch_terminal_event(&mut self, event: TerminalEvent) {
         let _ = event;
@@ -271,11 +271,11 @@ pub trait Terminal {
 }
 
 /// Raw events produced by the stdin reader thread / SIGWINCH forwarder and
-/// dispatched by [`ProcessTerminal::pump`]. `pub` only so [`Tui::pump`]
+/// dispatched by [`ProcessTerminal::pump`]. `pub` only so [`TuiMainScreen::pump`]
 /// (tui.rs) can wait on the event stream without holding the terminal lock;
 /// not part of the supported API.
 ///
-/// [`Tui::pump`]: crate::tui::Tui::pump
+/// [`TuiMainScreen::pump`]: crate::tui_main_screen::TuiMainScreen::pump
 #[doc(hidden)]
 #[derive(Debug)]
 pub enum TerminalEvent {

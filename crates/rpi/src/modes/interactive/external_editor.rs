@@ -7,6 +7,8 @@
 use std::path::Path;
 use std::sync::Mutex;
 
+use rpi_tui::tui::TuiStopOptions;
+
 use crate::modes::interactive::interactive_mode::InteractiveUi;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -48,7 +50,7 @@ impl InteractiveUi {
         // Stop the TUI so the terminal is released to the editor
         // (interactive-mode.ts:3849). The editor handle stays reachable —
         // stopping does not destroy the component tree.
-        self.ui.stop();
+        self.ui.stop(TuiStopOptions::default());
 
         // Temp dir `pi-editor-{pid}/prompt.md` (external-editor.ts:14-17;
         // pid-scoped instead of mkdtemp so the path is reproducible).

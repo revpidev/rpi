@@ -271,7 +271,7 @@ impl UiBridge for InteractiveUiBridge {
         let _ = self.next_input_listener.fetch_add(1, Ordering::Relaxed);
         let id = ui.ui.add_input_listener(Box::new(move |data: &str| {
             handler(data.to_owned()).map(|result: TerminalInputResult| {
-                rpi_tui::tui::InputListenerResult {
+                rpi_tui::tui::TuiInputListenerResult {
                     consume: result.consume.unwrap_or(false),
                     data: result.data,
                 }

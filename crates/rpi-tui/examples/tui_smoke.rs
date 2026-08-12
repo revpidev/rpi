@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use rpi_tui::components::loader::Loader;
 use rpi_tui::components::text::Text;
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component, InputListenerResult, Tui};
+use rpi_tui::tui::{shared_component, TuiInputListenerResult, TuiStopOptions};
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 fn main() {
-    let tui = Tui::new(Box::new(ProcessTerminal::new()));
+    let tui = TuiMainScreen::new(Box::new(ProcessTerminal::new()));
     rpi_tui::recovery::install_panic_hook(&tui);
 
     // Signal restore needs a running multi-threaded runtime (the returned
@@ -57,7 +58,7 @@ fn main() {
     tui.add_input_listener(Box::new(move |data| {
         if data == "q" {
             quit_flag.store(true, Ordering::SeqCst);
-            return Some(InputListenerResult {
+            return Some(TuiInputListenerResult {
                 consume: true,
                 data: None,
             });
@@ -77,7 +78,7 @@ fn main() {
         tui.pump(Some(timeout));
     }
 
-    tui.stop();
+    tui.stop(TuiStopOptions::default());
     let reason = if quit.load(Ordering::SeqCst) {
         "quit key"
     } else {

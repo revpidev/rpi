@@ -14,10 +14,11 @@ use std::time::Instant;
 
 use rpi_tui::components::text::Text;
 use rpi_tui::terminal::ProcessTerminal;
-use rpi_tui::tui::{shared_component, Tui};
+use rpi_tui::tui::shared_component;
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 fn main() {
-    let tui = Tui::new(Box::new(ProcessTerminal::new()));
+    let tui = TuiMainScreen::new(Box::new(ProcessTerminal::new()));
     rpi_tui::recovery::install_panic_hook(&tui);
 
     tui.add_child(shared_component(Text::new("about to panic", 1, 1, None)));

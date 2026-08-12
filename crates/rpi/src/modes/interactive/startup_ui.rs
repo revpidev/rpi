@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
 use rpi_tui::terminal_colors::TerminalColorScheme;
-use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, Tui};
+use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::themes::{get_available_themes, load_theme};
@@ -109,7 +110,7 @@ pub(crate) async fn run_first_time_setup_with_terminal(
     super::interactive_mode::install_global_keybindings();
 
     let session = runtime.session();
-    let ui = Tui::with_options(
+    let ui = TuiMainScreen::with_options(
         terminal,
         Some(session.settings_manager(|settings| settings.get_show_hardware_cursor())),
         Some(runtime.services().agent_dir.clone()),
@@ -184,7 +185,7 @@ pub(crate) async fn run_first_time_setup_with_terminal(
 
     stop.store(true, Ordering::Relaxed);
     let _ = driver.join();
-    ui.stop();
+    ui.stop(TuiStopOptions::default());
 
     if let Some(result) = completed {
         // Persist the result (startup-ui.ts:176-179).
@@ -247,7 +248,7 @@ impl Focusable for SelectorRegion {
 ///   channel.
 /// - Package-based startup themes (`loadStartupThemes`, startup-ui.ts:60-75)
 ///   are not ported — same exemption as the first-time setup dialog.
-/// - `clearStartupTui`'s 25ms repaint delay is dropped; `ui.stop()` restores
+/// - `clearStartupTui`'s 25ms repaint delay is dropped; `ui.stop(TuiStopOptions::default())` restores
 ///   the terminal.
 pub(crate) fn run_startup_selector(
     settings: &crate::core::settings_manager::SettingsManager,
@@ -277,7 +278,7 @@ pub(crate) fn run_startup_selector_with_terminal(
         Err(_) => return None,
     };
 
-    let ui = Tui::with_options(
+    let ui = TuiMainScreen::with_options(
         terminal,
         Some(settings.get_show_hardware_cursor()),
         Some(crate::config::get_agent_dir()),
@@ -321,7 +322,7 @@ pub(crate) fn run_startup_selector_with_terminal(
 
     let Ok(driver) = driver else {
         // No pump thread → no input; fail closed (cancel).
-        ui.stop();
+        ui.stop(TuiStopOptions::default());
         return None;
     };
 
@@ -336,7 +337,7 @@ pub(crate) fn run_startup_selector_with_terminal(
 
     stop.store(true, Ordering::Relaxed);
     let _ = driver.join();
-    ui.stop();
+    ui.stop(TuiStopOptions::default());
     result
 }
 

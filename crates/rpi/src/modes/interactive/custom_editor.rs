@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
 use rpi_tui::keybindings::get_keybindings;
-use rpi_tui::tui::{Component, Focusable, Tui};
+use rpi_tui::tui::{Component, Focusable};
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 /// App-action handler (upstream `() => void`).
 pub type ActionHandler = Box<dyn FnMut() + Send>;
@@ -47,7 +48,7 @@ pub struct CustomEditor {
 }
 
 impl CustomEditor {
-    pub fn new(tui: Tui, theme: EditorTheme, options: EditorOptions) -> Self {
+    pub fn new(tui: TuiMainScreen, theme: EditorTheme, options: EditorOptions) -> Self {
         Self {
             editor: Editor::new(tui, theme, options),
             action_handlers: HashMap::new(),
@@ -293,13 +294,13 @@ mod tests {
 
     struct Harness {
         editor: Arc<Mutex<CustomEditor>>,
-        _tui: Tui,
+        _tui: TuiMainScreen,
     }
 
     impl Harness {
         fn new() -> Self {
             install_keybindings();
-            let tui = Tui::new(Box::new(super::super::test_support::TestTerminal::new()));
+            let tui = TuiMainScreen::new(Box::new(super::super::test_support::TestTerminal::new()));
             let editor = Arc::new(Mutex::new(CustomEditor::new(
                 tui.clone(),
                 EditorTheme {

@@ -16,7 +16,7 @@
 //! layer because Node signal/exception handlers are process-global callbacks
 //! registered next to the event loop. This port keeps them in rpi-tui because
 //! §8.5 assigns terminal restore to the TUI layer and a Rust panic hook is
-//! process-global state that must capture the live [`Tui`] handle. The
+//! process-global state that must capture the live [`TuiMainScreen`] handle. The
 //! graceful-shutdown orchestration around the restore (extension cleanup,
 //! `drainInput`, session shutdown events) stays with the interactive mode
 //! (T12), exactly as upstream splits it.
@@ -27,23 +27,24 @@
 //!   continues unwinding (exit code 101 on `main`) after the hook returns.
 //!   Exiting from the hook would also kill the process on panics in
 //!   unrelated worker threads, which Rust semantics deliberately do not.
-//! - Rust addition: when the panicking thread holds the `Tui` lock
+//! - Rust addition: when the panicking thread holds the `TuiMainScreen` lock
 //!   (mid-render panic), [`restore_terminal`] falls back to a fixed restore
 //!   byte sequence written straight to stdout instead of deadlocking
 //!   (upstream's single-threaded event loop cannot hit this case), and
-//!   queues a full stop op on the `Tui` so the event loop's next tick writes
+//!   queues a full stop op on the `TuiMainScreen` so the event loop's next tick writes
 //!   the complete restore sequence and stops rendering over it.
 
 use std::io::{self, Write};
 
-use crate::tui::Tui;
+use crate::tui::TuiStopOptions;
+use crate::tui_main_screen::TuiMainScreen;
 
-/// Fixed best-effort restore sequence for the locked-Tui fallback in
-/// [`restore_terminal`], mirroring the writes of `Tui::stop_internal` +
+/// Fixed best-effort restore sequence for the locked-TuiMainScreen fallback in
+/// [`restore_terminal`], mirroring the writes of `TuiMainScreen::stop_internal` +
 /// `ProcessTerminal::stop` (tui.ts:689-714, terminal.ts:396-449) in the same
 /// order, minus the state-dependent parts the fallback cannot know
 /// (progress keepalive clear, cursor repositioning):
-/// 1. `\x1b[?2031l` — color scheme notifications off (`Tui::stop_internal`)
+/// 1. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
 /// 2. `\x1b[?2004l` — bracketed paste off
 /// 3. `\x1b[<u` — pop Kitty keyboard protocol
 /// 4. `\x1b[>4;0m` — modifyOtherKeys off
@@ -54,27 +55,27 @@ use crate::tui::Tui;
 const MINIMAL_RESTORE_SEQUENCE: &str = "\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
 
 /// Restore the terminal via `tui.stop()`; fall back to a fixed restore
-/// sequence + raw-mode reset when the `Tui` lock is held by the panicking
+/// sequence + raw-mode reset when the `TuiMainScreen` lock is held by the panicking
 /// thread. Never panics: upstream wraps the restore in `try {} catch {}`
 /// (interactive-mode.ts:3624-3628), so every step here ignores errors.
 ///
-/// The fallback also queues a full stop op on the `Tui`: the event loop's
-/// next [`Tui::tick`] pending-op drain runs it, writing the complete restore
+/// The fallback also queues a full stop op on the `TuiMainScreen`: the event loop's
+/// next [`TuiMainScreen::tick`] pending-op drain runs it, writing the complete restore
 /// sequence and setting `stopped` so later renders short-circuit instead of
 /// clobbering the minimal restore above. When the panic happened on the
 /// event-loop thread itself nothing drains the op — no renders follow
 /// either, so the minimal sequence stands.
-pub fn restore_terminal(tui: &Tui) {
-    if tui.try_stop() {
+pub fn restore_terminal(tui: &TuiMainScreen) {
+    if tui.try_stop(TuiStopOptions::default()) {
         return;
     }
     let mut stdout = io::stdout();
     let _ = stdout.write_all(MINIMAL_RESTORE_SEQUENCE.as_bytes());
     let _ = stdout.flush();
-    // The locked-Tui case cannot consult `was_raw`; a TUI that was started
+    // The locked-TuiMainScreen case cannot consult `was_raw`; a TUI that was started
     // put the terminal into raw mode, so disabling is the right default.
     let _ = crossterm::terminal::disable_raw_mode();
-    tui.queue_stop();
+    tui.queue_stop(TuiStopOptions::default());
 }
 
 /// Install a process-global panic hook that restores the terminal BEFORE
@@ -82,14 +83,14 @@ pub fn restore_terminal(tui: &Tui) {
 /// panic message), matching upstream `uncaughtCrash` ordering: `ui.stop()`
 /// first, `console.error(error)` second (interactive-mode.ts:3624-3636).
 ///
-/// Call once, after constructing the [`Tui`] and before/after `start()`
+/// Call once, after constructing the [`TuiMainScreen`] and before/after `start()`
 /// (the hook only needs the handle; stop on a never-started TUI is a safe
 /// no-op). Re-installing chains onto whatever hook is current, so installing
 /// twice wraps the hooks — install once per process.
 ///
 /// Unlike upstream, the hook does not exit the process; the panic keeps
 /// unwinding after the chained hook returns (see header note).
-pub fn install_panic_hook(tui: &Tui) {
+pub fn install_panic_hook(tui: &TuiMainScreen) {
     let previous_hook = std::panic::take_hook();
     let tui = tui.clone();
     std::panic::set_hook(Box::new(move |panic_info| {
@@ -111,7 +112,7 @@ pub fn install_panic_hook(tui: &Tui) {
 /// the returned handle on orderly shutdown to mirror upstream's
 /// `unregisterSignalHandlers`.
 #[cfg(unix)]
-pub fn spawn_signal_restore(tui: &Tui) -> Option<tokio::task::JoinHandle<()>> {
+pub fn spawn_signal_restore(tui: &TuiMainScreen) -> Option<tokio::task::JoinHandle<()>> {
     use tokio::signal::unix::{signal, SignalKind};
 
     let runtime = tokio::runtime::Handle::try_current().ok()?;
@@ -137,7 +138,7 @@ pub fn spawn_signal_restore(tui: &Tui) -> Option<tokio::task::JoinHandle<()>> {
 /// No signal restore on non-unix platforms (upstream likewise registers
 /// SIGHUP only off Windows; SIGTERM restore there stays with T12).
 #[cfg(not(unix))]
-pub fn spawn_signal_restore(_tui: &Tui) -> Option<tokio::task::JoinHandle<()>> {
+pub fn spawn_signal_restore(_tui: &TuiMainScreen) -> Option<tokio::task::JoinHandle<()>> {
     None
 }
 
@@ -187,7 +188,7 @@ mod tests {
 
     /// §8.5 / T11 self-test: after an induced panic the terminal restore
     /// sequence must already be written before the chained (default-output)
-    /// hook runs. Runs the full real path: `Tui::start` on a
+    /// hook runs. Runs the full real path: `TuiMainScreen::start` on a
     /// `ProcessTerminal` with an injected writer, then an actual panicking
     /// thread (caught via `join`).
     #[test]
@@ -195,7 +196,7 @@ mod tests {
         let _hook_guard = PanicHookGuard;
         let writer = SharedWriter::default();
         let terminal = ProcessTerminal::with_writer(writer.clone());
-        let tui = Tui::new(Box::new(terminal));
+        let tui = TuiMainScreen::new(Box::new(terminal));
         tui.start();
 
         // Stand-in for the default hook: records whether the restore bytes
@@ -229,7 +230,7 @@ mod tests {
         );
 
         // Byte-level assertions on the restore sequence written by
-        // `Tui::stop_internal` + `ProcessTerminal::stop`.
+        // `TuiMainScreen::stop_internal` + `ProcessTerminal::stop`.
         let bytes = writer.bytes();
         assert!(bytes.contains("\x1b[?25h"), "cursor shown: {bytes:?}");
         assert!(
@@ -243,7 +244,7 @@ mod tests {
     }
 
     /// The fixed fallback sequence covers every protocol/state flag the
-    /// engine can enable (locked-Tui fallback of `restore_terminal`).
+    /// engine can enable (locked-TuiMainScreen fallback of `restore_terminal`).
     #[test]
     fn minimal_restore_sequence_covers_terminal_state() {
         for sequence in [

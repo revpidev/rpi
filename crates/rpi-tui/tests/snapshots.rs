@@ -302,7 +302,7 @@ use rpi_tui::autocomplete::{
 };
 use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
 use rpi_tui::terminal::Terminal;
-use rpi_tui::tui::Tui;
+use rpi_tui::tui_main_screen::TuiMainScreen;
 
 /// Fixed-size virtual terminal for editor snapshots (upstream
 /// test/virtual-terminal.ts).
@@ -353,7 +353,7 @@ impl Terminal for FixedTerminal {
 }
 
 fn editor_at(columns: usize, rows: usize) -> Editor {
-    let tui = Tui::new(Box::new(FixedTerminal::new(columns as u16, rows as u16)));
+    let tui = TuiMainScreen::new(Box::new(FixedTerminal::new(columns as u16, rows as u16)));
     Editor::new(
         tui,
         EditorTheme {
