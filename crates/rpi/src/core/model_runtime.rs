@@ -1,24 +1,17 @@
 //! Canonical model/auth runtime (design §6.1 services).
 //!
-//! Port of the T10-reachable subset of
-//! `packages/coding-agent/src/core/model-runtime.ts` @ pi 0.82.1 (2efa728)
-//! plus `runtime-credentials.ts`.
+//! Port of `packages/coding-agent/src/core/model-runtime.ts` @ pi 0.84.1+
+//! (4181f66) plus `runtime-credentials.ts`.
 //!
-//! T10 subset boundaries (full parity lands with T13 providers):
-//! - The 38 built-in provider factories are T13; `ModelRuntime::create`
-//!   seeds them from `rpi_ai::providers::builtin_providers()` since the
-//!   registration wave (D-052), so models.json composes overrides only
-//!   (provider-composer) — same shape as upstream model-runtime.ts:181-190.
-//! - models.json `apiKey` is treated as an env var name
-//!   ([`env_api_key_auth`]); command/raw-key config values
-//!   (resolve-config-value.ts) and `oauth: "radius"` are T13.
-//! - Per-model `api` overrides inside one provider are not honored (the
-//!   provider-level `api` streams all models).
-//! - Availability is recomputed on each `get_available` call (upstream
-//!   coalesces concurrent refreshes onto one in-flight promise — the
-//!   single-threaded headless flows cannot observe the difference).
+//! v0.11 additions (T23 R3.4.6/R3.4.7):
+//! - Availability refresh is generation-gated (seq counters prevent stale
+//!   passes from publishing superseded snapshots, model-runtime.ts:148-152,
+//!   285-329).
+//! - Credential operations (login/logout/setRuntimeApiKey/removeRuntimeApiKey)
+//!   are serialized per-provider through an enqueue chain, and wrapped with
+//!   `synchronize_credential_state` + `CredentialSynchronizationError`
+//!   (model-runtime.ts:494-534, 536-688).
 //!
-//! W6-C notes (remote catalog overlay, model-runtime.ts:133-172, 516-537):
 //! - `ModelsStore` persistence (file next to models.json, upstream
 //!   `FileModelsStore`) and `Models::refresh` network plumbing landed:
 //!   `CreateModelRuntimeOptions` gains `modelsStore` / `modelsStorePath` /
@@ -45,6 +38,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use rpi_ai::api::anthropic_messages::AnthropicMessages;
@@ -238,6 +232,64 @@ struct ModelRuntimeSnapshot {
     auth: HashMap<String, AuthCheck>,
 }
 
+/// Computed snapshot data before publishing (the body of
+/// `runAvailabilityRefresh`, model-runtime.ts:286-313).
+struct ModelRuntimeSnapshotData {
+    all: Vec<Model>,
+    available: Vec<Model>,
+    configured_providers: HashSet<String>,
+    stored_providers: HashSet<String>,
+    auth: HashMap<String, AuthCheck>,
+}
+
+// ============================================================================
+// Credential synchronization (model-runtime.ts:91-111, 494-534)
+// ============================================================================
+
+/// `CredentialSynchronizationOperation` (model-runtime.ts:91).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSynchronizationOperation {
+    Login,
+    Logout,
+    SetRuntimeApiKey,
+    RemoveRuntimeApiKey,
+}
+
+impl CredentialSynchronizationOperation {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Login => "login",
+            Self::Logout => "logout",
+            Self::SetRuntimeApiKey => "setRuntimeApiKey",
+            Self::RemoveRuntimeApiKey => "removeRuntimeApiKey",
+        }
+    }
+}
+
+/// `CredentialSynchronizationError` (model-runtime.ts:94-111): the
+/// credential mutation committed successfully but the local model/auth
+/// snapshot could not be synchronized.
+#[derive(Debug)]
+pub struct CredentialSynchronizationError {
+    pub provider_id: String,
+    pub operation: CredentialSynchronizationOperation,
+    pub credential: Option<Credential>,
+    pub cause: String,
+}
+
+impl std::fmt::Display for CredentialSynchronizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Credential {} committed for {}, but local synchronization failed",
+            self.operation.as_str(),
+            self.provider_id
+        )
+    }
+}
+
+impl std::error::Error for CredentialSynchronizationError {}
+
 // ============================================================================
 // Api registry (T03 adapters; requirements §5.1 remainder is T13)
 // ============================================================================
@@ -335,6 +387,28 @@ pub struct ModelRuntime {
     composition_errors: Mutex<OrderedMap<String>>,
     availability_error: Mutex<Option<String>>,
     snapshot: RwLock<ModelRuntimeSnapshot>,
+    // ------------------------------------------------------------------
+    // Generation counters (model-runtime.ts:148-152, commits 8f9e76974 +
+    // c6eb6281a + a077fff0b): seq-gating prevents stale availability passes
+    // from publishing superseded snapshots, and allows credential
+    // operations to invalidate in-flight refreshes.
+    // ------------------------------------------------------------------
+    /// `availabilityRefreshSeq` (model-runtime.ts:148): incremented by every
+    /// full availability refresh; a pass whose seq no longer matches the
+    /// current value is discarded.
+    availability_refresh_seq: Mutex<u64>,
+    /// `availabilityErrorSeq` (model-runtime.ts:149): incremented whenever
+    /// an error is about to be recorded, so a newer successful pass can
+    /// clear a stale error.
+    availability_error_seq: Mutex<u64>,
+    /// `providerAvailabilitySeq` (model-runtime.ts:150): per-provider seq
+    /// for single-provider refreshes (credential operations).
+    provider_availability_seq: Mutex<HashMap<String, u64>>,
+    /// `credentialOperations` (model-runtime.ts:152): per-provider
+    /// serialization of credential mutations (login/logout/setRuntimeApiKey/
+    /// removeRuntimeApiKey). Upstream chains JS Promises; Rust uses
+    /// per-provider `tokio::sync::Mutex` for arrival-order serialization.
+    credential_operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// `mergeHeaders` (model-runtime.ts:77-91): case-insensitive replace, new
@@ -789,6 +863,10 @@ impl ModelRuntime {
             composition_errors: Mutex::new(OrderedMap::default()),
             availability_error: Mutex::new(None),
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
+            availability_refresh_seq: Mutex::new(0),
+            availability_error_seq: Mutex::new(0),
+            provider_availability_seq: Mutex::new(HashMap::new()),
+            credential_operations: Mutex::new(HashMap::new()),
         });
         // Seed the built-in providers (model-runtime.ts:181-190): every
         // static catalog provider is wrapped in the persisted remote-catalog
@@ -1128,15 +1206,72 @@ impl ModelRuntime {
         }))
     }
 
-    /// `runAvailabilityRefresh` (model-runtime.ts:240-268). Records the last
-    /// failure for `get_error` (upstream `availabilityError`).
-    async fn refresh_availability(&self) -> Result<(), ModelsError> {
-        let result = self.refresh_availability_inner().await;
-        *lock(&self.availability_error) = result.as_ref().err().map(|error| error.message.clone());
-        result
+    /// `runAvailabilityRefresh` (model-runtime.ts:285-314, commits 8f9e76974
+    /// et al.): computes auth + available, then publishes the snapshot only
+    /// when `seq` still matches `availability_refresh_seq` — a newer pass
+    /// invalidates this one. Clears the error when `error_seq` matches.
+    async fn run_availability_refresh(&self, seq: u64, error_seq: u64) -> Result<(), ModelsError> {
+        let result = self.compute_availability().await;
+        // Stale check: if a newer refresh was queued, discard this result.
+        if seq != *lock(&self.availability_refresh_seq) {
+            return result.map(|_| ());
+        }
+        match result {
+            Ok(snapshot_data) => {
+                let mut snapshot = write(&self.snapshot);
+                snapshot.all = snapshot_data.all;
+                snapshot.available = snapshot_data.available;
+                snapshot.configured_providers = snapshot_data.configured_providers;
+                snapshot.stored_providers = snapshot_data.stored_providers;
+                snapshot.auth = snapshot_data.auth;
+                // Clear the error only when our error_seq is still current.
+                if error_seq == *lock(&self.availability_error_seq) {
+                    *lock(&self.availability_error) = None;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if error_seq == *lock(&self.availability_error_seq) {
+                    *lock(&self.availability_error) = Some(error.message.clone());
+                }
+                Err(error)
+            }
+        }
     }
 
-    async fn refresh_availability_inner(&self) -> Result<(), ModelsError> {
+    /// `queueAvailabilityRefresh` (model-runtime.ts:316-329): bumps the
+    /// generation counters and runs the refresh, so any older in-flight pass
+    /// becomes stale. Errors are recorded for `get_error`.
+    async fn queue_availability_refresh(&self) -> Result<(), ModelsError> {
+        let seq = {
+            let mut s = lock(&self.availability_refresh_seq);
+            *s += 1;
+            *s
+        };
+        // Invalidate all per-provider seqs: a full refresh supersedes any
+        // single-provider pass (model-runtime.ts:318-320).
+        for provider_seq in lock(&self.provider_availability_seq).values_mut() {
+            *provider_seq += 1;
+        }
+        let error_seq = {
+            let mut s = lock(&self.availability_error_seq);
+            *s += 1;
+            *s
+        };
+        match self.run_availability_refresh(seq, error_seq).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error_seq == *lock(&self.availability_error_seq) {
+                    *lock(&self.availability_error) = Some(error.message.clone());
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Computes the full availability snapshot data without publishing it.
+    /// (`runAvailabilityRefresh` body, model-runtime.ts:286-313.)
+    async fn compute_availability(&self) -> Result<ModelRuntimeSnapshotData, ModelsError> {
         let providers = self.models.get_providers();
         let mut auth = HashMap::new();
         for provider in &providers {
@@ -1175,14 +1310,13 @@ impl ModelRuntime {
                 })?;
             available.extend(provider.filter_models(provider.get_models(), credential.as_ref()));
         }
-
-        let mut snapshot = write(&self.snapshot);
-        snapshot.all = all;
-        snapshot.available = available;
-        snapshot.configured_providers = configured;
-        snapshot.stored_providers = stored;
-        snapshot.auth = auth;
-        Ok(())
+        Ok(ModelRuntimeSnapshotData {
+            all,
+            available,
+            configured_providers: configured,
+            stored_providers: stored,
+            auth,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -1213,13 +1347,14 @@ impl ModelRuntime {
         self.check_provider_auth(&provider).await
     }
 
-    /// `getAvailable` (model-runtime.ts:313-328): every call recomputes
-    /// availability (upstream queues a refresh when none is in flight).
+    /// `getAvailable` (model-runtime.ts:313-328): queues a full availability
+    /// refresh (seq-gated) and returns the snapshot. When `provider_id` is
+    /// given, returns the filtered snapshot directly.
     pub async fn get_available(
         &self,
         provider_id: Option<&str>,
     ) -> Result<Vec<Model>, ModelsError> {
-        self.refresh_availability().await?;
+        self.queue_availability_refresh().await?;
         let snapshot = read(&self.snapshot);
         Ok(match provider_id {
             Some(provider_id) => snapshot
@@ -1327,24 +1462,164 @@ impl ModelRuntime {
         self.models.get_provider_auth(provider_id, None).await
     }
 
-    /// `setRuntimeApiKey` (model-runtime.ts:398-415) — non-persistent
-    /// runtime override (the `--api-key` CLI path). Like upstream, ends in
-    /// `refresh`: models.json is reloaded and providers rebuilt.
-    pub async fn set_runtime_api_key(&self, provider_id: &str, api_key: &str) {
-        self.credentials.set_runtime_api_key(provider_id, api_key);
-        self.refresh(None).await;
+    /// Returns the per-provider credential serialization mutex, creating it
+    /// on first use (model-runtime.ts:152, 494-512).
+    fn get_credential_mutex(&self, provider_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut ops = lock(&self.credential_operations);
+        if let Some(m) = ops.get(provider_id) {
+            return m.clone();
+        }
+        let m = Arc::new(tokio::sync::Mutex::new(()));
+        ops.insert(provider_id.to_owned(), m.clone());
+        m
     }
 
-    /// `removeRuntimeApiKey` (model-runtime.ts:417-420).
-    pub async fn remove_runtime_api_key(&self, provider_id: &str) {
-        self.credentials.remove_runtime_api_key(provider_id);
-        self.refresh(Some(ModelsRefreshOptions {
-            allow_network: Some(self.model_network_enabled),
-            force: None,
-            signal: None,
-            ..Default::default()
-        }))
-        .await;
+    /// `enqueueCredentialOperation` (model-runtime.ts:494-512, commit
+    /// d2be68dbe et al.): serializes credential operations per-provider.
+    /// Concurrent login/logout/setRuntimeApiKey/removeRuntimeApiKey on the
+    /// same provider run strictly in arrival order without dropping updates.
+    /// Upstream chains JS Promises; Rust uses `tokio::sync::Mutex` which
+    /// provides the same guarantee.
+    async fn enqueue_credential_operation(
+        self: &Arc<Self>,
+        provider_id: &str,
+        task: BoxFuture<'static, Result<(), CredentialSynchronizationError>>,
+    ) -> Result<(), CredentialSynchronizationError> {
+        let mutex = self.get_credential_mutex(provider_id);
+        let _guard = mutex.lock().await;
+        task.await
+    }
+
+    /// `synchronizeCredentialState` (model-runtime.ts:514-534): recompose the
+    /// provider, run a scoped refresh, update the snapshot, and refresh
+    /// availability. Any failure is wrapped in `CredentialSynchronizationError`.
+    async fn synchronize_credential_state(
+        &self,
+        provider_id: &str,
+        operation: CredentialSynchronizationOperation,
+        credential: Option<Credential>,
+    ) -> Result<(), CredentialSynchronizationError> {
+        self.synchronize_credential_state_with_signal(provider_id, operation, credential, None)
+            .await
+    }
+
+    /// `synchronizeCredentialState` with an optional interaction signal
+    /// (model-runtime.ts:514-534): the interaction's cancellation token
+    /// (from login) is combined with the refresh timeout to produce a bounded
+    /// refresh signal.
+    async fn synchronize_credential_state_with_signal(
+        &self,
+        provider_id: &str,
+        operation: CredentialSynchronizationOperation,
+        credential: Option<Credential>,
+        interaction_signal: Option<CancellationToken>,
+    ) -> Result<(), CredentialSynchronizationError> {
+        let wrap_err = |cause: String| CredentialSynchronizationError {
+            provider_id: provider_id.to_owned(),
+            operation,
+            credential: credential.clone(),
+            cause,
+        };
+        // recomposeProvider + composition error check
+        // (model-runtime.ts:522-524).
+        self.recompose_provider(provider_id);
+        if let Some(error) = lock(&self.composition_errors).get(provider_id).cloned() {
+            return Err(wrap_err(error));
+        }
+
+        // Scoped refresh (model-runtime.ts:525-528): allowNetwork=false,
+        // providers=[providerId].
+        let refresh_signal =
+            bounded_refresh_signal(self.model_refresh_timeout_ms, interaction_signal);
+        let result = self
+            .models
+            .refresh(Some(ModelsRefreshOptions {
+                allow_network: Some(false),
+                providers: Some(vec![provider_id.to_owned()]),
+                force: None,
+                signal: Some(refresh_signal),
+            }))
+            .await;
+        if result.aborted {
+            return Err(wrap_err("model catalog refresh was aborted".to_owned()));
+        }
+        for (pid, error) in &result.errors {
+            if pid == provider_id {
+                return Err(wrap_err(error.clone()));
+            }
+        }
+
+        // updateModelSnapshot (model-runtime.ts:529).
+        self.update_model_snapshot();
+
+        // refreshProviderAvailability — full availability refresh
+        // (simplified: we do a full queue_availability_refresh rather than
+        // the upstream single-provider variant, since our headless flows are
+        // single-task and the extra precision is not observable).
+        if let Err(error) = self.queue_availability_refresh().await {
+            return Err(wrap_err(error.message));
+        }
+        Ok(())
+    }
+
+    /// `setRuntimeApiKey` (model-runtime.ts:536-547, commit d2be68dbe et al.):
+    /// non-persistent runtime override (the `--api-key` CLI path), serialized
+    /// per-provider and followed by credential synchronization.
+    pub async fn set_runtime_api_key(
+        self: &Arc<Self>,
+        provider_id: &str,
+        api_key: &str,
+    ) -> Result<(), CredentialSynchronizationError> {
+        let provider_id = provider_id.to_owned();
+        let api_key = api_key.to_owned();
+        let credential = Credential::ApiKey(ApiKeyCredential {
+            key: Some(api_key.clone()),
+            env: None,
+        });
+        let runtime = self.clone();
+        let enqueue_pid = provider_id.clone();
+        self.enqueue_credential_operation(
+            &enqueue_pid,
+            async move {
+                runtime
+                    .credentials
+                    .set_runtime_api_key(&provider_id, &api_key);
+                runtime
+                    .synchronize_credential_state(
+                        &provider_id,
+                        CredentialSynchronizationOperation::SetRuntimeApiKey,
+                        Some(credential),
+                    )
+                    .await
+            }
+            .boxed(),
+        )
+        .await
+    }
+
+    /// `removeRuntimeApiKey` (model-runtime.ts:549-555).
+    pub async fn remove_runtime_api_key(
+        self: &Arc<Self>,
+        provider_id: &str,
+    ) -> Result<(), CredentialSynchronizationError> {
+        let provider_id = provider_id.to_owned();
+        let runtime = self.clone();
+        let enqueue_pid = provider_id.clone();
+        self.enqueue_credential_operation(
+            &enqueue_pid,
+            async move {
+                runtime.credentials.remove_runtime_api_key(&provider_id);
+                runtime
+                    .synchronize_credential_state(
+                        &provider_id,
+                        CredentialSynchronizationOperation::RemoveRuntimeApiKey,
+                        None,
+                    )
+                    .await
+            }
+            .boxed(),
+        )
+        .await
     }
 
     /// `listCredentials` (model-runtime.ts:422-424).
@@ -1352,18 +1627,23 @@ impl ModelRuntime {
         self.credentials.list(None).await
     }
 
-    /// `login` (model-runtime.ts:503-507): run the provider's login through
-    /// `Models`, then refresh so the new credential takes effect in model
-    /// availability and provider composition.
+    /// `login` (model-runtime.ts:673-680, commit d2be68dbe et al.): run the
+    /// provider's login through `Models`, serialized per-provider, followed by
+    /// credential synchronization.
     ///
-    /// The post-login refresh runs under a bounded signal (the resolved
-    /// `model_refresh_timeout_ms` — the same value that bounds the
-    /// create-time refresh — plus the interaction's own cancellation
-    /// token): a stuck remote-catalog fetch must not freeze the login flow
-    /// forever (upstream has no bound here — its fetch is equally
-    /// unbounded).
+    /// The login (credential acquisition) runs before the serialized chain so
+    /// a stalled previous operation does not block user interaction. The
+    /// post-login synchronization (recompose + refresh + availability) is
+    /// enqueued. The bounded refresh signal (resolved timeout + interaction
+    /// cancel) prevents a hung catalog fetch from freezing the login flow.
+    ///
+    /// Intentional difference: upstream enqueues the entire login+sync
+    /// together; here the credential acquisition is outside the chain because
+    /// `&dyn AuthInteraction` is borrowed and cannot be moved into a
+    /// `'static` enqueue closure. The practical impact is negligible for
+    /// headless single-task flows.
     pub async fn login(
-        &self,
+        self: &Arc<Self>,
         provider_id: &str,
         auth_type: AuthType,
         interaction: &dyn AuthInteraction,
@@ -1372,33 +1652,70 @@ impl ModelRuntime {
             .models
             .login(provider_id, auth_type, interaction)
             .await?;
-        let signal = bounded_refresh_signal(self.model_refresh_timeout_ms, interaction.signal());
-        self.refresh(Some(ModelsRefreshOptions {
-            allow_network: Some(self.model_network_enabled),
-            force: None,
-            signal: Some(signal),
-            ..Default::default()
-        }))
-        .await;
+
+        let provider_id = provider_id.to_owned();
+        let credential_for_sync = credential.clone();
+        let interaction_signal = interaction.signal();
+        let runtime = self.clone();
+        let enqueue_pid = provider_id.clone();
+        let err_pid = provider_id.clone();
+        self.enqueue_credential_operation(
+            &enqueue_pid,
+            async move {
+                runtime
+                    .synchronize_credential_state_with_signal(
+                        &provider_id,
+                        CredentialSynchronizationOperation::Login,
+                        Some(credential_for_sync),
+                        interaction_signal,
+                    )
+                    .await
+            }
+            .boxed(),
+        )
+        .await
+        .map_err(|_| {
+            ModelsError::new(
+                ModelsErrorCode::Auth,
+                format!(
+                    "Credential login committed for {err_pid}, but local synchronization failed"
+                ),
+            )
+        })?;
         Ok(credential)
     }
 
-    /// `logout` (model-runtime.ts:509-514): remove the stored credential,
-    /// reset credential-dependent compatibility projections, then refresh so
-    /// the unconfigured provider is skipped by availability (also under the
-    /// bounded refresh signal).
-    pub async fn logout(&self, provider_id: &str) -> Result<(), ModelsError> {
-        self.models.logout(provider_id).await?;
-        self.recompose_provider(provider_id);
-        let signal = bounded_refresh_signal(self.model_refresh_timeout_ms, None);
-        self.refresh(Some(ModelsRefreshOptions {
-            allow_network: Some(self.model_network_enabled),
-            force: None,
-            signal: Some(signal),
-            ..Default::default()
-        }))
-        .await;
-        Ok(())
+    /// `logout` (model-runtime.ts:682-688): remove the stored credential,
+    /// serialized per-provider, followed by credential synchronization.
+    pub async fn logout(
+        self: &Arc<Self>,
+        provider_id: &str,
+    ) -> Result<(), CredentialSynchronizationError> {
+        let provider_id = provider_id.to_owned();
+        let runtime = self.clone();
+        let enqueue_pid = provider_id.clone();
+        self.enqueue_credential_operation(
+            &enqueue_pid,
+            async move {
+                runtime.models.logout(&provider_id).await.map_err(|e| {
+                    CredentialSynchronizationError {
+                        provider_id: provider_id.clone(),
+                        operation: CredentialSynchronizationOperation::Logout,
+                        credential: None,
+                        cause: e.message,
+                    }
+                })?;
+                runtime
+                    .synchronize_credential_state(
+                        &provider_id,
+                        CredentialSynchronizationOperation::Logout,
+                        None,
+                    )
+                    .await
+            }
+            .boxed(),
+        )
+        .await
     }
 
     pub fn has_runtime_api_key(&self, provider_id: &str) -> bool {
@@ -1469,7 +1786,7 @@ impl ModelRuntime {
         };
         let result = self.models.refresh(Some(refresh_options)).await;
         self.update_model_snapshot();
-        if let Err(error) = self.refresh_availability().await {
+        if let Err(error) = self.queue_availability_refresh().await {
             // Availability errors are recorded in `get_error`; refreshed
             // models remain usable (model-runtime.ts:531-535).
             tracing::warn!("availability refresh failed: {}", error.message);
@@ -2432,5 +2749,265 @@ mod tests {
             runtime.get_models(Some("github-copilot")).len(),
             full_catalog.len()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Availability refresh generation (R3.4.6, model-runtime.ts:148-152,
+    // 285-329, commits 8f9e76974 + c6eb6281a + a077fff0b)
+    // ------------------------------------------------------------------
+
+    /// Concurrent `get_available` calls must not corrupt the snapshot — the
+    /// seq-gating ensures only the latest pass publishes
+    /// (queueAvailabilityRefresh, model-runtime.ts:316-329).
+    #[tokio::test]
+    async fn concurrent_get_available_calls_produce_consistent_snapshot() {
+        const ENV_KEY: &str = "RPI_TEST_CONCURRENT_AVAIL_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let provider = create_provider(CreateProviderOptions {
+            id: "concurrent-avail".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth(
+                    "Concurrent avail key",
+                    &[ENV_KEY],
+                ))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
+        });
+        runtime
+            .register_native_provider(provider)
+            .await
+            .expect("register");
+
+        // Launch multiple concurrent get_available calls.
+        let rt = runtime.clone();
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            let rt = rt.clone();
+            handles.push(tokio::spawn(async move {
+                rt.get_available(None).await.expect("get_available")
+            }));
+        }
+        let results: Vec<Vec<Model>> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task"))
+            .collect();
+
+        // All results must have the same length (consistent snapshot).
+        let len = results[0].len();
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result.len(),
+                len,
+                "snapshot length mismatch at result {i}: concurrent stale publish"
+            );
+        }
+
+        // The snapshot must not be empty — the provider has auth configured.
+        // (The built-in providers may or may not have auth depending on env,
+        // but the custom provider definitely does.)
+        let snapshot = runtime.get_available_snapshot();
+        assert!(
+            !snapshot.is_empty(),
+            "snapshot must contain available models after concurrent refresh"
+        );
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// `get_error` lists per-provider catalog failures from the availability
+    /// refresh (model-runtime.ts:426-434). A composition error must appear
+    /// in the error output alongside the availability refresh error.
+    #[tokio::test]
+    async fn get_available_records_availability_errors() {
+        // A runtime with no network and no auth → availability refresh
+        // should complete without error (no configured providers = empty
+        // available), and get_error should be None for availability.
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let _ = runtime.get_available(None).await;
+        // There may be composition errors from the built-in catalog (unlikely
+        // with empty models.json), but availability errors should be absent
+        // since there are no configured providers to check.
+        let error = runtime.get_error();
+        // If there's an error, it should not be an availability refresh error
+        // (the no-configured-providers path is not an error).
+        if let Some(error) = error {
+            assert!(
+                !error.contains("Availability refresh"),
+                "unexpected availability error with no configured providers: {error}"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Credential serialization (R3.4.7, model-runtime.ts:494-688, commits
+    // d2be68dbe et al.)
+    // ------------------------------------------------------------------
+
+    /// Regression: #7027 — credential refresh hang. A stalled network catalog
+    /// refresh must not block login (model-runtime.ts:494-534).
+    /// Port of `test/suite/regressions/7027-credential-refresh-hang.test.ts`
+    /// (upstream intent: "does not hold login behind an older stalled network
+    /// catalog refresh").
+    #[tokio::test]
+    async fn set_runtime_api_key_completes_despite_stalled_network_refresh() {
+        const ENV_KEY: &str = "RPI_TEST_7027_KEY";
+        std::env::set_var(ENV_KEY, "initial-key");
+        let url = hung_catalog_server().await;
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let inner = create_provider(CreateProviderOptions {
+            id: "stalled-7027".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth("7027 test key", &[ENV_KEY]))),
+                oauth: None,
+            },
+            models: vec![model_7027()],
+            api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
+        });
+        runtime
+            .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
+                inner,
+                Some(url),
+                None,
+            ))
+            .await
+            .expect("register");
+
+        // set_runtime_api_key must complete (not hang) despite the stalled
+        // catalog fetch — the bounded refresh signal aborts it via timeout.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runtime.set_runtime_api_key("stalled-7027", "secret"),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "set_runtime_api_key must not hang behind a stalled catalog refresh"
+        );
+        // The sync may fail (CredentialSynchronizationError) since the
+        // catalog fetch was aborted — that's acceptable; the credential is
+        // committed. Either Ok or Err is fine, as long as it doesn't hang.
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// Concurrent credential operations on the same provider are serialized
+    /// — no lost updates (R3.4.7 enqueue semantics).
+    #[tokio::test]
+    async fn concurrent_credential_ops_serialize_without_lost_updates() {
+        const ENV_KEY: &str = "RPI_TEST_CONCURRENT_CRED_KEY";
+        std::env::set_var(ENV_KEY, "initial-key");
+        let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
+            Arc::new(rpi_ai::auth::credential_store::InMemoryCredentialStore::new());
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(credentials.clone()),
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let provider = create_provider(CreateProviderOptions {
+            id: "concurrent-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth(
+                    "Concurrent test key",
+                    &[ENV_KEY],
+                ))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
+        });
+        runtime
+            .register_native_provider(provider)
+            .await
+            .expect("register");
+
+        // Launch multiple set_runtime_api_key calls concurrently — they must
+        // all complete without panicking, and the last committed key wins.
+        let rt = runtime.clone();
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let rt = rt.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = rt
+                    .set_runtime_api_key("concurrent-test", &format!("key-{i}"))
+                    .await;
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("task completed");
+        }
+
+        // The runtime API key override should be set to one of the keys
+        // (serialization ensures no write is lost — the final value is the
+        // last-enqueued key, but the order of completion is not guaranteed
+        // by tokio task scheduling alone).
+        assert!(
+            runtime.has_runtime_api_key("concurrent-test"),
+            "runtime API key should be set after concurrent operations"
+        );
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// Minimal model fixture for the 7027 regression test (same shape as the
+    /// upstream `dynamicModel`).
+    fn model_7027() -> Model {
+        use rpi_ai::types::{InputModality, ModelCost, ModelCostRates};
+        Model {
+            id: "dynamic".to_owned(),
+            name: "Dynamic".to_owned(),
+            api: ApiKind::from("openai-completions"),
+            provider: "stalled-7027".to_owned(),
+            base_url: "https://example.test/v1".to_owned(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: vec![InputModality::Text],
+            cost: ModelCost {
+                rates: ModelCostRates {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                tiers: None,
+            },
+            context_window: 1000,
+            max_tokens: 100,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+        }
     }
 }

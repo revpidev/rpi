@@ -1,9 +1,10 @@
 //! `rpi` binary entry point (T10: headless modes; interactive lands in T12).
 
 fn main() {
-    // Marker env for child processes/extensions (cli.ts:13).
+    // Marker env for child processes/extensions (cli.ts:13-14).
     // SAFETY-FREE note: set before the runtime starts; no readers race.
     std::env::set_var("RPI_CODING_AGENT", "true");
+    rpi::core::environment::set_ai_agent_marker();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = match tokio::runtime::Builder::new_multi_thread()

@@ -25,6 +25,7 @@ pub mod output_accumulator;
 pub mod path_utils;
 pub mod read;
 pub mod sanitize;
+pub mod tool_result_images;
 pub mod truncate;
 pub mod write;
 

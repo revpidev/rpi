@@ -1,7 +1,7 @@
 //! Model resolution, scoping, and initial selection.
 //!
-//! Port of `packages/coding-agent/src/core/model-resolver.ts` @ pi 0.82.1
-//! (2efa728), plus `defaults.ts` (`DEFAULT_THINKING_LEVEL`).
+//! Port of `packages/coding-agent/src/core/model-resolver.ts` @ pi 0.84.1+
+//! (4181f66), plus `defaults.ts` (`DEFAULT_THINKING_LEVEL`).
 //!
 //! Side effects are lifted to the caller: upstream prints warnings/errors and
 //! `process.exit(1)` inside `findInitialModel`; here the fallible path returns
@@ -618,15 +618,53 @@ pub fn resolve_cli_model(options: ResolveCliModelOptions) -> ResolveCliModelResu
     }
 
     // No provider inferred: try exact matches without provider inference
-    // (handles ids that naturally contain slashes).
+    // (handles ids that naturally contain slashes). Bare exact IDs can exist
+    // in multiple providers, so do not choose by catalog order — prefer the
+    // sole authenticated provider; otherwise require an explicit provider to
+    // avoid silently selecting an unusable provider
+    // (model-resolver.ts:464-502, commits b04faa2da et al.).
     if provider.is_none() {
         let lower = cli_model.to_lowercase();
-        if let Some(exact) = available_models.iter().find(|m| {
-            m.id.to_lowercase() == lower
-                || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
-        }) {
+        let exact_matches: Vec<&Model> = available_models
+            .iter()
+            .filter(|m| {
+                m.id.to_lowercase() == lower
+                    || format!("{}/{}", m.provider, m.id).to_lowercase() == lower
+            })
+            .collect();
+        if exact_matches.len() == 1 {
             return ResolveCliModelResult {
-                model: Some(exact.clone()),
+                model: Some(exact_matches[0].clone()),
+                ..Default::default()
+            };
+        }
+        if exact_matches.len() > 1 {
+            let authenticated: Vec<&&Model> = exact_matches
+                .iter()
+                .filter(|m| model_runtime.has_configured_auth(&m.provider))
+                .collect();
+            if authenticated.len() == 1 {
+                return ResolveCliModelResult {
+                    model: Some((*authenticated[0]).clone()),
+                    ..Default::default()
+                };
+            }
+            let mut matches_display: Vec<String> = exact_matches
+                .iter()
+                .map(|m| format!("{}/{}", m.provider, m.id))
+                .collect();
+            matches_display.sort();
+            let matches_str = matches_display.join(", ");
+            let auth_hint = if authenticated.is_empty() {
+                "No matching provider is authenticated."
+            } else {
+                "More than one matching provider is authenticated."
+            };
+            return ResolveCliModelResult {
+                model: None,
+                error: Some(format!(
+                    "Model \"{cli_model}\" is ambiguous across providers: {matches_str}. {auth_hint} Use --provider or provider/model."
+                )),
                 ..Default::default()
             };
         }
@@ -1608,6 +1646,138 @@ mod tests {
             Some(
                 "Could not restore model test-provider/gone (model no longer exists). Using test-provider/alpha-1."
             )
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // --model exact ID ambiguity (R3.4.5, model-resolver.ts:469-502)
+    // ------------------------------------------------------------------
+
+    /// Registers two providers that each carry a model with the same bare id,
+    /// with controllable auth state via env vars. The env-var mutations are
+    /// serialized to prevent cross-test races (the workspace has no
+    /// `serial_test`).
+    async fn runtime_with_ambiguous_models(
+        env_a: Option<&str>,
+        env_b: Option<&str>,
+    ) -> Arc<ModelRuntime> {
+        // Serialize env-var-dependent tests with an async mutex so the lock
+        // can be held across `.await` without clippy::await_holding_lock.
+        static AMBIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = AMBIG_LOCK.lock().await;
+        if let Some(val) = env_a {
+            std::env::set_var("RPI_TEST_AMBIG_A_KEY", val);
+        } else {
+            std::env::remove_var("RPI_TEST_AMBIG_A_KEY");
+        }
+        if let Some(val) = env_b {
+            std::env::set_var("RPI_TEST_AMBIG_B_KEY", val);
+        } else {
+            std::env::remove_var("RPI_TEST_AMBIG_B_KEY");
+        }
+        let credentials: Arc<dyn rpi_ai::auth::types::CredentialStore> =
+            Arc::new(InMemoryCredentialStore::new());
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(credentials),
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        for (provider_id, env_key) in [
+            ("provider-a", "RPI_TEST_AMBIG_A_KEY"),
+            ("provider-b", "RPI_TEST_AMBIG_B_KEY"),
+        ] {
+            runtime
+                .register_native_provider(create_provider(CreateProviderOptions {
+                    id: provider_id.to_owned(),
+                    name: None,
+                    base_url: None,
+                    headers: None,
+                    auth: ProviderAuth {
+                        api_key: Some(Arc::new(env_api_key_auth(
+                            format!("{provider_id} API key"),
+                            &[env_key],
+                        ))),
+                        oauth: None,
+                    },
+                    models: vec![model(provider_id, "shared-model", "Shared Model", false)],
+                    api: ProviderApi::Single(Arc::new(
+                        rpi_ai::api::openai_completions::OpenAiCompletions,
+                    )),
+                    ..Default::default()
+                }))
+                .await
+                .expect("register provider");
+        }
+        // Trigger an availability refresh so `has_configured_auth` reflects
+        // the current env state for the ambiguity check.
+        let _ = runtime.get_available(None).await;
+        runtime
+    }
+
+    /// Exact id across two providers, exactly one authenticated → resolve to
+    /// the authenticated provider (model-resolver.ts:478-486).
+    #[tokio::test]
+    async fn test_ambiguous_exact_id_resolves_to_sole_authenticated_provider() {
+        let runtime = runtime_with_ambiguous_models(Some("key-a"), None).await;
+        let result = resolve_cli_model(ResolveCliModelOptions {
+            cli_provider: None,
+            cli_model: Some("shared-model"),
+            cli_thinking: None,
+            model_runtime: &runtime,
+        });
+        let resolved = result.model.expect("resolved to authenticated provider");
+        assert_eq!(resolved.provider, "provider-a");
+        assert_eq!(resolved.id, "shared-model");
+        assert!(result.error.is_none());
+    }
+
+    /// Exact id across two providers, none authenticated → ambiguity error
+    /// with "No matching provider is authenticated."
+    /// (model-resolver.ts:492-494).
+    #[tokio::test]
+    async fn test_ambiguous_exact_id_zero_authenticated_is_error() {
+        let runtime = runtime_with_ambiguous_models(None, None).await;
+        let result = resolve_cli_model(ResolveCliModelOptions {
+            cli_provider: None,
+            cli_model: Some("shared-model"),
+            cli_thinking: None,
+            model_runtime: &runtime,
+        });
+        assert!(result.model.is_none());
+        let error = result.error.expect("ambiguity error");
+        assert!(
+            error.contains("is ambiguous across providers"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("No matching provider is authenticated."),
+            "unexpected authHint: {error}"
+        );
+        assert!(
+            error.contains("provider-a/shared-model") && error.contains("provider-b/shared-model"),
+            "must list both provider/model pairs: {error}"
+        );
+    }
+
+    /// Exact id across two providers, both authenticated → ambiguity error
+    /// with "More than one matching provider is authenticated."
+    /// (model-resolver.ts:495).
+    #[tokio::test]
+    async fn test_ambiguous_exact_id_multiple_authenticated_is_error() {
+        let runtime = runtime_with_ambiguous_models(Some("key-a"), Some("key-b")).await;
+        let result = resolve_cli_model(ResolveCliModelOptions {
+            cli_provider: None,
+            cli_model: Some("shared-model"),
+            cli_thinking: None,
+            model_runtime: &runtime,
+        });
+        assert!(result.model.is_none());
+        let error = result.error.expect("ambiguity error");
+        assert!(
+            error.contains("More than one matching provider is authenticated."),
+            "unexpected authHint: {error}"
         );
     }
 }

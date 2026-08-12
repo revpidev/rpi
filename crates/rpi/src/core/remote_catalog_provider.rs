@@ -269,14 +269,32 @@ impl Provider for RemoteCatalogProvider {
                         .filter(|stored| !stored.models.is_empty())
                         .and_then(|stored| stored.etag.clone());
                     let url = catalog_url(&catalog_base_url, inner.id())?;
-                    let mut request = reqwest::Client::new()
-                        .get(url)
-                        .header(reqwest::header::ACCEPT, "application/json")
-                        .header(reqwest::header::USER_AGENT, pi_user_agent());
-                    if let Some(validator) = &validator {
-                        request = request.header(reqwest::header::IF_NONE_MATCH, validator);
-                    }
-                    let response = send_with_signal(request, Some(&context.signal)).await?;
+                    // `fetchWithRetry` (46b53b995) wraps this management-plane
+                    // GET; the factory rebuilds the request per attempt so
+                    // headers are always set correctly.
+                    let ua = pi_user_agent();
+                    let url_clone = url.clone();
+                    let validator_clone = validator.clone();
+                    let response = send_with_retry(
+                        move || {
+                            let url = url_clone.clone();
+                            let ua = ua.clone();
+                            let validator = validator_clone.clone();
+                            Box::pin(async move {
+                                let mut request = reqwest::Client::new()
+                                    .get(url)
+                                    .header(reqwest::header::ACCEPT, "application/json")
+                                    .header(reqwest::header::USER_AGENT, ua);
+                                if let Some(validator) = &validator {
+                                    request =
+                                        request.header(reqwest::header::IF_NONE_MATCH, validator);
+                                }
+                                request
+                            })
+                        },
+                        Some(&context.signal),
+                    )
+                    .await?;
                     if context.signal.is_cancelled() {
                         return Ok(());
                     }
@@ -436,35 +454,27 @@ fn catalog_url(catalog_base_url: &str, provider_id: &str) -> Result<url::Url, Mo
         })
 }
 
-/// Send honoring the shared abort signal; a mid-flight cancellation rejects
-/// like the upstream `fetch(url, { signal })` AbortError.
-async fn send_with_signal(
-    request: reqwest::RequestBuilder,
+/// Send a management-plane GET with bounded retry
+/// (`fetchWithRetry` — 46b53b995), racing against the caller's abort signal.
+/// Transient transport failures and retryable status codes (408/425/429/5xx)
+/// are retried up to twice; caller cancellation is terminal.
+async fn send_with_retry<F, Fut>(
+    build: F,
     signal: Option<&CancellationToken>,
-) -> Result<reqwest::Response, ModelsError> {
-    let send = request.send();
-    match signal {
-        Some(token) => tokio::select! {
-            () = token.cancelled() => Err(ModelsError::new(
-                ModelsErrorCode::ModelSource,
-                "Model catalog request aborted",
-            )),
-            response = send => response.map_err(|error| {
-                ModelsError::with_cause(
-                    ModelsErrorCode::ModelSource,
-                    "Model catalog request failed",
-                    &error.to_string(),
-                )
-            }),
-        },
-        None => send.await.map_err(|error| {
+) -> Result<reqwest::Response, ModelsError>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = reqwest::RequestBuilder>,
+{
+    crate::utils::management_http::fetch_with_retry(build, signal, &Default::default())
+        .await
+        .map_err(|error| {
             ModelsError::with_cause(
                 ModelsErrorCode::ModelSource,
                 "Model catalog request failed",
-                &error.to_string(),
+                &error,
             )
-        }),
-    }
+        })
 }
 
 #[cfg(test)]
@@ -947,11 +957,16 @@ mod tests {
     #[tokio::test]
     async fn keeps_etag_and_overlay_after_transient_failure() {
         // Upstream: "keeps the etag and overlay after a transient failure" —
-        // 429 rejects, the cached body + etag survive, and the next refresh
-        // revalidates with If-None-Match.
+        // 429 is a retryable status code, so fetchWithRetry (46b53b995)
+        // exhausts the default 2 retries before propagating. The cached body
+        // + etag survive, and the next refresh revalidates with
+        // If-None-Match.
         let server = MockCatalogServer::start(vec![
             ScriptedResponse::json(200, serde_json::json!({ "dynamic": model("dynamic") }))
                 .with_headers(vec![("etag", "\"catalog-1\"")]),
+            // fetchWithRetry: initial 429 + 2 retries = 3 consecutive 429s.
+            ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
+            ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
             ScriptedResponse::json(429, serde_json::json!({ "error": "rate limited" })),
             ScriptedResponse {
                 status: 304,
@@ -973,7 +988,7 @@ mod tests {
             .refresh_models(make_context(store.clone(), true, true).await)
             .expect("refresh")
             .await
-            .expect_err("429 rejects");
+            .expect_err("429 rejects after retries");
         assert!(error.message.contains("429"), "message: {}", error.message);
 
         let stored = store
@@ -991,7 +1006,7 @@ mod tests {
             .await
             .expect("304 revalidation");
         assert_eq!(
-            server.requests()[2].if_none_match.as_deref(),
+            server.requests()[4].if_none_match.as_deref(),
             Some("\"catalog-1\"")
         );
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();

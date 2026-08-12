@@ -1405,3 +1405,44 @@ async fn runner_before_agent_start_ctx_get_system_prompt_reflects_chain() {
     );
     assert_eq!(result["systemPrompt"], "chained-A+B");
 }
+
+// ---------------------------------------------------------------------------
+// Event-bus lifecycle via host invalidate (6ca423447)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn runner_invalidate_unsubscribes_extension_event_bus_subscription() {
+    // 6ca423447 regression: a subscription made through the extension API's
+    // `events().on()` must be cleaned up when the host invalidates the runtime.
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let sink = received.clone();
+    let host = host_with(vec![inline_ext("ext-a", move |api| {
+        let sink = sink.clone();
+        let _unsub = api.events().on(
+            "my-channel",
+            Arc::new(move |data| {
+                sink.lock().unwrap().push(data);
+            }),
+        );
+        // The tracked wrapper handles lifecycle — forget the handle so it
+        // stays subscribed until invalidate().
+        std::mem::forget(_unsub);
+    })])
+    .await;
+
+    host.event_bus().emit("my-channel", json!({"n": 1}));
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[json!({"n": 1})],
+        "delivery before invalidate"
+    );
+
+    host.invalidate(None);
+
+    host.event_bus().emit("my-channel", json!({"n": 2}));
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[json!({"n": 1})],
+        "no delivery after invalidate — subscription was auto-unsubscribed"
+    );
+}

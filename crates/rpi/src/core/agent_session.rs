@@ -2,7 +2,9 @@
 //! management, shared by all run modes (print / json / rpc / interactive).
 //!
 //! Port of `packages/coding-agent/src/core/agent-session.ts` @ pi 0.82.1
-//! (2efa728).
+//! (2efa728), updated to 4181f66 (v0.84.1+) for v0.11 T23 (prompt-during-
+//! compaction rejection 8eda4f5b2, length-stop recovery 32850ef7c,
+//! disconnect/reconnect removal e56893f4c, bash hint softening 4e64de695).
 //!
 //! Structural notes (behavior preserved):
 //! - Upstream mutates plain class fields from the single-threaded event loop.
@@ -352,7 +354,9 @@ fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
 fn builtin_tool_guidelines(name: &str) -> &'static [&'static str] {
     match name {
         "read" => &["Use read to examine files instead of cat or sed."],
-        "bash" => &["Inspect RPI_* environment variables for current model and session details."],
+        // Softened from imperative to descriptive (upstream 4e64de695 / #7128,
+        // bash.ts:47): "You can inspect PI_* environment variables ...".
+        "bash" => &["You can inspect RPI_* environment variables for current model and session details."],
         "edit" => &[
             "Use edit for precise changes (edits[].oldText must match exactly)",
             "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
@@ -710,7 +714,12 @@ impl AgentSession {
             self.sync_session_env();
             if let AgentMessage::Assistant(assistant) = message {
                 *lock(&self.inner.last_assistant_message) = Some(assistant.clone());
-                if assistant.stop_reason != StopReason::Error {
+                // A length stop must not reset the overflow recovery budget:
+                // the truncated response may itself trigger recovery
+                // (agent-session.ts:653-654 @ 32850ef7c).
+                if assistant.stop_reason != StopReason::Error
+                    && assistant.stop_reason != StopReason::Length
+                {
                     self.inner.compaction.lock().await.reset_overflow_recovery();
                 }
                 // Reset the retry counter on a successful assistant response
@@ -1428,6 +1437,23 @@ impl AgentSession {
                 && self.try_execute_extension_command(text).await
             {
                 return Ok(None);
+            }
+
+            // Reject prompts while manual compaction is in progress
+            // (agent-session.ts:1133-1137 @ 8eda4f5b2). The abort-token cell
+            // is `Some` only during compaction; auto-compaction holds the
+            // runner mutex but the token is also set there.
+            if !self
+                .inner
+                .compaction_abort
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+            {
+                return Err(RpiError::Session(
+                    "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."
+                        .to_owned(),
+                ));
             }
 
             // Input event for extension interception (agent-session.ts:1132-1149).
@@ -2155,44 +2181,31 @@ impl AgentSession {
     // Compaction
     // ==================================================================
 
-    /// `_disconnectFromAgent` (agent-session.ts:817-822).
+    /// `_disconnectFromAgent` (agent-session.ts:814-818): disconnect from
+    /// agent events during disposal only (no longer used during compaction
+    /// per e56893f4c — manual compaction already waits for the active run to
+    /// settle, and summary generation does not emit Agent events).
     fn disconnect_from_agent(&self) {
         if let Some(unsubscribe) = lock(&self.inner.unsubscribe_agent).take() {
             unsubscribe();
         }
     }
 
-    /// `_reconnectToAgent` (agent-session.ts:828-831).
-    fn reconnect_to_agent(&self) {
-        let mut slot = lock(&self.inner.unsubscribe_agent);
-        if slot.is_some() {
-            return;
-        }
-        let weak = Arc::downgrade(&self.inner);
-        *slot = Some(self.inner.agent.subscribe(Arc::new(move |event, _signal| {
-            let weak = weak.clone();
-            Box::pin(async move {
-                if let Some(inner) = weak.upgrade() {
-                    AgentSession { inner }.handle_agent_event(event).await;
-                }
-            })
-        })));
-    }
-
-    /// `compact` (agent-session.ts:1783-1925).
+    /// `compact` (agent-session.ts:1783-1925). Per e56893f4c the agent-event
+    /// subscription is NOT disconnected during compaction: manual compaction
+    /// waits for the active run to settle, and summary generation does not
+    /// emit Agent events, so concurrent events should be preserved rather
+    /// than dropped.
     pub async fn compact(
         &self,
         custom_instructions: Option<&str>,
     ) -> Result<CompactionResult, RpiError> {
-        self.disconnect_from_agent();
         self.abort().await;
         self.sync_compaction_model();
         let result = {
             let mut runner = self.inner.compaction.lock().await;
             runner.compact(custom_instructions).await
         };
-        // Upstream reconnects in `finally` (agent-session.ts:1921-1924).
-        self.reconnect_to_agent();
         result
     }
 

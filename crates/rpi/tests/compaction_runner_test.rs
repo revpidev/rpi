@@ -484,3 +484,407 @@ async fn manual_compact_error_paths_and_success() {
         "Compaction failed: Already compacted"
     );
 }
+
+// ---------------------------------------------------------------------------
+// length-stop recovery chain (32850ef7c)
+// ---------------------------------------------------------------------------
+
+/// Helper: a length-stop message with output below the model's maxTokens.
+/// The fixture model has maxTokens=65536 and contextWindow=8192.
+fn length_stop_below_limit(text: &str, output_tokens: u64) -> AssistantMessage {
+    let mut message = faux_assistant_message(
+        text,
+        FauxAssistantOptions {
+            stop_reason: Some(StopReason::Length),
+            ..Default::default()
+        },
+    );
+    message.usage = serde_json::from_value(json!({
+        "input": 100,
+        "output": output_tokens,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "totalTokens": 100 + output_tokens,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+    }))
+    .expect("usage");
+    message.timestamp = now_ms();
+    message
+}
+
+/// A length stop below the model's desired output limit is recoverable:
+/// it triggers compaction + willRetry → true (agent-session.ts:1990-2001
+/// @ 32850ef7c).
+#[tokio::test]
+async fn length_stop_below_max_tokens_triggers_compaction_and_retry() {
+    let mut fixture = fixture(settings(), vec![scripted("RECOVERED")]);
+    fixture.seed_turn(
+        &format!("q {}", "x".repeat(80)),
+        &format!("a {}", "y".repeat(80)),
+        100,
+    );
+    // output=16 < maxTokens=65536 → recoverable length stop.
+    let truncated = length_stop_below_limit("partial", 16);
+    // Push the truncated message into agent state (like message_end did).
+    let mut messages = fixture.agent.state().messages;
+    messages.push(AgentMessage::Assistant(truncated.clone()));
+    fixture.agent.set_messages(messages);
+
+    assert!(fixture.runner.check_compaction(&truncated, true).await);
+    let events = fixture.events();
+    // compaction_start + compaction_end with willRetry=true.
+    assert_eq!(
+        event_types(&events),
+        vec!["compaction_start", "compaction_end"]
+    );
+    match &events[1] {
+        CompactionEvent::CompactionEnd {
+            reason,
+            will_retry,
+            aborted,
+            ..
+        } => {
+            assert_eq!(
+                *reason,
+                rpi::core::compaction_runner::CompactionReason::Overflow
+            );
+            assert!(will_retry);
+            assert!(!aborted);
+        }
+        other => panic!("expected compaction_end, got {other:?}"),
+    }
+    // The truncated length-stop message was removed from agent state for the
+    // retry. The last message should not be a length-stop assistant.
+    let messages = fixture.agent.state().messages;
+    if let Some(AgentMessage::Assistant(last)) = messages.last() {
+        assert!(
+            last.stop_reason != StopReason::Length,
+            "agent state should not end with a length-stop after recovery setup"
+        );
+    }
+}
+
+/// A length stop at the model's desired output limit (output == maxTokens)
+/// is NOT recoverable: no compaction is triggered (agent-session.ts:1990-2001
+/// @ 32850ef7c).
+#[tokio::test]
+async fn length_stop_at_max_tokens_is_not_recoverable() {
+    let mut fixture = fixture(settings(), Vec::new());
+    fixture.seed_turn("q", "a", 100);
+    // output=65536 == maxTokens → not recoverable.
+    let at_limit = length_stop_below_limit("full", 65536);
+    assert!(!fixture.runner.check_compaction(&at_limit, true).await);
+    assert!(fixture.events().is_empty());
+}
+
+/// Two consecutive recoverable length stops: the second emits a
+/// recovery-failure event and returns false (one-shot budget).
+#[tokio::test]
+async fn length_stop_recovery_is_attempted_only_once() {
+    let mut fixture = fixture(settings(), vec![scripted("SUMMARY")]);
+    fixture.seed_turn(
+        &format!("q {}", "x".repeat(80)),
+        &format!("a {}", "y".repeat(80)),
+        100,
+    );
+    let first = length_stop_below_limit("first truncated", 16);
+    let mut messages = fixture.agent.state().messages;
+    messages.push(AgentMessage::Assistant(first.clone()));
+    fixture.agent.set_messages(messages);
+
+    // First: recovery compaction + willRetry → true.
+    assert!(fixture.runner.check_compaction(&first, true).await);
+
+    // Second: another length stop — recovery budget exhausted.
+    let mut second = length_stop_below_limit("second truncated", 8);
+    second.timestamp = now_ms() + 1000;
+    let mut messages = fixture.agent.state().messages;
+    messages.push(AgentMessage::Assistant(second.clone()));
+    fixture.agent.set_messages(messages);
+    assert!(!fixture.runner.check_compaction(&second, true).await);
+    let errors = compaction_end_errors(&fixture.events());
+    assert_eq!(
+        errors,
+        vec![
+            "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+                .to_owned()
+        ]
+    );
+}
+
+/// After compaction with willRetry, a length-stop message restored from
+/// session history is removed from agent state (agent-session.ts:2184-2189
+/// @ 32850ef7c).
+#[tokio::test]
+async fn compaction_retry_removes_length_stop_from_agent_state() {
+    let mut fixture = fixture(settings(), vec![scripted("SUMMARY")]);
+    fixture.seed_turn(
+        &format!("q {}", "x".repeat(80)),
+        &format!("a {}", "y".repeat(80)),
+        100,
+    );
+    // Simulate: a length stop was persisted (session) and restored into agent
+    // state by finish_compaction's build_session_context.
+    let truncated = length_stop_below_limit("truncated", 16);
+    let mut messages = fixture.agent.state().messages;
+    messages.push(AgentMessage::Assistant(truncated.clone()));
+    fixture.agent.set_messages(messages);
+
+    // Run the auto-compaction with willRetry=true.
+    assert!(fixture.runner.check_compaction(&truncated, true).await);
+
+    // The recovery path removes the last assistant if it's error/length.
+    // Verify that agent state doesn't end with a length-stop assistant.
+    let messages = fixture.agent.state().messages;
+    if let Some(AgentMessage::Assistant(last)) = messages.last() {
+        assert!(
+            last.stop_reason != StopReason::Length && last.stop_reason != StopReason::Error,
+            "agent state should not end with a length/error stop after retry setup"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// abort-token lifecycle: clear before compaction_end emit (3852cb2b8)
+// ---------------------------------------------------------------------------
+
+/// The abort token is cleared *before* the `compaction_end` event is emitted
+/// so that `compaction_end` listeners can submit queued prompts and see
+/// `isCompacting === false` (agent-session.ts:1907-1908 @ 3852cb2b8).
+///
+/// The test captures the token state at the moment the sink receives
+/// `compaction_end`. If the clear happened after emit, the token would still
+/// be `Some` and the assertion would fail.
+#[tokio::test]
+async fn abort_token_cleared_before_compaction_end_emit_manual_3852cb2b8() {
+    let token_at_emit: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(65536),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+
+    let agent = Arc::new(Agent::new(AgentOptions::new(provider.stream_fn())));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+
+    let events: Arc<Mutex<Vec<CompactionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_sink = events.clone();
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        provider.stream_fn(),
+        ThinkingLevel::Off,
+        Arc::new(move |event| {
+            events_sink.lock().expect("events").push(event);
+        }),
+    );
+
+    // Swap the emit sink to one that inspects the abort token cell at the
+    // moment compaction_end is delivered.
+    let runner_abort_cell = runner.abort_token_cell();
+    let cell = runner_abort_cell.clone();
+    let token_state = token_at_emit.clone();
+    runner.set_emit_sink(Arc::new(move |event| {
+        if matches!(event, CompactionEvent::CompactionEnd { .. }) {
+            let is_none = cell.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+            *token_state.lock().unwrap() = Some(is_none);
+        }
+    }));
+
+    // Seed enough turns for a cut point (same pattern as the Fixture tests).
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q1 {}", "x".repeat(80)),
+        &format!("a1 {}", "y".repeat(80)),
+        100,
+    );
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q2 {}", "x".repeat(80)),
+        "a2",
+        100,
+    );
+    seed_turn_via_runner(&mut runner, &agent, "q3", "a3", 100);
+
+    let result = runner.compact(Some("focus")).await;
+    assert!(result.is_ok(), "manual compact should succeed");
+
+    let token_state = *token_at_emit.lock().unwrap();
+    match token_state {
+        Some(false) => panic!(
+            "abort token was still Some when compaction_end was emitted — \
+             must be cleared before emit (3852cb2b8)"
+        ),
+        Some(true) => {} // pass
+        None => panic!("compaction_end was never emitted"),
+    }
+}
+
+/// Same check for auto-compaction: the token is cleared before each
+/// `compaction_end` emit path (3852cb2b8).
+#[tokio::test]
+async fn abort_token_cleared_before_auto_compaction_end_emit_3852cb2b8() {
+    let token_at_emit: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(65536),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(vec![scripted("SUMMARY")]);
+    let model = provider.get_model(None).expect("faux-1");
+
+    let mut agent_opts = AgentOptions::new(provider.stream_fn());
+    agent_opts.initial_state = InitialAgentState {
+        model: Some(model.clone()),
+        thinking_level: Some(ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let agent = Arc::new(Agent::new(agent_opts));
+    let session = SessionManager::in_memory(None, NewSessionOptions::default()).expect("session");
+
+    let events: Arc<Mutex<Vec<CompactionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_sink = events.clone();
+    let mut runner = CompactionRunner::new(
+        agent.clone(),
+        Arc::new(Mutex::new(session)),
+        Some(model),
+        settings(),
+        None,
+        provider.stream_fn(),
+        ThinkingLevel::Off,
+        Arc::new(move |event| {
+            events_sink.lock().expect("events").push(event);
+        }),
+    );
+
+    let runner_abort_cell = runner.abort_token_cell();
+    let cell = runner_abort_cell.clone();
+    let token_state = token_at_emit.clone();
+    runner.set_emit_sink(Arc::new(move |event| {
+        if matches!(event, CompactionEvent::CompactionEnd { .. }) {
+            let is_none = cell.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+            token_state.lock().unwrap().push(is_none);
+        }
+    }));
+
+    seed_turn_via_runner(
+        &mut runner,
+        &agent,
+        &format!("q {}", "x".repeat(80)),
+        &format!("a {}", "y".repeat(80)),
+        5000,
+    );
+
+    // Trigger auto-compaction via a threshold message (9000 > 8192-4096).
+    let msg = assistant("done", StopReason::Stop, 9000, now_ms());
+    runner.check_compaction(&msg, true).await;
+
+    let states = token_at_emit.lock().unwrap().clone();
+    assert!(
+        !states.is_empty(),
+        "compaction_end should have been emitted"
+    );
+    for state in &states {
+        assert!(
+            *state,
+            "abort token must be None when compaction_end is emitted (3852cb2b8)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// manual compaction race: abort token lifecycle (7253 / e56893f4c)
+// ---------------------------------------------------------------------------
+
+/// Manual compaction clears the abort token after completion: a prompt
+/// arriving immediately after will not see a stale compaction state.
+#[tokio::test]
+async fn manual_compact_clears_abort_token_after_completion_7253() {
+    let mut fixture = fixture(settings(), vec![scripted("MANUAL SUMMARY")]);
+    fixture.seed_turn(
+        &format!("q1 {}", "x".repeat(80)),
+        &format!("a1 {}", "y".repeat(80)),
+        100,
+    );
+    fixture.seed_turn(&format!("q2 {}", "x".repeat(80)), "a2", 100);
+    fixture.seed_turn("q3", "a3", 100);
+
+    let cell = fixture.runner.abort_token_cell();
+    assert!(
+        cell.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+        "abort token should be None before compaction"
+    );
+
+    let _result = fixture.runner.compact(Some("focus")).await;
+
+    assert!(
+        cell.lock().unwrap_or_else(|e| e.into_inner()).is_none(),
+        "abort token should be None after compaction completes"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Helper: seed a turn into a runner+agent pair (for standalone runner tests)
+// ---------------------------------------------------------------------------
+
+/// Seed a conversation round into the runner's session and sync agent state.
+/// Used by standalone-runner tests that don't go through the `Fixture` struct.
+fn seed_turn_via_runner(
+    runner: &mut CompactionRunner,
+    agent: &Arc<Agent>,
+    user_text: &str,
+    assistant_text: &str,
+    total_tokens: u64,
+) {
+    let usage: rpi_ai::types::Usage = serde_json::from_value(json!({
+        "input": total_tokens, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+        "totalTokens": total_tokens,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+    }))
+    .expect("usage");
+    let mut assistant_msg = faux_assistant_message(assistant_text, FauxAssistantOptions::default());
+    assistant_msg.usage = usage;
+    assistant_msg.timestamp = now_ms();
+    let user_msg: AgentMessage = serde_json::from_value(json!({
+        "role": "user",
+        "content": user_text,
+        "timestamp": now_ms(),
+    }))
+    .expect("user msg");
+
+    runner
+        .session_mut()
+        .append_message(user_msg.clone())
+        .expect("append user");
+    runner
+        .session_mut()
+        .append_message(AgentMessage::Assistant(assistant_msg.clone()))
+        .expect("append assistant");
+    let mut messages = agent.state().messages;
+    messages.push(user_msg);
+    messages.push(AgentMessage::Assistant(assistant_msg));
+    agent.set_messages(messages);
+}

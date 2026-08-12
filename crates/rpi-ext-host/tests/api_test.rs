@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use rpi_ext_host::api::{
-    EventBus, ExecOptions, ExecResult, ExtensionApi, HostActions, InsertionMap, SendMessageOptions,
-    SendUserMessageOptions,
+    EventBus, ExecOptions, ExecResult, ExtensionApi, ExtensionRuntime, HostActions, InsertionMap,
+    SendMessageOptions, SendUserMessageOptions,
 };
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
@@ -586,4 +586,98 @@ fn api_insertion_map_set_replaces_in_place() {
     assert_eq!(entries, [("a", 3), ("b", 2)]);
     assert!(map.contains("b"));
     assert!(!map.contains("c"));
+}
+
+// ---------------------------------------------------------------------------
+// Event-bus lifecycle (6ca423447 — invalidate auto-unsubscribes)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_invalidate_unsubscribes_tracked_event_bus_subscriptions() {
+    // 6ca423447: invalidate() must drain tracked event-bus subscriptions
+    // so a stale extension context stops receiving bus events.
+    let runtime = ExtensionRuntime::new();
+    let bus = runtime.event_bus();
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let sink = received.clone();
+    let unsubscribe = bus.on(
+        "chan",
+        Arc::new(move |data| {
+            sink.lock().unwrap().push(data);
+        }),
+    );
+    let _tracked = runtime.track_event_bus_subscription(unsubscribe);
+
+    bus.emit("chan", json!(1));
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[json!(1)],
+        "subscription active before invalidate"
+    );
+
+    runtime.invalidate(None);
+
+    bus.emit("chan", json!(2));
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[json!(1)],
+        "subscription removed after invalidate — no leak"
+    );
+}
+
+#[test]
+fn api_tracked_unsubscribe_wrapper_is_idempotent() {
+    // Early unsubscribe through the returned wrapper should remove the
+    // subscription from tracking and not double-fire on invalidate.
+    let runtime = ExtensionRuntime::new();
+    let bus = runtime.event_bus();
+
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let sink = received.clone();
+    let unsubscribe = bus.on(
+        "chan",
+        Arc::new(move |data| {
+            sink.lock().unwrap().push(data);
+        }),
+    );
+    let tracked = runtime.track_event_bus_subscription(unsubscribe);
+
+    tracked(); // early unsubscribe
+    bus.emit("chan", json!(1));
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "no delivery after early unsubscribe"
+    );
+
+    // invalidate should be a no-op for this subscription.
+    runtime.invalidate(None);
+    bus.emit("chan", json!(2));
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "no double-unsubscribe effect"
+    );
+}
+
+#[test]
+fn api_invalidate_first_message_wins_for_unsubscribe_drain() {
+    // Second invalidate call must not panic or double-fire.
+    let runtime = ExtensionRuntime::new();
+    let bus = runtime.event_bus();
+
+    let count = Arc::new(Mutex::new(0));
+    let sink = count.clone();
+    let unsubscribe = bus.on(
+        "chan",
+        Arc::new(move |_| {
+            *sink.lock().unwrap() += 1;
+        }),
+    );
+    let _tracked = runtime.track_event_bus_subscription(unsubscribe);
+
+    bus.emit("chan", json!(1));
+    runtime.invalidate(Some("stale".to_owned()));
+    runtime.invalidate(Some("second".to_owned()));
+    assert_eq!(*count.lock().unwrap(), 1, "handler ran exactly once");
+    assert!(runtime.is_stale());
 }

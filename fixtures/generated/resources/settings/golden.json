@@ -1,5 +1,5 @@
 {
-  "upstream": "external/pi @ 2efa728 (v0.82.1), dist build",
+  "upstream": "external/pi @ 4181f66 (v0.84.1+), dist build",
   "deepMerge": [
     {
       "name": "nested-single-level-shallow-merge",
@@ -76,8 +76,8 @@
           "baseDelayMs": 2000
         },
         "providerRetry": {
-          "timeoutMs": null,
-          "maxRetries": null,
+          "timeoutMs": 1000,
+          "maxRetries": 2,
           "maxRetryDelayMs": 999
         },
         "packages": [],

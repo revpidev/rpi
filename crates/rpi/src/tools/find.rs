@@ -124,9 +124,50 @@ fn number_value(v: f64) -> Value {
     }
 }
 
-/// `/`-separated path string (toPosixPath, find.ts:16-18).
+/// `/`-separated path string (toPosixPath component; replaces native `\`
+/// separators from Windows-style results with `/`).
 fn to_posix_path(value: &str) -> String {
     value.replace('\\', "/")
+}
+
+/// `relativizeFindResultPath` (find.ts:17-27 @ 523b5a491): strip the search
+/// root from absolute result paths (preserving the trailing separator of
+/// directories), normalize to posix separators, and pass relative results
+/// through unchanged.
+///
+/// On Unix `path.sep` is `/`, so `hadTrailingSeparator` checks for `/` only;
+/// the Windows `[/\\]` fallback is gated behind `cfg!(windows)`.
+fn relativize_find_result_path(result_path: &str, search_path: &str) -> String {
+    let had_trailing_sep =
+        result_path.ends_with('/') || (cfg!(windows) && result_path.ends_with('\\'));
+    let relative_path = if Path::new(result_path).is_absolute() {
+        // path.relative(searchPath, resultPath): strip the search root only
+        // when the result is actually a descendant (i.e. the prefix is
+        // followed by a path separator or equals the full result). This
+        // prevents matching siblings with a shared string prefix
+        // (523b5a491 / #6104: `/foo/bar-baz` is NOT a child of `/foo/bar`).
+        let search = search_path.trim_end_matches('/');
+        if result_path == search {
+            String::new()
+        } else if let Some(rest) = result_path.strip_prefix(search) {
+            if rest.starts_with('/') {
+                rest.trim_start_matches('/').to_owned()
+            } else {
+                // Sibling with shared prefix — not a descendant, keep as-is.
+                result_path.to_owned()
+            }
+        } else {
+            result_path.to_owned()
+        }
+    } else {
+        result_path.to_owned()
+    };
+    let posix_path = to_posix_path(&relative_path);
+    if had_trailing_sep && !posix_path.ends_with('/') {
+        format!("{posix_path}/")
+    } else {
+        posix_path
+    }
 }
 
 /// `pathExists` walk-up git repository detection (find.ts:230-239).
@@ -421,17 +462,11 @@ impl AgentTool for FindTool {
                 return Ok(no_files_found());
             }
             // Relativise against the search root for stable output
-            // (find.ts:183-186).
-            let search_prefix = format!("{}/", search_path.display());
+            // (relativizeFindResultPath, find.ts:17-27 @ 523b5a491).
+            let search_root = search_path.display().to_string();
             let relativized: Vec<String> = results
                 .iter()
-                .map(|p| {
-                    if let Some(rest) = p.strip_prefix(&search_prefix) {
-                        to_posix_path(rest)
-                    } else {
-                        to_posix_path(p)
-                    }
-                })
+                .map(|p| relativize_find_result_path(p, &search_root))
                 .collect();
             return Ok(assemble_result(relativized, effective_limit, false));
         }
@@ -457,5 +492,66 @@ impl AgentTool for FindTool {
             return Ok(no_files_found());
         }
         Ok(assemble_result(outcome.results, effective_limit, true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Port of `relativizeFindResultPath` behavior (find.ts:17-27 @ 523b5a491):
+    // absolute paths are stripped of the search root; relative paths pass
+    // through; trailing separators are preserved; backslashes become `/`.
+
+    #[test]
+    fn relativize_strips_search_root_from_absolute_path() {
+        let result = relativize_find_result_path("/foo/bar/sub/file.txt", "/foo/bar");
+        assert_eq!(result, "sub/file.txt");
+    }
+
+    #[test]
+    fn relativize_preserves_directory_trailing_slash() {
+        let result = relativize_find_result_path("/foo/bar/sub/", "/foo/bar");
+        assert_eq!(result, "sub/");
+    }
+
+    #[test]
+    fn relativize_passes_relative_path_unchanged() {
+        // Relative results from custom glob operations pass through unchanged
+        // instead of being resolved against process.cwd() (523b5a491).
+        let result = relativize_find_result_path("sub/file.txt", "/foo/bar");
+        assert_eq!(result, "sub/file.txt");
+    }
+
+    #[test]
+    fn relativize_keeps_trailing_slash_on_relative_dir() {
+        let result = relativize_find_result_path("sub/", "/foo/bar");
+        assert_eq!(result, "sub/");
+    }
+
+    #[test]
+    fn relativize_does_not_match_sibling_with_shared_prefix() {
+        // `/foo/bar-baz` shares a string prefix with `/foo/bar` but is NOT a
+        // child — this was the bug fixed in 523b5a491 (#6104). Our prefix
+        // check strips the search root followed by `/`, so the sibling is
+        // left intact.
+        let result = relativize_find_result_path("/foo/bar-baz/file.txt", "/foo/bar");
+        assert_eq!(result, "/foo/bar-baz/file.txt");
+    }
+
+    #[test]
+    fn relativize_normalizes_backslashes_to_posix() {
+        let result = relativize_find_result_path("sub\\file.txt", "/foo/bar");
+        assert_eq!(result, "sub/file.txt");
+    }
+
+    #[test]
+    fn relativize_strips_trailing_slash_from_search_root() {
+        // The search root may or may not end with `/`; either way the result
+        // must be the same.
+        let with_slash = relativize_find_result_path("/foo/bar/sub", "/foo/bar/");
+        let without_slash = relativize_find_result_path("/foo/bar/sub", "/foo/bar");
+        assert_eq!(with_slash, "sub");
+        assert_eq!(with_slash, without_slash);
     }
 }

@@ -2782,3 +2782,53 @@ fn migrate_float_version_2_0_is_not_treated_as_v1() {
     assert_eq!(entries[1]["message"]["role"], json!("custom"));
     assert_eq!(entries[0]["version"], json!(3));
 }
+
+// ---------------------------------------------------------------------------
+// Symlink session directory discovery (da66636cc, #7552)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_all_discovers_sessions_through_symlinked_directories() {
+    // da66636cc (#7552): session directories that are symlinks to external
+    // storage must be discovered just like real directories in the default
+    // sessions dir (not a custom_dir override, which is flat-listed).
+    let tmp = TempDir::new();
+    let real_store = tmp.path().join("real-store");
+    let session_subdir = real_store.join("abc123");
+    std::fs::create_dir_all(&session_subdir).expect("create dir");
+    std::fs::write(
+        session_subdir.join("session.jsonl"),
+        format!("{}\n", header_line("abc123", "/tmp")),
+    )
+    .expect("write");
+
+    // Set up agent dir so get_sessions_dir() returns our temp.
+    let agent_dir = tmp.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+    // sessions/abc123 → real-store/abc123 (symlink)
+    std::os::unix::fs::symlink(&session_subdir, sessions_dir.join("abc123"))
+        .expect("create symlink");
+
+    // SAFETY: this test uses a unique temp agent_dir; env var set/restore is
+    // serial and scoped. Use a lock to prevent parallel env races.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var_os(crate::config::ENV_AGENT_DIR);
+    std::env::set_var(crate::config::ENV_AGENT_DIR, &agent_dir);
+
+    let sessions = SessionManager::list_all(None);
+
+    // Restore env immediately.
+    match prev {
+        Some(v) => std::env::set_var(crate::config::ENV_AGENT_DIR, v),
+        None => std::env::remove_var(crate::config::ENV_AGENT_DIR),
+    }
+
+    let matching: Vec<_> = sessions.iter().filter(|s| s.id == "abc123").collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "symlinked session dir should be discovered"
+    );
+}

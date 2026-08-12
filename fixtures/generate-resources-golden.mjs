@@ -61,7 +61,7 @@ import { DefaultResourceLoader } from "../external/pi/packages/coding-agent/dist
 const here = dirname(fileURLToPath(import.meta.url));
 const resourcesDir = join(here, "generated", "resources");
 
-const UPSTREAM = "external/pi @ 2efa728 (v0.82.1), dist build";
+const UPSTREAM = "external/pi @ 4181f66 (v0.84.1+), dist build";
 
 /** Replace every occurrence of `root` in any string with the `<path>` placeholder. */
 function stripRoot(value, root) {

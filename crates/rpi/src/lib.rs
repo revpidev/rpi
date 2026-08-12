@@ -20,5 +20,6 @@ pub mod logging;
 pub mod modes;
 pub mod sdk;
 pub mod tools;
+pub mod utils;
 
 pub use error::RpiError;

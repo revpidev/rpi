@@ -4826,4 +4826,139 @@ mod tests {
             other => panic!("expected stored api_key credential, got {other:?}"),
         }
     }
+
+    // ------------------------------------------------------------------
+    // credential-resolved baseUrl override (R3.4.8, commit e741cb05c,
+    // model-runtime.ts:600, apply_auth in models.rs:1451-1457)
+    // ------------------------------------------------------------------
+
+    /// Auth that returns a `base_url` override in its resolved result —
+    /// simulating a credential-resolved endpoint (e.g. subscription proxy).
+    struct BaseUrlOverrideAuth;
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for BaseUrlOverrideAuth {
+        fn name(&self) -> &str {
+            "Override API key"
+        }
+
+        async fn resolve(
+            &self,
+            _ctx: &dyn AuthContext,
+            _credential: Option<&ApiKeyCredential>,
+        ) -> Result<Option<AuthResult>, ModelsError> {
+            Ok(Some(AuthResult {
+                auth: ModelAuth {
+                    api_key: Some("sk-override".to_owned()),
+                    headers: None,
+                    base_url: Some("https://credential-resolved.example.com/v1".to_owned()),
+                },
+                env: None,
+                source: Some("OVERRIDE".to_owned()),
+            }))
+        }
+    }
+
+    /// A streams impl that records the model's base_url at dispatch time so
+    /// the test can assert the override was applied.
+    struct RecordingBaseUrlStreams {
+        captured_base_url: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ProviderStreams for RecordingBaseUrlStreams {
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &Context,
+            options: Option<StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            *self.captured_base_url.lock().unwrap() = Some(model.base_url.clone());
+            let stream = AssistantMessageEventStream::new();
+            let mut partial = crate::types::AssistantMessage {
+                role: crate::types::AssistantRole::Assistant,
+                content: vec![],
+                api: model.api.clone(),
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: options.and_then(|o| o.request.api_key),
+                timestamp: 0,
+                deferred: None,
+                end_turn: None,
+                raw_stop_reason: None,
+            };
+            partial.stop_reason = StopReason::Stop;
+            stream.push(StreamEvent::Done {
+                reason: DoneReason::Stop,
+                message: partial,
+            });
+            stream.end(None);
+            stream
+        }
+
+        fn stream_simple(
+            &self,
+            model: &Model,
+            context: &Context,
+            _options: Option<SimpleStreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.stream(model, context, None)
+        }
+    }
+
+    /// `apply_auth` applies a credential-resolved `base_url` to the request
+    /// model — both the main stream and `streamSimple` paths
+    /// (R3.4.8, model-runtime.ts:600 @ e741cb05c).
+    #[tokio::test]
+    async fn test_apply_auth_overrides_base_url_from_credential_resolution() {
+        let captured = Arc::new(Mutex::new(None));
+        let streams = Arc::new(RecordingBaseUrlStreams {
+            captured_base_url: captured.clone(),
+        });
+        let provider = create_provider(CreateProviderOptions {
+            id: "override-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(BaseUrlOverrideAuth)),
+                oauth: None,
+            },
+            models: vec![model("override-test", ApiKind::ANTHROPIC_MESSAGES)],
+            api: ProviderApi::Single(streams),
+            ..Default::default()
+        });
+        let models = Models::new(None);
+        models.set_provider(provider);
+        let model = models.get_model("override-test", "m").expect("model");
+
+        // The model's static base_url is the fixture default.
+        assert_eq!(model.base_url, "https://example.com");
+
+        // Main stream path: credential-resolved base_url overrides.
+        let _ = models
+            .complete(&model, &Context::default(), None)
+            .await
+            .expect("result");
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("https://credential-resolved.example.com/v1"),
+            "main stream path must use the credential-resolved base_url"
+        );
+
+        // streamSimple path: same override applies.
+        captured.lock().unwrap().take();
+        let _ = models
+            .complete_simple(&model, &Context::default(), None)
+            .await;
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("https://credential-resolved.example.com/v1"),
+            "streamSimple path must use the credential-resolved base_url"
+        );
+    }
 }

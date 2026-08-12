@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -107,6 +107,41 @@ impl EventBus {
     /// `clear()` (EventBusController).
     pub fn clear(&self) {
         write(&self.inner.handlers).clear();
+    }
+}
+
+/// Extension-facing wrapper around [`EventBus`] that enforces `assertActive`
+/// and tracks subscriptions for auto-unsubscribe on `invalidate()`
+/// (6ca423447, loader.ts:410-419). The raw bus is still reachable via
+/// [`Self::bus`] for host-internal use.
+pub struct TrackedEventBus {
+    bus: EventBus,
+    runtime: ExtensionRuntime,
+}
+
+impl TrackedEventBus {
+    pub(crate) fn new(bus: EventBus, runtime: ExtensionRuntime) -> Self {
+        TrackedEventBus { bus, runtime }
+    }
+
+    /// Access the underlying raw bus (host-internal callers that need to emit
+    /// without an active-extension check).
+    pub fn bus(&self) -> &EventBus {
+        &self.bus
+    }
+
+    /// `events.emit` (loader.ts:411-413 after 6ca423447).
+    pub fn emit(&self, channel: &str, data: Value) -> Result<(), ExtError> {
+        self.runtime.assert_active()?;
+        self.bus.emit(channel, data);
+        Ok(())
+    }
+
+    /// `events.on` (loader.ts:414-417 after 6ca423447).
+    pub fn on(&self, channel: &str, handler: BusHandler) -> Unsubscribe {
+        self.runtime.assert_active().ok();
+        let unsubscribe = self.bus.on(channel, handler);
+        self.runtime.track_event_bus_subscription(unsubscribe)
     }
 }
 
@@ -666,6 +701,13 @@ struct RuntimeInner {
     ui_bridge: RwLock<Option<Arc<dyn UiBridge>>>,
     mode: RwLock<ExtensionMode>,
     event_bus: EventBus,
+    /// Tracked event-bus subscriptions that are auto-unsubscribed on
+    /// `invalidate()` (6ca423447, loader.ts:179-180). Keyed by a monotonically
+    /// increasing ID so the returned wrapper can remove itself on early
+    /// unsubscribe without scanning closures. Uses `Mutex` because
+    /// `Unsubscribe` (`Box<dyn FnOnce + Send>`) is not `Sync`.
+    event_bus_unsubscribers: std::sync::Mutex<HashMap<u64, Unsubscribe>>,
+    next_bus_subscription_id: AtomicU64,
 }
 
 impl Default for ExtensionRuntime {
@@ -690,6 +732,8 @@ impl ExtensionRuntime {
                 ui_bridge: RwLock::new(None),
                 mode: RwLock::new(ExtensionMode::Print),
                 event_bus: EventBus::new(),
+                event_bus_unsubscribers: std::sync::Mutex::new(HashMap::new()),
+                next_bus_subscription_id: AtomicU64::new(0),
             }),
         }
     }
@@ -702,16 +746,63 @@ impl ExtensionRuntime {
         }
     }
 
-    /// `invalidate` (loader.ts:201-205): first message wins.
+    /// `invalidate` (loader.ts:201-205 after 6ca423447): first message wins,
+    /// then unsubscribe all tracked event-bus subscriptions to prevent leaks.
     pub fn invalidate(&self, message: Option<String>) {
         let mut stale = write(&self.inner.stale_message);
-        if stale.is_none() {
-            *stale = Some(message.unwrap_or_else(|| DEFAULT_STALE_MESSAGE.to_owned()));
+        if stale.is_some() {
+            return;
+        }
+        *stale = Some(message.unwrap_or_else(|| DEFAULT_STALE_MESSAGE.to_owned()));
+        drop(stale);
+        // 6ca423447: drain and fire tracked unsubscribers so stale extension
+        // contexts can't keep receiving bus events from the new runtime.
+        let unsubscribers = std::mem::take(
+            &mut *self
+                .inner
+                .event_bus_unsubscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for (_, unsubscribe) in unsubscribers {
+            unsubscribe();
         }
     }
 
     pub fn is_stale(&self) -> bool {
         read(&self.inner.stale_message).is_some()
+    }
+
+    /// `trackEventBusSubscription` (loader.ts:207-216 after 6ca423447):
+    /// wrap an unsubscribe closure so it is retained until `invalidate()`.
+    /// Calling the returned closure early removes it from the tracking set
+    /// and fires the inner unsubscribe, making it idempotent.
+    pub fn track_event_bus_subscription(&self, unsubscribe: Unsubscribe) -> Unsubscribe {
+        let id = self
+            .inner
+            .next_bus_subscription_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .event_bus_unsubscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, unsubscribe);
+        let inner = self.inner.clone();
+        let removed = Arc::new(AtomicBool::new(false));
+        let removed_clone = removed.clone();
+        Box::new(move || {
+            if removed_clone.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            if let Some(unsub) = inner
+                .event_bus_unsubscribers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id)
+            {
+                unsub();
+            }
+        })
     }
 
     // -- flag values (types.ts:1571) ----------------------------------------
@@ -947,9 +1038,10 @@ impl ExtensionContext {
             .unwrap_or_else(|| crate::bridges::NullUiBridge::shared()))
     }
 
-    /// `pi.events` — the shared bus, also reachable from handlers.
-    pub fn events(&self) -> EventBus {
-        self.runtime.event_bus()
+    /// `pi.events` — tracked bus wrapper (6ca423447). Enforces `assertActive`
+    /// and auto-unsubscribes on `invalidate()`.
+    pub fn events(&self) -> TrackedEventBus {
+        TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
     }
 
     // -- session-bound accessors (types.ts:324-341; defaults runner.ts:275-285)
@@ -1728,8 +1820,8 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.events` (loader.ts:389).
-    pub fn events(&self) -> EventBus {
-        self.runtime.event_bus()
+    /// `pi.events` (loader.ts:389 + 6ca423447 tracking wrapper).
+    pub fn events(&self) -> TrackedEventBus {
+        TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
     }
 }

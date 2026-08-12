@@ -500,7 +500,8 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             state
                 .api
                 .events()
-                .emit(channel, args.get("data").cloned().unwrap_or(Value::Null));
+                .emit(channel, args.get("data").cloned().unwrap_or(Value::Null))
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
         "events.on" => {
@@ -509,7 +510,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .to_owned();
             let forward = state.forward.clone();
             let bus_channel = channel.clone();
-            let unsubscribe = state.api.events().on(
+            let _unsubscribe = state.api.events().on(
                 &channel,
                 Arc::new(move |data| {
                     forward.dispatch_forget(json!({
@@ -519,10 +520,11 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     }));
                 }),
             );
-            // Bus subscriptions live until runtime teardown; the
-            // unsubscribe closure is intentionally leaked (upstream keeps
-            // them for the runtime lifetime as well).
-            std::mem::forget(unsubscribe);
+            // 6ca423447: subscriptions are tracked by the runtime and
+            // auto-unsubscribed on `invalidate()`. The handle is dropped —
+            // calling it would unsubscribe immediately, and keeping it alive
+            // in JS land is unnecessary since the runtime tracks it.
+            std::mem::forget(_unsubscribe);
             Ok(Value::Null)
         }
 

@@ -22,7 +22,10 @@ use crate::config::{get_agent_dir, get_default_session_dir_path};
 use crate::core::agent_session::{AgentSession, AgentSessionConfig};
 use crate::core::agent_session_services::CreateAgentSessionServicesOptions;
 use crate::core::auth_guidance::format_no_models_available_message;
-use crate::core::extensions::{new_extension_runner_ref, NoopExtensionRunner, SessionStartEvent};
+use crate::core::extensions::{
+    extension_after_tool_call_hook, new_extension_runner_ref, NoopExtensionRunner,
+    SessionStartEvent,
+};
 use crate::core::model_resolver::{
     find_initial_model, FindInitialModelOptions, ScopedModel, DEFAULT_THINKING_LEVEL,
 };
@@ -509,8 +512,9 @@ pub async fn create_agent_session(
     agent_options.before_tool_call = Some(
         crate::core::extensions::extension_before_tool_call_hook(extension_runner_ref.clone()),
     );
-    agent_options.after_tool_call = Some(crate::core::extensions::extension_after_tool_call_hook(
+    agent_options.after_tool_call = Some(after_tool_call_with_image_normalization(
         extension_runner_ref.clone(),
+        resource_loader.clone(),
     ));
     agent_options.on_response = Some(crate::core::extensions::extension_on_response_callback(
         extension_runner_ref.clone(),
@@ -621,6 +625,75 @@ fn filter_tool_result_image_blocks(blocks: &mut Vec<rpi_ai::types::ToolResultCon
         }
     }
     *blocks = result;
+}
+
+/// `afterToolCall` hook combining the extension `tool_result` hook with
+/// image normalization (agent-session.ts:501-531, upstream commit b0e05b442).
+///
+/// Upstream runs the extension `tool_result` hook first, then normalizes the
+/// resulting content (`hookResult?.content ?? result.content`) through
+/// `normalizeToolResultImages` so images injected or replaced by extensions
+/// are covered too (agent-session.ts:517-520).
+///
+/// `images.autoResize` is re-read from settings on every invocation so
+/// mid-session changes take effect on the next tool call.
+fn after_tool_call_with_image_normalization(
+    runner_ref: crate::core::extensions::ExtensionRunnerRef,
+    resource_loader: Arc<Mutex<crate::core::resource_loader::DefaultResourceLoader>>,
+) -> rpi_agent::agent_loop::AfterToolCallFn {
+    let extension_hook = extension_after_tool_call_hook(runner_ref);
+    Arc::new(
+        move |context: rpi_agent::agent_loop::AfterToolCallContext,
+              signal: tokio_util::sync::CancellationToken| {
+            let extension_hook = extension_hook.clone();
+            let resource_loader = resource_loader.clone();
+            Box::pin(async move {
+                // Step 1: extension tool_result hook (agent-session.ts:501-514).
+                let extension_result = extension_hook(context.clone(), signal).await?;
+
+                // Step 2: resolve content (agent-session.ts:516).
+                let content = extension_result
+                    .as_ref()
+                    .and_then(|r| r.content.clone())
+                    .unwrap_or_else(|| context.result.content.clone());
+
+                // Step 3: read autoResize from settings (agent-session.ts:519).
+                let auto_resize = {
+                    let loader = resource_loader.lock().unwrap_or_else(|e| e.into_inner());
+                    loader.settings_manager().get_image_auto_resize()
+                };
+
+                // Step 4: normalize (agent-session.ts:518-520).
+                let normalized = crate::tools::tool_result_images::normalize_tool_result_images(
+                    content,
+                    auto_resize,
+                );
+
+                // Step 5: assemble final override (agent-session.ts:522-531).
+                // If the extension hook returned None and normalization didn't
+                // change anything, return None (no override).
+                if extension_result.is_none() && !normalized.changed {
+                    return Ok(None);
+                }
+
+                let extension_result = extension_result.unwrap_or_default();
+                Ok(Some(rpi_agent::agent_loop::AfterToolCallResult {
+                    content: Some(normalized.content),
+                    details: extension_result.details,
+                    is_error: extension_result.is_error.or(Some(context.is_error)),
+                    usage: extension_result.usage,
+                    terminate: None,
+                }))
+            })
+                as futures::future::BoxFuture<
+                    'static,
+                    Result<
+                        Option<rpi_agent::agent_loop::AfterToolCallResult>,
+                        rpi_agent::AgentError,
+                    >,
+                >
+        },
+    )
 }
 
 fn parse_thinking_level_str(level: &str) -> ThinkingLevel {

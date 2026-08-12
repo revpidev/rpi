@@ -1167,7 +1167,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                             message: "--api-key requires a model to be specified via --model, --provider/--model, or --models".to_owned(),
                         }),
                         Some(model) => {
-                            services
+                            let _ = services
                                 .model_runtime
                                 .set_runtime_api_key(&model.provider, api_key)
                                 .await;

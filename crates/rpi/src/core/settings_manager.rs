@@ -323,36 +323,45 @@ fn json_value<T: Serialize>(value: &T) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// deepMergeSettings (settings-manager.ts:132-160)
+// deepMergeObjects / deepMergeSettings
+// (settings-manager.ts:141-167, recursive since commit 97f0ccdd9 / pi 4181f66)
 // ---------------------------------------------------------------------------
 
-/// `deepMergeSettings(base, overrides)` — the upstream comment claims
-/// recursion but the code performs a **single-level shallow merge** for
-/// nested objects: top-level keys take the union; when both values at one
-/// top-level key are plain objects the result is `{...base, ...override}`
-/// (so depth ≥ 2 nesting is replaced wholesale); primitives, arrays, and
-/// `null` always replace wholesale (requirements §7.7).
+/// `isMergeableObject` + `deepMergeObjects` (settings-manager.ts:141-162):
+/// recursively merge two JSON objects. When both `base[key]` and
+/// `overrides[key]` are plain objects (non-null, non-array — the
+/// [`Value::Object`] arm) the values merge recursively at every depth;
+/// primitives, arrays, and `null` replace wholesale (requirements §7.7).
+///
+/// `undefined` override values are skipped upstream; JSON has no `undefined`,
+/// so absent keys simply never appear in `overrides`.
 ///
 /// Key order matches JS spread semantics: overridden keys keep their base
 /// position, new keys append (indexmap insertion semantics).
-fn deep_merge_settings(base: &Settings, overrides: &Settings) -> Settings {
-    let mut result = base.fields.clone();
-    for (key, override_value) in &overrides.fields {
-        // JS `undefined` override values are skipped; JSON has no undefined —
-        // absent keys simply never appear in `overrides`.
-        if let (Value::Object(override_obj), Some(Value::Object(base_obj))) =
-            (override_value, base.fields.get(key))
-        {
-            let mut merged = base_obj.clone();
-            for (sub_key, sub_value) in override_obj {
-                merged.insert(sub_key.clone(), sub_value.clone());
+fn deep_merge_objects(
+    base: &Map<String, Value>,
+    overrides: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut result = base.clone();
+    for (key, override_value) in overrides {
+        let merged_value = match (base.get(key), override_value) {
+            (Some(Value::Object(base_obj)), Value::Object(override_obj)) => {
+                Value::Object(deep_merge_objects(base_obj, override_obj))
             }
-            result.insert(key.clone(), Value::Object(merged));
-        } else {
-            result.insert(key.clone(), override_value.clone());
-        }
+            _ => override_value.clone(),
+        };
+        result.insert(key.clone(), merged_value);
     }
-    Settings { fields: result }
+    result
+}
+
+/// `deepMergeSettings(base, overrides)` (settings-manager.ts:164-167,
+/// commit 97f0ccdd9): project/overrides take precedence, nested objects
+/// merge recursively.
+fn deep_merge_settings(base: &Settings, overrides: &Settings) -> Settings {
+    Settings {
+        fields: deep_merge_objects(&base.fields, &overrides.fields),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2964,8 +2973,7 @@ mod tests {
     }
 
     // =======================================================================
-    // deepMergeSettings unit tests (settings-manager.ts:132-160 semantics;
-    // the upstream comment claims recursion — the code does not recurse)
+    // deepMergeSettings unit tests (settings-manager.ts:141-167, commit 97f0ccdd9)
     // =======================================================================
 
     #[test]
@@ -2983,7 +2991,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deep_merge_nested_objects_single_level_shallow() {
+    fn test_deep_merge_nested_objects_one_level() {
         // Depth 1: override sub-keys win, base-only sub-keys survive.
         let base = settings(json!({"compaction": {"enabled": false, "reserveTokens": 100}}));
         let overrides = settings(json!({"compaction": {"reserveTokens": 200}}));
@@ -2995,8 +3003,9 @@ mod tests {
     }
 
     #[test]
-    fn test_deep_merge_depth_two_replaces_wholesale() {
-        // Depth >= 2: retry.provider is replaced wholesale, not merged.
+    fn test_deep_merge_depth_two_merges_recursively() {
+        // Depth >= 2: retry.provider merges recursively (commit 97f0ccdd9),
+        // so global-only sub-keys survive alongside the project override.
         let base = settings(
             json!({"retry": {"enabled": true, "provider": {"timeoutMs": 1000, "maxRetries": 2}}}),
         );
@@ -3004,7 +3013,53 @@ mod tests {
         let merged = deep_merge_settings(&base, &overrides);
         assert_eq!(
             merged.as_map()["retry"],
-            json!({"enabled": true, "provider": {"maxRetries": 5}})
+            json!({"enabled": true, "provider": {"timeoutMs": 1000, "maxRetries": 5}})
+        );
+    }
+
+    #[test]
+    fn test_deep_merge_7572_project_partial_global_full_recursive() {
+        // #7572 golden: project-level settings carries only a partial slice
+        // of a nested object (retry.provider.{maxRetries,baseURL}); the
+        // global settings carries the rest of `retry` plus unrelated
+        // top-level keys. The merge must recurse so the project override
+        // wins its slice while the global remainder survives at every depth.
+        let global = settings(json!({
+            "theme": "dark",
+            "defaultModel": "global-model",
+            "retry": {
+                "enabled": true,
+                "provider": {
+                    "timeoutMs": 1000,
+                    "maxRetries": 2,
+                    "baseURL": "https://global.example.com"
+                }
+            },
+            "compaction": {"enabled": true, "reserveTokens": 100}
+        }));
+        let project = settings(json!({
+            "retry": {"provider": {"maxRetries": 5, "baseURL": "https://project.example.com"}}
+        }));
+        let merged = deep_merge_settings(&global, &project);
+        // Unrelated global-only keys survive untouched.
+        assert_eq!(merged.as_map()["theme"], json!("dark"));
+        assert_eq!(merged.as_map()["defaultModel"], json!("global-model"));
+        assert_eq!(
+            merged.as_map()["compaction"],
+            json!({"enabled": true, "reserveTokens": 100})
+        );
+        // retry.enabled (global-only) survives; retry.provider merges:
+        // timeoutMs (global-only) survives, maxRetries + baseURL (project) win.
+        assert_eq!(
+            merged.as_map()["retry"],
+            json!({
+                "enabled": true,
+                "provider": {
+                    "timeoutMs": 1000,
+                    "maxRetries": 5,
+                    "baseURL": "https://project.example.com"
+                }
+            })
         );
     }
 

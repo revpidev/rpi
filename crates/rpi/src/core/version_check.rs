@@ -90,6 +90,10 @@ pub trait LatestVersionTransport: Send + Sync {
 
 /// Production transport: reqwest with rustls (no proxy code of its own —
 /// reqwest's env proxy support covers `HTTP_PROXY`/`HTTPS_PROXY`).
+///
+/// Uses [`fetch_with_retry`] (46b53b995) for bounded immediate retry on
+/// transient failures — this is the management-plane HTTP helper used by
+/// version-check / catalog / managed-tool / package downloads.
 pub struct ReqwestLatestVersionTransport;
 
 impl LatestVersionTransport for ReqwestLatestVersionTransport {
@@ -101,16 +105,29 @@ impl LatestVersionTransport for ReqwestLatestVersionTransport {
     ) -> BoxFuture<'a, Result<Option<String>, String>> {
         Box::pin(async move {
             let client = reqwest::Client::builder()
-                .timeout(timeout)
                 .build()
                 .map_err(|e| e.to_string())?;
-            let response = client
-                .get(url)
-                .header(reqwest::header::USER_AGENT, user_agent)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .send()
-                .await
-                .map_err(|e| e.to_string())?;
+            let url = url.to_owned();
+            let ua = user_agent.to_owned();
+            let response = crate::utils::management_http::fetch_with_retry(
+                move || {
+                    let client = client.clone();
+                    let url = url.clone();
+                    let ua = ua.clone();
+                    Box::pin(async move {
+                        client
+                            .get(url)
+                            .header(reqwest::header::USER_AGENT, ua)
+                            .header(reqwest::header::ACCEPT, "application/json")
+                    })
+                },
+                None,
+                &crate::utils::management_http::FetchRetryOptions {
+                    timeout: Some(timeout),
+                    ..Default::default()
+                },
+            )
+            .await?;
             if !response.status().is_success() {
                 return Ok(None);
             }

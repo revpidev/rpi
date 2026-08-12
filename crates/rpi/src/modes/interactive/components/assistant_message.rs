@@ -194,13 +194,14 @@ impl AssistantMessageComponent {
             .iter()
             .any(|c| matches!(c, AssistantContent::ToolCall(_)));
         self.has_tool_calls = has_tool_calls;
+        // Length stops: neutral truncation wording (assistant-message.ts:180
+        // @ 32850ef7c).
         if message.stop_reason == StopReason::Length {
             self.content_container
                 .add_child(StdBox::new(Spacer::new(1)));
-            let text = self.theme.fg(
-                "error",
-                "Error: Model stopped because it reached the maximum output token limit. The response may be incomplete.",
-            );
+            let text = self
+                .theme
+                .fg("error", "Response was truncated before completion.");
             self.content_container.add_child(StdBox::new(Text::new(
                 text,
                 self.output_pad,
@@ -423,9 +424,8 @@ mod tests {
             "Thinking...",
             1,
         );
-        let stripped = strip_ansi(&component.render(40).join("\n"));
-        // Long line wraps at width 40; check a stable fragment.
-        assert!(stripped.contains("maximum output token"));
+        let stripped = strip_ansi(&component.render(80).join("\n"));
+        assert!(stripped.contains("Response was truncated before completion."));
     }
 
     #[test]

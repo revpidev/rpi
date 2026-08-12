@@ -1517,7 +1517,7 @@ impl InteractiveUi {
                             };
                             ui.show_status(&message);
                         }
-                        Err(error) => ui.show_error(&format!("Logout failed: {}", error.message)),
+                        Err(error) => ui.show_error(&format!("Logout failed: {error}")),
                     }
                 });
             }),
@@ -2519,7 +2519,7 @@ mod tests {
     /// but runtime auth resolution is env/credential-driven; inject a
     /// runtime API key so `get_available` marks `custom/m1` as available.
     async fn make_model_available(session: &AgentSession) {
-        session
+        let _ = session
             .model_runtime()
             .set_runtime_api_key("custom", "sk-test-interactive")
             .await;

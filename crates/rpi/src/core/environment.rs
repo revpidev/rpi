@@ -58,6 +58,21 @@ pub fn is_coding_agent() -> bool {
         .unwrap_or(false)
 }
 
+/// `AI_AGENT` (cli.ts:14, rpc-entry.ts:8 @ 4f4762f06) — a generic process
+/// attribution marker derived from [`APP_NAME`](crate::config::APP_NAME).
+///
+/// The CLI and RPC entry points set this so generic tooling can attribute
+/// child processes (bash tool, etc.) to Rpi. It is **not** set automatically
+/// when Rpi is embedded through the SDK.
+pub const ENV_AI_AGENT: &str = "AI_AGENT";
+
+/// `process.env.AI_AGENT = APP_NAME` (cli.ts:14, rpc-entry.ts:8 @ 4f4762f06).
+///
+/// Called by the CLI/RPC entry points only; SDK embedding must not call this.
+pub fn set_ai_agent_marker() {
+    std::env::set_var(ENV_AI_AGENT, crate::config::APP_NAME);
+}
+
 // ---------------------------------------------------------------------------
 // Package directory override (config.ts:367-372)
 // ---------------------------------------------------------------------------
@@ -477,6 +492,23 @@ mod tests {
             std::env::var(ENV_CODING_AGENT).ok().as_deref(),
             Some("true")
         );
+    }
+
+    // Port of cli.ts:14 / rpc-entry.ts:8 @ 4f4762f06 — AI_AGENT derived from
+    // APP_NAME so child processes (bash tool etc.) can attribute themselves.
+    #[test]
+    fn test_ai_agent_marker() {
+        let (_lock, _guard) = EnvGuard::set(&[(ENV_AI_AGENT, None)]);
+        assert_ne!(
+            std::env::var(ENV_AI_AGENT).ok().as_deref(),
+            Some(crate::config::APP_NAME)
+        );
+        set_ai_agent_marker();
+        assert_eq!(
+            std::env::var(ENV_AI_AGENT).ok().as_deref(),
+            Some(crate::config::APP_NAME)
+        );
+        assert_eq!(crate::config::APP_NAME, "rpi");
     }
 
     // Port of config.ts:369-372 — non-empty override, normalized.

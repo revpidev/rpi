@@ -2416,7 +2416,12 @@ impl SessionManager {
         };
         let mut sessions = Vec::new();
         for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            // da66636cc (#7552): follow symlinked session directories as well
+            // as real ones — session dirs may be symlinks to external storage.
+            if entry
+                .file_type()
+                .is_ok_and(|t| t.is_dir() || t.is_symlink())
+            {
                 sessions.extend(list_sessions_from_dir(&entry.path()));
             }
         }

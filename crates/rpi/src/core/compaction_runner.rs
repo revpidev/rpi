@@ -1,5 +1,7 @@
 //! Port of the compaction wiring of
-//! `packages/coding-agent/src/core/agent-session.ts` @ pi 0.82.1 (2efa728):
+//! `packages/coding-agent/src/core/agent-session.ts` @ pi 0.82.1 (2efa728),
+//! updated to 4181f66 (v0.84.1+) for the length-stop recovery chain
+//! (32850ef7c/e56893f4c/8eda4f5b2/3852cb2b8 — see v0.11 T23):
 //! `compact()` (:1783-1925), `_checkCompaction` (:1953-2042),
 //! `_runAutoCompaction` (:2047-2215), and `_summarizationRetryCallbacks`
 //! (:2646-2669).
@@ -35,7 +37,7 @@ use rpi_agent::session::{get_latest_compaction_entry, parse_iso8601_ms, SessionE
 use rpi_agent::types::ThinkingLevel;
 use rpi_agent::{Agent, StreamFn};
 use rpi_ai::types::{AssistantMessage, Model, StopReason};
-use rpi_ai::utils::overflow::is_context_overflow;
+use rpi_ai::utils::overflow::{is_context_overflow, is_recoverable_length};
 use rpi_ai::utils::retry::{RetryCallbacks, RetryPolicy};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -336,6 +338,9 @@ impl CompactionRunner {
                 Some(format!("Compaction failed: {}", raw_error_message(error))),
             ),
         };
+        // compaction_end listeners may submit queued prompts, so expose idle
+        // state before notifying them (agent-session.ts:1907-1908 @ 3852cb2b8).
+        *lock_abort(&self.active_token) = None;
         self.emit(CompactionEvent::CompactionEnd {
             reason: CompactionReason::Manual,
             result,
@@ -343,7 +348,6 @@ impl CompactionRunner {
             will_retry: false,
             error_message,
         });
-        *lock_abort(&self.active_token) = None;
         outcome
     }
 
@@ -552,8 +556,23 @@ impl CompactionRunner {
             }
         }
 
-        // Case 1: overflow (agent-session.ts:1979-2011).
-        if same_model && is_context_overflow(assistant_message, Some(context_window)) {
+        // Case 1: Recoverable failure (agent-session.ts:1990-2001 @ 32850ef7c).
+        // Explicit/silent context overflow still uses context metadata.
+        // A length stop is recoverable when output ended below the model's
+        // original desired limit, independent of the configured context size
+        // or any context-clamped provider request limit. A successful response
+        // over the configured window should compact but must not retry: the
+        // assistant answer already completed and agent.continue() cannot
+        // continue from an assistant.
+        let max_tokens = self
+            .model
+            .as_ref()
+            .map(|m| u64::from(m.max_tokens))
+            .unwrap_or(0);
+        let recoverable_length = same_model && is_recoverable_length(assistant_message, max_tokens);
+        if same_model
+            && (is_context_overflow(assistant_message, Some(context_window)) || recoverable_length)
+        {
             let will_retry = assistant_message.stop_reason != StopReason::Stop;
 
             if !will_retry {
@@ -655,6 +674,9 @@ impl CompactionRunner {
                 Ok(compaction) => compaction,
                 Err(error) if raw_error_message(&error) == "Compaction cancelled" => {
                     // Extension cancel (agent-session.ts:2085-2092).
+                    // Clear idle state before compaction_end so listeners can
+                    // submit queued prompts (agent-session.ts:1907-1908 @ 3852cb2b8).
+                    *lock_abort(&self.active_token) = None;
                     self.emit(CompactionEvent::CompactionEnd {
                         reason,
                         result: None,
@@ -686,6 +708,8 @@ impl CompactionRunner {
             };
 
             if token.is_cancelled() {
+                // Clear idle state before compaction_end (3852cb2b8).
+                *lock_abort(&self.active_token) = None;
                 self.emit(CompactionEvent::CompactionEnd {
                     reason,
                     result: None,
@@ -699,6 +723,9 @@ impl CompactionRunner {
             let result = self
                 .finish_compaction(result, from_extension, reason, will_retry)
                 .await?;
+            // Clear idle state before compaction_end so listeners can submit
+            // queued prompts (agent-session.ts:1907-1908 @ 3852cb2b8).
+            *lock_abort(&self.active_token) = None;
             self.emit(CompactionEvent::CompactionEnd {
                 reason,
                 result: Some(Box::new(result)),
@@ -709,9 +736,16 @@ impl CompactionRunner {
 
             if will_retry {
                 let mut messages = self.agent.state().messages;
+                // The overflow response was persisted on message_end before
+                // _checkCompaction() removed it from agent state. Rebuilding
+                // state from the new compaction can restore that kept entry,
+                // leaving an assistant as the final message. agent.continue()
+                // rejects that state, so remove the retriable error or
+                // truncated-length response again before continuing the
+                // interrupted turn (agent-session.ts:2184-2189 @ 32850ef7c).
                 if matches!(
                     messages.last(),
-                    Some(rpi_agent::AgentMessage::Assistant(m)) if m.stop_reason == StopReason::Error
+                    Some(rpi_agent::AgentMessage::Assistant(m)) if m.stop_reason == StopReason::Error || m.stop_reason == StopReason::Length
                 ) {
                     messages.pop();
                     self.agent.set_messages(messages);

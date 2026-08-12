@@ -887,7 +887,8 @@ async fn w3_events_bus_cross_extension_pub_sub() {
 
     slot_api(&sender_slot)
         .events()
-        .emit("my-channel", json!({"n": 42}));
+        .emit("my-channel", json!({"n": 42}))
+        .unwrap();
     assert_eq!(
         received
             .lock()

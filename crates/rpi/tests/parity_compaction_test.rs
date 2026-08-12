@@ -262,7 +262,11 @@ impl Harness {
                             .session_mut()
                             .append_message(message.clone())
                             .expect("append message");
-                        if assistant.stop_reason != StopReason::Error {
+                        // A length stop must not reset the overflow recovery
+                        // budget (agent-session.ts:653-654 @ 32850ef7c).
+                        if assistant.stop_reason != StopReason::Error
+                            && assistant.stop_reason != StopReason::Length
+                        {
                             self.runner.reset_overflow_recovery();
                         }
                         self.last_assistant = Some(assistant.clone());

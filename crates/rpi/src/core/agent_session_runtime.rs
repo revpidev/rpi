@@ -3,7 +3,8 @@
 //! (new / fork / switch / import) with teardown + rebind.
 //!
 //! Port of `packages/coding-agent/src/core/agent-session-runtime.ts` @ pi
-//! 0.82.1 (2efa728).
+//! 0.82.1 (2efa728), updated to 4181f66 (v0.84.1+) for v0.11 T23 teardown
+//! ordering (abort before `session_shutdown`, #7022).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -215,8 +216,16 @@ impl AgentSessionRuntime {
             .unwrap_or(false)
     }
 
-    /// `teardownCurrent` (agent-session-runtime.ts:167-175).
+    /// `teardownCurrent` (agent-session-runtime.ts:167-178).
+    ///
+    /// Settle any active response first so the aborted turn (including tool
+    /// results) is persisted to the outgoing session before it is replaced
+    /// (#7022, R3.4.9). Upstream order: `await session.abort()` → emit
+    /// `session_shutdown` → `beforeSessionInvalidate` → `session.dispose()`.
     async fn teardown_current(&self, reason: SessionShutdownReason, target: Option<String>) {
+        // #7022: settle the active turn so tool results land in the outgoing
+        // session file before shutdown listeners observe the replacement.
+        self.session.abort().await;
         if self
             .session
             .extension_runner()
