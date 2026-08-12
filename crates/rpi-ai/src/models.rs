@@ -689,6 +689,27 @@ pub struct Models {
 /// Type alias for the per-provider serial publication chain tail.
 type PublicationChain = Arc<tokio::sync::Mutex<Option<BoxFuture<'static, ()>>>>;
 
+/// Drop guard for one provider refresh (models.ts:431-435 `finally`): aborts
+/// the combined-signal watcher task and removes the refresh controller if it
+/// is still current. Upstream relies on `finally`; here the outer `select!`
+/// in [`Models::refresh`] drops the per-provider future when the caller
+/// signal fires, so cleanup must run in `Drop` to not leak controllers (and
+/// detached watcher tasks) from `refresh_controllers`.
+struct ProviderRefreshGuard {
+    models: Models,
+    provider_id: String,
+    controller: CancellationToken,
+    watcher: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProviderRefreshGuard {
+    fn drop(&mut self) {
+        self.watcher.abort();
+        self.models
+            .end_provider_refresh(&self.provider_id, &self.controller);
+    }
+}
+
 impl Default for Models {
     fn default() -> Self {
         Self::new(None)
@@ -1096,6 +1117,14 @@ impl Models {
                             controller_clone.cancelled().await;
                             combined_clone.cancel();
                         });
+                        // Runs the models.ts:431-435 `finally` cleanup even
+                        // when this future is dropped by the outer `select!`.
+                        let _guard = ProviderRefreshGuard {
+                            models: this.clone(),
+                            provider_id: provider_id.clone(),
+                            controller: controller.clone(),
+                            watcher: controller_handle,
+                        };
 
                         let operation = async {
                             // models.ts:401-418.
@@ -1152,8 +1181,6 @@ impl Models {
                             result = operation => result,
                         };
 
-                        controller_handle.abort();
-
                         // models.ts:422-431: errors land only when NOT aborted.
                         match outcome {
                             Ok(()) => {}
@@ -1167,7 +1194,8 @@ impl Models {
                             }
                         }
 
-                        this.end_provider_refresh(&provider_id, &controller);
+                        // `_guard` drops here: aborts the watcher and runs
+                        // `end_provider_refresh` (models.ts:432-434).
                     }
                 })
                 .collect();
@@ -1222,11 +1250,13 @@ impl Models {
     ) -> Result<(), ModelsError> {
         let provider_id = provider.id().to_owned();
         let store_options = AuthOperationOptions::with_signal(signal.clone());
+        // models.ts:375 does not catch: a store read failure propagates into
+        // the refresh `errors` map via the caller (models.ts:422-429).
         let stored = self
             .models_store
             .read(&provider_id, Some(&store_options))
             .await
-            .unwrap_or(None);
+            .map_err(ai_error_to_models_error)?;
 
         let chain = self.publication_chain_for(&provider_id);
         let shared = Arc::new(PublishShared {
@@ -4960,5 +4990,99 @@ mod tests {
             Some("https://credential-resolved.example.com/v1"),
             "streamSimple path must use the credential-resolved base_url"
         );
+    }
+
+    /// T21 fix: a models-store read failure in `run_provider_refresh_phase`
+    /// propagates (models.ts:375 has no catch) and lands in the refresh
+    /// `errors` map (models.ts:422-429).
+    #[tokio::test]
+    async fn refresh_reports_models_store_read_failures() {
+        struct FailingReadStore;
+        #[async_trait::async_trait]
+        impl ModelsStore for FailingReadStore {
+            async fn read(
+                &self,
+                _: &str,
+                _: Option<&AuthOperationOptions>,
+            ) -> Result<Option<ModelsStoreEntry>, AiError> {
+                Err(AiError::CredentialStore("read boom".to_owned()))
+            }
+            async fn write(
+                &self,
+                _: &str,
+                _: ModelsStoreEntry,
+                _: Option<&AuthOperationOptions>,
+            ) -> Result<(), AiError> {
+                Ok(())
+            }
+            async fn delete(
+                &self,
+                _: &str,
+                _: Option<&AuthOperationOptions>,
+            ) -> Result<(), AiError> {
+                Ok(())
+            }
+        }
+
+        let provider = callback_provider("dyn", ProviderAuth::default(), vec![], |_context| {
+            Box::pin(async { Ok(()) })
+        });
+        let models = Models::new(Some(CreateModelsOptions {
+            credentials: None,
+            auth_context: None,
+            models_store: Some(Arc::new(FailingReadStore)),
+        }));
+        models.set_provider(provider);
+        let result = models
+            .refresh(Some(ModelsRefreshOptions {
+                allow_network: Some(false),
+                ..Default::default()
+            }))
+            .await;
+        assert!(!result.aborted);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, "dyn");
+        assert!(result.errors[0].1.contains("read boom"));
+    }
+
+    /// T21 fix: when the caller cancels mid-refresh, the outer `select!`
+    /// drops the per-provider future; the `ProviderRefreshGuard` must still
+    /// abort the signal watcher and remove the controller from
+    /// `refresh_controllers` (models.ts:431-435 `finally`).
+    #[tokio::test]
+    async fn refresh_removes_controller_when_caller_cancels_mid_refresh() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let started_in_callback = started.clone();
+        let provider = callback_provider("dyn", ProviderAuth::default(), vec![], move |_context| {
+            let started = started_in_callback.clone();
+            Box::pin(async move {
+                started.notify_one();
+                // Hang until the caller's cancellation drops this future.
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        });
+        let models = Models::new(None);
+        models.set_provider(provider);
+        let token = CancellationToken::new();
+        let models_clone = models.clone();
+        let token_clone = token.clone();
+        let refresh_task = tokio::spawn(async move {
+            models_clone
+                .refresh(Some(ModelsRefreshOptions {
+                    signal: Some(token_clone),
+                    ..Default::default()
+                }))
+                .await
+        });
+        started.notified().await;
+        token.cancel();
+        let result = refresh_task.await.expect("join");
+        assert!(result.aborted);
+        assert!(models
+            .refresh_controllers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty());
     }
 }

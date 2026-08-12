@@ -514,8 +514,11 @@ impl CredentialStore for FileCredentialStore {
     async fn read(
         &self,
         provider_id: &str,
-        _options: Option<&AuthOperationOptions>,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Option<Credential>, ModelsError> {
+        // auth-storage.ts:444 `options?.signal?.throwIfAborted()` (via
+        // `readLatestData`, auth-storage.ts:403).
+        AuthOperationOptions::throw_if_cancelled(options)?;
         let data = self.data.read().await;
         let Some(value) = data.get(provider_id) else {
             return Ok(None);
@@ -542,8 +545,10 @@ impl CredentialStore for FileCredentialStore {
     /// represent them.
     async fn list(
         &self,
-        _options: Option<&AuthOperationOptions>,
+        options: Option<&AuthOperationOptions>,
     ) -> Result<Vec<CredentialInfo>, ModelsError> {
+        // auth-storage.ts:488 `options?.signal?.throwIfAborted()`.
+        AuthOperationOptions::throw_if_cancelled(options)?;
         Ok(self
             .data
             .read()
@@ -589,6 +594,9 @@ impl CredentialStore for FileCredentialStore {
         };
         AuthOperationOptions::throw_if_cancelled(options)?;
         let provider = provider_id.to_owned();
+        // Owned clone so the cancellation token can move into the `'static`
+        // lock callback (auth-storage.ts:185 re-checks after `fn` returns).
+        let options = options.cloned();
         let (snapshot, credential) = self
             .backend
             .with_lock_async(
@@ -597,6 +605,7 @@ impl CredentialStore for FileCredentialStore {
                     Result<LockResult<(AuthStorageData, Option<Credential>)>, ModelsError>,
                 > {
                     let provider = provider.clone();
+                    let options = options.clone();
                     Box::pin(async move {
                         let current_data = parse_storage_data(content.as_deref())?;
                         let current = match current_data.get(&provider) {
@@ -604,6 +613,10 @@ impl CredentialStore for FileCredentialStore {
                             None => None,
                         };
                         let next = f(current).await?;
+                        // auth-storage.ts:185: re-check after the callback
+                        // returns, before writing — a cancelled modify must
+                        // not persist its result.
+                        AuthOperationOptions::throw_if_cancelled(options.as_ref())?;
                         match next {
                             None => {
                                 let current = match current_data.get(&provider) {
@@ -1351,6 +1364,64 @@ mod tests {
             storage.read("openai", None).await.expect("read"),
             Some(api_key_credential("fixture-command-key"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// read/list honor the entry `throwIfAborted`
+    /// (auth-storage.ts:444/488 @ 4181f66).
+    #[tokio::test]
+    async fn read_and_list_reject_a_cancelled_signal() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        write_auth_json(
+            &auth_path,
+            json!({ "anthropic": { "type": "api_key", "key": "k" } }),
+        );
+        let storage = FileCredentialStore::new(&auth_path);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let options = AuthOperationOptions::with_signal(token);
+        let error = storage
+            .read("anthropic", Some(&options))
+            .await
+            .expect_err("read must reject");
+        assert_eq!(error.code, ModelsErrorCode::Aborted);
+        let error = storage
+            .list(Some(&options))
+            .await
+            .expect_err("list must reject");
+        assert_eq!(error.code, ModelsErrorCode::Aborted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cancellation during the modify callback rejects before the write
+    /// (auth-storage.ts:185 @ 4181f66): the new credential is not persisted.
+    #[tokio::test]
+    async fn modify_cancelled_after_callback_does_not_write() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        let storage = FileCredentialStore::new(&auth_path);
+        let token = tokio_util::sync::CancellationToken::new();
+        let cancel_in_fn = token.clone();
+        let f: ModifyFn = Arc::new(move |_| {
+            let token = cancel_in_fn.clone();
+            Box::pin(async move {
+                token.cancel();
+                Ok(Some(api_key_credential("new")))
+            })
+        });
+        let options = AuthOperationOptions::with_signal(token);
+        let error = storage
+            .modify("anthropic", f, Some(&options))
+            .await
+            .expect_err("modify must reject");
+        assert_eq!(error.code, ModelsErrorCode::Aborted);
+        assert!(storage
+            .read("anthropic", None)
+            .await
+            .expect("read")
+            .is_none());
+        assert_eq!(read_file_json(&auth_path), json!({}));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

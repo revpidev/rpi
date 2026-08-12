@@ -175,8 +175,26 @@ impl Provider for RadiusProvider {
                         Vec::new()
                     };
 
-                    // Apply the restored overlay to the in-memory models.
-                    *models.lock().unwrap_or_else(|e| e.into_inner()) = dynamic.clone();
+                    // Apply the restored overlay to the in-memory models
+                    // through the publish gate (radius.ts:36-48): a stale
+                    // generation or cancelled signal skips the update and
+                    // aborts the rest of the refresh.
+                    if stored.is_some() {
+                        let models_for_update = models.clone();
+                        let applied = context
+                            .publish
+                            .publish(ModelsPublication {
+                                persist: None,
+                                update: Some(Box::new(move || {
+                                    *models_for_update.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        dynamic;
+                                })),
+                            })
+                            .await?;
+                        if !applied {
+                            return Ok(());
+                        }
+                    }
 
                     // Import catalogs cached by the pre-ModelsStore Radius
                     // implementation (radius.ts:42-49).
@@ -572,5 +590,60 @@ mod tests {
         // The restored list is retained despite the failed fetch.
         let ids: Vec<String> = provider.get_models().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, ["radius-large".to_owned()]);
+    }
+
+    /// Phase-1 restore goes through the publish gate (radius.ts:38-47): with
+    /// a stale generation the update is skipped, the stored catalog does not
+    /// overwrite the in-memory list, and the refresh returns early.
+    #[tokio::test]
+    async fn phase1_restore_skips_update_on_stale_generation() {
+        use crate::models::{PublishHandle, PublishShared};
+        let store: Arc<dyn crate::models_store::ModelsStore> =
+            Arc::new(crate::models_store::InMemoryModelsStore::new());
+        store
+            .write(
+                "radius",
+                crate::models_store::ModelsStoreEntry {
+                    models: vec![radius_model("stored")],
+                    last_modified: None,
+                    checked_at: Some(now_millis()),
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("write");
+        let provider = radius_provider_with(RadiusProviderOptions {
+            gateway: Some("http://127.0.0.1:1".to_owned()), // unreachable: must not be fetched
+            ..Default::default()
+        });
+        let stored = store.read("radius", None).await.expect("read");
+        let signal = tokio_util::sync::CancellationToken::new();
+        // Context captured generation 1; a newer refresh bumped it to 2.
+        let shared = std::sync::Arc::new(PublishShared {
+            provider_id: "radius".to_owned(),
+            generation: 1,
+            signal: signal.clone(),
+            store: store.clone(),
+            chain: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            refresh_generations: std::sync::Arc::new(std::sync::RwLock::new(
+                [("radius".to_owned(), 2u64)].into(),
+            )),
+        });
+        let context = crate::models::RefreshModelsContext {
+            credential: Some(oauth_credential("access-token")),
+            stored,
+            publish: PublishHandle { shared },
+            allow_network: false,
+            force: None,
+            signal,
+        };
+        provider
+            .refresh_models(context)
+            .expect("refresh")
+            .await
+            .expect("refresh");
+        // The stale phase-1 restore must not overwrite the in-memory list.
+        assert!(provider.get_models().is_empty());
     }
 }
