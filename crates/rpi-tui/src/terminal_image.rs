@@ -4,7 +4,10 @@
 //! Port of `packages/tui/src/terminal-image.ts` @ pi 0.82.1 (2efa728), with
 //! `detect_capabilities_with` tracking the 4181f66 revision (fa07e7bd9:
 //! Windows consoles fall back to truecolor when no terminal is positively
-//! identified).
+//! identified). The Kitty image metadata registry
+//! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
+//! `crop_kitty_image_line`) and the `render_image` registration call also
+//! track the 4181f66 revision (T30).
 //!
 //! Intentional differences:
 //! - `probeTmuxHyperlinks` runs `tmux display-message` through `try_wait`
@@ -20,8 +23,12 @@
 //!   `None` instead of a best-effort parse.
 //! - `encodeITerm2` models upstream's `number | string` `width`/`height`
 //!   parameters as `Option<String>`; callers format numbers themselves.
+//! - The registry stores no `transmissionGeneration` and there is no
+//!   `getKittyImagePlacement` — both are only needed by the fullscreen
+//!   renderer (T31).
 
 use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -495,6 +502,145 @@ pub struct ImageCellSize {
     pub rows: u32,
 }
 
+/// `KittyImageMetadata` (terminal-image.ts:274-279 @ 4181f66).
+/// `RegisteredKittyImageMetadata.transmissionGeneration` is not ported (T31).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KittyImageMetadata {
+    pub image_id: u32,
+    pub columns: u32,
+    pub rows: u32,
+    pub width_px: f64,
+    pub height_px: f64,
+}
+
+/// Metadata registry (terminal-image.ts:295): insertion-ordered map capped at
+/// 1000 entries. Re-registering an id refreshes its position (`delete` + `set`
+/// upstream); the oldest entry is evicted once the cap is exceeded. The queue
+/// mirrors the JS `Map` first-key eviction exactly.
+struct KittyImageMetadataRegistry {
+    map: HashMap<u32, KittyImageMetadata>,
+    order: VecDeque<u32>,
+}
+
+impl KittyImageMetadataRegistry {
+    fn new() -> Self {
+        KittyImageMetadataRegistry {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+}
+
+const KITTY_IMAGE_METADATA_LIMIT: usize = 1000;
+
+static KITTY_IMAGE_METADATA: Mutex<Option<KittyImageMetadataRegistry>> = Mutex::new(None);
+
+fn lock_kitty_image_metadata() -> std::sync::MutexGuard<'static, Option<KittyImageMetadataRegistry>>
+{
+    KITTY_IMAGE_METADATA
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Clear the registry between tests (it is process-global).
+#[cfg(test)]
+fn reset_kitty_image_metadata() {
+    *lock_kitty_image_metadata() = None;
+}
+
+/// `registerKittyImageMetadata` (terminal-image.ts:298-306 @ 4181f66).
+pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
+    let mut guard = lock_kitty_image_metadata();
+    let registry = guard.get_or_insert_with(KittyImageMetadataRegistry::new);
+    if registry.map.remove(&metadata.image_id).is_some() {
+        registry.order.retain(|&id| id != metadata.image_id);
+    }
+    registry.map.insert(metadata.image_id, metadata);
+    registry.order.push_back(metadata.image_id);
+    if registry.map.len() > KITTY_IMAGE_METADATA_LIMIT {
+        if let Some(oldest_image_id) = registry.order.pop_front() {
+            registry.map.remove(&oldest_image_id);
+        }
+    }
+}
+
+/// Locate the first `\x1b_G<controls>;` command in a line (upstream regex
+/// `/\x1b_G([^;]*);/`): returns `(match_index, controls, match_len)`.
+fn find_kitty_command(line: &str) -> Option<(usize, &str, usize)> {
+    let match_index = line.find(KITTY_PREFIX)?;
+    let controls_start = match_index + KITTY_PREFIX.len();
+    let semicolon = line[controls_start..].find(';')? + controls_start;
+    Some((
+        match_index,
+        &line[controls_start..semicolon],
+        semicolon + 1 - match_index,
+    ))
+}
+
+/// `getRegisteredKittyImageMetadata` (terminal-image.ts:308-313 @ 4181f66).
+fn get_registered_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    let (_, controls, _) = find_kitty_command(line)?;
+    // Upstream `/(?:^|,)i=(\d+)(?:,|$)/`: a whole `,`-separated control of
+    // ASCII digits after `i=`.
+    let image_id = controls
+        .split(',')
+        .filter_map(|control| control.strip_prefix("i="))
+        .find(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<u32>().ok())?;
+    let guard = lock_kitty_image_metadata();
+    guard.as_ref()?.map.get(&image_id).copied()
+}
+
+/// `getKittyImageMetadata` (terminal-image.ts:315-325 @ 4181f66).
+pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    get_registered_kitty_image_metadata(line)
+}
+
+/// `cropKittyImageLine` (terminal-image.ts:382-394 @ 4181f66): rewrite the
+/// `y=`/`h=`/`r=` control keys so the terminal shows only rows
+/// `hidden_rows .. hidden_rows + visible_rows` of the placed image.
+pub fn crop_kitty_image_line(line: &str, hidden_rows: u32, visible_rows: u32) -> String {
+    let metadata = get_kitty_image_metadata(line);
+    let found = find_kitty_command(line);
+    let (Some(metadata), Some((match_index, controls, match_len))) = (metadata, found) else {
+        return line.to_string();
+    };
+    // The upstream `hiddenRows < 0` guard cannot occur with `u32`; the rest
+    // mirrors terminal-image.ts:385.
+    if hidden_rows >= metadata.rows || visible_rows == 0 {
+        return line.to_string();
+    }
+    let cropped_rows = visible_rows.min(metadata.rows - hidden_rows);
+    if hidden_rows == 0 && cropped_rows == metadata.rows {
+        return line.to_string();
+    }
+    // f64 arithmetic mirrors upstream `Math.floor`/`Math.ceil` exactly.
+    let height_px = metadata.height_px;
+    let rows = f64::from(metadata.rows);
+    let source_y = (height_px * f64::from(hidden_rows) / rows).floor();
+    let source_end = (height_px * f64::from(hidden_rows + cropped_rows) / rows).ceil();
+    let source_height = (height_px.min(source_end) - source_y).max(1.0);
+    // Drop existing `y=`/`h=`/`r=` controls (upstream `/^[yhr]=/`).
+    let mut cropped_controls: Vec<String> = controls
+        .split(',')
+        .filter(|control| {
+            !control.starts_with("y=") && !control.starts_with("h=") && !control.starts_with("r=")
+        })
+        .map(str::to_string)
+        .collect();
+    // Rust's `{}` formats integral f64 without a decimal point, matching the
+    // JS template-string interpolation upstream.
+    cropped_controls.push(format!("y={source_y}"));
+    cropped_controls.push(format!("h={source_height}"));
+    cropped_controls.push(format!("r={cropped_rows}"));
+    format!(
+        "{}\x1b_G{};{}",
+        &line[..match_index],
+        cropped_controls.join(","),
+        &line[match_index + match_len..]
+    )
+}
+
 /// `calculateImageCellSize` (terminal-image.ts:257-281). Mirror upstream's
 /// f64 arithmetic exactly so results match `Math.floor`/`Math.ceil` behavior.
 pub fn calculate_image_cell_size(
@@ -692,7 +838,8 @@ pub struct RenderImageResult {
     pub image_id: Option<u32>,
 }
 
-/// `renderImage` (terminal-image.ts:432-466).
+/// `renderImage` (terminal-image.ts:571-614 @ 4181f66; the pre-registry
+/// revision was :432-466).
 pub fn render_image(
     base64_data: &str,
     image_dimensions: ImageDimensions,
@@ -713,6 +860,18 @@ pub fn render_image(
     );
 
     if caps.images == Some(ImageProtocol::Kitty) {
+        // `registerKittyImageMetadata(...)` (terminal-image.ts:586-594 @
+        // 4181f66): registration happens before encoding, only with an
+        // explicit image id.
+        if let Some(image_id) = options.image_id {
+            register_kitty_image_metadata(KittyImageMetadata {
+                image_id,
+                columns: size.columns,
+                rows: size.rows,
+                width_px: image_dimensions.width_px,
+                height_px: image_dimensions.height_px,
+            });
+        }
         let sequence = encode_kitty(
             base64_data,
             &KittyEncodeOptions {
@@ -1814,6 +1973,167 @@ mod tests {
                 }
             );
             set_cell_dimensions(CellDimensions::default());
+        });
+    }
+
+    // ── Kitty image metadata registry (terminal-image.ts:295-394 @ 4181f66) ──
+
+    /// Build a single-command Kitty image line carrying `i=<id>`.
+    fn kitty_line(image_id: u32) -> String {
+        format!("\x1b_Ga=T,f=100,i={image_id},c=10,r=34;QUJD\x1b\\")
+    }
+
+    fn metadata(image_id: u32) -> KittyImageMetadata {
+        KittyImageMetadata {
+            image_id,
+            columns: 10,
+            rows: 34,
+            width_px: 90.0,
+            height_px: 612.0,
+        }
+    }
+
+    #[test]
+    fn test_register_and_get_kitty_image_metadata_round_trip() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        assert_eq!(
+            get_kitty_image_metadata(&kitty_line(id)),
+            Some(metadata(id))
+        );
+    }
+
+    #[test]
+    fn test_get_kitty_image_metadata_returns_none_without_command_or_id() {
+        assert_eq!(get_kitty_image_metadata("plain text"), None);
+        assert_eq!(get_kitty_image_metadata("\x1b_Ga=T,f=100;QUJD\x1b\\"), None);
+        // `ai=5` must not parse as `i=5` (upstream `(?:^|,)i=` boundary).
+        assert_eq!(get_kitty_image_metadata("\x1b_Gai=5;QUJD\x1b\\"), None);
+        // Unknown id: well-formed command, nothing registered.
+        assert_eq!(get_kitty_image_metadata(&kitty_line(0xffff_ff00)), None);
+    }
+
+    #[test]
+    fn test_registry_evicts_oldest_beyond_1000_entries() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_kitty_image_metadata();
+        let base = 0x7000_0000u32;
+        for offset in 0..=1000u32 {
+            register_kitty_image_metadata(metadata(base + offset));
+        }
+        let guard = lock_kitty_image_metadata();
+        let registry = guard.as_ref().unwrap_or_else(|| unreachable!());
+        assert_eq!(registry.map.len(), KITTY_IMAGE_METADATA_LIMIT);
+        assert!(!registry.map.contains_key(&base));
+        assert!(registry.map.contains_key(&(base + 1)));
+        assert!(registry.map.contains_key(&(base + 1000)));
+    }
+
+    #[test]
+    fn test_registry_re_registration_refreshes_eviction_order() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_kitty_image_metadata();
+        let base = 0x6000_0000u32;
+        register_kitty_image_metadata(metadata(base));
+        for offset in 1..1000u32 {
+            register_kitty_image_metadata(metadata(base + offset));
+        }
+        // Re-registering `base` moves it to the newest position.
+        register_kitty_image_metadata(metadata(base));
+        // One more entry pushes the registry over the cap: the oldest entry
+        // (`base + 1`) is evicted, not the refreshed `base`.
+        register_kitty_image_metadata(metadata(base + 1000));
+        let guard = lock_kitty_image_metadata();
+        let registry = guard.as_ref().unwrap_or_else(|| unreachable!());
+        assert!(registry.map.contains_key(&base));
+        assert!(!registry.map.contains_key(&(base + 1)));
+        assert!(registry.map.contains_key(&(base + 1000)));
+    }
+
+    #[test]
+    fn test_crop_kitty_image_line_rewrites_yhr_controls() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        // hidden 10, visible 5 of 34 rows at 612px: sourceY = floor(612*10/34)
+        // = 180, sourceEnd = ceil(612*15/34) = 270, sourceHeight = 90.
+        let cropped = crop_kitty_image_line(&kitty_line(id), 10, 5);
+        assert_eq!(
+            cropped,
+            format!("\x1b_Ga=T,f=100,i={id},c=10,y=180,h=90,r=5;QUJD\x1b\\")
+        );
+    }
+
+    #[test]
+    fn test_crop_kitty_image_line_preserves_prefix_and_suffix() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        let line = format!("pre\x1b_Gi={id};QUJD\x1b\\post");
+        let cropped = crop_kitty_image_line(&line, 17, 17);
+        assert_eq!(
+            cropped,
+            format!("pre\x1b_Gi={id},y=306,h=306,r=17;QUJD\x1b\\post")
+        );
+    }
+
+    #[test]
+    fn test_crop_kitty_image_line_noop_cases() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        let line = kitty_line(id);
+        // Full image: no crop needed.
+        assert_eq!(crop_kitty_image_line(&line, 0, 34), line);
+        // visible_rows larger than the remainder is clamped to the full image.
+        assert_eq!(crop_kitty_image_line(&line, 0, 100), line);
+        // hidden_rows out of range / zero visible rows: unchanged.
+        assert_eq!(crop_kitty_image_line(&line, 34, 5), line);
+        assert_eq!(crop_kitty_image_line(&line, 10, 0), line);
+        // No metadata / no command: unchanged.
+        let unknown = kitty_line(0xffff_ff01);
+        assert_eq!(crop_kitty_image_line(&unknown, 1, 1), unknown);
+        assert_eq!(crop_kitty_image_line("plain", 1, 1), "plain");
+    }
+
+    #[test]
+    fn test_render_image_registers_kitty_metadata() {
+        with_globals(|| {
+            set_capabilities(KITTY_CAPS);
+            let id = allocate_image_id();
+            // 1x1 white PNG pixel.
+            let png = b64(&[
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1f, 0x15, 0xc4, 0x89,
+            ]);
+            let result = render_image(
+                &png,
+                ImageDimensions {
+                    width_px: 1.0,
+                    height_px: 1.0,
+                },
+                &ImageRenderOptions {
+                    image_id: Some(id),
+                    ..Default::default()
+                },
+            );
+            let result = result.unwrap_or_else(|| unreachable!());
+            // 1x1 px at the default 80-column cap scales up to 80x40 cells
+            // (calculate_image_cell_size, terminal-image.ts:396-420).
+            let expected = KittyImageMetadata {
+                image_id: id,
+                columns: 80,
+                rows: result.rows,
+                width_px: 1.0,
+                height_px: 1.0,
+            };
+            assert_eq!(
+                get_kitty_image_metadata(&format!("\x1b_Gi={id};\x1b\\")),
+                Some(expected)
+            );
+            reset_capabilities_cache();
         });
     }
 }

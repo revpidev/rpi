@@ -109,6 +109,11 @@
 //!   panics with the upstream error message (upstream throws an uncaught
 //!   Error). Redraw/crash log write failures are ignored (upstream would
 //!   throw).
+//! - T30 extension of the frozen component contract: `Component` gains two
+//!   defaulted methods — `layout_node` (replaces upstream's `LAYOUT_NODE`
+//!   symbol protocol, layout-node.ts:48-51) and `as_scroll_view` (scroll
+//!   dispatch after hit-testing, same precedent as `as_focusable`). Both
+//!   default to `None`, so existing components are unaffected.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -116,6 +121,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
+use crate::components::scroll_view::ScrollView;
+use crate::layout_node::LayoutNode;
 use crate::terminal::Terminal;
 use crate::terminal_colors::{RgbColor, TerminalColorScheme};
 use crate::terminal_image::is_image_line;
@@ -185,6 +192,24 @@ pub trait Component: Send {
     /// (T17 extension to the frozen contract; components with expansion state
     /// override this and forward to their inherent `set_expanded`.)
     fn set_expanded(&mut self, _expanded: bool) {}
+
+    /// Layout node for the T30 layout engine: replaces upstream's
+    /// `LAYOUT_NODE` symbol protocol (`getLayoutNode`, layout-node.ts:48-51).
+    /// Stack/scroll containers override this; the returned node borrows the
+    /// component, so the engine clones what it needs and releases the
+    /// component lock before recursing into children. Default: not a layout
+    /// container. (T30 extension to the frozen contract.)
+    fn layout_node(&self) -> Option<LayoutNode<'_>> {
+        None
+    }
+
+    /// Downcast-style accessor for scroll views, same precedent as
+    /// [`Component::as_focusable`]: the layout engine (T31) calls scroll
+    /// methods through this after hit-testing. Default: not a scroll view.
+    /// (T30 extension to the frozen contract.)
+    fn as_scroll_view(&self) -> Option<&ScrollView> {
+        None
+    }
 }
 
 /// Components that can receive focus and display a hardware cursor.

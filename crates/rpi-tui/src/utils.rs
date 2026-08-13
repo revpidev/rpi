@@ -1,4 +1,5 @@
-//! Port of `packages/tui/src/utils.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/utils.ts` @ pi 0.82.1 (2efa728), with
+//! `get_grapheme_cell_range` tracking the 4181f66 revision.
 //!
 //! Terminal text utilities: visible width (Unicode EAW + ANSI aware), wrapping
 //! with ANSI/OSC-8 preservation, truncation, column slicing and overlay segment
@@ -1739,6 +1740,45 @@ pub fn extract_segments(
         after,
         after_width,
     }
+}
+
+/// Terminal-cell range occupied by a grapheme (upstream `GraphemeCellRange`,
+/// utils.ts:314-317 @ 4181f66).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphemeCellRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Return the terminal-cell range occupied by the grapheme at a visible column
+/// (`getGraphemeCellRange`, utils.ts:319-341 @ 4181f66). ANSI sequences are
+/// skipped; unlike `getOsc8LinkAtColumn` upstream does NOT special-case tabs
+/// here, so neither do we.
+pub fn get_grapheme_cell_range(line: &str, column: usize) -> Option<GraphemeCellRange> {
+    let mut current_col = 0usize;
+    let mut i = 0;
+    while i < line.len() {
+        if let Some(ansi) = extract_ansi_code(line, i) {
+            i += ansi.length;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += 1;
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            let width = grapheme_width(segment);
+            if width > 0 && column >= current_col && column < current_col + width {
+                return Some(GraphemeCellRange {
+                    start: current_col,
+                    end: current_col + width,
+                });
+            }
+            current_col += width;
+        }
+        i = text_end;
+    }
+    None
 }
 
 // @generated — DO NOT EDIT BY HAND.
@@ -5465,5 +5505,57 @@ mod tests {
         for sample in samples {
             assert_eq!(visible_width(sample), 2, "Expected {sample} to be width 2");
         }
+    }
+
+    // ---- getGraphemeCellRange (utils.ts:319-341 @ 4181f66) ----
+
+    #[test]
+    fn grapheme_cell_range_reports_narrow_graphemes() {
+        let range = get_grapheme_cell_range("hello", 2);
+        assert_eq!(range, Some(GraphemeCellRange { start: 2, end: 3 }));
+    }
+
+    #[test]
+    fn grapheme_cell_range_spans_wide_grapheme_cells() {
+        // "a界b": 界 occupies columns 1..3; both columns 1 and 2 map to it.
+        let line = "a界b";
+        assert_eq!(
+            get_grapheme_cell_range(line, 0),
+            Some(GraphemeCellRange { start: 0, end: 1 })
+        );
+        assert_eq!(
+            get_grapheme_cell_range(line, 1),
+            Some(GraphemeCellRange { start: 1, end: 3 })
+        );
+        assert_eq!(
+            get_grapheme_cell_range(line, 2),
+            Some(GraphemeCellRange { start: 1, end: 3 })
+        );
+        assert_eq!(
+            get_grapheme_cell_range(line, 3),
+            Some(GraphemeCellRange { start: 3, end: 4 })
+        );
+    }
+
+    #[test]
+    fn grapheme_cell_range_skips_ansi_sequences() {
+        // ANSI styling takes no cells; "ab" occupies columns 0..2.
+        let line = "\x1b[31ma\x1b[0mb";
+        assert_eq!(
+            get_grapheme_cell_range(line, 0),
+            Some(GraphemeCellRange { start: 0, end: 1 })
+        );
+        assert_eq!(
+            get_grapheme_cell_range(line, 1),
+            Some(GraphemeCellRange { start: 1, end: 2 })
+        );
+        assert_eq!(get_grapheme_cell_range(line, 2), None);
+    }
+
+    #[test]
+    fn grapheme_cell_range_returns_none_out_of_bounds() {
+        assert_eq!(get_grapheme_cell_range("abc", 3), None);
+        assert_eq!(get_grapheme_cell_range("abc", 100), None);
+        assert_eq!(get_grapheme_cell_range("", 0), None);
     }
 }
