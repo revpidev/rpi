@@ -135,6 +135,9 @@ pub struct SettingsSelectorOptions {
     pub default_project_trust: DefaultProjectTrust,
     pub clear_on_shrink: bool,
     pub show_terminal_progress: bool,
+    pub tui_mode: rpi_tui::tui::TuiMode,
+    pub fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput,
+    pub fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode,
     pub warnings: WarningSettings,
 }
 
@@ -171,6 +174,9 @@ pub enum SettingsChange {
     DefaultProjectTrust(DefaultProjectTrust),
     ClearOnShrink(bool),
     ShowTerminalProgress(bool),
+    TuiMode(rpi_tui::tui::TuiMode),
+    FullscreenExitOutput(crate::core::settings_manager::FullscreenExitOutput),
+    FullscreenScrollbar(rpi_tui::components::scroll_view::ScrollbarMode),
     Warnings(WarningSettings),
 }
 
@@ -236,6 +242,63 @@ fn parse_double_escape(value: &str) -> DoubleEscapeAction {
         "tree" => DoubleEscapeAction::Tree,
         "fork" => DoubleEscapeAction::Fork,
         _ => DoubleEscapeAction::None,
+    }
+}
+
+/// `newValue as TuiMode` (settings-selector.ts:869 @ 5446cd754).
+fn tui_mode_to_str(mode: rpi_tui::tui::TuiMode) -> &'static str {
+    match mode {
+        rpi_tui::tui::TuiMode::Regular => "regular",
+        rpi_tui::tui::TuiMode::Fullscreen => "fullscreen",
+    }
+}
+
+fn parse_tui_mode(value: &str) -> rpi_tui::tui::TuiMode {
+    if value == "fullscreen" {
+        rpi_tui::tui::TuiMode::Fullscreen
+    } else {
+        rpi_tui::tui::TuiMode::Regular
+    }
+}
+
+/// FullscreenExitOutput ↔ "transcript" | "resume-hint"
+/// (settings-manager.ts:1140-1142 @ 5446cd754).
+fn fullscreen_exit_output_to_str(
+    output: crate::core::settings_manager::FullscreenExitOutput,
+) -> &'static str {
+    match output {
+        crate::core::settings_manager::FullscreenExitOutput::Transcript => "transcript",
+        crate::core::settings_manager::FullscreenExitOutput::ResumeHint => "resume-hint",
+    }
+}
+
+fn parse_fullscreen_exit_output(
+    value: &str,
+) -> crate::core::settings_manager::FullscreenExitOutput {
+    if value == "resume-hint" {
+        crate::core::settings_manager::FullscreenExitOutput::ResumeHint
+    } else {
+        crate::core::settings_manager::FullscreenExitOutput::Transcript
+    }
+}
+
+/// FullscreenScrollbar ↔ "auto" | "always" | "hidden"
+/// (settings-manager.ts:1150-1152 @ 6129a353b).
+fn fullscreen_scrollbar_to_str(
+    mode: rpi_tui::components::scroll_view::ScrollbarMode,
+) -> &'static str {
+    match mode {
+        rpi_tui::components::scroll_view::ScrollbarMode::Auto => "auto",
+        rpi_tui::components::scroll_view::ScrollbarMode::Always => "always",
+        rpi_tui::components::scroll_view::ScrollbarMode::Hidden => "hidden",
+    }
+}
+
+fn parse_fullscreen_scrollbar(value: &str) -> rpi_tui::components::scroll_view::ScrollbarMode {
+    match value {
+        "always" => rpi_tui::components::scroll_view::ScrollbarMode::Always,
+        "hidden" => rpi_tui::components::scroll_view::ScrollbarMode::Hidden,
+        _ => rpi_tui::components::scroll_view::ScrollbarMode::Auto,
     }
 }
 
@@ -1283,6 +1346,49 @@ impl SettingsSelectorComponent {
                     })
                 }),
             },
+            // T32: tui-mode, fullscreen-exit-output, fullscreen-scrollbar
+            // (settings-selector.ts:636-657 @ 5446cd754/6129a353b).
+            SettingItem {
+                id: "tui-mode".to_string(),
+                label: "TUI mode".to_string(),
+                description: Some(
+                    "Interface layout; fullscreen mode is experimental".to_string(),
+                ),
+                current_value: tui_mode_to_str(options.tui_mode).to_string(),
+                values: Some(vec!["regular".to_string(), "fullscreen".to_string()]),
+                submenu: None,
+            },
+            SettingItem {
+                id: "fullscreen-exit-output".to_string(),
+                label: "Fullscreen exit output".to_string(),
+                description: Some(
+                    "Print the transcript or only a session resume hint when exiting fullscreen mode"
+                        .to_string(),
+                ),
+                current_value: fullscreen_exit_output_to_str(options.fullscreen_exit_output)
+                    .to_string(),
+                values: Some(vec![
+                    "transcript".to_string(),
+                    "resume-hint".to_string(),
+                ]),
+                submenu: None,
+            },
+            SettingItem {
+                id: "fullscreen-scrollbar".to_string(),
+                label: "Fullscreen scrollbar".to_string(),
+                description: Some(
+                    "Scrollbar behavior in fullscreen mode; has no effect in regular mode"
+                        .to_string(),
+                ),
+                current_value: fullscreen_scrollbar_to_str(options.fullscreen_scrollbar)
+                    .to_string(),
+                values: Some(vec![
+                    "auto".to_string(),
+                    "always".to_string(),
+                    "hidden".to_string(),
+                ]),
+                submenu: None,
+            },
             SettingItem {
                 id: "theme".to_string(),
                 label: "Theme".to_string(),
@@ -1595,6 +1701,13 @@ impl SettingsSelectorComponent {
                 }
                 "clear-on-shrink" => SettingsChange::ClearOnShrink(new_value == "true"),
                 "terminal-progress" => SettingsChange::ShowTerminalProgress(new_value == "true"),
+                "tui-mode" => SettingsChange::TuiMode(parse_tui_mode(new_value)),
+                "fullscreen-exit-output" => {
+                    SettingsChange::FullscreenExitOutput(parse_fullscreen_exit_output(new_value))
+                }
+                "fullscreen-scrollbar" => {
+                    SettingsChange::FullscreenScrollbar(parse_fullscreen_scrollbar(new_value))
+                }
                 "theme" => SettingsChange::Theme(new_value.to_string()),
                 _ => return,
             };
@@ -1711,6 +1824,9 @@ mod tests {
             default_project_trust: DefaultProjectTrust::Ask,
             clear_on_shrink: true,
             show_terminal_progress: false,
+            tui_mode: rpi_tui::tui::TuiMode::Regular,
+            fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput::Transcript,
+            fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode::Auto,
             warnings: WarningSettings {
                 anthropic_extra_usage: Some(true),
             },
@@ -1800,10 +1916,10 @@ mod tests {
         assert!(joined.contains("false"));
         assert!(joined.contains("Autocomplete max items"));
         assert!(joined.contains("Enter/Space to change · Esc to cancel"));
-        // Scroll hint shows the item count (26 items without image rows, 28
+        // Scroll hint shows the item count (29 items without image rows, 31
         // with them; the 10-row window always scrolls).
         let supports_images = get_capabilities().images.is_some();
-        let item_count = if supports_images { 28 } else { 26 };
+        let item_count = if supports_images { 31 } else { 29 };
         assert!(lines
             .iter()
             .any(|l| l.contains(&format!("(1/{item_count})"))));
@@ -2016,11 +2132,12 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Theme item index: 27 with image rows, 25 without.
+        // Theme item index: 30 with image rows, 28 without (3 T32 items
+        // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            27
+            30
         } else {
-            25
+            28
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2066,11 +2183,12 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Theme item index: 27 with image rows, 25 without.
+        // Theme item index: 30 with image rows, 28 without (3 T32 items
+        // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            27
+            30
         } else {
-            25
+            28
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2103,5 +2221,25 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| *e == SettingsChange::Theme("light/dark".to_string())));
+    }
+
+    #[test]
+    fn t32_items_appear_with_correct_count() {
+        install_keybindings();
+        let (_received, on_change) = changes();
+        let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
+        let component = SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
+
+        // The full item count is now 29 (no images) or 31 (with images),
+        // up from 26/28 — the 3 T32 items.
+        let supports_images = get_capabilities().images.is_some();
+        let expected = if supports_images { 31 } else { 29 };
+        let lines = render_plain(&component, 100);
+        let joined = lines.join("\n");
+        // The scroll indicator shows the total count.
+        assert!(
+            joined.contains(&format!("{expected}")),
+            "total item count {expected} visible in scroll indicator"
+        );
     }
 }

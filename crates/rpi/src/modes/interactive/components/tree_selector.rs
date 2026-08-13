@@ -47,7 +47,7 @@ use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::{slice_by_column, truncate_to_width, visible_width, wrap_text_with_ansi};
 use serde_json::{Map, Value};
 
@@ -2255,7 +2255,7 @@ pub struct TreeSelectorComponent {
     /// Retained for the integration layer (render scheduling); upstream
     /// passes `this.ui` at the call site instead.
     #[allow(dead_code)]
-    tui: TuiMainScreen,
+    tui: TuiHandle,
 
     /// `onLabelChangeCallback` (tree-selector.ts:1333).
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
@@ -2294,7 +2294,7 @@ impl TreeSelectorComponent {
         leaf_id: Option<String>,
         terminal_rows: u16,
         theme: Arc<Theme>,
-        tui: TuiMainScreen,
+        tui: TuiHandle,
         on_select: Box<dyn FnMut(&str) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         on_label_change: Option<Box<dyn FnMut(&str, Option<&str>) + Send>>,
@@ -2520,6 +2520,7 @@ mod tests {
         AssistantContent as Ac, ImageContent, TextContent as Tc, ToolCall,
         ToolResultContent as Trc, UserContentBlock, UserRole,
     };
+    use rpi_tui::tui_main_screen::TuiMainScreen;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -2747,9 +2748,9 @@ mod tests {
         leaf_id: Option<&str>,
         on_label_change: Option<Box<dyn FnMut(&str, Option<&str>) + Send>>,
     ) -> TreeSelectorComponent {
-        let tui = TuiMainScreen::new(Box::new(
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
             crate::modes::interactive::test_support::TestTerminal::new(),
-        ));
+        )));
         TreeSelectorComponent::new(
             tree,
             leaf_id.map(str::to_owned),
@@ -3874,9 +3875,9 @@ mod tests {
         install_global_keybindings();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = calls.clone();
-        let tui = TuiMainScreen::new(Box::new(
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
             crate::modes::interactive::test_support::TestTerminal::new(),
-        ));
+        )));
         let _component = TreeSelectorComponent::new(
             vec![],
             None,

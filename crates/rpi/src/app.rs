@@ -1362,6 +1362,13 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         AppMode::Interactive => {
             // Interactive mode (T12): the TUI owns the terminal; the runtime
             // is moved in and disposed on exit (interactive-mode.ts:832-920).
+            // Renderer selection (interactive-mode.ts:530 @ f074efd92):
+            // CLI `--tui-mode` > settings `getTuiMode()` > default regular.
+            let tui_mode = parsed_owned.tui_mode.unwrap_or_else(|| {
+                runtime
+                    .session()
+                    .settings_manager(|settings| settings.get_tui_mode())
+            });
             run_interactive_mode(
                 runtime,
                 crate::modes::interactive::InteractiveModeOptions {
@@ -1370,6 +1377,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     initial_images,
                     initial_messages: parsed_owned.messages,
                     verbose: parsed_owned.verbose,
+                    tui_mode,
                 },
             )
             .await

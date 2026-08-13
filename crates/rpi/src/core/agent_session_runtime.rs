@@ -583,9 +583,7 @@ impl AgentSessionRuntime {
             &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         );
         if !resolved_path.exists() {
-            return Err(RpiError::Session(
-                SessionImportFileNotFoundError(resolved_path).to_string(),
-            ));
+            return Err(SessionImportFileNotFoundError(resolved_path).into());
         }
 
         let session_dir = {

@@ -263,16 +263,47 @@ impl TuiMainScreen {
         show_hardware_cursor: Option<bool>,
         log_directory: Option<PathBuf>,
     ) -> TuiMainScreen {
-        let schedule = Arc::new(Mutex::new(RenderSchedule {
-            requested: false,
-            deadline: None,
-            last_render_at: None,
-        }));
         let size_cache = TerminalSizeCache {
             rows: Arc::new(AtomicU16::new(terminal.rows())),
             columns: Arc::new(AtomicU16::new(terminal.columns())),
         };
         let terminal: SharedTerminal = Arc::new(Mutex::new(terminal));
+        Self::build(terminal, show_hardware_cursor, log_directory, size_cache)
+    }
+
+    /// T32 variant of [`TuiMainScreen::with_options`] that takes an existing
+    /// [`SharedTerminal`] instead of a `Box<dyn Terminal>`, so `switch_tui_mode`
+    /// (interactive-mode.ts:808-814 @ b103937d3) can reuse the same terminal
+    /// across renderer swaps. The size cache is seeded from the terminal's
+    /// current dimensions.
+    pub fn with_shared_terminal(
+        terminal: SharedTerminal,
+        show_hardware_cursor: Option<bool>,
+        log_directory: Option<PathBuf>,
+    ) -> TuiMainScreen {
+        let (rows, columns) = {
+            let t = lock_shared(&terminal);
+            (t.rows(), t.columns())
+        };
+        let size_cache = TerminalSizeCache {
+            rows: Arc::new(AtomicU16::new(rows)),
+            columns: Arc::new(AtomicU16::new(columns)),
+        };
+        Self::build(terminal, show_hardware_cursor, log_directory, size_cache)
+    }
+
+    /// Shared body of [`with_options`] / [`with_shared_terminal`].
+    fn build(
+        terminal: SharedTerminal,
+        show_hardware_cursor: Option<bool>,
+        log_directory: Option<PathBuf>,
+        size_cache: TerminalSizeCache,
+    ) -> TuiMainScreen {
+        let schedule = Arc::new(Mutex::new(RenderSchedule {
+            requested: false,
+            deadline: None,
+            last_render_at: None,
+        }));
         let base = TuiBase::new(
             Arc::clone(&terminal),
             show_hardware_cursor,
@@ -421,6 +452,14 @@ impl TuiMainScreen {
         self.try_read(|inner| inner.children.len()).unwrap_or(0)
     }
 
+    /// Rust addition (T32 `switch_tui_mode`): snapshot the child list for
+    /// re-mounting after a renderer swap (interactive-mode.ts:793 @ b103937d3).
+    /// Empty on lock contention.
+    pub fn children(&self) -> Vec<SharedComponent> {
+        self.try_read(|inner| inner.children.clone())
+            .unwrap_or_default()
+    }
+
     /// Upstream `clear` (tui.ts:270).
     pub fn clear(&self) {
         self.run_or_queue(|inner| inner.children.clear());
@@ -503,6 +542,16 @@ impl TuiMainScreen {
         self.run_or_queue(move |inner| inner.on_debug = on_debug);
     }
 
+    /// Take the debug callback so `switch_tui_mode` can move it to the new
+    /// renderer (interactive-mode.ts:798, 816). `None` on lock contention
+    /// (same fallback discipline as [`TuiMainScreen::children`]).
+    pub fn take_on_debug(&self) -> Option<Box<dyn FnMut() + Send>> {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|mut inner| inner.on_debug.take())
+    }
+
     /// Upstream `onTerminalColorSchemeChange` (tui.ts:662). Returns an id for
     /// [`TuiMainScreen::remove_terminal_color_scheme_listener`].
     pub fn on_terminal_color_scheme_change(&self, listener: TerminalColorSchemeListener) -> u64 {
@@ -524,6 +573,14 @@ impl TuiMainScreen {
     /// Upstream `setTerminalColorSchemeNotifications` (tui.ts:669).
     pub fn set_terminal_color_scheme_notifications(&self, enabled: bool) {
         self.run_or_queue(move |inner| inner.set_terminal_color_scheme_notifications(enabled));
+    }
+
+    /// Number of registered terminal color-scheme listeners (observability
+    /// for the `switch_tui_mode` theme-listener rebind,
+    /// interactive-mode.ts:827).
+    pub fn terminal_color_scheme_listener_count(&self) -> usize {
+        self.try_read(|inner| inner.terminal_color_scheme_listeners.len())
+            .unwrap_or(0)
     }
 
     // --- terminal introspection queries -----------------------------------

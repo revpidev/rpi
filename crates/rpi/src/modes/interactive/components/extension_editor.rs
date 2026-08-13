@@ -26,7 +26,7 @@ use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
 use rpi_tui::components::select_list::SelectListTheme;
 use rpi_tui::components::text::Text;
 use rpi_tui::tui::{Component, Focusable};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 
 use crate::core::themes::Theme;
 
@@ -55,7 +55,7 @@ impl ExtensionEditorComponent {
     /// [`EditorOptions::default`]; `prefill` is set via `editor.setText`
     /// (extension-editor.ts:71-73).
     pub fn new(
-        tui: TuiMainScreen,
+        tui: TuiHandle,
         theme: Arc<Theme>,
         title: String,
         prefill: Option<String>,
@@ -194,14 +194,16 @@ impl Focusable for ExtensionEditorComponent {
 mod tests {
     use super::*;
     use crate::modes::interactive::test_support::TestTerminal;
+    use rpi_tui::tui_handle::TuiHandle;
+    use rpi_tui::tui_main_screen::TuiMainScreen;
     use std::sync::Mutex;
 
     fn theme() -> Arc<Theme> {
         Arc::new(crate::core::themes::load_theme("dark", None).expect("builtin dark theme"))
     }
 
-    fn tui() -> TuiMainScreen {
-        TuiMainScreen::new(Box::new(TestTerminal::new()))
+    fn tui() -> TuiHandle {
+        TuiHandle::from_main(TuiMainScreen::new(Box::new(TestTerminal::new())))
     }
 
     fn strip_ansi(input: &str) -> String {

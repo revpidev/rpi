@@ -66,7 +66,7 @@ use rpi_tui::components::input::Input;
 use rpi_tui::components::text::Text;
 use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::{truncate_to_width, visible_width};
 
 use crate::core::session_manager::{SessionInfo, SessionManager};
@@ -974,7 +974,7 @@ pub struct SessionSelectorComponent {
     top_border: DynamicBorder,
     bottom_border: DynamicBorder,
     theme: Arc<Theme>,
-    tui: TuiMainScreen,
+    tui: TuiHandle,
     scope: SessionScope,
     sort_mode: SortMode,
     name_filter: NameFilter,
@@ -1015,7 +1015,7 @@ impl SessionSelectorComponent {
         cwd: PathBuf,
         session_dir: Option<PathBuf>,
         theme: Arc<Theme>,
-        tui: TuiMainScreen,
+        tui: TuiHandle,
         on_select: Box<dyn FnMut(&str) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         on_exit: Box<dyn FnMut() + Send>,
@@ -1419,6 +1419,7 @@ mod tests {
     use super::*;
     use crate::modes::interactive::interactive_mode::install_global_keybindings;
     use crate::modes::interactive::test_support::{TempDir, TestTerminal};
+    use rpi_tui::tui_main_screen::TuiMainScreen;
 
     /// ISO-8601 UTC timestamp for the given epoch ms (same civil-from-days
     /// algorithm as `tui.rs`).
@@ -1537,8 +1538,8 @@ mod tests {
         Arc::new(crate::core::themes::load_theme("dark", None).expect("builtin dark theme"))
     }
 
-    fn tui() -> TuiMainScreen {
-        TuiMainScreen::new(Box::new(TestTerminal::new()))
+    fn tui() -> TuiHandle {
+        TuiHandle::from_main(TuiMainScreen::new(Box::new(TestTerminal::new())))
     }
 
     fn strip_ansi(input: &str) -> String {

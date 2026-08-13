@@ -49,6 +49,11 @@ use crate::core::environment;
 use crate::error::RpiError;
 use crate::tools::path_utils::{normalize_path, resolve_path};
 
+// Re-exported from rpi-tui to match upstream settings-manager re-exporting
+// TuiMode and ScrollViewScrollbar (settings-manager.ts:36, :138).
+pub use rpi_tui::components::scroll_view::ScrollbarMode;
+pub use rpi_tui::tui::TuiMode;
+
 /// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (http-dispatcher.ts:4).
 pub const DEFAULT_HTTP_IDLE_TIMEOUT_MS: u64 = 300_000;
 
@@ -207,6 +212,17 @@ pub enum DoubleEscapeAction {
     Tree,
     #[serde(rename = "none")]
     None,
+}
+
+/// `FullscreenExitOutput = "transcript" | "resume-hint"`
+/// (settings-manager.ts:37, :137, :1140-1148 @ 5446cd754 @ 4181f66).
+/// Default `"transcript"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FullscreenExitOutput {
+    #[serde(rename = "transcript")]
+    Transcript,
+    #[serde(rename = "resume-hint")]
+    ResumeHint,
 }
 
 /// `settings.treeFilterMode`: `"default" | "no-tools" | "user-only" |
@@ -2170,6 +2186,57 @@ impl SettingsManager {
         self.save();
     }
 
+    /// `getTuiMode` (settings-manager.ts:1130-1132 @ 5446cd754 @ 4181f66):
+    /// default `"regular"`; only `"fullscreen"` returns fullscreen.
+    pub fn get_tui_mode(&self) -> TuiMode {
+        match self.settings.get_str("tuiMode") {
+            Some("fullscreen") => TuiMode::Fullscreen,
+            _ => TuiMode::Regular,
+        }
+    }
+
+    /// `setTuiMode` (settings-manager.ts:1134-1138 @ 5446cd754).
+    pub fn set_tui_mode(&mut self, mode: TuiMode) {
+        self.global_settings.set("tuiMode", json_value(&mode));
+        self.mark_modified("tuiMode", None);
+        self.save();
+    }
+
+    /// `getFullscreenExitOutput` (settings-manager.ts:1140-1142 @ 5446cd754):
+    /// default `"transcript"`; only `"resume-hint"` returns resume-hint.
+    pub fn get_fullscreen_exit_output(&self) -> FullscreenExitOutput {
+        match self.settings.get_str("fullscreenExitOutput") {
+            Some("resume-hint") => FullscreenExitOutput::ResumeHint,
+            _ => FullscreenExitOutput::Transcript,
+        }
+    }
+
+    /// `setFullscreenExitOutput` (settings-manager.ts:1144-1148 @ 5446cd754).
+    pub fn set_fullscreen_exit_output(&mut self, output: FullscreenExitOutput) {
+        self.global_settings
+            .set("fullscreenExitOutput", json_value(&output));
+        self.mark_modified("fullscreenExitOutput", None);
+        self.save();
+    }
+
+    /// `getFullscreenScrollbar` (settings-manager.ts:1150-1153 @ 5446cd754):
+    /// default `"auto"`; only `"always"` / `"hidden"` pass through.
+    pub fn get_fullscreen_scrollbar(&self) -> ScrollbarMode {
+        match self.settings.get_str("fullscreenScrollbar") {
+            Some("always") => ScrollbarMode::Always,
+            Some("hidden") => ScrollbarMode::Hidden,
+            _ => ScrollbarMode::Auto,
+        }
+    }
+
+    /// `setFullscreenScrollbar` (settings-manager.ts:1155-1159 @ 5446cd754).
+    pub fn set_fullscreen_scrollbar(&mut self, mode: ScrollbarMode) {
+        self.global_settings
+            .set("fullscreenScrollbar", json_value(&mode));
+        self.mark_modified("fullscreenScrollbar", None);
+        self.save();
+    }
+
     /// `getWarnings` (settings-manager.ts:1225-1227) — returns a copy;
     /// defaults are applied by consumers (`anthropicExtraUsage`: true).
     pub fn get_warnings(&self) -> WarningSettings {
@@ -3539,5 +3606,81 @@ mod tests {
         );
         let saved = read_json(&global_path(&dirs));
         assert_eq!(saved["markdown"]["mermaid"], json!("off"));
+    }
+
+    // =======================================================================
+    // TUI mode + fullscreen settings
+    // (settings-manager.ts:1130-1159 @ 5446cd754 @ 4181f66,
+    //  test/settings-manager.test.ts:400-450)
+    // =======================================================================
+
+    // Port of "defaults to regular and persists fullscreen mode".
+    #[test]
+    fn test_tui_mode_defaults_to_regular_and_persists_fullscreen() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+
+        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
+
+        manager.set_tui_mode(TuiMode::Fullscreen);
+
+        assert_eq!(manager.get_tui_mode(), TuiMode::Fullscreen);
+        let saved = read_json(&global_path(&dirs));
+        assert_eq!(saved["tuiMode"], json!("fullscreen"));
+    }
+
+    // Port of "falls back to regular for unsupported values".
+    #[test]
+    fn test_tui_mode_falls_back_to_regular_for_unsupported_values() {
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"tuiMode": "other"}));
+
+        let manager = create(&dirs);
+
+        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
+    }
+
+    // Port of "does not recognize the old uiMode setting".
+    #[test]
+    fn test_tui_mode_does_not_recognize_old_ui_mode_setting() {
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"uiMode": "fullscreen"}));
+
+        let manager = create(&dirs);
+
+        assert_eq!(manager.get_tui_mode(), TuiMode::Regular);
+    }
+
+    // Port of "validates and persists fullscreen settings".
+    #[test]
+    fn test_fullscreen_settings_validate_and_persist() {
+        let dirs = test_dirs();
+        let mut manager = create(&dirs);
+
+        // Defaults
+        assert_eq!(
+            manager.get_fullscreen_exit_output(),
+            FullscreenExitOutput::Transcript
+        );
+        assert_eq!(manager.get_fullscreen_scrollbar(), ScrollbarMode::Auto);
+
+        manager.set_fullscreen_exit_output(FullscreenExitOutput::ResumeHint);
+        manager.set_fullscreen_scrollbar(ScrollbarMode::Hidden);
+
+        let saved = read_json(&global_path(&dirs));
+        assert_eq!(saved["fullscreenExitOutput"], json!("resume-hint"));
+        assert_eq!(saved["fullscreenScrollbar"], json!("hidden"));
+
+        // Invalid values fall back to defaults
+        write_json(
+            &global_path(&dirs),
+            json!({"fullscreenExitOutput": "nothing", "fullscreenScrollbar": "sometimes"}),
+        );
+        let reloaded = create(&dirs);
+        assert_eq!(
+            reloaded.get_fullscreen_exit_output(),
+            FullscreenExitOutput::Transcript
+        );
+        assert_eq!(reloaded.get_fullscreen_scrollbar(), ScrollbarMode::Auto);
     }
 }

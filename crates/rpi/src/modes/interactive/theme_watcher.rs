@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use rpi_tui::terminal_colors::{RgbColor, TerminalColorScheme};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 
 use crate::core::themes::get_theme_watch_path;
 use crate::modes::interactive::interactive_mode::{InteractiveUi, UiCommand};
@@ -154,7 +154,7 @@ fn hex_to_rgb(hex: &str) -> Option<RgbColor> {
 /// `detectTerminalThemeForAuto` (theme.ts:777-789): DSR color-scheme query,
 /// then OSC 11 background query, then `COLORFGBG`/fallback.
 pub(crate) async fn detect_terminal_theme_for_auto(
-    ui: &TuiMainScreen,
+    ui: &TuiHandle,
     timeout_ms: u64,
 ) -> TerminalColorScheme {
     let timeout = Duration::from_millis(timeout_ms);
@@ -236,7 +236,7 @@ fn poll_theme_change(
 /// symmetry with the drain-side apply (the reload itself runs on the drain,
 /// which owns `ui_state.ui`).
 pub(crate) fn spawn_theme_watcher(
-    _ui: TuiMainScreen,
+    _ui: TuiHandle,
     ui_state: Arc<InteractiveUi>,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {

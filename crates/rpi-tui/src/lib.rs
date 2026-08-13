@@ -36,6 +36,7 @@ pub(crate) mod test_vt;
 pub mod tui;
 pub mod tui_alt_screen;
 pub(crate) mod tui_base;
+pub mod tui_handle;
 pub mod tui_main_screen;
 pub mod undo_stack;
 pub mod utils;

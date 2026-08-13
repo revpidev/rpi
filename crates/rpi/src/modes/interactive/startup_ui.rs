@@ -24,6 +24,7 @@ use std::time::Duration;
 use rpi_tui::terminal::ProcessTerminal;
 use rpi_tui::terminal_colors::TerminalColorScheme;
 use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::tui_main_screen::TuiMainScreen;
 
 use crate::core::agent_session_runtime::AgentSessionRuntime;
@@ -110,12 +111,14 @@ pub(crate) async fn run_first_time_setup_with_terminal(
     super::interactive_mode::install_global_keybindings();
 
     let session = runtime.session();
-    let ui = TuiMainScreen::with_options(
+    let ui_main = TuiMainScreen::with_options(
         terminal,
         Some(session.settings_manager(|settings| settings.get_show_hardware_cursor())),
         Some(runtime.services().agent_dir.clone()),
     );
-    ui.set_clear_on_shrink(session.settings_manager(|settings| settings.get_clear_on_shrink()));
+    ui_main
+        .set_clear_on_shrink(session.settings_manager(|settings| settings.get_clear_on_shrink()));
+    let ui = TuiHandle::from_main(ui_main);
 
     // Start the TUI and its driver before the terminal queries: the OSC 11 /
     // DSR replies are delivered by `pump` (startup-ui.ts starts the TUI
@@ -278,12 +281,13 @@ pub(crate) fn run_startup_selector_with_terminal(
         Err(_) => return None,
     };
 
-    let ui = TuiMainScreen::with_options(
+    let ui_main = TuiMainScreen::with_options(
         terminal,
         Some(settings.get_show_hardware_cursor()),
         Some(crate::config::get_agent_dir()),
     );
-    ui.set_clear_on_shrink(settings.get_clear_on_shrink());
+    ui_main.set_clear_on_shrink(settings.get_clear_on_shrink());
+    let ui = TuiHandle::from_main(ui_main);
     ui.start();
     let stop = Arc::new(AtomicBool::new(false));
     let driver_ui = ui.clone();

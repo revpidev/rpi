@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
 use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 
 /// App-action handler (upstream `() => void`).
 pub type ActionHandler = Box<dyn FnMut() + Send>;
@@ -50,7 +50,7 @@ pub struct CustomEditor {
 }
 
 impl CustomEditor {
-    pub fn new(tui: TuiMainScreen, theme: EditorTheme, options: EditorOptions) -> Self {
+    pub fn new(tui: TuiHandle, theme: EditorTheme, options: EditorOptions) -> Self {
         Self {
             editor: Editor::new(tui, theme, options),
             action_handlers: HashMap::new(),
@@ -294,6 +294,7 @@ impl Focusable for CustomEditorRegion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_tui::tui_main_screen::TuiMainScreen;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::MutexGuard;
 
@@ -312,7 +313,7 @@ mod tests {
 
     struct Harness {
         editor: Arc<Mutex<CustomEditor>>,
-        _tui: TuiMainScreen,
+        _tui: TuiHandle,
         _keybindings_guard: MutexGuard<'static, ()>,
     }
 
@@ -320,7 +321,9 @@ mod tests {
         fn new() -> Self {
             let guard = KEYBINDINGS_LOCK.lock().unwrap();
             install_keybindings();
-            let tui = TuiMainScreen::new(Box::new(super::super::test_support::TestTerminal::new()));
+            let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+                super::super::test_support::TestTerminal::new(),
+            )));
             let editor = Arc::new(Mutex::new(CustomEditor::new(
                 tui.clone(),
                 EditorTheme {
@@ -503,7 +506,9 @@ mod tests {
         };
 
         install_custom();
-        let tui = TuiMainScreen::new(Box::new(super::super::test_support::TestTerminal::new()));
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+            super::super::test_support::TestTerminal::new(),
+        )));
         let editor = Arc::new(Mutex::new(CustomEditor::new(
             tui.clone(),
             EditorTheme {

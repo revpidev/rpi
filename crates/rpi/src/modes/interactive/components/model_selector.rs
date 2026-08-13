@@ -42,7 +42,7 @@ use rpi_tui::components::text::Text;
 use rpi_tui::fuzzy::fuzzy_filter;
 use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable};
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::utils::truncate_to_width;
 
 use crate::core::model_runtime::ModelRuntime;
@@ -263,7 +263,7 @@ fn get_scope_hint_text(theme: &Theme) -> String {
 /// (model-selector.ts:35-361).
 pub struct ModelSelectorComponent {
     theme: Arc<Theme>,
-    tui: TuiMainScreen,
+    tui: TuiHandle,
     search_input: Input,
     focused: bool,
     current_model: Option<Model>,
@@ -285,7 +285,7 @@ impl ModelSelectorComponent {
         model_runtime: Arc<ModelRuntime>,
         scoped_models: Vec<(Model, Option<ModelThinkingLevel>)>,
         theme: Arc<Theme>,
-        tui: TuiMainScreen,
+        tui: TuiHandle,
         save_default: Box<dyn FnMut(&Model) + Send>,
         on_select: Box<dyn FnMut(Model) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
@@ -744,10 +744,10 @@ mod tests {
     }
 
     #[allow(clippy::type_complexity)] // mirrors the upstream callback type
-    fn tui() -> TuiMainScreen {
-        TuiMainScreen::new(Box::new(
+    fn tui() -> TuiHandle {
+        TuiHandle::from_main(TuiMainScreen::new(Box::new(
             crate::modes::interactive::test_support::TestTerminal::new(),
-        ))
+        )))
     }
 
     /// Capture calls through a shared mutex for callback assertions.

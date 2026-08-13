@@ -20,6 +20,14 @@ pub enum RpiError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// `SessionImportFileNotFoundError` (agent-session-runtime.ts:46-54) —
+    /// kept typed so `/import` can route it to `showError` while other
+    /// import failures are fatal (interactive-mode.ts:5852-5855).
+    #[error(transparent)]
+    SessionImportFileNotFound(
+        #[from] crate::core::agent_session_runtime::SessionImportFileNotFoundError,
+    ),
 }
 
 impl RpiError {

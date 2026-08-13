@@ -523,9 +523,10 @@ pub fn composite_tui_line(
 // =============================================================================
 
 /// `TuiMode` (tui.ts:284 @ 4181f66): `"regular" | "fullscreen"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TuiMode {
+    #[default]
     Regular,
     Fullscreen,
 }

@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use rpi_tui::terminal::ProcessTerminal;
 use rpi_tui::tui::{shared_component_from_boxed, Component, Focusable, TuiStopOptions};
+use rpi_tui::tui_handle::TuiHandle;
 use rpi_tui::tui_main_screen::TuiMainScreen;
 
 use crate::core::settings_manager::SettingsManager;
@@ -98,12 +99,13 @@ pub(crate) async fn select_session_with_terminal(
     let theme = load_theme(&theme_name, None)
         .or_else(|_| load_theme("dark", None))
         .map_err(|error| RpiError::Resource(error.to_string()))?;
-    let ui = TuiMainScreen::with_options(
+    let ui_main = TuiMainScreen::with_options(
         terminal,
         Some(settings.get_show_hardware_cursor()),
         Some(crate::config::get_agent_dir()),
     );
-    ui.set_clear_on_shrink(settings.get_clear_on_shrink());
+    ui_main.set_clear_on_shrink(settings.get_clear_on_shrink());
+    let ui = TuiHandle::from_main(ui_main);
 
     let (select_tx, select_rx) = tokio::sync::oneshot::channel::<String>();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();

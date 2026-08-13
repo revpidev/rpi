@@ -64,6 +64,7 @@ use crate::modes::interactive::footer::format_tokens;
 use crate::modes::interactive::interactive_mode::{
     InteractiveMode, InteractiveUi, ShareState, UiCommand,
 };
+use crate::RpiError;
 
 /// `MAX_OSC52_ENCODED_LENGTH` (utils/clipboard.ts:20).
 const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
@@ -682,13 +683,17 @@ impl InteractiveMode {
                     .show_status(&format!("Session imported from: {input_path}"));
             }
             // Upstream distinguishes MissingSessionCwdError (cwd prompt,
-            // interactive-mode.ts:5489-5501) and SessionImportFileNotFoundError
-            // (interactive-mode.ts:5503-5505); the cwd prompt is a T15
-            // extension hook — local reports all failures uniformly.
-            Err(error) => self.ui_state.show_error(&format!(
-                "Failed to import session: {}",
-                error.raw_message()
-            )),
+            // interactive-mode.ts:5489-5501 — a T15 extension hook still
+            // pending locally) and SessionImportFileNotFoundError
+            // (recoverable showError, interactive-mode.ts:5852-5854); every
+            // other import failure is fatal (interactive-mode.ts:5855).
+            Err(RpiError::SessionImportFileNotFound(error)) => self
+                .ui_state
+                .show_error(&format!("Failed to import session: {error}")),
+            Err(error) => {
+                self.handle_fatal_runtime_error("Failed to import session", &error.raw_message())
+                    .await
+            }
         }
     }
 }

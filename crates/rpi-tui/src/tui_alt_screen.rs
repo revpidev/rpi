@@ -53,7 +53,9 @@ use base64::Engine;
 use tokio::sync::oneshot;
 
 use crate::components::alt_screen_flash::{AltScreenFlashContainer, DEFAULT_DURATION_MS};
-use crate::components::scroll_view::{Follow, Overscroll, ScrollView, ScrollViewOptions};
+use crate::components::scroll_view::{
+    Follow, Overscroll, ScrollView, ScrollViewOptions, ScrollbarMode,
+};
 use crate::keybindings::{get_keybindings, Keybinding};
 use crate::keys::is_key_release;
 use crate::kitty_registry::{
@@ -398,16 +400,59 @@ impl TuiAltScreen {
         log_directory: Option<PathBuf>,
         options: TuiAltScreenOptions,
     ) -> TuiAltScreen {
-        let schedule = Arc::new(Mutex::new(RenderSchedule {
-            requested: false,
-            deadline: None,
-            last_render_at: None,
-        }));
         let size_cache = TerminalSizeCache {
             rows: Arc::new(AtomicU16::new(terminal.rows())),
             columns: Arc::new(AtomicU16::new(terminal.columns())),
         };
         let terminal: SharedTerminal = Arc::new(Mutex::new(terminal));
+        Self::build(
+            terminal,
+            show_hardware_cursor,
+            log_directory,
+            options,
+            size_cache,
+        )
+    }
+
+    /// T32 variant of [`TuiAltScreen::with_options`] that takes an existing
+    /// [`SharedTerminal`] instead of `Box<dyn Terminal>`, so `switch_tui_mode`
+    /// (interactive-mode.ts:808-814 @ b103937d3) can reuse the same terminal.
+    pub fn with_shared_terminal(
+        terminal: SharedTerminal,
+        show_hardware_cursor: Option<bool>,
+        log_directory: Option<PathBuf>,
+        options: TuiAltScreenOptions,
+    ) -> TuiAltScreen {
+        let (rows, columns) = {
+            let t = lock_shared(&terminal);
+            (t.rows(), t.columns())
+        };
+        let size_cache = TerminalSizeCache {
+            rows: Arc::new(AtomicU16::new(rows)),
+            columns: Arc::new(AtomicU16::new(columns)),
+        };
+        Self::build(
+            terminal,
+            show_hardware_cursor,
+            log_directory,
+            options,
+            size_cache,
+        )
+    }
+
+    /// Shared body of [`with_options`] / [`with_shared_terminal`].
+    fn build(
+        terminal: SharedTerminal,
+        show_hardware_cursor: Option<bool>,
+        log_directory: Option<PathBuf>,
+        options: TuiAltScreenOptions,
+        size_cache: TerminalSizeCache,
+    ) -> TuiAltScreen {
+        let schedule = Arc::new(Mutex::new(RenderSchedule {
+            requested: false,
+            deadline: None,
+            last_render_at: None,
+        }));
         let base = TuiBase::new(
             Arc::clone(&terminal),
             show_hardware_cursor,
@@ -560,6 +605,69 @@ impl TuiAltScreen {
             inner.children.clear();
             lock_shared(&inner.implicit_children).clear();
         });
+    }
+
+    // --- Rust additions: container list ops (mirror TuiMainScreen) ---------
+    // These mirror the TuiMainScreen Rust-specific methods so a TuiHandle
+    // proxy can forward them uniformly (T12-S5a showSelector region swap +
+    // T32 switch_tui_mode child snapshot).
+
+    /// Rust addition: insert a child at a specific position. Out-of-range
+    /// indexes append. Mirrors [`TuiMainScreen::insert_child_at`].
+    pub fn insert_child_at(&self, index: usize, component: SharedComponent) {
+        self.run_or_queue(move |inner| {
+            let index = index.min(inner.children.len());
+            inner.children.insert(index, component.clone());
+            lock_shared(&inner.implicit_children).insert(index, component);
+        });
+    }
+
+    /// Rust addition: atomically swap `old` for `new`, preserving position.
+    /// Mirrors [`TuiMainScreen::swap_child`].
+    pub fn swap_child(&self, old: &SharedComponent, new: &SharedComponent) {
+        let old = Arc::clone(old);
+        let new = Arc::clone(new);
+        self.run_or_queue(move |inner| {
+            if let Some(index) = inner
+                .children
+                .iter()
+                .position(|child| same_component(child, &old))
+            {
+                inner.children[index] = new.clone();
+                lock_shared(&inner.implicit_children)[index] = new;
+            } else if !inner
+                .children
+                .iter()
+                .any(|child| same_component(child, &new))
+            {
+                inner.children.push(new.clone());
+                lock_shared(&inner.implicit_children).push(new);
+            }
+        });
+    }
+
+    /// Rust addition: position of a child (identity comparison). `None` on
+    /// lock contention or when not mounted.
+    pub fn child_position(&self, component: &SharedComponent) -> Option<usize> {
+        self.try_read(|inner| {
+            inner
+                .children
+                .iter()
+                .position(|child| same_component(child, component))
+        })
+        .flatten()
+    }
+
+    /// Rust addition: the number of top-level children. 0 on lock contention.
+    pub fn children_len(&self) -> usize {
+        self.try_read(|inner| inner.children.len()).unwrap_or(0)
+    }
+
+    /// Rust addition (T32 `switch_tui_mode`): snapshot the child list for
+    /// re-mounting after a renderer swap. Empty on lock contention.
+    pub fn children(&self) -> Vec<SharedComponent> {
+        self.try_read(|inner| inner.children.clone())
+            .unwrap_or_default()
     }
 
     // --- viewport API (tui-alt-screen.ts:185-210, 351-383) -----------------
@@ -716,6 +824,16 @@ impl TuiAltScreen {
         self.run_or_queue(move |inner| inner.on_debug = on_debug);
     }
 
+    /// Take the debug callback so `switch_tui_mode` can move it to the new
+    /// renderer (interactive-mode.ts:798, 816). `None` on lock contention
+    /// (same fallback discipline as [`TuiAltScreen::children`]).
+    pub fn take_on_debug(&self) -> Option<Box<dyn FnMut() + Send>> {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|mut inner| inner.on_debug.take())
+    }
+
     /// Upstream `onTerminalColorSchemeChange` (tui.ts:662).
     pub fn on_terminal_color_scheme_change(&self, listener: TerminalColorSchemeListener) -> u64 {
         let id = self.next_listener_id.fetch_add(1, Ordering::Relaxed);
@@ -736,6 +854,14 @@ impl TuiAltScreen {
     /// Upstream `setTerminalColorSchemeNotifications` (tui.ts:669).
     pub fn set_terminal_color_scheme_notifications(&self, enabled: bool) {
         self.run_or_queue(move |inner| inner.set_terminal_color_scheme_notifications(enabled));
+    }
+
+    /// Number of registered terminal color-scheme listeners (observability
+    /// for the `switch_tui_mode` theme-listener rebind,
+    /// interactive-mode.ts:827).
+    pub fn terminal_color_scheme_listener_count(&self) -> usize {
+        self.try_read(|inner| inner.terminal_color_scheme_listeners.len())
+            .unwrap_or(0)
     }
 
     /// Upstream `queryTerminalBackgroundColor` (tui.ts:1670); the timeout is
@@ -811,6 +937,13 @@ impl TuiAltScreen {
     /// mounted roots plus overlays.
     pub fn invalidate(&self) {
         self.run_or_queue(TuiAltScreenInner::invalidate_mounted);
+    }
+
+    /// Apply the fullscreen scrollbar setting to the primary scroll view
+    /// (interactive-mode.ts:1894-1896 @ 6129a353b). Rust addition for T32.
+    pub fn set_fullscreen_scrollbar(&self, mode: ScrollbarMode) {
+        let scroll_view = self.get_primary_scroll_view();
+        with_scroll_view(&scroll_view, |sv| sv.set_scrollbar(mode));
     }
 
     /// Access the terminal (upstream `public terminal`, tui.ts:296). Same

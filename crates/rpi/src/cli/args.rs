@@ -12,6 +12,7 @@
 //! `.rpi`, env prefix `RPI_`.
 
 use rpi_agent::types::ThinkingLevel;
+use rpi_tui::tui::TuiMode;
 
 use crate::cli::diagnostics::Diagnostic;
 use crate::config::{APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR};
@@ -88,6 +89,10 @@ pub struct Args {
     pub list_models: Option<ListModels>,
     pub offline: bool,
     pub verbose: bool,
+    /// `--tui-mode <regular|fullscreen>` (args.ts:49, :180-192 @ f074efd92).
+    /// `--alt` is a hidden compatibility alias that maps to `fullscreen`
+    /// (rpi deviation G4: upstream removed `--alt`, rpi keeps the mapping).
+    pub tui_mode: Option<TuiMode>,
     pub project_trust_override: Option<bool>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
@@ -293,6 +298,41 @@ pub fn parse_args(args: &[String]) -> Args {
             }
         } else if arg == "--verbose" {
             result.verbose = true;
+        } else if arg == "--tui-mode" {
+            // --tui-mode <regular|fullscreen> (args.ts:180-192 @ f074efd92).
+            match args.get(i + 1) {
+                Some(mode) if mode == "regular" || mode == "fullscreen" => {
+                    result.tui_mode = Some(if mode == "regular" {
+                        TuiMode::Regular
+                    } else {
+                        TuiMode::Fullscreen
+                    });
+                    i += 1;
+                }
+                None => {
+                    // Missing value (args.ts:185-186).
+                    result.diagnostics.push(Diagnostic::error(
+                        "--tui-mode requires regular or fullscreen",
+                    ));
+                }
+                Some(mode) if mode.starts_with('-') => {
+                    // Next arg is a flag, not a value (args.ts:185-186).
+                    result.diagnostics.push(Diagnostic::error(
+                        "--tui-mode requires regular or fullscreen",
+                    ));
+                }
+                Some(mode) => {
+                    // Invalid value: consume it, then report (args.ts:188-192).
+                    i += 1;
+                    result.diagnostics.push(Diagnostic::error(format!(
+                        "Invalid TUI mode \"{mode}\". Valid values: regular, fullscreen"
+                    )));
+                }
+            }
+        } else if arg == "--alt" {
+            // rpi deviation G4: hidden compatibility alias -> fullscreen
+            // (upstream removed --alt; kept here per task file / gate G4).
+            result.tui_mode = Some(TuiMode::Fullscreen);
         } else if arg == "--approve" || arg == "-a" {
             result.project_trust_override = Some(true);
         } else if arg == "--no-approve" || arg == "-na" {
@@ -456,6 +496,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
+  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as RPI_OFFLINE=1)
@@ -1077,6 +1118,102 @@ mod tests {
     #[test]
     fn test_parses_offline_flag() {
         assert!(args(&["--offline"]).offline);
+    }
+
+    // --tui-mode flag (args.ts:180-192 @ f074efd92, test/args.test.ts:332-355)
+
+    #[test]
+    fn test_parses_tui_mode_regular() {
+        assert_eq!(
+            args(&["--tui-mode", "regular"]).tui_mode,
+            Some(TuiMode::Regular)
+        );
+    }
+
+    #[test]
+    fn test_parses_tui_mode_fullscreen() {
+        assert_eq!(
+            args(&["--tui-mode", "fullscreen"]).tui_mode,
+            Some(TuiMode::Fullscreen)
+        );
+    }
+
+    #[test]
+    fn test_tui_mode_rejects_invalid_modes() {
+        let result = args(&["--tui-mode", "other"]);
+        assert_eq!(result.tui_mode, None);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "Invalid TUI mode \"other\". Valid values: regular, fullscreen"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_tui_mode_requires_a_mode() {
+        let result = args(&["--tui-mode"]);
+        assert_eq!(result.tui_mode, None);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "--tui-mode requires regular or fullscreen"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_tui_mode_requires_value_when_next_is_flag() {
+        let result = args(&["--tui-mode", "--verbose"]);
+        assert_eq!(result.tui_mode, None);
+        assert_eq!(
+            result.diagnostics,
+            vec![Diagnostic::error(
+                "--tui-mode requires regular or fullscreen"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_tui_mode_does_not_recognize_old_ui_mode_flag() {
+        let result = args(&["--ui-mode", "fullscreen"]);
+        assert_eq!(result.tui_mode, None);
+        assert_eq!(
+            result.unknown_flag("ui-mode"),
+            Some(&UnknownFlagValue::String("fullscreen".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_alt_maps_to_fullscreen() {
+        // rpi deviation G4: --alt is a hidden compatibility alias.
+        assert_eq!(args(&["--alt"]).tui_mode, Some(TuiMode::Fullscreen));
+    }
+
+    #[test]
+    fn test_alt_not_in_unknown_flags() {
+        let result = args(&["--alt"]);
+        assert!(result.unknown_flags.is_empty());
+    }
+
+    #[test]
+    fn test_help_contains_tui_mode_line() {
+        let help = print_help(&[], false);
+        assert!(
+            help.contains(
+                "--tui-mode <mode>              TUI mode: regular (default) or fullscreen"
+            ),
+            "help text must contain --tui-mode line"
+        );
+    }
+
+    #[test]
+    fn test_help_does_not_contain_alt() {
+        let help = print_help(&[], false);
+        assert!(
+            !help.contains("--alt"),
+            "help text must not contain --alt (hidden alias)"
+        );
     }
 
     // tool flags

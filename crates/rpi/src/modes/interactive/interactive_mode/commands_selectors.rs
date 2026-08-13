@@ -431,6 +431,56 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
         SettingsChange::ShowTerminalProgress(enabled) => {
             session.settings_manager(|s| s.set_show_terminal_progress(enabled));
         }
+        SettingsChange::TuiMode(mode) => {
+            // onTuiModeChange (interactive-mode.ts:4559-4567 @ b103937d3):
+            // switch → on failure, roll back selector value + show rejection
+            // status (no persistence); on success, persist + show confirmation.
+            if !ui.switch_tui_mode(mode, true, true) {
+                // Roll back the selector's displayed value to the actual mode
+                // (interactive-mode.ts:4561 `selector.getSettingsList().
+                // updateValue("tui-mode", this.ui.mode)`).
+                let actual_mode = ui.ui.mode();
+                let mode_str = match actual_mode {
+                    rpi_tui::tui::TuiMode::Regular => "regular",
+                    rpi_tui::tui::TuiMode::Fullscreen => "fullscreen",
+                };
+                if let Some(weak) = lock(&ui.settings_selector_weak).as_ref() {
+                    if let Some(selector) = weak.upgrade() {
+                        selector
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_settings_list()
+                            .update_value("tui-mode", mode_str);
+                    }
+                }
+                ui.show_status("Close active overlays before changing TUI mode");
+            } else {
+                session.settings_manager(|s| s.set_tui_mode(mode));
+                let mode_str = match mode {
+                    rpi_tui::tui::TuiMode::Regular => "regular",
+                    rpi_tui::tui::TuiMode::Fullscreen => "fullscreen",
+                };
+                ui.show_status(&format!("TUI mode: {mode_str}"));
+            }
+        }
+        SettingsChange::FullscreenExitOutput(output) => {
+            // onFullscreenExitOutputChange (interactive-mode.ts:4569-4571).
+            session.settings_manager(|s| s.set_fullscreen_exit_output(output));
+        }
+        SettingsChange::FullscreenScrollbar(scrollbar_mode) => {
+            // onFullscreenScrollbarChange (interactive-mode.ts:4572-4574
+            // @ 6129a353b): persist + apply to the live scroll view.
+            // `apply_fullscreen_scrollbar` reaches the transcript scroll
+            // view directly (it survives in `fullscreen_layout_root`
+            // regardless of the active renderer, so a change in regular
+            // mode sticks for the next fullscreen switch); the TuiHandle
+            // dispatch additionally covers the live alt-screen renderer
+            // for an immediate repaint.
+            session.settings_manager(|s| s.set_fullscreen_scrollbar(scrollbar_mode));
+            ui.apply_fullscreen_scrollbar(scrollbar_mode);
+            ui.ui.set_fullscreen_scrollbar(scrollbar_mode);
+            ui.render_handle.request_render();
+        }
         SettingsChange::Warnings(warnings) => {
             session.settings_manager(|s| s.set_warnings(&warnings));
         }
@@ -1035,6 +1085,9 @@ impl InteractiveUi {
             default_project_trust: session.settings_manager(|s| s.get_default_project_trust()),
             clear_on_shrink: session.settings_manager(|s| s.get_clear_on_shrink()),
             show_terminal_progress: session.settings_manager(|s| s.get_show_terminal_progress()),
+            tui_mode: ui.ui.mode(),
+            fullscreen_exit_output: session.settings_manager(|s| s.get_fullscreen_exit_output()),
+            fullscreen_scrollbar: session.settings_manager(|s| s.get_fullscreen_scrollbar()),
             warnings: session.settings_manager(|s| s.get_warnings()),
         };
 
@@ -1056,6 +1109,12 @@ impl InteractiveUi {
             on_change,
             on_cancel,
         )));
+
+        // Store a weak ref for the TuiMode rollback path
+        // (interactive-mode.ts:4561 `selector.getSettingsList().updateValue(
+        // "tui-mode", this.ui.mode)`).
+        *lock(&ui.settings_selector_weak) = Some(Arc::downgrade(&selector));
+
         let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
         ui.show_selector(entry);
     }
@@ -1917,6 +1976,9 @@ impl InteractiveMode {
                 lock(&self.ui_state.editor).set_text("");
                 self.ui_state.show_status("Cloned to new session");
             }
+            // interactive-mode.ts:4947-4949: clone failure is a recoverable
+            // `showError`, unlike the five fatal call sites (create ×2
+            // :1832/:6222, fork :1844, resume :5164, import :5855).
             Err(error) => self.ui_state.show_error(&error.raw_message()),
         }
     }
@@ -1943,7 +2005,11 @@ impl InteractiveMode {
                 lock(&self.ui_state.editor).set_text(result.selected_text.as_deref().unwrap_or(""));
                 self.ui_state.show_status("Forked to new session");
             }
-            Err(error) => self.ui_state.show_error(&error.raw_message()),
+            // interactive-mode.ts:1844 @ 4181f66: fork failure is fatal.
+            Err(error) => {
+                self.handle_fatal_runtime_error("Failed to fork session", &error.raw_message())
+                    .await
+            }
         }
     }
 
@@ -1959,7 +2025,11 @@ impl InteractiveMode {
                 self.rebind_session_ui().await;
                 self.ui_state.show_status("✓ New session started");
             }
-            Err(error) => self.ui_state.show_error(&error.raw_message()),
+            // interactive-mode.ts:6222 @ 4181f66: create failure is fatal.
+            Err(error) => {
+                self.handle_fatal_runtime_error("Failed to create session", &error.raw_message())
+                    .await
+            }
         }
     }
 
@@ -2004,7 +2074,11 @@ impl InteractiveMode {
                 self.rebind_session_ui().await;
                 self.ui_state.show_status("Resumed session");
             }
-            Err(error) => self.ui_state.show_error(&error.raw_message()),
+            // interactive-mode.ts:5164 @ 4181f66: resume failure is fatal.
+            Err(error) => {
+                self.handle_fatal_runtime_error("Failed to resume session", &error.raw_message())
+                    .await
+            }
         }
     }
 
@@ -2430,6 +2504,21 @@ mod tests {
     /// runtime-dependent commands (`/new`, `/resume`, `/clone`) can switch
     /// sessions.
     async fn switchable_harness() -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        switchable_harness_with_factory(None).await
+    }
+
+    /// Like [`switchable_harness`] but the session factory always fails with
+    /// the given message, so runtime-dependent commands hit their error
+    /// branches.
+    async fn failing_factory_harness(
+        factory_error: &str,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
+        switchable_harness_with_factory(Some(factory_error.to_owned())).await
+    }
+
+    async fn switchable_harness_with_factory(
+        factory_error: Option<String>,
+    ) -> (InteractiveMode, Arc<TestTerminal>, AgentSession, TempDir) {
         install_global_keybindings();
         let tmp = TempDir::new();
         let agent_dir = tmp.path().join("agent");
@@ -2483,33 +2572,43 @@ mod tests {
         let factory = {
             use crate::RpiError;
             use futures::future::BoxFuture;
-            let services = services.clone();
-            let cwd = cwd.clone();
-            let agent_dir = agent_dir.clone();
-            Arc::new(move |options: CreateRuntimeOptions| {
-                let services = services.clone();
-                let cwd = cwd.clone();
-                let agent_dir = agent_dir.clone();
-                Box::pin(async move {
-                    let created = create_agent_session(CreateAgentSessionOptions {
-                        cwd: Some(cwd),
-                        agent_dir: Some(agent_dir),
-                        model: None,
-                        no_tools: Some(NoTools::All),
-                        services: Some(services),
-                        session_manager: Some(options.session_manager),
-                        ..Default::default()
-                    })
-                    .await?;
-                    Ok(CreateAgentSessionRuntimeResult {
-                        session: created.session,
-                        services: created.services.expect("services round-trip"),
-                        diagnostics: Vec::new(),
-                        model_fallback_message: created.model_fallback_message,
-                    })
+            match factory_error {
+                Some(message) => Arc::new(move |_options: CreateRuntimeOptions| {
+                    let message = message.clone();
+                    Box::pin(async move { Err(RpiError::Session(message.clone())) })
+                        as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, RpiError>>
                 })
-                    as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, RpiError>>
-            })
+                    as crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory,
+                None => {
+                    let services = services.clone();
+                    let cwd = cwd.clone();
+                    let agent_dir = agent_dir.clone();
+                    Arc::new(move |options: CreateRuntimeOptions| {
+                        let services = services.clone();
+                        let cwd = cwd.clone();
+                        let agent_dir = agent_dir.clone();
+                        Box::pin(async move {
+                            let created = create_agent_session(CreateAgentSessionOptions {
+                                cwd: Some(cwd),
+                                agent_dir: Some(agent_dir),
+                                model: None,
+                                no_tools: Some(NoTools::All),
+                                services: Some(services),
+                                session_manager: Some(options.session_manager),
+                                ..Default::default()
+                            })
+                            .await?;
+                            Ok(CreateAgentSessionRuntimeResult {
+                                session: created.session,
+                                services: created.services.expect("services round-trip"),
+                                diagnostics: Vec::new(),
+                                model_fallback_message: created.model_fallback_message,
+                            })
+                        })
+                            as BoxFuture<'static, Result<CreateAgentSessionRuntimeResult, RpiError>>
+                    })
+                }
+            }
         };
 
         let runtime =
@@ -2888,6 +2987,30 @@ mod tests {
         let chat = rendered_chat(&mode.ui_state);
         assert!(chat.contains("Cloned to new session"), "chat: {chat}");
         assert_ne!(mode.session.session_id(), old_session_id);
+    }
+
+    /// B1 (interactive-mode.ts:4947-4949): clone failure is a recoverable
+    /// `showError`, not a fatal exit. If the handler took the fatal path it
+    /// would `process::exit` and kill this test binary, so completing the
+    /// assertions below proves the recoverable path was taken.
+    #[tokio::test]
+    async fn handle_clone_command_failure_shows_error_not_fatal() {
+        let (mut mode, _terminal, session, _tmp) =
+            failing_factory_harness("clone factory exploded").await;
+        // Give the session a leaf to fork from.
+        lock(&session.session_manager())
+            .append_message(user_message("fork me"))
+            .expect("append message");
+        mode.handle_clone_command().await;
+        let chat = rendered_chat(&mode.ui_state);
+        assert!(
+            chat.contains("Error: clone factory exploded"),
+            "clone failure surfaces a recoverable error, chat: {chat}"
+        );
+        assert!(
+            !chat.contains("Cloned to new session"),
+            "clone did not succeed, chat: {chat}"
+        );
     }
 
     #[tokio::test]

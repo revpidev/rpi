@@ -62,9 +62,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::modes::interactive::component_tree::component_from_tree;
@@ -87,9 +87,10 @@ use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
 use rpi_tui::tui::{
     shared_component_from_boxed, Component, Container, Focusable, RenderHandle, SharedComponent,
-    TuiStopOptions,
+    TuiMode, TuiStopOptions,
 };
-use rpi_tui::tui_main_screen::TuiMainScreen;
+use rpi_tui::tui_handle::{Renderer, TuiHandle};
+use rpi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 
@@ -105,6 +106,7 @@ use crate::core::themes::{load_theme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
 use crate::error::RpiError;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
+use crate::modes::interactive::components::settings_selector::SettingsSelectorComponent;
 use crate::modes::interactive::components::status_indicator::{
     BranchSummaryStatusIndicator, CompactionStatusIndicator, CompactionStatusReason,
     RetryStatusIndicator, StatusIndicatorKind, WorkingStatusIndicator,
@@ -175,6 +177,9 @@ pub struct InteractiveModeOptions {
     pub initial_messages: Vec<String>,
     /// Force verbose startup (overrides the quietStartup setting).
     pub verbose: bool,
+    /// TUI layout mode (interactive-mode.ts:331 @ f074efd92). Merged
+    /// CLI > settings before construction (interactive-mode.ts:530).
+    pub tui_mode: TuiMode,
 }
 
 /// Install the keybinding managers into both globals
@@ -914,7 +919,7 @@ fn resolve_theme(session: &AgentSession) -> Arc<Theme> {
 /// `pub(crate)` so the slash-command handlers in `commands.rs` can
 /// extend it.
 pub(crate) struct InteractiveUi {
-    pub(crate) ui: TuiMainScreen,
+    pub(crate) ui: TuiHandle,
     /// The bound session. Replaceable behind an `RwLock` so session
     /// switching (`/new`/`/resume`/`/clone`/`/fork`/`/import`) can rebind the
     /// shared `ui_state` (upstream `rebindCurrentSession`,
@@ -1071,6 +1076,42 @@ pub(crate) struct InteractiveUi {
     /// `modes/interactive/autocomplete` port) and read by the slash-command
     /// dispatch.
     pub(crate) skill_commands: Mutex<HashMap<String, String>>,
+
+    /// `mainScreenRenderState` (interactive-mode.ts:389 @ b103937d3):
+    /// captured from the main-screen renderer before a switch, restored on
+    /// the way back. Held on `InteractiveUi` so the settings callback (which
+    /// runs on the driver thread with only `&Arc<InteractiveUi>`) can drive
+    /// `switch_tui_mode`.
+    pub(crate) main_screen_render_state: Mutex<Option<TuiMainScreenRenderState>>,
+    /// `fullscreenLayoutRoot` (interactive-mode.ts:394, 884-887 @ 5446cd754):
+    /// created once at init, held for the process lifetime, applied via
+    /// `set_layout_root` whenever the fullscreen renderer is active.
+    pub(crate) fullscreen_layout_root: Mutex<Option<SharedComponent>>,
+    /// `transcriptScrollView` (interactive-mode.ts:869-873, 1895): the
+    /// fullscreen transcript scroll view inside [`Self::fullscreen_layout_root`],
+    /// created once at init. Retained so `applyFullscreenScrollbarSetting`
+    /// (interactive-mode.ts:1894-1896) reaches it regardless of the active
+    /// renderer (a setting change in regular mode must stick for the next
+    /// fullscreen switch).
+    pub(crate) fullscreen_transcript_scroll_view: Mutex<Option<SharedComponent>>,
+    /// Agent directory (for renderer log directories), stored so
+    /// `switch_tui_mode` on `InteractiveUi` can construct a new renderer.
+    pub(crate) agent_dir: Mutex<PathBuf>,
+    /// Shared theme handle for the fullscreen scrollbar style closure
+    /// (interactive-mode.ts:874 `scrollbarStyle: (text) =>
+    /// theme.bg("scrollbarThumb", text)`). Updated in `apply_theme` so the
+    /// scrollbar follows theme changes without recreating the scroll view.
+    pub(crate) scrollbar_theme: Arc<Mutex<Arc<Theme>>>,
+    /// Weak ref to the mounted settings selector, for the TuiMode rollback
+    /// path (interactive-mode.ts:4561). Set when the selector mounts, cleared
+    /// when it unmounts.
+    pub(crate) settings_selector_weak: Mutex<Option<Weak<Mutex<SettingsSelectorComponent>>>>,
+    /// Extension terminal input listeners registered via the UI bridge
+    /// (interactive-mode.ts:2303-2312). Each entry is `(listener_id, handler)`.
+    /// On `switch_tui_mode`, all handlers are re-registered on the new
+    /// renderer (interactive-mode.ts:2314-2318).
+    pub(crate) extension_input_listeners:
+        Mutex<Vec<(u64, rpi_ext_host::api::TerminalInputHandler)>>,
 }
 
 /// The last `showStatus` text child (tracked for back-to-back coalescing).
@@ -1098,6 +1139,187 @@ pub(crate) struct ShareState {
 impl InteractiveUi {
     pub(crate) fn push(&self, command: UiCommand) {
         lock(&self.event_queue).push_back(command);
+    }
+
+    /// `switchTuiMode` (interactive-mode.ts:788-837 @ b103937d3) —
+    /// `InteractiveUi`-level entry point for the settings callback (which
+    /// runs on the driver thread with `&Arc<InteractiveUi>`). Returns
+    /// `false` when an overlay is open; otherwise swaps the renderer.
+    ///
+    /// `restore_progress`: restore the terminal progress indicator if the
+    /// session is streaming/compacting. `start_renderer`: start the new
+    /// renderer + restore progress (false = used by exit path).
+    pub(crate) fn switch_tui_mode(
+        &self,
+        mode: TuiMode,
+        restore_progress: bool,
+        start_renderer: bool,
+    ) -> bool {
+        // 1. Same mode → no-op (interactive-mode.ts:790).
+        if self.ui.mode() == mode {
+            return true;
+        }
+        // 2. Overlay rejection (interactive-mode.ts:791).
+        if self.ui.has_overlay_entries() {
+            return false;
+        }
+        // 3. Save component tree + renderer-carried state
+        //    (interactive-mode.ts:793-798).
+        let components = self.ui.children();
+        let focus = self.ui.get_focused_component();
+        let terminal = self.ui.terminal();
+        let show_hardware_cursor = self.ui.get_show_hardware_cursor();
+        let clear_on_shrink = self.ui.get_clear_on_shrink();
+        let on_debug = self.ui.take_on_debug();
+
+        // 4. Capture main-screen render state (interactive-mode.ts:799-801).
+        if self.ui.mode() == TuiMode::Regular {
+            *lock(&self.main_screen_render_state) = self.ui.capture_render_state();
+        }
+
+        // 5. Stop old renderer, clear focus + children
+        //    (interactive-mode.ts:803-806).
+        self.ui.stop(TuiStopOptions {
+            preserve_screen: true,
+        });
+        self.ui.set_focus(None);
+        self.ui.clear();
+        if self.ui.mode() == TuiMode::Fullscreen {
+            self.ui.set_layout_root(None);
+        }
+
+        // 6. Build the new renderer reusing the same terminal
+        //    (interactive-mode.ts:808-814).
+        let agent_dir = lock(&self.agent_dir).clone();
+        let new_renderer: Renderer = match mode {
+            TuiMode::Fullscreen => {
+                Renderer::Alt(rpi_tui::tui_alt_screen::TuiAltScreen::with_shared_terminal(
+                    terminal,
+                    Some(show_hardware_cursor),
+                    Some(agent_dir),
+                    rpi_tui::tui_alt_screen::TuiAltScreenOptions::default(),
+                ))
+            }
+            TuiMode::Regular => Renderer::Main(TuiMainScreen::with_shared_terminal(
+                terminal,
+                Some(show_hardware_cursor),
+                Some(agent_dir),
+            )),
+        };
+        self.ui.swap_renderer(new_renderer);
+
+        // 7. Restore clear_on_shrink (interactive-mode.ts:815).
+        self.ui.set_clear_on_shrink(clear_on_shrink);
+        // Restore the debug callback (interactive-mode.ts:816
+        // `nextUi.onDebug = onDebug`).
+        self.ui.set_on_debug(on_debug);
+        // Upstream also records `this.options.tuiMode = mode`
+        // (interactive-mode.ts:821); locally the options struct's `tui_mode`
+        // is only read at construction — afterwards the TuiHandle's mode is
+        // the single source of truth — so there is nothing to update.
+
+        // 8. Restore main-screen render state (interactive-mode.ts:817-819).
+        if mode == TuiMode::Regular {
+            let state = lock(&self.main_screen_render_state).take();
+            if let Some(state) = state {
+                self.ui.restore_render_state(state);
+            }
+        }
+
+        // 9. Re-mount children + layout root (interactive-mode.ts:822).
+        for component in &components {
+            self.ui.add_child(component.clone());
+        }
+        if mode == TuiMode::Fullscreen {
+            let layout_root = lock(&self.fullscreen_layout_root).clone();
+            if let Some(layout_root) = layout_root {
+                self.ui.set_layout_root(Some(layout_root));
+            }
+            // Divergence: upstream throws when the layout root is missing
+            // (interactive-mode.ts:774 "Fullscreen layout is not
+            // initialized"); locally the root is created at init and lives
+            // for the process lifetime, so the `None` case is unreachable
+            // in practice and silently skipped instead of crashing the
+            // switch.
+        }
+
+        // 10. Invalidate + restore focus (interactive-mode.ts:823-824).
+        self.ui.invalidate();
+        self.ui.set_focus(focus);
+
+        if !start_renderer {
+            return true;
+        }
+
+        // 11. Start (interactive-mode.ts:826).
+        self.ui.start();
+
+        // themeController.rebindTui() (interactive-mode.ts:827): the
+        // color-scheme listener lived on the swapped-out renderer; rebind it
+        // on the new one and restore the notification flag (upstream tracks
+        // `autoSyncEnabled`, theme-controller.ts:38-42; here the flag is
+        // derived from the theme setting — it is enabled exactly when the
+        // setting is an automatic pair, matching `init_auto_theme` and the
+        // `/settings` theme-change path).
+        self.bind_terminal_color_scheme_listener();
+        let auto_sync_enabled = self.session().settings_manager(|settings| {
+            crate::modes::interactive::theme_watcher::auto_theme_pair(
+                settings.get_theme_setting().as_deref(),
+            )
+            .is_some()
+        });
+        self.ui
+            .set_terminal_color_scheme_notifications(auto_sync_enabled);
+
+        // Rebind extension terminal input listeners on the new renderer
+        // (interactive-mode.ts:827-828, 2314-2318). The old listener IDs
+        // were on the previous (now-swapped) renderer; re-register each
+        // handler and update the tracked IDs.
+        {
+            let mut listeners = lock(&self.extension_input_listeners);
+            for (id, handler) in listeners.iter_mut() {
+                let handler = Arc::clone(handler);
+                let new_id = self.ui.add_input_listener(Box::new(move |data: &str| {
+                    handler(data.to_owned()).map(|result| rpi_tui::tui::TuiInputListenerResult {
+                        consume: result.consume.unwrap_or(false),
+                        data: result.data,
+                    })
+                }));
+                *id = new_id;
+            }
+        }
+
+        // Restore progress indicator if streaming/compacting
+        // (interactive-mode.ts:829-835).
+        if restore_progress {
+            let session = self.session();
+            let show_progress =
+                session.settings_manager(|settings| settings.get_show_terminal_progress());
+            if show_progress && (session.is_streaming() || session.is_compacting()) {
+                self.ui.with_terminal(|t| t.set_progress(true));
+            }
+        }
+        true
+    }
+
+    /// `applyFullscreenScrollbarSetting` (interactive-mode.ts:1894-1896 @
+    /// 6129a353b): apply the scrollbar mode directly to the transcript
+    /// scroll view. Upstream applies unconditionally — the scroll view is
+    /// created at init and lives in `fullscreen_layout_root` for the
+    /// process lifetime, so a change made in regular mode sticks for the
+    /// next fullscreen switch (the `TuiHandle::set_fullscreen_scrollbar`
+    /// dispatch alone no-ops while the main-screen renderer is active).
+    pub(crate) fn apply_fullscreen_scrollbar(
+        &self,
+        mode: rpi_tui::components::scroll_view::ScrollbarMode,
+    ) {
+        let scroll_view = lock(&self.fullscreen_transcript_scroll_view).clone();
+        if let Some(scroll_view) = scroll_view {
+            let guard = lock(&scroll_view);
+            if let Some(view) = guard.as_scroll_view() {
+                view.set_scrollbar(mode);
+            }
+        }
     }
 
     /// Swap the `/share` gh runner (tests inject a mock; production keeps
@@ -1133,6 +1355,41 @@ impl InteractiveUi {
         lock(&self.self_arc)
             .as_ref()
             .and_then(|weak| weak.upgrade())
+    }
+
+    /// `bindTerminalColorSchemeListener` (theme-controller.ts:35, 120-124):
+    /// register the listener that re-resolves an automatic theme pair when
+    /// the terminal reports a color-scheme change (`applyTerminalTheme`,
+    /// theme-controller.ts:126-135). Shared by `init_auto_theme` (initial
+    /// bind) and `switch_tui_mode` (`themeController.rebindTui()`,
+    /// interactive-mode.ts:827) so the two bind sites cannot drift. The
+    /// listener runs on the driver thread (the TUI's tick) — the same thread
+    /// as the drain, so the theme field lock never contends. Registrations
+    /// live on the renderer; the swapped-out renderer is dropped on a mode
+    /// switch, so no explicit unsubscribe is needed (upstream keeps one TUI
+    /// instance and unsubscribes explicitly).
+    pub(crate) fn bind_terminal_color_scheme_listener(&self) {
+        let Some(listener_ui) = self.upgrade_self() else {
+            return;
+        };
+        self.ui
+            .on_terminal_color_scheme_change(Box::new(move |scheme| {
+                let setting = listener_ui
+                    .session()
+                    .settings_manager(|settings| settings.get_theme_setting());
+                let Some((light, dark)) =
+                    crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
+                else {
+                    return;
+                };
+                let name = match scheme {
+                    rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
+                    rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
+                };
+                if let Ok(theme) = crate::core::themes::load_theme(&name, None) {
+                    listener_ui.apply_theme(Arc::new(theme));
+                }
+            }));
     }
 
     /// The bound session (cheap Arc-shared clone). The read guard is
@@ -1819,6 +2076,8 @@ impl InteractiveUi {
             self.ui.set_focus(Some(self.editor_region.clone()));
             self.ui.request_render(false);
         }
+        // Clear the settings selector weak ref (selector is no longer mounted).
+        *lock(&self.settings_selector_weak) = None;
     }
 
     /// `showTreeSelector` (interactive-mode.ts:4635-4747), basic path:
@@ -2837,7 +3096,8 @@ impl InteractiveUi {
     /// 800-804). Called from the drain / the color-scheme listener — never
     /// concurrently with component callbacks.
     pub(crate) fn apply_theme(&self, theme: Arc<Theme>) {
-        *lock(&self.theme) = theme;
+        *lock(&self.theme) = Arc::clone(&theme);
+        *lock(&self.scrollbar_theme) = Arc::clone(&theme);
         let markdown = {
             let current = lock(&self.theme);
             markdown_theme(&current)
@@ -3233,7 +3493,7 @@ fn compaction_status_reason(reason: CompactionReason) -> CompactionStatusReason 
 /// `pub(crate)` for the command handlers in `commands.rs`.
 pub struct InteractiveMode {
     pub(crate) runtime: AgentSessionRuntime,
-    ui: TuiMainScreen,
+    ui: TuiHandle,
     pub(crate) session: AgentSession,
     options: InteractiveModeOptions,
     pub(crate) ui_state: Arc<InteractiveUi>,
@@ -3280,8 +3540,27 @@ impl InteractiveMode {
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
         let clear_on_shrink = session.settings_manager(|settings| settings.get_clear_on_shrink());
-        let ui = TuiMainScreen::with_options(terminal, Some(show_hardware_cursor), Some(agent_dir));
-        ui.set_clear_on_shrink(clear_on_shrink);
+        // Renderer selection (interactive-mode.ts:343-352, 540-546 @ f074efd92):
+        // `tui_mode == Fullscreen` → `TuiAltScreen`; otherwise → `TuiMainScreen`.
+        let ui: TuiHandle = if options.tui_mode == TuiMode::Fullscreen {
+            let alt = rpi_tui::tui_alt_screen::TuiAltScreen::with_options(
+                terminal,
+                Some(show_hardware_cursor),
+                Some(agent_dir.clone()),
+                rpi_tui::tui_alt_screen::TuiAltScreenOptions::default(),
+            );
+            let handle = TuiHandle::from_alt(alt);
+            handle.set_clear_on_shrink(clear_on_shrink);
+            handle
+        } else {
+            let main = TuiMainScreen::with_options(
+                terminal,
+                Some(show_hardware_cursor),
+                Some(agent_dir.clone()),
+            );
+            main.set_clear_on_shrink(clear_on_shrink);
+            TuiHandle::from_main(main)
+        };
         let render_handle = ui.render_handle();
         let cwd = session
             .session_manager()
@@ -3325,7 +3604,7 @@ impl InteractiveMode {
         let ui_state = Arc::new(InteractiveUi {
             ui: ui.clone(),
             session: RwLock::new(session.clone()),
-            theme: Mutex::new(theme),
+            theme: Mutex::new(Arc::clone(&theme)),
             markdown_theme: Mutex::new(markdown_theme),
             render_handle,
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -3393,6 +3672,13 @@ impl InteractiveMode {
             flush_generation: AtomicU64::new(0),
             input_tx,
             skill_commands: Mutex::new(HashMap::new()),
+            main_screen_render_state: Mutex::new(None),
+            fullscreen_layout_root: Mutex::new(None),
+            fullscreen_transcript_scroll_view: Mutex::new(None),
+            agent_dir: Mutex::new(agent_dir),
+            scrollbar_theme: Arc::new(Mutex::new(Arc::clone(&theme))),
+            settings_selector_weak: Mutex::new(None),
+            extension_input_listeners: Mutex::new(Vec::new()),
         });
         *lock(&ui_state.self_arc) = Some(Arc::downgrade(&ui_state));
 
@@ -3498,37 +3784,169 @@ impl InteractiveMode {
             });
         }
 
-        // Assemble the UI tree (interactive-mode.ts:707-719): the container
-        // chain order IS the layout — header → loaded resources → chat →
-        // pending messages → status → widgets above → editor → widgets
-        // below → footer.
+        // Assemble the UI tree (interactive-mode.ts:707-719, 867-897): the
+        // header → loaded resources → chat are grouped into a document
+        // container; the direct TUI children are:
+        // [document, pending_messages, status, widgets_above, editor,
+        //  widgets_below, footer].
         let ui_state = Arc::clone(&self.ui_state);
         let add_region = |container: Arc<Mutex<Container>>| {
             shared_component_from_boxed(Box::new(SharedChild(container)))
         };
         let header_region = add_region(ui_state.header_container.clone());
         *lock(&ui_state.header_region) = Some(header_region.clone());
-        self.ui.add_child(header_region);
-        self.ui
-            .add_child(add_region(ui_state.loaded_resources_container.clone()));
-        self.ui
-            .add_child(add_region(ui_state.chat_container.clone()));
-        self.ui
-            .add_child(add_region(ui_state.pending_messages_container.clone()));
-        self.ui
-            .add_child(shared_component_from_boxed(Box::new(SharedChild(
-                ui_state.status.clone(),
-            ))));
-        self.ui
-            .add_child(add_region(ui_state.widgets_above.clone()));
-        self.ui.add_child(self.editor_region.clone());
-        self.ui
-            .add_child(add_region(ui_state.widgets_below.clone()));
+        let pending_messages_region = add_region(ui_state.pending_messages_container.clone());
+        let status_region =
+            shared_component_from_boxed(Box::new(SharedChild(ui_state.status.clone())));
+        let widgets_above_region = add_region(ui_state.widgets_above.clone());
+        let widgets_below_region = add_region(ui_state.widgets_below.clone());
         let footer_region =
             shared_component_from_boxed(Box::new(SharedChild(ui_state.footer.clone())));
         *lock(&ui_state.footer_region) = Some(footer_region.clone());
-        self.ui.add_child(footer_region);
+
+        // Group header + loaded_resources + chat into the document container
+        // (interactive-mode.ts:551-554, 867-875).
+        let document_container = Arc::new(Mutex::new(Container::new()));
+        {
+            let mut doc = lock(&document_container);
+            doc.children
+                .push(Box::new(SharedChild(ui_state.header_container.clone())));
+            doc.children.push(Box::new(SharedChild(
+                ui_state.loaded_resources_container.clone(),
+            )));
+            doc.children
+                .push(Box::new(SharedChild(ui_state.chat_container.clone())));
+        }
+        let document_region =
+            shared_component_from_boxed(Box::new(SharedChild(document_container)));
+
+        // `mountInteractiveTui` (interactive-mode.ts:888-896): the 7 regions
+        // are direct TUI children in both modes.
+        self.ui.add_child(document_region.clone());
+        self.ui.add_child(pending_messages_region.clone());
+        self.ui.add_child(status_region.clone());
+        self.ui.add_child(widgets_above_region.clone());
+        self.ui.add_child(self.editor_region.clone());
+        self.ui.add_child(widgets_below_region.clone());
+        self.ui.add_child(footer_region.clone());
         self.ui.set_focus(Some(self.editor_region.clone()));
+
+        // Fullscreen layout root (interactive-mode.ts:869-887 @ 5446cd754):
+        // transcriptScrollView wraps the document container; dock is a VStack
+        // of pending/status/widgets/editor/widgets/footer; the layout root is
+        // a VStack of [scrollview(grow), dock(auto)].
+        // `scrollbarStyle: (text) => theme.bg("scrollbarThumb", text)`
+        // (interactive-mode.ts:874 @ b3ed27b3f). The closure captures a
+        // shared theme handle so it follows theme changes.
+        let scrollbar_theme = Arc::clone(&ui_state.scrollbar_theme);
+        let scrollbar_style: rpi_tui::components::scroll_view::ScrollbarStyleFn =
+            Arc::new(move |text: &str| {
+                let theme = lock(&scrollbar_theme);
+                theme.bg("scrollbarThumb", text)
+            });
+        let transcript_scroll_view = shared_component_from_boxed(Box::new(
+            rpi_tui::components::scroll_view::ScrollView::new(
+                document_region,
+                rpi_tui::components::scroll_view::ScrollViewOptions {
+                    follow: rpi_tui::components::scroll_view::Follow::End,
+                    primary: true,
+                    overscroll: rpi_tui::components::scroll_view::Overscroll::Chain,
+                    scrollbar: self
+                        .session
+                        .settings_manager(|s| s.get_fullscreen_scrollbar()),
+                    scrollbar_style: Some(scrollbar_style),
+                    ..rpi_tui::components::scroll_view::ScrollViewOptions::default()
+                },
+            ),
+        ));
+        let dock =
+            shared_component_from_boxed(Box::new(rpi_tui::components::v_stack::VStack::new(
+                vec![
+                    rpi_tui::components::stack::StackChild::Entry(
+                        pending_messages_region,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(0.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        status_region,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(0.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        widgets_above_region,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(0.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        self.editor_region.clone(),
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(3.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        widgets_below_region,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(0.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        footer_region,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            shrink: Some(1.0),
+                            min_size: Some(1.0),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                rpi_tui::components::stack::StackOptions::default(),
+            )));
+        let fullscreen_layout_root =
+            shared_component_from_boxed(Box::new(rpi_tui::components::v_stack::VStack::new(
+                vec![
+                    rpi_tui::components::stack::StackChild::Entry(
+                        transcript_scroll_view.clone(),
+                        rpi_tui::components::stack::StackEntryOptions {
+                            basis: Some(rpi_tui::layout_node::Basis::Fixed(0.0)),
+                            grow: Some(1.0),
+                            shrink: Some(1.0),
+                            min_size: Some(1.0),
+                            ..Default::default()
+                        },
+                    ),
+                    rpi_tui::components::stack::StackChild::Entry(
+                        dock,
+                        rpi_tui::components::stack::StackEntryOptions {
+                            basis: Some(rpi_tui::layout_node::Basis::Auto),
+                            grow: Some(0.0),
+                            shrink: Some(1.0),
+                            min_size: Some(1.0),
+                            ..Default::default()
+                        },
+                    ),
+                ],
+                rpi_tui::components::stack::StackOptions::default(),
+            )));
+        *lock(&ui_state.fullscreen_layout_root) = Some(fullscreen_layout_root.clone());
+        *lock(&ui_state.fullscreen_transcript_scroll_view) = Some(transcript_scroll_view.clone());
+
+        // Apply layout root if starting in fullscreen mode
+        // (interactive-mode.ts:773-775).
+        if self.ui.mode() == TuiMode::Fullscreen {
+            self.ui.set_layout_root(Some(fullscreen_layout_root));
+        }
 
         InteractiveUi::setup_key_handlers(&ui_state);
         InteractiveUi::setup_editor_submit_handler(&ui_state);
@@ -3737,28 +4155,7 @@ impl InteractiveMode {
     /// disabled until then (`setAutoSync`, theme-controller.ts:107-111).
     async fn init_auto_theme(&self) {
         let ui = &self.ui_state.ui;
-        // `applyTerminalTheme` (theme-controller.ts:113-125): re-resolve the
-        // auto pair when the terminal reports a color scheme change. Runs on
-        // the driver thread (the TUI's tick) — the same thread as the drain,
-        // so the theme field lock never contends.
-        let listener_ui = Arc::clone(&self.ui_state);
-        ui.on_terminal_color_scheme_change(Box::new(move |scheme| {
-            let setting = listener_ui
-                .session()
-                .settings_manager(|settings| settings.get_theme_setting());
-            let Some((light, dark)) =
-                crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
-            else {
-                return;
-            };
-            let name = match scheme {
-                rpi_tui::terminal_colors::TerminalColorScheme::Light => light,
-                rpi_tui::terminal_colors::TerminalColorScheme::Dark => dark,
-            };
-            if let Ok(theme) = crate::core::themes::load_theme(&name, None) {
-                listener_ui.apply_theme(Arc::new(theme));
-            }
-        }));
+        self.ui_state.bind_terminal_color_scheme_listener();
 
         let setting = self
             .session
@@ -4193,9 +4590,92 @@ impl InteractiveMode {
         self.ui_state.render_handle.request_render();
     }
 
-    /// `shutdown` (interactive-mode.ts:3555-3594) — S4b basic version:
-    /// stop the driver, restore the terminal, dispose the runtime, print
-    /// the resume hint.
+    /// `switchTuiMode` (interactive-mode.ts:788-837 @ b103937d3): swap the
+    /// active renderer while preserving the component tree and focus. Returns
+    /// `false` (without side effects) when an overlay is open.
+    ///
+    /// `restore_progress`: restore the terminal progress indicator if the
+    /// session is streaming/compacting (interactive-mode.ts:829-835).
+    /// `start_renderer`: start the new renderer + rebind watchers
+    /// (interactive-mode.ts:825-828). `false` is used by `stopInteractiveTui`
+    /// for the transcript-exit path.
+    fn switch_tui_mode(
+        &mut self,
+        mode: TuiMode,
+        restore_progress: bool,
+        start_renderer: bool,
+    ) -> bool {
+        self.ui_state
+            .switch_tui_mode(mode, restore_progress, start_renderer)
+    }
+
+    /// `stopInteractiveTui` (interactive-mode.ts:779-786 @ ac4ac9eaf): the
+    /// fullscreen exit-output logic. `transcript` switches back to regular
+    /// first (so the main-screen renderer can paint the full transcript);
+    /// `resume-hint` stops the fullscreen renderer with `preserve_screen`
+    /// (only emits EXIT_ALT_SCREEN, no transcript).
+    fn stop_interactive_tui(
+        &mut self,
+        exit_output: crate::core::settings_manager::FullscreenExitOutput,
+    ) {
+        use crate::core::settings_manager::FullscreenExitOutput;
+        if self.ui.mode() == TuiMode::Fullscreen && exit_output == FullscreenExitOutput::Transcript
+        {
+            // Hide all overlays first (interactive-mode.ts:781).
+            while self.ui.has_overlay_entries() {
+                self.ui.hide_overlay();
+            }
+            // Switch back to regular, no progress restore, no start.
+            self.switch_tui_mode(TuiMode::Regular, false, false);
+            self.ui.render_now(false);
+        }
+        let preserve = self.ui.mode() == TuiMode::Fullscreen;
+        self.ui.stop(TuiStopOptions {
+            preserve_screen: preserve,
+        });
+    }
+
+    /// `handleFatalRuntimeError` (interactive-mode.ts:1949-1955): hardcodes
+    /// `transcript` exit output (ignores user setting) and exits the process.
+    pub(crate) async fn handle_fatal_runtime_error(&mut self, prefix: &str, error: &str) -> ! {
+        self.ui_state.show_error(&format!("{prefix}: {error}"));
+        // stopThemeWatcher + driver stop happen in shutdown; the fatal path
+        // skips the normal shutdown and directly stops the TUI.
+        self.driver_stop.store(true, Ordering::Relaxed);
+        if let Some(driver) = self.driver.take() {
+            let _ = driver.join();
+        }
+        self.theme_watcher_stop.store(true, Ordering::Relaxed);
+        if let Some(watcher) = self.theme_watcher.take() {
+            let _ = watcher.join();
+        }
+        self.git_watcher_stop.store(true, Ordering::Relaxed);
+        if let Some(watcher) = self.git_watcher.take() {
+            let _ = watcher.join();
+        }
+        // The fatal path calls upstream `stop("transcript")`
+        // (interactive-mode.ts:1953), whose sequence starts with
+        // disposeActiveSelector + clearing the terminal progress indicator +
+        // clearStatusIndicator (interactive-mode.ts:6381-6386). Mirror that
+        // prefix here (footer/extension-listener disposal has no local
+        // equivalent on this path; `shutdown` covers the normal exit).
+        self.ui_state.hide_selector();
+        let show_progress = self
+            .session
+            .settings_manager(|settings| settings.get_show_terminal_progress());
+        if show_progress {
+            self.ui.with_terminal(|t| t.set_progress(false));
+        }
+        self.ui_state.clear_status_indicator(None);
+        if let Some(unsubscribe) = self.unsubscribe.take() {
+            unsubscribe();
+        }
+        self.stop_interactive_tui(fatal_exit_output());
+        std::process::exit(1);
+    }
+
+    /// `shutdown` (interactive-mode.ts:3555-3594, 6380-6398) — S4b version
+    /// with T32 fullscreen exit behavior (interactive-mode.ts:779-786).
     async fn shutdown(&mut self) {
         if self.is_shutting_down {
             return;
@@ -4220,13 +4700,28 @@ impl InteractiveMode {
             let _ = watcher.join();
         }
 
-        // Restore the terminal (raw mode off, cursor shown).
-        self.ui.stop(TuiStopOptions::default());
+        // Dispose active selectors, clear progress, clear status, unsubscribe
+        // (interactive-mode.ts:6381-6392).
+        self.ui_state.hide_selector();
+        let show_progress = self
+            .session
+            .settings_manager(|settings| settings.get_show_terminal_progress());
+        if show_progress {
+            self.ui.with_terminal(|t| t.set_progress(false));
+        }
+        self.ui_state.clear_status_indicator(None);
 
         // Unsubscribe from session events (interactive-mode.ts:1735).
         if let Some(unsubscribe) = self.unsubscribe.take() {
             unsubscribe();
         }
+
+        // T32: stopInteractiveTui applies the fullscreen exit-output logic
+        // (interactive-mode.ts:6393-6396, 779-786 @ ac4ac9eaf).
+        let exit_output = self
+            .session
+            .settings_manager(|s| s.get_fullscreen_exit_output());
+        self.stop_interactive_tui(exit_output);
 
         // TODO: drain terminal input before exit (upstream
         // terminal.drainInput(1000), interactive-mode.ts:3572-3583) — the
@@ -4241,6 +4736,15 @@ impl InteractiveMode {
             );
         }
     }
+}
+
+/// The exit output used by the fatal path (`handleFatalRuntimeError`,
+/// interactive-mode.ts:1949-1955 `this.stop("transcript")` @ ac4ac9eaf):
+/// always `Transcript`, regardless of the user's `fullscreenExitOutput`
+/// setting — the main-screen renderer must repaint the full transcript so
+/// the fatal error stays visible after the process exits.
+fn fatal_exit_output() -> crate::core::settings_manager::FullscreenExitOutput {
+    crate::core::settings_manager::FullscreenExitOutput::Transcript
 }
 
 #[derive(Debug)]
@@ -6582,5 +7086,227 @@ mod tests {
         bridge.set_tools_expanded(true);
         assert!(bridge.get_tools_expanded());
         mode.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // T32: renderer selection + switch_tui_mode + exit behavior
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn switch_tui_mode_same_mode_is_noop() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // Default mode is regular → switching to regular is a no-op.
+        let result = mode.switch_tui_mode(TuiMode::Regular, true, true);
+        assert!(result, "same-mode switch returns true");
+        assert_eq!(mode.ui.mode(), TuiMode::Regular);
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn switch_tui_mode_rejects_when_overlay_open() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // Mount an overlay to block the switch.
+        let overlay_component = shared_component_from_boxed(Box::new(Container::new()));
+        let _handle = mode.ui.show_overlay(overlay_component, None);
+        assert!(mode.ui.has_overlay_entries());
+        let result = mode.switch_tui_mode(TuiMode::Fullscreen, true, true);
+        assert!(!result, "overlay rejection returns false");
+        assert_eq!(mode.ui.mode(), TuiMode::Regular, "mode unchanged");
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn switch_tui_mode_regular_to_fullscreen_and_back_preserves_children_and_focus() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let children_before = mode.ui.children_len();
+        let focus_before = mode.ui.get_focused_component();
+        assert!(focus_before.is_some(), "editor is focused");
+
+        // Regular → Fullscreen.
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        assert_eq!(
+            mode.ui.children_len(),
+            children_before,
+            "children preserved after switch to fullscreen"
+        );
+
+        // Fullscreen → Regular.
+        assert!(mode.switch_tui_mode(TuiMode::Regular, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Regular);
+        assert_eq!(
+            mode.ui.children_len(),
+            children_before,
+            "children preserved after round-trip"
+        );
+        let focus_after = mode.ui.get_focused_component();
+        assert!(focus_after.is_some(), "focus restored after round-trip");
+        mode.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_interactive_tui_fullscreen_resume_hint_preserves_screen() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // Switch to fullscreen first.
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        // Exit with resume-hint: should stop with preserve_screen=true.
+        mode.stop_interactive_tui(crate::core::settings_manager::FullscreenExitOutput::ResumeHint);
+        // The mode is still fullscreen (resume-hint doesn't switch back).
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+    }
+
+    #[tokio::test]
+    async fn stop_interactive_tui_fullscreen_transcript_switches_to_regular() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // Switch to fullscreen first.
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        // Exit with transcript: should switch back to regular first.
+        mode.stop_interactive_tui(crate::core::settings_manager::FullscreenExitOutput::Transcript);
+        assert_eq!(
+            mode.ui.mode(),
+            TuiMode::Regular,
+            "transcript exit switches to regular"
+        );
+    }
+
+    #[tokio::test]
+    async fn renderer_selection_defaults_to_regular() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        assert_eq!(
+            mode.ui.mode(),
+            TuiMode::Regular,
+            "default renderer is regular"
+        );
+    }
+
+    #[tokio::test]
+    async fn renderer_selection_fullscreen_from_options() {
+        let harness = build_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions {
+                tui_mode: TuiMode::Fullscreen,
+                ..Default::default()
+            },
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        assert_eq!(
+            mode.ui.mode(),
+            TuiMode::Fullscreen,
+            "CLI tui_mode=fullscreen selects alt screen"
+        );
+    }
+
+    /// B2 (interactive-mode.ts:827 `themeController.rebindTui()`): after a
+    /// renderer swap, the new renderer holds the terminal color-scheme
+    /// listener registration (dark/light auto-follow keeps working).
+    #[tokio::test]
+    async fn switch_tui_mode_rebinds_theme_listener_on_new_renderer() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // `init` alone does not bind the listener (`init_auto_theme` runs in
+        // `run`), so the initial renderer starts without a registration.
+        assert_eq!(mode.ui.terminal_color_scheme_listener_count(), 0);
+
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, true, true));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        assert_eq!(
+            mode.ui.terminal_color_scheme_listener_count(),
+            1,
+            "theme listener rebound on the fullscreen renderer"
+        );
+
+        assert!(mode.switch_tui_mode(TuiMode::Regular, true, true));
+        assert_eq!(mode.ui.mode(), TuiMode::Regular);
+        assert_eq!(
+            mode.ui.terminal_color_scheme_listener_count(),
+            1,
+            "theme listener rebound on the round-tripped regular renderer"
+        );
+        mode.shutdown().await;
+    }
+
+    /// S1 (interactive-mode.ts:1894-1896 `applyFullscreenScrollbarSetting`):
+    /// a fullscreenScrollbar change made in regular mode applies to the
+    /// transcript scroll view living in `fullscreen_layout_root`, so the new
+    /// value is in effect after switching to fullscreen.
+    #[tokio::test]
+    async fn fullscreen_scrollbar_change_in_regular_mode_sticks_for_fullscreen_switch() {
+        use rpi_tui::components::scroll_view::ScrollbarMode;
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        assert_eq!(mode.ui.mode(), TuiMode::Regular);
+        let transcript_scrollbar = |mode: &InteractiveMode| {
+            let scroll_view = lock(&mode.ui_state.fullscreen_transcript_scroll_view)
+                .clone()
+                .expect("transcript scroll view retained at init");
+            let guard = lock(&scroll_view);
+            guard.as_scroll_view().map(|view| view.scrollbar())
+        };
+        assert_eq!(transcript_scrollbar(&mode), Some(ScrollbarMode::Auto));
+
+        // Change the setting while the main-screen renderer is active (the
+        // `TuiHandle::set_fullscreen_scrollbar` dispatch no-ops on Main, so
+        // only the direct apply can land).
+        mode.ui_state
+            .apply_fullscreen_scrollbar(ScrollbarMode::Always);
+        assert_eq!(
+            transcript_scrollbar(&mode),
+            Some(ScrollbarMode::Always),
+            "change in regular mode reaches the transcript scroll view"
+        );
+
+        // Switch to fullscreen: the mounted layout root carries the new
+        // value (the scroll view is the same component).
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        assert_eq!(
+            transcript_scrollbar(&mode),
+            Some(ScrollbarMode::Always),
+            "fullscreen switch keeps the value set in regular mode"
+        );
+        mode.shutdown().await;
+    }
+
+    /// Verifies the fatal exit path hardcodes Transcript even when the user
+    /// setting is ResumeHint (interactive-mode.ts:1949-1955 @ ac4ac9eaf).
+    /// We can't call `handle_fatal_runtime_error` (it calls `process::exit`),
+    /// so the test goes through the extracted decision point
+    /// (`fatal_exit_output`) and then verifies the exit behavior that
+    /// decision drives.
+    #[tokio::test]
+    async fn fatal_exit_hardcodes_transcript_even_when_setting_is_resume_hint() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // Set user setting to resume-hint (must be ignored on fatal exit).
+        mode.session.settings_manager(|s| {
+            s.set_fullscreen_exit_output(
+                crate::core::settings_manager::FullscreenExitOutput::ResumeHint,
+            )
+        });
+        // The fatal decision ignores the user setting.
+        assert_eq!(
+            fatal_exit_output(),
+            crate::core::settings_manager::FullscreenExitOutput::Transcript,
+            "fatal path decides Transcript regardless of the resume-hint setting"
+        );
+        // Switch to fullscreen.
+        assert!(mode.switch_tui_mode(TuiMode::Fullscreen, false, false));
+        assert_eq!(mode.ui.mode(), TuiMode::Fullscreen);
+        // The fatal exit uses the decision output: switches back to regular.
+        mode.stop_interactive_tui(fatal_exit_output());
+        assert_eq!(
+            mode.ui.mode(),
+            TuiMode::Regular,
+            "fatal exit with Transcript switches to regular regardless of user setting"
+        );
     }
 }

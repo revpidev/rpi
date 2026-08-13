@@ -88,6 +88,7 @@ Common options:
 | `--continue` / `--resume` | Continue the last session or resume a named one |
 | `--session <id>` / `--fork <id>` | Open or fork a specific session |
 | `--print` | Non-interactive single turn, prints the reply and exits |
+| `--tui-mode regular\|fullscreen` | Select the terminal UI mode: regular (inline) or fullscreen (alt-screen) |
 | `--export <format>` | Export a session (e.g. HTML) |
 | `--offline` | Disable all network endpoints for this run |
 | `rpi <message>` | One-shot prompt in non-interactive mode |
@@ -161,7 +162,7 @@ scripts/verify-upstream.sh # confirm external/pi is at the pinned commit
 
 ## Status
 
-v0.1 (T01–T16) complete: four-layer crates (`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`) plus the extension host (L0 native + L1 Wasm) delivered. v0.11 in progress (upstream baseline raised to `4181f66` / v0.84.1+).
+v0.1 (T01–T16) complete: four-layer crates (`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`) plus the extension host (L0 native + L1 Wasm) delivered. v0.11 in progress (upstream baseline raised to `4181f66` / v0.84.1+): JSON/RPC delta-only wire format, stream-termination semantics across all provider families, settings deep-merge, length-stop recovery chain, auth command family (`auth check` / `print-api-key`), extension API additions (model registry, markdown transformers), TUI trait refactor with dual renderers (regular + fullscreen alt-screen via `--tui-mode`), LaTeX/Mermaid rendering, and a viewport layout engine.
 
 ## License
 

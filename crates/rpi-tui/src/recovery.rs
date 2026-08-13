@@ -44,6 +44,8 @@ use crate::tui_main_screen::TuiMainScreen;
 /// `ProcessTerminal::stop` (tui.ts:689-714, terminal.ts:396-449) in the same
 /// order, minus the state-dependent parts the fallback cannot know
 /// (progress keepalive clear, cursor repositioning):
+/// 0. `\x1b[?1049l` — exit alternate screen (T32: the panic hook may fire
+///    while the fullscreen renderer is active; this restores the main screen)
 /// 1. `\x1b[?2031l` — color scheme notifications off (`TuiMainScreen::stop_internal`)
 /// 2. `\x1b[?2004l` — bracketed paste off
 /// 3. `\x1b[<u` — pop Kitty keyboard protocol
@@ -52,7 +54,8 @@ use crate::tui_main_screen::TuiMainScreen;
 ///
 /// Raw mode restore (`crossterm::terminal::disable_raw_mode`) is a syscall,
 /// not part of this byte sequence.
-const MINIMAL_RESTORE_SEQUENCE: &str = "\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
+const MINIMAL_RESTORE_SEQUENCE: &str =
+    "\x1b[?1049l\x1b[?2031l\x1b[?2004l\x1b[<u\x1b[>4;0m\x1b[?25h";
 
 /// Restore the terminal via `tui.stop()`; fall back to a fixed restore
 /// sequence + raw-mode reset when the `TuiMainScreen` lock is held by the panicking

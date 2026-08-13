@@ -45,7 +45,7 @@ use crate::keybindings::{get_keybindings, Keybinding};
 use crate::keys::{decode_printable_key, matches_key};
 use crate::kill_ring::{KillRing, KillRingPushOptions};
 use crate::tui::{Component, Focusable, CURSOR_MARKER};
-use crate::tui_main_screen::TuiMainScreen;
+use crate::tui_handle::TuiHandle;
 use crate::undo_stack::UndoStack;
 use crate::utils::{
     cjk_break_regex, get_grapheme_segmenter, is_whitespace_char, slice_by_column, visible_width,
@@ -600,7 +600,7 @@ pub struct Editor {
     /// Focusable interface — set by TUI when focus changes.
     focused: bool,
 
-    tui: TuiMainScreen,
+    tui: TuiHandle,
     /// Select list theme shared with each recreated autocomplete list.
     select_list_theme: Arc<SelectListTheme>,
     padding_x: usize,
@@ -675,7 +675,7 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(tui: TuiMainScreen, theme: EditorTheme, options: EditorOptions) -> Self {
+    pub fn new(tui: TuiHandle, theme: EditorTheme, options: EditorOptions) -> Self {
         let EditorTheme {
             border_color,
             select_list,
@@ -3634,6 +3634,7 @@ mod tests {
     use super::*;
     use crate::autocomplete::{CompletionResult, SlashCommand, SlashCommandOrItem};
     use crate::terminal::Terminal;
+    use crate::tui_handle::TuiHandle;
     use crate::tui_main_screen::TuiMainScreen;
 
     /// Virtual terminal for tests (upstream test `VirtualTerminal`,
@@ -3685,8 +3686,11 @@ mod tests {
     }
 
     /// `createTestTUI` (editor.test.ts:11-14).
-    fn test_tui(columns: usize, rows: usize) -> TuiMainScreen {
-        TuiMainScreen::new(Box::new(TestTerminal::new(columns as u16, rows as u16)))
+    fn test_tui(columns: usize, rows: usize) -> TuiHandle {
+        TuiHandle::from_main(TuiMainScreen::new(Box::new(TestTerminal::new(
+            columns as u16,
+            rows as u16,
+        ))))
     }
 
     /// `defaultEditorTheme` with identity styling (test-themes.ts:35-38,

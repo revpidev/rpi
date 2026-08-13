@@ -29,11 +29,18 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use crate::layout_node::{LayoutNode, ScrollLayoutNode, ScrollLayoutState};
 use crate::tui::{lock_component, Component, RenderHandle, SharedComponent};
 
 /// `ScrollViewScrollbar` (scroll-view.ts:4): `"hidden" | "auto" | "always"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serde derives added for the `fullscreenScrollbar` settings key
+/// (settings-manager.ts:1150-1159 @ 4181f66, T32); the wire format is the
+/// lowercase string form matching upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ScrollbarMode {
     #[default]
     Hidden,

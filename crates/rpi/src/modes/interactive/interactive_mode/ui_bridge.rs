@@ -263,12 +263,16 @@ impl UiBridge for InteractiveUiBridge {
     }
 
     /// `onTerminalInput` (interactive-mode.ts:2187-2205 area) via the Tui
-    /// input-listener registry (tui.ts:651-658).
+    /// input-listener registry (tui.ts:651-658). The handler is also stored
+    /// in `extension_input_listeners` for re-registration during
+    /// `switch_tui_mode` (interactive-mode.ts:2303-2318).
     fn on_terminal_input(&self, handler: TerminalInputHandler) -> Unsubscribe {
         let Some(ui) = self.ui() else {
             return Box::new(|| {});
         };
         let _ = self.next_input_listener.fetch_add(1, Ordering::Relaxed);
+        let handler_arc: Arc<dyn Fn(String) -> Option<TerminalInputResult> + Send + Sync> =
+            Arc::clone(&handler);
         let id = ui.ui.add_input_listener(Box::new(move |data: &str| {
             handler(data.to_owned()).map(|result: TerminalInputResult| {
                 rpi_tui::tui::TuiInputListenerResult {
@@ -277,8 +281,16 @@ impl UiBridge for InteractiveUiBridge {
                 }
             })
         }));
+        // Track for rebind on switch_tui_mode (interactive-mode.ts:2306-2307).
+        lock(&ui.extension_input_listeners).push((id, handler_arc));
+        let ui_weak = Arc::downgrade(&ui);
         let tui = ui.ui.clone();
-        Box::new(move || tui.remove_input_listener(id))
+        Box::new(move || {
+            tui.remove_input_listener(id);
+            if let Some(ui) = ui_weak.upgrade() {
+                lock(&ui.extension_input_listeners).retain(|(lid, _)| *lid != id);
+            }
+        })
     }
 
     /// `setStatus` — footer extension status; `None` clears.
