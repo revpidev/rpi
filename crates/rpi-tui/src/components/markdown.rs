@@ -35,6 +35,40 @@
 //! - The table fallback (`token.raw`) re-appends the trailing newline when
 //!   the source had one, so `wrapTextWithAnsi` produces the same trailing
 //!   empty line as upstream.
+//! - The width-aware `transform` option (markdown.ts:285 @ 4181f66) runs on
+//!   every render and the transformed text is part of the render cache key;
+//!   upstream caches by raw source text + width and skips the transform on
+//!   cache hits. A stateful transform closure (e.g. the mermaid
+//!   streaming/final switch) therefore cannot serve stale lines here.
+//! - LaTeX integration (markdown.ts:26-144 @ 4181f66): marked tokenizer
+//!   extensions (`tokenizeInlineLatex`, `tokenizeBlockLatex`,
+//!   `looksLikePendingDollarMath`, `isEscaped`, `findClosingDelimiter`) are
+//!   ported as free functions below (same snake_case names). comrak has no
+//!   tokenizer extension mechanism, so the integration point differs:
+//!   display-math blocks are detected on `Paragraph` nodes by scanning their
+//!   raw source with `tokenize_block_latex` at every line start and splitting
+//!   the paragraph into plain/display segments (render-time, equivalent to
+//!   marked cutting its paragraph before the next `startBlock` match,
+//!   markdown.ts:129 + marked's `startBlock` paragraph truncation); inline
+//!   math is scanned on each `Text` node's raw source slice, equivalent to
+//!   marked's inline extension being called at every lexer position.
+//!   Deviations:
+//!   - A pending inline token only consumes the rest of its text node plus
+//!     the raw slices of the remaining siblings (upstream consumes the rest
+//!     of the inline source); identical for the common case where the pending
+//!     span ends the paragraph.
+//!   - A pending display token is scoped to its paragraph (upstream consumes
+//!     the rest of the document). Both self-heal when the delimiter closes.
+//!   - Inline math cannot cross comrak inline-node boundaries (e.g. `*`
+//!     emphasis inside `$...$`); upstream's latex tokenizer wins over
+//!     emphasis in those cases. Plain segments of mixed text nodes are
+//!     re-emitted from the raw source with CommonMark backslash-escape
+//!     resolution (HTML entity decoding is not re-applied there).
+//!   - Display math spanning a blank line is not merged (comrak splits the
+//!     paragraph); upstream's lazy block regex can span blank lines.
+//!   - `render_latex` is part of the render cache key (upstream has no such
+//!     cache key); flipping the option without `invalidate()` re-renders
+//!     instead of serving stale lines.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -43,6 +77,7 @@ use comrak::nodes::{Node, NodeValue, Sourcepos};
 use comrak::Arena;
 use comrak::{parse_document, Options};
 
+use crate::latex::render_latex;
 use crate::terminal_image::{get_capabilities, hyperlink, is_image_line};
 use crate::tui::Component;
 use crate::utils::{
@@ -119,14 +154,43 @@ impl MarkdownTheme {
     }
 }
 
-/// `MarkdownOptions` (markdown.ts:98-103).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Width-aware Markdown source transform (markdown.ts:102-103 @ 4181f66):
+/// receives the raw Markdown source and the available content width
+/// (`width - paddingX * 2`), returns the transformed source. Applied before
+/// parsing (markdown.ts:285). rpi-tui stays host-agnostic, so this is a
+/// plain function type — the ext-host `MarkdownTransformerFn` (with its
+/// `MarkdownTransformContext`) is adapted onto it by the rpi crate.
+pub type MarkdownTransformFn = Arc<dyn Fn(&str, usize) -> String + Send + Sync>;
+
+/// `MarkdownOptions` (markdown.ts:98-103). Not `Copy`/`PartialEq`/`Debug`:
+/// the `transform` field carries a closure. `render_latex` defaults to
+/// `true` (markdown.ts:98-99), so `Default` is implemented manually.
+#[derive(Clone)]
 pub struct MarkdownOptions {
     /// Preserve source list markers instead of normalizing them.
     pub preserve_ordered_list_markers: bool,
     /// Preserve source backslash escapes instead of normalizing escaped
     /// punctuation.
     pub preserve_backslash_escapes: bool,
+    /// Render LaTeX math spans (`$...$`, `\(...\)`, …). Consumed by the
+    /// LaTeX renderer (T29); not yet wired into `render_token` — see the
+    /// TODO marker there.
+    pub render_latex: bool,
+    /// Optional width-aware source transform, applied before parsing
+    /// (markdown.ts:285). `None` = pass-through.
+    pub transform: Option<MarkdownTransformFn>,
+}
+
+impl Default for MarkdownOptions {
+    fn default() -> Self {
+        MarkdownOptions {
+            preserve_ordered_list_markers: false,
+            preserve_backslash_escapes: false,
+            // markdown.ts:98-99: latex rendering is on by default.
+            render_latex: true,
+            transform: None,
+        }
+    }
 }
 
 /// `InlineStyleContext` (markdown.ts:105-108).
@@ -175,10 +239,15 @@ enum TokenType {
 const STYLE_SENTINEL: char = '\0';
 
 /// Render cache entry (upstream `cachedText` / `cachedWidth` / `cachedLines`,
-/// markdown.ts:120-122).
+/// markdown.ts:120-122). The transformed source and the `render_latex` option
+/// are part of the cache key so a stateful transform closure or a flipped
+/// option cannot serve stale lines (deviation from upstream, which keys on
+/// the raw source text only — T29).
 struct MarkdownCache {
     text: String,
+    transformed: String,
     width: usize,
+    render_latex: bool,
     lines: Vec<String>,
 }
 
@@ -262,6 +331,379 @@ fn is_js_whitespace(c: char) -> bool {
 /// JS `\S` (negated `\s`).
 fn is_js_non_whitespace(c: char) -> bool {
     !is_js_whitespace(c)
+}
+
+/// ECMA-262 `String.prototype.trimEnd` (upstream `.trim()`/`.trimEnd()` on
+/// latex raw/text uses the `\s` set above, not Rust's Unicode White_Space).
+fn trim_js_end(s: &str) -> &str {
+    let mut start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        if !is_js_whitespace(c) {
+            break;
+        }
+        start = i;
+    }
+    &s[..start]
+}
+
+/// ECMA-262 `String.prototype.trimStart`.
+fn trim_js_start(s: &str) -> &str {
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if !is_js_whitespace(c) {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    &s[end..]
+}
+
+/// ECMA-262 `String.prototype.trim`.
+fn trim_js(s: &str) -> &str {
+    trim_js_end(trim_js_start(s))
+}
+
+/// `isEscaped` (markdown.ts:32-38): an odd number of backslashes before the
+/// position.
+fn is_escaped(source: &str, index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut position = index;
+    while position > 0 && source.as_bytes()[position - 1] == b'\\' {
+        backslashes += 1;
+        position -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// `findClosingDelimiter` (markdown.ts:40-46): first closing delimiter that
+/// is not escaped.
+fn find_closing_delimiter(source: &str, closing: &str, start: usize) -> Option<usize> {
+    let mut index = source[start..].find(closing).map(|i| i + start);
+    while let Some(found) = index {
+        if !is_escaped(source, found) {
+            return Some(found);
+        }
+        index = source[found + closing.len()..]
+            .find(closing)
+            .map(|i| i + found + closing.len());
+    }
+    None
+}
+
+/// `looksLikePendingDollarMath` (markdown.ts:48-50):
+/// `/\\[A-Za-z]+|[_^=+*/<>()[\]|±≤≥≠≈∈→⇒∞∫∑√-]/`.
+fn looks_like_pending_dollar_math(source: &str) -> bool {
+    if source.contains('\\') {
+        let bytes = source.as_bytes();
+        for i in 0..bytes.len() - 1 {
+            if bytes[i] == b'\\' && bytes[i + 1].is_ascii_alphabetic() {
+                return true;
+            }
+        }
+    }
+    source.chars().any(|c| {
+        matches!(
+            c,
+            '_' | '^'
+                | '='
+                | '+'
+                | '*'
+                | '/'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '|'
+                | '±'
+                | '≤'
+                | '≥'
+                | '≠'
+                | '≈'
+                | '∈'
+                | '→'
+                | '⇒'
+                | '∞'
+                | '∫'
+                | '∑'
+                | '√'
+                | '-'
+        )
+    })
+}
+
+/// `/^[A-Z_][A-Z0-9_]*(?:[^A-Za-z0-9_\s])?$/` (markdown.ts:77) — the currency
+/// half of the `$` guard.
+fn is_currency_content(content: &str) -> bool {
+    let mut chars = content.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_uppercase() || first == '_') {
+        return false;
+    }
+    for c in chars.by_ref() {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' {
+            continue;
+        }
+        // The single optional trailing character must be the last one and
+        // must not be a word character or ECMA whitespace.
+        return chars.next().is_none() && !is_js_whitespace(c);
+    }
+    true
+}
+
+/// An inline LaTeX token (upstream `LatexToken` with `type: "latex"`,
+/// markdown.ts:26-30).
+struct LatexInlineToken<'a> {
+    raw: &'a str,
+    text: &'a str,
+    pending: bool,
+}
+
+/// `tokenizeInlineLatex` (markdown.ts:52-99).
+fn tokenize_inline_latex(source: &str) -> Option<LatexInlineToken<'_>> {
+    let (opening, closing) = if source.starts_with("$$") {
+        ("$$", "$$")
+    } else if source.starts_with("\\(") {
+        ("\\(", "\\)")
+    } else if source.starts_with("\\[") {
+        ("\\[", "\\]")
+    } else if source.starts_with('$') && !source[1..].chars().next().is_some_and(is_js_whitespace) {
+        ("$", "$")
+    } else {
+        return None;
+    };
+
+    if let Some(closing_index) = find_closing_delimiter(source, closing, opening.len()) {
+        if opening == "$" {
+            let content = &source[opening.len()..closing_index];
+            let after = &source[closing_index + closing.len()..];
+            let content_ends_whitespace = content.chars().next_back().is_some_and(is_js_whitespace);
+            let after_starts_digit = after.chars().next().is_some_and(|c| c.is_ascii_digit());
+            let currency = is_currency_content(content)
+                && after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+            if content_ends_whitespace || after_starts_digit || currency || content.contains('`') {
+                return None;
+            }
+        }
+        let text = &source[opening.len()..closing_index];
+        if text.is_empty() || text.contains('\n') {
+            return None;
+        }
+        return Some(LatexInlineToken {
+            raw: &source[..closing_index + closing.len()],
+            text,
+            pending: false,
+        });
+    }
+
+    let pending_source = &source[opening.len()..];
+    if opening.starts_with('\\') || looks_like_pending_dollar_math(pending_source) {
+        return Some(LatexInlineToken {
+            raw: source,
+            text: pending_source,
+            pending: true,
+        });
+    }
+    None
+}
+
+/// Skip the ` {0,3}` prefix of the block latex patterns.
+fn skip_up_to_3_spaces(source: &str) -> &str {
+    let mut rest = source;
+    for _ in 0..3 {
+        rest = rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    rest
+}
+
+/// Skip the `[ \t]*` runs of the block latex patterns.
+fn skip_horizontal(source: &str) -> &str {
+    source.trim_start_matches([' ', '\t'])
+}
+
+/// The shared shape of `dollarMatch` and `bracketMatch` (markdown.ts:102-110):
+/// `^ {0,3}(opening)[ \t]*(?:\n)?([\s\S]*?)(closing)[ \t]*(?:\n|$)`. Returns
+/// the content (un-trimmed) and the total match length; the closing must be
+/// followed by horizontal whitespace and then a newline or end of input
+/// (lazy — the first such closing wins).
+fn match_block_delimited<'s>(
+    source: &'s str,
+    opening: &str,
+    closing: &str,
+) -> Option<(&'s str, usize)> {
+    let after_opening = skip_up_to_3_spaces(source).strip_prefix(opening)?;
+    let after_horizontal = skip_horizontal(after_opening);
+    let content_start = after_horizontal
+        .strip_prefix('\n')
+        .unwrap_or(after_horizontal);
+
+    let mut search = content_start;
+    let content_start_offset = content_start.as_ptr() as usize - source.as_ptr() as usize;
+    while let Some(relative) = search.find(closing) {
+        let tail = &search[relative + closing.len()..];
+        let tail_after_horizontal = skip_horizontal(tail);
+        let trailing_ws_len = tail.len() - tail_after_horizontal.len();
+        if tail_after_horizontal.is_empty() || tail_after_horizontal.starts_with('\n') {
+            let trailing_newline = usize::from(tail_after_horizontal.starts_with('\n'));
+            let raw_len = content_start_offset
+                + relative
+                + closing.len()
+                + trailing_ws_len
+                + trailing_newline;
+            return Some((&content_start[..relative], raw_len));
+        }
+        search = &search[relative + closing.len()..];
+    }
+    None
+}
+
+/// The shared `^ {0,3}(opening)[ \t]*(?:\n)?` prefix of the pending block
+/// patterns (markdown.ts:112-119).
+fn strip_block_opening<'s>(source: &'s str, opening: &str) -> Option<&'s str> {
+    let after_opening = skip_up_to_3_spaces(source).strip_prefix(opening)?;
+    let after_horizontal = skip_horizontal(after_opening);
+    Some(
+        after_horizontal
+            .strip_prefix('\n')
+            .unwrap_or(after_horizontal),
+    )
+}
+
+/// A display LaTeX token (upstream `LatexToken` with `type: "latexBlock"`).
+struct LatexBlockToken<'a> {
+    raw: &'a str,
+    text: &'a str,
+    pending: bool,
+}
+
+/// `tokenizeBlockLatex` (markdown.ts:101-121).
+fn tokenize_block_latex(source: &str) -> Option<LatexBlockToken<'_>> {
+    // dollarMatch: `^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*?)\$\$[ \t]*(?:\n|$)`.
+    // A falsy (empty) content group makes upstream fall through.
+    if let Some((content, raw_len)) = match_block_delimited(source, "$$", "$$") {
+        if !content.is_empty() {
+            return Some(LatexBlockToken {
+                raw: &source[..raw_len],
+                text: trim_js(content),
+                pending: false,
+            });
+        }
+    }
+    // bracketMatch: `^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*?)\\\][ \t]*(?:\n|$)`.
+    if let Some((content, raw_len)) = match_block_delimited(source, "\\[", "\\]") {
+        if !content.is_empty() {
+            return Some(LatexBlockToken {
+                raw: &source[..raw_len],
+                text: trim_js(content),
+                pending: false,
+            });
+        }
+    }
+    // pendingBracket: `^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*)$` — always pending.
+    if let Some(rest) = strip_block_opening(source, "\\[") {
+        return Some(LatexBlockToken {
+            raw: source,
+            text: rest,
+            pending: true,
+        });
+    }
+    // pendingDollar: `^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*)$` — pending only for
+    // non-empty math-looking content.
+    if let Some(rest) = strip_block_opening(source, "$$") {
+        if !rest.is_empty() && looks_like_pending_dollar_math(rest) {
+            return Some(LatexBlockToken {
+                raw: source,
+                text: rest,
+                pending: true,
+            });
+        }
+    }
+    None
+}
+
+/// CommonMark backslash-escape resolution for the plain segments of mixed
+/// text nodes (comrak resolves escapes in its literal; raw slices keep them).
+fn resolve_backslash_escapes(text: &str) -> String {
+    if !text.contains('\\') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.peek().copied() {
+                Some(next) if next.is_ascii_punctuation() => {
+                    out.push(next);
+                    chars.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// One segment of a paragraph split for display LaTeX (see
+/// `split_latex_blocks`).
+enum LatexParagraphSegment<'a> {
+    Plain {
+        start: usize,
+        end: usize,
+    },
+    Latex {
+        start: usize,
+        end: usize,
+        token: LatexBlockToken<'a>,
+    },
+}
+
+/// Split a paragraph's raw source into plain and display-LaTeX segments,
+/// trying `tokenize_block_latex` at every line start — the equivalent of
+/// marked's block tokenizer running at block boundaries and its `startBlock`
+/// truncating the paragraph before the next block-LaTeX opening.
+fn split_latex_blocks(raw: &str) -> Vec<LatexParagraphSegment<'_>> {
+    let mut segments = Vec::new();
+    let mut position = 0;
+    let mut plain_start = 0;
+    while position < raw.len() {
+        match tokenize_block_latex(&raw[position..]) {
+            Some(token) => {
+                if position > plain_start {
+                    segments.push(LatexParagraphSegment::Plain {
+                        start: plain_start,
+                        end: position,
+                    });
+                }
+                let raw_len = token.raw.len();
+                segments.push(LatexParagraphSegment::Latex {
+                    start: position,
+                    end: position + raw_len,
+                    token,
+                });
+                position += raw_len;
+                plain_start = position;
+            }
+            None => match raw[position..].find('\n') {
+                Some(newline) => position += newline + 1,
+                None => break,
+            },
+        }
+    }
+    if plain_start < raw.len() {
+        segments.push(LatexParagraphSegment::Plain {
+            start: plain_start,
+            end: raw.len(),
+        });
+    }
+    segments
 }
 
 /// Whether the source gap between two blocks contains a blank line. Blank
@@ -689,6 +1131,20 @@ impl Markdown {
         source: &str,
         style_context: &InlineStyleContext<'_>,
     ) -> String {
+        self.render_inline_tokens_in_range(node, source, style_context, None)
+    }
+
+    /// `renderInlineTokens` restricted to an absolute source byte range —
+    /// used for the plain segments of a paragraph split around display LaTeX.
+    /// A soft break at `end - 1` (the newline the next segment starts after)
+    /// is excluded so the segment does not end with a stray line break.
+    fn render_inline_tokens_in_range(
+        &self,
+        node: Node<'_>,
+        source: &str,
+        style_context: &InlineStyleContext<'_>,
+        range: Option<(usize, usize)>,
+    ) -> String {
         let mut result = String::new();
         let apply_text_with_newlines = |text: &str| -> String {
             let segments: Vec<&str> = text.split('\n').collect();
@@ -699,18 +1155,60 @@ impl Markdown {
                 .join("\n")
         };
 
-        for token in node.children() {
+        let children: Vec<Node<'_>> = match range {
+            Some((start, end)) => node
+                .children()
+                .filter(|child| {
+                    let child_start = node_start_offset(source, child);
+                    if child_start < start || child_start >= end {
+                        return false;
+                    }
+                    if child_start == end - 1
+                        && matches!(child.data.borrow().value, NodeValue::SoftBreak)
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .collect(),
+            None => node.children().collect(),
+        };
+
+        let mut index = 0;
+        while index < children.len() {
+            let token = children[index];
             let value = &token.data.borrow().value;
             match value {
                 NodeValue::Text(text) => {
                     // Escape tokens (upstream `escape`) are resolved into
                     // text nodes; re-emit the backslash when preserving.
-                    let rendered = if self.options.preserve_backslash_escapes {
-                        re_escape_backslashes(node_slice(source, token.data.borrow().sourcepos))
+                    let raw = node_slice(source, token.data.borrow().sourcepos);
+                    if self.options.render_latex {
+                        if let Some(pending_tail) = self.render_inline_text_with_latex(
+                            raw,
+                            &apply_text_with_newlines,
+                            &mut result,
+                        ) {
+                            // Pending token (markdown.ts:84-89): the raw
+                            // source from the opening to the end of the
+                            // inline source, i.e. the rest of this text node
+                            // plus the raw slices of the remaining siblings.
+                            let mut pending_raw = pending_tail.to_string();
+                            for sibling in &children[index + 1..] {
+                                pending_raw
+                                    .push_str(node_slice(source, sibling.data.borrow().sourcepos));
+                            }
+                            result.push_str(&apply_text_with_newlines(&pending_raw));
+                            break;
+                        }
                     } else {
-                        text.to_string()
-                    };
-                    result.push_str(&apply_text_with_newlines(&rendered));
+                        let rendered = if self.options.preserve_backslash_escapes {
+                            re_escape_backslashes(raw)
+                        } else {
+                            text.to_string()
+                        };
+                        result.push_str(&apply_text_with_newlines(&rendered));
+                    }
                 }
                 NodeValue::Strong => {
                     let bold_content = self.render_inline_tokens(token, source, style_context);
@@ -801,6 +1299,7 @@ impl Markdown {
                 // matching the upstream default case (no `text` property).
                 _ => {}
             }
+            index += 1;
         }
 
         while !style_context.style_prefix.is_empty() && result.ends_with(style_context.style_prefix)
@@ -808,6 +1307,68 @@ impl Markdown {
             result.truncate(result.len() - style_context.style_prefix.len());
         }
         result
+    }
+
+    /// Scan a text node's raw source for inline LaTeX — the equivalent of
+    /// marked's inline `latex` tokenizer extension being called at every
+    /// lexer position (markdown.ts:52-99, 645-652). Emits plain segments
+    /// (with backslash-escape resolution, like comrak's resolved literal)
+    /// and rendered math (`renderLatex(text) ?? raw`). Returns the pending
+    /// tail when the node ends with an unclosed math opening (upstream
+    /// pending token raw, markdown.ts:84-89).
+    fn render_inline_text_with_latex<'r>(
+        &self,
+        raw: &'r str,
+        apply: &dyn Fn(&str) -> String,
+        result: &mut String,
+    ) -> Option<&'r str> {
+        let emit_plain = |segment: &str, result: &mut String| {
+            if segment.is_empty() {
+                return;
+            }
+            let text = if self.options.preserve_backslash_escapes {
+                re_escape_backslashes(segment)
+            } else {
+                resolve_backslash_escapes(segment)
+            };
+            result.push_str(&apply(&text));
+        };
+
+        let mut position = 0;
+        let mut plain_start = 0;
+        while position < raw.len() {
+            match tokenize_inline_latex(&raw[position..]) {
+                Some(token) => {
+                    emit_plain(&raw[plain_start..position], result);
+                    if token.pending {
+                        return Some(&raw[position..]);
+                    }
+                    let rendered =
+                        render_latex(token.text, false).unwrap_or_else(|| token.raw.to_string());
+                    result.push_str(&apply(&rendered));
+                    position += token.raw.len();
+                    plain_start = position;
+                }
+                None => {
+                    // marked's lexer order: the latex extension fails at the
+                    // backslash, then the escape tokenizer consumes `\X`
+                    // (backslash + ASCII punctuation) as one unit — the
+                    // escaped character is never a tokenizer position.
+                    let rest = &raw[position..];
+                    let advance = if rest.starts_with('\\') {
+                        match rest.chars().nth(1) {
+                            Some(next) if next.is_ascii_punctuation() => 2,
+                            _ => 1,
+                        }
+                    } else {
+                        rest.chars().next().map_or(1, char::len_utf8)
+                    };
+                    position += advance;
+                }
+            }
+        }
+        emit_plain(&raw[plain_start..], result);
+        None
     }
 
     /// `getOrderedListMarker` (markdown.ts:591-594).
@@ -906,6 +1467,83 @@ impl Markdown {
         rest[4..].chars().next().is_some_and(is_js_non_whitespace)
     }
 
+    /// Render a paragraph whose raw source contains display-LaTeX blocks
+    /// (`$$...$$` / `\[...\]` at line starts, markdown.ts:101-144 + 505-517).
+    /// Splits the paragraph into plain and display segments — the equivalent
+    /// of marked's block tokenizer + `startBlock` paragraph truncation — and
+    /// renders them with the upstream block spacing rules: each non-last
+    /// segment gets a blank line after it; the last one follows the spacing
+    /// rule of its own block type (paragraph skips `list`/`space`,
+    /// latexBlock only skips `space`, markdown.ts:495-498 + 514-516).
+    /// Returns `None` when the paragraph contains no display LaTeX.
+    fn render_paragraph_with_latex(
+        &self,
+        token: Node<'_>,
+        source: &str,
+        next_token_type: Option<TokenType>,
+        style_context: &InlineStyleContext<'_>,
+    ) -> Option<Vec<String>> {
+        let raw = node_raw(source, token.data.borrow().sourcepos);
+        let segments = split_latex_blocks(raw);
+        if !segments
+            .iter()
+            .any(|segment| matches!(segment, LatexParagraphSegment::Latex { .. }))
+        {
+            return None;
+        }
+
+        let paragraph_start = node_start_offset(source, token);
+        let segment_count = segments.len();
+        let mut lines: Vec<String> = Vec::new();
+        for (index, segment) in segments.iter().enumerate() {
+            let is_latex = match segment {
+                LatexParagraphSegment::Plain { start, end } => {
+                    let text = self.render_inline_tokens_in_range(
+                        token,
+                        source,
+                        style_context,
+                        Some((paragraph_start + start, paragraph_start + end)),
+                    );
+                    lines.push(text);
+                    false
+                }
+                LatexParagraphSegment::Latex {
+                    start,
+                    end,
+                    token: latex,
+                } => {
+                    // markdown.ts:507-510: pending or unsupported math falls
+                    // back to the raw source (delimiters included).
+                    let rendered = if latex.pending {
+                        trim_js(&raw[*start..*end]).to_string()
+                    } else {
+                        render_latex(latex.text, true)
+                            .unwrap_or_else(|| trim_js(&raw[*start..*end]).to_string())
+                    };
+                    for line in rendered.split('\n') {
+                        lines.push(self.apply_default_style(line));
+                    }
+                    true
+                }
+            };
+
+            if index + 1 < segment_count {
+                lines.push(String::new());
+            } else {
+                let spaced = match next_token_type {
+                    None => false,
+                    Some(TokenType::Space) => false,
+                    Some(TokenType::List) => is_latex,
+                    Some(TokenType::Other) => true,
+                };
+                if spaced {
+                    lines.push(String::new());
+                }
+            }
+        }
+        Some(lines)
+    }
+
     /// `renderToken` (markdown.ts:327-490).
     fn render_token(
         &self,
@@ -962,6 +1600,16 @@ impl Markdown {
                 }
             }
             NodeValue::Paragraph => {
+                if self.options.render_latex {
+                    if let Some(latex_lines) = self.render_paragraph_with_latex(
+                        token,
+                        source,
+                        next_token_type,
+                        style_context,
+                    ) {
+                        return latex_lines;
+                    }
+                }
                 let paragraph_text = self.render_inline_tokens(token, source, style_context);
                 lines.push(paragraph_text);
                 // Don't add spacing if next token is space or list, or if
@@ -1508,29 +2156,48 @@ impl Markdown {
 
 impl Component for Markdown {
     fn render(&self, width: usize) -> Vec<String> {
+        // Available width for content (subtract horizontal padding).
+        let content_width = width.saturating_sub(self.padding_x * 2).max(1);
+
+        // Apply the width-aware transform (markdown.ts:285). The transform
+        // runs on every render (not only on cache misses like upstream):
+        // the transformed text is part of the cache key, so a stateful
+        // transform (e.g. the mermaid streaming/final switch) cannot serve
+        // stale lines.
+        let transformed_text = self
+            .options
+            .transform
+            .as_ref()
+            .map(|transform| transform(&self.text, content_width))
+            .unwrap_or_else(|| self.text.clone());
+
         // Check cache.
         if let Some(cache) = self.cache.borrow().as_ref() {
-            if cache.text == self.text && cache.width == width {
+            if cache.text == self.text
+                && cache.transformed == transformed_text
+                && cache.width == width
+                && cache.render_latex == self.options.render_latex
+            {
                 return cache.lines.clone();
             }
         }
 
-        // Available width for content (subtract horizontal padding).
-        let content_width = width.saturating_sub(self.padding_x * 2).max(1);
-
-        // Don't render anything if there's no actual text.
-        if self.text.trim().is_empty() {
+        // Don't render anything if there's no actual text (upstream checks
+        // the transformed text, markdown.ts:288).
+        if transformed_text.trim().is_empty() {
             let result = vec![String::new()];
             *self.cache.borrow_mut() = Some(MarkdownCache {
                 text: self.text.clone(),
+                transformed: transformed_text,
                 width,
+                render_latex: self.options.render_latex,
                 lines: result.clone(),
             });
             return result;
         }
 
         // Replace tabs with 3 spaces for consistent rendering.
-        let normalized_text = self.text.replace('\t', "   ");
+        let normalized_text = transformed_text.replace('\t', "   ");
 
         // Parse markdown (comrak replaces marked's lexer).
         let arena = Arena::new();
@@ -1626,7 +2293,9 @@ impl Component for Markdown {
         // Update cache.
         *self.cache.borrow_mut() = Some(MarkdownCache {
             text: self.text.clone(),
+            transformed: transformed_text,
             width,
+            render_latex: self.options.render_latex,
             lines: result.clone(),
         });
 
@@ -2154,6 +2823,90 @@ mod tests {
             }),
         );
         assert_eq!(plain(&markdown, 80), ["\"\\\""]);
+    }
+
+    // ── Width-aware transform (markdown.ts:285, T29) ─────────────────────────
+
+    #[test]
+    fn transform_applies_before_parsing() {
+        let markdown = Markdown::new(
+            "original",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                transform: Some(Arc::new(|text, _| format!("**{text}**"))),
+                ..Default::default()
+            }),
+        );
+        // The transform output is parsed as markdown: the bold markers are
+        // gone from the source and the bold ANSI styling is present.
+        let rendered = markdown.render(80).join("\n");
+        assert!(!rendered.contains("**original**"));
+        assert!(rendered.contains("\x1b[1moriginal\x1b[22m"));
+    }
+
+    #[test]
+    fn transform_receives_available_content_width() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_inner = Arc::clone(&seen);
+        let markdown = Markdown::new(
+            "hello",
+            3,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                transform: Some(Arc::new(move |text, width| {
+                    seen_inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(width);
+                    text.to_owned()
+                })),
+                ..Default::default()
+            }),
+        );
+        markdown.render(80);
+        markdown.render(80);
+        markdown.render(40);
+        let widths = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // width - padding_x * 2 (markdown.ts:284), clamped to >= 1.
+        assert_eq!(widths, vec![74, 74, 34]);
+    }
+
+    #[test]
+    fn transform_result_changes_invalidate_cache() {
+        // A stateful transform can return different output for the same
+        // source + width; the transformed text is part of the cache key, so
+        // the second render must not serve stale lines.
+        let state = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state_inner = Arc::clone(&state);
+        let markdown = Markdown::new(
+            "hello",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                transform: Some(Arc::new(move |text, _| {
+                    if state_inner.load(std::sync::atomic::Ordering::Relaxed) {
+                        format!("**{text}**")
+                    } else {
+                        text.to_owned()
+                    }
+                })),
+                ..Default::default()
+            }),
+        );
+        let first = markdown.render(80).join("\n");
+        assert!(first.contains("hello"));
+        assert!(!first.contains("\x1b[1mhello\x1b[22m"));
+
+        state.store(true, std::sync::atomic::Ordering::Relaxed);
+        let second = markdown.render(80).join("\n");
+        assert!(second.contains("\x1b[1mhello\x1b[22m"));
     }
 
     // ── Pre-styled text (thinking traces) ──────────────────────────────────
@@ -2821,5 +3574,231 @@ mod tests {
         assert_eq!(markdown.render(80), [""]);
         let whitespace = md("   \n  ");
         assert_eq!(whitespace.render(80), [""]);
+    }
+
+    // ── LaTeX math ─────────────────────────────────────────────────────────
+    // Ports of the upstream `describe("LaTeX math")` cases (markdown.test.ts
+    // @ 4181f66), expectations verified against the upstream renderer.
+
+    #[test]
+    fn renders_inline_dollar_and_parenthesis_delimiters() {
+        let markdown = md(
+            r"A map $\mathbb{C}^3 \to \mathbb{C}^3$, $xy$, $x-y$, $-x$, $\frac{1}{2}$, and \(s \to \infty\).",
+        );
+        assert_eq!(
+            plain(&markdown, 80),
+            ["A map ℂ³ → ℂ³, xy, x-y, -x, 1/2, and s → ∞."]
+        );
+    }
+
+    #[test]
+    fn renders_display_dollar_delimiters() {
+        let markdown = md(r"Before
+
+$$\{3x+2y,\; x \in \{0, \pm 1\}\}$$
+
+after");
+        assert_eq!(
+            plain(&markdown, 80),
+            ["Before", "", "{3x+2y, x ∈ {0, ± 1}}", "", "after"]
+        );
+    }
+
+    #[test]
+    fn renders_display_bracket_delimiters() {
+        let markdown = md(r"Before
+
+\[
+E \approx \frac{0.1\ \text{lux}}{100\ \text{lm/W}}
+\]
+
+after");
+        assert_eq!(
+            plain(&markdown, 80),
+            [
+                "Before",
+                "",
+                "    0.1 lux",
+                "E ≈ ────────",
+                "    100 lm/W",
+                "",
+                "after"
+            ]
+        );
+    }
+
+    #[test]
+    fn aligns_matrix_rows_with_the_opening_delimiter() {
+        let markdown = md(r"Consider the matrix
+
+\[
+A=
+\begin{pmatrix}
+\pi & 0\\
+0 & \frac{1}{\pi}
+\end{pmatrix}.
+\]");
+        assert_eq!(
+            plain(&markdown, 80),
+            [
+                "Consider the matrix",
+                "",
+                "A = ⎛ π │ 0   ⎞",
+                "    ⎝ 0 │ 1/π ⎠.",
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_lower_limits_beneath_display_operators() {
+        let markdown = md(r"\[
+\lim_{x\to 0}\frac{\frac{\sin x}{x}-1}{\frac{e^x-1}{x}-1}=0
+\]");
+        assert_eq!(
+            plain(&markdown, 80),
+            [
+                "     (sin x)/x-1",
+                "lim  ─────────── = 0",
+                "x→0  (eˣ-1)/x-1"
+            ]
+        );
+    }
+
+    #[test]
+    fn renders_math_inside_lists_and_tables() {
+        let markdown = md(r"- Formula: $F_1 = u^2$
+
+| Value |
+| --- |
+| $\mathbb{C}^3$ |");
+        assert_eq!(
+            plain(&markdown, 80),
+            [
+                "- Formula: F₁ = u²",
+                "",
+                "┌───────┐",
+                "│ Value │",
+                "├───────┤",
+                "│ ℂ³    │",
+                "└───────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_treat_currency_shell_variables_or_code_spans_as_math() {
+        let source = "Costs $5 and $10 or $8k–$12k; use `$x$`, $HOME, and ${PATH}.";
+        let markdown = md(source);
+        assert_eq!(
+            plain(&markdown, 80),
+            ["Costs $5 and $10 or $8k–$12k; use $x$, $HOME, and ${PATH}."]
+        );
+
+        let shell_variables = "Paths: $HOME/$USER and $XDG_CONFIG_HOME/$APP_CONFIG";
+        let shell_markdown = md(shell_variables);
+        assert_eq!(plain(&shell_markdown, 80), [shell_variables]);
+    }
+
+    #[test]
+    fn preserves_unsupported_and_incomplete_latex() {
+        let cases = [
+            (
+                r"Unknown $x + \unknown{y}$ after",
+                "Unknown $x + \\unknown{y}$ after",
+            ),
+            (r"Streaming $\mathbb{C}^3", "Streaming $\\mathbb{C}^3"),
+        ];
+        for (source, expected) in cases {
+            let markdown = md(source);
+            assert_eq!(plain(&markdown, 80), [expected], "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn preserves_incomplete_backslash_delimiters_while_streaming() {
+        let inline = md(r"Map \(\mathbb{C}^3");
+        assert_eq!(plain(&inline, 80), [r"Map \(\mathbb{C}^3"]);
+
+        let display = md("\\[\nx^2");
+        assert_eq!(plain(&display, 80), ["\\[", "x^2"]);
+    }
+
+    #[test]
+    fn does_not_render_latex_inside_escaped_delimiters_or_code_fences() {
+        let source = "Escaped \\$x-y\\$.\n\n```text\n$\\mathbb{C}^3$\n```";
+        let markdown = md(source);
+        assert_eq!(
+            plain(&markdown, 80),
+            ["Escaped $x-y$.", "", "```text", "  $\\mathbb{C}^3$", "```"]
+        );
+    }
+
+    #[test]
+    fn allows_latex_rendering_to_be_disabled() {
+        let markdown = Markdown::new(
+            r"Map $\mathbb{C}^3 \to \mathbb{C}^3$",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                render_latex: false,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            plain(&markdown, 80),
+            [r"Map $\mathbb{C}^3 \to \mathbb{C}^3$"]
+        );
+    }
+
+    #[test]
+    fn switches_from_raw_to_rendered_math_when_a_streamed_delimiter_closes() {
+        let mut markdown = md(r"Map $\mathbb{C}^3");
+        assert_eq!(plain(&markdown, 80), [r"Map $\mathbb{C}^3"]);
+        markdown.set_text(r"Map $\mathbb{C}^3$");
+        assert_eq!(plain(&markdown, 80), ["Map ℂ³"]);
+    }
+
+    #[test]
+    fn splits_paragraphs_at_mid_paragraph_display_math() {
+        let markdown = md("text\n$$x^2+1$$\nmore");
+        assert_eq!(plain(&markdown, 80), ["text", "", "x²+1", "", "more"]);
+
+        let markdown = md("$$x^2+1$$\nafter");
+        assert_eq!(plain(&markdown, 80), ["x²+1", "", "after"]);
+    }
+
+    #[test]
+    fn renders_math_inside_blockquotes_and_headings() {
+        let markdown = md("> quote $x^2$");
+        assert_eq!(plain(&markdown, 80), ["│ quote x²"]);
+
+        let markdown = md("# Head $x^2$");
+        assert_eq!(plain(&markdown, 80), ["Head x²"]);
+    }
+
+    #[test]
+    fn latex_output_contains_no_pua_markers() {
+        let markdown = md(r"$$
+\begin{pmatrix}a & b \\ c & d\end{pmatrix}
+$$");
+        let output = markdown.render(80).join("\n");
+        for marker in '\u{f0000}'..='\u{f0005}' {
+            assert!(
+                !output.contains(marker),
+                "PUA marker leaked: {:#x}",
+                marker as u32
+            );
+        }
+    }
+
+    #[test]
+    fn render_latex_option_change_invalidates_cache() {
+        let mut markdown = md(r"Map $\mathbb{C}^3$");
+        assert_eq!(plain(&markdown, 80), ["Map ℂ³"]);
+        // No invalidate(): the cache key must include the render_latex flag.
+        markdown.options.render_latex = false;
+        assert_eq!(plain(&markdown, 80), [r"Map $\mathbb{C}^3$"]);
     }
 }

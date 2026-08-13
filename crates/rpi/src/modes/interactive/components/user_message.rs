@@ -13,12 +13,14 @@
 use std::boxed::Box as StdBox;
 use std::sync::Arc;
 
+use rpi_ext_host::types::MarkdownTransformerFn;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::tui::Component;
 
 use crate::core::themes::Theme;
 
+use super::markdown_transform::create_markdown_transform;
 use super::util::{OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START};
 
 /// Component that renders a user message (user-message.ts:11-57).
@@ -28,6 +30,8 @@ pub struct UserMessageComponent {
     output_pad: usize,
     theme: Arc<Theme>,
     content_box: TuiBox,
+    /// Extension-registered Markdown transformers (user-message.ts:17).
+    markdown_transformers: Vec<MarkdownTransformerFn>,
 }
 
 impl UserMessageComponent {
@@ -36,6 +40,7 @@ impl UserMessageComponent {
         theme: Arc<Theme>,
         markdown_theme: Arc<MarkdownTheme>,
         output_pad: usize,
+        markdown_transformers: Vec<MarkdownTransformerFn>,
     ) -> Self {
         let mut component = Self {
             text: text.into(),
@@ -43,6 +48,7 @@ impl UserMessageComponent {
             output_pad,
             theme,
             content_box: TuiBox::new(0, 0, None),
+            markdown_transformers,
         };
         component.rebuild();
         component
@@ -77,6 +83,15 @@ impl UserMessageComponent {
             Some(MarkdownOptions {
                 preserve_ordered_list_markers: true,
                 preserve_backslash_escapes: true,
+                // user-message.ts:50-54: the transform chain joins the
+                // marker/escape options in the same options object; `None`
+                // (no registered transformers) is a pass-through.
+                transform: create_markdown_transform(
+                    "user",
+                    false,
+                    self.markdown_transformers.clone(),
+                ),
+                ..Default::default()
             }),
         )));
         self.content_box = content_box;
@@ -141,6 +156,7 @@ mod tests {
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
             1,
+            Vec::new(),
         );
         let lines = component.render(20);
 
@@ -163,9 +179,44 @@ mod tests {
             theme(),
             markdown_theme(&load_theme("dark", None).unwrap()),
             1,
+            Vec::new(),
         );
         assert!(strip_ansi(&component.render(20)[1]).starts_with(" hello "));
         component.set_output_pad(0);
         assert!(strip_ansi(&component.render(20)[1]).starts_with("hello"));
+    }
+
+    #[test]
+    fn applies_markdown_transform_with_user_context() {
+        // user-message.ts:50-54: transformers apply with messageType "user"
+        // and isStreaming false; the existing marker/escape options stay in
+        // effect (preserve_ordered_list_markers).
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_inner = Arc::clone(&seen);
+        let component = UserMessageComponent::new(
+            "1. hello",
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            1,
+            vec![Arc::new(move |md, ctx| {
+                seen_inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(ctx.clone());
+                format!("{md}\n* transformed")
+            })],
+        );
+        let stripped = strip_ansi(&component.render(40).join("\n"));
+        assert!(stripped.contains("transformed"), "stripped: {stripped}");
+        // The preserved source marker still renders (options merged).
+        assert!(stripped.contains("1. hello"));
+
+        let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].message_type, "user");
+        assert!(!calls[0].is_streaming);
+        // Markdown padding is 0; the box applies outputPad: the content
+        // width seen by the transform is 40 - 2 * 1 (TuiBox padding).
+        assert_eq!(calls[0].available_width, 38);
     }
 }

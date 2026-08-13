@@ -23,6 +23,8 @@ pub mod first_time_setup;
 pub mod keybinding_hints;
 pub mod llama_view;
 pub mod login_dialog;
+pub mod markdown_transform;
+pub mod mermaid;
 pub mod model_search;
 pub mod model_selector;
 pub mod oauth_selector;

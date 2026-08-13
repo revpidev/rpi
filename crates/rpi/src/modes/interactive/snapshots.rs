@@ -85,6 +85,7 @@ fn user_message_simple() {
         dark_theme(),
         markdown_theme(&load_theme("dark", None).unwrap()),
         1,
+        Vec::new(),
     );
     assert_snapshot("user_message_simple", &component.render(20));
 }
@@ -139,6 +140,7 @@ fn assistant_message_text_and_thinking() {
         markdown_theme(&load_theme("dark", None).unwrap()),
         "Thinking...",
         1,
+        Vec::new(),
     );
     assert_snapshot("assistant_message_text_and_thinking", &component.render(60));
 }
@@ -156,6 +158,7 @@ fn assistant_message_hidden_thinking() {
         markdown_theme(&load_theme("dark", None).unwrap()),
         "Thinking...",
         1,
+        Vec::new(),
     );
     assert_snapshot("assistant_message_hidden_thinking", &component.render(60));
 }
@@ -171,6 +174,7 @@ fn assistant_message_length_stop() {
         markdown_theme(&load_theme("dark", None).unwrap()),
         "Thinking...",
         1,
+        Vec::new(),
     );
     assert_snapshot("assistant_message_length_stop", &component.render(60));
 }

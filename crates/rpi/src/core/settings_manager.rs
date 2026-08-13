@@ -147,6 +147,32 @@ pub struct ThinkingBudgetsSettings {
 pub struct MarkdownSettings {
     /// default: "  "
     pub code_block_indent: Option<String>,
+    /// default: "streaming"
+    pub mermaid: Option<MermaidRenderingMode>,
+}
+
+/// `MermaidRenderingMode = "off" | "final" | "streaming"`
+/// (settings-manager.ts:56) — default `"streaming"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MermaidRenderingMode {
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "final")]
+    Final,
+    #[default]
+    #[serde(rename = "streaming")]
+    Streaming,
+}
+
+impl MermaidRenderingMode {
+    /// The on-disk string form (settings-manager.ts:56).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MermaidRenderingMode::Off => "off",
+            MermaidRenderingMode::Final => "final",
+            MermaidRenderingMode::Streaming => "streaming",
+        }
+    }
 }
 
 /// `WarningSettings` (settings-manager.ts:58-60) — file shape.
@@ -2122,6 +2148,28 @@ impl SettingsManager {
             .to_string()
     }
 
+    /// `getMermaidRenderingMode` (settings-manager.ts:1263-1266) — anything
+    /// that is not `"off"` or `"final"` resolves to `"streaming"`.
+    pub fn get_mermaid_rendering_mode(&self) -> MermaidRenderingMode {
+        match self
+            .settings
+            .nested("markdown", "mermaid")
+            .and_then(Value::as_str)
+        {
+            Some("off") => MermaidRenderingMode::Off,
+            Some("final") => MermaidRenderingMode::Final,
+            _ => MermaidRenderingMode::Streaming,
+        }
+    }
+
+    /// `setMermaidRenderingMode` (settings-manager.ts:1268-1273).
+    pub fn set_mermaid_rendering_mode(&mut self, mode: MermaidRenderingMode) {
+        self.global_settings
+            .set_nested("markdown", "mermaid", json_value(&mode));
+        self.mark_modified("markdown", Some("mermaid"));
+        self.save();
+    }
+
     /// `getWarnings` (settings-manager.ts:1225-1227) — returns a copy;
     /// defaults are applied by consumers (`anthropicExtraUsage`: true).
     pub fn get_warnings(&self) -> WarningSettings {
@@ -3407,6 +3455,89 @@ mod tests {
         assert_eq!(manager.get_output_pad(), 1);
         assert_eq!(manager.get_autocomplete_max_visible(), 5);
         assert_eq!(manager.get_code_block_indent(), "  ");
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Streaming
+        );
         assert_eq!(manager.get_websocket_connect_timeout_ms().unwrap(), None);
+    }
+
+    // =======================================================================
+    // Mermaid rendering mode (settings-manager.ts:1263-1273)
+    // =======================================================================
+
+    fn mermaid_manager(value: Value) -> SettingsManager {
+        SettingsManager::in_memory(settings(value), SettingsManagerCreateOptions::default())
+    }
+
+    /// The three on-disk values parse to their modes; anything else
+    /// (missing, `null`, unknown strings) resolves to `"streaming"`
+    /// (settings-manager.ts:1264-1265).
+    #[test]
+    fn test_mermaid_rendering_mode_parses_three_states() {
+        assert_eq!(
+            mermaid_manager(json!({"markdown": {"mermaid": "off"}})).get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Off
+        );
+        assert_eq!(
+            mermaid_manager(json!({"markdown": {"mermaid": "final"}})).get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Final
+        );
+        assert_eq!(
+            mermaid_manager(json!({"markdown": {"mermaid": "streaming"}}))
+                .get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Streaming
+        );
+    }
+
+    /// Non-`"off"`/`"final"` values fall back to `"streaming"`.
+    #[test]
+    fn test_mermaid_rendering_mode_falls_back_to_streaming() {
+        for value in [
+            json!({}),
+            json!({"markdown": {}}),
+            json!({"markdown": {"mermaid": "bogus"}}),
+            json!({"markdown": {"mermaid": null}}),
+            json!({"markdown": {"mermaid": 5}}),
+        ] {
+            assert_eq!(
+                mermaid_manager(value).get_mermaid_rendering_mode(),
+                MermaidRenderingMode::Streaming
+            );
+        }
+    }
+
+    /// Set then get round-trips, persists to the `markdown.mermaid` nested
+    /// key, and merges with other `markdown` sub-keys on disk
+    /// (settings-manager.ts:591-599, 1268-1273).
+    #[test]
+    fn test_set_mermaid_rendering_mode_writes_nested_key() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"markdown": {"codeBlockIndent": "    "}}),
+        );
+
+        let mut manager = create(&dirs);
+        manager.set_mermaid_rendering_mode(MermaidRenderingMode::Final);
+
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Final
+        );
+
+        let saved = read_json(&global_path(&dirs));
+        assert_eq!(saved["markdown"]["mermaid"], json!("final"));
+        // The sibling sub-key survives the nested write.
+        assert_eq!(saved["markdown"]["codeBlockIndent"], json!("    "));
+
+        // The in-memory view was refreshed too (the setter's save reloads).
+        manager.set_mermaid_rendering_mode(MermaidRenderingMode::Off);
+        assert_eq!(
+            manager.get_mermaid_rendering_mode(),
+            MermaidRenderingMode::Off
+        );
+        let saved = read_json(&global_path(&dirs));
+        assert_eq!(saved["markdown"]["mermaid"], json!("off"));
     }
 }

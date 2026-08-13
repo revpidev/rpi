@@ -1,0 +1,7 @@
+sequenceDiagram
+  participant Alice
+  participant Bob
+  Alice->>Bob: Hello Bob, how are you?
+  Bob-->>Alice: Great!
+  Alice-)Bob: See you later!
+  Note over Alice,Bob: A short note

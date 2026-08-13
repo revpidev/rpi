@@ -46,6 +46,9 @@ httpdate.workspace = true
 url.workspace = true
 # T17-W2 syntax highlighting (ADR-0008): syntect replaces upstream hljs.
 syntect.workspace = true
+# T29 mermaid markdown transformer: comrak scans fenced code blocks
+# (same parser as the rpi-tui markdown component).
+comrak.workspace = true
 # T18 binary self-update (ADR-0011): release asset unpack (see workspace
 # Cargo.toml for the backend notes).
 flate2.workspace = true

@@ -421,6 +421,66 @@ async fn runner_entry_renderer_first_registration_wins_silently() {
     assert!(host.get_entry_renderer("other").is_none());
 }
 
+/// Markdown transformers (runner.ts:589-591 @ 4181f66): one per extension,
+/// flattened in load order; extensions without one contribute nothing.
+#[tokio::test]
+async fn runner_markdown_transformers_chain_in_load_order() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let calls_a = Arc::clone(&calls);
+    let calls_b = Arc::clone(&calls);
+
+    let host = host_with(vec![
+        inline_ext("ext-a", move |api| {
+            let calls = Arc::clone(&calls_a);
+            api.register_markdown_transformer(Arc::new(move |md, ctx| {
+                calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!(
+                        "a:{}:{}:{}",
+                        ctx.message_type, ctx.is_streaming, ctx.available_width
+                    ));
+                format!("A({md})")
+            }))
+            .unwrap();
+        }),
+        // No transformer registered — contributes nothing to the chain.
+        inline_ext("ext-none", |_api| {}),
+        inline_ext("ext-b", move |api| {
+            let calls = Arc::clone(&calls_b);
+            api.register_markdown_transformer(Arc::new(move |md, ctx| {
+                calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!(
+                        "b:{}:{}:{}",
+                        ctx.message_type, ctx.is_streaming, ctx.available_width
+                    ));
+                format!("B({md})")
+            }))
+            .unwrap();
+        }),
+    ])
+    .await;
+
+    let transformers = host.get_markdown_transformers();
+    assert_eq!(transformers.len(), 2, "unregistered extension skipped");
+
+    // Chain in load order, sharing the same context (markdown-transform.ts).
+    let context = ext::MarkdownTransformContext {
+        message_type: "assistant".to_owned(),
+        is_streaming: true,
+        available_width: 76,
+    };
+    let step_a = transformers[0]("hello".to_owned(), context.clone());
+    let step_b = transformers[1](step_a, context.clone());
+    assert_eq!(step_b, "B(A(hello))");
+    assert_eq!(
+        *calls.lock().unwrap_or_else(|e| e.into_inner()),
+        ["a:assistant:true:76", "b:assistant:true:76"]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Generic emit (runner.ts:788-820)
 // ---------------------------------------------------------------------------

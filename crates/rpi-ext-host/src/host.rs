@@ -432,6 +432,10 @@ impl NativeExtensionHost {
         self.core().get_message_renderer(custom_type)
     }
 
+    pub fn get_markdown_transformers(&self) -> Vec<crate::types::MarkdownTransformerFn> {
+        self.core().get_markdown_transformers()
+    }
+
     pub fn get_entry_renderer(&self, custom_type: &str) -> Option<crate::types::EntryRenderFn> {
         self.core().get_entry_renderer(custom_type)
     }

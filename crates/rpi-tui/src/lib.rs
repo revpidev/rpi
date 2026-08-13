@@ -19,6 +19,8 @@ pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;
+pub mod latex;
+pub mod mermaid;
 pub mod native_modifiers;
 pub mod recovery;
 pub mod stdin_buffer;

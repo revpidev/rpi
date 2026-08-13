@@ -476,6 +476,14 @@ pub trait ExtensionRunner: Send + Sync {
         None
     }
 
+    /// `getMarkdownTransformers` (runner.ts:589-591 @ 4181f66): the
+    /// extension-registered width-aware Markdown transform chain, in
+    /// extension load order. Empty when no extensions are loaded (the
+    /// no-op runner default).
+    fn get_markdown_transformers(&self) -> Vec<rpi_ext_host::types::MarkdownTransformerFn> {
+        Vec::new()
+    }
+
     /// `getRegisteredCommands()` — all extension slash commands with
     /// conflict-resolved invocation names (runner.ts:595-638).
     fn registered_commands(&self) -> Vec<ExtensionCommand> {

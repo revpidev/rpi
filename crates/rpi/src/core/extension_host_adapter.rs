@@ -638,6 +638,10 @@ impl ExtensionRunner for ExtensionHostAdapter {
         })
     }
 
+    fn get_markdown_transformers(&self) -> Vec<ext::MarkdownTransformerFn> {
+        self.host.get_markdown_transformers()
+    }
+
     fn registered_commands(&self) -> Vec<ExtensionCommand> {
         self.host
             .get_registered_commands()

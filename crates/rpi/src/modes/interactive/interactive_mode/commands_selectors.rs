@@ -360,6 +360,13 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
             // components read the flag at construction.
             ui.rebuild_chat_from_messages();
         }
+        SettingsChange::MermaidRenderingMode(mode) => {
+            session.settings_manager(|s| s.set_mermaid_rendering_mode(mode));
+            // `chatContainer.invalidate()` (interactive-mode.ts:4483-4487):
+            // drop the markdown render caches so mounted messages re-render
+            // with the new mode; `requestRender()` is the common tail below.
+            Component::invalidate(&mut *lock(&ui.chat_container));
+        }
         SettingsChange::ShowCacheMissNotices(shown) => {
             session.settings_manager(|s| s.set_show_cache_miss_notices(shown));
             // `rebuildChatFromMessages` (interactive-mode.ts:4237-4240).
@@ -1009,6 +1016,7 @@ impl InteractiveUi {
                 .map(|info| info.name)
                 .collect(),
             hide_thinking_block: *lock(&ui.hide_thinking_block),
+            mermaid_rendering_mode: session.settings_manager(|s| s.get_mermaid_rendering_mode()),
             show_cache_miss_notices: session.settings_manager(|s| s.get_show_cache_miss_notices()),
             collapse_changelog: session.settings_manager(|s| s.get_collapse_changelog()),
             enable_install_telemetry: session

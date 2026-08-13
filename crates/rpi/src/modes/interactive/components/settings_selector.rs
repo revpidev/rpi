@@ -42,7 +42,8 @@ use rpi_tui::terminal_image::get_capabilities;
 use rpi_tui::tui::{Component, Focusable};
 
 use crate::core::settings_manager::{
-    DefaultProjectTrust, DoubleEscapeAction, TransportSetting, TreeFilterMode, WarningSettings,
+    DefaultProjectTrust, DoubleEscapeAction, MermaidRenderingMode, TransportSetting,
+    TreeFilterMode, WarningSettings,
 };
 use crate::core::themes::Theme;
 use crate::modes::interactive::components::dynamic_border::DynamicBorder;
@@ -120,6 +121,7 @@ pub struct SettingsSelectorOptions {
     pub terminal_theme: TerminalColorScheme,
     pub available_themes: Vec<String>,
     pub hide_thinking_block: bool,
+    pub mermaid_rendering_mode: MermaidRenderingMode,
     pub show_cache_miss_notices: bool,
     pub collapse_changelog: bool,
     pub enable_install_telemetry: bool,
@@ -155,6 +157,7 @@ pub enum SettingsChange {
     Theme(String),
     ThemePreview(String),
     HideThinkingBlock(bool),
+    MermaidRenderingMode(MermaidRenderingMode),
     ShowCacheMissNotices(bool),
     CollapseChangelog(bool),
     EnableInstallTelemetry(bool),
@@ -187,6 +190,18 @@ fn parse_queue_mode(value: &str) -> QueueMode {
         QueueMode::All
     } else {
         QueueMode::OneAtATime
+    }
+}
+
+/// `newValue as MermaidRenderingMode` (settings-selector.ts:822): the
+/// selector only offers the three known values; anything unrecognized
+/// resolves to `"streaming"` like the settings getter
+/// (settings-manager.ts:1264-1265).
+fn parse_mermaid_rendering_mode(value: &str) -> MermaidRenderingMode {
+    match value {
+        "off" => MermaidRenderingMode::Off,
+        "final" => MermaidRenderingMode::Final,
+        _ => MermaidRenderingMode::Streaming,
     }
 }
 
@@ -1090,6 +1105,20 @@ impl SettingsSelectorComponent {
                 submenu: None,
             },
             SettingItem {
+                id: "mermaid-rendering".to_string(),
+                label: "Mermaid diagrams".to_string(),
+                description: Some(
+                    "Render Mermaid code blocks as Unicode diagrams".to_string(),
+                ),
+                current_value: options.mermaid_rendering_mode.as_str().to_string(),
+                values: Some(vec![
+                    "off".to_string(),
+                    "final".to_string(),
+                    "streaming".to_string(),
+                ]),
+                submenu: None,
+            },
+            SettingItem {
                 id: "cache-miss-notices".to_string(),
                 label: "Cache miss notices".to_string(),
                 description: Some(
@@ -1543,6 +1572,9 @@ impl SettingsSelectorComponent {
                     }
                 }
                 "hide-thinking" => SettingsChange::HideThinkingBlock(new_value == "true"),
+                "mermaid-rendering" => {
+                    SettingsChange::MermaidRenderingMode(parse_mermaid_rendering_mode(new_value))
+                }
                 "cache-miss-notices" => SettingsChange::ShowCacheMissNotices(new_value == "true"),
                 "collapse-changelog" => SettingsChange::CollapseChangelog(new_value == "true"),
                 "quiet-startup" => SettingsChange::QuietStartup(new_value == "true"),
@@ -1665,6 +1697,7 @@ mod tests {
             terminal_theme: TerminalColorScheme::Dark,
             available_themes: vec!["dark".to_string(), "light".to_string()],
             hide_thinking_block: false,
+            mermaid_rendering_mode: MermaidRenderingMode::Streaming,
             show_cache_miss_notices: true,
             collapse_changelog: false,
             enable_install_telemetry: true,
@@ -1767,10 +1800,10 @@ mod tests {
         assert!(joined.contains("false"));
         assert!(joined.contains("Autocomplete max items"));
         assert!(joined.contains("Enter/Space to change · Esc to cancel"));
-        // Scroll hint shows the item count (25 items without image rows, 27
+        // Scroll hint shows the item count (26 items without image rows, 28
         // with them; the 10-row window always scrolls).
         let supports_images = get_capabilities().images.is_some();
-        let item_count = if supports_images { 27 } else { 25 };
+        let item_count = if supports_images { 28 } else { 26 };
         assert!(lines
             .iter()
             .any(|l| l.contains(&format!("(1/{item_count})"))));
@@ -1825,6 +1858,30 @@ mod tests {
         let events = received.lock().unwrap();
         // auto → sse (first value after current).
         assert_eq!(events[0], SettingsChange::Transport(Transport::Sse));
+    }
+
+    #[test]
+    fn cycles_mermaid_rendering_and_maps_values() {
+        install_keybindings();
+        let (received, on_change) = changes();
+        let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
+        let mut component =
+            SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
+        // Jump to Mermaid diagrams through the search box.
+        for c in ["m", "e", "r"] {
+            component.handle_input(c);
+        }
+        component.handle_input("\r");
+        let events = received.lock().unwrap();
+        // streaming → off (first value after current).
+        assert_eq!(
+            events[0],
+            SettingsChange::MermaidRenderingMode(MermaidRenderingMode::Off)
+        );
+        // The current value renders next to the label.
+        let lines = render_plain(&component, 100);
+        let joined = lines.join("\n");
+        assert!(joined.contains("Mermaid diagrams") && joined.contains("off"));
     }
 
     #[test]
@@ -1886,13 +1943,13 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Move down to the Warnings item (index 24 with image rows, 22
+        // Move down to the Warnings item (index 25 with image rows, 23
         // without: the nine always-present rows inserted after autocompact /
         // auto-resize push the base items down).
         let target = if get_capabilities().images.is_some() {
-            24
+            25
         } else {
-            22
+            23
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -1924,12 +1981,12 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Move to the Thinking level item (index 25 with image rows, 23
+        // Move to the Thinking level item (index 26 with image rows, 24
         // without).
         let target = if get_capabilities().images.is_some() {
-            25
+            26
         } else {
-            23
+            24
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -1959,11 +2016,11 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Theme item index: 26 with image rows, 24 without.
+        // Theme item index: 27 with image rows, 25 without.
         let target = if get_capabilities().images.is_some() {
-            26
+            27
         } else {
-            24
+            25
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2009,10 +2066,11 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let mut component =
             SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
+        // Theme item index: 27 with image rows, 25 without.
         let target = if get_capabilities().images.is_some() {
-            26
+            27
         } else {
-            24
+            25
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");

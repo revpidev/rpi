@@ -1257,6 +1257,12 @@ impl InteractiveUi {
                         self.render_handle.request_render();
                     }
                     AgentMessage::Assistant(assistant) => {
+                        // Compute transformers first: `markdown_transformers`
+                        // takes the theme lock, and the `lock(&self.theme)`
+                        // guard in the argument list below would still be
+                        // held while arguments evaluate (Rust temporaries
+                        // live to the end of the statement).
+                        let markdown_transformers = self.markdown_transformers();
                         let mut component =
                             crate::modes::interactive::components::AssistantMessageComponent::new(
                                 None,
@@ -1265,8 +1271,11 @@ impl InteractiveUi {
                                 Arc::clone(&lock(&self.markdown_theme)),
                                 lock(&self.hidden_thinking_label).clone(),
                                 self.output_pad.load(Ordering::Relaxed),
+                                markdown_transformers,
                             );
-                        component.update_content(assistant.clone());
+                        // streaming component: `updateContent(message, true)`
+                        // (interactive-mode.ts:3140).
+                        component.update_content(assistant.clone(), true);
                         let handle = Arc::new(Mutex::new(component));
                         let entry_address =
                             self.add_chat_child(Box::new(SharedChild(handle.clone())));
@@ -1283,7 +1292,9 @@ impl InteractiveUi {
                 // message_update (interactive-mode.ts:2928-2961).
                 if let AgentMessage::Assistant(assistant) = &message {
                     if let Some(track) = lock(&self.streaming).as_ref() {
-                        lock(&track.handle).update_content(assistant.clone());
+                        // interactive-mode.ts:3148: streaming updates pass
+                        // isStreaming = true.
+                        lock(&track.handle).update_content(assistant.clone(), true);
                         for content in &assistant.content {
                             if let AssistantContent::ToolCall(tool_call) = content {
                                 let mut pending_tools = lock(&self.pending_tools);
@@ -1341,7 +1352,9 @@ impl InteractiveUi {
                         if !stop_is_error {
                             self.maybe_show_cache_miss_notice(&assistant);
                         }
-                        component.update_content(assistant);
+                        // interactive-mode.ts:3193: message_end updates with
+                        // isStreaming = false.
+                        component.update_content(assistant, false);
                         drop(component);
 
                         if stop_is_error {
@@ -2492,8 +2505,34 @@ impl InteractiveUi {
         chat.children.push(Box::new(component));
     }
 
+    /// `getMarkdownTransformers` (interactive-mode.ts:1975-1976): the
+    /// mermaid transformer first (interactive-mode.ts:447-450), then the
+    /// extension-registered width-aware Markdown transform chain, in
+    /// extension load order.
+    fn markdown_transformers(&self) -> Vec<rpi_ext_host::types::MarkdownTransformerFn> {
+        let session = self.session();
+        let mermaid =
+            crate::modes::interactive::components::mermaid::create_mermaid_markdown_transformer(
+                {
+                    let session = session.clone();
+                    // The mode is read lazily per render call, like upstream's
+                    // `getMode: () => settingsManager.getMermaidRenderingMode()`.
+                    move || session.settings_manager(|s| s.get_mermaid_rendering_mode())
+                },
+                // Upstream captures the theme once when the transformer is
+                // built (interactive-mode.ts:450); here the transformer is
+                // rebuilt per message, so newly added messages follow theme
+                // changes (deviation).
+                Some(Arc::clone(&lock(&self.theme))),
+            );
+        let mut transformers = vec![mermaid];
+        transformers.extend(session.extension_runner().get_markdown_transformers());
+        transformers
+    }
+
     /// `addMessageToChat` (interactive-mode.ts:3236-3338).
     fn add_message_to_chat(&self, message: AgentMessage, populate_history: bool) {
+        let markdown_transformers = self.markdown_transformers();
         match &message {
             AgentMessage::BashExecution(bash_execution) => {
                 let mut component = BashExecutionComponent::new(
@@ -2596,6 +2635,7 @@ impl InteractiveUi {
                             Arc::clone(&lock(&self.theme)),
                             Arc::clone(&lock(&self.markdown_theme)),
                             self.output_pad.load(Ordering::Relaxed),
+                            markdown_transformers.clone(),
                         )));
                     }
                 } else {
@@ -2604,6 +2644,7 @@ impl InteractiveUi {
                         Arc::clone(&lock(&self.theme)),
                         Arc::clone(&lock(&self.markdown_theme)),
                         self.output_pad.load(Ordering::Relaxed),
+                        markdown_transformers.clone(),
                     )));
                 }
                 drop(chat);
@@ -2620,6 +2661,7 @@ impl InteractiveUi {
                         Arc::clone(&lock(&self.markdown_theme)),
                         lock(&self.hidden_thinking_label).clone(),
                         self.output_pad.load(Ordering::Relaxed),
+                        markdown_transformers,
                     );
                 self.add_chat_child(Box::new(component));
             }

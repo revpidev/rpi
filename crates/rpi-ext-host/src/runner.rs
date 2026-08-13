@@ -438,6 +438,16 @@ impl ExtensionRunnerCore {
             .find_map(|ext| ext.message_renderer(custom_type))
     }
 
+    /// `getMarkdownTransformers` (runner.ts:589-591 @ 4181f66): one
+    /// transformer per extension, flattened in load order; extensions
+    /// without a registered transformer contribute nothing.
+    pub fn get_markdown_transformers(&self) -> Vec<crate::types::MarkdownTransformerFn> {
+        self.extensions
+            .iter()
+            .filter_map(|ext| ext.markdown_transformer())
+            .collect()
+    }
+
     /// `getEntryRenderer` (runner.ts:585-593): first registration wins.
     pub fn get_entry_renderer(&self, custom_type: &str) -> Option<crate::types::EntryRenderFn> {
         self.extensions
