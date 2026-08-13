@@ -135,37 +135,15 @@ pub async fn process_file_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "rpi-file-processor-test-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            ));
-            std::fs::create_dir_all(&dir).expect("create temp dir");
-            TempDir(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::tools::test_helpers::TempDir;
 
     #[tokio::test]
     async fn test_text_file_wrapped_in_file_tag() {
         let temp = TempDir::new();
-        let file = temp.0.join("note.txt");
+        let file = temp.path().join("note.txt");
         std::fs::write(&file, "hello world").expect("write");
 
-        let result = process_file_arguments(&["note.txt".to_owned()], &temp.0, true)
+        let result = process_file_arguments(&["note.txt".to_owned()], temp.path(), true)
             .await
             .expect("process");
         assert_eq!(
@@ -183,7 +161,7 @@ mod tests {
                 .expect("runtime")
                 .block_on(process_file_arguments(
                     &["nope.txt".to_owned()],
-                    &temp.0,
+                    temp.path(),
                     true,
                 ));
         match result {
@@ -197,9 +175,9 @@ mod tests {
     #[tokio::test]
     async fn test_empty_file_is_skipped() {
         let temp = TempDir::new();
-        std::fs::write(temp.0.join("empty.txt"), "").expect("write");
+        std::fs::write(temp.path().join("empty.txt"), "").expect("write");
 
-        let result = process_file_arguments(&["empty.txt".to_owned()], &temp.0, true)
+        let result = process_file_arguments(&["empty.txt".to_owned()], temp.path(), true)
             .await
             .expect("process");
         assert_eq!(result.text, "");
@@ -217,9 +195,9 @@ mod tests {
             0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
             0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ];
-        std::fs::write(temp.0.join("img.png"), png).expect("write");
+        std::fs::write(temp.path().join("img.png"), png).expect("write");
 
-        let result = process_file_arguments(&["img.png".to_owned()], &temp.0, true)
+        let result = process_file_arguments(&["img.png".to_owned()], temp.path(), true)
             .await
             .expect("process");
         assert_eq!(result.images.len(), 1);
@@ -227,7 +205,7 @@ mod tests {
         assert!(!result.images[0].data.is_empty());
         assert!(result.text.starts_with(&format!(
             "<file name=\"{}\">",
-            temp.0.join("img.png").display()
+            temp.path().join("img.png").display()
         )));
         assert!(result.text.ends_with("</file>\n"));
     }
