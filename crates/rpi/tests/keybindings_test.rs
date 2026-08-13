@@ -308,7 +308,7 @@ fn test_config_ordering_extras_alphabetical() {
     assert_eq!(keys[2].as_str(), "zzz_unknown");
 }
 
-// --- All 75 default keys spot-checks (docs/keybindings.md parity) ---------
+// --- All 83 default keys spot-checks (docs/keybindings.md parity) ---------
 
 #[test]
 fn test_all_tui_editor_defaults() {
@@ -392,6 +392,27 @@ fn test_all_tui_input_select_defaults() {
     assert_eq!(mgr.get_keys("tui.select.pageDown"), vec!["pageDown"]);
     assert_eq!(mgr.get_keys("tui.select.confirm"), vec!["enter"]);
     assert_eq!(mgr.get_keys("tui.select.cancel"), vec!["escape", "ctrl+c"]);
+}
+
+#[test]
+fn test_all_tui_alt_screen_defaults() {
+    let mgr = KeybindingsManager::new();
+    // The 8 tui.altScreen.* actions (tui/src/keybindings.ts:154-179
+    // @ 4181f66); half-page navigation is unbound by default.
+    assert_eq!(mgr.get_keys("tui.altScreen.pageUp"), vec!["pageUp"]);
+    assert_eq!(mgr.get_keys("tui.altScreen.pageDown"), vec!["pageDown"]);
+    assert!(mgr.get_keys("tui.altScreen.halfPageUp").is_empty());
+    assert!(mgr.get_keys("tui.altScreen.halfPageDown").is_empty());
+    assert_eq!(
+        mgr.get_keys("tui.altScreen.previousPrompt"),
+        vec!["ctrl+shift+up"]
+    );
+    assert_eq!(
+        mgr.get_keys("tui.altScreen.nextPrompt"),
+        vec!["ctrl+shift+down"]
+    );
+    assert_eq!(mgr.get_keys("tui.altScreen.top"), vec!["home"]);
+    assert_eq!(mgr.get_keys("tui.altScreen.bottom"), vec!["end"]);
 }
 
 #[test]

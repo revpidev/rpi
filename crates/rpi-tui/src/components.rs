@@ -1,5 +1,6 @@
 //! pi-tui base components (ports of `packages/tui/src/components/*`).
 
+pub mod alt_screen_flash;
 pub mod r#box;
 pub mod cancellable_loader;
 pub mod editor;

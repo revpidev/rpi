@@ -302,7 +302,7 @@ mod tests {
     /// runs them on parallel threads.
     static KEYBINDINGS_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Install the full 75-entry keybinding table (the ids the dispatch
+    /// Install the full 83-entry keybinding table (the ids the dispatch
     /// checks are all default bindings, so the full table is equivalent to
     /// the previously-used custom manager — and identical across parallel
     /// test threads, avoiding global-manager races).

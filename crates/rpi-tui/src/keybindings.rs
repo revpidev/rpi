@@ -5,7 +5,7 @@
 //!
 //! Intentional differences:
 //! - `Keybinding` is a Rust enum mirroring the compile-time union
-//!   `Keybinding = keyof Keybindings` (keybindings.ts:7-44). The upstream
+//!   `Keybinding = keyof Keybindings` (keybindings.ts:7-53). The upstream
 //!   `Keybindings` interface itself is only a keyof source (every value is
 //!   the literal `true`) and has no runtime shape, so no equivalent type
 //!   exists; ids are the canonical `tui.*` tokens at runtime
@@ -67,7 +67,7 @@ impl KeyBindingValue {
 }
 
 /// A keybinding id (`Keybinding = keyof Keybindings`, keybindings.ts:7-53
-/// @ 4181f66; the 8 `tui.altScreen.*` ids land with T31).
+/// @ 4181f66).
 ///
 /// The upstream union type is compile-time only; the runtime ids are the
 /// `tui.*` strings ([`Keybinding::as_str`]), byte-identical to the
@@ -111,13 +111,21 @@ pub enum Keybinding {
     SelectPageDown,
     SelectConfirm,
     SelectCancel,
+    // Alternate-screen viewport navigation (keybindings.ts:45-52 @ 4181f66)
+    AltScreenPageUp,
+    AltScreenPageDown,
+    AltScreenHalfPageUp,
+    AltScreenHalfPageDown,
+    AltScreenPreviousPrompt,
+    AltScreenNextPrompt,
+    AltScreenTop,
+    AltScreenBottom,
 }
 
 impl Keybinding {
-    /// All 33 keybinding ids, in interface order (keybindings.ts:7-42
-    /// @ 4181f66; the alt-screen ids at :44-52 land with the alt-screen
-    /// renderer, T31).
-    pub const ALL: [Keybinding; 33] = [
+    /// All 41 keybinding ids, in interface order (keybindings.ts:7-52
+    /// @ 4181f66).
+    pub const ALL: [Keybinding; 41] = [
         Self::EditorCursorUp,
         Self::EditorCursorDown,
         Self::EditorHistoryPrevious,
@@ -151,6 +159,14 @@ impl Keybinding {
         Self::SelectPageDown,
         Self::SelectConfirm,
         Self::SelectCancel,
+        Self::AltScreenPageUp,
+        Self::AltScreenPageDown,
+        Self::AltScreenHalfPageUp,
+        Self::AltScreenHalfPageDown,
+        Self::AltScreenPreviousPrompt,
+        Self::AltScreenNextPrompt,
+        Self::AltScreenTop,
+        Self::AltScreenBottom,
     ];
 
     /// The canonical id string, byte-identical to the upstream config token
@@ -190,6 +206,14 @@ impl Keybinding {
             Self::SelectPageDown => "tui.select.pageDown",
             Self::SelectConfirm => "tui.select.confirm",
             Self::SelectCancel => "tui.select.cancel",
+            Self::AltScreenPageUp => "tui.altScreen.pageUp",
+            Self::AltScreenPageDown => "tui.altScreen.pageDown",
+            Self::AltScreenHalfPageUp => "tui.altScreen.halfPageUp",
+            Self::AltScreenHalfPageDown => "tui.altScreen.halfPageDown",
+            Self::AltScreenPreviousPrompt => "tui.altScreen.previousPrompt",
+            Self::AltScreenNextPrompt => "tui.altScreen.nextPrompt",
+            Self::AltScreenTop => "tui.altScreen.top",
+            Self::AltScreenBottom => "tui.altScreen.bottom",
         }
     }
 
@@ -231,6 +255,14 @@ impl Keybinding {
             "tui.select.pageDown" => Self::SelectPageDown,
             "tui.select.confirm" => Self::SelectConfirm,
             "tui.select.cancel" => Self::SelectCancel,
+            "tui.altScreen.pageUp" => Self::AltScreenPageUp,
+            "tui.altScreen.pageDown" => Self::AltScreenPageDown,
+            "tui.altScreen.halfPageUp" => Self::AltScreenHalfPageUp,
+            "tui.altScreen.halfPageDown" => Self::AltScreenHalfPageDown,
+            "tui.altScreen.previousPrompt" => Self::AltScreenPreviousPrompt,
+            "tui.altScreen.nextPrompt" => Self::AltScreenNextPrompt,
+            "tui.altScreen.top" => Self::AltScreenTop,
+            "tui.altScreen.bottom" => Self::AltScreenBottom,
             _ => return None,
         })
     }
@@ -445,9 +477,8 @@ fn entry(
 static TUI_KEYBINDINGS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
 
 /// The default keybinding table (`TUI_KEYBINDINGS`, keybindings.ts:65-180
-/// @ 4181f66) — the 33 `tui.*` keybinding ids with their default keys and
-/// descriptions, in upstream definition order (the 8 `tui.altScreen.*` ids
-/// land with the alt-screen renderer, T31).
+/// @ 4181f66) — the 41 `tui.*` keybinding ids with their default keys and
+/// descriptions, in upstream definition order.
 pub fn tui_keybindings() -> &'static [(String, KeybindingDefinition)] {
     TUI_KEYBINDINGS
         .get_or_init(build_tui_keybindings)
@@ -577,6 +608,49 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
             "tui.select.cancel",
             multiple(&["escape", "ctrl+c"]),
             "Cancel selection",
+        ),
+        // ---- tui.altScreen.* (8) ----
+        // These intentionally shadow the unmodified editor bindings in
+        // fullscreen mode (keybindings.ts:153 @ 4181f66).
+        entry(
+            "tui.altScreen.pageUp",
+            single("pageUp"),
+            "Scroll viewport up one page",
+        ),
+        entry(
+            "tui.altScreen.pageDown",
+            single("pageDown"),
+            "Scroll viewport down one page",
+        ),
+        entry(
+            "tui.altScreen.halfPageUp",
+            multiple(&[]),
+            "Scroll viewport up half a page",
+        ),
+        entry(
+            "tui.altScreen.halfPageDown",
+            multiple(&[]),
+            "Scroll viewport down half a page",
+        ),
+        entry(
+            "tui.altScreen.previousPrompt",
+            single("ctrl+shift+up"),
+            "Jump to previous semantic prompt",
+        ),
+        entry(
+            "tui.altScreen.nextPrompt",
+            single("ctrl+shift+down"),
+            "Jump to next semantic prompt",
+        ),
+        entry(
+            "tui.altScreen.top",
+            single("home"),
+            "Scroll viewport to top",
+        ),
+        entry(
+            "tui.altScreen.bottom",
+            single("end"),
+            "Scroll viewport to bottom",
         ),
     ]
 }
@@ -1076,7 +1150,7 @@ mod tests {
         let keybindings = KeybindingsManager::with_defaults();
         let resolved = keybindings.get_resolved_bindings();
 
-        assert_eq!(resolved.len(), 33);
+        assert_eq!(resolved.len(), 41);
         assert_eq!(
             resolved.get("tui.editor.cursorUp"),
             Some(&KeyBindingValue::Single("up".to_string()))

@@ -13,8 +13,10 @@
 //!   queries, start/stop common segments.
 //! - `tui_main_screen.rs`: [`TuiMainScreen`]
 //!   (upstream `TuiMainScreen`, tui-main-screen.ts:57) — the main-screen
-//!   differential renderer, the only [`Tui`] implementation so far (the
-//!   fullscreen renderer is T31).
+//!   differential renderer.
+//! - `tui_alt_screen.rs`: [`TuiAltScreen`](crate::tui_alt_screen::TuiAltScreen)
+//!   (upstream `TuiAltScreen`, tui-alt-screen.ts:129) — the fullscreen
+//!   alternate-screen renderer with an application-owned viewport (T31).
 //!
 //! Intentional differences: see below.
 //!
@@ -550,8 +552,9 @@ pub type SharedTerminal = Arc<Mutex<Box<dyn Terminal + Send>>>;
 
 /// Object-safe TUI interface (upstream `TUI`, tui.ts:291-318 @ 4181f66).
 ///
-/// Implemented by [`TuiMainScreen`] (`mode() == TuiMode::Regular`); the
-/// fullscreen viewport renderer is T31. The generic `with_terminal` accessor
+/// Implemented by [`TuiMainScreen`] (`mode() == TuiMode::Regular`) and by
+/// [`TuiAltScreen`](crate::tui_alt_screen::TuiAltScreen)
+/// (`mode() == TuiMode::Fullscreen`, T31). The generic `with_terminal` accessor
 /// stays an inherent method on the implementation (it is not object-safe).
 /// Upstream `TUI extends Component` (render/handleInput members); here the
 /// engine was never a `Component` (see the header note on the Container API),
@@ -684,91 +687,145 @@ pub trait Tui: Send + Sync {
 }
 
 /// `ViewportTUI` (tui.ts:322-325 @ 4181f66): a [`Tui`] that renders into a
-/// managed viewport instead of the main screen. Interface only — the
-/// fullscreen implementation is T31. (Upstream brands implementors with the
-/// `VIEWPORT_TUI` symbol + `isViewportTUI` guard, tui.ts:320/327-329; a Rust
-/// `dyn Tui` can be downcast or the trait used directly, so no brand here.)
+/// managed viewport instead of the main screen. Implemented by
+/// [`TuiAltScreen`](crate::tui_alt_screen::TuiAltScreen) (T31). Upstream only
+/// declares `setLayoutRoot` on the interface; the remaining members are the
+/// public `TuiAltScreen` viewport API (tui-alt-screen.ts:185-191, 351-364,
+/// 380-383), exposed here so `dyn ViewportTui` consumers can drive the
+/// viewport. (Upstream brands implementors with the `VIEWPORT_TUI` symbol +
+/// `isViewportTUI` guard, tui.ts:320/327-329; a Rust `dyn Tui` can be
+/// downcast or the trait used directly, so no brand here.)
 pub trait ViewportTui: Tui {
     /// Upstream `setLayoutRoot` (tui.ts:324).
     fn set_layout_root(&self, root: Option<SharedComponent>);
+
+    /// Upstream `get viewportTop` (tui-alt-screen.ts:185-187).
+    fn viewport_top(&self) -> usize;
+
+    /// Upstream `get isFollowingOutput` (tui-alt-screen.ts:189-191).
+    fn is_following_output(&self) -> bool;
+
+    /// Upstream `scrollBy` (tui-alt-screen.ts:351-354).
+    fn scroll_by(&self, lines: i64);
+
+    /// Upstream `scrollToTop` (tui-alt-screen.ts:356-359).
+    fn scroll_to_top(&self);
+
+    /// Upstream `scrollToBottom` (tui-alt-screen.ts:361-364).
+    fn scroll_to_bottom(&self);
+
+    /// Upstream `flash` (tui-alt-screen.ts:380-383): show a transient message
+    /// in the alternate-screen flash stack. `duration_ms` mirrors the
+    /// `durationMs` parameter; `None` uses the upstream default
+    /// ([`DEFAULT_DURATION_MS`](crate::components::alt_screen_flash::DEFAULT_DURATION_MS)).
+    fn flash(&self, message: &str, duration_ms: Option<u64>);
 }
 
-/// Handle returned by [`TuiMainScreen::show_overlay`] for controlling the overlay
+/// Handle returned by `show_overlay` for controlling the overlay
 /// (upstream `OverlayHandle`, tui.ts:218-231).
+///
+/// The entry operations go through a per-renderer ops trait so the same
+/// handle type works for every [`Tui`] implementation (T31 added the
+/// alternate-screen renderer; upstream's handle closes over the live TUI
+/// object).
 #[derive(Clone)]
 pub struct OverlayHandle {
-    tui: TuiMainScreen,
+    ops: Arc<dyn OverlayHandleOps>,
     entry_id: u64,
 }
 
+/// Per-renderer backing operations for [`OverlayHandle`] (see its doc).
+pub(crate) trait OverlayHandleOps: Send + Sync {
+    fn hide(&self, entry_id: u64);
+    fn set_hidden(&self, entry_id: u64, hidden: bool);
+    fn is_hidden(&self, entry_id: u64) -> bool;
+    fn focus(&self, entry_id: u64);
+    fn unfocus(&self, entry_id: u64, options: Option<OverlayUnfocusOptions>);
+    fn is_focused(&self, entry_id: u64) -> bool;
+}
+
 impl OverlayHandle {
-    /// Constructed by `TuiMainScreen::show_overlay` (tui_main_screen.rs).
-    pub(crate) fn new(tui: TuiMainScreen, entry_id: u64) -> Self {
-        Self { tui, entry_id }
+    /// Constructed by the renderer's `show_overlay` implementation.
+    pub(crate) fn new(ops: Arc<dyn OverlayHandleOps>, entry_id: u64) -> Self {
+        Self { ops, entry_id }
     }
 
     /// Permanently remove the overlay (cannot be shown again) (tui.ts:513).
     pub fn hide(&self) {
-        let entry_id = self.entry_id;
-        self.tui
-            .run_or_queue(move |inner| inner.overlay_hide(entry_id));
+        self.ops.hide(self.entry_id);
     }
 
     /// Temporarily hide or show the overlay (tui.ts:528).
     pub fn set_hidden(&self, hidden: bool) {
-        let entry_id = self.entry_id;
-        self.tui
-            .run_or_queue(move |inner| inner.overlay_set_hidden(entry_id, hidden));
+        self.ops.set_hidden(self.entry_id, hidden);
     }
 
     /// Check if the overlay is temporarily hidden (tui.ts:548). Returns false
     /// on lock contention.
     pub fn is_hidden(&self) -> bool {
-        let entry_id = self.entry_id;
-        self.tui
-            .try_read(move |inner| {
-                inner
-                    .overlay_stack
-                    .iter()
-                    .find(|entry| entry.id == entry_id)
-                    .is_some_and(|entry| entry.hidden)
-            })
-            .unwrap_or(false)
+        self.ops.is_hidden(self.entry_id)
     }
 
     /// Focus this overlay and bring it to the visual front (tui.ts:549).
     pub fn focus(&self) {
-        let entry_id = self.entry_id;
-        self.tui
-            .run_or_queue(move |inner| inner.overlay_focus(entry_id));
+        self.ops.focus(self.entry_id);
     }
 
     /// Release focus to the next visible capturing overlay or previous
     /// target, or to an explicit target when provided (tui.ts:555).
     pub fn unfocus(&self, options: Option<OverlayUnfocusOptions>) {
-        let entry_id = self.entry_id;
-        self.tui
-            .run_or_queue(move |inner| inner.overlay_unfocus(entry_id, options));
+        self.ops.unfocus(self.entry_id, options);
     }
 
     /// Check if this overlay currently has focus (tui.ts:586). Returns false
     /// on lock contention.
     pub fn is_focused(&self) -> bool {
-        let entry_id = self.entry_id;
-        self.tui
-            .try_read(move |inner| {
-                let Some(entry) = inner
-                    .overlay_stack
-                    .iter()
-                    .find(|entry| entry.id == entry_id)
-                else {
-                    return false;
-                };
-                inner
-                    .focused_component
-                    .as_ref()
-                    .is_some_and(|focused| same_component(focused, &entry.component))
-            })
-            .unwrap_or(false)
+        self.ops.is_focused(self.entry_id)
+    }
+}
+
+impl OverlayHandleOps for TuiMainScreen {
+    fn hide(&self, entry_id: u64) {
+        self.run_or_queue(move |inner| inner.overlay_hide(entry_id));
+    }
+
+    fn set_hidden(&self, entry_id: u64, hidden: bool) {
+        self.run_or_queue(move |inner| inner.overlay_set_hidden(entry_id, hidden));
+    }
+
+    fn is_hidden(&self, entry_id: u64) -> bool {
+        self.try_read(move |inner| {
+            inner
+                .overlay_stack
+                .iter()
+                .find(|entry| entry.id == entry_id)
+                .is_some_and(|entry| entry.hidden)
+        })
+        .unwrap_or(false)
+    }
+
+    fn focus(&self, entry_id: u64) {
+        self.run_or_queue(move |inner| inner.overlay_focus(entry_id));
+    }
+
+    fn unfocus(&self, entry_id: u64, options: Option<OverlayUnfocusOptions>) {
+        self.run_or_queue(move |inner| inner.overlay_unfocus(entry_id, options));
+    }
+
+    fn is_focused(&self, entry_id: u64) -> bool {
+        self.try_read(move |inner| {
+            let Some(entry) = inner
+                .overlay_stack
+                .iter()
+                .find(|entry| entry.id == entry_id)
+            else {
+                return false;
+            };
+            inner
+                .focused_component
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, &entry.component))
+        })
+        .unwrap_or(false)
     }
 }

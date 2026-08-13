@@ -6,8 +6,9 @@
 //! Windows consoles fall back to truecolor when no terminal is positively
 //! identified). The Kitty image metadata registry
 //! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
-//! `crop_kitty_image_line`) and the `render_image` registration call also
-//! track the 4181f66 revision (T30).
+//! `crop_kitty_image_line` / `get_kitty_image_placement`) and the
+//! `render_image` registration call also track the 4181f66 revision
+//! (T30/T31).
 //!
 //! Intentional differences:
 //! - `probeTmuxHyperlinks` runs `tmux display-message` through `try_wait`
@@ -23,9 +24,9 @@
 //!   `None` instead of a best-effort parse.
 //! - `encodeITerm2` models upstream's `number | string` `width`/`height`
 //!   parameters as `Option<String>`; callers format numbers themselves.
-//! - The registry stores no `transmissionGeneration` and there is no
-//!   `getKittyImagePlacement` — both are only needed by the fullscreen
-//!   renderer (T31).
+//! - `transmissionGeneration` is a `u64` counter inside the metadata registry
+//!   (upstream module-level number); same per-registration increment
+//!   semantics.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
@@ -453,6 +454,12 @@ pub fn delete_all_kitty_images() -> String {
     "\x1b_Ga=d,d=A,q=2\x1b\\".to_string()
 }
 
+/// `deleteAllKittyPlacements` (terminal-image.ts:238-241): delete all visible
+/// Kitty placements while retaining their uploaded image data.
+pub fn delete_all_kitty_placements() -> String {
+    "\x1b_Ga=d,d=a,q=2\x1b\\".to_string()
+}
+
 /// Options for `encodeITerm2` (terminal-image.ts:227-236). Upstream's
 /// `width`/`height` are `number | string`; numbers are formatted by the caller.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -503,7 +510,6 @@ pub struct ImageCellSize {
 }
 
 /// `KittyImageMetadata` (terminal-image.ts:274-279 @ 4181f66).
-/// `RegisteredKittyImageMetadata.transmissionGeneration` is not ported (T31).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KittyImageMetadata {
     pub image_id: u32,
@@ -513,13 +519,24 @@ pub struct KittyImageMetadata {
     pub height_px: f64,
 }
 
+/// `RegisteredKittyImageMetadata` (terminal-image.ts:282-284 @ 4181f66): the
+/// public metadata plus the per-registration transmission generation.
+#[derive(Debug, Clone, Copy)]
+struct RegisteredKittyImageMetadata {
+    metadata: KittyImageMetadata,
+    transmission_generation: u64,
+}
+
 /// Metadata registry (terminal-image.ts:295): insertion-ordered map capped at
 /// 1000 entries. Re-registering an id refreshes its position (`delete` + `set`
 /// upstream); the oldest entry is evicted once the cap is exceeded. The queue
 /// mirrors the JS `Map` first-key eviction exactly.
 struct KittyImageMetadataRegistry {
-    map: HashMap<u32, KittyImageMetadata>,
+    map: HashMap<u32, RegisteredKittyImageMetadata>,
     order: VecDeque<u32>,
+    /// `kittyTransmissionGeneration` (terminal-image.ts:296): incremented on
+    /// every registration and assigned to the registered entry.
+    transmission_generation: u64,
 }
 
 impl KittyImageMetadataRegistry {
@@ -527,6 +544,7 @@ impl KittyImageMetadataRegistry {
         KittyImageMetadataRegistry {
             map: HashMap::new(),
             order: VecDeque::new(),
+            transmission_generation: 0,
         }
     }
 }
@@ -542,9 +560,11 @@ fn lock_kitty_image_metadata() -> std::sync::MutexGuard<'static, Option<KittyIma
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Clear the registry between tests (it is process-global).
+/// Clear the registry between tests (it is process-global). Also used by
+/// `kitty_registry::tests`, which exercise placement reads against the same
+/// registry.
 #[cfg(test)]
-fn reset_kitty_image_metadata() {
+pub(crate) fn reset_kitty_image_metadata() {
     *lock_kitty_image_metadata() = None;
 }
 
@@ -552,10 +572,20 @@ fn reset_kitty_image_metadata() {
 pub fn register_kitty_image_metadata(metadata: KittyImageMetadata) {
     let mut guard = lock_kitty_image_metadata();
     let registry = guard.get_or_insert_with(KittyImageMetadataRegistry::new);
+    // `kittyTransmissionGeneration += 1` precedes the delete+set
+    // (terminal-image.ts:298-301).
+    registry.transmission_generation = registry.transmission_generation.wrapping_add(1);
+    let generation = registry.transmission_generation;
     if registry.map.remove(&metadata.image_id).is_some() {
         registry.order.retain(|&id| id != metadata.image_id);
     }
-    registry.map.insert(metadata.image_id, metadata);
+    registry.map.insert(
+        metadata.image_id,
+        RegisteredKittyImageMetadata {
+            metadata,
+            transmission_generation: generation,
+        },
+    );
     registry.order.push_back(metadata.image_id);
     if registry.map.len() > KITTY_IMAGE_METADATA_LIMIT {
         if let Some(oldest_image_id) = registry.order.pop_front() {
@@ -578,7 +608,7 @@ fn find_kitty_command(line: &str) -> Option<(usize, &str, usize)> {
 }
 
 /// `getRegisteredKittyImageMetadata` (terminal-image.ts:308-313 @ 4181f66).
-fn get_registered_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+fn get_registered_kitty_image_metadata(line: &str) -> Option<RegisteredKittyImageMetadata> {
     let (_, controls, _) = find_kitty_command(line)?;
     // Upstream `/(?:^|,)i=(\d+)(?:,|$)/`: a whole `,`-separated control of
     // ASCII digits after `i=`.
@@ -593,7 +623,83 @@ fn get_registered_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata>
 
 /// `getKittyImageMetadata` (terminal-image.ts:315-325 @ 4181f66).
 pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
-    get_registered_kitty_image_metadata(line)
+    get_registered_kitty_image_metadata(line).map(|registered| registered.metadata)
+}
+
+/// `KittyImagePlacement` (terminal-image.ts:286-293 @ 4181f66).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KittyImagePlacement {
+    pub image_id: u32,
+    pub transmission_generation: u64,
+    pub transmission_bytes: usize,
+    pub estimated_decoded_bytes: f64,
+    pub sequence: String,
+    pub replacement_line: String,
+}
+
+/// `KITTY_PLACEMENT_CONTROL_KEYS` (terminal-image.ts:327-345 @ 4181f66).
+const KITTY_PLACEMENT_CONTROL_KEYS: [&str; 17] = [
+    "i", "p", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "U", "z", "P", "Q", "H", "V",
+];
+
+/// `/(?:^|,)m=1(?:,|$)/.test(controls)` (terminal-image.ts:360 @ 4181f66):
+/// `m=1` as a whole comma-separated control.
+fn controls_have_m_1(controls: &str) -> bool {
+    controls.split(',').any(|control| control == "m=1")
+}
+
+/// Build a placement-only command for an image line emitted by `render_image`
+/// (`getKittyImagePlacement`, terminal-image.ts:348-380 @ 4181f66).
+pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
+    let (match_index, controls, _) = find_kitty_command(line)?;
+    let metadata = get_registered_kitty_image_metadata(line)?;
+
+    // Skip `m=1` continuation chunks up to the final one
+    // (terminal-image.ts:353-366). Payload bytes are base64, so the first ST
+    // after the control prefix is the chunk terminator.
+    let mut command_start = match_index;
+    let mut command_controls = controls;
+    let transmission_end = loop {
+        let terminator = line[command_start + KITTY_PREFIX.len()..].find("\x1b\\")?;
+        let terminator = command_start + KITTY_PREFIX.len() + terminator;
+        let transmission_end = terminator + 2;
+        if !controls_have_m_1(command_controls) {
+            break transmission_end;
+        }
+        command_start = transmission_end;
+        if !line[command_start..].starts_with(KITTY_PREFIX) {
+            return None;
+        }
+        let controls_start = command_start + KITTY_PREFIX.len();
+        let controls_end = line[controls_start..].find(';')?;
+        command_controls = &line[controls_start..controls_start + controls_end];
+    };
+
+    // Placement controls come from the FIRST chunk (`match[1]`), filtered by
+    // the whitelist; the key is everything before the first `=`
+    // (terminal-image.ts:368-371).
+    let kept: Vec<&str> = controls
+        .split(',')
+        .filter(|control| {
+            let key = control.split('=').next().unwrap_or_default();
+            KITTY_PLACEMENT_CONTROL_KEYS.contains(&key)
+        })
+        .collect();
+    let sequence = format!("\x1b_Ga=p,q=2,{}\x1b\\", kept.join(","));
+    let replacement_line = format!(
+        "{}{}{}",
+        &line[..match_index],
+        sequence,
+        &line[transmission_end..]
+    );
+    Some(KittyImagePlacement {
+        image_id: metadata.metadata.image_id,
+        transmission_generation: metadata.transmission_generation,
+        transmission_bytes: transmission_end - match_index,
+        estimated_decoded_bytes: metadata.metadata.width_px * metadata.metadata.height_px * 4.0,
+        sequence,
+        replacement_line,
+    })
 }
 
 /// `cropKittyImageLine` (terminal-image.ts:382-394 @ 4181f66): rewrite the
@@ -929,13 +1035,16 @@ pub fn image_fallback(
     format!("[Image: {}]", parts.join(" "))
 }
 
+/// Serializes tests that mutate process-global state (capabilities cache,
+/// Kitty metadata registry, Kitty image cache); cargo runs tests in one binary
+/// with parallel threads. Shared between the `terminal_image` and
+/// `kitty_registry` test modules.
+#[cfg(test)]
+pub(crate) static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes tests that mutate process env or module globals; cargo runs
-    /// tests in one binary with parallel threads.
-    static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     /// `withEnv` (terminal-image.test.ts:37-55): clears every capability env
     /// var, applies `overrides` (None = unset), runs `f`, then restores.
@@ -1434,6 +1543,7 @@ mod tests {
     fn test_encode_kitty_suppresses_replies_for_delete_commands() {
         assert_eq!(delete_kitty_image(42), "\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
         assert_eq!(delete_all_kitty_images(), "\x1b_Ga=d,d=A,q=2\x1b\\");
+        assert_eq!(delete_all_kitty_placements(), "\x1b_Ga=d,d=a,q=2\x1b\\");
     }
 
     #[test]
@@ -2095,6 +2205,134 @@ mod tests {
         let unknown = kitty_line(0xffff_ff01);
         assert_eq!(crop_kitty_image_line(&unknown, 1, 1), unknown);
         assert_eq!(crop_kitty_image_line("plain", 1, 1), "plain");
+    }
+
+    // ── Kitty image placement (terminal-image.ts:348-380 @ 4181f66) ────────
+
+    #[test]
+    fn test_creates_placement_only_commands_for_uploaded_and_cropped_images() {
+        // terminal-image.test.ts:450-466.
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        register_kitty_image_metadata(KittyImageMetadata {
+            image_id: 42,
+            columns: 3,
+            rows: 3,
+            width_px: 100.0,
+            height_px: 100.0,
+        });
+        let transmission = encode_kitty(
+            &"A".repeat(8192),
+            &KittyEncodeOptions {
+                columns: Some(3),
+                rows: Some(3),
+                image_id: Some(42),
+                move_cursor: Some(false),
+            },
+        );
+        let line = format!("left {} right", crop_kitty_image_line(&transmission, 2, 1));
+        let placement = get_kitty_image_placement(&line).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            placement.transmission_bytes,
+            line.len() - "left ".len() - " right".len()
+        );
+        assert_eq!(placement.estimated_decoded_bytes, 100.0 * 100.0 * 4.0);
+        assert_eq!(
+            placement.sequence,
+            "\x1b_Ga=p,q=2,C=1,c=3,i=42,y=66,h=34,r=1\x1b\\"
+        );
+        assert_eq!(
+            placement.replacement_line,
+            format!("left {} right", placement.sequence)
+        );
+        assert!(!placement.replacement_line.contains("AAAA"));
+    }
+
+    #[test]
+    fn test_get_kitty_image_placement_tracks_transmission_generation() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_kitty_image_metadata();
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        register_kitty_image_metadata(metadata(id));
+        let placement =
+            get_kitty_image_placement(&kitty_line(id)).unwrap_or_else(|| unreachable!());
+        assert_eq!(placement.image_id, id);
+        // The counter is process-global and was reset above: two registrations.
+        assert_eq!(placement.transmission_generation, 2);
+        assert_eq!(placement.estimated_decoded_bytes, 90.0 * 612.0 * 4.0);
+        assert_eq!(
+            placement.sequence,
+            format!("\x1b_Ga=p,q=2,i={id},c=10,r=34\x1b\\")
+        );
+        assert_eq!(placement.replacement_line, placement.sequence);
+    }
+
+    #[test]
+    fn test_get_kitty_image_placement_measures_all_transmission_chunks() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        // 3 chunks: m=1 first, m=1 middle, m=0 last (terminal-image.ts:188-208).
+        let data = "A".repeat(KITTY_CHUNK_SIZE * 2 + 10);
+        let transmission = encode_kitty(
+            &data,
+            &KittyEncodeOptions {
+                image_id: Some(id),
+                ..Default::default()
+            },
+        );
+        let line = format!("pre {transmission} post");
+        let placement = get_kitty_image_placement(&line).unwrap_or_else(|| unreachable!());
+        assert_eq!(placement.transmission_bytes, transmission.len());
+        assert_eq!(
+            placement.replacement_line,
+            format!("pre {} post", placement.sequence)
+        );
+        assert!(!placement.replacement_line.contains('A'));
+        // Only first-chunk controls are whitelisted into the sequence.
+        assert_eq!(placement.sequence, format!("\x1b_Ga=p,q=2,i={id}\x1b\\"));
+    }
+
+    #[test]
+    fn test_get_kitty_image_placement_returns_none_for_unknown_or_malformed_lines() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(get_kitty_image_placement("plain text"), None);
+        // Well-formed command, unregistered id.
+        assert_eq!(get_kitty_image_placement(&kitty_line(0xffff_ff02)), None);
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        // Missing chunk terminator.
+        assert_eq!(
+            get_kitty_image_placement(&format!("\x1b_Gi={id};AAAA")),
+            None
+        );
+        // m=1 chunk not followed by a Kitty command.
+        assert_eq!(
+            get_kitty_image_placement(&format!("\x1b_Gi={id},m=1;AAAA\x1b\\oops")),
+            None
+        );
+        // m=1 chunk whose follow-up chunk has no `;` after the controls.
+        assert_eq!(
+            get_kitty_image_placement(&format!("\x1b_Gi={id},m=1;AAAA\x1b\\\x1b_Gm=0")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_get_kitty_image_placement_preserves_prefix_and_suffix() {
+        let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let id = allocate_image_id();
+        register_kitty_image_metadata(metadata(id));
+        let line = format!("pre\x1b_Gi={id};QUJD\x1b\\post");
+        let placement = get_kitty_image_placement(&line).unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            placement.replacement_line,
+            format!("pre{}post", placement.sequence)
+        );
+        assert_eq!(
+            placement.transmission_bytes,
+            format!("\x1b_Gi={id};QUJD\x1b\\").len()
+        );
     }
 
     #[test]

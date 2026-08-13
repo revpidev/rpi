@@ -6,16 +6,21 @@
 //! render-state capture/restore (tui-main-screen.ts:68-89) and the
 //! `preserve_screen` stop hook (tui-main-screen.ts:101-109).
 //!
-//! [`TuiMainScreen`] is the clonable handle (the pre-split `Tui` struct) and
-//! the only [`Tui`] implementation so far; it takes the stable-reference
-//! role of upstream's renderer `Proxy` (b103937d3). If T32's runtime mode
-//! switch needs `dyn Tui` forwarding, that lands with T31/T32. The shared
-//! engine state and behavior live in `TuiBase` (tui_base.rs; see its module
-//! header for the composition-over-inheritance mapping).
+//! [`TuiMainScreen`] is the clonable handle (the pre-split `Tui` struct); it
+//! takes the stable-reference role of upstream's renderer `Proxy` (b103937d3).
+//! The fullscreen alternate-screen renderer is `TuiAltScreen` (T31,
+//! tui_alt_screen.rs). If T32's runtime mode switch needs `dyn Tui`
+//! forwarding, that lands with T32. The shared engine state and behavior live
+//! in `TuiBase` (tui_base.rs; see its module header for the
+//! composition-over-inheritance mapping).
 //!
 //! Intentional differences: see the `tui.rs` header notes; this file adds
 //! none of its own. The kitty image line helpers live here like upstream
-//! (tui-main-screen.ts:7-40).
+//! (tui-main-screen.ts:7-40). T31 moved `composite_overlays` /
+//! `apply_line_resets` / `extract_cursor_position` (and `CursorPos`) into
+//! `tui_base.rs` as shared renderer helpers — the alternate-screen renderer
+//! (`tui-alt-screen.ts`) uses the same three upstream functions; call sites
+//! here are unchanged behavior.
 
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
@@ -30,15 +35,15 @@ use crate::terminal::{InputHandler, ResizeHandler, Terminal};
 use crate::terminal_colors::{RgbColor, TerminalColorScheme};
 use crate::terminal_image::{delete_kitty_image, is_image_line};
 use crate::tui::{
-    composite_tui_line, lock_component, lock_shared, same_component, OverlayHandle, OverlayOptions,
-    RenderHandle, SharedComponent, SharedTerminal, TerminalColorSchemeListener, Tui,
-    TuiInputListener, TuiMode, TuiStopOptions, CURSOR_MARKER, SEGMENT_RESET,
+    lock_component, lock_shared, same_component, OverlayHandle, OverlayOptions, RenderHandle,
+    SharedComponent, SharedTerminal, TerminalColorSchemeListener, Tui, TuiInputListener, TuiMode,
+    TuiStopOptions,
 };
 use crate::tui_base::{
-    env_flag_is_1, schedule_render, OverlayStackEntry, PendingOsc11BackgroundQuery,
+    env_flag_is_1, schedule_render, CursorPos, PendingOsc11BackgroundQuery,
     PendingTerminalColorSchemeQuery, RenderSchedule, TerminalSizeCache, TuiBase,
 };
-use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
+use crate::utils::visible_width;
 
 // =============================================================================
 // Kitty image line helpers (tui.ts:21-58)
@@ -146,14 +151,6 @@ fn iso_timestamp_now() -> String {
 /// an empty value is falsy in JS.
 fn is_termux_session() -> bool {
     std::env::var("TERMUX_VERSION").is_ok_and(|value| !value.is_empty())
-}
-
-/// Cursor position extracted from [`CURSOR_MARKER`] (upstream
-/// `{ row, col }`, tui.ts:1238).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CursorPos {
-    row: i32,
-    col: i32,
 }
 
 /// Screen row diff between the current hardware cursor and a target buffer
@@ -447,7 +444,7 @@ impl TuiMainScreen {
     ) -> OverlayHandle {
         let entry_id = self.next_overlay_id.fetch_add(1, Ordering::Relaxed);
         self.run_or_queue(move |inner| inner.show_overlay(entry_id, component, options));
-        OverlayHandle::new(self.clone(), entry_id)
+        OverlayHandle::new(Arc::new(self.clone()), entry_id)
     }
 
     /// Upstream `hideOverlay`: hide the topmost overlay and restore previous
@@ -898,121 +895,6 @@ impl TuiMainScreenInner {
         self.terminal().write("\r\n");
     }
 
-    /// `compositeOverlays` (tui.ts:1036-1095): composite all overlays into
-    /// content lines (sorted by focusOrder, higher = on top).
-    fn composite_overlays(
-        &self,
-        lines: Vec<String>,
-        term_width: i32,
-        term_height: i32,
-    ) -> Vec<String> {
-        if self.overlay_stack.is_empty() {
-            return lines;
-        }
-        let mut result = lines;
-
-        // Pre-render all visible overlays and calculate positions.
-        struct Rendered {
-            overlay_lines: Vec<String>,
-            row: i32,
-            col: i32,
-            width: i32,
-        }
-        let mut rendered: Vec<Rendered> = Vec::new();
-        let mut min_lines_needed = result.len() as i32;
-
-        let mut visible_entries: Vec<&OverlayStackEntry> = self
-            .overlay_stack
-            .iter()
-            .filter(|entry| self.is_overlay_visible(entry))
-            .collect();
-        visible_entries.sort_by_key(|entry| entry.focus_order);
-        for entry in visible_entries {
-            // Get layout with height=0 first to determine width and maxHeight
-            // (width and maxHeight don't depend on overlay height).
-            let initial =
-                TuiBase::resolve_overlay_layout(entry.options.as_ref(), 0, term_width, term_height);
-
-            // Render component at calculated width.
-            let mut overlay_lines =
-                lock_component(&entry.component).render(initial.width.max(0) as usize);
-
-            // Apply maxHeight if specified.
-            if let Some(max_height) = initial.max_height {
-                if overlay_lines.len() as i32 > max_height {
-                    overlay_lines.truncate(max_height.max(0) as usize);
-                }
-            }
-
-            // Get final row/col with the actual overlay height.
-            let layout = TuiBase::resolve_overlay_layout(
-                entry.options.as_ref(),
-                overlay_lines.len() as i32,
-                term_width,
-                term_height,
-            );
-            min_lines_needed = min_lines_needed.max(layout.row + overlay_lines.len() as i32);
-            rendered.push(Rendered {
-                overlay_lines,
-                row: layout.row,
-                col: layout.col,
-                width: initial.width,
-            });
-        }
-
-        // Pad to at least terminal height so overlays have screen-relative
-        // positions. Excludes maxLinesRendered: the historical high-water mark
-        // caused self-reinforcing inflation that pushed content into scrollback
-        // on terminal widen.
-        let working_height = (result.len() as i32).max(term_height).max(min_lines_needed);
-        while (result.len() as i32) < working_height {
-            result.push(String::new());
-        }
-
-        let viewport_start = 0.max(working_height - term_height);
-
-        // Composite each overlay.
-        for rendered_overlay in &rendered {
-            for (i, overlay_line) in rendered_overlay.overlay_lines.iter().enumerate() {
-                let index = viewport_start + rendered_overlay.row + i as i32;
-                if index >= 0 && (index as usize) < result.len() {
-                    // Defensive: truncate overlay line to declared width before
-                    // compositing (components should already respect width, but
-                    // this ensures it).
-                    let truncated = if visible_width(overlay_line) as i32 > rendered_overlay.width {
-                        slice_by_column(
-                            overlay_line,
-                            0,
-                            rendered_overlay.width.max(0) as usize,
-                            true,
-                        )
-                    } else {
-                        overlay_line.clone()
-                    };
-                    result[index as usize] = composite_tui_line(
-                        &result[index as usize],
-                        &truncated,
-                        rendered_overlay.col,
-                        rendered_overlay.width,
-                        term_width,
-                    );
-                }
-            }
-        }
-
-        result
-    }
-
-    /// `applyLineResets` (tui.ts:1099-1108): normalize terminal output and
-    /// append SGR + OSC 8 reset to every non-image line.
-    fn apply_line_resets(lines: &mut [String]) {
-        for line in lines {
-            if !is_image_line(line) {
-                *line = normalize_terminal_output(line) + SEGMENT_RESET;
-            }
-        }
-    }
-
     /// `collectKittyImageIds` (tui.ts:1110-1118); Vec keeps the JS Set's
     /// first-seen insertion order.
     fn collect_kitty_image_ids(lines: &[String]) -> Vec<u32> {
@@ -1103,27 +985,6 @@ impl TuiMainScreenInner {
         }
 
         Self::delete_kitty_images(&ids)
-    }
-
-    /// `extractCursorPosition` (tui.ts:1238-1256): find CURSOR_MARKER in the
-    /// visible viewport, strip it, and return its position.
-    fn extract_cursor_position(lines: &mut [String], height: i32) -> Option<CursorPos> {
-        // Only scan the bottom `height` lines (visible viewport).
-        let viewport_top = 0.max(lines.len() as i32 - height);
-        for row in (viewport_top..lines.len() as i32).rev() {
-            let line = &lines[row as usize];
-            if let Some(marker_index) = line.find(CURSOR_MARKER) {
-                // Visual column = width of text before the marker.
-                let col = visible_width(&line[..marker_index]) as i32;
-                lines[row as usize] = format!(
-                    "{}{}",
-                    &line[..marker_index],
-                    &line[marker_index + CURSOR_MARKER.len()..]
-                );
-                return Some(CursorPos { row, col });
-            }
-        }
-        None
     }
 
     /// Full render helper (upstream `fullRender` closure, tui.ts:1288-1329):
@@ -1256,9 +1117,9 @@ impl TuiMainScreenInner {
 
         // Extract cursor position before applying line resets (marker must be
         // found first).
-        let cursor_pos = Self::extract_cursor_position(&mut new_lines, height);
+        let cursor_pos = TuiBase::extract_cursor_position(&mut new_lines, height);
 
-        Self::apply_line_resets(&mut new_lines);
+        TuiBase::apply_line_resets(&mut new_lines);
 
         // First render - just output everything without clearing (assumes a
         // clean screen).
@@ -1848,39 +1709,42 @@ mod tests {
     //! `test/regression-overlay-cjk-boundary.test.ts`, and the
     //! `TUI.queryTerminalBackgroundColor` cases of `test/terminal-colors.test.ts`.
     //!
-    //! `VirtualTerminal` below ports `test/virtual-terminal.ts`; upstream uses
-    //! `@xterm/headless`, here a minimal screen emulator covers exactly the
-    //! sequences the TUI emits (CSI A/B/G/H/J/K, SGR with per-cell italic
-    //! tracking for the style-leak assertions, CR/LF with scrolling, private
-    //! modes, OSC/APC/DCS skipping). `translateToString(true)` parity: cells
-    //! never written are dropped from the end of a line; explicitly written
-    //! spaces count.
-    //!
-    //! Async timing (`waitForRender` = nextTick + 20ms settle + flush) becomes
-    //! the explicit `settle` helper driving `TuiMainScreen::tick` with synthetic instants.
+    //! The test terminal and drive helpers (`VirtualTerminal`, `settle`,
+    //! `render_and_flush`, `send_input`, `state_lock`, `EnvGuard`) live in
+    //! `crate::test_vt` (port of `test/virtual-terminal.ts` plus the T31
+    //! extensions; see its module header). Async timing (`waitForRender` =
+    //! nextTick + 20ms settle + flush) becomes the explicit `settle` helper
+    //! driving `TuiMainScreen::tick` with synthetic instants.
 
     use super::*;
     use crate::keys::{is_key_release, matches_key};
+    use crate::test_vt::{
+        render_and_flush, send_input, settle, state_lock, EnvGuard, TestTui, VirtualTerminal,
+    };
     use crate::tui::{
-        shared_component, Component, Focusable, OverlayAnchor, OverlayMargin, OverlayMarginSpec,
-        OverlayOptions, OverlayUnfocusOptions, SizeValue, TuiInputListenerResult,
+        composite_tui_line, shared_component, Component, Focusable, OverlayAnchor, OverlayMargin,
+        OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, SizeValue,
+        TuiInputListenerResult, CURSOR_MARKER,
     };
     use crate::tui_base::TuiBase;
-    use std::future::Future;
-    use std::pin::Pin;
+    use crate::utils::slice_by_column;
     use std::sync::atomic::AtomicBool;
-
-    use unicode_width::UnicodeWidthChar;
 
     use crate::terminal_image::{
         reset_capabilities_cache, set_capabilities, set_cell_dimensions, CellDimensions,
         TerminalCapabilities,
     };
 
-    /// Serializes tests that mutate process env or module globals
-    /// (capabilities cache, cell dimensions); cargo runs tests in one binary
-    /// with parallel threads. Mirrors terminal_image.rs's TEST_STATE_LOCK.
-    static TEST_STATE_LOCK: Mutex<()> = Mutex::new(());
+    /// `TestTui` drive impl backing the shared settle/render helpers.
+    impl TestTui for TuiMainScreen {
+        fn tick(&self, now: Instant) {
+            TuiMainScreen::tick(self, now);
+        }
+
+        fn has_pending_work(&self) -> bool {
+            TuiMainScreen::has_pending_work(self)
+        }
+    }
 
     const KITTY_CAPS: TerminalCapabilities = TerminalCapabilities {
         images: Some(crate::terminal_image::ImageProtocol::Kitty),
@@ -1889,488 +1753,8 @@ mod tests {
     };
 
     // -------------------------------------------------------------------------
-    // VirtualTerminal (port of test/virtual-terminal.ts)
+    // Test helpers (TUI-agnostic drive helpers live in crate::test_vt)
     // -------------------------------------------------------------------------
-
-    #[derive(Clone, Default)]
-    struct VtCell {
-        text: String,
-        italic: bool,
-        /// Second cell of a wide (CJK) character: emits nothing.
-        continuation: bool,
-    }
-
-    /// `None` = never written / cleared (xterm null cell).
-    type VtLine = Vec<Option<VtCell>>;
-
-    struct VtState {
-        cols: usize,
-        rows: usize,
-        /// Scrollback + screen; the screen is the last `rows` entries.
-        /// Invariant: `lines.len() >= rows`.
-        lines: Vec<VtLine>,
-        /// Screen-relative cursor row.
-        cursor_row: usize,
-        /// Cursor column; may equal `cols` (pending wrap, like xterm).
-        cursor_col: usize,
-        italic: bool,
-        cursor_hidden: bool,
-        /// Every `write` recorded (upstream `LoggingVirtualTerminal`).
-        writes: Vec<String>,
-        input_handler: Option<InputHandler>,
-        resize_handler: Option<ResizeHandler>,
-    }
-
-    /// Clonable handle so tests keep access after the TUI takes ownership.
-    #[derive(Clone)]
-    struct VirtualTerminal {
-        state: Arc<Mutex<VtState>>,
-    }
-
-    impl VirtualTerminal {
-        fn new(columns: usize, rows: usize) -> Self {
-            VirtualTerminal {
-                state: Arc::new(Mutex::new(VtState {
-                    cols: columns,
-                    rows,
-                    lines: vec![vec![None; columns]; rows],
-                    cursor_row: 0,
-                    cursor_col: 0,
-                    italic: false,
-                    cursor_hidden: false,
-                    writes: Vec::new(),
-                    input_handler: None,
-                    resize_handler: None,
-                })),
-            }
-        }
-
-        fn lock(&self) -> MutexGuard<'_, VtState> {
-            lock_shared(&self.state)
-        }
-
-        /// Simulate keyboard input (upstream `sendInput`).
-        fn send_input(&self, data: &str) {
-            let handler = self.lock().input_handler.take();
-            if let Some(mut handler) = handler {
-                handler(data);
-                let mut state = self.lock();
-                if state.input_handler.is_none() {
-                    state.input_handler = Some(handler);
-                }
-            }
-        }
-
-        /// Resize the terminal (upstream `resize`).
-        fn resize(&self, columns: usize, rows: usize) {
-            {
-                let mut state = self.lock();
-                state.cols = columns;
-                state.rows = rows;
-                for line in &mut state.lines {
-                    line.resize(columns, None);
-                }
-                while state.lines.len() < rows {
-                    state.lines.push(vec![None; columns]);
-                }
-                state.cursor_row = state.cursor_row.min(rows - 1);
-                state.cursor_col = state.cursor_col.min(columns);
-            }
-            let handler = self.lock().resize_handler.take();
-            if let Some(mut handler) = handler {
-                handler();
-                let mut state = self.lock();
-                if state.resize_handler.is_none() {
-                    state.resize_handler = Some(handler);
-                }
-            }
-        }
-
-        /// The visible viewport (upstream `getViewport`).
-        fn get_viewport(&self) -> Vec<String> {
-            let state = self.lock();
-            let screen_top = state.lines.len() - state.rows;
-            state.lines[screen_top..]
-                .iter()
-                .map(translate_line)
-                .collect()
-        }
-
-        /// The entire scroll buffer (upstream `getScrollBuffer`).
-        fn get_scroll_buffer(&self) -> Vec<String> {
-            self.lock().lines.iter().map(translate_line).collect()
-        }
-
-        /// Cursor position, screen-relative (upstream `getCursorPosition`).
-        fn get_cursor_position(&self) -> (usize, usize) {
-            let state = self.lock();
-            (state.cursor_col, state.cursor_row)
-        }
-
-        /// Whether the cursor is hidden (tracks `?25l` / `?25h`).
-        fn cursor_hidden(&self) -> bool {
-            self.lock().cursor_hidden
-        }
-
-        /// xterm `cell.isItalic()` for the style-leak assertions.
-        fn cell_italic(&self, row: usize, col: usize) -> bool {
-            let state = self.lock();
-            let screen_top = state.lines.len() - state.rows;
-            state.lines[screen_top + row]
-                .get(col)
-                .and_then(|cell| cell.as_ref())
-                .is_some_and(|cell| cell.italic)
-        }
-
-        /// Concatenated recorded writes (upstream `getWrites`).
-        fn get_writes(&self) -> String {
-            self.lock().writes.concat()
-        }
-
-        fn clear_writes(&self) {
-            self.lock().writes.clear();
-        }
-    }
-
-    /// xterm `line.translateToString(true)`: trailing never-written cells are
-    /// dropped; written spaces and wide-char continuations are handled.
-    fn translate_line(line: &VtLine) -> String {
-        let last_written = line.iter().rposition(Option::is_some);
-        let Some(last) = last_written else {
-            return String::new();
-        };
-        let mut out = String::new();
-        for cell in &line[..=last] {
-            match cell {
-                None => out.push(' '),
-                Some(cell) if cell.continuation => {}
-                Some(cell) => out.push_str(&cell.text),
-            }
-        }
-        out
-    }
-
-    impl VtState {
-        fn blank_line(cols: usize) -> VtLine {
-            vec![None; cols]
-        }
-
-        fn screen_top(&self) -> usize {
-            self.lines.len() - self.rows
-        }
-
-        fn abs_row(&self) -> usize {
-            self.screen_top() + self.cursor_row
-        }
-
-        fn line_feed(&mut self) {
-            if self.cursor_row == self.rows - 1 {
-                self.lines.push(Self::blank_line(self.cols));
-            } else {
-                self.cursor_row += 1;
-            }
-        }
-
-        fn put_char(&mut self, ch: char) {
-            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width == 0 {
-                // Combining char: merge into the previous cell's text.
-                if self.cursor_col > 0 {
-                    let abs = self.abs_row();
-                    if let Some(Some(cell)) = self.lines[abs].get_mut(self.cursor_col - 1) {
-                        if !cell.continuation {
-                            cell.text.push(ch);
-                        }
-                    }
-                }
-                return;
-            }
-            if self.cursor_col >= self.cols {
-                // Pending wrap: move to the next line first (xterm wraparound).
-                self.cursor_col = 0;
-                self.line_feed();
-            }
-            let abs = self.abs_row();
-            let col = self.cursor_col;
-            let italic = self.italic;
-            self.lines[abs][col] = Some(VtCell {
-                text: ch.to_string(),
-                italic,
-                continuation: false,
-            });
-            if width == 2 && col + 1 < self.cols {
-                self.lines[abs][col + 1] = Some(VtCell {
-                    text: String::new(),
-                    italic,
-                    continuation: true,
-                });
-            }
-            self.cursor_col += width;
-        }
-
-        fn clear_line_range(&mut self, from: usize, to: usize) {
-            let abs = self.abs_row();
-            for col in from..=to.min(self.cols - 1) {
-                if col < self.cols {
-                    self.lines[abs][col] = None;
-                }
-            }
-        }
-
-        fn handle_csi(&mut self, params: &str, final_byte: char) {
-            let first_param = || {
-                params
-                    .split(';')
-                    .next()
-                    .and_then(|p| p.parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .unwrap_or(1)
-            };
-            match final_byte {
-                'A' => self.cursor_row = self.cursor_row.saturating_sub(first_param()),
-                'B' => self.cursor_row = (self.cursor_row + first_param()).min(self.rows - 1),
-                'C' => self.cursor_col = (self.cursor_col + first_param()).min(self.cols - 1),
-                'D' => self.cursor_col = self.cursor_col.saturating_sub(first_param()),
-                'G' => {
-                    self.cursor_col = first_param().saturating_sub(1).min(self.cols - 1);
-                }
-                'H' => {
-                    self.cursor_row = 0;
-                    self.cursor_col = 0;
-                }
-                'J' => match params {
-                    "2" => {
-                        let top = self.screen_top();
-                        let blank = Self::blank_line(self.cols);
-                        for line in &mut self.lines[top..] {
-                            *line = blank.clone();
-                        }
-                    }
-                    "3" => {
-                        // Clear scrollback: keep only the screen lines.
-                        let top = self.screen_top();
-                        self.lines.drain(..top);
-                    }
-                    _ => {
-                        // Clear from cursor to end of screen.
-                        let abs = self.abs_row();
-                        for col in self.cursor_col..self.cols {
-                            self.lines[abs][col] = None;
-                        }
-                        let blank = Self::blank_line(self.cols);
-                        for row in abs + 1..self.lines.len() {
-                            self.lines[row] = blank.clone();
-                        }
-                    }
-                },
-                'K' => match params {
-                    "2" => {
-                        let abs = self.abs_row();
-                        self.lines[abs] = Self::blank_line(self.cols);
-                    }
-                    "1" => {
-                        let col = self.cursor_col;
-                        self.clear_line_range(0, col);
-                    }
-                    _ => {
-                        let col = self.cursor_col;
-                        self.clear_line_range(col, self.cols - 1);
-                    }
-                },
-                'm' => {
-                    for param in params.split(';') {
-                        match param {
-                            "" | "0" => self.italic = false,
-                            "3" => self.italic = true,
-                            "23" => self.italic = false,
-                            _ => {}
-                        }
-                    }
-                }
-                'h' | 'l' if params == "?25" => {
-                    self.cursor_hidden = final_byte == 'l';
-                }
-                _ => {}
-            }
-        }
-
-        /// Feed output into the emulator (and record it).
-        fn write_raw(&mut self, data: &str) {
-            self.writes.push(data.to_string());
-            let chars: Vec<char> = data.chars().collect();
-            let mut i = 0;
-            while i < chars.len() {
-                match chars[i] {
-                    '\x1b' => match chars.get(i + 1) {
-                        Some('[') => {
-                            let mut j = i + 2;
-                            let mut params = String::new();
-                            while j < chars.len() {
-                                let ch = chars[j];
-                                if ('\x40'..='\x7e').contains(&ch) {
-                                    break;
-                                }
-                                params.push(ch);
-                                j += 1;
-                            }
-                            if let Some(&final_byte) = chars.get(j) {
-                                self.handle_csi(&params, final_byte);
-                                j += 1;
-                            }
-                            i = j;
-                        }
-                        // OSC / APC / DCS / SOS / PM: skip to BEL or ST.
-                        Some(']') | Some('_') | Some('P') | Some('X') | Some('^') => {
-                            let mut j = i + 2;
-                            while j < chars.len() {
-                                if chars[j] == '\x07' {
-                                    j += 1;
-                                    break;
-                                }
-                                if chars[j] == '\x1b' && chars.get(j + 1) == Some(&'\\') {
-                                    j += 2;
-                                    break;
-                                }
-                                j += 1;
-                            }
-                            i = j;
-                        }
-                        Some(_) => i += 2,
-                        None => i += 1,
-                    },
-                    '\r' => {
-                        self.cursor_col = 0;
-                        i += 1;
-                    }
-                    '\n' => {
-                        self.line_feed();
-                        i += 1;
-                    }
-                    '\t' => {
-                        let next_tab_stop = (self.cursor_col / 8 + 1) * 8;
-                        while self.cursor_col < next_tab_stop.min(self.cols) {
-                            self.put_char(' ');
-                        }
-                        i += 1;
-                    }
-                    ch if (ch as u32) < 0x20 => i += 1,
-                    ch => {
-                        self.put_char(ch);
-                        i += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    impl Terminal for VirtualTerminal {
-        fn start(&mut self, on_input: InputHandler, on_resize: ResizeHandler) {
-            let mut state = self.lock();
-            state.input_handler = Some(on_input);
-            state.resize_handler = Some(on_resize);
-            // Enable bracketed paste mode for consistency with ProcessTerminal.
-            state.write_raw("\x1b[?2004h");
-        }
-
-        fn stop(&mut self) {
-            let mut state = self.lock();
-            state.write_raw("\x1b[?2004l");
-            state.input_handler = None;
-            state.resize_handler = None;
-        }
-
-        fn drain_input(
-            &mut self,
-            _max_ms: Option<u64>,
-            _idle_ms: Option<u64>,
-        ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-            // No-op for the virtual terminal — no stdin to drain.
-            Box::pin(async {})
-        }
-
-        fn write(&mut self, data: &str) {
-            self.lock().write_raw(data);
-        }
-
-        fn columns(&self) -> u16 {
-            self.lock().cols as u16
-        }
-
-        fn rows(&self) -> u16 {
-            self.lock().rows as u16
-        }
-
-        fn kitty_protocol_active(&self) -> bool {
-            // The virtual terminal always reports Kitty protocol as active.
-            true
-        }
-
-        fn move_by(&mut self, lines: i32) {
-            if lines > 0 {
-                self.write(&format!("\x1b[{lines}B"));
-            } else if lines < 0 {
-                self.write(&format!("\x1b[{}A", -lines));
-            }
-        }
-
-        fn hide_cursor(&mut self) {
-            self.write("\x1b[?25l");
-        }
-
-        fn show_cursor(&mut self) {
-            self.write("\x1b[?25h");
-        }
-
-        fn clear_line(&mut self) {
-            self.write("\x1b[K");
-        }
-
-        fn clear_from_cursor(&mut self) {
-            self.write("\x1b[J");
-        }
-
-        fn clear_screen(&mut self) {
-            self.write("\x1b[2J\x1b[H");
-        }
-
-        fn set_title(&mut self, title: &str) {
-            self.write(&format!("\x1b]0;{title}\x07"));
-        }
-
-        fn set_progress(&mut self, _active: bool) {}
-    }
-
-    // -------------------------------------------------------------------------
-    // Test helpers
-    // -------------------------------------------------------------------------
-
-    /// Upstream `waitForRender` (virtual-terminal.ts:212-217): drive the TUI
-    /// until no work is pending, advancing synthetic time in 20ms steps (the
-    /// upstream settle delay). Returns the final synthetic instant so throttle
-    /// tests can schedule relative to it.
-    fn settle(tui: &TuiMainScreen) -> Instant {
-        let mut now = Instant::now();
-        loop {
-            tui.tick(now);
-            if !tui.has_pending_work() {
-                return now;
-            }
-            now += Duration::from_millis(20);
-        }
-    }
-
-    /// Upstream `renderAndFlush`: forced render + settle.
-    fn render_and_flush(tui: &TuiMainScreen) {
-        tui.request_render(true);
-        settle(tui);
-    }
-
-    /// `sendInput` + processing tick (input is queued to the inbox and drained
-    /// by the tick; see header note on input delivery).
-    fn send_input(terminal: &VirtualTerminal, tui: &TuiMainScreen, data: &str) {
-        terminal.send_input(data);
-        tui.tick(Instant::now());
-    }
 
     /// `TestComponent` (tui-render.test.ts:18-24): render returns shared lines.
     struct TestComponent {
@@ -2612,32 +1996,6 @@ mod tests {
         TuiMainScreen::with_options(Box::new(terminal.clone()), None, Some(temp_log_dir()))
     }
 
-    /// `withEnv` (tui-render.test.ts:43-65): set/unset an env var, restore on drop.
-    struct EnvGuard {
-        key: &'static str,
-        saved: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> EnvGuard {
-            let saved = std::env::var(key).ok();
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-            EnvGuard { key, saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.saved {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     /// Sets Kitty image capabilities + cell dimensions, restores on drop
     /// (tui-render.test.ts try/finally blocks).
     struct CapsGuard;
@@ -2658,12 +2016,6 @@ mod tests {
             reset_capabilities_cache();
             set_cell_dimensions(CellDimensions::default());
         }
-    }
-
-    fn state_lock() -> MutexGuard<'static, ()> {
-        TEST_STATE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     use crate::terminal_image::{allocate_image_id, encode_kitty, KittyEncodeOptions};
@@ -2841,7 +2193,7 @@ mod tests {
         let image_lines = kitty_image_lines(6, 6);
         let image_sequence = image_lines[0].clone();
         assert!(
-            image_lines.len() > terminal.lock().rows,
+            image_lines.len() > terminal.rows(),
             "test image should exceed the viewport height"
         );
         let mut new_lines = vec!["before".to_string()];

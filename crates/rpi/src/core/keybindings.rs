@@ -2,13 +2,15 @@
 //! `packages/coding-agent/src/core/keybindings.ts` @ pi 0.82.1 (2efa728)
 //! and `packages/tui/src/keybindings.ts`.
 //!
-//! Provides the full keybinding definitions table (75 namespace ids), the
+//! Provides the full keybinding definitions table (83 namespace ids), the
 //! legacy-name migration table (59 entries), config-file loading with
 //! migration, conflict detection, and the [`KeybindingsManager`] that merges
-//! defaults with user overrides. The 33 `tui.editor.*`/`tui.input.*`/`tui.select.*`
+//! defaults with user overrides. The 41
+//! `tui.editor.*`/`tui.input.*`/`tui.select.*`/`tui.altScreen.*`
 //! defaults track `packages/tui/src/keybindings.ts` @ 4181f66 (b0d382e25 +
 //! 16ad96ae8: ctrl+home/end/pageUp/pageDown aliases and the unbound-by-default
-//! `historyPrevious`/`historyNext` actions).
+//! `historyPrevious`/`historyNext` actions; the 8 `tui.altScreen.*` actions,
+//! T31).
 //!
 //! Intentional differences:
 //! - `matchesKey` (Kitty keyboard protocol parser from `tui/src/keys.ts`) is
@@ -207,7 +209,7 @@ pub fn migrate_key_name(key: &str) -> &str {
 }
 
 // ===========================================================================
-// Keybinding Definitions (75 = 33 tui.* + 42 app.*)
+// Keybinding Definitions (83 = 41 tui.* + 42 app.*)
 // ===========================================================================
 
 static DEFINITIONS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
@@ -222,7 +224,7 @@ fn m(keys: &[&'static str]) -> KeyBindingValue {
     KeyBindingValue::Multiple(keys.iter().map(|k| k.to_string()).collect())
 }
 
-/// Build the full definitions table (75 entries, platform-specific defaults).
+/// Build the full definitions table (83 entries, platform-specific defaults).
 ///
 /// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:65-180
 /// @ 4181f66 + coding-agent/src/core/keybindings.ts:64-207).
@@ -345,6 +347,45 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             "tui.select.cancel",
             m(&["escape", "ctrl+c"]),
             "Cancel selection",
+        ),
+        // ---- tui.altScreen.* (8) ----
+        // These intentionally shadow the unmodified editor bindings in
+        // fullscreen mode (tui/src/keybindings.ts:153 @ 4181f66).
+        (
+            "tui.altScreen.pageUp",
+            s("pageUp"),
+            "Scroll viewport up one page",
+        ),
+        (
+            "tui.altScreen.pageDown",
+            s("pageDown"),
+            "Scroll viewport down one page",
+        ),
+        (
+            "tui.altScreen.halfPageUp",
+            m(&[]),
+            "Scroll viewport up half a page",
+        ),
+        (
+            "tui.altScreen.halfPageDown",
+            m(&[]),
+            "Scroll viewport down half a page",
+        ),
+        (
+            "tui.altScreen.previousPrompt",
+            s("ctrl+shift+up"),
+            "Jump to previous semantic prompt",
+        ),
+        (
+            "tui.altScreen.nextPrompt",
+            s("ctrl+shift+down"),
+            "Jump to next semantic prompt",
+        ),
+        ("tui.altScreen.top", s("home"), "Scroll viewport to top"),
+        (
+            "tui.altScreen.bottom",
+            s("end"),
+            "Scroll viewport to bottom",
         ),
         // ---- app.* (42) ----
         ("app.interrupt", s("escape"), "Cancel or abort"),
@@ -870,7 +911,7 @@ mod tests {
     #[test]
     fn test_definitions_count() {
         let defs = keybinding_definitions();
-        assert_eq!(defs.len(), 75, "expected 75 keybinding definitions");
+        assert_eq!(defs.len(), 83, "expected 83 keybinding definitions");
     }
 
     #[test]

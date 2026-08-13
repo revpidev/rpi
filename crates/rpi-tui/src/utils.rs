@@ -1,5 +1,7 @@
-//! Port of `packages/tui/src/utils.ts` @ pi 0.82.1 (2efa728), with
-//! `get_grapheme_cell_range` tracking the 4181f66 revision.
+//! Port of `packages/tui/src/utils.ts` @ pi 0.82.1 (2efa728), with the
+//! alternate-screen helpers (`get_grapheme_cell_range`,
+//! `strip_terminal_sequences`, `get_osc8_link_at_column`, c13ffe187) tracking
+//! the 4181f66 revision.
 //!
 //! Terminal text utilities: visible width (Unicode EAW + ANSI aware), wrapping
 //! with ANSI/OSC-8 preservation, truncation, column slicing and overlay segment
@@ -1750,6 +1752,28 @@ pub struct GraphemeCellRange {
     pub end: usize,
 }
 
+/// Remove ANSI, OSC, and APC control sequences while preserving visible text
+/// (`stripTerminalSequences`, utils.ts:297-312 @ 4181f66). Unlike
+/// `visible_width`, tabs are NOT expanded here.
+pub fn strip_terminal_sequences(str: &str) -> String {
+    if !str.contains('\x1b') {
+        return str.to_string();
+    }
+    let mut result = String::with_capacity(str.len());
+    let mut i = 0;
+    while i < str.len() {
+        if let Some(ansi) = extract_ansi_code(str, i) {
+            i += ansi.length;
+            continue;
+        }
+        // Whole characters instead of UTF-16 code units — see header notes.
+        let ch = str[i..].chars().next().unwrap_or('\u{fffd}');
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
+}
+
 /// Return the terminal-cell range occupied by the grapheme at a visible column
 /// (`getGraphemeCellRange`, utils.ts:319-341 @ 4181f66). ANSI sequences are
 /// skipped; unlike `getOsc8LinkAtColumn` upstream does NOT special-case tabs
@@ -1773,6 +1797,61 @@ pub fn get_grapheme_cell_range(line: &str, column: usize) -> Option<GraphemeCell
                     start: current_col,
                     end: current_col + width,
                 });
+            }
+            current_col += width;
+        }
+        i = text_end;
+    }
+    None
+}
+
+/// OSC 8 URL match `^\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)$`
+/// (utils.ts:351 @ 4181f66): `Some(url)` when the code is an OSC 8 hyperlink
+/// (an empty `url` is a close), `None` otherwise.
+fn osc8_link_url(ansi_code: &str) -> Option<&str> {
+    let rest = ansi_code.strip_prefix("\x1b]8;")?;
+    // `[^;]*;` — the params part up to the first `;`.
+    let url = rest.split_once(';')?.1;
+    let url = url
+        .strip_suffix('\x07')
+        .or_else(|| url.strip_suffix("\x1b\\"))?;
+    // `[^\x07\x1b]*` — the URL itself may not contain BEL or ESC.
+    if url.contains('\x07') || url.contains('\x1b') {
+        return None;
+    }
+    Some(url)
+}
+
+/// Return the OSC 8 hyperlink covering a visible terminal column
+/// (`getOsc8LinkAtColumn`, utils.ts:343-366 @ 4181f66).
+pub fn get_osc8_link_at_column(line: &str, column: usize) -> Option<String> {
+    let mut active_url: Option<String> = None;
+    let mut current_col = 0usize;
+    let mut i = 0;
+    while i < line.len() {
+        if let Some(ansi) = extract_ansi_code(line, i) {
+            if let Some(url) = osc8_link_url(ansi.code) {
+                // `hyperlink[1] || undefined` (utils.ts:351-352): an empty
+                // URL (close) clears the active link.
+                active_url = if url.is_empty() {
+                    None
+                } else {
+                    Some(url.to_string())
+                };
+            }
+            i += ansi.length;
+            continue;
+        }
+        let mut text_end = i;
+        while text_end < line.len() && extract_ansi_code(line, text_end).is_none() {
+            text_end += 1;
+        }
+        for segment in line[i..text_end].graphemes(true) {
+            // Upstream special-cases a lone "\t" as 3 cells (utils.ts:359);
+            // `grapheme_width` already returns 3 for it (utils.rs:240-242).
+            let width = grapheme_width(segment);
+            if column >= current_col && column < current_col + width {
+                return active_url;
             }
             current_col += width;
         }
@@ -5557,5 +5636,103 @@ mod tests {
         assert_eq!(get_grapheme_cell_range("abc", 3), None);
         assert_eq!(get_grapheme_cell_range("abc", 100), None);
         assert_eq!(get_grapheme_cell_range("", 0), None);
+    }
+
+    // ---- stripTerminalSequences (utils.ts:297-312 @ 4181f66) ----
+
+    #[test]
+    fn strip_terminal_sequences_returns_plain_text_unchanged() {
+        assert_eq!(strip_terminal_sequences("hello world"), "hello world");
+        assert_eq!(strip_terminal_sequences(""), "");
+    }
+
+    #[test]
+    fn strip_terminal_sequences_removes_csi_osc_and_apc_codes() {
+        // CSI styling, OSC 8 hyperlink open/close, and an APC cursor marker.
+        let line = "\x1b[31mred\x1b[0m \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ \x1b_cursor\x1b\\tail";
+        assert_eq!(strip_terminal_sequences(line), "red link tail");
+    }
+
+    #[test]
+    fn strip_terminal_sequences_preserves_tabs_and_wide_chars() {
+        // Unlike `visibleWidth`, tabs are NOT expanded (utils.ts:298-312).
+        assert_eq!(strip_terminal_sequences("a\tb"), "a\tb");
+        assert_eq!(strip_terminal_sequences("\x1b[1m界\x1b[0m"), "界");
+    }
+
+    // ---- getOsc8LinkAtColumn (utils.ts:343-366 @ 4181f66) ----
+
+    #[test]
+    fn osc8_link_at_column_returns_the_active_url_inside_a_link() {
+        let line = "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\";
+        assert_eq!(
+            get_osc8_link_at_column(line, 0),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            get_osc8_link_at_column(line, 4),
+            Some("https://example.com".to_string())
+        );
+        // Past the linked text: no active URL.
+        assert_eq!(get_osc8_link_at_column(line, 5), None);
+    }
+
+    #[test]
+    fn osc8_link_at_column_ignores_ansi_and_handles_the_close() {
+        let line = "\x1b]8;;https://a.example\x1b\\\x1b[31mab\x1b[0m\x1b]8;;\x1b\\cd";
+        // ANSI codes take no cells; columns 0..2 ("ab") stay inside the link.
+        assert_eq!(
+            get_osc8_link_at_column(line, 0),
+            Some("https://a.example".to_string())
+        );
+        assert_eq!(
+            get_osc8_link_at_column(line, 1),
+            Some("https://a.example".to_string())
+        );
+        // After the close, columns 2.. map to no link.
+        assert_eq!(get_osc8_link_at_column(line, 2), None);
+        assert_eq!(get_osc8_link_at_column(line, 3), None);
+    }
+
+    #[test]
+    fn osc8_link_at_column_counts_tabs_as_three_cells() {
+        // The tab covers columns 0..3, "ab" 3..5, then the link closes.
+        let line = "\x1b]8;;https://t.example\x1b\\\tab\x1b]8;;\x1b\\c";
+        assert_eq!(
+            get_osc8_link_at_column(line, 0),
+            Some("https://t.example".to_string())
+        );
+        assert_eq!(
+            get_osc8_link_at_column(line, 2),
+            Some("https://t.example".to_string())
+        );
+        assert_eq!(
+            get_osc8_link_at_column(line, 4),
+            Some("https://t.example".to_string())
+        );
+        assert_eq!(get_osc8_link_at_column(line, 5), None);
+    }
+
+    #[test]
+    fn osc8_link_at_column_spans_wide_graphemes() {
+        // "界" occupies columns 1..3 of "a界b", inside an active link.
+        let line = "\x1b]8;;https://w.example\x1b\\a界b\x1b]8;;\x1b\\";
+        assert_eq!(
+            get_osc8_link_at_column(line, 0),
+            Some("https://w.example".to_string())
+        );
+        assert_eq!(
+            get_osc8_link_at_column(line, 2),
+            Some("https://w.example".to_string())
+        );
+        assert_eq!(get_osc8_link_at_column(line, 4), None);
+    }
+
+    #[test]
+    fn osc8_link_at_column_reports_none_without_a_link() {
+        assert_eq!(get_osc8_link_at_column("plain", 0), None);
+        assert_eq!(get_osc8_link_at_column("", 0), None);
+        // Non-OSC-8 sequences do not start a link.
+        assert_eq!(get_osc8_link_at_column("\x1b[31mtext\x1b[0m", 0), None);
     }
 }

@@ -38,12 +38,14 @@ use crate::terminal_colors::{
     is_osc11_background_color_response, parse_osc11_background_color,
     parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme,
 };
-use crate::terminal_image::{get_capabilities, set_cell_dimensions, CellDimensions};
+use crate::terminal_image::{get_capabilities, is_image_line, set_cell_dimensions, CellDimensions};
 use crate::tui::{
-    lock_component, lock_shared, parse_size_value, same_component, Component, OverlayAnchor,
-    OverlayMargin, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, SharedComponent,
-    SharedTerminal, SizeValue, TerminalColorSchemeListener, TuiInputListener,
+    composite_tui_line, lock_component, lock_shared, parse_size_value, same_component, Component,
+    OverlayAnchor, OverlayMargin, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions,
+    SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener, TuiInputListener,
+    CURSOR_MARKER, SEGMENT_RESET,
 };
+use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
 
 /// `OverlayStackEntry` (tui.ts:233-239). The `id` replaces upstream's entry
 /// object identity.
@@ -121,6 +123,15 @@ pub(crate) struct OverlayLayout {
     pub(crate) row: i32,
     pub(crate) col: i32,
     pub(crate) max_height: Option<i32>,
+}
+
+/// Cursor position extracted from [`CURSOR_MARKER`] (upstream
+/// `{ row, col }`, tui.ts:1238). Shared by the main-screen and alternate-screen
+/// renderers (T31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CursorPos {
+    pub(crate) row: i32,
+    pub(crate) col: i32,
 }
 
 // =============================================================================
@@ -890,6 +901,146 @@ impl TuiBase {
         !self.overlay_stack.is_empty()
     }
 
+    /// `compositeOverlays` (tui.ts:1036-1095): composite all overlays into
+    /// content lines (sorted by focusOrder, higher = on top). Shared by the
+    /// main-screen (`doRender`, tui.ts:1291) and alternate-screen
+    /// (`doRender`, tui-alt-screen.ts:990) renderers (T31).
+    pub(crate) fn composite_overlays(
+        &self,
+        lines: Vec<String>,
+        term_width: i32,
+        term_height: i32,
+    ) -> Vec<String> {
+        if self.overlay_stack.is_empty() {
+            return lines;
+        }
+        let mut result = lines;
+
+        // Pre-render all visible overlays and calculate positions.
+        struct Rendered {
+            overlay_lines: Vec<String>,
+            row: i32,
+            col: i32,
+            width: i32,
+        }
+        let mut rendered: Vec<Rendered> = Vec::new();
+        let mut min_lines_needed = result.len() as i32;
+
+        let mut visible_entries: Vec<&OverlayStackEntry> = self
+            .overlay_stack
+            .iter()
+            .filter(|entry| self.is_overlay_visible(entry))
+            .collect();
+        visible_entries.sort_by_key(|entry| entry.focus_order);
+        for entry in visible_entries {
+            // Get layout with height=0 first to determine width and maxHeight
+            // (width and maxHeight don't depend on overlay height).
+            let initial =
+                TuiBase::resolve_overlay_layout(entry.options.as_ref(), 0, term_width, term_height);
+
+            // Render component at calculated width.
+            let mut overlay_lines =
+                lock_component(&entry.component).render(initial.width.max(0) as usize);
+
+            // Apply maxHeight if specified.
+            if let Some(max_height) = initial.max_height {
+                if overlay_lines.len() as i32 > max_height {
+                    overlay_lines.truncate(max_height.max(0) as usize);
+                }
+            }
+
+            // Get final row/col with the actual overlay height.
+            let layout = TuiBase::resolve_overlay_layout(
+                entry.options.as_ref(),
+                overlay_lines.len() as i32,
+                term_width,
+                term_height,
+            );
+            min_lines_needed = min_lines_needed.max(layout.row + overlay_lines.len() as i32);
+            rendered.push(Rendered {
+                overlay_lines,
+                row: layout.row,
+                col: layout.col,
+                width: initial.width,
+            });
+        }
+
+        // Pad to at least terminal height so overlays have screen-relative
+        // positions. Excludes maxLinesRendered: the historical high-water mark
+        // caused self-reinforcing inflation that pushed content into scrollback
+        // on terminal widen.
+        let working_height = (result.len() as i32).max(term_height).max(min_lines_needed);
+        while (result.len() as i32) < working_height {
+            result.push(String::new());
+        }
+
+        let viewport_start = 0.max(working_height - term_height);
+
+        // Composite each overlay.
+        for rendered_overlay in &rendered {
+            for (i, overlay_line) in rendered_overlay.overlay_lines.iter().enumerate() {
+                let index = viewport_start + rendered_overlay.row + i as i32;
+                if index >= 0 && (index as usize) < result.len() {
+                    // Defensive: truncate overlay line to declared width before
+                    // compositing (components should already respect width, but
+                    // this ensures it).
+                    let truncated = if visible_width(overlay_line) as i32 > rendered_overlay.width {
+                        slice_by_column(
+                            overlay_line,
+                            0,
+                            rendered_overlay.width.max(0) as usize,
+                            true,
+                        )
+                    } else {
+                        overlay_line.clone()
+                    };
+                    result[index as usize] = composite_tui_line(
+                        &result[index as usize],
+                        &truncated,
+                        rendered_overlay.col,
+                        rendered_overlay.width,
+                        term_width,
+                    );
+                }
+            }
+        }
+
+        result
+    }
+
+    /// `applyLineResets` (tui.ts:1099-1108): normalize terminal output and
+    /// append SGR + OSC 8 reset to every non-image line. Shared by both
+    /// renderers (T31).
+    pub(crate) fn apply_line_resets(lines: &mut [String]) {
+        for line in lines {
+            if !is_image_line(line) {
+                *line = normalize_terminal_output(line) + SEGMENT_RESET;
+            }
+        }
+    }
+
+    /// `extractCursorPosition` (tui.ts:1238-1256): find CURSOR_MARKER in the
+    /// visible viewport, strip it, and return its position. Shared by both
+    /// renderers (T31).
+    pub(crate) fn extract_cursor_position(lines: &mut [String], height: i32) -> Option<CursorPos> {
+        // Only scan the bottom `height` lines (visible viewport).
+        let viewport_top = 0.max(lines.len() as i32 - height);
+        for row in (viewport_top..lines.len() as i32).rev() {
+            let line = &lines[row as usize];
+            if let Some(marker_index) = line.find(CURSOR_MARKER) {
+                // Visual column = width of text before the marker.
+                let col = visible_width(&line[..marker_index]) as i32;
+                lines[row as usize] = format!(
+                    "{}{}",
+                    &line[..marker_index],
+                    &line[marker_index + CURSOR_MARKER.len()..]
+                );
+                return Some(CursorPos { row, col });
+            }
+        }
+        None
+    }
+
     /// `TuiBase.start` (tui.ts:691-705 @ 4181f66). The subclass hooks
     /// `beforeTerminalStart` / `afterTerminalStart` (tui.ts:376-378) are
     /// no-ops for the main screen, so the handle calls this directly after
@@ -990,7 +1141,16 @@ impl TuiBase {
         if self.consume_terminal_color_scheme_report(data) {
             return;
         }
+        self.handle_input_dispatch(data);
+    }
 
+    /// The `handleInput` segment after the introspection-query consumption
+    /// (tui.ts:827-895): input listeners, cell-size response, debug key, the
+    /// overlay focus-restore checks and the focused-component dispatch.
+    /// `TuiAltScreen` calls this after its first-position viewport listener
+    /// (upstream registers `handleViewportInput` as the first input listener
+    /// in its constructor, tui-alt-screen.ts:182).
+    pub(crate) fn handle_input_dispatch(&mut self, data: &str) {
         let listener_data;
         let mut data = data;
         if !self.input_listeners.is_empty() {
