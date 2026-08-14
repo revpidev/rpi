@@ -66,10 +66,12 @@ pub struct SseDecoder {
 }
 
 /// Cap on a single SSE line's byte length — a malicious server cannot grow
-/// the decoder buffer without bound. Aligned with the stdio side's 8 KiB
-/// capture cap (`MAX_CAPTURED_STDERR_BYTES`, stdio.rs); the SDK has no
-/// equivalent cap (its EventSource parser is unbounded).
-const MAX_LINE_BYTES: usize = 8 * 1024;
+/// the decoder buffer without bound. Aligned with the SDK stdio ReadBuffer
+/// `maxBufferSize` (10 MiB); the SDK's EventSource parser itself is
+/// unbounded. NOTE: legitimate responses (tools/list of a large server,
+/// big tool results) routinely exceed a few KiB on ONE `data:` line — a
+/// KiB-scale cap silently discards them (regression: tavily tools/list).
+const MAX_LINE_BYTES: usize = 10 * 1024 * 1024;
 
 /// One decoded SSE event.
 #[derive(Debug, Clone, PartialEq)]
@@ -899,6 +901,24 @@ mod tests {
             assert_eq!(events.len(), 1, "split at {split}");
             assert_eq!(events[0].data, "{\"t\": \"你好🎉\"}");
         }
+    }
+
+    #[test]
+    fn sse_decoder_delivers_large_legitimate_data_lines() {
+        // Regression (tavily tools/list timeout): a real server's tools/list
+        // or tool result routinely puts tens/hundreds of KiB on ONE data
+        // line. The cap guards memory (10 MiB, SDK ReadBuffer maxBufferSize)
+        // — it must not eat legitimate payloads.
+        let big = "y".repeat(512 * 1024);
+        let frame = format!("event: message\r\ndata: {{\"r\":\"{big}\"}}\r\n\r\n");
+        let mut decoder = SseDecoder::new();
+        // Split across two feeds to exercise the accumulation path.
+        let bytes = frame.into_bytes();
+        let mid = bytes.len() / 2;
+        assert!(decoder.feed(&bytes[..mid]).is_empty());
+        let events = decoder.feed(&bytes[mid..]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, format!("{{\"r\":\"{big}\"}}"));
     }
 
     #[test]
