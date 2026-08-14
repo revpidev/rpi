@@ -1,0 +1,47 @@
+{
+  "side": "rpi",
+  "status": "Authenticated",
+  "entries": [
+    {
+      "kind": "registration",
+      "params": {
+        "redirect_uris": [
+          "http://localhost:$port/callback"
+        ],
+        "client_name": "$client_name",
+        "client_uri": "$client_uri",
+        "grant_types": [
+          "authorization_code",
+          "refresh_token"
+        ],
+        "response_types": [
+          "code"
+        ],
+        "token_endpoint_auth_method": "none",
+        "application_type": "native"
+      }
+    },
+    {
+      "kind": "authorization",
+      "params": {
+        "response_type": "code",
+        "client_id": "stub-dcr-client",
+        "redirect_uri": "http://localhost:$port/callback",
+        "code_challenge": "$challenge",
+        "code_challenge_method": "S256",
+        "state": "$state"
+      }
+    },
+    {
+      "kind": "token",
+      "params": {
+        "grant_type": "authorization_code",
+        "code": "$code",
+        "redirect_uri": "http://localhost:$port/callback",
+        "client_id": "stub-dcr-client",
+        "code_verifier": "$verifier",
+        "client_secret": "stub-dcr-secret"
+      }
+    }
+  ]
+}

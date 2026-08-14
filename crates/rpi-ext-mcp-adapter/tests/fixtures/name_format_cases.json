@@ -1,0 +1,2655 @@
+{
+  "provenance": "external/pi-mcp-adapter/types.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "formatToolName": [
+    {
+      "server": "searxng",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "searxng_web_search"
+    },
+    {
+      "server": "searxng",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "searxng",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "searxng_web_search"
+    },
+    {
+      "server": "searxng",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_web_search"
+    },
+    {
+      "server": "searxng",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "searxng_list_sims"
+    },
+    {
+      "server": "searxng",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "searxng",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "searxng_list_sims"
+    },
+    {
+      "server": "searxng",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_list_sims"
+    },
+    {
+      "server": "searxng",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "searxng_simple"
+    },
+    {
+      "server": "searxng",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "searxng",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "searxng_simple"
+    },
+    {
+      "server": "searxng",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_simple"
+    },
+    {
+      "server": "searxng",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "searxng_with-dash"
+    },
+    {
+      "server": "searxng",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "searxng",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "searxng_with-dash"
+    },
+    {
+      "server": "searxng",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_with-dash"
+    },
+    {
+      "server": "searxng",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "searxng_with space"
+    },
+    {
+      "server": "searxng",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "searxng",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "searxng_with space"
+    },
+    {
+      "server": "searxng",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_with space"
+    },
+    {
+      "server": "searxng",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "searxng_日本語tool"
+    },
+    {
+      "server": "searxng",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "searxng",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "searxng_日本語tool"
+    },
+    {
+      "server": "searxng",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__searxng_日本語tool"
+    },
+    {
+      "server": "my server",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "my_20_server_web_search"
+    },
+    {
+      "server": "my server",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "my server",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "my_20_server_web_search"
+    },
+    {
+      "server": "my server",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_web_search"
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "my_20_server_list_sims"
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "my_20_server_list_sims"
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_list_sims"
+    },
+    {
+      "server": "my server",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "my_20_server_simple"
+    },
+    {
+      "server": "my server",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "my server",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "my_20_server_simple"
+    },
+    {
+      "server": "my server",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_simple"
+    },
+    {
+      "server": "my server",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "my_20_server_with-dash"
+    },
+    {
+      "server": "my server",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "my server",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "my_20_server_with-dash"
+    },
+    {
+      "server": "my server",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_with-dash"
+    },
+    {
+      "server": "my server",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "my_20_server_with space"
+    },
+    {
+      "server": "my server",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "my server",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "my_20_server_with space"
+    },
+    {
+      "server": "my server",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_with space"
+    },
+    {
+      "server": "my server",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "my_20_server_日本語tool"
+    },
+    {
+      "server": "my server",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "my server",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "my_20_server_日本語tool"
+    },
+    {
+      "server": "my server",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server_日本語tool"
+    },
+    {
+      "server": "my_server",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "my_5f_server_web_search"
+    },
+    {
+      "server": "my_server",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "my_server",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "my_5f_server_web_search"
+    },
+    {
+      "server": "my_server",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_web_search"
+    },
+    {
+      "server": "my_server",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "my_5f_server_list_sims"
+    },
+    {
+      "server": "my_server",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "my_server",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "my_5f_server_list_sims"
+    },
+    {
+      "server": "my_server",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_list_sims"
+    },
+    {
+      "server": "my_server",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "my_5f_server_simple"
+    },
+    {
+      "server": "my_server",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "my_server",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "my_5f_server_simple"
+    },
+    {
+      "server": "my_server",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_simple"
+    },
+    {
+      "server": "my_server",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "my_5f_server_with-dash"
+    },
+    {
+      "server": "my_server",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "my_server",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "my_5f_server_with-dash"
+    },
+    {
+      "server": "my_server",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_with-dash"
+    },
+    {
+      "server": "my_server",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "my_5f_server_with space"
+    },
+    {
+      "server": "my_server",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "my_server",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "my_5f_server_with space"
+    },
+    {
+      "server": "my_server",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_with space"
+    },
+    {
+      "server": "my_server",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "my_5f_server_日本語tool"
+    },
+    {
+      "server": "my_server",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "my_server",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "my_5f_server_日本語tool"
+    },
+    {
+      "server": "my_server",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server_日本語tool"
+    },
+    {
+      "server": "my-server",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "my_2d_server_web_search"
+    },
+    {
+      "server": "my-server",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "my-server",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "my_2d_server_web_search"
+    },
+    {
+      "server": "my-server",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_web_search"
+    },
+    {
+      "server": "my-server",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "my_2d_server_list_sims"
+    },
+    {
+      "server": "my-server",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "my-server",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "my_2d_server_list_sims"
+    },
+    {
+      "server": "my-server",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_list_sims"
+    },
+    {
+      "server": "my-server",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "my_2d_server_simple"
+    },
+    {
+      "server": "my-server",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "my-server",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "my_2d_server_simple"
+    },
+    {
+      "server": "my-server",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_simple"
+    },
+    {
+      "server": "my-server",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "my_2d_server_with-dash"
+    },
+    {
+      "server": "my-server",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "my-server",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "my_2d_server_with-dash"
+    },
+    {
+      "server": "my-server",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_with-dash"
+    },
+    {
+      "server": "my-server",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "my_2d_server_with space"
+    },
+    {
+      "server": "my-server",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "my-server",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "my_2d_server_with space"
+    },
+    {
+      "server": "my-server",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_with space"
+    },
+    {
+      "server": "my-server",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "my_2d_server_日本語tool"
+    },
+    {
+      "server": "my-server",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "my-server",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "my_2d_server_日本語tool"
+    },
+    {
+      "server": "my-server",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server_日本語tool"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_web_search"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "filesystem_web_search"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_web_search"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_list_sims"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "filesystem_list_sims"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_list_sims"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_simple"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "filesystem_simple"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_simple"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_with-dash"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "filesystem_with-dash"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_with-dash"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_with space"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "filesystem_with space"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_with space"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp_日本語tool"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "filesystem_日本語tool"
+    },
+    {
+      "server": "filesystem-mcp",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp_日本語tool"
+    },
+    {
+      "server": "-mcp",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "_2d_mcp_web_search"
+    },
+    {
+      "server": "-mcp",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "-mcp",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "mcp_web_search"
+    },
+    {
+      "server": "-mcp",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_web_search"
+    },
+    {
+      "server": "-mcp",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "_2d_mcp_list_sims"
+    },
+    {
+      "server": "-mcp",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "-mcp",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "mcp_list_sims"
+    },
+    {
+      "server": "-mcp",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_list_sims"
+    },
+    {
+      "server": "-mcp",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "_2d_mcp_simple"
+    },
+    {
+      "server": "-mcp",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "-mcp",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "mcp_simple"
+    },
+    {
+      "server": "-mcp",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_simple"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "_2d_mcp_with-dash"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "mcp_with-dash"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_with-dash"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "_2d_mcp_with space"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "mcp_with space"
+    },
+    {
+      "server": "-mcp",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_with space"
+    },
+    {
+      "server": "-mcp",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "_2d_mcp_日本語tool"
+    },
+    {
+      "server": "-mcp",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "-mcp",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "mcp_日本語tool"
+    },
+    {
+      "server": "-mcp",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp_日本語tool"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "FooMCP_web_search"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "Foo_web_search"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_web_search"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "FooMCP_list_sims"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "Foo_list_sims"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_list_sims"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "FooMCP_simple"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "Foo_simple"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_simple"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "FooMCP_with-dash"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "Foo_with-dash"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_with-dash"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "FooMCP_with space"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "Foo_with space"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_with space"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "FooMCP_日本語tool"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "Foo_日本語tool"
+    },
+    {
+      "server": "FooMCP",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP_日本語tool"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "xcodebuild_web_search"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "xcodebuild_web_search"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_web_search"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "xcodebuild_list_sims"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "xcodebuild_list_sims"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_list_sims"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "xcodebuild_simple"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "xcodebuild_simple"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_simple"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "xcodebuild_with-dash"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "xcodebuild_with-dash"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_with-dash"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "xcodebuild_with space"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "xcodebuild_with space"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_with space"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "xcodebuild_日本語tool"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "xcodebuild_日本語tool"
+    },
+    {
+      "server": "xcodebuild",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild_日本語tool"
+    },
+    {
+      "server": "日本語",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__web_search"
+    },
+    {
+      "server": "日本語",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "日本語",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__web_search"
+    },
+    {
+      "server": "日本語",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__web_search"
+    },
+    {
+      "server": "日本語",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__list_sims"
+    },
+    {
+      "server": "日本語",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "日本語",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__list_sims"
+    },
+    {
+      "server": "日本語",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__list_sims"
+    },
+    {
+      "server": "日本語",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__simple"
+    },
+    {
+      "server": "日本語",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "日本語",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__simple"
+    },
+    {
+      "server": "日本語",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__simple"
+    },
+    {
+      "server": "日本語",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__with-dash"
+    },
+    {
+      "server": "日本語",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "日本語",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__with-dash"
+    },
+    {
+      "server": "日本語",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__with-dash"
+    },
+    {
+      "server": "日本語",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__with space"
+    },
+    {
+      "server": "日本語",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "日本語",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__with space"
+    },
+    {
+      "server": "日本語",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__with space"
+    },
+    {
+      "server": "日本語",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e__日本語tool"
+    },
+    {
+      "server": "日本語",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "日本語",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e__日本語tool"
+    },
+    {
+      "server": "日本語",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e__日本語tool"
+    },
+    {
+      "server": "a b",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "a_20_b_web_search"
+    },
+    {
+      "server": "a b",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "a b",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "a_20_b_web_search"
+    },
+    {
+      "server": "a b",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_web_search"
+    },
+    {
+      "server": "a b",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "a_20_b_list_sims"
+    },
+    {
+      "server": "a b",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "a b",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "a_20_b_list_sims"
+    },
+    {
+      "server": "a b",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_list_sims"
+    },
+    {
+      "server": "a b",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "a_20_b_simple"
+    },
+    {
+      "server": "a b",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "a b",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "a_20_b_simple"
+    },
+    {
+      "server": "a b",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_simple"
+    },
+    {
+      "server": "a b",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "a_20_b_with-dash"
+    },
+    {
+      "server": "a b",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "a b",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "a_20_b_with-dash"
+    },
+    {
+      "server": "a b",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_with-dash"
+    },
+    {
+      "server": "a b",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "a_20_b_with space"
+    },
+    {
+      "server": "a b",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "a b",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "a_20_b_with space"
+    },
+    {
+      "server": "a b",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_with space"
+    },
+    {
+      "server": "a b",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "a_20_b_日本語tool"
+    },
+    {
+      "server": "a b",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "a b",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "a_20_b_日本語tool"
+    },
+    {
+      "server": "a b",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b_日本語tool"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_web_search"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_web_search"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_web_search"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_list_sims"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_list_sims"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_list_sims"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_simple"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_simple"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_simple"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_with-dash"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_with-dash"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_with-dash"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_with space"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_with space"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_with space"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b_日本語tool"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b_日本語tool"
+    },
+    {
+      "server": "a-20-b",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b_日本語tool"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "with_5f_underscore_web_search"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "with_5f_underscore_web_search"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_web_search"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "with_5f_underscore_list_sims"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "with_5f_underscore_list_sims"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_list_sims"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "with_5f_underscore_simple"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "with_5f_underscore_simple"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_simple"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "with_5f_underscore_with-dash"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "with_5f_underscore_with-dash"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_with-dash"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "with_5f_underscore_with space"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "with_5f_underscore_with space"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_with space"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "with_5f_underscore_日本語tool"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "with_5f_underscore_日本語tool"
+    },
+    {
+      "server": "with_underscore",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore_日本語tool"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "web_search",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_web_search"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "web_search",
+      "prefix": "none",
+      "expected": "web_search"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "web_search",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_web_search"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "web_search",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_web_search"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_list_sims"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": "list_sims"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_list_sims"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_list_sims"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "simple",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_simple"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "simple",
+      "prefix": "none",
+      "expected": "simple"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "simple",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_simple"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "simple",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_simple"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with-dash",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_with-dash"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with-dash",
+      "prefix": "none",
+      "expected": "with-dash"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with-dash",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_with-dash"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with-dash",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_with-dash"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with space",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_with space"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with space",
+      "prefix": "none",
+      "expected": "with space"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with space",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_with space"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "with space",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_with space"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "日本語tool",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP_日本語tool"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "日本語tool",
+      "prefix": "none",
+      "expected": "日本語tool"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "日本語tool",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp_日本語tool"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "tool": "日本語tool",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP_日本語tool"
+    }
+  ],
+  "getServerPrefix": [
+    {
+      "server": "searxng",
+      "prefix": "server",
+      "expected": "searxng"
+    },
+    {
+      "server": "searxng",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "searxng",
+      "prefix": "short",
+      "expected": "searxng"
+    },
+    {
+      "server": "searxng",
+      "prefix": "mcp",
+      "expected": "mcp__searxng"
+    },
+    {
+      "server": "my server",
+      "prefix": "server",
+      "expected": "my_20_server"
+    },
+    {
+      "server": "my server",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "my server",
+      "prefix": "short",
+      "expected": "my_20_server"
+    },
+    {
+      "server": "my server",
+      "prefix": "mcp",
+      "expected": "mcp__my_20_server"
+    },
+    {
+      "server": "my_server",
+      "prefix": "server",
+      "expected": "my_5f_server"
+    },
+    {
+      "server": "my_server",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "my_server",
+      "prefix": "short",
+      "expected": "my_5f_server"
+    },
+    {
+      "server": "my_server",
+      "prefix": "mcp",
+      "expected": "mcp__my_5f_server"
+    },
+    {
+      "server": "my-server",
+      "prefix": "server",
+      "expected": "my_2d_server"
+    },
+    {
+      "server": "my-server",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "my-server",
+      "prefix": "short",
+      "expected": "my_2d_server"
+    },
+    {
+      "server": "my-server",
+      "prefix": "mcp",
+      "expected": "mcp__my_2d_server"
+    },
+    {
+      "server": "filesystem-mcp",
+      "prefix": "server",
+      "expected": "filesystem_2d_mcp"
+    },
+    {
+      "server": "filesystem-mcp",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "filesystem-mcp",
+      "prefix": "short",
+      "expected": "filesystem"
+    },
+    {
+      "server": "filesystem-mcp",
+      "prefix": "mcp",
+      "expected": "mcp__filesystem_2d_mcp"
+    },
+    {
+      "server": "-mcp",
+      "prefix": "server",
+      "expected": "_2d_mcp"
+    },
+    {
+      "server": "-mcp",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "-mcp",
+      "prefix": "short",
+      "expected": "mcp"
+    },
+    {
+      "server": "-mcp",
+      "prefix": "mcp",
+      "expected": "mcp___2d_mcp"
+    },
+    {
+      "server": "FooMCP",
+      "prefix": "server",
+      "expected": "FooMCP"
+    },
+    {
+      "server": "FooMCP",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "FooMCP",
+      "prefix": "short",
+      "expected": "Foo"
+    },
+    {
+      "server": "FooMCP",
+      "prefix": "mcp",
+      "expected": "mcp__FooMCP"
+    },
+    {
+      "server": "xcodebuild",
+      "prefix": "server",
+      "expected": "xcodebuild"
+    },
+    {
+      "server": "xcodebuild",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "xcodebuild",
+      "prefix": "short",
+      "expected": "xcodebuild"
+    },
+    {
+      "server": "xcodebuild",
+      "prefix": "mcp",
+      "expected": "mcp__xcodebuild"
+    },
+    {
+      "server": "日本語",
+      "prefix": "server",
+      "expected": "_65e5__672c__8a9e_"
+    },
+    {
+      "server": "日本語",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "日本語",
+      "prefix": "short",
+      "expected": "_65e5__672c__8a9e_"
+    },
+    {
+      "server": "日本語",
+      "prefix": "mcp",
+      "expected": "mcp___65e5__672c__8a9e_"
+    },
+    {
+      "server": "a b",
+      "prefix": "server",
+      "expected": "a_20_b"
+    },
+    {
+      "server": "a b",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "a b",
+      "prefix": "short",
+      "expected": "a_20_b"
+    },
+    {
+      "server": "a b",
+      "prefix": "mcp",
+      "expected": "mcp__a_20_b"
+    },
+    {
+      "server": "a-20-b",
+      "prefix": "server",
+      "expected": "a_2d_20_2d_b"
+    },
+    {
+      "server": "a-20-b",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "a-20-b",
+      "prefix": "short",
+      "expected": "a_2d_20_2d_b"
+    },
+    {
+      "server": "a-20-b",
+      "prefix": "mcp",
+      "expected": "mcp__a_2d_20_2d_b"
+    },
+    {
+      "server": "with_underscore",
+      "prefix": "server",
+      "expected": "with_5f_underscore"
+    },
+    {
+      "server": "with_underscore",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "with_underscore",
+      "prefix": "short",
+      "expected": "with_5f_underscore"
+    },
+    {
+      "server": "with_underscore",
+      "prefix": "mcp",
+      "expected": "mcp__with_5f_underscore"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "prefix": "server",
+      "expected": "trailing_2d_mcp_2d_MCP"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "prefix": "none",
+      "expected": ""
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "prefix": "short",
+      "expected": "trailing_2d_mcp"
+    },
+    {
+      "server": "trailing-mcp-MCP",
+      "prefix": "mcp",
+      "expected": "mcp__trailing_2d_mcp_2d_MCP"
+    }
+  ],
+  "getToolNameCandidates": [
+    {
+      "server": "demo",
+      "tool": "search",
+      "prefix": "server",
+      "expected": [
+        "search",
+        "demo_search",
+        "mcp__demo_search"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "search",
+      "prefix": "none",
+      "expected": [
+        "search",
+        "demo_search",
+        "mcp__demo_search"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "search",
+      "prefix": "short",
+      "expected": [
+        "search",
+        "demo_search",
+        "mcp__demo_search"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "search",
+      "prefix": "mcp",
+      "expected": [
+        "search",
+        "mcp__demo_search",
+        "demo_search"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": [
+        "list.sims",
+        "demo_list_sims",
+        "mcp__demo_list_sims"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": [
+        "list.sims",
+        "list_sims",
+        "demo_list_sims",
+        "mcp__demo_list_sims"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": [
+        "list.sims",
+        "demo_list_sims",
+        "mcp__demo_list_sims"
+      ]
+    },
+    {
+      "server": "demo",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": [
+        "list.sims",
+        "mcp__demo_list_sims",
+        "demo_list_sims"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "search",
+      "prefix": "server",
+      "expected": [
+        "search",
+        "my_20_server_search",
+        "mcp__my_20_server_search"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "search",
+      "prefix": "none",
+      "expected": [
+        "search",
+        "my_20_server_search",
+        "mcp__my_20_server_search"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "search",
+      "prefix": "short",
+      "expected": [
+        "search",
+        "my_20_server_search",
+        "mcp__my_20_server_search"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "search",
+      "prefix": "mcp",
+      "expected": [
+        "search",
+        "mcp__my_20_server_search",
+        "my_20_server_search"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "server",
+      "expected": [
+        "list.sims",
+        "my_20_server_list_sims",
+        "mcp__my_20_server_list_sims"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "none",
+      "expected": [
+        "list.sims",
+        "list_sims",
+        "my_20_server_list_sims",
+        "mcp__my_20_server_list_sims"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "short",
+      "expected": [
+        "list.sims",
+        "my_20_server_list_sims",
+        "mcp__my_20_server_list_sims"
+      ]
+    },
+    {
+      "server": "my server",
+      "tool": "list.sims",
+      "prefix": "mcp",
+      "expected": [
+        "list.sims",
+        "mcp__my_20_server_list_sims",
+        "my_20_server_list_sims"
+      ]
+    }
+  ],
+  "resolveServerFromToolName": [
+    {
+      "tool": "searxng_searxng_web_search",
+      "servers": [
+        "searxng"
+      ],
+      "prefix": "server",
+      "expected": "searxng"
+    },
+    {
+      "tool": "my_20_server_web_search",
+      "servers": [
+        "my server",
+        "my_server"
+      ],
+      "prefix": "server",
+      "expected": "my server"
+    },
+    {
+      "tool": "my_5f_server_search",
+      "servers": [
+        "my server",
+        "my_server"
+      ],
+      "prefix": "server",
+      "expected": "my_server"
+    },
+    {
+      "tool": "github_create_issue",
+      "servers": [
+        "searxng",
+        "github"
+      ],
+      "prefix": "server",
+      "expected": "github"
+    },
+    {
+      "tool": "searxng_2d_extra_deep_search",
+      "servers": [
+        "searxng",
+        "searxng-extra"
+      ],
+      "prefix": "server",
+      "expected": "searxng-extra"
+    },
+    {
+      "tool": "filesystem_read_file",
+      "servers": [
+        "filesystem-mcp"
+      ],
+      "prefix": "short",
+      "expected": "filesystem-mcp"
+    },
+    {
+      "tool": "mcp_query",
+      "servers": [
+        "-mcp"
+      ],
+      "prefix": "short",
+      "expected": "-mcp"
+    },
+    {
+      "tool": "foo_query",
+      "servers": [
+        "foo",
+        "foo-mcp"
+      ],
+      "prefix": "short",
+      "expected": null
+    },
+    {
+      "tool": "mcp__my_2d_server_run",
+      "servers": [
+        "my-server"
+      ],
+      "prefix": "mcp",
+      "expected": "my-server"
+    },
+    {
+      "tool": "searxng_web_search",
+      "servers": [
+        "searxng"
+      ],
+      "prefix": "none",
+      "expected": null
+    },
+    {
+      "tool": "unknown_tool",
+      "servers": [
+        "searxng",
+        "github"
+      ],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "web_search",
+      "servers": [
+        "searxng"
+      ],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "searxng_web_search",
+      "servers": [],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "notsearxng_search",
+      "servers": [
+        "searxng"
+      ],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "searxngweb_search",
+      "servers": [
+        "searxng"
+      ],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "web_search",
+      "servers": [
+        "noisy",
+        "searxng"
+      ],
+      "prefix": "server",
+      "expected": null
+    },
+    {
+      "tool": "a_20_b_run",
+      "servers": [
+        "a b",
+        "a-20-b"
+      ],
+      "prefix": "server",
+      "expected": "a b"
+    },
+    {
+      "tool": "a_2d_20_2d_b_run",
+      "servers": [
+        "a b",
+        "a-20-b"
+      ],
+      "prefix": "server",
+      "expected": "a-20-b"
+    },
+    {
+      "tool": "mcp__my_2d_server_run",
+      "servers": [
+        "my-server",
+        "my_server"
+      ],
+      "prefix": "mcp",
+      "expected": "my-server"
+    },
+    {
+      "tool": "mcp__my_5f_server_run",
+      "servers": [
+        "my-server",
+        "my_server"
+      ],
+      "prefix": "mcp",
+      "expected": "my_server"
+    }
+  ],
+  "sanitizePromptName": [
+    {
+      "input": "plan",
+      "expected": "plan"
+    },
+    {
+      "input": "my prompt!",
+      "expected": "my_prompt"
+    },
+    {
+      "input": "   ",
+      "expected": "prompt"
+    },
+    {
+      "input": "123go",
+      "expected": "_123go"
+    },
+    {
+      "input": "_lead",
+      "expected": "lead"
+    },
+    {
+      "input": "__a--b__",
+      "expected": "a--b"
+    },
+    {
+      "input": "a.b.c",
+      "expected": "a_b_c"
+    }
+  ],
+  "formatPromptCommandName": [
+    {
+      "prompt": "plan",
+      "server": "my server",
+      "prefix": "server",
+      "expected": "mcp__my_20_server__plan"
+    },
+    {
+      "prompt": "plan",
+      "server": "my_server",
+      "prefix": "server",
+      "expected": "mcp__my_5f_server__plan"
+    },
+    {
+      "prompt": "Do Thing!",
+      "server": "srv",
+      "prefix": "none",
+      "expected": "mcp__srv__Do_Thing"
+    }
+  ],
+  "isToolAllowed": [
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "include": [
+        "search_*"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "include": [
+        "demo_search_records"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "include": [
+        "other_*"
+      ],
+      "expected": false
+    },
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "exclude": [
+        "*_records"
+      ],
+      "expected": false
+    },
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "include": [
+        "*"
+      ],
+      "exclude": [
+        "search_*"
+      ],
+      "expected": false
+    },
+    {
+      "tool": "search_records",
+      "server": "demo",
+      "prefix": "server",
+      "include": [
+        "search-records"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "list.sims",
+      "server": "xcodebuild",
+      "prefix": "server",
+      "include": [
+        "xcodebuild_list?ims"
+      ],
+      "expected": false
+    },
+    {
+      "tool": "list.sims",
+      "server": "xcodebuild",
+      "prefix": "short",
+      "include": [
+        "xcodebuild_list_sims"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "list.sims",
+      "server": "xcodebuild",
+      "prefix": "mcp",
+      "include": [
+        "mcp__xcodebuild_list_sims"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "list.sims",
+      "server": "xcodebuild",
+      "prefix": "none",
+      "include": [
+        "list_sims"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "a",
+      "server": "s",
+      "prefix": "server",
+      "include": [],
+      "expected": true
+    },
+    {
+      "tool": "a",
+      "server": "s",
+      "prefix": "server",
+      "include": "not-an-array",
+      "expected": true
+    },
+    {
+      "tool": "a",
+      "server": "s",
+      "prefix": "server",
+      "include": [
+        42,
+        "a"
+      ],
+      "expected": true
+    },
+    {
+      "tool": "a",
+      "server": "s",
+      "prefix": "server",
+      "include": [
+        "*"
+      ],
+      "exclude": [
+        "s_a"
+      ],
+      "expected": false
+    }
+  ]
+}

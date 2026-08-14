@@ -1,0 +1,190 @@
+{
+  "provenance": "external/pi-mcp-adapter/metadata-cache.ts computeServerHash @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "cases": [
+    {
+      "name": "stdio-basic",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "args": [
+          "server.js",
+          "--flag"
+        ]
+      },
+      "expectedHash": "8572e23023f6f0cc1dae2cdf98f4687e9fbeabc1b434e8fa1ad84f6a79d61084"
+    },
+    {
+      "name": "env-interpolation",
+      "env": {
+        "RPI_MCP_FIXTURE_TOKEN": "secret-1"
+      },
+      "entry": {
+        "command": "node",
+        "env": {
+          "TOKEN": "$env:RPI_MCP_FIXTURE_TOKEN",
+          "PLAIN": "x"
+        }
+      },
+      "expectedHash": "a0fbe41f5cfb3d4cfda3f139d4d64b8d3d02edc6d6c40f4efa42eedaa0a8de6b"
+    },
+    {
+      "name": "env-brace-forms",
+      "env": {
+        "RPI_MCP_FIXTURE_TOKEN": "secret-1"
+      },
+      "entry": {
+        "command": "node",
+        "env": {
+          "A": "${RPI_MCP_FIXTURE_TOKEN}",
+          "B": "{env:RPI_MCP_FIXTURE_TOKEN}"
+        }
+      },
+      "expectedHash": "0d5f80c09f978b87c9a16fc0cdf968335c66bf62176bc99d61d4cbb486feae9f"
+    },
+    {
+      "name": "http-headers-interpolation",
+      "env": {
+        "RPI_MCP_FIXTURE_TOKEN": "secret-1"
+      },
+      "entry": {
+        "url": "https://example.test/mcp",
+        "headers": {
+          "Authorization": "Bearer ${RPI_MCP_FIXTURE_TOKEN}"
+        }
+      },
+      "expectedHash": "85a1cfc0c0f79a6c0822ed099174545e35c0b30d3463143ee547a449b0c06cc2"
+    },
+    {
+      "name": "bearer-token-env",
+      "env": {
+        "RPI_MCP_FIXTURE_TOKEN": "secret-1"
+      },
+      "entry": {
+        "url": "https://example.test/mcp",
+        "bearerTokenEnv": "RPI_MCP_FIXTURE_TOKEN"
+      },
+      "expectedHash": "4b01e005d638045f3d424a14d90aa21287fb18c90de2a0e46248334fa312d297"
+    },
+    {
+      "name": "bearer-literal-escaped-bang",
+      "env": {},
+      "entry": {
+        "url": "https://example.test/mcp",
+        "bearerToken": "!!not-a-cmd"
+      },
+      "expectedHash": "996326353c98ef6164efbf2ea28df026f386740ea792b584a69c758900571092"
+    },
+    {
+      "name": "bearer-literal-with-interpolation",
+      "env": {
+        "RPI_MCP_FIXTURE_TOKEN": "secret-1"
+      },
+      "entry": {
+        "url": "https://example.test/mcp",
+        "bearerToken": "tok-${RPI_MCP_FIXTURE_TOKEN}"
+      },
+      "expectedHash": "bd803a0dc54f3e70b31274de541c8fec60aa6e8f17bda993bce7094a5453b1fc"
+    },
+    {
+      "name": "socket-tilde-expansion",
+      "env": {
+        "HOME": "/home/mcpfixture"
+      },
+      "entry": {
+        "socket": "~/mcp.sock"
+      },
+      "expectedHash": "1971b3dc0fcf8d23ae7a4571251b22303fd3bf0ba5739a4075026c2ecd05cfe9"
+    },
+    {
+      "name": "cwd-relative-passthrough",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "cwd": "relative/dir"
+      },
+      "expectedHash": "21557ce4c4e765eb8ff6a1f931467733a892d6ba02221ca3021b52f2f4fbb28c"
+    },
+    {
+      "name": "tool-filters",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "includeTools": [
+          "a",
+          "b"
+        ],
+        "excludeTools": [
+          "c"
+        ],
+        "exposeResources": false
+      },
+      "expectedHash": "5f84fa6559e410922880b097053da1a0623a04fe8d7f7688ad934154201890c9"
+    },
+    {
+      "name": "protocol-and-oauth-fields",
+      "env": {},
+      "entry": {
+        "url": "https://example.test/mcp",
+        "protocolVersion": "auto",
+        "auth": "oauth",
+        "oauth": {
+          "clientId": "x"
+        }
+      },
+      "expectedHash": "8fa9158ee98b5352a4c143d36c2dfde6171b7b351b1b69475e4d7081a3920ab5"
+    },
+    {
+      "name": "runtime-fields-ignored-a",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "lifecycle": "eager",
+        "idleTimeout": 0,
+        "debug": true,
+        "requestTimeoutMs": 500
+      },
+      "expectedHash": "640c21126120d4b777a98ccd6dd13bbac1944ea6f6d0c35cff3824e8dc4b6bb6",
+      "expectSameAs": "runtime-fields-ignored-b"
+    },
+    {
+      "name": "runtime-fields-ignored-b",
+      "env": {},
+      "entry": {
+        "command": "node"
+      },
+      "expectedHash": "640c21126120d4b777a98ccd6dd13bbac1944ea6f6d0c35cff3824e8dc4b6bb6"
+    },
+    {
+      "name": "command-secret-marker-left-literal",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "env": {
+          "TOKEN": "!echo hi"
+        }
+      },
+      "expectedHash": "0076983aafaeada83426fbbd1a61a1d5f0a72d0c5acf12bacc14e71bdf7842a5"
+    },
+    {
+      "name": "url-env-interpolation",
+      "env": {
+        "RPI_MCP_FIXTURE_HOST": "example.test"
+      },
+      "entry": {
+        "url": "https://${RPI_MCP_FIXTURE_HOST}/mcp"
+      },
+      "expectedHash": "e1132c0ed4475bba1419ab1f52d83c5041c2f4f8611b24566532752fb5e1fa95"
+    },
+    {
+      "name": "unset-env-expands-empty",
+      "env": {},
+      "entry": {
+        "command": "node",
+        "env": {
+          "MISSING": "$env:RPI_MCP_FIXTURE_DEFINITELY_UNSET"
+        }
+      },
+      "expectedHash": "fe8ea6075e767e6c743e6d2acba419cd479e905466ec576c8aed2565df1db959"
+    }
+  ]
+}

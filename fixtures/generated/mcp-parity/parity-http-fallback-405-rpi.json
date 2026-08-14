@@ -1,0 +1,97 @@
+{
+  "side": "rpi",
+  "transport": "http",
+  "results": {
+    "echo": {
+      "content": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ]
+    },
+    "failCall": {
+      "threw": false,
+      "result": {
+        "isError": true,
+        "content": [
+          {
+            "type": "text",
+            "text": "boom"
+          }
+        ]
+      }
+    },
+    "readResource": {
+      "contents": [
+        {
+          "uri": "fixture://config",
+          "text": "resource-body"
+        }
+      ]
+    }
+  },
+  "status": "connected",
+  "frames": [
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "initialize",
+      "params": {
+        "protocolVersion": "2025-11-25",
+        "capabilities": {},
+        "clientInfo": {
+          "name": "parity-client",
+          "version": "1.0.0"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "notifications/initialized"
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "tools/list"
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "resources/list"
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "prompts/list"
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "tools/call",
+      "params": {
+        "name": "echo",
+        "arguments": {
+          "query": "hello"
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "tools/call",
+      "params": {
+        "name": "fail",
+        "arguments": {}
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": "$id",
+      "method": "resources/read",
+      "params": {
+        "uri": "fixture://config"
+      }
+    }
+  ]
+}

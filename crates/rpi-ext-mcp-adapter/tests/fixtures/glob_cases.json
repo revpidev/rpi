@@ -1,0 +1,651 @@
+{
+  "provenance": "external/pi-mcp-adapter/types.ts matchesToolPattern/isToolAllowed/getToolNameCandidates + search-ranking.ts resolveSearchKeywords @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "matches": [
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [],
+      "expected": false,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "*"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "*_prs"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "search_*"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "*file*"
+      ],
+      "expected": false,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "github_*"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "search_prs"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "nonexistent"
+      ],
+      "expected": false,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "???_*"
+      ],
+      "expected": true,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "pattern": [
+        "*.query"
+      ],
+      "expected": false,
+      "candidates": [
+        "search_prs",
+        "github_search_prs",
+        "mcp__github_search_prs"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "*"
+      ],
+      "expected": true,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "*_prs"
+      ],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "search_*"
+      ],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "*file*"
+      ],
+      "expected": true,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "github_*"
+      ],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "read_file"
+      ],
+      "expected": true,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "nonexistent"
+      ],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "???_*"
+      ],
+      "expected": true,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "pattern": [
+        "*.query"
+      ],
+      "expected": false,
+      "candidates": [
+        "read_file",
+        "filesystem_read_file",
+        "mcp__filesystem_read_file"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "*"
+      ],
+      "expected": true,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "*_prs"
+      ],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "search_*"
+      ],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "*file*"
+      ],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "github_*"
+      ],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "advanced.query"
+      ],
+      "expected": true,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "nonexistent"
+      ],
+      "expected": false,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "???_*"
+      ],
+      "expected": true,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "pattern": [
+        "*.query"
+      ],
+      "expected": true,
+      "candidates": [
+        "advanced.query",
+        "mcp__demo_2d_server_advanced_query",
+        "demo_2d_server_advanced_query"
+      ]
+    }
+  ],
+  "allowed": [
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "expected": true
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "include": [
+        "search_*"
+      ],
+      "expected": true
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "include": [
+        "*"
+      ],
+      "exclude": [
+        "*_prs"
+      ],
+      "expected": false
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "exclude": [
+        "read_*"
+      ],
+      "expected": true
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "include": [
+        "github_search_prs"
+      ],
+      "exclude": [],
+      "expected": true
+    },
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "include": [
+        "other"
+      ],
+      "expected": false
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "expected": true
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "include": [
+        "search_*"
+      ],
+      "expected": false
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "include": [
+        "*"
+      ],
+      "exclude": [
+        "*_prs"
+      ],
+      "expected": true
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "exclude": [
+        "read_*"
+      ],
+      "expected": false
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "include": [
+        "github_search_prs"
+      ],
+      "exclude": [],
+      "expected": false
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "include": [
+        "other"
+      ],
+      "expected": false
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "expected": true
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "include": [
+        "search_*"
+      ],
+      "expected": false
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "include": [
+        "*"
+      ],
+      "exclude": [
+        "*_prs"
+      ],
+      "expected": true
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "exclude": [
+        "read_*"
+      ],
+      "expected": true
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "include": [
+        "github_search_prs"
+      ],
+      "exclude": [],
+      "expected": false
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "include": [
+        "other"
+      ],
+      "expected": false
+    }
+  ],
+  "keywords": [
+    {
+      "server": "github",
+      "toolName": "search_prs",
+      "prefix": "server",
+      "definition": {
+        "searchKeywords": {
+          "search_*": [
+            "find records",
+            "lookup"
+          ],
+          "advanced_*": [
+            "fuzzy search"
+          ],
+          "nonmatch": [
+            "should not appear"
+          ]
+        }
+      },
+      "expected": [
+        "find records",
+        "lookup"
+      ]
+    },
+    {
+      "server": "filesystem",
+      "toolName": "read_file",
+      "prefix": "short",
+      "definition": {
+        "searchKeywords": {
+          "search_*": [
+            "find records",
+            "lookup"
+          ],
+          "advanced_*": [
+            "fuzzy search"
+          ],
+          "nonmatch": [
+            "should not appear"
+          ]
+        }
+      },
+      "expected": []
+    },
+    {
+      "server": "demo-server",
+      "toolName": "advanced.query",
+      "prefix": "mcp",
+      "definition": {
+        "searchKeywords": {
+          "search_*": [
+            "find records",
+            "lookup"
+          ],
+          "advanced_*": [
+            "fuzzy search"
+          ],
+          "nonmatch": [
+            "should not appear"
+          ]
+        }
+      },
+      "expected": []
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+initialize PASS
+tools_call PASS
+sse-retry PASS
+elicitation-sep1034-client-defaults FAIL (expected: server->client elicitation is P2 scope; P0 answers -32601)

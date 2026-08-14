@@ -1,0 +1,461 @@
+{
+  "provenance": "external/pi-mcp-adapter/ts-shape.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "cases": [
+    {
+      "name": "required-and-optional-object-properties",
+      "input": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "expected": "{ query: string; limit?: number; }"
+    },
+    {
+      "name": "enum-unions",
+      "input": {
+        "enum": [
+          "fast",
+          "safe",
+          null
+        ]
+      },
+      "expected": "\"fast\" | \"safe\" | null"
+    },
+    {
+      "name": "nested-objects-and-arrays",
+      "input": {
+        "type": "object",
+        "properties": {
+          "config": {
+            "type": "object",
+            "properties": {
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "tags"
+            ]
+          }
+        },
+        "required": [
+          "config"
+        ]
+      },
+      "expected": "{ config: { tags: string[]; }; }"
+    },
+    {
+      "name": "hoists-local-references",
+      "input": {
+        "type": "object",
+        "properties": {
+          "address": {
+            "$ref": "#/$defs/Address"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "$defs": {
+          "Address": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      },
+      "expected": "type Address = { city: string; };\n\n{ address: Address; }"
+    },
+    {
+      "name": "ignores-unsupported-unreferenced-definitions",
+      "input": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "$defs": {
+          "Unused": {
+            "if": {
+              "type": "string"
+            },
+            "then": {
+              "type": "number"
+            }
+          }
+        }
+      },
+      "expected": "{ query: string; }"
+    },
+    {
+      "name": "closed-objects-with-referenced-union-variants",
+      "input": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "blocks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/block"
+            }
+          }
+        },
+        "required": [
+          "blocks"
+        ],
+        "$defs": {
+          "text": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "text"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ]
+          },
+          "qr": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "const": "qr"
+              },
+              "data": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data"
+            ]
+          },
+          "block": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/text"
+              },
+              {
+                "$ref": "#/$defs/qr"
+              }
+            ]
+          }
+        }
+      },
+      "expected": "type block = text | qr;\ntype text = { type: \"text\"; text: string; };\ntype qr = { type: \"qr\"; data: string; };\n\n{ blocks: block[]; }"
+    },
+    {
+      "name": "exotic-if-then",
+      "input": {
+        "if": {
+          "type": "string"
+        },
+        "then": {
+          "type": "number"
+        }
+      },
+      "expected": null
+    },
+    {
+      "name": "exotic-remote-ref",
+      "input": {
+        "$ref": "https://example.com/schema"
+      },
+      "expected": null
+    },
+    {
+      "name": "const-string",
+      "input": {
+        "const": "draft"
+      },
+      "expected": "\"draft\""
+    },
+    {
+      "name": "const-number",
+      "input": {
+        "const": 42
+      },
+      "expected": "42"
+    },
+    {
+      "name": "const-number-float",
+      "input": {
+        "const": 1.5
+      },
+      "expected": "1.5"
+    },
+    {
+      "name": "type-array-union",
+      "input": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "expected": "string | null"
+    },
+    {
+      "name": "type-unknown-scalar",
+      "input": {
+        "type": "function"
+      },
+      "expected": null
+    },
+    {
+      "name": "no-type",
+      "input": {
+        "description": "free-form"
+      },
+      "expected": "unknown"
+    },
+    {
+      "name": "empty-object",
+      "input": {
+        "type": "object"
+      },
+      "expected": "{}"
+    },
+    {
+      "name": "empty-properties",
+      "input": {
+        "type": "object",
+        "properties": {}
+      },
+      "expected": "{}"
+    },
+    {
+      "name": "array-without-items",
+      "input": {
+        "type": "array"
+      },
+      "expected": "unknown[]"
+    },
+    {
+      "name": "array-of-union-parenthesized",
+      "input": {
+        "type": "array",
+        "items": {
+          "type": [
+            "string",
+            "number"
+          ]
+        }
+      },
+      "expected": "(string | number)[]"
+    },
+    {
+      "name": "non-identifier-property-names",
+      "input": {
+        "type": "object",
+        "properties": {
+          "with-dash": {
+            "type": "string"
+          },
+          "with space": {
+            "type": "number"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "expected": "{ \"with-dash\"?: string; \"with space\"?: number; ok?: boolean; }"
+    },
+    {
+      "name": "definitions-group-alias",
+      "input": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "$ref": "#/definitions/thing"
+          }
+        },
+        "definitions": {
+          "thing": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": "type thing = string;\n\n{ a?: thing; }"
+    },
+    {
+      "name": "alias-collision-gets-generated-name",
+      "input": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "$ref": "#/$defs/has-dash"
+          },
+          "b": {
+            "$ref": "#/$defs/has-dash2"
+          }
+        },
+        "$defs": {
+          "has-dash": {
+            "type": "string"
+          },
+          "has-dash2": {
+            "type": "number"
+          }
+        }
+      },
+      "expected": "type Definition1 = string;\ntype Definition2 = number;\n\n{ a?: Definition1; b?: Definition2; }"
+    },
+    {
+      "name": "pointer-escape-tokens",
+      "input": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "$ref": "#/$defs/weird~0name"
+          }
+        },
+        "$defs": {
+          "weird~name": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": "type Definition1 = string;\n\n{ a?: Definition1; }"
+    },
+    {
+      "name": "unreferenced-definitions-group-ignored",
+      "input": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string"
+          }
+        },
+        "definitions": {
+          "Unused": {
+            "not": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "expected": "{ q?: string; }"
+    },
+    {
+      "name": "additional-properties-true-unsupported",
+      "input": {
+        "type": "object",
+        "properties": {
+          "q": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true
+      },
+      "expected": null
+    },
+    {
+      "name": "pattern-properties-unsupported",
+      "input": {
+        "type": "object",
+        "patternProperties": {
+          "^x-": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": null
+    },
+    {
+      "name": "enum-with-objects-unsupported",
+      "input": {
+        "enum": [
+          {
+            "a": 1
+          }
+        ]
+      },
+      "expected": null
+    },
+    {
+      "name": "nested-ref-in-definition",
+      "input": {
+        "type": "object",
+        "properties": {
+          "outer": {
+            "$ref": "#/$defs/Outer"
+          }
+        },
+        "$defs": {
+          "Outer": {
+            "type": "object",
+            "properties": {
+              "inner": {
+                "$ref": "#/$defs/Inner"
+              }
+            }
+          },
+          "Inner": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": "type Outer = { inner?: Inner; };\ntype Inner = string;\n\n{ outer?: Outer; }"
+    },
+    {
+      "name": "null-root",
+      "input": null,
+      "expected": null
+    },
+    {
+      "name": "array-root",
+      "input": [
+        1,
+        2
+      ],
+      "expected": null
+    },
+    {
+      "name": "anyof-empty-unsupported",
+      "input": {
+        "anyOf": []
+      },
+      "expected": null
+    },
+    {
+      "name": "enum-number-values",
+      "input": {
+        "enum": [
+          1,
+          2.5,
+          true
+        ]
+      },
+      "expected": "1 | 2.5 | true"
+    }
+  ]
+}

@@ -7,6 +7,7 @@ members = [
     "crates/rpi-tui",
     "crates/rpi",
     "crates/rpi-ext-host",
+    "crates/rpi-ext-mcp-adapter",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
 ]
@@ -22,6 +23,7 @@ rpi-ai = { path = "crates/rpi-ai" }
 rpi-agent = { path = "crates/rpi-agent" }
 rpi-tui = { path = "crates/rpi-tui" }
 rpi-ext-host = { path = "crates/rpi-ext-host" }
+rpi-ext-mcp-adapter = { path = "crates/rpi-ext-mcp-adapter" }
 rpi-test-support = { path = "crates/rpi-test-support" }
 
 # External baseline (coding-standards appendix A).

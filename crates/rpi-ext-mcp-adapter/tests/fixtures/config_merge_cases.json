@@ -1,0 +1,388 @@
+{
+  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "note": "imports are expanded by upstream loadMcpConfig but NOT by the P0 rpi port [VARIANT]; no fixture case uses imports-dependent servers.",
+  "cases": [
+    {
+      "name": "six-source-fold",
+      "layers": {
+        "shared-global": {
+          "settings": {
+            "idleTimeout": 5,
+            "requestTimeoutMs": 1500,
+            "showStatusIcon": true
+          },
+          "mcpServers": {
+            "shared": {
+              "command": "generic"
+            },
+            "genericOnly": {
+              "command": "generic-only"
+            }
+          }
+        },
+        "agents-global": {
+          "mcpServers": {
+            "shared": {
+              "command": "agents-flat"
+            },
+            "agentsFlatOnly": {
+              "command": "agents-flat-only"
+            }
+          }
+        },
+        "agents-nested-global": {
+          "mcpServers": {
+            "shared": {
+              "command": "agents-nested"
+            }
+          }
+        },
+        "pi-global": {
+          "settings": {
+            "toolPrefix": "short",
+            "directTools": true
+          },
+          "mcpServers": {
+            "shared": {
+              "command": "pi-global"
+            },
+            "piOnly": {
+              "command": "pi-only"
+            }
+          }
+        },
+        "shared-project": {
+          "settings": {
+            "toolPrefix": "none",
+            "oauthDir": "shared-oauth"
+          },
+          "mcpServers": {
+            "shared": {
+              "command": "project"
+            },
+            "projectOnly": {
+              "command": "project-only"
+            }
+          }
+        },
+        "pi-project": {
+          "settings": {
+            "autoAuth": true,
+            "oauthDir": ".pi/oauth",
+            "showStatusIcon": false
+          },
+          "mcpServers": {
+            "shared": {
+              "command": "project-pi"
+            },
+            "projectPiOnly": {
+              "command": "project-pi-only"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "shared": {
+            "command": "project-pi"
+          },
+          "genericOnly": {
+            "command": "generic-only"
+          },
+          "agentsFlatOnly": {
+            "command": "agents-flat-only"
+          },
+          "piOnly": {
+            "command": "pi-only"
+          },
+          "projectOnly": {
+            "command": "project-only"
+          },
+          "projectPiOnly": {
+            "command": "project-pi-only"
+          }
+        },
+        "settings": {
+          "idleTimeout": 5,
+          "requestTimeoutMs": 1500,
+          "showStatusIcon": false,
+          "toolPrefix": "none",
+          "directTools": true,
+          "oauthDir": ".pi/oauth",
+          "autoAuth": true
+        }
+      }
+    },
+    {
+      "name": "same-url-keeps-inherited-auth",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "headers": {
+                "Authorization": "Bearer secret-vk"
+              }
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "directTools": true
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://litellm.internal/mcp/",
+            "headers": {
+              "Authorization": "Bearer secret-vk"
+            },
+            "directTools": true
+          }
+        }
+      }
+    },
+    {
+      "name": "url-change-strips-credentials",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "headers": {
+                "Authorization": "Bearer ${RPI_MCP_FIXTURE_UNUSED}"
+              },
+              "bearerTokenEnv": "RPI_MCP_FIXTURE_UNUSED",
+              "bearerToken": "secret-bearer-token",
+              "oauth": {
+                "clientId": "client",
+                "clientSecret": "oauth-client-secret"
+              }
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/"
+          }
+        }
+      }
+    },
+    {
+      "name": "url-change-keeps-only-override-auth",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "headers": {
+                "Authorization": "Bearer secret-vk"
+              }
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/",
+              "headers": {
+                "Authorization": "Bearer override-token"
+              }
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/",
+            "headers": {
+              "Authorization": "Bearer override-token"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "url-change-preserves-oauth-false",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "oauth": false
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/",
+            "oauth": false
+          }
+        }
+      }
+    },
+    {
+      "name": "three-source-laundering-prevented",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "headers": {
+                "Authorization": "Bearer secret-vk"
+              }
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "headers": {
+                "Authorization": "Bearer secret-vk"
+              }
+            }
+          }
+        },
+        "shared-project": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/"
+          }
+        }
+      }
+    },
+    {
+      "name": "socket-transport-switch",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "toSocket": {
+              "command": "old",
+              "args": [
+                "--old"
+              ],
+              "env": {
+                "OLD": "1"
+              },
+              "cwd": "/old"
+            },
+            "toCommand": {
+              "socket": "/old.sock"
+            },
+            "toUrl": {
+              "socket": "/old.sock"
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "toSocket": {
+              "socket": "/shared.sock"
+            },
+            "toCommand": {
+              "command": "new"
+            },
+            "toUrl": {
+              "url": "https://example.test/mcp"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "toSocket": {
+            "socket": "/shared.sock"
+          },
+          "toCommand": {
+            "command": "new"
+          },
+          "toUrl": {
+            "url": "https://example.test/mcp"
+          }
+        }
+      }
+    },
+    {
+      "name": "malformed-entries-dropped",
+      "layers": {
+        "shared-project": {
+          "mcpServers": {
+            "valid": {
+              "command": "node"
+            },
+            "nullEntry": null,
+            "listEntry": [],
+            "stringEntry": "node"
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "valid": {
+            "command": "node"
+          }
+        }
+      }
+    },
+    {
+      "name": "legacy-mcp-servers-key",
+      "layers": {
+        "shared-project": {
+          "mcp-servers": {
+            "legacy": {
+              "command": "x"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "legacy": {
+            "command": "x"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,325 @@
+[
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: initialize)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "rpi-mcp-conformance",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "mcpMethod": "initialize"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: initialize)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "initialize",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "mcp-session-id": "47c837a3-0a94-4930-a161-00da0a2485f3",
+        "x-accel-buffering": "no",
+        "content-length": 192
+      },
+      "body": "event: message\ndata: {\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"elicitation-defaults-test-server\",\"version\":\"1.0.0\"}},\"jsonrpc\":\"2.0\",\"id\":0}\n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: notifications/initialized)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "mcpMethod": "notifications/initialized"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 202 response for POST /mcp (method: notifications/initialized)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 202,
+      "mcpMethod": "notifications/initialized",
+      "headers": {
+        "x-powered-by": "Express"
+      }
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: tools/list)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list"
+      },
+      "mcpMethod": "tools/list"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: tools/list)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "tools/list",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "mcp-session-id": "47c837a3-0a94-4930-a161-00da0a2485f3",
+        "x-accel-buffering": "no",
+        "content-length": 256
+      },
+      "body": "event: message\ndata: {\"result\":{\"tools\":[{\"name\":\"test_client_elicitation_defaults\",\"description\":\"Tests that client applies defaults for omitted elicitation fields\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}]},\"jsonrpc\":\"2.0\",\"id\":1}\n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received GET request for /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: tools/call)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "test_client_elicitation_defaults",
+          "arguments": {}
+        }
+      },
+      "mcpMethod": "tools/call"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "error": {
+          "code": -32601,
+          "message": "Method not found"
+        }
+      }
+    }
+  },
+  {
+    "id": "client-elicitation-sep1034-general",
+    "name": "ClientElicitationSEP1034General",
+    "description": "Client handles elicitation with defaults",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "errorMessage": "Elicitation failed: MCP error -32601: Method not found",
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 202 response for POST /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 202,
+      "headers": {
+        "x-powered-by": "Express"
+      }
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: tools/call)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "tools/call",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "mcp-session-id": "47c837a3-0a94-4930-a161-00da0a2485f3",
+        "x-accel-buffering": "no"
+      },
+      "body": "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Elicitation error: MCP error -32601: Method not found\"}]},\"jsonrpc\":\"2.0\",\"id\":2}\n\n"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for GET /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp",
+      "statusCode": 200,
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "mcp-session-id": "47c837a3-0a94-4930-a161-00da0a2485f3",
+        "x-accel-buffering": "no"
+      },
+      "body": "event: message\ndata: {\"method\":\"elicitation/create\",\"params\":{\"message\":\"Test client default value handling - please accept with defaults\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"User name\",\"default\":\"John Doe\"},\"age\":{\"type\":\"integer\",\"description\":\"User age\",\"default\":30},\"score\":{\"type\":\"number\",\"description\":\"User score\",\"default\":95.5},\"status\":{\"type\":\"string\",\"description\":\"User status\",\"enum\":[\"active\",\"inactive\",\"pending\"],\"default\":\"active\"},\"verified\":{\"type\":\"boolean\",\"description\":\"Verification status\",\"default\":true}},\"required\":[]}},\"jsonrpc\":\"2.0\",\"id\":0}\n\n"
+    }
+  },
+  {
+    "id": "client-elicitation-sep1034-string-default",
+    "name": "clientelicitationsep1034stringdefault",
+    "description": "Server applies default default for elicitation",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "details": {
+      "message": "Tool was not called by client"
+    },
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  },
+  {
+    "id": "client-elicitation-sep1034-integer-default",
+    "name": "clientelicitationsep1034integerdefault",
+    "description": "Server applies default default for elicitation",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "details": {
+      "message": "Tool was not called by client"
+    },
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  },
+  {
+    "id": "client-elicitation-sep1034-number-default",
+    "name": "clientelicitationsep1034numberdefault",
+    "description": "Server applies default default for elicitation",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "details": {
+      "message": "Tool was not called by client"
+    },
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  },
+  {
+    "id": "client-elicitation-sep1034-enum-default",
+    "name": "clientelicitationsep1034enumdefault",
+    "description": "Server applies default default for elicitation",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "details": {
+      "message": "Tool was not called by client"
+    },
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  },
+  {
+    "id": "client-elicitation-sep1034-boolean-default",
+    "name": "clientelicitationsep1034booleandefault",
+    "description": "Server applies default default for elicitation",
+    "status": "FAILURE",
+    "timestamp": "$ts",
+    "details": {
+      "message": "Tool was not called by client"
+    },
+    "specReferences": [
+      {
+        "id": "SEP-1034",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1034"
+      }
+    ]
+  }
+]

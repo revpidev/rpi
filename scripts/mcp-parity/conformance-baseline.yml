@@ -1,0 +1,10 @@
+# Expected failures for the official MCP client conformance suite when the
+# client under test is the rpi-ext-mcp-adapter P0 stack (driven by the crate
+# example conformance_driver). Mirrors upstream pi-mcp-adapter's
+# conformance/baseline-client.yml purpose: a failure listed here keeps the
+# suite green; a listed scenario starting to pass fails the run as a stale
+# baseline.
+client:
+  # Server→client elicitation is P2 scope; the P0 client answers -32601 so
+  # the tool call fails as expected.
+  - elicitation-sep1034-client-defaults

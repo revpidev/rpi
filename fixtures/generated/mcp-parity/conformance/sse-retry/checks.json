@@ -1,0 +1,277 @@
+[
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received POST request for / (method: initialize)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "url": "/",
+      "jsonrpcMethod": "initialize",
+      "jsonrpcId": 0
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "OutgoingResponse",
+    "description": "Sent initialize response",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "jsonrpcId": 0,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "result": {
+          "protocolVersion": "2025-03-26",
+          "serverInfo": {
+            "name": "sse-retry-test-server",
+            "version": "1.0.0"
+          },
+          "capabilities": {
+            "tools": {}
+          }
+        }
+      }
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received POST request for / (method: notifications/initialized)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "url": "/",
+      "jsonrpcMethod": "notifications/initialized"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received GET request for /",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "url": "/",
+      "headers": {
+        "mcp-session-id": "session-$epoch",
+        "accept": "text/event-stream",
+        "host": "localhost:$port"
+      },
+      "connectionCount": 1
+    }
+  },
+  {
+    "id": "outgoing-sse-event",
+    "name": "OutgoingSseEvent",
+    "description": "Sent SSE priming event on GET stream (id: event-1, retry: 500ms)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "eventId": "event-1",
+      "retryMs": 500,
+      "eventType": "priming",
+      "raw": "id: event-1\nretry: 500\ndata: \n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received POST request for / (method: tools/list)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "url": "/",
+      "jsonrpcMethod": "tools/list",
+      "jsonrpcId": 1
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "OutgoingResponse",
+    "description": "Sent tools/list response",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "jsonrpcId": 1,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+          "tools": [
+            {
+              "name": "test_reconnection",
+              "description": "A tool that triggers SSE stream closure to test client reconnection behavior",
+              "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received POST request for / (method: tools/call)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "url": "/",
+      "jsonrpcMethod": "tools/call",
+      "jsonrpcId": 2
+    }
+  },
+  {
+    "id": "outgoing-sse-event",
+    "name": "OutgoingSseEvent",
+    "description": "Sent SSE priming event for tools/call (id: event-2, retry: 500ms)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "eventId": "event-2",
+      "retryMs": 500,
+      "eventType": "priming",
+      "raw": "id: event-2\nretry: 500\ndata: \n\n"
+    }
+  },
+  {
+    "id": "outgoing-stream-close",
+    "name": "OutgoingStreamClose",
+    "description": "Closed tools/call SSE stream to trigger client reconnection",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "retryMs": 500,
+      "pendingToolCallId": 2
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "IncomingRequest",
+    "description": "Received GET request for / (Last-Event-ID: event-2)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "url": "/",
+      "headers": {
+        "mcp-session-id": "session-$epoch",
+        "mcp-protocol-version": "2025-03-26",
+        "accept": "text/event-stream",
+        "last-event-id": "event-2",
+        "host": "localhost:$port"
+      },
+      "connectionCount": 2
+    }
+  },
+  {
+    "id": "outgoing-sse-event",
+    "name": "OutgoingSseEvent",
+    "description": "Sent SSE priming event on GET stream (id: event-3, retry: 500ms)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "eventId": "event-3",
+      "retryMs": 500,
+      "eventType": "priming",
+      "raw": "id: event-3\nretry: 500\ndata: \n\n"
+    }
+  },
+  {
+    "id": "outgoing-sse-event",
+    "name": "OutgoingSseEvent",
+    "description": "Sent tool response on GET stream after reconnection (id: event-4)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "eventId": "event-4",
+      "eventType": "message",
+      "jsonrpcId": 2,
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Reconnection test completed successfully"
+            }
+          ]
+        }
+      },
+      "raw": "event: message\nid: event-4\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Reconnection test completed successfully\"}]}}\n\n"
+    }
+  },
+  {
+    "id": "client-sse-graceful-reconnect",
+    "name": "ClientGracefulReconnect",
+    "description": "Client reconnects via GET after SSE stream is closed gracefully",
+    "status": "SUCCESS",
+    "timestamp": "$ts",
+    "specReferences": [
+      {
+        "id": "SEP-1699",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1699"
+      }
+    ],
+    "details": {
+      "getConnectionCount": 2
+    }
+  },
+  {
+    "id": "client-sse-retry-timing",
+    "name": "ClientRespectsRetryField",
+    "description": "Client MUST respect the retry field, waiting the given number of milliseconds before attempting to reconnect",
+    "status": "SUCCESS",
+    "timestamp": "$ts",
+    "specReferences": [
+      {
+        "id": "SEP-1699",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1699"
+      }
+    ],
+    "details": {
+      "expectedRetryMs": 500,
+      "minAcceptableMs": 450,
+      "maxAcceptableMs": 700,
+      "veryLateThresholdMs": 1000,
+      "earlyToleranceMs": 50,
+      "lateToleranceMs": 200,
+      "withinTolerance": true,
+      "tooEarly": false,
+      "slightlyLate": false,
+      "veryLate": false,
+      "getConnectionCount": 2
+    }
+  },
+  {
+    "id": "client-sse-last-event-id",
+    "name": "ClientSendsLastEventId",
+    "description": "Client SHOULD send Last-Event-ID header on reconnection for resumability",
+    "status": "SUCCESS",
+    "timestamp": "$ts",
+    "specReferences": [
+      {
+        "id": "SEP-1699",
+        "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/issues/1699"
+      }
+    ],
+    "details": {
+      "hasLastEventId": true,
+      "lastEventIds": [
+        "event-2"
+      ],
+      "getConnectionCount": 2
+    }
+  }
+]

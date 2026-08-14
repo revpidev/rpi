@@ -1,0 +1,7 @@
+{
+  "side": "rpi",
+  "transport": "http",
+  "results": {},
+  "status": "needs-auth",
+  "frames": []
+}

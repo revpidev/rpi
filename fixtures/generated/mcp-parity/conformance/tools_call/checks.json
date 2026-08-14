@@ -1,0 +1,215 @@
+[
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: initialize)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {},
+          "clientInfo": {
+            "name": "rpi-mcp-conformance",
+            "version": "1.0.0"
+          }
+        }
+      },
+      "mcpMethod": "initialize"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: initialize)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "initialize",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "x-accel-buffering": "no",
+        "content-length": 178
+      },
+      "body": "event: message\ndata: {\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"add-numbers-server\",\"version\":\"1.0.0\"}},\"jsonrpc\":\"2.0\",\"id\":0}\n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: notifications/initialized)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+      },
+      "mcpMethod": "notifications/initialized"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 202 response for POST /mcp (method: notifications/initialized)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 202,
+      "mcpMethod": "notifications/initialized",
+      "headers": {
+        "x-powered-by": "Express"
+      }
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received GET request for /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 404 response for GET /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp",
+      "statusCode": 404,
+      "headers": {
+        "x-powered-by": "Express",
+        "content-security-policy": "default-src 'none'",
+        "x-content-type-options": "nosniff",
+        "content-type": "text/html; charset=utf-8",
+        "content-length": 142
+      },
+      "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot GET /mcp</pre>\n</body>\n</html>\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: tools/list)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list"
+      },
+      "mcpMethod": "tools/list"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: tools/list)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "tools/list",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "x-accel-buffering": "no",
+        "content-length": 303
+      },
+      "body": "event: message\ndata: {\"result\":{\"tools\":[{\"name\":\"add_numbers\",\"description\":\"Add two numbers together\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\",\"description\":\"First number\"},\"b\":{\"type\":\"number\",\"description\":\"Second number\"}},\"required\":[\"a\",\"b\"]}}]},\"jsonrpc\":\"2.0\",\"id\":1}\n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received POST request for /mcp (method: tools/call)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "body": {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+          "name": "add_numbers",
+          "arguments": {
+            "a": 5,
+            "b": 3
+          }
+        }
+      },
+      "mcpMethod": "tools/call"
+    }
+  },
+  {
+    "id": "tool-add-numbers",
+    "name": "ToolAddNumbers",
+    "description": "Validates that the add_numbers tool works correctly",
+    "status": "SUCCESS",
+    "timestamp": "$ts",
+    "specReferences": [
+      {
+        "id": "MCP-Tools",
+        "url": "https://modelcontextprotocol.io/specification/2025-06-18/server/tools#calling-tools"
+      }
+    ],
+    "details": {
+      "a": 5,
+      "b": 3,
+      "result": 8
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 200 response for POST /mcp (method: tools/call)",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "POST",
+      "path": "/mcp",
+      "statusCode": 200,
+      "mcpMethod": "tools/call",
+      "headers": {
+        "x-powered-by": "Express",
+        "cache-control": "no-cache, no-transform",
+        "connection": "keep-alive",
+        "content-type": "text/event-stream",
+        "x-accel-buffering": "no",
+        "content-length": 119
+      },
+      "body": "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"The sum of 5 and 3 is 8\"}]},\"jsonrpc\":\"2.0\",\"id\":2}\n\n"
+    }
+  }
+]

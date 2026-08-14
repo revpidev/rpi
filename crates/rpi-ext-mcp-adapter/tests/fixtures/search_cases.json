@@ -1,0 +1,1205 @@
+{
+  "provenance": "external/pi-mcp-adapter/search-ranking.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "state": {
+    "servers": [
+      {
+        "name": "demo",
+        "definition": {
+          "command": "npx",
+          "searchKeywords": {
+            "search_*": [
+              "records",
+              "fuzzy lookup"
+            ],
+            "search_records_advanced": [
+              "fuzzy lookup",
+              "legacy"
+            ]
+          }
+        },
+        "tools": [
+          {
+            "name": "search_records",
+            "originalName": "search_records",
+            "description": "Find records"
+          },
+          {
+            "name": "find_records",
+            "originalName": "find_records",
+            "description": "Search records"
+          },
+          {
+            "name": "search_records_advanced",
+            "originalName": "search_records_advanced",
+            "description": "Advanced record search with filters"
+          },
+          {
+            "name": "record_search",
+            "originalName": "record_search",
+            "description": "Fuzzy lookup across records"
+          }
+        ]
+      },
+      {
+        "name": "better-icons",
+        "definition": {
+          "command": "npx"
+        },
+        "tools": [
+          {
+            "name": "sync_icon",
+            "originalName": "sync_icon",
+            "description": "Add an icon to your project's icons file."
+          }
+        ]
+      },
+      {
+        "name": "disabled-srv",
+        "definition": {
+          "command": "npx",
+          "disabled": true
+        },
+        "tools": [
+          {
+            "name": "hidden_tool",
+            "originalName": "hidden_tool",
+            "description": "Should never rank"
+          }
+        ]
+      }
+    ],
+    "globalPrefix": "server"
+  },
+  "rank": [
+    {
+      "query": "search",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 369
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 319
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 253
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 90
+        }
+      ]
+    },
+    {
+      "query": "search",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 369
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 319
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 253
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 90
+        }
+      ]
+    },
+    {
+      "query": "search missing",
+      "includeKeywords": true,
+      "expected": []
+    },
+    {
+      "query": "search missing",
+      "includeKeywords": false,
+      "expected": []
+    },
+    {
+      "query": "simulator",
+      "includeKeywords": true,
+      "expected": []
+    },
+    {
+      "query": "simulator",
+      "includeKeywords": false,
+      "expected": []
+    },
+    {
+      "query": "synchronize",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 69
+        }
+      ]
+    },
+    {
+      "query": "synchronize",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 69
+        }
+      ]
+    },
+    {
+      "query": "fuzzy lookup",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 155
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 155
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 110
+        }
+      ]
+    },
+    {
+      "query": "fuzzy lookup",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 110
+        }
+      ]
+    },
+    {
+      "query": "lookup legacy",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 65
+        }
+      ]
+    },
+    {
+      "query": "lookup legacy",
+      "includeKeywords": false,
+      "expected": []
+    },
+    {
+      "query": "fuzzy",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 90
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 90
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 90
+        }
+      ]
+    },
+    {
+      "query": "fuzzy",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 90
+        }
+      ]
+    },
+    {
+      "query": "advanced",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 318
+        }
+      ]
+    },
+    {
+      "query": "advanced",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 318
+        }
+      ]
+    },
+    {
+      "query": "records",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 413
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 373
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 303
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 119
+        }
+      ]
+    },
+    {
+      "query": "records",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 303
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 303
+        },
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 263
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 119
+        }
+      ]
+    },
+    {
+      "query": "icon",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 367
+        }
+      ]
+    },
+    {
+      "query": "icon",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 367
+        }
+      ]
+    },
+    {
+      "query": "sync",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 319
+        }
+      ]
+    },
+    {
+      "query": "sync",
+      "includeKeywords": false,
+      "expected": [
+        {
+          "server": "better-icons",
+          "tool": "sync_icon",
+          "score": 319
+        }
+      ]
+    },
+    {
+      "query": "search",
+      "server": "demo",
+      "includeKeywords": true,
+      "expected": [
+        {
+          "server": "demo",
+          "tool": "search_records_advanced",
+          "score": 369
+        },
+        {
+          "server": "demo",
+          "tool": "search_records",
+          "score": 319
+        },
+        {
+          "server": "demo",
+          "tool": "record_search",
+          "score": 253
+        },
+        {
+          "server": "demo",
+          "tool": "find_records",
+          "score": 90
+        }
+      ]
+    }
+  ],
+  "score": [
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "search",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 319
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "search",
+      "keywords": [],
+      "expected": 90
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "search",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 369
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "search",
+      "keywords": [],
+      "expected": 253
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "search",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "search",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "search missing",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "search missing",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "search missing",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "search missing",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "search missing",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "search missing",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "simulator",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "simulator",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "simulator",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "simulator",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "simulator",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "simulator",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "synchronize",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "synchronize",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "synchronize",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "synchronize",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "synchronize",
+      "expected": 69
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "synchronize",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "fuzzy lookup",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 155
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "fuzzy lookup",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "fuzzy lookup",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 155
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "fuzzy lookup",
+      "keywords": [],
+      "expected": 110
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "fuzzy lookup",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "fuzzy lookup",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "lookup legacy",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "lookup legacy",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "lookup legacy",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 65
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "lookup legacy",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "lookup legacy",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "lookup legacy",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "fuzzy",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 90
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "fuzzy",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "fuzzy",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 90
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "fuzzy",
+      "keywords": [],
+      "expected": 90
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "fuzzy",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "fuzzy",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "advanced",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "advanced",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "advanced",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 318
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "advanced",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "advanced",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "advanced",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "records",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": 413
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "records",
+      "keywords": [],
+      "expected": 303
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "records",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": 373
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "records",
+      "keywords": [],
+      "expected": 119
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "records",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "records",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "icon",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "icon",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "icon",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "icon",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "icon",
+      "expected": 367
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "icon",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "sync",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "sync",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "sync",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "sync",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "sync",
+      "expected": 319
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "sync",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "",
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records",
+      "description": "Find records",
+      "query": "  ",
+      "keywords": [
+        "records",
+        "fuzzy lookup"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "find_records",
+      "description": "Search records",
+      "query": "  ",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "search_records_advanced",
+      "description": "Advanced record search with filters",
+      "query": "  ",
+      "keywords": [
+        "records",
+        "fuzzy lookup",
+        "legacy"
+      ],
+      "expected": null
+    },
+    {
+      "server": "demo",
+      "tool": "record_search",
+      "description": "Fuzzy lookup across records",
+      "query": "  ",
+      "keywords": [],
+      "expected": null
+    },
+    {
+      "server": "better-icons",
+      "tool": "sync_icon",
+      "description": "Add an icon to your project's icons file.",
+      "query": "  ",
+      "expected": null
+    },
+    {
+      "server": "disabled-srv",
+      "tool": "hidden_tool",
+      "description": "Should never rank",
+      "query": "  ",
+      "expected": null
+    }
+  ],
+  "paginate": [
+    {
+      "items": [
+        "a",
+        "b",
+        "c"
+      ],
+      "offset": 1,
+      "limit": 1,
+      "expected": {
+        "items": [
+          "b"
+        ],
+        "total": 3,
+        "hasMore": true,
+        "nextOffset": 2
+      }
+    },
+    {
+      "items": [
+        "a",
+        "b",
+        "c"
+      ],
+      "offset": 5,
+      "limit": 1,
+      "expected": {
+        "items": [],
+        "total": 3,
+        "hasMore": false,
+        "nextOffset": null
+      }
+    },
+    {
+      "items": [
+        "a",
+        "b",
+        "c"
+      ],
+      "offset": 0,
+      "limit": 12,
+      "expected": {
+        "items": [
+          "a",
+          "b",
+          "c"
+        ],
+        "total": 3,
+        "hasMore": false,
+        "nextOffset": null
+      }
+    },
+    {
+      "items": [
+        "a",
+        "b",
+        "c"
+      ],
+      "offset": 2,
+      "limit": 5,
+      "expected": {
+        "items": [
+          "c"
+        ],
+        "total": 3,
+        "hasMore": false,
+        "nextOffset": null
+      }
+    },
+    {
+      "items": [],
+      "offset": 0,
+      "limit": 12,
+      "expected": {
+        "items": [],
+        "total": 0,
+        "hasMore": false,
+        "nextOffset": null
+      }
+    }
+  ],
+  "suggestions": [
+    {
+      "name": "demo_search_records",
+      "limit": 5,
+      "expected": [
+        "search_records",
+        "search_records_advanced",
+        "find_records",
+        "record_search"
+      ]
+    },
+    {
+      "name": "demo_serch",
+      "limit": 5,
+      "expected": []
+    },
+    {
+      "name": "search_records",
+      "limit": 5,
+      "expected": [
+        "search_records",
+        "search_records_advanced",
+        "find_records",
+        "record_search"
+      ]
+    },
+    {
+      "name": "nonexistent",
+      "limit": 5,
+      "expected": []
+    },
+    {
+      "name": "sync_icon",
+      "limit": 2,
+      "expected": [
+        "sync_icon"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+[package]
+name = "rpi-ext-mcp-adapter"
+description = "MCP client adapter extension (L0 native plugin) — port of pi-mcp-adapter @ v2.24.0 (3d953f90)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# rlib: all logic lives in the library for unit/parity tests; cdylib is the
+# distributed artifact loaded by rpi-ext-host's native loader (design §2.1).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# configHash (FR-P0-10): sha256 over the stable-stringified identity fields.
+sha2.workspace = true
+# Insertion-ordered maps for server/entry tables (JS object key order
+# parity). Transitive dependency promoted to direct (precedent: ring, http,
+# bytes in the workspace manifest) — serde_json `preserve_order` is built on
+# the same crate.
+indexmap = { version = "2", features = ["serde"] }
+# WHATWG URL validation parity with upstream `new URL()` (utils.ts
+# resolveServerUrl) — used by computeServerHash.
+url.workspace = true
+# Plugin-owned tokio runtime (design §2.3) + dispatch block_on bridge.
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+# FR-P0-08: streamable HTTP + legacy SSE transports (workspace baseline,
+# rustls + stream features).
+reqwest.workspace = true
+# FR-P0-04: `mcp({ search, regex: true })` mode (workspace baseline).
+regex.workspace = true
+# FR-P0-07: stdio child process-group SIGKILL on shutdown (G4 no-leftover-
+# process red line; workspace baseline).
+libc.workspace = true
+# FR-P0-06: MCP blob resource decoding before temp-file materialization
+# (tool-registrar.ts materializeBinaryResource; workspace baseline).
+base64.workspace = true
+# FR-P1-04: OAuth credential storage (upstream @napi-rs/keyring → Rust
+# keyring crate, same underlying native backend; design §3.7).
+# On Linux headless without Secret Service / dbus, the store is unavailable
+# and authentication fails closed (no plaintext fallback) — matching the
+# upstream behavior (design risk R4).
+keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
+
