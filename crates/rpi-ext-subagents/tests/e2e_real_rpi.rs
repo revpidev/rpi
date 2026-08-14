@@ -229,6 +229,17 @@ fn e2e_real_rpi_child_and_stream_fixture() {
         std::env::set_var("RPI_SUBAGENT_EXTENSION_PATH", &cdylib);
         std::env::set_var("STUBPAR_API_KEY", "stub-key");
     }
+    // TE05: pin the P0 foreground default in the sandbox config
+    // (asyncByDefault defaults to true with FR-P1-04).
+    std::fs::create_dir_all(agent_dir.join("extensions").join("subagent")).unwrap();
+    std::fs::write(
+        agent_dir
+            .join("extensions")
+            .join("subagent")
+            .join("config.json"),
+        r#"{"asyncByDefault": false}"#,
+    )
+    .unwrap();
     let host = Arc::new(FakeHost {
         cwd: project.clone(),
         model: json!({"provider": "stubpar", "id": "stub-1"}),

@@ -69,6 +69,14 @@ fn tool_surface_integration() {
     let dir = sandbox();
     std::env::set_var("RPI_CODING_AGENT_DIR", dir.join("agent"));
     std::env::set_var("RPI_SUBAGENT_RPI_BINARY", "/nonexistent-rpi");
+    // TE05: pin the foreground default (asyncByDefault defaults to true with
+    // FR-P1-04); the async path has its own assertions above.
+    std::fs::create_dir_all(dir.join("agent").join("extensions").join("subagent")).unwrap();
+    std::fs::write(
+        dir.join("agent").join("extensions").join("subagent").join("config.json"),
+        r#"{"asyncByDefault": false}"#,
+    )
+    .unwrap();
     let host = Arc::new(FakeHost {
         cwd: dir.join("proj"),
         model: json!({"provider": "faux", "id": "faux-1"}),
@@ -129,12 +137,17 @@ fn tool_surface_integration() {
         .unwrap()
         .contains("ADR-0016"));
 
-    // async is rejected until FR-P1-04.
+    // async:true starts a background run (FR-P1-04): immediate receipt,
+    // not an error; the run itself fails fast on the missing binary but the
+    // receipt already returned.
     let result = execute(json!({ "agent": "scout", "task": "t", "async": true }));
-    assert!(result["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("async:true is not supported"));
+    assert_eq!(result["isError"], Value::Bool(false));
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("Background run") && text.contains("started"),
+        "{text}"
+    );
+    assert!(result["details"]["statusFile"].is_string());
 
     // status before any run.
     let result = execute(json!({ "action": "status" }));

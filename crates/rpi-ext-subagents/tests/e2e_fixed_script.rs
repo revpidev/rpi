@@ -49,6 +49,19 @@ impl Sandbox {
         let dump_root = root.join("dumps");
         std::fs::create_dir_all(project.join(".rpi")).unwrap();
         std::fs::create_dir_all(&agent_dir).unwrap();
+        // TE05: asyncByDefault defaults to true (upstream parity), which
+        // would flip every P0 scenario to background mode — pin the P0
+        // foreground semantics in the sandbox config; async gets its own
+        // scenarios below.
+        std::fs::create_dir_all(agent_dir.join("extensions").join("subagent")).unwrap();
+        std::fs::write(
+            agent_dir
+                .join("extensions")
+                .join("subagent")
+                .join("config.json"),
+            r#"{"asyncByDefault": false}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(&dump_root).unwrap();
         std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
         std::env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());

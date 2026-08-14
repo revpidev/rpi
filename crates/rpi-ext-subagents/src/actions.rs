@@ -158,15 +158,24 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     lines.join("\n")
 }
 
-/// P0 management dispatch. Returns the tool text plus optional details
-/// additions (upstream `result()` carries details.mode).
-pub fn handle_management_action(
+/// Extra dependencies the P1 control actions need (async registry access).
+pub struct ActionDeps<'a> {
+    pub host: Option<&'a dyn crate::HostContext>,
+    pub runtime: Option<&'a crate::PluginRuntime>,
+    /// Raw call params (for control actions needing ids/messages).
+    pub params: Option<Value>,
+}
+
+/// `handleManagementAction` (agent-management.ts:1242 dispatch, P1 subset).
+pub fn handle_management_action_with(
     action: &str,
     agent_name: Option<&str>,
     cwd: &Path,
     settings: &SettingsPair,
     config: &crate::config::ExtensionConfig,
+    deps: &ActionDeps<'_>,
 ) -> ToolOutcome {
+    let raw_params = deps.params.clone().unwrap_or(Value::Null);
     match action {
         "list" => {
             let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
@@ -184,7 +193,7 @@ pub fn handle_management_action(
             }
         }
         "status" => {
-            // P0 has no async runs; foreground memory carries the last runs.
+            // Foreground memory + live async registry (async-status.ts shape).
             let memory = FOREGROUND_RUN_MEMORY
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
@@ -205,13 +214,233 @@ pub fn handle_management_action(
                         .unwrap_or_default()
                 ));
             }
+            lines.push(String::new());
+            lines.push("Background runs:".to_string());
+            let async_runs = crate::runner::background::list_runs();
+            if async_runs.is_empty() {
+                lines.push("- (none)".to_string());
+            }
+            for run in &async_runs {
+                lines.push(format!(
+                    "- {} mode={} state={}{}",
+                    run["runId"].as_str().unwrap_or("?"),
+                    run["mode"].as_str().unwrap_or("?"),
+                    run["state"].as_str().unwrap_or("?"),
+                    run["error"]
+                        .as_str()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default()
+                ));
+            }
             ToolOutcome::text(lines.join("\n"))
+        }
+        // Async control actions (async-stop-action.ts / control-channel.ts).
+        "interrupt" => match id_param(&raw_params) {
+            Some(id) => match crate::runner::background::interrupt_run(&id) {
+                Ok(status) => ToolOutcome::text(format_async_status("interrupted", &status)),
+                Err(message) => ToolOutcome::error(message),
+            },
+            None => ToolOutcome::error(
+                "action \"interrupt\" requires the background run id (use { id }).".to_string(),
+            ),
+        },
+        "stop" => match id_param(&raw_params) {
+            Some(id) => {
+                // Cooperative stop + direct child signalling; the bounded
+                // terminal wait happens on the plugin runtime.
+                let (Some(runtime), Some(_host)) = (deps.runtime, deps.host) else {
+                    return ToolOutcome::error(
+                        "action \"stop\" is unavailable in this context.".to_string(),
+                    );
+                };
+                match crate::runner::background::find_run(&id) {
+                    Some(handle) => {
+                        handle.control.request_stop();
+                        crate::runner::foreground::request_stop_for_run(&handle.run_id);
+                        let run_dir = handle.run_dir.clone();
+                        crate::artifacts::append_jsonl(
+                            &run_dir.join("events.jsonl"),
+                            &serde_json::json!({
+                                "type": "control.stop",
+                                "runId": handle.run_id,
+                            })
+                            .to_string(),
+                        );
+                        let snapshot = runtime.block_on(async {
+                            match crate::runner::background::wait_for_runs(
+                                Some(handle.run_id.as_str()),
+                                false,
+                                15_000,
+                            )
+                            .await
+                            {
+                                Ok(waited) => waited["runs"]
+                                    .as_array()
+                                    .and_then(|runs| runs.first().cloned()),
+                                Err(_) => None,
+                            }
+                        });
+                        match snapshot {
+                            Some(status) => {
+                                ToolOutcome::text(format_async_status("stopped", &status))
+                            }
+                            None => ToolOutcome::text(format!(
+                                "Stop requested for background run {}.",
+                                handle.run_id
+                            )),
+                        }
+                    }
+                    None => ToolOutcome::error(format!("No active background run matches '{id}'.")),
+                }
+            }
+            None => ToolOutcome::error(
+                "action \"stop\" requires the background run id (use { id }).".to_string(),
+            ),
+        },
+        "steer" => {
+            let id = id_param(&raw_params).unwrap_or_default();
+            let message = raw_params
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let mode = raw_params
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("steer")
+                .to_string();
+            let target_index = raw_params.get("targetIndex").and_then(Value::as_u64).map(|v| v as usize);
+            let Some(message) = message else {
+                return ToolOutcome::error(
+                    "action \"steer\" requires a non-empty message.".to_string(),
+                );
+            };
+            match crate::runner::background::deliver_steer(&id, &message, &mode, target_index) {
+                Ok(request) => ToolOutcome::text(format!(
+                    "Steer request {} delivered to child {} of run {}.",
+                    request["id"].as_str().unwrap_or("?"),
+                    request["targetIndex"].as_u64().unwrap_or(0),
+                    id
+                )),
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
+        "resume" => {
+            // Revive from the persisted child session (async-resume.ts):
+            // requires a terminal/paused run and a continuation task.
+            let (Some(id), Some(host), Some(runtime)) = (
+                id_param(&raw_params),
+                deps.host,
+                deps.runtime,
+            ) else {
+                return ToolOutcome::error(
+                    "action \"resume\" requires the run id and an active session context.".to_string(),
+                );
+            };
+            let task = raw_params
+                .get("task")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string);
+            let Some(status) = crate::runner::background::read_run_status(&id) else {
+                return ToolOutcome::error(format!("No background run matches '{id}'."));
+            };
+            if matches!(status["state"].as_str(), Some("running") | Some("queued")) {
+                return ToolOutcome::error(format!(
+                    "Background run {id} is still {state}; resume applies to interrupted or stopped runs.",
+                    state = status["state"].as_str().unwrap_or("?")
+                ));
+            }
+            let session_file = status["steps"]
+                .as_array()
+                .and_then(|steps| steps.last())
+                .and_then(|step| step["sessionFile"].as_str())
+                .map(str::to_string);
+            let Some(session_file) = session_file else {
+                return ToolOutcome::error(format!(
+                    "Background run {id} has no persisted child session to resume from."
+                ));
+            };
+            let agent_name = status["steps"]
+                .as_array()
+                .and_then(|steps| steps.last())
+                .and_then(|step| step["agent"].as_str())
+                .unwrap_or("worker")
+                .to_string();
+            let task = task.unwrap_or_else(|| {
+                "Continue the interrupted task from this session.".to_string()
+            });
+            // New async run reviving the old session file.
+            let params = serde_json::json!({
+                "agent": agent_name,
+                "task": task,
+                "sessionFile": session_file,
+                "async": true,
+            });
+            let host_cwd = host.cwd();
+            let settings = crate::config::read_settings_pair(&host_cwd);
+            let config = crate::config::load_config();
+            let result = crate::tool::execute_subagent_tool(&params, host, &settings, &config, runtime);
+            ToolOutcome {
+                text: result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                details: result.get("details").cloned().unwrap_or(Value::Null),
+                is_error: result["isError"].as_bool().unwrap_or(false),
+            }
+        }
+        "grant-spawn-budget" => {
+            let additional = raw_params
+                .get("additional")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let session_id = raw_params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let Some(session_id) = session_id else {
+                return ToolOutcome::error(
+                    "action \"grant-spawn-budget\" requires a session id in an interactive session."
+                        .to_string(),
+                );
+            };
+            let ledger = crate::runner::background::SpawnBudgetLedger::open(&session_id);
+            match ledger.grant(additional, config.max_subagent_spawns_per_session()) {
+                Ok(granted) => ToolOutcome::text(format!(
+                    "Spawn budget granted: cumulative grant is now {granted}."
+                )),
+                Err(message) => ToolOutcome::error(message),
+            }
         }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config)),
         other => ToolOutcome::error(format!(
-            "Unknown subagent action \"{other}\". Supported P0 actions: list, get, status, doctor."
+            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, grant-spawn-budget, doctor."
         )),
     }
+}
+
+/// `{ id }` or `{ runId }` param for control actions.
+fn id_param(params: &Value) -> Option<String> {
+    params
+        .get("id")
+        .or_else(|| params.get("runId"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn format_async_status(verb: &str, status: &Value) -> String {
+    format!(
+        "Background run {} {}: state={}{}",
+        status["runId"].as_str().unwrap_or("?"),
+        verb,
+        status["state"].as_str().unwrap_or("?"),
+        status["error"]
+            .as_str()
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default()
+    )
 }
 
 /// Doctor sections (extension/doctor.ts:229-270, P0 subset): Runtime,

@@ -90,6 +90,7 @@ fn run_args_case(input: &Value) -> Value {
             .map(|v| v as usize),
         parent_session_id: get_str("parentSessionId").map(str::to_string),
         fanout_authorized: input.get("fanoutAuthorized") == Some(&Value::Bool(true)),
+        steer_inbox: None,
         self_extension: Some("/ext/placeholder".to_string()),
     };
     match rpi_ext_subagents::parity::build_args_public(&build_input) {

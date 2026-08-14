@@ -3,6 +3,7 @@
 pub mod builtin;
 pub mod discover;
 pub mod frontmatter;
+pub mod skills;
 
 use std::path::{Path, PathBuf};
 

@@ -222,6 +222,13 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
 /// `<agentDir>/sessions/*/subagent-artifacts`.
 pub fn cleanup_all_artifact_dirs(max_age_days: u64) {
     cleanup_old_artifacts(&paths::temp_artifacts_dir(), max_age_days);
+    // Chain scratch dirs: user-scoped temp roots get the 24h sweep
+    // (settings.ts cleanupOldChainDirs L197-215); project-local roots are
+    // never age-scanned, matching upstream.
+    crate::p1::chain::cleanup_old_chain_dirs(
+        &paths::temp_root_dir().join("chain-runs"),
+        crate::p1::chain::CHAIN_DIR_MAX_AGE_MS,
+    );
     let sessions_base = paths::get_agent_dir().join("sessions");
     let Ok(dirs) = std::fs::read_dir(&sessions_base) else {
         return;

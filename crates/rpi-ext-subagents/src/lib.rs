@@ -24,6 +24,7 @@ mod description;
 mod diagnostic;
 mod error;
 mod launch;
+mod p1;
 mod paths;
 mod runner;
 mod runtime;
@@ -59,11 +60,49 @@ enum PluginMode {
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
 
-/// Host bridge the tool layer uses (cwd, parent model, parent session file).
+/// Clonable host-call channel for background tasks (FR-P1-04): the runner
+/// task outlives the dispatch call that started it and needs `sendMessage` /
+/// `events.emit` from the plugin runtime.
+#[derive(Clone, Copy)]
+pub struct AsyncHostCalls {
+    pub call: extern "C" fn(
+        rpi_ext_host::native::PluginCookie,
+        abi_stable::std_types::RVec<u8>,
+    ) -> abi_stable::std_types::RVec<u8>,
+    pub cookie: usize,
+}
+
+/// Fire one host call from a background context; returns the raw envelope.
+pub fn host_call_static(channel: &AsyncHostCalls, method: &str, args: Value) -> Value {
+    let request = serde_json::to_vec(&json!({
+        "call": method,
+        "args": args,
+        "seq": 0,
+    }))
+    .unwrap_or_default();
+    let response =
+        (channel.call)(channel.cookie as rpi_ext_host::native::PluginCookie, RVec::from(request));
+    serde_json::from_slice(&response[..]).unwrap_or(Value::Null)
+}
+
+/// Host bridge the tool layer uses (cwd, parent model, parent session file,
+/// and — from TE05 — the scoped model registry for fuzzy resolution).
 pub trait HostContext {
     fn cwd(&self) -> PathBuf;
     fn parent_model(&self) -> Option<String>;
     fn parent_session_file(&self, settings: &config::SettingsPair) -> Option<PathBuf>;
+    /// `ctx.scopedModels` projection: `(provider, id)` pairs for
+    /// `launch::model` fuzzy resolution (FR-P1-05). Returns an empty list
+    /// when the host reports none — resolution then falls back to verbatim.
+    fn scoped_models(&self) -> Vec<launch::model::AvailableModel> {
+        Vec::new()
+    }
+
+    /// Async notification channel for background runs (FR-P1-04); `None` in
+    /// test fakes disables host notification (result files still land).
+    fn async_calls(&self) -> Option<AsyncHostCalls> {
+        None
+    }
 }
 
 struct HostCallsContext<'a> {
@@ -98,6 +137,39 @@ impl HostContext for HostCallsContext<'_> {
         let cwd = self.cwd();
         let dir = paths::resolve_parent_session_dir(&cwd, settings.session_dir.as_deref());
         paths::find_latest_session_file(&dir)
+    }
+
+    fn async_calls(&self) -> Option<AsyncHostCalls> {
+        Some(AsyncHostCalls {
+            call: self.calls.call,
+            cookie: self.cookie,
+        })
+    }
+
+    fn scoped_models(&self) -> Vec<launch::model::AvailableModel> {
+        let Some(scoped) = host_call_ok(self.calls, self.cookie, "ctx.scopedModels", json!({}))
+        else {
+            return Vec::new();
+        };
+        let Some(items) = scoped.as_array() else {
+            return Vec::new();
+        };
+        let mut models = Vec::new();
+        for item in items {
+            let model = item.get("model");
+            let (Some(provider), Some(id)) = (
+                model.and_then(|m| m.get("provider")).and_then(Value::as_str),
+                model.and_then(|m| m.get("id")).and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            models.push(launch::model::AvailableModel {
+                full_id: format!("{provider}/{id}"),
+                provider: provider.to_string(),
+                id: id.to_string(),
+            });
+        }
+        models
     }
 }
 
@@ -233,6 +305,21 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             if let Err(error) = register("on", json!({ "event": "session_start" })) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // Steer inbox consumer (FR-P1-04, subagent-prompt-runtime.ts
+            // registerSteeringInbox L333): when the parent launched this
+            // child with a steer inbox, poll it and inject messages through
+            // `sendUserMessage` (deliverAs steer|followUp), writing an ack
+            // per consumed request.
+            if let Ok(inbox) = std::env::var(launch::args::SUBAGENT_STEER_INBOX_ENV) {
+                if !inbox.trim().is_empty() {
+                    let inbox = std::path::PathBuf::from(inbox);
+                    let calls_copy = RpiHostCalls { call: calls.call };
+                    let cookie_copy = cookie;
+                    plugin_runtime.spawn(async move {
+                        steer_inbox_loop(calls_copy, cookie_copy, inbox).await;
+                    });
+                }
+            }
             if mode == PluginMode::ChildFanout {
                 if let Err(error) = register(
                     "registerTool",
@@ -270,12 +357,37 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
             }
-            for event in ["session_start", "session_shutdown"] {
+            for event in ["session_start", "session_shutdown", "agent_end"] {
                 if let Err(error) = register("on", json!({ "event": event })) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
             }
-            // Startup artifact cleanup (index.ts:371-372).
+            // `subagent_wait` (FR-P1-04, wait-tool.ts): registered unless
+            // disabled by config.waitTool / RPI_SUBAGENT_WAIT_TOOL_ENABLED.
+            if config.wait_tool_enabled() {
+                if let Err(error) = register(
+                    "registerTool",
+                    json!({
+                        "name": "subagent_wait",
+                        "label": "Subagent wait",
+                        "description": "Wait for background subagent runs to reach a terminal state (first-terminal by default, all with { all: true }); non-blocking with { nonBlocking: true }. Disabled by config.waitTool.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string", "description": "Run id or unique id prefix; omit to wait on any background run." },
+                                "all": { "type": "boolean", "description": "Wait for every background run to finish (default: first terminal)." },
+                                "nonBlocking": { "type": "boolean", "description": "Register a wake and return immediately." },
+                                "timeoutMs": { "type": "integer", "description": "Wait timeout in milliseconds (default 30 minutes)." }
+                            }
+                        },
+                    }),
+                ) {
+                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                }
+            }
+            // Startup: stale async-run reconciliation (ADR-0019 crash branch)
+            // + artifact cleanup (index.ts:371-372).
+            runner::background::reconcile_stale_runs();
             artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
         }
     }
@@ -295,6 +407,77 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     }
 }
 
+/// Steer inbox poll loop (registerSteeringInbox L333 + writeSteerAck):
+/// 500ms scan, inject via sendUserMessage, ack per request, stop on the
+/// steering-capability file being closed (`steer-inbox-closed.json`).
+async fn steer_inbox_loop(calls: RpiHostCalls, cookie: usize, inbox: PathBuf) {
+    let _ = std::fs::create_dir_all(&inbox);
+    // Capability beacon: the parent can probe readiness.
+    let _ = std::fs::write(
+        inbox.join("capability.json"),
+        json!({ "protocolVersion": 1, "supported": true }).to_string(),
+    );
+    loop {
+        if inbox.join("steer-inbox-closed.json").exists() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(&inbox) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(request) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            if request.get("type").and_then(Value::as_str) != Some("steer") {
+                continue;
+            }
+            let message = request
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let deliver_as = match request.get("mode").and_then(Value::as_str) {
+                Some("follow_up") => "followUp",
+                _ => "steer",
+            };
+            let _ = host_call(
+                &calls,
+                cookie,
+                "sendUserMessage",
+                json!({
+                    "content": message,
+                    "options": { "deliverAs": deliver_as },
+                }),
+            );
+            // Ack + consume.
+            if let Some(acks) = inbox.parent() {
+                let ack_dir = acks.parent().map(|p| p.join("steer-acks"));
+                if let Some(ack_dir) = ack_dir {
+                    let _ = std::fs::create_dir_all(&ack_dir);
+                    let id = request
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let _ = std::fs::write(
+                        ack_dir.join(format!("{id}.json")),
+                        json!({ "type": "steer-ack", "id": id }).to_string(),
+                    );
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 /// Host-dispatched calls (`rpi_dispatch`): toolExecute / command / event.
 fn dispatch_message(message: &Value) -> Value {
     let Some(state) = STATE.get() else {
@@ -302,17 +485,10 @@ fn dispatch_message(message: &Value) -> Value {
     };
     match message.get("kind").and_then(Value::as_str) {
         Some("toolExecute") => {
+            let tool_name = message.get("toolName").and_then(Value::as_str).unwrap_or("");
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let host = HostCallsContext {
-                calls: &state.calls,
-                cookie: state.cookie,
-            };
-            let settings = config::read_settings_pair(&host.cwd());
-            let config = config::load_config();
-            let result =
-                tool::execute_subagent_tool(&params, &host, &settings, &config, &state.runtime);
-            // Child-safe mode blocks mutating management actions; P0's four
-            // actions are read-only, so the restriction is a forward guard.
+            // Child-safe mode blocks mutating management actions before
+            // execution (fanout-child.ts allowlist, L174-189).
             if state.mode == PluginMode::ChildFanout {
                 if let Some(action) = params.get("action").and_then(Value::as_str) {
                     if !matches!(action, "list" | "get" | "status" | "doctor") {
@@ -326,7 +502,16 @@ fn dispatch_message(message: &Value) -> Value {
                     }
                 }
             }
-            result
+            if tool_name == "subagent_wait" {
+                return execute_subagent_wait(&params, state);
+            }
+            let host = HostCallsContext {
+                calls: &state.calls,
+                cookie: state.cookie,
+            };
+            let settings = config::read_settings_pair(&host.cwd());
+            let config = config::load_config();
+            tool::execute_subagent_tool(&params, &host, &settings, &config, &state.runtime)
         }
         Some("command") => {
             let name = message.get("name").and_then(Value::as_str).unwrap_or("");
@@ -355,16 +540,96 @@ fn dispatch_message(message: &Value) -> Value {
                     Value::Null
                 }
                 (PluginMode::Parent, "session_shutdown") => {
-                    // Sweep live children (SIGTERM → 3s → SIGKILL).
+                    // Harvest async runs (ADR-0019 interactive branch), then
+                    // sweep live children (SIGTERM → 3s → SIGKILL).
                     state
                         .runtime
-                        .spawn(runner::foreground::kill_all_children_for_shutdown());
+                        .spawn(async_runner_shutdown());
+                    Value::Null
+                }
+                (PluginMode::Parent, "agent_end") => {
+                    // Headless auto-drain (ADR-0019 print branch,
+                    // auto-drain.ts): wait for outstanding runs before exit.
+                    let has_ui = host_call_ok(&state.calls, state.cookie, "ctx.hasUI", json!({}))
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    if !has_ui {
+                        state.runtime.spawn(async_move_drain());
+                    }
                     Value::Null
                 }
                 _ => Value::Null,
             }
         }
         _ => Value::Null,
+    }
+}
+
+/// Named async fn wrappers (async blocks around the registry calls trip the
+/// rustc HRTB-closure limitation).
+async fn async_runner_shutdown() {
+    runner::background::harvest_for_shutdown().await;
+    runner::foreground::kill_all_children_for_shutdown().await;
+}
+
+async fn async_move_drain() {
+    // DEFAULT_AUTO_DRAIN_TIMEOUT_MS (auto-drain.ts:9): 30 minutes.
+    if let Err(message) = runner::background::drain_outstanding_work(30 * 60 * 1000).await {
+        tracing::error!(%message, "auto-drain failed");
+    }
+}
+
+/// `subagent_wait` execution (subagent-wait.ts waitForSubagents subset).
+fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
+    let config = config::load_config();
+    if !config.wait_tool_enabled() {
+        return json!({
+            "content": [{ "type": "text", "text":
+                "subagent_wait is disabled by config.waitTool or RPI_SUBAGENT_WAIT_TOOL_ENABLED; returning immediately without blocking background work. Active work keeps going, and you can inspect subagents with subagent({ action: \"status\" }) or rely on completion notifications."
+            }],
+            "isError": false,
+        });
+    }
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let all = params.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let non_blocking = params
+        .get("nonBlocking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if non_blocking {
+        // P0-shape stub for the persistent-subscription mode: return now;
+        // completion notifications are the wake channel.
+        return json!({
+            "content": [{ "type": "text", "text":
+                "Registered for background completion notifications; returning without blocking."
+            }],
+            "isError": false,
+        });
+    }
+    let timeout_ms = params
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .filter(|v| *v > 0)
+        .unwrap_or(30 * 60 * 1000);
+    let result = state.runtime.block_on(async {
+        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms).await
+    });
+    match result {
+        Ok(waited) => json!({
+            "content": [{ "type": "text", "text":
+                format!("Wait finished: {} run(s) reached a terminal state.", waited["waited"].as_u64().unwrap_or(0))
+            }],
+            "details": waited,
+            "isError": false,
+        }),
+        Err(message) => json!({
+            "content": [{ "type": "text", "text": message }],
+            "isError": true,
+        }),
     }
 }
 
@@ -456,6 +721,8 @@ pub mod parity {
         pub parent_session_id: Option<String>,
         pub fanout_authorized: bool,
         pub self_extension: Option<String>,
+        /// Steer inbox dir (FR-P1-04); None clears the env.
+        pub steer_inbox: Option<PathBuf>,
     }
 
     pub struct BuildArgsResultPublic {
@@ -494,6 +761,7 @@ pub mod parity {
             parent_session_id: input.parent_session_id.clone(),
             fanout_authorized: input.fanout_authorized,
             self_extension: input.self_extension.clone(),
+            steer_inbox: input.steer_inbox.clone(),
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {

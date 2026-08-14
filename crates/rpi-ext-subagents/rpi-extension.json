@@ -1,8 +1,13 @@
 {
   "name": "rpi-subagents",
   "version": "0.1.0",
-  "description": "Delegation extension: single `subagent` tool that spawns focused child rpi sessions with per-agent prompts, tool allowlists and depth limits (P0 core).",
+  "description": "Delegation extension: single `subagent` tool that spawns focused child rpi sessions with per-agent prompts, tool allowlists and depth limits; composite tasks/steps runs (ADR-0018), background async runs (ADR-0019), model fallback chains.",
   "native": "librpi_ext_subagents.so",
-  "capabilities": ["tools", "commands", "session"],
+  "capabilities": [
+    "tools",
+    "commands",
+    "session",
+    "events"
+  ],
   "rpiAbi": 1
 }

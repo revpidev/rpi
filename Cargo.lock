@@ -2567,7 +2567,9 @@ name = "rpi-ext-subagents"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "futures",
  "libc",
+ "regex",
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",

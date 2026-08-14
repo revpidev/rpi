@@ -91,6 +91,9 @@ pub struct AgentConfig {
     pub default_progress: bool,
     pub max_subagent_depth: Option<u64>,
     pub disabled: Option<bool>,
+    /// `acceptanceRole`: "read-only" | "writer" (FR-P1-09 acceptance level
+    /// inference input; agent-management.ts:559-562).
+    pub acceptance_role: Option<String>,
     /// Which frontmatter keys the definition actually wrote (agentFrontmatterFields
     /// WeakMap upstream) — the fill-only override guard.
     pub frontmatter_fields: std::collections::BTreeSet<String>,
@@ -363,6 +366,12 @@ pub fn agent_from_content(
         default_progress: fm.get("defaultProgress").map(String::as_str) == Some("true"),
         max_subagent_depth,
         disabled: None,
+        acceptance_role: match fm.get("acceptanceRole").map(String::as_str) {
+            // read-only | writer | false; anything else is treated as unset
+            // (agent-management.ts:559-562 validation vocabulary).
+            Some("read-only") | Some("writer") => fm.get("acceptanceRole").cloned(),
+            _ => None,
+        },
         frontmatter_fields: fm.keys().cloned().collect(),
     }))
 }
@@ -545,9 +554,14 @@ pub fn discover_agents_with_user_dirs(
     user_dirs: Vec<PathBuf>,
 ) -> Result<Vec<AgentConfig>, String> {
     let default_model = settings.default_model.clone();
+    // `applySubagentDefaults` (agents.ts:995-1009, called per scope at
+    // 1760/1771/1779): defaultModel → defaultThinking → defaultExtensions,
+    // each fill-only.
+    let default_thinking = settings.default_thinking.clone();
+    let default_extensions = settings.default_extensions.clone();
 
     let mut builtin = crate::agents::builtin::load_builtin_agents(builtin_dir);
-    apply_default_model(&mut builtin, &default_model);
+    apply_subagent_defaults(&mut builtin, &default_model, &default_thinking, &default_extensions);
     apply_builtin_overrides(&mut builtin, settings);
 
     let mut user: Vec<AgentConfig> = if scope == "project" {
@@ -561,6 +575,8 @@ pub fn discover_agents_with_user_dirs(
         dedupe_by_name(agents)
     };
     apply_default_model(&mut user, &default_model);
+    apply_default_thinking(&mut user, &default_thinking);
+    apply_default_extensions(&mut user, &default_extensions);
     apply_custom_overrides(
         &mut user,
         &settings.project.overrides,
@@ -577,6 +593,8 @@ pub fn discover_agents_with_user_dirs(
         dedupe_by_name(agents)
     };
     apply_default_model(&mut project, &default_model);
+    apply_default_thinking(&mut project, &default_thinking);
+    apply_default_extensions(&mut project, &default_extensions);
     apply_custom_overrides(
         &mut project,
         &settings.project.overrides,
@@ -626,26 +644,83 @@ fn apply_default_model(agents: &mut [AgentConfig], default_model: &Option<String
     }
 }
 
+/// `applySubagentDefaults` composition (agents.ts:995-1009).
+fn apply_subagent_defaults(
+    agents: &mut [AgentConfig],
+    default_model: &Option<String>,
+    default_thinking: &Option<String>,
+    default_extensions: &Option<Vec<String>>,
+) {
+    apply_default_model(agents, default_model);
+    apply_default_thinking(agents, default_thinking);
+    apply_default_extensions(agents, default_extensions);
+}
+
+/// `applySubagentDefaultThinking` (agents.ts:995-1009): fill only agents
+/// without a frontmatter thinking level.
+fn apply_default_thinking(agents: &mut [AgentConfig], default_thinking: &Option<String>) {
+    let Some(default_thinking) = default_thinking else {
+        return;
+    };
+    for agent in agents.iter_mut() {
+        if matches!(agent.thinking, ThinkingSpec::Unset) {
+            agent.thinking = ThinkingSpec::Level(default_thinking.clone());
+        }
+    }
+}
+
+/// `applySubagentDefaultExtensions` (agents.ts:1011-1019): fill only agents
+/// that did not declare `extensions`.
+fn apply_default_extensions(agents: &mut [AgentConfig], default_extensions: &Option<Vec<String>>) {
+    let Some(default_extensions) = default_extensions else {
+        return;
+    };
+    for agent in agents.iter_mut() {
+        if agent.extensions.is_none() {
+            agent.extensions = Some(default_extensions.clone());
+        }
+    }
+}
+
 /// `applyBuiltinOverrides` (agents.ts:1051-1104): project override → project
 /// bulk disable → user override → user bulk disable; disableBuiltins replaces
 /// the entry with `{disabled: true}` (upstream masks the other scope).
+/// `disableThinking` clears the thinking level of builtin agents unless the
+/// winning override entry sets an explicit `thinking` (applyGlobalThinking,
+/// agents.ts:1066-1069).
 fn apply_builtin_overrides(agents: &mut [AgentConfig], settings: &crate::config::SettingsPair) {
+    let disable_thinking = settings.disable_thinking;
+    let clear_thinking = |agent: &mut AgentConfig, explicit_override: bool| {
+        if disable_thinking && !explicit_override {
+            agent.thinking = ThinkingSpec::Unset;
+        }
+    };
     for agent in agents.iter_mut() {
         if let Some(project_override) = settings.project.overrides.get(&agent.name) {
+            let explicit = project_override.thinking.is_some();
             apply_override_entry(agent, project_override);
+            clear_thinking(agent, explicit);
             continue;
         }
         if settings.project_bulk_disabled {
             agent.disabled = Some(true);
+            clear_thinking(agent, false);
             continue;
         }
         if let Some(user_override) = settings.user.overrides.get(&agent.name) {
+            // agents.ts:1085: an explicit user-override thinking protects from
+            // clearing only when the project file does not configure
+            // disableThinking.
+            let explicit =
+                !settings.project_thinking_configured && user_override.thinking.is_some();
             apply_override_entry(agent, user_override);
+            clear_thinking(agent, explicit);
             continue;
         }
         if settings.user_bulk_disabled {
             agent.disabled = Some(true);
         }
+        clear_thinking(agent, false);
     }
 }
 
@@ -671,7 +746,7 @@ fn apply_custom_overrides(
 
 fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOverride) {
     // Builtin overrides replace wholesale (project/user settings win over the
-    // shipped definition).
+    // shipped definition) — `applyBuiltinOverride` (agents.ts:1011-1043).
     if let Some(description) = &entry.description {
         agent.description = description.clone();
     }
@@ -686,9 +761,48 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
         agent.tools = split;
         agent.mcp_direct_tools = mcp;
     }
+    if let Some(fallback_models) = &entry.fallback_models {
+        agent.fallback_models = fallback_models.clone().unwrap_or_default();
+    }
+    if let Some(thinking) = &entry.thinking {
+        agent.thinking = match thinking {
+            Some(level) => ThinkingSpec::Level(level.clone()),
+            None => ThinkingSpec::Unset,
+        };
+    }
+    if let Some(mode) = &entry.system_prompt_mode {
+        agent.system_prompt_mode = match mode.as_str() {
+            "append" => "append",
+            _ => "replace",
+        };
+    }
+    if let Some(inherit) = entry.inherit_project_context {
+        agent.inherit_project_context = inherit;
+    }
+    if let Some(inherit) = entry.inherit_skills {
+        agent.inherit_skills = inherit;
+    }
+    if let Some(default_context) = &entry.default_context {
+        agent.default_context = match default_context.as_deref() {
+            Some("fork") => Some(ContextMode::Fork),
+            Some("fresh") => Some(ContextMode::Fresh),
+            _ => None,
+        };
+    }
+    if let Some(role) = &entry.acceptance_role {
+        agent.acceptance_role = role.clone();
+    }
+    if let Some(system_prompt) = &entry.system_prompt {
+        agent.system_prompt = system_prompt.clone();
+    }
+    if let Some(skills) = &entry.skills {
+        agent.skills = skills.clone().unwrap_or_default();
+    }
 }
 
 fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOverride) {
+    // `applyCustomAgentOverride` (agents.ts:1123-1206): fill-only via
+    // frontmatter field presence; `false` clears (delete upstream).
     if let Some(description) = &entry.description {
         agent.description = description.clone();
     }
@@ -707,6 +821,56 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
             let (split, mcp) = split_tool_list(tools.clone());
             agent.tools = split;
             agent.mcp_direct_tools = mcp;
+        }
+    }
+    if let Some(fallback_models) = &entry.fallback_models {
+        if !agent.has_frontmatter_field(&["fallbackModels"]) {
+            agent.fallback_models = fallback_models.clone().unwrap_or_default();
+        }
+    }
+    if let Some(thinking) = &entry.thinking {
+        if !agent.has_frontmatter_field(&["thinking"]) {
+            agent.thinking = match thinking {
+                Some(level) => ThinkingSpec::Level(level.clone()),
+                None => ThinkingSpec::Unset,
+            };
+        }
+    }
+    if let Some(mode) = &entry.system_prompt_mode {
+        if !agent.has_frontmatter_field(&["systemPromptMode"]) {
+            agent.system_prompt_mode = match mode.as_str() {
+                "append" => "append",
+                _ => "replace",
+            };
+        }
+    }
+    if let Some(inherit) = entry.inherit_project_context {
+        if !agent.has_frontmatter_field(&["inheritProjectContext"]) {
+            agent.inherit_project_context = inherit;
+        }
+    }
+    if let Some(inherit) = entry.inherit_skills {
+        if !agent.has_frontmatter_field(&["inheritSkills"]) {
+            agent.inherit_skills = inherit;
+        }
+    }
+    if let Some(default_context) = &entry.default_context {
+        if !agent.has_frontmatter_field(&["defaultContext"]) {
+            agent.default_context = match default_context.as_deref() {
+                Some("fork") => Some(ContextMode::Fork),
+                Some("fresh") => Some(ContextMode::Fresh),
+                _ => None,
+            };
+        }
+    }
+    if let Some(role) = &entry.acceptance_role {
+        if !agent.has_frontmatter_field(&["acceptanceRole"]) {
+            agent.acceptance_role = role.clone();
+        }
+    }
+    if let Some(skills) = &entry.skills {
+        if !agent.has_frontmatter_field(&["skill", "skills"]) {
+            agent.skills = skills.clone().unwrap_or_default();
         }
     }
 }

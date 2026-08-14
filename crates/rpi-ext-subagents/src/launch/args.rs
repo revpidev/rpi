@@ -39,6 +39,7 @@ pub const SUBAGENT_CHILD_AGENT_ENV: &str = "RPI_SUBAGENT_CHILD_AGENT";
 pub const SUBAGENT_CHILD_INDEX_ENV: &str = "RPI_SUBAGENT_CHILD_INDEX";
 pub const SUBAGENT_PARENT_DEPTH_ENV: &str = "RPI_SUBAGENT_PARENT_DEPTH";
 pub const SUBAGENT_PARENT_EVENT_SINK_ENV: &str = "RPI_SUBAGENT_PARENT_EVENT_SINK";
+pub const SUBAGENT_STEER_INBOX_ENV: &str = "RPI_SUBAGENT_STEER_INBOX";
 pub const SUBAGENT_PARENT_CONTROL_INBOX_ENV: &str = "RPI_SUBAGENT_PARENT_CONTROL_INBOX";
 pub const SUBAGENT_PARENT_ROOT_RUN_ID_ENV: &str = "RPI_SUBAGENT_PARENT_ROOT_RUN_ID";
 pub const SUBAGENT_PARENT_RUN_ID_ENV: &str = "RPI_SUBAGENT_PARENT_RUN_ID";
@@ -149,6 +150,9 @@ pub struct BuildArgsInput {
     /// always-injected PROMPT_RUNTIME slot). `None` skips injection — used by
     /// tests and by the degraded path when the path cannot be resolved.
     pub self_extension: Option<String>,
+    /// Steer inbox dir for this child (FR-P1-04 steer); `None` clears the
+    /// env (foreground runs have no live steer channel through the plugin).
+    pub steer_inbox: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -496,6 +500,14 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     };
     cleared(&mut env, SUBAGENT_PARENT_EVENT_SINK_ENV);
     cleared(&mut env, SUBAGENT_PARENT_CONTROL_INBOX_ENV);
+    if let Some(inbox) = &input.steer_inbox {
+        env.insert(
+            SUBAGENT_STEER_INBOX_ENV.to_string(),
+            Some(inbox.to_string_lossy().to_string()),
+        );
+    } else {
+        cleared(&mut env, SUBAGENT_STEER_INBOX_ENV);
+    }
     cleared(&mut env, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV);
     env.insert(
         SUBAGENT_PARENT_ROOT_RUN_ID_ENV.into(),

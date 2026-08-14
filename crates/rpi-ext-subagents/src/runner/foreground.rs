@@ -45,19 +45,21 @@ const SHUTDOWN_TERM_TO_KILL_MS: u64 = 3000;
 const POST_EXIT_DRAIN_HARD_MS: u64 = 8000;
 
 /// Live children registry for the shutdown sweep. `kill_on_drop(true)` covers
-/// future-drop and process-exit; this covers `session_shutdown` events.
-type LiveChildEntry = (u32, Arc<tokio::sync::Mutex<Child>>);
+/// future-drop and process-exit; this covers `session_shutdown` events and the
+/// async `stop` action (FR-P1-04: stop is terminal, so the running child is
+/// signalled through the registry by run id).
+type LiveChildEntry = (u32, String, Arc<tokio::sync::Mutex<Child>>);
 static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChildEntry>> = Mutex::new(BTreeMap::new());
 static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
 
-fn register_child(child: Child) -> (u64, u32, Arc<tokio::sync::Mutex<Child>>) {
+fn register_child(child: Child, run_id: &str) -> (u64, u32, Arc<tokio::sync::Mutex<Child>>) {
     let id = NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed);
     let pid = child.id().unwrap_or(0);
     let shared = Arc::new(tokio::sync::Mutex::new(child));
     LIVE_CHILDREN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id, (pid, shared.clone()));
+        .insert(id, (pid, run_id.to_string(), shared.clone()));
     (id, pid, shared)
 }
 
@@ -66,6 +68,25 @@ fn unregister_child(id: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
+}
+
+/// Signal every live child spawned for `run_id` (async stop): SIGTERM now,
+/// SIGKILL after the shutdown grace. Signals are pid-direct (ladder style of
+/// `kill_all_children_for_shutdown`).
+pub fn request_stop_for_run(run_id: &str) {
+    let children: Vec<(u32, Arc<tokio::sync::Mutex<Child>>)> = {
+        LIVE_CHILDREN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, child_run, _)| child_run == run_id)
+            .map(|(pid, _, child)| (*pid, child.clone()))
+            .collect()
+    };
+    for (pid, _) in children {
+        signal_pid(pid, Signal::Term);
+        signal_pid(pid, Signal::Kill);
+    }
 }
 
 /// Kill every live child (SIGTERM → 3s → SIGKILL). Called from the
@@ -79,7 +100,7 @@ pub async fn kill_all_children_for_shutdown() {
             .cloned()
             .collect()
     };
-    for (pid, child) in children {
+    for (pid, _, child) in children {
         signal_pid(pid, Signal::Term);
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS)).await;
         signal_pid(pid, Signal::Kill);
@@ -138,6 +159,11 @@ pub struct ForegroundRunInput {
     pub thinking: Option<String>,
     pub run_id: String,
     pub timeout_ms: Option<u64>,
+    /// Child position within the run (0 for single delegation; the parallel
+    /// runner assigns each task its index — artifact naming
+    /// `{runId}_{agent}_{index}_*` and `RPI_SUBAGENT_CHILD_INDEX` derive from
+    /// it, executor 5929-5966).
+    pub child_index: u32,
     /// Effective cap the child's own nesting checks enforce.
     pub child_max_subagent_depth: u64,
     pub artifacts_dir: Option<PathBuf>,
@@ -146,6 +172,8 @@ pub struct ForegroundRunInput {
     pub parent_session_id: Option<String>,
     pub self_extension: Option<String>,
     pub fanout_authorized: bool,
+    /// Steer inbox for async children (FR-P1-04); None clears the env.
+    pub steer_inbox: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,7 +208,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     let artifact_paths = input
         .artifacts_dir
         .as_ref()
-        .map(|dir| artifacts::get_artifact_paths(dir, &input.run_id, &input.agent_name, Some(0)));
+        .map(|dir| {
+            artifacts::get_artifact_paths(dir, &input.run_id, &input.agent_name, Some(input.child_index))
+        });
     let mut attempted_models = Vec::new();
     if let Some(model) = &input.model {
         attempted_models.push(model.clone());
@@ -207,10 +237,11 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         prompt_file_stem: Some(input.agent_name.clone()),
         run_id: Some(input.run_id.clone()),
         child_agent_name: Some(input.agent_name.clone()),
-        child_index: Some(0),
+        child_index: Some(input.child_index as usize),
         parent_session_id: input.parent_session_id.clone(),
         fanout_authorized: input.fanout_authorized,
         self_extension: input.self_extension.clone(),
+        steer_inbox: input.steer_inbox.clone(),
     });
 
     let launch = match launch {
@@ -287,7 +318,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         );
     }
 
-    let (child_id, child_pid, child_handle) = register_child(child);
+    let (child_id, child_pid, child_handle) = register_child(child, &input.run_id);
     // Take the pipes under a short lock; the run must NOT hold the child lock
     // while streams are open (the wait below re-acquires it).
     let (stdout, stderr) = {
@@ -529,6 +560,57 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     result.attempted_models = attempted_models;
     result.session_file = input.session_file.clone();
     result
+}
+
+/// Model attempt loop (execution.ts `modelAttemptsLoop` 1569-1695, FR-P1-05):
+/// run the primary model, and on a *retryable provider failure* re-run the
+/// whole child with the next candidate from `build_model_candidates`. Timeouts
+/// and tool failures inside the child never advance the chain. Artifacts of
+/// the last attempt win (same paths per child), with `attemptedModels`
+/// carrying the full chain for meta.json.
+pub async fn run_foreground_with_fallback(
+    input: &ForegroundRunInput,
+    candidates: &[String],
+) -> ForegroundRunResult {
+    let Some(first) = candidates.first() else {
+        return run_foreground(input).await;
+    };
+    let mut attempted: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut result = run_attempt(input, first).await;
+    attempted.extend(result.attempted_models.iter().cloned());
+    for candidate in &candidates[1..] {
+        let advance = result.exit_code != 0
+            && !result.timed_out
+            && crate::launch::model::is_retryable_model_failure(result.error.as_deref());
+        if !advance {
+            break;
+        }
+        notes.push(crate::launch::model::format_model_attempt_note(
+            attempted.last().map(String::as_str).unwrap_or_default(),
+            result.error.as_deref(),
+            Some(result.exit_code),
+            Some(candidate),
+        ));
+        result = run_attempt(input, candidate).await;
+        attempted.extend(result.attempted_models.iter().cloned());
+    }
+    result.attempted_models = attempted;
+    if !notes.is_empty() {
+        // Attempt notes ride ahead of the final output (execution.ts 1590-1600).
+        let mut output = notes.join("\n");
+        output.push_str("\n\n");
+        output.push_str(&result.final_output);
+        result.final_output = output;
+    }
+    result
+}
+
+/// One child attempt under a specific model candidate.
+async fn run_attempt(input: &ForegroundRunInput, candidate: &str) -> ForegroundRunResult {
+    let mut attempt_input = input.clone();
+    attempt_input.model = Some(candidate.to_string());
+    run_foreground(&attempt_input).await
 }
 
 /// Persist artifacts for a finished run (`persistSingleResultMetadata` P0
