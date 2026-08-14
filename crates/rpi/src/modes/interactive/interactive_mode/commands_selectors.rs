@@ -3651,7 +3651,10 @@ mod tests {
         let ui = &mode.ui_state;
         assert_eq!(ui.ui.mode(), rpi_tui::tui::TuiMode::Regular);
 
-        apply_settings_change(ui, SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen));
+        apply_settings_change(
+            ui,
+            SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen),
+        );
         // Queue-only: no synchronous renderer access, no persistence yet.
         assert_eq!(
             ui.ui.mode(),
@@ -3692,7 +3695,10 @@ mod tests {
         let _handle = ui.ui.show_overlay(overlay, None);
         assert!(ui.ui.has_overlay_entries());
 
-        apply_settings_change(ui, SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen));
+        apply_settings_change(
+            ui,
+            SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen),
+        );
         ui.drain_events();
         assert_eq!(
             ui.ui.mode(),

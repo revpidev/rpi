@@ -2183,7 +2183,9 @@ impl InteractiveUi {
         {
             let mut container = lock(&self.editor_container);
             container.clear();
-            container.children.push(Box::new(SharedEntry(entry.clone())));
+            container
+                .children
+                .push(Box::new(SharedEntry(entry.clone())));
         }
         *lock(&self.active_selector) = Some(entry.clone());
         self.ui.set_focus(Some(entry));
@@ -5992,14 +5994,14 @@ mod tests {
             "container stays mounted"
         );
         let content = lock(&ui.editor_container).render(40).join("\n");
-        assert!(content.contains("selector"), "selector visible: {content:?}");
+        assert!(
+            content.contains("selector"),
+            "selector visible: {content:?}"
+        );
         assert!(lock(&ui.active_selector).is_some());
         // Focus moved to the selector entry.
         assert!(
-            std::sync::Arc::ptr_eq(
-                &ui.ui.get_focused_component().expect("focused"),
-                &selector
-            ),
+            std::sync::Arc::ptr_eq(&ui.ui.get_focused_component().expect("focused"), &selector),
             "selector focused"
         );
 
