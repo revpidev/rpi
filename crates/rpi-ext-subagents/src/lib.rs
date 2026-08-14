@@ -25,6 +25,7 @@ mod diagnostic;
 mod error;
 mod launch;
 mod p1;
+mod prompts;
 mod paths;
 mod runner;
 mod runtime;
@@ -349,6 +350,28 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             ) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // Bundled prompt templates register as commands (FR-P1-07).
+            for (name, body) in prompts::BUNDLED_PROMPTS {
+                let spec = prompts::parse_template(body);
+                let description = format!(
+                    "Prompt shortcut: {}",
+                    spec.description.as_deref().unwrap_or(name)
+                );
+                if let Err(error) =
+                    register("registerCommand", json!({ "name": name, "description": description }))
+                {
+                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                }
+            }
+            if let Err(error) = register(
+                "registerCommand",
+                json!({
+                    "name": "prompt-workflow",
+                    "description": "Run a subagent prompt template (/prompt-workflow <name> [args] [--fork|--fresh|--bg|--subagent <agent>])"
+                }),
+            ) {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
+            }
             for (name, description) in commands::command_definitions() {
                 if let Err(error) = register(
                     "registerCommand",
@@ -387,6 +410,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             }
             // Startup: stale async-run reconciliation (ADR-0019 crash branch)
             // + artifact cleanup (index.ts:371-372).
+            // Orchestration skill ships to the user skill dir (FR-P1-07;
+            // parent sessions only — children never resolve it).
+            prompts::install_orchestration_skill();
             runner::background::reconcile_stale_runs();
             artifacts::cleanup_all_artifact_dirs(config.cleanup_days_or_default());
         }
@@ -525,6 +551,11 @@ fn dispatch_message(message: &Value) -> Value {
             };
             let settings = config::read_settings_pair(&host.cwd());
             let config = config::load_config();
+            if let Some(outcome) =
+                prompts::handle_prompt_command(name, args, &host, &settings, &config, &state.runtime)
+            {
+                return outcome;
+            }
             commands::handle_command(name, args, &host, &settings, &config, &state.runtime)
         }
         Some("event") => {

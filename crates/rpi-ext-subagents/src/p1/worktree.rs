@@ -116,6 +116,7 @@ pub struct WorktreeInfo {
     pub agent_cwd: PathBuf,
     pub branch: String,
     pub index: usize,
+    #[allow(dead_code)]
     pub node_modules_linked: bool,
     pub synthetic_paths: Vec<String>,
 }
@@ -123,6 +124,7 @@ pub struct WorktreeInfo {
 /// `createSingleWorktree` (worktree.ts:380-435): create + node_modules link +
 /// setup hook, with rollback on setup failure (worktree remove --force +
 /// branch -D, best effort preserving the original error).
+#[allow(clippy::too_many_arguments)]
 pub fn create_worktree(
     toplevel: &Path,
     cwd_relative: &str,
@@ -141,10 +143,11 @@ pub fn create_worktree(
         "git worktree add",
     )
     .map_err(|message| {
-        message
-            .is_empty()
-            .then(|| format!("failed to create worktree {}", worktree_path.to_string_lossy()))
-            .unwrap_or(message)
+        if message.is_empty() {
+            format!("failed to create worktree {}", worktree_path.to_string_lossy())
+        } else {
+            message
+        }
     })?;
 
     let agent_cwd = if cwd_relative.is_empty() {
@@ -206,6 +209,7 @@ fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> bool {
 /// `runWorktreeSetupHook` (worktree.ts:336-379): stdin = the v1 payload,
 /// stdout = JSON object `{ syntheticPaths?: string[] }`; non-zero exit,
 /// malformed stdout, or timeout (default 30s) fail the setup.
+#[allow(clippy::too_many_arguments)]
 fn run_worktree_setup_hook(
     hook: &str,
     timeout_ms: u64,
@@ -315,6 +319,7 @@ fn remove_synthetic_paths(worktree: &WorktreeInfo) {
 
 /// Captured diff (`WorktreeDiff`).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WorktreeDiff {
     pub index: usize,
     pub agent: String,
