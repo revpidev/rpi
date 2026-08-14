@@ -509,6 +509,38 @@ pub async fn run_child_async(
         agent.max_subagent_depth,
     );
 
+    // Supervisor channel (FR-P1-10): per-child channel dir env + the
+    // intercomBridge tool/prompt application.
+    let bridge_mode = ctx
+        .config
+        .intercom_bridge
+        .as_ref()
+        .and_then(|bridge| bridge.get("mode"))
+        .and_then(Value::as_str)
+        .unwrap_or("always")
+        .to_string();
+    let mut child_tools = agent.tools.clone();
+    let mut bridge_prompt_source = system_prompt.clone();
+    crate::p1::supervisor::apply_intercom_bridge(
+        &bridge_mode,
+        Some(context.as_str()),
+        &mut child_tools,
+        &mut bridge_prompt_source,
+    );
+    let supervisor_channel = if bridge_prompt_source != system_prompt || child_tools != agent.tools {
+        let dir = crate::p1::supervisor::channel_dir(
+            &ctx.run_id,
+            &agent.name,
+            spec.child_index as usize,
+        );
+        crate::p1::supervisor::ensure_channel(&dir);
+        Some(dir)
+    } else {
+        None
+    };
+    let system_prompt = bridge_prompt_source;
+    let agent_tools = child_tools;
+
     // Fork task preamble (executor 4119-4122).
     let task_text = if context == ContextMode::Fork {
         session_fork::wrap_fork_task(&spec.task, None)
@@ -520,7 +552,7 @@ pub async fn run_child_async(
         agent_name: agent.name.clone(),
         agent_system_prompt: system_prompt,
         agent_system_prompt_mode: agent.system_prompt_mode,
-        agent_tools: agent.tools.clone(),
+        agent_tools: agent_tools.clone(),
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_inherit_project_context: agent.inherit_project_context,
@@ -548,6 +580,7 @@ pub async fn run_child_async(
         self_extension,
         fanout_authorized,
         steer_inbox: spec.steer_inbox.clone(),
+        supervisor_channel,
     };
 
     let mut result = foreground::run_foreground_with_fallback(&input, &candidates).await;

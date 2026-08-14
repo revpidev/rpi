@@ -174,6 +174,8 @@ pub struct ForegroundRunInput {
     pub fanout_authorized: bool,
     /// Steer inbox for async children (FR-P1-04); None clears the env.
     pub steer_inbox: Option<PathBuf>,
+    /// Supervisor channel dir (FR-P1-10); None clears the env.
+    pub supervisor_channel: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -242,6 +244,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         fanout_authorized: input.fanout_authorized,
         self_extension: input.self_extension.clone(),
         steer_inbox: input.steer_inbox.clone(),
+        supervisor_channel: input.supervisor_channel.clone(),
     });
 
     let launch = match launch {

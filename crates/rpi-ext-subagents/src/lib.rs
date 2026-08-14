@@ -306,6 +306,28 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             if let Err(error) = register("on", json!({ "event": "session_start" })) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // Supervisor client (FR-P1-10): children with a channel dir get
+            // contact_supervisor (native-supervisor-channel.ts L298).
+            // Registration is best-effort: a bare-file `--extension` injection
+            // carries no manifest → capabilities=[] → registerTool is denied;
+            // the child must survive that (packaged installs with the
+            // manifest register normally).
+            if crate::p1::supervisor::ChildSupervisorContext::from_env().is_some() {
+                if let Err(error) = register(
+                    "registerTool",
+                    json!({
+                        "name": "contact_supervisor",
+                        "label": "Contact supervisor",
+                        "description": "Contact the parent orchestrator session: need_decision (blocking clarification), interview_request (structured input), or progress_update (non-blocking note).",
+                        "parameters": crate::p1::supervisor::ChildSupervisorContext::tool_schema(),
+                    }),
+                ) {
+                    tracing::warn!(
+                        error = %error.to_string(),
+                        "contact_supervisor registration denied (bare-file extension load carries no capabilities); child continues without it"
+                    );
+                }
+            }
             // Steer inbox consumer (FR-P1-04, subagent-prompt-runtime.ts
             // registerSteeringInbox L333): when the parent launched this
             // child with a steer inbox, poll it and inject messages through
@@ -384,6 +406,26 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 if let Err(error) = register("on", json!({ "event": event })) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
+            }
+            // Parent-side supervisor tool (FR-P1-10).
+            if let Err(error) = register(
+                "registerTool",
+                json!({
+                    "name": "subagent_supervisor",
+                    "label": "Subagent supervisor",
+                    "description": "Handle child supervisor requests: {action: \"pending\"} lists requests from this session's children; {action: \"reply\", replyTo, message} answers one.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["pending", "reply"] },
+                            "replyTo": { "type": "string", "description": "Request id being answered (reply)." },
+                            "message": { "type": "string", "description": "The reply text." }
+                        },
+                        "required": ["action"]
+                    },
+                }),
+            ) {
+                return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
             // `subagent_wait` (FR-P1-04, wait-tool.ts): registered unless
             // disabled by config.waitTool / RPI_SUBAGENT_WAIT_TOOL_ENABLED.
@@ -530,6 +572,45 @@ fn dispatch_message(message: &Value) -> Value {
             }
             if tool_name == "subagent_wait" {
                 return execute_subagent_wait(&params, state);
+            }
+            if tool_name == "contact_supervisor" {
+                if let Some(context) = crate::p1::supervisor::ChildSupervisorContext::from_env() {
+                    return context.execute(&params);
+                }
+                return json!({
+                    "content": [{ "type": "text", "text":
+                        "contact_supervisor is unavailable: no supervisor channel was configured for this session."
+                    }],
+                    "isError": true,
+                });
+            }
+            if tool_name == "subagent_supervisor" {
+                let orchestrator_session_id = std::env::var(
+                    launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
+                )
+                .unwrap_or_default();
+                // The parent's own session id comes from its newest session
+                // file (TE-D16 derivation), falling back to the env.
+                let session_id = if orchestrator_session_id.is_empty() {
+                    HostCallsContext {
+                        calls: &state.calls,
+                        cookie: state.cookie,
+                    }
+                    .parent_session_file(&config::read_settings_pair(
+                        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    ))
+                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                    .unwrap_or_default()
+                } else {
+                    orchestrator_session_id
+                };
+                return crate::p1::supervisor::parent_supervisor_action(
+                    params.get("action").and_then(Value::as_str).unwrap_or(""),
+                    params.get("replyTo").and_then(Value::as_str),
+                    params.get("message").and_then(Value::as_str),
+                    &session_id,
+                    &crate::p1::supervisor::channels_root(),
+                );
             }
             let host = HostCallsContext {
                 calls: &state.calls,
@@ -754,6 +835,8 @@ pub mod parity {
         pub self_extension: Option<String>,
         /// Steer inbox dir (FR-P1-04); None clears the env.
         pub steer_inbox: Option<PathBuf>,
+        /// Supervisor channel dir (FR-P1-10); None clears the env.
+        pub supervisor_channel: Option<PathBuf>,
     }
 
     pub struct BuildArgsResultPublic {
@@ -793,6 +876,7 @@ pub mod parity {
             fanout_authorized: input.fanout_authorized,
             self_extension: input.self_extension.clone(),
             steer_inbox: input.steer_inbox.clone(),
+            supervisor_channel: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
         Ok(BuildArgsResultPublic {

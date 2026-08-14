@@ -5,4 +5,5 @@ pub mod acceptance;
 pub mod chain;
 pub mod launch_child;
 pub mod parallel;
+pub mod supervisor;
 pub mod worktree;

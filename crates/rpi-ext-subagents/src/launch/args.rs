@@ -153,6 +153,9 @@ pub struct BuildArgsInput {
     /// Steer inbox dir for this child (FR-P1-04 steer); `None` clears the
     /// env (foreground runs have no live steer channel through the plugin).
     pub steer_inbox: Option<PathBuf>,
+    /// Supervisor channel dir (FR-P1-10): activates the child-side
+    /// `contact_supervisor` tool; `None` clears the env.
+    pub supervisor_channel: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -507,6 +510,14 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         );
     } else {
         cleared(&mut env, SUBAGENT_STEER_INBOX_ENV);
+    }
+    if let Some(channel) = &input.supervisor_channel {
+        env.insert(
+            crate::p1::supervisor::SUPERVISOR_CHANNEL_DIR_ENV.to_string(),
+            Some(channel.to_string_lossy().to_string()),
+        );
+    } else {
+        cleared(&mut env, crate::p1::supervisor::SUPERVISOR_CHANNEL_DIR_ENV);
     }
     cleared(&mut env, SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV);
     env.insert(
