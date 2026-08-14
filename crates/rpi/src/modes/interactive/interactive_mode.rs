@@ -642,6 +642,61 @@ impl<T: Component + Focusable> Focusable for FocusableRegion<T> {
     }
 }
 
+/// Container child that delegates to a type-erased [`SharedComponent`]
+/// (interactive-mode.ts `editorContainer` content-swap pattern): the entry
+/// stays addressable as a `SharedComponent` — focus target identity for
+/// `set_focus` — while rendering as container content. Upstream mounts the
+/// editor/selector objects directly in `editorContainer`; the port needs
+/// this delegating wrapper because `Container.children` are boxed values.
+///
+/// Used by the editor container: selectors swap in for the editor by
+/// replacing the container CONTENT (visible in both regular and fullscreen
+/// mode, since the container itself stays mounted in the children list and
+/// the fullscreen dock), instead of swapping top-level TUI children (which
+/// fullscreen never renders — the layout root replaces them).
+struct SharedEntry(SharedComponent);
+
+impl Component for SharedEntry {
+    fn render(&self, width: usize) -> Vec<String> {
+        lock(&self.0).render(width)
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        lock(&self.0).handle_input(data);
+    }
+
+    fn invalidate(&mut self) {
+        lock(&self.0).invalidate();
+    }
+
+    fn set_expanded(&mut self, expanded: bool) {
+        lock(&self.0).set_expanded(expanded);
+    }
+
+    fn as_focusable(&self) -> Option<&dyn Focusable> {
+        Some(self)
+    }
+
+    fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> {
+        Some(self)
+    }
+}
+
+impl Focusable for SharedEntry {
+    fn focused(&self) -> bool {
+        lock(&self.0)
+            .as_focusable()
+            .map(|f| f.focused())
+            .unwrap_or(false)
+    }
+
+    fn set_focused(&mut self, focused: bool) {
+        if let Some(f) = lock(&self.0).as_focusable_mut() {
+            f.set_focused(focused);
+        }
+    }
+}
+
 /// The address of a boxed child inside a container — used for removal by
 /// identity (mirrors `Container::remove_child`'s pointer comparison). Stored
 /// as `usize` and never dereferenced; valid because the box stays owned by
@@ -963,9 +1018,21 @@ pub(crate) struct InteractiveUi {
     /// (`git_branch_watcher.rs` reads `cwd` / writes `git_branch`).
     pub(crate) footer_data: Arc<FooterDataProvider>,
 
-    /// The editor's tree entry (T12-S5a `showSelector` swaps this child in
-    /// the TUI's child list for the active selector, preserving position).
+    /// The editor's focus identity (T12-S5a): the mounted tree entry is
+    /// [`Self::editor_container_entry`]; this handle is the focus target and
+    /// the container's idle content.
     editor_region: SharedComponent,
+    /// `editorContainer` (interactive-mode.ts:403, 568-569): the permanently
+    /// mounted container whose CONTENT is swapped between the editor region
+    /// and the active selector. Selectors must swap container content, not
+    /// top-level TUI children: in fullscreen mode the layout root replaces
+    /// the children for rendering, so a child-level swap mounts the selector
+    /// invisibly while it holds focus — the "hot-switch into fullscreen /
+    /// /settings eats all input" bug.
+    editor_container: Arc<Mutex<Container>>,
+    /// The mounted tree entry wrapping [`Self::editor_container`], added to
+    /// the TUI children and the fullscreen dock.
+    editor_container_entry: SharedComponent,
     /// Header/footer tree entries (stored at init) + the active extension
     /// overrides (T15 W4 `setHeader`/`setFooter` region swaps).
     header_region: Mutex<Option<SharedComponent>>,
@@ -2096,26 +2163,45 @@ impl InteractiveUi {
         address
     }
 
-    /// `showSelector` (interactive-mode.ts:4122-4133): swap the editor in
-    /// the TUI child list for a selector entry, preserving its position.
+    /// `showSelector` (interactive-mode.ts:4122-4133): swap the selector in
+    /// as the editor CONTAINER's content (upstream `editorContainer.clear();
+    /// editorContainer.addChild(selector)`). The container itself stays
+    /// mounted in the TUI children and the fullscreen dock, so the selector
+    /// is visible in both modes — swapping top-level TUI children would
+    /// mount it invisibly in fullscreen (the layout root replaces the
+    /// children, tui-alt-screen.ts:205) while it holds focus, eating all
+    /// input.
+    ///
     /// Re-entrant shows (e.g. settings → theme submenu) hide the previous
     /// selector first. May be called from inside a component dispatch (e.g.
-    /// a keybinding or a selector's own cancel), so the swap must go through
-    /// `Tui::swap_child` — a `child_position` read would fail on the held
-    /// inner lock and the fallback would append after the footer.
+    /// a keybinding or a selector's own cancel): the dispatch holds the TUI
+    /// inner lock and the focused component's lock, not the editor
+    /// container's, so the content swap is safe; `set_focus`/
+    /// `request_render` go through the renderer's re-entrancy queue.
     pub(crate) fn show_selector(&self, entry: SharedComponent) {
         self.hide_selector();
-        self.ui.swap_child(&self.editor_region, &entry);
+        {
+            let mut container = lock(&self.editor_container);
+            container.clear();
+            container.children.push(Box::new(SharedEntry(entry.clone())));
+        }
         *lock(&self.active_selector) = Some(entry.clone());
         self.ui.set_focus(Some(entry));
         self.ui.request_render(false);
     }
 
     /// The `done()` callback (interactive-mode.ts:4123-4127): restore the
-    /// editor at the selector's former position.
+    /// editor into the container (upstream `editorContainer.clear();
+    /// editorContainer.addChild(editor)`).
     pub(crate) fn hide_selector(&self) {
-        if let Some(selector) = lock(&self.active_selector).take() {
-            self.ui.swap_child(&selector, &self.editor_region);
+        if lock(&self.active_selector).take().is_some() {
+            {
+                let mut container = lock(&self.editor_container);
+                container.clear();
+                container
+                    .children
+                    .push(Box::new(SharedEntry(self.editor_region.clone())));
+            }
             self.ui.set_focus(Some(self.editor_region.clone()));
             self.ui.request_render(false);
         }
@@ -3639,10 +3725,17 @@ impl InteractiveMode {
         let (flush_tx, flush_rx) = watch::channel(0u64);
         let (input_tx, input_rx) = unbounded_channel();
 
-        // The editor region is the TUI-visible entry; the mode keeps the
-        // shared handle for drain-side mutations.
+        // The editor region is the focus identity; it lives inside the
+        // permanently mounted editor container (interactive-mode.ts:568-569
+        // `editorContainer`) so selectors can swap container content.
         let editor_region =
             shared_component_from_boxed(Box::new(CustomEditorRegion::new(editor.clone())));
+        let editor_container = Arc::new(Mutex::new(Container::new()));
+        lock(&editor_container)
+            .children
+            .push(Box::new(SharedEntry(editor_region.clone())));
+        let editor_container_entry =
+            shared_component_from_boxed(Box::new(SharedChild(editor_container.clone())));
 
         let ui_state = Arc::new(InteractiveUi {
             ui: ui.clone(),
@@ -3662,6 +3755,8 @@ impl InteractiveMode {
             footer,
             footer_data,
             editor_region: editor_region.clone(),
+            editor_container: editor_container.clone(),
+            editor_container_entry: editor_container_entry.clone(),
             header_region: Mutex::new(None),
             footer_region: Mutex::new(None),
             custom_header: Mutex::new(None),
@@ -3869,7 +3964,10 @@ impl InteractiveMode {
         self.ui.add_child(pending_messages_region.clone());
         self.ui.add_child(status_region.clone());
         self.ui.add_child(widgets_above_region.clone());
-        self.ui.add_child(self.editor_region.clone());
+        // The editor container (not the editor region itself) is the mounted
+        // child: selectors swap the container's content, so they stay
+        // visible when the fullscreen layout root replaces the children.
+        self.ui.add_child(ui_state.editor_container_entry.clone());
         self.ui.add_child(widgets_below_region.clone());
         self.ui.add_child(footer_region.clone());
         self.ui.set_focus(Some(self.editor_region.clone()));
@@ -3930,7 +4028,7 @@ impl InteractiveMode {
                         },
                     ),
                     rpi_tui::components::stack::StackChild::Entry(
-                        self.editor_region.clone(),
+                        ui_state.editor_container_entry.clone(),
                         rpi_tui::components::stack::StackEntryOptions {
                             shrink: Some(1.0),
                             min_size: Some(3.0),
@@ -5861,14 +5959,23 @@ mod tests {
     // ---------------------------------------------------------------------
 
     #[tokio::test]
-    async fn show_selector_swaps_editor_and_hide_restores_position() {
+    async fn show_selector_swaps_editor_container_content_and_hide_restores() {
         let (mut mode, _terminal, _session) = mode_harness().await;
         mode.init().await;
         let ui = &mode.ui_state;
-        let editor_position = ui
-            .ui
-            .child_position(&mode.editor_region)
-            .expect("editor mounted");
+
+        // The editor container (not the editor region) is the mounted TUI
+        // child, holding the editor as its initial content
+        // (interactive-mode.ts:568-569 editorContainer).
+        assert!(
+            ui.ui.child_position(&ui.editor_container_entry).is_some(),
+            "editor container mounted"
+        );
+        assert!(
+            ui.ui.child_position(&mode.editor_region).is_none(),
+            "editor region is container content, not a TUI child"
+        );
+        assert_eq!(lock(&ui.editor_container).children.len(), 1);
 
         // A placeholder selector entry (a Text region stands in for a real
         // selector component).
@@ -5877,21 +5984,31 @@ mod tests {
         )))));
         ui.show_selector(selector.clone());
 
-        assert_eq!(
-            ui.ui.child_position(&selector),
-            Some(editor_position),
-            "selector replaces the editor at its position"
+        // The container content swaps to the selector; the mounted child is
+        // unchanged, so the selector is visible in both regular and
+        // fullscreen mode (the fullscreen layout root replaces children).
+        assert!(
+            ui.ui.child_position(&ui.editor_container_entry).is_some(),
+            "container stays mounted"
         );
-        assert!(ui.ui.child_position(&mode.editor_region).is_none());
+        let content = lock(&ui.editor_container).render(40).join("\n");
+        assert!(content.contains("selector"), "selector visible: {content:?}");
         assert!(lock(&ui.active_selector).is_some());
+        // Focus moved to the selector entry.
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &ui.ui.get_focused_component().expect("focused"),
+                &selector
+            ),
+            "selector focused"
+        );
 
         ui.hide_selector();
-        assert_eq!(
-            ui.ui.child_position(&mode.editor_region),
-            Some(editor_position),
-            "editor restored at the selector's position"
+        let content = lock(&ui.editor_container).render(40).join("\n");
+        assert!(
+            !content.contains("selector"),
+            "editor restored as container content"
         );
-        assert!(ui.ui.child_position(&selector).is_none());
         assert!(lock(&ui.active_selector).is_none());
         // Focus is back on the editor.
         let focused = lock(&mode.editor_region)
@@ -5918,27 +6035,23 @@ mod tests {
 
         InteractiveUi::show_tree_selector(&Arc::clone(&mode.ui_state), None);
         assert!(lock(&ui.active_selector).is_some(), "tree selector mounted");
-        assert!(ui.ui.child_position(&mode.editor_region).is_none());
 
         // Escape through the TUI dispatch closes the selector and restores
         // the editor (upstream `tui.select.cancel`). The cancel runs while
         // the TUI inner lock is held by `tick`, so this also covers the
-        // mid-dispatch swap path (`Tui::swap_child`).
-        let editor_position = ui
-            .ui
-            .child_position(&lock(&ui.active_selector).clone().expect("selector"))
-            .expect("selector mounted");
+        // mid-dispatch container-content swap path.
         terminal.feed("\u{1b}");
         ui.ui.tick(std::time::Instant::now());
         assert!(
             lock(&ui.active_selector).is_none(),
             "escape closed the selector"
         );
-        assert_eq!(
-            ui.ui.child_position(&mode.editor_region),
-            Some(editor_position),
-            "editor restored at the selector's position"
-        );
+        // The editor is the container's content again and holds focus.
+        let focused = lock(&mode.editor_region)
+            .as_focusable()
+            .expect("focusable editor region")
+            .focused();
+        assert!(focused, "editor focused after the selector closed");
     }
 
     #[tokio::test]
@@ -6723,6 +6836,68 @@ mod tests {
         terminal.feed("\r");
         ui.ui.tick(std::time::Instant::now());
         assert_eq!(lock(&ui.editor).get_text(), "", "submit clears editor");
+    }
+
+    /// Regression: after a hot switch to fullscreen, keyboard input must
+    /// still reach the editor (post-switch input loss; PTY-verified against
+    /// the real terminal path).
+    #[tokio::test]
+    async fn switch_tui_mode_to_fullscreen_input_reaches_editor() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        terminal.feed("abc");
+        ui.ui.tick(std::time::Instant::now());
+        assert_eq!(lock(&ui.editor).get_text(), "abc", "regular input works");
+
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen, "switched");
+
+        terminal.feed("x");
+        ui.ui.tick(std::time::Instant::now());
+        assert_eq!(
+            lock(&ui.editor).get_text(),
+            "abcx",
+            "fullscreen input works after hot switch"
+        );
+        mode.shutdown().await;
+    }
+
+    /// Regression: the real /settings flow — switch with the selector
+    /// mounted, then close it and type. Covers the editor-container content
+    /// swap keeping the selector visible and focusable across the switch.
+    #[tokio::test]
+    async fn switch_tui_mode_with_settings_selector_mounted() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        // /settings opens: selector swaps in for the editor region + focus.
+        InteractiveUi::show_settings_selector(ui);
+        let focused = ui.ui.get_focused_component();
+        assert!(focused.is_some(), "selector focused");
+
+        // Change tui-mode through the deferred drain path.
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen, "switched");
+
+        // Selector still receives input (e.g. j/k navigation does not panic).
+        terminal.feed("j");
+        ui.ui.tick(std::time::Instant::now());
+
+        // Close the selector (Esc → on_cancel → hide_selector).
+        ui.hide_selector();
+        terminal.feed("x");
+        ui.ui.tick(std::time::Instant::now());
+        assert_eq!(
+            lock(&ui.editor).get_text(),
+            "x",
+            "editor receives input after selector closes post-switch"
+        );
+        mode.shutdown().await;
     }
 
     /// /tree three branches (T12 self-check list): user → leaf=parent + text fill-back

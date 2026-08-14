@@ -35,9 +35,11 @@
 //! - Raw mode: the previous state is captured with crossterm's
 //!   `is_raw_mode_enabled()` (upstream `process.stdin.isRaw || false`).
 //!   `process.stdin.pause()` in `stop()` (terminal.ts:446) has no Rust
-//!   equivalent: the reader thread stays blocked in `read()` after `stop()`
-//!   until the next input byte arrives, at which point its channel send
-//!   fails and the thread exits.
+//!   equivalent: the stdin reader thread is spawned once and lives for the
+//!   process; `stop()` clears its live sender slot so bytes read while
+//!   stopped are discarded. Respawning the reader per `start()` would leave
+//!   the previous thread blocked in `read()`, where it would swallow the
+//!   first keystroke after a renderer hot-swap (T32 follow-up fix).
 //! - Windows `ENABLE_VIRTUAL_TERMINAL_INPUT`: upstream loads a native Node
 //!   helper (`win32-console-mode.node`, terminal.ts:338-366); crossterm's
 //!   raw mode does not set this flag and no native helper is bundled, so on
@@ -71,6 +73,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::keys::set_kitty_protocol_active;
@@ -377,6 +380,14 @@ pub struct ProcessTerminal<W: Write = io::Stdout> {
     progress_keepalive_deadline: Option<Instant>,
     event_tx: Option<mpsc::Sender<TerminalEvent>>,
     event_rx: Option<TerminalEventSource>,
+    /// Live sender slot shared with the persistent stdin reader thread.
+    /// `start()` installs the current channel's sender, `stop()` clears it.
+    /// The reader is spawned once and lives for the process: respawning it
+    /// per `start()` would leave the previous thread blocked in `read()`,
+    /// where it would consume (and discard) the first keystroke after a
+    /// renderer hot-swap before noticing its stale channel.
+    stdin_slot: Arc<Mutex<Option<mpsc::Sender<TerminalEvent>>>>,
+    stdin_reader_started: bool,
     resize_task: Option<tokio::task::JoinHandle<()>>,
     /// Terminal size query; injectable so tests can simulate "not a tty"
     /// (upstream tests monkey-patch `process.stdout.columns/rows`).
@@ -415,6 +426,8 @@ impl<W: Write> ProcessTerminal<W> {
             progress_keepalive_deadline: None,
             event_tx: None,
             event_rx: None,
+            stdin_slot: Arc::new(Mutex::new(None)),
+            stdin_reader_started: false,
             resize_task: None,
             query_size: crossterm::terminal::size,
         }
@@ -452,12 +465,21 @@ impl<W: Write> ProcessTerminal<W> {
     }
 
     /// Blocking stdin reader thread: raw bytes → incremental UTF-8 decode →
-    /// channel (upstream `process.stdin` `data` events after
+    /// the live sender slot (upstream `process.stdin` `data` events after
     /// `setEncoding("utf8")` + `resume()`).
+    ///
+    /// Spawned once on the first `start()` and kept for the process
+    /// lifetime. Bytes read while the slot is empty (terminal stopped) or
+    /// whose send fails (stale receiver) are discarded — the reader never
+    /// exits just because the terminal was stopped, so a later `start()`
+    /// (renderer hot-swap) does not leave a zombie thread racing the live
+    /// one for stdin.
     fn spawn_stdin_reader(&mut self) {
-        let Some(tx) = self.event_tx.clone() else {
+        if self.stdin_reader_started {
             return;
-        };
+        }
+        self.stdin_reader_started = true;
+        let slot = Arc::clone(&self.stdin_slot);
         let spawned = std::thread::Builder::new()
             .name("rpi-tui-stdin".to_string())
             .spawn(move || {
@@ -471,8 +493,13 @@ impl<W: Write> ProcessTerminal<W> {
                             pending.extend_from_slice(&buf[..n]);
                             let (text, rest) = decode_utf8_incremental(&pending);
                             pending = rest;
-                            if !text.is_empty() && tx.send(TerminalEvent::Input(text)).is_err() {
-                                break;
+                            if !text.is_empty() {
+                                let tx = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                if let Some(tx) = tx {
+                                    // A send failure means the receiver was
+                                    // dropped by `stop()`; discard the bytes.
+                                    let _ = tx.send(TerminalEvent::Input(text));
+                                }
                             }
                         }
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -480,8 +507,8 @@ impl<W: Write> ProcessTerminal<W> {
                     }
                 }
             });
-        // Detach: the thread exits on EOF, on read error, or when its next
-        // channel send fails after `stop()` dropped the receiver.
+        // Detach: the thread exits on EOF or read error, and idles (bytes
+        // discarded) while the terminal is stopped.
         drop(spawned);
     }
 
@@ -726,6 +753,9 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
         let (tx, rx) = mpsc::channel();
         self.event_tx = Some(tx);
         self.event_rx = Some(TerminalEventSource::new(rx));
+        // Publish the new sender to the persistent stdin reader (spawned
+        // once below); input read before this point is discarded.
+        *self.stdin_slot.lock().unwrap_or_else(|e| e.into_inner()) = self.event_tx.clone();
 
         // Resize handler wiring (upstream `process.stdout.on("resize")`).
         self.spawn_resize_forwarder();
@@ -769,7 +799,11 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
             buffer.destroy();
         }
 
-        // Remove event handlers / event sources.
+        // Remove event handlers / event sources. The stdin reader slot is
+        // cleared FIRST so the persistent reader discards bytes from here
+        // on; its in-flight send to the old channel may fail, which it
+        // treats as discard.
+        *self.stdin_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.input_handler = None;
         self.resize_handler = None;
         if let Some(task) = self.resize_task.take() {
@@ -780,9 +814,8 @@ impl<W: Write + Send> Terminal for ProcessTerminal<W> {
 
         // Upstream pauses stdin to prevent buffered input (e.g. Ctrl+D) from
         // being re-interpreted after raw mode is disabled (terminal.ts:443-446).
-        // No Rust equivalent: the reader thread stays blocked in `read()`
-        // until the next input byte arrives, then exits because its channel
-        // send fails (see header note).
+        // The persistent reader's cleared slot approximates this: bytes read
+        // while stopped are discarded instead of buffered.
 
         // Restore raw mode state.
         if self.started {
