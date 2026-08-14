@@ -328,6 +328,22 @@ impl Drop for WasmGuest {
     }
 }
 
+/// In-flight tool `on_update` callbacks (ADR-0015): an extension tool's
+/// execute closure stashes `toolCallId → on_update` here for the duration of
+/// its `toolExecute` dispatch, so `toolUpdate` host calls (guest → host,
+/// re-entrant during the dispatch) reach the agent's partial-result sink.
+/// The entry is removed when the dispatch returns — updates arriving after
+/// that are dropped (upstream settle semantics, agent-loop.ts:1301-1302).
+/// `std::sync::Mutex`: callbacks are invoked OUTSIDE the lock (cloned `Arc`).
+pub(crate) type PendingToolUpdates = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<dyn Fn(rpi_agent::types::AgentToolResult) + Send + Sync>,
+        >,
+    >,
+>;
+
 /// State shared with the `rpi_host_call` import closure.
 pub struct HostState {
     pub api: ExtensionApi,
@@ -338,6 +354,10 @@ pub struct HostState {
     /// rejected outside one (upstream documents the deadlock hazard; here
     /// the check enforces the boundary).
     pub in_command: std::cell::Cell<bool>,
+    /// Per-extension in-flight `on_update` sinks (ADR-0015). Lives on the
+    /// guest Store (wasm) / plugin call context (native) — shared by the
+    /// execute closures this extension registers.
+    pub tool_updates: PendingToolUpdates,
 }
 
 /// The `rpi_host_call` response envelopes.
@@ -415,6 +435,7 @@ pub async fn instantiate_and_init(
                 async_handle,
                 forward,
                 in_command: std::cell::Cell::new(false),
+                tool_updates: PendingToolUpdates::default(),
             },
         );
         let mut linker = wasmtime::Linker::new(store.engine());

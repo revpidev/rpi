@@ -199,6 +199,20 @@ impl<V> InsertionMap<V> {
         self.entries.len()
     }
 
+    /// `Map.delete` — remove the key; returns whether it was present.
+    /// Rebuilds the index (registration maps are small and removals rare).
+    pub fn remove(&mut self, key: &str) -> bool {
+        if !self.index.contains_key(key) {
+            return false;
+        }
+        self.entries.retain(|(k, _)| k != key);
+        self.index.clear();
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            self.index.insert(k.clone(), i);
+        }
+        true
+    }
+
     /// `Map.values()` — insertion order.
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.iter().map(|(_, v)| v)
@@ -1512,6 +1526,10 @@ impl LoadedExtension {
         write(&self.tools).set(tool.definition.name.clone(), tool);
     }
 
+    pub(crate) fn remove_tool(&self, name: &str) -> bool {
+        write(&self.tools).remove(name)
+    }
+
     pub fn tools(&self) -> InsertionMap<RegisteredTool> {
         read(&self.tools).clone()
     }
@@ -1664,6 +1682,26 @@ impl ExtensionApi {
             actions.refresh_tools();
         }
         Ok(())
+    }
+
+    /// `pi.unregisterTool(name)` (ADR-0015, additive ABI v1 method): removes
+    /// this extension's own registry entry; returns whether one was removed.
+    /// Post-bind the removal triggers `refreshTools` (mirroring
+    /// `registerTool`), which rebuilds the session tool registry and drops
+    /// the name from the active set (agent-session.ts:926-941 silently skips
+    /// names missing from the registry). Another extension's same-named
+    /// registration survives and stays active. Unknown names (including
+    /// built-ins and repeat calls) return `false` without error.
+    pub fn unregister_tool(&self, name: &str) -> Result<bool, ExtError> {
+        self.runtime.assert_active()?;
+        let removed = self.extension.remove_tool(name);
+        if removed {
+            // refreshTools is a no-op pre-bind (loader.ts:191-192).
+            if let Some(actions) = self.runtime.actions() {
+                actions.refresh_tools();
+            }
+        }
+        Ok(removed)
     }
 
     /// `pi.registerCommand(name, options)` (loader.ts:254-261).

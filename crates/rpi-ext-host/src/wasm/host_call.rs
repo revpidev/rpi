@@ -42,10 +42,11 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
     use CapabilityRequirement::{Free, Requires, UnknownMethod};
     match method {
         "on" | "getFlag" => Free,
-        "registerTool" => Requires(Capability::Tools),
-        "registerCommand" | "registerShortcut" | "registerFlag" => {
-            Requires(Capability::Commands)
-        }
+        // ADR-0015 additions: unregisterTool (registry removal) and
+        // toolUpdate (partial-result report) belong to the same capability
+        // as registerTool — they write/affect only this extension's tools.
+        "registerTool" | "unregisterTool" | "toolUpdate" => Requires(Capability::Tools),
+        "registerCommand" | "registerShortcut" | "registerFlag" => Requires(Capability::Commands),
         "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
             Requires(Capability::Ui)
         }
@@ -58,16 +59,39 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         // additions (ctx.scopedModels / ctx.modelRegistry.* /
         // ctx.setRuntimeApiKey / ctx.removeRuntimeApiKey /
         // ctx.getSystemPromptSource / ctx.getAppendSystemPromptSources).
-        "sendMessage" | "sendUserMessage" | "appendEntry" | "setSessionName"
-        | "getSessionName" | "setLabel" | "getActiveTools" | "getAllTools"
-        | "setActiveTools" | "getCommands" | "setModel" | "getThinkingLevel"
-        | "setThinkingLevel" | "ctx.isIdle" | "ctx.isProjectTrusted"
-        | "ctx.hasPendingMessages" | "ctx.getContextUsage" | "ctx.getSystemPrompt"
-        | "ctx.model" | "ctx.cwd" | "ctx.mode" | "ctx.hasUI" | "ctx.abort"
-        | "ctx.shutdown" | "ctx.compact" | "ctx.scopedModels" | "ctx.getSystemPromptSource"
-        | "ctx.getAppendSystemPromptSources" | "ctx.modelRegistry.complete"
-        | "ctx.modelRegistry.find" | "ctx.modelRegistry.hasConfiguredAuth"
-        | "ctx.modelRegistry.getApiKeyAndHeaders" | "ctx.setRuntimeApiKey"
+        "sendMessage"
+        | "sendUserMessage"
+        | "appendEntry"
+        | "setSessionName"
+        | "getSessionName"
+        | "setLabel"
+        | "getActiveTools"
+        | "getAllTools"
+        | "setActiveTools"
+        | "getCommands"
+        | "setModel"
+        | "getThinkingLevel"
+        | "setThinkingLevel"
+        | "ctx.isIdle"
+        | "ctx.isProjectTrusted"
+        | "ctx.hasPendingMessages"
+        | "ctx.getContextUsage"
+        | "ctx.getSystemPrompt"
+        | "ctx.model"
+        | "ctx.cwd"
+        | "ctx.mode"
+        | "ctx.hasUI"
+        | "ctx.abort"
+        | "ctx.shutdown"
+        | "ctx.compact"
+        | "ctx.scopedModels"
+        | "ctx.getSystemPromptSource"
+        | "ctx.getAppendSystemPromptSources"
+        | "ctx.modelRegistry.complete"
+        | "ctx.modelRegistry.find"
+        | "ctx.modelRegistry.hasConfiguredAuth"
+        | "ctx.modelRegistry.getApiKeyAndHeaders"
+        | "ctx.setRuntimeApiKey"
         | "ctx.removeRuntimeApiKey" => Requires(Capability::Session),
         _ => UnknownMethod,
     }
@@ -144,6 +168,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .to_owned();
             let forward_exec = state.forward.clone();
             let tool_name = name.clone();
+            let execute_updates = state.tool_updates.clone();
             let render_call = state.forward.clone();
             let render_result = state.forward.clone();
             let has_render_call = definition
@@ -181,18 +206,39 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     execute: Arc::new(move |request, _ctx| {
                         let forward = forward_exec.clone();
                         let tool_name = tool_name.clone();
+                        let tool_updates = execute_updates.clone();
                         Box::pin(async move {
+                            let tool_call_id = request.tool_call_id.clone();
+                            // ADR-0015: stash the agent's on_update sink so
+                            // `toolUpdate` host calls made by the guest/plugin
+                            // during this dispatch stream partial results back.
+                            // The entry is removed on return — late updates are
+                            // dropped (upstream settle semantics).
+                            if let Some(on_update) = request.on_update {
+                                let sink: Arc<
+                                    dyn Fn(rpi_agent::types::AgentToolResult) + Send + Sync,
+                                > = on_update.into();
+                                tool_updates
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(tool_call_id.clone(), sink);
+                            }
                             let result = forward
                                 .dispatch(
                                     json!({
                                         "kind": "toolExecute",
                                         "toolName": tool_name,
-                                        "toolCallId": request.tool_call_id,
+                                        "toolCallId": tool_call_id,
                                         "params": request.params,
                                     }),
                                     false,
                                 )
-                                .await?;
+                                .await;
+                            tool_updates
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&tool_call_id);
+                            let result = result?;
                             serde_json::from_value(result)
                                 .map_err(|e| format!("tool result JSON: {e}"))
                         })
@@ -236,6 +282,61 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     name,
                 })
                 .map_err(|e| ("stale", e.to_string()))?;
+            Ok(Value::Null)
+        }
+
+        // ADR-0015: `unregisterTool(name)` — removes this extension's own
+        // registry entry (returns bool); post-bind the session refreshes and
+        // the tool leaves the active set. Unknown names → false, no error.
+        "unregisterTool" => {
+            let name = str_arg(&args, "name")
+                .ok_or_else(|| ("invalidRequest", "unregisterTool: missing name".to_owned()))?;
+            let removed = state
+                .api
+                .unregister_tool(name)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(json!(removed))
+        }
+
+        // ADR-0015: `toolUpdate(toolCallId, update)` — guest/plugin reports a
+        // partial `AgentToolResult` for its in-flight toolExecute. The sink
+        // lives in the per-extension pending table for the dispatch duration;
+        // unknown/stale ids are dropped (upstream ignores post-execute
+        // updates), still answering ok so the guest need not track lifetimes.
+        "toolUpdate" => {
+            let tool_call_id = str_arg(&args, "toolCallId").ok_or_else(|| {
+                (
+                    "invalidRequest",
+                    "toolUpdate: missing toolCallId".to_owned(),
+                )
+            })?;
+            let update = args
+                .get("update")
+                .cloned()
+                .ok_or_else(|| ("invalidRequest", "toolUpdate: missing update".to_owned()))?;
+            let update: rpi_agent::types::AgentToolResult = serde_json::from_value(update)
+                .map_err(|e| {
+                    (
+                        "invalidRequest",
+                        format!("toolUpdate: malformed update: {e}"),
+                    )
+                })?;
+            let sink = state
+                .tool_updates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(tool_call_id)
+                .cloned();
+            match sink {
+                // Invoke outside the lock (coding-standards §6.5).
+                Some(sink) => sink(update),
+                None => {
+                    tracing::debug!(
+                        tool_call_id,
+                        "toolUpdate dropped: no in-flight execution for this id"
+                    );
+                }
+            }
             Ok(Value::Null)
         }
 

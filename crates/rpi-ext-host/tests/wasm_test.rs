@@ -597,3 +597,252 @@ async fn t271_markdown_transformer_non_string_return_preserves_content() {
         "non-string return must preserve original markdown (was clearing to empty string)"
     );
 }
+
+// ============================================================================
+// TE01 / ADR-0015: unregisterTool + toolUpdate (additive ABI v1 methods)
+// ============================================================================
+
+/// Unregister-cycle guest: registers `wasm_cycle`, then unregisterTool →
+/// repeat unregister → unknown unregister, turning each boolean outcome into
+/// an observable evidence registration (WAT cannot compare JSON text, so it
+/// compares the response byte length: `{"ok":true}` = 11, `{"ok":false}` =
+/// 12), and finally re-registers `wasm_cycle`.
+const UNREGISTER_CYCLE_GUEST_WAT: &str = r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func $call (param $ptr i32) (result i64)
+    (call $host_call (local.get $ptr) (call $strlen (local.get $ptr))))
+  (func $pack (param $ptr i32) (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+      (i64.extend_i32_u (call $strlen (local.get $ptr)))))
+  (func (export "rpi_extension_init") (result i64)
+    (drop (call $call (i32.const 16)))
+    ;; first unregister: {"ok":true} (11 bytes) -> evidence_true
+    (if (i32.eq (i32.wrap_i64 (call $call (i32.const 512))) (i32.const 11))
+      (then (drop (call $call (i32.const 768)))))
+    ;; repeat unregister: {"ok":false} (12 bytes) -> evidence_repeat_false
+    (if (i32.eq (i32.wrap_i64 (call $call (i32.const 1024))) (i32.const 12))
+      (then (drop (call $call (i32.const 1280)))))
+    ;; unknown unregister: {"ok":false} (12 bytes) -> evidence_unknown_false
+    (if (i32.eq (i32.wrap_i64 (call $call (i32.const 1536))) (i32.const 12))
+      (then (drop (call $call (i32.const 1792)))))
+    ;; re-register the tool (full cycle)
+    (drop (call $call (i32.const 2048)))
+    (return (call $pack (i32.const 2304))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (return (call $pack (i32.const 2304))))
+  (data (i32.const 16) "{\"call\":\"registerTool\",\"args\":{\"name\":\"wasm_cycle\",\"description\":\"c\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 512) "{\"call\":\"unregisterTool\",\"args\":{\"name\":\"wasm_cycle\"}}\00")
+  (data (i32.const 768) "{\"call\":\"registerTool\",\"args\":{\"name\":\"evidence_true\",\"description\":\"e\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 1024) "{\"call\":\"unregisterTool\",\"args\":{\"name\":\"wasm_cycle\"}}\00")
+  (data (i32.const 1280) "{\"call\":\"registerTool\",\"args\":{\"name\":\"evidence_repeat_false\",\"description\":\"e\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 1536) "{\"call\":\"unregisterTool\",\"args\":{\"name\":\"wasm_never\"}}\00")
+  (data (i32.const 1792) "{\"call\":\"registerTool\",\"args\":{\"name\":\"evidence_unknown_false\",\"description\":\"e\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 2048) "{\"call\":\"registerTool\",\"args\":{\"name\":\"wasm_cycle\",\"description\":\"c\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 2304) "{\"ok\":true}\00")
+)
+"#;
+
+/// Updater guest: registers `wasm_updater`; every dispatch reports one
+/// partial result via `toolUpdate` (hardcoded toolCallId `tc-update` — the
+/// host test drives the execute with exactly that id) and returns the final
+/// result.
+const UPDATER_GUEST_WAT: &str = r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func $call (param $ptr i32) (result i64)
+    (call $host_call (local.get $ptr) (call $strlen (local.get $ptr))))
+  (func $pack (param $ptr i32) (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+      (i64.extend_i32_u (call $strlen (local.get $ptr)))))
+  (func (export "rpi_extension_init") (result i64)
+    (drop (call $call (i32.const 16)))
+    (return (call $pack (i32.const 1024))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (drop (call $call (i32.const 512)))
+    (return (call $pack (i32.const 1536))))
+  (data (i32.const 16) "{\"call\":\"registerTool\",\"args\":{\"name\":\"wasm_updater\",\"description\":\"u\",\"parameters\":{\"type\":\"object\"}}}\00")
+  (data (i32.const 512) "{\"call\":\"toolUpdate\",\"args\":{\"toolCallId\":\"tc-update\",\"update\":{\"content\":[{\"type\":\"text\",\"text\":\"wasm-partial\"}],\"details\":null}}}\00")
+  (data (i32.const 1024) "{\"ok\":true}\00")
+  (data (i32.const 1536) "{\"content\":[{\"type\":\"text\",\"text\":\"wasm-final\"}],\"details\":null}\00")
+)
+"#;
+
+/// Builds a probe guest whose init forwards the given host call's response
+/// verbatim as the init receipt (capability-denial probing). `call_json` is
+/// plain JSON; quotes/backslashes are escaped for the WAT string literal.
+fn te01_probe_wat(call_json: &str) -> String {
+    let escaped = call_json.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        r#"
+(module
+  (import "rpi" "rpi_host_call" (func $host_call (param i32 i32) (result i64)))
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func (export "rpi_extension_init") (result i64)
+    (return (call $host_call (i32.const 16) (call $strlen (i32.const 16)))))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    (return (i64.const 0)))
+  (data (i32.const 16) "{escaped}\00")
+)
+"#
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_unregister_tool_full_cycle_and_boundaries() {
+    let tmp = TempDir::new("unreg");
+    let wasm = tmp.write_guest(
+        "unreg",
+        UNREGISTER_CYCLE_GUEST_WAT,
+        Some(r#"{"name":"unreg","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["tools"],"rpiAbi":1}"#),
+    );
+    let (host, errors) = host_loading(&[wasm]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // First unregister returned true, repeat and unknown returned false
+    // (evidence tools registered by the guest's length comparisons).
+    assert!(host.get_tool_definition("evidence_true").is_some());
+    assert!(host.get_tool_definition("evidence_repeat_false").is_some());
+    assert!(host.get_tool_definition("evidence_unknown_false").is_some());
+    // Re-registration after unregister works (full cycle).
+    assert!(host.get_tool_definition("wasm_cycle").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_unregister_tool_and_tool_update_capability_denied_for_bare_guest() {
+    let tmp = TempDir::new("te01-caps");
+    for (dir, call) in [
+        (
+            "bare-unregister",
+            r#"{"call":"unregisterTool","args":{"name":"x"}}"#,
+        ),
+        (
+            "bare-toolupdate",
+            r#"{"call":"toolUpdate","args":{"toolCallId":"x","update":{"content":[],"details":null}}}"#,
+        ),
+    ] {
+        let wasm = tmp.write_guest(dir, &te01_probe_wat(call), None);
+        let (_host, errors) = host_loading(&[wasm]).await;
+        assert_eq!(errors.len(), 1, "{dir}: {errors:?}");
+        assert!(
+            errors[0].contains("capabilityDenied"),
+            "{dir} must be denied: {errors:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_tool_update_outside_execute_is_dropped_with_ok() {
+    let tmp = TempDir::new("te01-late");
+    // Granted capabilities: toolUpdate with an unknown toolCallId (no
+    // in-flight execution) must be dropped but answered {"ok": null} — the
+    // forwarded receipt loads cleanly.
+    let wasm = tmp.write_guest(
+        "late",
+        &te01_probe_wat(
+            r#"{"call":"toolUpdate","args":{"toolCallId":"never-started","update":{"content":[],"details":null}}}"#,
+        ),
+        Some(r#"{"name":"late","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["tools"],"rpiAbi":1}"#),
+    );
+    let (_host, errors) = host_loading(&[wasm]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wasm_tool_execute_streams_on_update_to_host() {
+    let tmp = TempDir::new("te01-update");
+    let wasm = tmp.write_guest(
+        "updater",
+        UPDATER_GUEST_WAT,
+        Some(r#"{"name":"updater","version":"0.1.0","wasm":"dist/guest.wasm","capabilities":["tools"],"rpiAbi":1}"#),
+    );
+    let (host, errors) = host_loading(&[wasm]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let updates: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = updates.clone();
+    let on_update: rpi_agent::types::AgentToolUpdateCallback =
+        Box::new(move |result: rpi_agent::types::AgentToolResult| {
+            if let Some(rpi_ai::types::ToolResultContent::Text(text)) = result.content.first() {
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(text.text.clone());
+            }
+        });
+
+    let definition = host
+        .get_tool_definition("wasm_updater")
+        .expect("registered");
+    let request = rpi_ext_host::types::ToolExecuteRequest {
+        tool_call_id: "tc-update".to_owned(),
+        params: json!({}),
+        signal: tokio_util::sync::CancellationToken::new(),
+        on_update: Some(on_update),
+    };
+    let result = (definition.execute)(request, host.core().create_context())
+        .await
+        .expect("execute");
+
+    assert_eq!(
+        updates.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+        &["wasm-partial".to_owned()],
+        "partial result must reach the host on_update sink"
+    );
+    assert_eq!(
+        result.content[0],
+        rpi_ai::types::ToolResultContent::Text(rpi_ai::types::TextContent {
+            text: "wasm-final".to_owned(),
+            text_signature: None
+        })
+    );
+}

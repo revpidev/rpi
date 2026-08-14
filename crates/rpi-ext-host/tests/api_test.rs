@@ -847,3 +847,138 @@ fn resolved_request_auth_preserves_null_header_values_7030() {
         Some(Some("Bearer token".to_owned()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// TE01 / ADR-0015: unregisterTool (additive ABI v1 method)
+// ---------------------------------------------------------------------------
+
+fn te01_tool_definition(name: &str) -> ext::ToolDefinition {
+    ext::ToolDefinition {
+        name: name.to_owned(),
+        label: name.to_owned(),
+        description: "te01 probe tool".to_owned(),
+        prompt_snippet: None,
+        prompt_guidelines: None,
+        parameters: json!({"type": "object"}),
+        constrained_sampling: None,
+        render_shell: None,
+        prepare_arguments: None,
+        execution_mode: None,
+        execute: Arc::new(|_request, _ctx| {
+            Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) })
+        }),
+        render_call: None,
+        render_result: None,
+    }
+}
+
+fn refresh_count(actions: &MockActions) -> usize {
+    *actions
+        .refresh_count
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[tokio::test]
+async fn unregister_tool_register_unregister_reregister_cycle() {
+    let host = host_with(vec![inline_ext("ext-cycle", |api| {
+        api.register_tool(te01_tool_definition("cycle_tool"))
+            .expect("register at load");
+    })])
+    .await;
+    assert!(host.get_tool_definition("cycle_tool").is_some());
+
+    let actions = Arc::new(MockActions::default());
+    host.bind_actions(actions.clone()).await;
+    let api = api_of(&host);
+
+    // Unregister: entry removed, refresh fired (drops it from the active set).
+    assert!(api.unregister_tool("cycle_tool").expect("unregister"));
+    assert!(host.get_tool_definition("cycle_tool").is_none());
+    assert_eq!(refresh_count(&actions), 1);
+
+    // Re-register: the name is usable again (also refreshes, like registerTool).
+    api.register_tool(te01_tool_definition("cycle_tool"))
+        .expect("re-register");
+    assert!(host.get_tool_definition("cycle_tool").is_some());
+    assert_eq!(refresh_count(&actions), 2);
+
+    // Unregister again — repeatable.
+    assert!(api.unregister_tool("cycle_tool").expect("unregister"));
+    assert!(host.get_tool_definition("cycle_tool").is_none());
+    assert_eq!(refresh_count(&actions), 3);
+}
+
+#[tokio::test]
+async fn unregister_tool_unknown_name_and_repeat_are_false_without_refresh() {
+    let host = host_with(vec![inline_ext("ext-edges", |api| {
+        api.register_tool(te01_tool_definition("edge_tool"))
+            .expect("register at load");
+    })])
+    .await;
+    let actions = Arc::new(MockActions::default());
+    host.bind_actions(actions.clone()).await;
+    let api = api_of(&host);
+
+    // Never-registered name (incl. built-in names): false, no error, no refresh.
+    assert!(!api.unregister_tool("never_registered").expect("ok"));
+    assert!(!api.unregister_tool("bash").expect("ok"));
+    assert_eq!(refresh_count(&actions), 0);
+
+    // Repeat unregister: the second call is false.
+    assert!(api.unregister_tool("edge_tool").expect("first"));
+    assert!(!api.unregister_tool("edge_tool").expect("second"));
+    assert_eq!(refresh_count(&actions), 1);
+}
+
+#[tokio::test]
+async fn unregister_tool_only_removes_own_registration() {
+    // Two extensions register the same name; the first-registered wins at
+    // query time (runner.ts:447-457). After ext-a unregisters, ext-b's
+    // registration becomes visible again.
+    let host = host_with(vec![
+        inline_ext("ext-a", |api| {
+            let mut definition = te01_tool_definition("shared_tool");
+            definition.description = "from ext-a".to_owned();
+            api.register_tool(definition).expect("register a");
+        }),
+        inline_ext("ext-b", |api| {
+            let mut definition = te01_tool_definition("shared_tool");
+            definition.description = "from ext-b".to_owned();
+            api.register_tool(definition).expect("register b");
+        }),
+    ])
+    .await;
+    assert_eq!(
+        host.get_tool_definition("shared_tool")
+            .expect("visible")
+            .description,
+        "from ext-a"
+    );
+
+    let api_a = ExtensionApi::for_extension(
+        host.core().extensions()[0].clone(),
+        host.runtime(),
+        "/test-cwd",
+    );
+    assert!(api_a.unregister_tool("shared_tool").expect("unregister"));
+    let surviving = host
+        .get_tool_definition("shared_tool")
+        .expect("ext-b registration survives");
+    assert_eq!(surviving.description, "from ext-b");
+}
+
+#[tokio::test]
+async fn unregister_tool_on_stale_runtime_errors() {
+    let host = host_with(vec![inline_ext("ext-stale", |api| {
+        api.register_tool(te01_tool_definition("stale_tool"))
+            .expect("register at load");
+    })])
+    .await;
+    let api = api_of(&host);
+    host.invalidate(None);
+    assert!(matches!(
+        api.unregister_tool("stale_tool"),
+        Err(ExtError::Stale(_))
+    ));
+}

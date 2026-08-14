@@ -105,9 +105,40 @@ struct Registration {
     handler: Handler,
 }
 
+/// Context handed to tools registered via [`Extension::tool_with_context`]
+/// (ADR-0015): the tool-call params plus the `toolCallId`, which backs
+/// [`ToolContext::report_update`].
+pub struct ToolContext {
+    /// The `params` of the `toolExecute` dispatch.
+    pub params: Value,
+    /// The `toolCallId` of the in-flight call.
+    pub tool_call_id: String,
+}
+
+impl ToolContext {
+    /// `on_update` report (ADR-0015): stream a partial `AgentToolResult`
+    /// (`{"content": [...], "details": ...}`) to the host while the tool is
+    /// executing. Fire-and-forget; updates after execute returns are dropped
+    /// by the host.
+    pub fn report_update(&self, update: Value) -> Result<(), String> {
+        host_call(
+            "toolUpdate",
+            json!({"toolCallId": self.tool_call_id, "update": update}),
+        )
+        .map(|_| ())
+    }
+}
+
+type ContextToolHandler = Box<dyn Fn(ToolContext) -> Result<Value, String> + Send>;
+
+enum ToolExecute {
+    Simple(Handler),
+    WithContext(ContextToolHandler),
+}
+
 struct ToolRegistration {
     definition: Value,
-    execute: Handler,
+    execute: ToolExecute,
 }
 
 struct State {
@@ -157,9 +188,32 @@ impl Extension {
     ) -> &mut Self {
         state().tools.push(ToolRegistration {
             definition,
-            execute: Box::new(execute),
+            execute: ToolExecute::Simple(Box::new(execute)),
         });
         self
+    }
+
+    /// Like [`Extension::tool`], but the handler receives a [`ToolContext`]
+    /// and can stream partial results via [`ToolContext::report_update`]
+    /// (ADR-0015).
+    pub fn tool_with_context(
+        &mut self,
+        definition: Value,
+        execute: impl Fn(ToolContext) -> Result<Value, String> + Send + 'static,
+    ) -> &mut Self {
+        state().tools.push(ToolRegistration {
+            definition,
+            execute: ToolExecute::WithContext(Box::new(execute)),
+        });
+        self
+    }
+
+    /// `pi.unregisterTool(name)` (ADR-0015): remove a tool this extension
+    /// registered. Returns `true` when a registration was removed; unknown
+    /// names return `false` (no error).
+    pub fn unregister_tool(&self, name: &str) -> Result<bool, String> {
+        host_call("unregisterTool", json!({ "name": name }))
+            .map(|value| value.as_bool().unwrap_or(false))
     }
 
     /// Host call escape hatch for the rest of the capability surface
@@ -245,7 +299,9 @@ pub fn dispatch(ptr: u32, len: usize) -> u64 {
     let message: Value = match serde_json::from_slice(&unpack(ptr as *const u8, len)) {
         Ok(message) => message,
         Err(error) => {
-            return pack_json(&json!({"error": {"kind": "invalidRequest", "message": error.to_string()}}))
+            return pack_json(
+                &json!({"error": {"kind": "invalidRequest", "message": error.to_string()}}),
+            )
         }
     };
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
@@ -279,10 +335,18 @@ pub fn dispatch(ptr: u32, len: usize) -> u64 {
             state
                 .tools
                 .iter()
-                .find(|tool| {
-                    tool.definition.get("name").and_then(Value::as_str) == Some(tool_name)
+                .find(|tool| tool.definition.get("name").and_then(Value::as_str) == Some(tool_name))
+                .map(|tool| match &tool.execute {
+                    ToolExecute::Simple(execute) => execute(params),
+                    ToolExecute::WithContext(execute) => execute(ToolContext {
+                        params,
+                        tool_call_id: message
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    }),
                 })
-                .map(|tool| (tool.execute)(params))
         }
         _ => None,
     };
