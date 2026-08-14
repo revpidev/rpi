@@ -94,6 +94,9 @@ pub struct AgentConfig {
     /// `acceptanceRole`: "read-only" | "writer" (FR-P1-09 acceptance level
     /// inference input; agent-management.ts:559-562).
     pub acceptance_role: Option<String>,
+    /// `memory: {scope: project|user, path}` (agent-memory.ts:36): the
+    /// per-agent memory dir whose MEMORY.md is injected into the child prompt.
+    pub memory: Option<MemoryConfig>,
     /// Which frontmatter keys the definition actually wrote (agentFrontmatterFields
     /// WeakMap upstream) — the fill-only override guard.
     pub frontmatter_fields: std::collections::BTreeSet<String>,
@@ -106,6 +109,142 @@ impl AgentConfig {
 
     fn has_frontmatter_field(&self, fields: &[&str]) -> bool {
         fields.iter().any(|f| self.frontmatter_fields.contains(*f))
+    }
+}
+
+/// `memory` frontmatter (agent-memory.ts:36): inline
+/// `memory: {scope: "project"|"user", path: "..."}` — the hand-rolled
+/// frontmatter yields scalar strings, so the object form arrives as the raw
+/// line; both `memory: {scope: project, path: notes}` and
+/// `memory: project:notes` (shorthand) are accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryConfig {
+    /// `project` → `<cwd>/.rpi/agent-memory/`, `user` → `<agentDir>/agent-memory/`.
+    pub scope: &'static str,
+    pub path: String,
+}
+
+impl MemoryConfig {
+    pub fn parse(raw: Option<&str>) -> Option<Self> {
+        let raw = raw?.trim();
+        if raw.is_empty() || raw == "false" {
+            return None;
+        }
+        let body = raw
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        // Try `key: value` pairs first.
+        let mut scope: Option<&'static str> = None;
+        let mut path: Option<String> = None;
+        for pair in body.split(',') {
+            let Some((key, value)) = pair.split_once(':') else {
+                continue;
+            };
+            let key = key.trim();
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            match key {
+                "scope" => {
+                    scope = match value {
+                        "project" => Some("project"),
+                        "user" => Some("user"),
+                        _ => Some("project"),
+                    };
+                }
+                "path" => path = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        // Shorthand `project:notes`.
+        if scope.is_none() || path.is_none() {
+            if let Some((raw_scope, raw_path)) = body.split_once(':') {
+                let raw_scope = raw_scope.trim();
+                let raw_path = raw_path.trim().trim_matches('"');
+                if scope.is_none() {
+                    scope = match raw_scope {
+                        "user" => Some("user"),
+                        _ => Some("project"),
+                    };
+                }
+                if path.is_none() && !raw_path.is_empty() {
+                    path = Some(raw_path.to_string());
+                }
+            }
+        }
+        Some(Self {
+            scope: scope.unwrap_or("project"),
+            path: path.unwrap_or_else(|| "default".to_string()),
+        })
+    }
+
+    /// `resolveMemoryDir` (agent-memory.ts:79-103): traversal-guarded
+    /// directory under the scope root.
+    pub fn resolve_dir(&self, cwd: &Path, agent_name: &str) -> Option<PathBuf> {
+        if self.path.is_empty()
+            || self.path.contains('\0')
+            || self.path.split(['/']).any(|segment| segment == "." || segment == "..")
+            || self.path.contains(':')
+        {
+            return None;
+        }
+        let base = if self.scope == "user" {
+            crate::paths::get_agent_dir().join("agent-memory")
+        } else {
+            crate::paths::get_project_config_dir(cwd).join("agent-memory")
+        };
+        Some(base.join(&self.path).join(sanitize_memory_segment(agent_name)))
+    }
+}
+
+fn sanitize_memory_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// `readMemoryFile` (agent-memory.ts:143-171): first MAX_MEMORY_LINES (200)
+/// lines, MAX_MEMORY_BYTES (16KiB) cap; O_NOFOLLOW-equivalent (symlinked
+/// memory files are skipped — "unsafe").
+pub fn read_agent_memory_file(dir: &Path) -> Option<String> {
+    let file = dir.join("MEMORY.md");
+    let meta = std::fs::symlink_metadata(&file).ok()?;
+    if meta.file_type().is_symlink() {
+        return None; // unsafe: symlinked memory file
+    }
+    let content = std::fs::read_to_string(&file).ok()?;
+    let mut out = String::new();
+    for (index, line) in content.lines().enumerate() {
+        if index >= 200 || out.len() + line.len() > 16 * 1024 {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// `buildAgentMemoryInjection` (agent-memory.ts:193-224): read-write block
+/// when the agent holds write tools, read-only recall otherwise.
+pub fn build_agent_memory_injection(memory_text: &str, writable: bool) -> String {
+    if writable {
+        format!(
+            "<agent_memory access=\"read-write\">\nMaintain durable notes in your agent memory.\nCreate and update MEMORY.md in your memory directory as you learn durable facts, decisions, and conventions.\n\n{memory_text}\n</agent_memory>"
+        )
+    } else {
+        format!(
+            "<agent_memory access=\"read-only\">\nRecall durable notes from a prior run of this agent.\n\n{memory_text}\n</agent_memory>"
+        )
     }
 }
 
@@ -366,6 +505,7 @@ pub fn agent_from_content(
         default_progress: fm.get("defaultProgress").map(String::as_str) == Some("true"),
         max_subagent_depth,
         disabled: None,
+        memory: MemoryConfig::parse(fm.get("memory").map(String::as_str)),
         acceptance_role: match fm.get("acceptanceRole").map(String::as_str) {
             // read-only | writer | false; anything else is treated as unset
             // (agent-management.ts:559-562 validation vocabulary).

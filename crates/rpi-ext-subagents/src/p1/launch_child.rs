@@ -387,6 +387,38 @@ pub async fn run_child_async(
             system_prompt = format!("{system_prompt}\n\n{injection}");
         }
     }
+    // Per-agent memory injection (FR-P1-08, agent-memory.ts:193): the
+    // MEMORY.md head rides the system prompt; write tools switch the block
+    // to read-write.
+    if let Some(memory) = &agent.memory {
+        if let Some(dir) = memory.resolve_dir(&effective_cwd, &agent.name) {
+            if let Some(text) = discover::read_agent_memory_file(&dir) {
+                let writable = agent
+                    .tools
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .any(|t| matches!(t.as_str(), "edit" | "write" | "bash"))
+                    })
+                    .unwrap_or(false);
+                let injection = discover::build_agent_memory_injection(&text, writable);
+                if system_prompt.is_empty() {
+                    system_prompt = injection;
+                } else {
+                    system_prompt = format!("{system_prompt}\n\n{injection}");
+                }
+            }
+        }
+    }
+    // Project refinement overlay (FR-P1-08, execution.ts:1492).
+    if let Some(overlay) = crate::actions::agent_refinement_overlay(&effective_cwd, &agent.name) {
+        if system_prompt.is_empty() {
+            system_prompt = overlay;
+        } else {
+            system_prompt = format!("{system_prompt}\n\n{overlay}");
+        }
+    }
 
     // Output path: child override > agent frontmatter.
     let output_path = match &spec.output {
