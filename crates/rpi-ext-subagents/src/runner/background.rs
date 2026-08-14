@@ -502,7 +502,7 @@ pub async fn drive_run(
             for (index, _) in entries.iter().enumerate() {
                 mark_step(&handle, index, "queued");
             }
-            match crate::p1::parallel::run_parallel_async(&entries, &agents, &ctx, concurrency)
+            match crate::p1::parallel::run_parallel_async(&entries, &agents, &ctx, concurrency, None)
                 .await
             {
                 Ok(outcomes) => {

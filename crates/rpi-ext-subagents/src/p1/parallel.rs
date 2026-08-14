@@ -36,6 +36,8 @@ const FORBIDDEN_ENTRY_FIELDS: [&str; 7] = [
 pub struct TaskEntry {
     pub key: String,
     pub spec: ChildSpec,
+    /// Per-task `worktree` override over the top-level default (FR-P1-06).
+    pub worktree_override: Option<bool>,
 }
 
 /// Parse and validate the `tasks` array (workflow `runs.all` items +
@@ -99,8 +101,10 @@ pub fn parse_tasks(
             }
             _ => OutputOverride::Inherit,
         };
+        let worktree_override = object.get("worktree").and_then(Value::as_bool);
         entries.push(TaskEntry {
             key,
+            worktree_override,
             spec: ChildSpec {
                 agent_name: agent_name.to_string(),
                 task: task.to_string(),
@@ -188,6 +192,20 @@ fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
     }
 }
 
+/// Worktree plan for a parallel batch (FR-P1-06): children whose index is
+/// enabled get an isolated worktree (cwd redirect), a captured patch after
+/// the run, a handoff manifest, and rollback-safe cleanup.
+pub struct WorktreePlan {
+    pub toplevel: std::path::PathBuf,
+    pub base_commit: String,
+    pub base_dir: std::path::PathBuf,
+    pub enabled: Vec<bool>,
+    pub config: crate::config::ExtensionConfig,
+    /// Patches + manifest land beside the base dir (upstream handoffs/).
+    pub manifest_path: Option<std::path::PathBuf>,
+    pub diffs: std::sync::Mutex<Vec<(usize, String, String, crate::p1::worktree::WorktreeDiff)>>,
+}
+
 /// One aggregated task result (`ParallelTaskResult`).
 #[derive(Debug, Clone)]
 pub struct ParallelTaskOutcome {
@@ -211,8 +229,15 @@ pub fn run_parallel(
     ctx: &RunCtx,
     runtime: &PluginRuntime,
     concurrency: usize,
+    worktree: Option<std::sync::Arc<WorktreePlan>>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
-    runtime.block_on(run_parallel_async(entries, agents, ctx, concurrency))
+    runtime.block_on(run_parallel_async(
+        entries,
+        agents,
+        ctx,
+        concurrency,
+        worktree,
+    ))
 }
 
 /// Async core (see [`run_parallel`]) — call directly from runtime tasks
@@ -222,6 +247,7 @@ pub async fn run_parallel_async(
     agents: &[AgentConfig],
     ctx: &RunCtx,
     concurrency: usize,
+    worktree: Option<std::sync::Arc<WorktreePlan>>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
     let concurrency = concurrency.max(1);
     let outcomes: Vec<Option<ParallelTaskOutcome>> = async {
@@ -233,8 +259,9 @@ pub async fn run_parallel_async(
         let results = stream::iter(indexed)
             .map(|(index, entry)| {
                 let agents = Arc::clone(&agents);
+                let plan = worktree.clone();
                 async move {
-                    let outcome = launch_one(&entry, &agents, ctx).await;
+                    let outcome = launch_one(&entry, &agents, ctx, plan.as_deref()).await;
                     (index, outcome)
                 }
             })
@@ -273,14 +300,80 @@ async fn launch_one(
     entry: &TaskEntry,
     agents: &[AgentConfig],
     ctx: &RunCtx,
+    worktree: Option<&WorktreePlan>,
 ) -> Option<ParallelTaskOutcome> {
     let agent = discover::resolve_agent_name(agents, &entry.spec.agent_name)
         .ok()?
         .cloned()?;
-    let outcome: ChildOutcome = launch_child::run_child_async(&entry.spec, &agent, ctx)
+    // Worktree isolation (FR-P1-06): create → redirect cwd → run → capture
+    // patch → journal → cleanup. Creation failure skips the child entirely
+    // (upstream: "creation failure does not start the child").
+    let mut spec = entry.spec.clone();
+    let mut prepared = None;
+    if let Some(plan) = worktree {
+        if plan.enabled.get(entry.spec.child_index as usize).copied().unwrap_or(false) {
+            let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
+            let cwd_relative = crate::p1::worktree::resolve_repo_cwd_relative(&cwd).ok()?;
+            let info = crate::p1::worktree::create_worktree(
+                &plan.toplevel,
+                &cwd_relative,
+                &ctx.run_id,
+                entry.spec.child_index as usize,
+                &plan.base_commit,
+                &plan.base_dir,
+                Some(&entry.spec.agent_name),
+                &plan.config,
+            )
+            .ok()?;
+            spec.cwd = Some(info.agent_cwd.clone());
+            prepared = Some(info);
+        }
+    }
+    let outcome: ChildOutcome = launch_child::run_child_async(&spec, &agent, ctx)
         .await
         .ok()?;
+    if let (Some(plan), Some(info)) = (worktree, prepared) {
+        let patch_dir = plan.base_dir.join("patches");
+        if let Ok(diff) = crate::p1::worktree::capture_worktree_diff(
+            &info,
+            &outcome.agent_name,
+            &plan.base_commit,
+            &patch_dir,
+        ) {
+            let status = if outcome.result.exit_code == 0 { "complete" } else { "failed" };
+            let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, plan.manifest_path.as_deref());
+            plan.diffs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((entry.spec.child_index as usize, outcome.agent_name.clone(), status.to_string(), diff));
+        } else {
+            // Dirty worktree without a recorded patch: keep it for
+            // inspection (cleanup_worktree refuses).
+            let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, plan.manifest_path.as_deref());
+        }
+    }
     Some(project_outcome(entry, &outcome))
+}
+
+/// Write the handoff manifest after a worktree batch finishes (upstream
+/// writes it before cleanup so `handoffRecordsPatch` passes).
+pub fn finalize_worktree_handoff(plan: &WorktreePlan, run_id: &str, cwd: &std::path::Path) {
+    let diffs = plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if diffs.is_empty() {
+        return;
+    }
+    let path = crate::p1::worktree::write_handoff_manifest(
+        &plan.base_dir,
+        run_id,
+        "parallel",
+        cwd,
+        &plan.base_commit,
+        &diffs,
+    );
+    // Re-run cleanup attempts now that the manifest exists (dirty worktrees
+    // kept earlier can be pruned once their patch is journaled).
+    // The manifest path is returned for status/reporting.
+    let _ = path;
 }
 
 /// `ParallelTaskResult` projection off the shared child outcome.

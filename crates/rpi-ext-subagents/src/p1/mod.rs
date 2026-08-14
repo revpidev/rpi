@@ -4,3 +4,4 @@
 pub mod chain;
 pub mod launch_child;
 pub mod parallel;
+pub mod worktree;

@@ -436,6 +436,34 @@ fn assemble_single_details(
     details
 }
 
+/// Build the worktree plan for a parallel batch when any task opts in
+/// (top-level `worktree: true` or per-task `worktree: true`).
+fn build_worktree_plan(
+    entries: &[crate::p1::parallel::TaskEntry],
+    object: &serde_json::Map<String, Value>,
+    ctx: &crate::p1::launch_child::RunCtx,
+) -> Result<Option<std::sync::Arc<crate::p1::parallel::WorktreePlan>>, String> {
+    let top_worktree = object.get("worktree").and_then(Value::as_bool).unwrap_or(false);
+    let enabled: Vec<bool> = entries
+        .iter()
+        .map(|entry| entry.worktree_override.unwrap_or(top_worktree))
+        .collect();
+    if !enabled.iter().any(|e| *e) {
+        return Ok(None);
+    }
+    let (toplevel, base_commit) = crate::p1::worktree::resolve_repo_base(&ctx.base_cwd)?;
+    let base_dir = crate::p1::worktree::resolve_worktree_base_dir(&ctx.config, &toplevel)?;
+    Ok(Some(std::sync::Arc::new(crate::p1::parallel::WorktreePlan {
+        toplevel,
+        base_commit,
+        base_dir,
+        enabled,
+        config: ctx.config.clone(),
+        manifest_path: None,
+        diffs: std::sync::Mutex::new(Vec::new()),
+    })))
+}
+
 /// `tasks` composition dispatch (FR-P1-01, ADR-0018).
 fn dispatch_tasks(
     object: &serde_json::Map<String, Value>,
@@ -453,11 +481,31 @@ fn dispatch_tasks(
     let concurrency = ctx
         .config
         .parallel_concurrency(object.get("concurrency")) as usize;
-    let outcomes = match crate::p1::parallel::run_parallel(&entries, agents, ctx, runtime, concurrency)
-    {
+    // Worktree isolation (FR-P1-06): top-level `worktree: true` defaults
+    // every task in; per-task `worktree: false` opts out.
+    let top_worktree = object.get("worktree").and_then(Value::as_bool).unwrap_or(false);
+    let worktree_plan = if top_worktree {
+        match build_worktree_plan(&entries, object, ctx) {
+            Ok(plan) => plan,
+            Err(error) => return ToolOutcome::error(error),
+        }
+    } else {
+        None
+    };
+    let outcomes = match crate::p1::parallel::run_parallel(
+        &entries,
+        agents,
+        ctx,
+        runtime,
+        concurrency,
+        worktree_plan.clone(),
+    ) {
         Ok(outcomes) => outcomes,
         Err(error) => return ToolOutcome::error(error),
     };
+    if let Some(plan) = &worktree_plan {
+        crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
+    }
     record_runs(&outcomes.iter().map(|o| (o.agent.clone(), o.exit_code, 0, o.error.clone())).collect::<Vec<_>>(), &ctx.run_id);
 
     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
