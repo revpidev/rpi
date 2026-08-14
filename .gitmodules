@@ -1,3 +1,12 @@
 [submodule "external/pi"]
 	path = external/pi
 	url = https://github.com/earendil-works/pi.git
+[submodule "external/pi-mcp-adapter"]
+	path = external/pi-mcp-adapter
+	url = https://github.com/nicobailon/pi-mcp-adapter.git
+[submodule "external/pi-subagents"]
+	path = external/pi-subagents
+	url = https://github.com/nicobailon/pi-subagents.git
+[submodule "external/agent-smart-fetch"]
+	path = external/agent-smart-fetch
+	url = https://github.com/Thinkscape/agent-smart-fetch.git
