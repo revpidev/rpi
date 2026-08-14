@@ -366,12 +366,20 @@ pub(crate) fn handle_host_call(state: &mut HostState, request: &[u8]) -> Vec<u8>
         .to_owned();
     let args = request.get("args").cloned().unwrap_or(Value::Null);
 
-    if let Some(capability) = host_call::required_capability(&method) {
-        if !state.capabilities.contains(&capability) {
-            return error_response(
-                "capabilityDenied",
-                format!("method \"{method}\" requires capability \"{capability:?}\""),
-            );
+    match host_call::required_capability(&method) {
+        host_call::CapabilityRequirement::Free => {}
+        host_call::CapabilityRequirement::Requires(capability) => {
+            if !state.capabilities.contains(&capability) {
+                return error_response(
+                    "capabilityDenied",
+                    format!("method \"{method}\" requires capability \"{capability:?}\""),
+                );
+            }
+        }
+        // Rejected here (not by `dispatch`) so the capability mapping stays
+        // fail-closed: an unclassified method never reaches a dispatch arm.
+        host_call::CapabilityRequirement::UnknownMethod => {
+            return error_response("unknownMethod", format!("unknown host call: {method}"));
         }
     }
 

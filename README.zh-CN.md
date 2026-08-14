@@ -104,6 +104,8 @@ rpi list                   # 列出已装扩展
 rpi config                 # 查看已批准的项目信任决策
 ```
 
+机器可读模式（`--mode json` / `--mode rpc`）的线协议契约见 [docs/json-rpc.md](./docs/json-rpc.md)。
+
 ## 配置
 
 配置位于 `~/.rpi/`（或 `RPI_CODING_AGENT_DIR`）。设置以环境变量驱动，各产品端点均可覆盖或关闭：
@@ -161,7 +163,7 @@ scripts/verify-upstream.sh # 确认 external/pi 停留在钉死 commit
 
 ## 状态
 
-v0.1（T01–T16）已完成：四层 crate（`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`）+ 扩展宿主（L0 原生 + L1 Wasm）交付。v0.11 进行中（对照基线提升至 `4181f66` / v0.84.1+）。
+v0.1（T01–T16）已完成：四层 crate（`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`）+ 扩展宿主（L0 原生 + L1 Wasm）交付。v0.11（T17–T32）已完成（对照基线 `4181f66` / v0.84.1+）：JSON/RPC delta-only 线格式、全 provider 家族流终止语义、settings 深合并、length-stop 恢复链、auth 命令族（`auth check` / `print-api-key`）、扩展 API 新增（model registry、markdown transformer）、TUI trait 化双渲染器（regular + `--tui-mode` 全屏 alt-screen）、LaTeX/Mermaid 渲染、视口布局引擎。
 
 ## 许可证
 

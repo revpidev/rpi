@@ -105,6 +105,8 @@ rpi list                   # list installed extensions
 rpi config                 # review approved project trust decisions
 ```
 
+Machine-readable modes (`--mode json` / `--mode rpc`) follow the wire contract in [docs/json-rpc.md](./docs/json-rpc.md).
+
 ## Configuration
 
 Configuration lives in `~/.rpi/` (or `RPI_CODING_AGENT_DIR`). Settings are environment-variable-driven; the product endpoints can each be overridden or disabled:
@@ -162,7 +164,7 @@ scripts/verify-upstream.sh # confirm external/pi is at the pinned commit
 
 ## Status
 
-v0.1 (T01–T16) complete: four-layer crates (`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`) plus the extension host (L0 native + L1 Wasm) delivered. v0.11 in progress (upstream baseline raised to `4181f66` / v0.84.1+): JSON/RPC delta-only wire format, stream-termination semantics across all provider families, settings deep-merge, length-stop recovery chain, auth command family (`auth check` / `print-api-key`), extension API additions (model registry, markdown transformers), TUI trait refactor with dual renderers (regular + fullscreen alt-screen via `--tui-mode`), LaTeX/Mermaid rendering, and a viewport layout engine.
+v0.1 (T01–T16) complete: four-layer crates (`rpi-ai` / `rpi-agent` / `rpi-tui` / `rpi`) plus the extension host (L0 native + L1 Wasm) delivered. v0.11 (T17–T32) complete (upstream baseline `4181f66` / v0.84.1+): JSON/RPC delta-only wire format, stream-termination semantics across all provider families, settings deep-merge, length-stop recovery chain, auth command family (`auth check` / `print-api-key`), extension API additions (model registry, markdown transformers), TUI trait refactor with dual renderers (regular + fullscreen alt-screen via `--tui-mode`), LaTeX/Mermaid rendering, and a viewport layout engine.
 
 ## License
 

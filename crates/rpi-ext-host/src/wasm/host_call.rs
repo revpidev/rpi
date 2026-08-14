@@ -18,27 +18,59 @@ use crate::api::{DeliverAs, SendMessageOptions, SendUserMessageOptions};
 use crate::types as ext;
 use crate::types::{FlagType, FlagValue};
 
-/// method → capability mapping (docs/extension-abi.md table). `on` and
-/// `getFlag` are free: `capabilities: []` guests may subscribe to events,
-/// and a flag read only ever sees the extension's own flags.
-pub fn required_capability(method: &str) -> Option<Capability> {
-    Some(match method {
-        "on" | "getFlag" => return None,
-        "registerTool" => Capability::Tools,
-        "registerCommand" | "registerShortcut" | "registerFlag" => Capability::Commands,
-        "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
-            Capability::Ui
+/// Capability gate outcome for a host method (docs/extension-abi.md table).
+pub enum CapabilityRequirement {
+    /// No capability required: `capabilities: []` guests may subscribe to
+    /// events (`on`), and a flag read (`getFlag`) only ever sees the
+    /// extension's own flags.
+    Free,
+    /// The method requires the given manifest capability.
+    Requires(Capability),
+    /// Not a host method at all. The caller rejects it as `unknownMethod`
+    /// without any capability check. This arm exists so the mapping is
+    /// fail-closed for maintenance: a new dispatch arm whose author forgets
+    /// to classify it here is unreachable (guests get `unknownMethod`) until
+    /// it is assigned a capability — instead of silently inheriting one.
+    UnknownMethod,
+}
+
+/// method → capability mapping (docs/extension-abi.md table). Every known
+/// top-level method is listed explicitly; the `ui.`/`command.` prefixes are
+/// safe to map wholesale because their sub-dispatchers are themselves
+/// fail-closed (`unknownMethod` for unlisted sub-methods).
+pub fn required_capability(method: &str) -> CapabilityRequirement {
+    use CapabilityRequirement::{Free, Requires, UnknownMethod};
+    match method {
+        "on" | "getFlag" => Free,
+        "registerTool" => Requires(Capability::Tools),
+        "registerCommand" | "registerShortcut" | "registerFlag" => {
+            Requires(Capability::Commands)
         }
-        "exec" => Capability::Exec,
-        "registerProvider" | "unregisterProvider" => Capability::Provider,
-        "events.emit" | "events.on" => Capability::Events,
-        m if m.starts_with("ui.") => Capability::Ui,
-        m if m.starts_with("command.") => Capability::Session,
-        // v0.11 additions (ctx.scopedModels / ctx.modelRegistry.* /
+        "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
+            Requires(Capability::Ui)
+        }
+        "exec" => Requires(Capability::Exec),
+        "registerProvider" | "unregisterProvider" => Requires(Capability::Provider),
+        "events.emit" | "events.on" => Requires(Capability::Events),
+        m if m.starts_with("ui.") => Requires(Capability::Ui),
+        m if m.starts_with("command.") => Requires(Capability::Session),
+        // Session-level actions and context reads, including the v0.11
+        // additions (ctx.scopedModels / ctx.modelRegistry.* /
         // ctx.setRuntimeApiKey / ctx.removeRuntimeApiKey /
-        // ctx.getSystemPromptSource / ctx.getAppendSystemPromptSources)
-        _ => Capability::Session,
-    })
+        // ctx.getSystemPromptSource / ctx.getAppendSystemPromptSources).
+        "sendMessage" | "sendUserMessage" | "appendEntry" | "setSessionName"
+        | "getSessionName" | "setLabel" | "getActiveTools" | "getAllTools"
+        | "setActiveTools" | "getCommands" | "setModel" | "getThinkingLevel"
+        | "setThinkingLevel" | "ctx.isIdle" | "ctx.isProjectTrusted"
+        | "ctx.hasPendingMessages" | "ctx.getContextUsage" | "ctx.getSystemPrompt"
+        | "ctx.model" | "ctx.cwd" | "ctx.mode" | "ctx.hasUI" | "ctx.abort"
+        | "ctx.shutdown" | "ctx.compact" | "ctx.scopedModels" | "ctx.getSystemPromptSource"
+        | "ctx.getAppendSystemPromptSources" | "ctx.modelRegistry.complete"
+        | "ctx.modelRegistry.find" | "ctx.modelRegistry.hasConfiguredAuth"
+        | "ctx.modelRegistry.getApiKeyAndHeaders" | "ctx.setRuntimeApiKey"
+        | "ctx.removeRuntimeApiKey" => Requires(Capability::Session),
+        _ => UnknownMethod,
+    }
 }
 
 type CallResult = Result<Value, (&'static str, String)>;
@@ -857,5 +889,82 @@ fn parse_send_message_options(options: Value) -> SendMessageOptions {
     SendMessageOptions {
         trigger_turn: bool_arg(&options, "triggerTurn"),
         deliver_as: options.get("deliverAs").and_then(parse_deliver_as),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The capability gate is fail-closed: methods not listed in
+    /// `required_capability` are classified `UnknownMethod` and rejected
+    /// before dispatch, instead of silently inheriting a capability.
+    #[test]
+    fn unknown_methods_are_unclassified() {
+        assert!(matches!(
+            required_capability("ctx.totallyMadeUp"),
+            CapabilityRequirement::UnknownMethod
+        ));
+        assert!(matches!(
+            required_capability("registerSomethingNew"),
+            CapabilityRequirement::UnknownMethod
+        ));
+        assert!(matches!(
+            required_capability(""),
+            CapabilityRequirement::UnknownMethod
+        ));
+    }
+
+    #[test]
+    fn known_methods_map_to_their_documented_capabilities() {
+        use CapabilityRequirement::{Free, Requires};
+        assert!(matches!(required_capability("on"), Free));
+        assert!(matches!(required_capability("getFlag"), Free));
+        assert!(matches!(
+            required_capability("registerTool"),
+            Requires(Capability::Tools)
+        ));
+        assert!(matches!(
+            required_capability("registerCommand"),
+            Requires(Capability::Commands)
+        ));
+        assert!(matches!(
+            required_capability("registerMarkdownTransformer"),
+            Requires(Capability::Ui)
+        ));
+        assert!(matches!(
+            required_capability("exec"),
+            Requires(Capability::Exec)
+        ));
+        assert!(matches!(
+            required_capability("registerProvider"),
+            Requires(Capability::Provider)
+        ));
+        assert!(matches!(
+            required_capability("events.emit"),
+            Requires(Capability::Events)
+        ));
+        // Prefix arms: sub-dispatchers reject unlisted sub-methods.
+        assert!(matches!(
+            required_capability("ui.select"),
+            Requires(Capability::Ui)
+        ));
+        assert!(matches!(
+            required_capability("command.newSession"),
+            Requires(Capability::Session)
+        ));
+        // v0.11 additions are Session-gated.
+        assert!(matches!(
+            required_capability("ctx.modelRegistry.getApiKeyAndHeaders"),
+            Requires(Capability::Session)
+        ));
+        assert!(matches!(
+            required_capability("ctx.scopedModels"),
+            Requires(Capability::Session)
+        ));
+        assert!(matches!(
+            required_capability("ctx.setRuntimeApiKey"),
+            Requires(Capability::Session)
+        ));
     }
 }

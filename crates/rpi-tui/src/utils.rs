@@ -5194,6 +5194,55 @@ mod tests {
         assert_eq!(visible_width("🇨🇳"), 2);
     }
 
+    // ---- R5.3.2 grapheme-width exception table guards (dfe47d3fb) ----
+    //
+    // The full-code-point parity guard lives in
+    // scripts/verify-tui-unicode-data.mjs (diffs TERMINAL_SPACING_MARK_RANGES
+    // against the pinned runtime's regex evaluation). These unit tests pin
+    // the v0.11 delta itself so `cargo test` alone catches table edits.
+
+    /// The 14 non-spacing exceptions (upstream regex utils.ts:46-47 expanded:
+    /// 065F 0F7F 102B 102C 1031 1033-1035 1038 103A-103E) are terminal
+    /// spacing marks: each allocates one cell, including with no base char.
+    #[test]
+    fn non_spacing_exceptions_are_terminal_spacing_marks() {
+        let exceptions = [
+            0x065Fu32, 0x0F7F, 0x102B, 0x102C, 0x1031, 0x1033, 0x1034, 0x1035, 0x1038, 0x103A,
+            0x103B, 0x103C, 0x103D, 0x103E,
+        ];
+        assert_eq!(exceptions.len(), 14);
+        for cp in exceptions {
+            let c = char::from_u32(cp).unwrap();
+            assert!(
+                is_terminal_spacing_mark_char(c),
+                "U+{cp:04X} must be a terminal spacing mark"
+            );
+            assert_eq!(
+                visible_width(&c.to_string()),
+                1,
+                "U+{cp:04X} without a base character must occupy one cell"
+            );
+        }
+    }
+
+    /// U+1734/U+302E/U+302F are subtracted from Spacing_Mark by the upstream
+    /// regex — they must NOT be terminal spacing marks and stay zero-width.
+    #[test]
+    fn spacing_mark_exclusions_stay_zero_width() {
+        for cp in [0x1734u32, 0x302E, 0x302F] {
+            let c = char::from_u32(cp).unwrap();
+            assert!(
+                !is_terminal_spacing_mark_char(c),
+                "U+{cp:04X} must be excluded from terminal spacing marks"
+            );
+            assert_eq!(
+                visible_width(&c.to_string()),
+                0,
+                "U+{cp:04X} must stay zero-width"
+            );
+        }
+    }
+
     #[test]
     fn should_truncate_trailing_whitespace_that_exceeds_width() {
         let two_spaces_wrapped_to_width1 = wrap_text_with_ansi("  ", 1);
