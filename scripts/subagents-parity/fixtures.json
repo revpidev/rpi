@@ -1,0 +1,217 @@
+{
+  "//": "Shared parity fixtures (TE04 G3). The args cases mirror buildPiArgs inputs; sessionDir/sessionFile paths are fixed strings so both sides compare verbatim. rpi-only fields (selfExtension, fanoutAuthorized) are constants handled by the runners.",
+  "args": {
+    "cases": [
+      {
+        "name": "minimal-fresh",
+        "input": {
+          "task": "map the codebase",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "systemPrompt": "You are a scout.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "scout",
+          "childAgentName": "scout",
+          "runId": "ab12cd34",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "fork-session-file",
+        "input": {
+          "task": "continue from the fork",
+          "sessionEnabled": true,
+          "sessionFile": "/sess/root/fork.jsonl",
+          "model": "anthropic/claude-x",
+          "thinking": "high",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "systemPrompt": "You are the oracle.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "oracle",
+          "childAgentName": "oracle",
+          "runId": "ff001122",
+          "childIndex": 0,
+          "parentSessionId": "parent-1"
+        }
+      },
+      {
+        "name": "tools-allowlist-with-read-autoprep",
+        "input": {
+          "task": "grep around",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "model": "faux/faux-1",
+          "thinking": "low",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "requireReadTool": true,
+          "tools": ["bash", "write"],
+          "systemPrompt": "You are a scout.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "scout",
+          "childAgentName": "scout",
+          "runId": "0000aaaa",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "tools-empty-no-tools",
+        "input": {
+          "task": "answer only",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": false,
+          "inheritSkills": false,
+          "tools": [],
+          "systemPrompt": "You are a reviewer.",
+          "systemPromptMode": "append",
+          "promptFileStem": "reviewer",
+          "childAgentName": "reviewer",
+          "runId": "1111bbbb",
+          "childIndex": 2
+        }
+      },
+      {
+        "name": "extensions-declared-disables-ambient",
+        "input": {
+          "task": "use the extension",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "tools": ["read", "/abs/tools/helper.so"],
+          "extensions": [],
+          "systemPrompt": "You are a worker.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "worker",
+          "childAgentName": "worker",
+          "runId": "2222cccc",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "subagentOnly-extensions-ambient",
+        "input": {
+          "task": "delegate inside",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "tools": ["read", "subagent"],
+          "subagentOnlyExtensions": ["/opt/child-only.so"],
+          "systemPrompt": "You are a worker.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "worker",
+          "childAgentName": "worker",
+          "runId": "3333dddd",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "no-session",
+        "input": {
+          "task": "quick one",
+          "sessionEnabled": false,
+          "inheritProjectContext": false,
+          "inheritSkills": true,
+          "runId": "4444eeee",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "long-task-file-delivery",
+        "input": {
+          "task": "This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a very long task. This is a long task that clearly exceeds the 8000 code unit limit to force file delivery.",
+          "taskDelivery": "file",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "runId": "5555ffff",
+          "childIndex": 0
+        }
+      },
+      {
+        "name": "thinking-suffix-preserved",
+        "input": {
+          "task": "already suffixed",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "model": "openai/gpt-x:low",
+          "thinking": "high",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "runId": "6666a1b2",
+          "childIndex": 0
+        }
+      }
+    ]
+  },
+  "frontmatter": {
+    "cases": [
+      {
+        "name": "scout-upstream",
+        "content": "---\nname: scout\ndescription: Fast codebase recon that returns compressed context for handoff\ntools: read, grep, find, ls, bash, write, intercom\nthinking: low\nsystemPromptMode: replace\ninheritProjectContext: true\ninheritSkills: false\noutput: context.md\ndefaultProgress: true\n---\n\nYou are a scouting subagent running inside pi.\n\nBody line two.\n"
+      },
+      {
+        "name": "block-list-tools",
+        "content": "---\nname: blocky\ndescription: block list\ntools:\n  - read\n  - bash, edit\n  - write\n---\n\nBody.\n"
+      },
+      {
+        "name": "quoted-and-folded",
+        "content": "---\nname: \"quoted\"\ndescription: >\n  folded line one\n  folded line two\nalias: 'single'\n---\n\nBody after folded.\n"
+      },
+      {
+        "name": "no-frontmatter",
+        "content": "Just a prompt body.\n"
+      },
+      {
+        "name": "unterminated",
+        "content": "---\nname: x\nno closing fence"
+      },
+      {
+        "name": "unknown-fields-ignored",
+        "content": "---\nname: x\ndescription: d\nfutureField: value\n# comment line\n---\nBody.\n"
+      }
+    ]
+  },
+  "final-output": {
+    "cases": [
+      {
+        "name": "last-text-part",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "text", "text": "first" }], "stopReason": "stop" },
+          { "role": "assistant", "content": [{ "type": "text", "text": "middle" }, { "type": "text", "text": "the answer" }], "stopReason": "stop" }
+        ]
+      },
+      {
+        "name": "skip-errored",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "text", "text": "good" }], "stopReason": "stop" },
+          { "role": "assistant", "content": [{ "type": "text", "text": "bad" }], "stopReason": "error", "errorMessage": "boom" }
+        ]
+      },
+      {
+        "name": "empty",
+        "messages": []
+      },
+      {
+        "name": "acceptance-fence-whole-message",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "text", "text": "Summary\n```acceptance-report\n{\"criteriaSatisfied\": true}\n```\nfinal part" }], "stopReason": "stop" }
+        ]
+      },
+      {
+        "name": "toolresult-and-user-ignored",
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "question" }] },
+          { "role": "toolResult", "content": [{ "type": "text", "text": "tool output" }] },
+          { "role": "assistant", "content": [{ "type": "text", "text": "assistant answer" }], "stopReason": "stop" }
+        ]
+      }
+    ]
+  }
+}

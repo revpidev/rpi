@@ -2563,6 +2563,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-ext-subagents"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "libc",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-ext-host",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rpi-test-native-plugin"
 version = "0.1.0"
 dependencies = [

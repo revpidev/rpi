@@ -8,6 +8,7 @@ members = [
     "crates/rpi",
     "crates/rpi-ext-host",
     "crates/rpi-ext-mcp-adapter",
+    "crates/rpi-ext-subagents",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
 ]

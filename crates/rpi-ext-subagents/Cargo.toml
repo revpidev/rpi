@@ -1,0 +1,35 @@
+[package]
+name = "rpi-ext-subagents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# L0 native extension plugin (delegation): rlib for in-process tests, cdylib is
+# the distributed artifact loaded by rpi-ext-host (design §2.1, TE04).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# dladdr for resolving this cdylib's own path (child `--extension` injection)
+# and unix signal constants for the SIGINT/SIGTERM/SIGKILL escalation ladder.
+libc.workspace = true
+
+# Test-only fixed child (design §5.3 e2e); not part of the distributed plugin.
+[[bin]]
+name = "rpi-subagents-fixed-child"
+path = "src/bin/fixed-child.rs"
+
+[dev-dependencies]
+rpi-ai.workspace = true
+rpi-agent.workspace = true
+rpi-ext-host.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+abi_stable = "0.11"

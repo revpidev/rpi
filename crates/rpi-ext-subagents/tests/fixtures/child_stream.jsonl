@@ -1,0 +1,14 @@
+{"type":"session","version":3,"id":"01a0006d-01f7-722e-a0c6-9e9230bc047e","timestamp":"2026-08-14T13:18:59.063Z","cwd":"/tmp/rpi-sub-reale2e-193273-56808962/proj"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"Say the plan verdict"}],"timestamp":1786713539126}}
+{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"Say the plan verdict"}],"timestamp":1786713539126}}
+{"type":"message_start","message":{"role":"assistant","content":[],"api":"openai-completions","provider":"stubpar","model":"stub-1","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"pending","timestamp":1786713539128}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_start","contentIndex":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"The plan looks solid"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":" and ready to land"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_end","contentIndex":0,"content":"The plan looks solid and ready to land"}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"The plan looks solid and ready to land"}],"api":"openai-completions","provider":"stubpar","model":"stub-1","usage":{"input":12,"output":9,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":21,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","rawStopReason":"stop","timestamp":1786713539128}}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"The plan looks solid and ready to land"}],"api":"openai-completions","provider":"stubpar","model":"stub-1","usage":{"input":12,"output":9,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":21,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","rawStopReason":"stop","timestamp":1786713539128},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"user","content":[{"type":"text","text":"Say the plan verdict"}],"timestamp":1786713539126},{"role":"assistant","content":[{"type":"text","text":"The plan looks solid and ready to land"}],"api":"openai-completions","provider":"stubpar","model":"stub-1","usage":{"input":12,"output":9,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":21,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","rawStopReason":"stop","timestamp":1786713539128}],"willRetry":false}
+{"type":"agent_settled"}
