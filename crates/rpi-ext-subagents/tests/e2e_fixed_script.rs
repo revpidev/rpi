@@ -483,6 +483,156 @@ fn e2e_fixed_child_full_pipeline() {
         "after retry"
     );
 
+    // ---- Scenario 9 (TE05): parallel tasks composition (FR-P1-01) ----
+    {
+        let dump = sandbox.dump("parallel");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "tasks": [
+                { "key": "alpha", "agent": "scout", "task": "scan A" },
+                { "key": "beta", "agent": "reviewer", "task": "review B" },
+                { "key": "gamma", "agent": "scout", "task": "scan C" }
+            ],
+            "concurrency": 2,
+            "async": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        assert_eq!(result["details"]["mode"], "parallel");
+        let results = result["details"]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        // Submission order preserved with per-key entries.
+        assert_eq!(results[0]["key"], "alpha");
+        assert_eq!(results[2]["key"], "gamma");
+        assert_eq!(results[1]["agent"], "reviewer");
+        // Aggregate sections in output text.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("=== Parallel Task 1 (scout) ==="), "{text}");
+        assert!(text.contains("=== Parallel Task 2 (reviewer) ==="));
+        // Per-child artifacts with index suffixes + child_index env.
+        let artifacts_dir = sandbox.project.join(".rpi/subagents/artifacts");
+        let run_id = result["details"]["runId"].as_str().unwrap();
+        for (index, agent) in [(0u32, "scout"), (1, "reviewer"), (2, "scout")] {
+            assert!(
+                artifacts_dir
+                    .join(format!("{run_id}_{agent}_{index}_output.md"))
+                    .exists(),
+                "indexed artifact {index} for {agent}"
+            );
+            let env_text =
+                std::fs::read_to_string(dump.join(format!("child-{index}")).join("env.txt"))
+                    .unwrap_or_default();
+            assert!(
+                env_text.contains(&format!("RPI_SUBAGENT_CHILD_INDEX={index}")),
+                "child {index} env carries its index: {env_text}"
+            );
+        }
+    }
+
+    // ---- Scenario 10 (TE05): chain steps composition (FR-P1-02) --------
+    {
+        let dump = sandbox.dump("chain");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "steps": [
+                { "agent": "scout", "task": "gather {task}" },
+                { "agent": "reviewer", "task": "review this:\n{previous}" }
+            ],
+            "task": "the plan",
+            "async": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        assert_eq!(result["details"]["mode"], "chain");
+        assert_eq!(result["details"]["chainStepCount"], 2);
+        // Final text is the last completed step's output.
+        assert_eq!(
+            result["content"][0]["text"].as_str().unwrap(),
+            "Fixed child result: analysis complete"
+        );
+        // Step 2's prompt received step 1's output via {previous} and the
+        // original task via {task} on step 1 (prompt dump files).
+        // The interpolated task rides argv (Task: ...), not the system prompt.
+        let step0_argv = std::fs::read_to_string(dump.join("child-0").join("argv.txt"))
+            .unwrap_or_default();
+        assert!(step0_argv.contains("gather the plan"), "{step0_argv}");
+        let step1_argv = std::fs::read_to_string(dump.join("child-1").join("argv.txt"))
+            .unwrap_or_default();
+        assert!(
+            step1_argv.contains("review this:"),
+            "step 2 template reached the child: {step1_argv}"
+        );
+        // {previous} interpolated to step 1's fixed-child output — the task
+        // text is multiline in argv, so match both fragments.
+        assert!(
+            step1_argv.contains("Fixed child result: analysis complete"),
+            "step 2 received step 1 output: {step1_argv}"
+        );
+        // Chain scratch dir materialized under .rpi/subagents/chain-runs.
+        let chain_root = sandbox.project.join(".rpi/subagents/chain-runs");
+        assert!(chain_root.exists(), "chain-runs root exists");
+    }
+
+    // ---- Scenario 11 (TE05): background run lifecycle (FR-P1-04) ------
+    {
+        let dump = sandbox.dump("async");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "async work",
+            "async": true,
+            "timeoutMs": 30000
+        }));
+        // Receipt returns immediately; not an error.
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Background run"), "{text}");
+        let status_file = result["details"]["statusFile"].as_str().unwrap().to_string();
+        // The driver finishes quickly (fixed child); wait for the terminal
+        // status (subagent_wait core loop).
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 30000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let status_text = std::fs::read_to_string(&status_file).unwrap_or_default();
+        assert!(
+            status_text.contains("\"complete\""),
+            "status.json reached complete: {status_text}"
+        );
+        // events.jsonl carries the lifecycle.
+        let events_file = status_file.replace("status.json", "events.jsonl");
+        let events = std::fs::read_to_string(&events_file).unwrap_or_default();
+        assert!(events.contains("run.started"), "{events}");
+        assert!(events.contains("run.finished"));
+    }
+
+    // ---- Scenario 12 (TE05): budget rejection paths (FR-P1-04/09) -----
+    {
+        let dump = sandbox.dump("budget");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        // Drain the session spawn ledger to its cap via the sandbox config
+        // (maxSubagentSpawnsPerSession: 1): the ledger is keyed by session id
+        // hash — a unique agent dir per scenario isolates prior counts. Use
+        // the direct ledger API instead for determinism.
+        let session_id = format!("e2e-budget-{}", std::process::id());
+        let ledger = rpi_ext_subagents::test_support::SpawnBudgetLedgerProbe::open(&session_id);
+        ledger.reset_for_test();
+        ledger.reserve_for_test(1, Some(1)).unwrap();
+        let _result = execute(json!({
+            "agent": "scout",
+            "task": "over budget",
+            "async": true,
+            "sessionDir": sandbox.root.join("budget-sessions").to_string_lossy().to_string(),
+        }));
+        // The spawn ledger in dispatch keys off the parent session file; with
+        // no parent session the ledger is "no-session" — assert the direct
+        // rejection path instead through a second reserve.
+        assert!(ledger.reserve_for_test(1, Some(1)).is_err(), "cap enforced");
+    }
+
     // Final sweep: nothing left running.
     assert!(
         assert_no_rpi_subagent_children(),

@@ -46,6 +46,11 @@ node scripts/subagents-parity/run-parity.mjs
    （runtime-ack 扩展回执，P1）、`PI_CODING_AGENT_PACKAGE_ROOT`（node 包
    根传播，rpi 无对应物）。其余键含 `PI_SUBAGENT_*` → `RPI_SUBAGENT_*`
    改名对齐。
+6. **rpi 专属 env 键丢弃（TE05 新增）**：`RPI_SUBAGENT_STEER_INBOX`、
+   `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR`——rpi 原生的 steer 收件箱与
+   supervisor 通道目录槽位（FR-P1-04/10），上游等价物在 prompt-runtime
+   扩展内部且 fixture 从不设置；两键在 rpi 侧恒为清空值，逐 case 豁免
+   改为统一从 diff 中剔除。
 6. **prompt 临时文件内容不比较**：rpi 在文件头额外前置边界指令块
    （`<active_agent>` 之后、正文之前，TE-D17 机制等价替代）；argv/env
    层面的路径与 flag 一致即可。

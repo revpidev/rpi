@@ -10,24 +10,38 @@ use std::io::Write;
 fn main() {
     let mode = std::env::var("RPI_E2E_MODE").unwrap_or_else(|_| "ok".to_string());
     if let Ok(dump_dir) = std::env::var("RPI_E2E_DUMP_DIR") {
+        // TE05: parallel children dump into `child-<index>/` alongside the
+        // flat files (flat keeps the P0 single-run assertions stable;
+        // index 0 also lands in child-0/ for composite scenarios).
+        let child_index = std::env::var("RPI_SUBAGENT_CHILD_INDEX").ok();
+        let indexed_dir = child_index.as_deref().map(|index| {
+            std::path::PathBuf::from(&dump_dir).join(format!("child-{index}"))
+        });
+        if let Some(indexed) = &indexed_dir {
+            let _ = std::fs::create_dir_all(indexed);
+        }
         let _ = std::fs::create_dir_all(&dump_dir);
         let args: Vec<String> = std::env::args().collect();
         let _ = std::fs::write(
             std::path::Path::new(&dump_dir).join("argv.txt"),
             args.join("\n"),
         );
+        if let Some(indexed) = &indexed_dir {
+            let _ = std::fs::write(indexed.join("argv.txt"), args.join("\n"));
+        }
         let mut env_pairs: Vec<(String, String)> = std::env::vars()
             .filter(|(key, _)| key.starts_with("RPI_") || key.starts_with("MCP") || key == "PATH")
             .collect();
         env_pairs.sort();
-        let _ = std::fs::write(
-            std::path::Path::new(&dump_dir).join("env.txt"),
-            env_pairs
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        let env_text = env_pairs
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::write(std::path::Path::new(&dump_dir).join("env.txt"), &env_text);
+        if let Some(indexed) = &indexed_dir {
+            let _ = std::fs::write(indexed.join("env.txt"), &env_text);
+        }
         let _ = std::fs::write(
             std::path::Path::new(&dump_dir).join("pid.txt"),
             std::process::id().to_string(),
@@ -40,8 +54,11 @@ fn main() {
                     if let Ok(content) = std::fs::read_to_string(path) {
                         let _ = std::fs::write(
                             std::path::Path::new(&dump_dir).join("prompt.md"),
-                            content,
+                            &content,
                         );
+                        if let Some(indexed) = &indexed_dir {
+                            let _ = std::fs::write(indexed.join("prompt.md"), &content);
+                        }
                         #[cfg(unix)]
                         if let Ok(meta) = std::fs::metadata(path) {
                             use std::os::unix::fs::PermissionsExt;

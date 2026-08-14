@@ -745,11 +745,66 @@ fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
     }
 }
 
+/// Integration-test probes (not part of the plugin surface): budget-ledger
+/// access for deterministic rejection scenarios.
+pub mod test_support {
+    /// Thin wrapper over the session spawn-budget ledger.
+    pub struct SpawnBudgetLedgerProbe {
+        ledger: crate::runner::background::SpawnBudgetLedger,
+        session_id: String,
+    }
+
+    impl SpawnBudgetLedgerProbe {
+        pub fn open(session_id: &str) -> Self {
+            Self {
+                ledger: crate::runner::background::SpawnBudgetLedger::open(session_id),
+                session_id: session_id.to_string(),
+            }
+        }
+
+        /// Remove the ledger file (test isolation).
+        pub fn reset_for_test(&self) {
+            let _ = std::fs::remove_file(crate::runner::background::spawn_budgets_dir().join(
+                format!("{}.json", self.session_id),
+            ));
+            // The real filename is hashed; remove via the probe path list.
+            // (SpawnBudgetLedger paths are hash-keyed; the reset removes
+            // every file in the budgets dir for test isolation.)
+            if let Ok(entries) =
+                std::fs::read_dir(crate::runner::background::spawn_budgets_dir())
+            {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+
+        pub fn reserve_for_test(
+            &self,
+            amount: u64,
+            limit: Option<u64>,
+        ) -> Result<(), String> {
+            self.ledger.reserve(amount, limit)
+        }
+    }
+}
+
 /// Test seam: drive a tool execution against an installed state.
 pub fn execute_for_test(params: &Value) -> Value {
     dispatch_message(&json!({
         "kind": "toolExecute",
         "toolName": "subagent",
+        "toolCallId": "test",
+        "params": params,
+    }))
+}
+
+/// Test seam: drive a named tool execution (subagent_wait, supervisor tools)
+/// against an installed state.
+pub fn execute_tool_for_test(tool_name: &str, params: &Value) -> Value {
+    dispatch_message(&json!({
+        "kind": "toolExecute",
+        "toolName": tool_name,
         "toolCallId": "test",
         "params": params,
     }))

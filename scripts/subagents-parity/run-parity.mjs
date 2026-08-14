@@ -99,7 +99,17 @@ function normalizeOutput(output) {
 	}
 	if (clone?.env) {
 		const sorted = {};
+		// rpi-only env keys with no upstream counterpart (TE05): the steer
+		// inbox and supervisor channel are rpi-native channel mechanisms
+		// (upstream rides the prompt-runtime extension + PI_-prefixed vars
+		// the fixtures never set), so cleared/absent values are excluded
+		// from the diff instead of whitelisted per case.
+		const RPI_ONLY_ENV_KEYS = new Set([
+			"RPI_SUBAGENT_STEER_INBOX",
+			"RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
+		]);
 		for (const key of Object.keys(clone.env).sort()) {
+			if (RPI_ONLY_ENV_KEYS.has(key)) continue;
 			sorted[key] = String(clone.env[key]).replace(
 				/\/tmp\/(pi|rpi)-subagent-[A-Za-z0-9_-]+/g,
 				"<TMPDIR>",
