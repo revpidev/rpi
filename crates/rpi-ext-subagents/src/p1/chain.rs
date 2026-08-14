@@ -140,7 +140,10 @@ pub fn parse_steps(steps: &Value) -> Result<Vec<StepSpec>, String> {
             output,
             reads,
             skills,
-            progress: object.get("progress").and_then(Value::as_bool).unwrap_or(false),
+            progress: object
+                .get("progress")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             binding,
             timeout_ms: match object.get("timeoutMs") {
                 Some(Value::Number(n)) if n.is_u64() && n.as_u64().unwrap_or(0) > 0 => n.as_u64(),
@@ -300,7 +303,10 @@ pub fn build_chain_instructions(
                 progress_path.to_string_lossy()
             ));
         } else {
-            suffix_parts.push(format!("Update progress at: {}", progress_path.to_string_lossy()));
+            suffix_parts.push(format!(
+                "Update progress at: {}",
+                progress_path.to_string_lossy()
+            ));
         }
     }
     if let Some(summary) = previous_summary {
@@ -358,10 +364,7 @@ pub async fn run_chain_async(
     if progress_requested {
         // `writeInitialProgressFile` (settings.ts:371).
         let _ = std::fs::create_dir_all(&chain_dir);
-        let _ = std::fs::write(
-            chain_dir.join("progress.md"),
-            INITIAL_PROGRESS_CONTENT,
-        );
+        let _ = std::fs::write(chain_dir.join("progress.md"), INITIAL_PROGRESS_CONTENT);
     }
     let usage_budget = ctx.usage_budget.clone();
     let mut accumulated_cost = 0.0f64;
@@ -385,16 +388,19 @@ pub async fn run_chain_async(
         // Step-level behavior resolution (resolveStepBehavior L272-299):
         // step override > agent frontmatter > false.
         let output_override = match &step.output {
-            OutputOverride::Path(path) => Some(resolve_chain_path(
-                &path.to_string_lossy(),
-                &chain_dir,
-            )),
+            OutputOverride::Path(path) => {
+                Some(resolve_chain_path(&path.to_string_lossy(), &chain_dir))
+            }
             OutputOverride::Disabled => None,
-            OutputOverride::Inherit => agent.output.as_deref().map(|raw| {
-                resolve_chain_path(raw, &chain_dir)
-            }),
+            OutputOverride::Inherit => agent
+                .output
+                .as_deref()
+                .map(|raw| resolve_chain_path(raw, &chain_dir)),
         };
-        let reads: Vec<String> = step.reads.clone().unwrap_or_else(|| agent.default_reads.clone());
+        let reads: Vec<String> = step
+            .reads
+            .clone()
+            .unwrap_or_else(|| agent.default_reads.clone());
         let skills = step.skills.clone().unwrap_or_else(|| agent.skills.clone());
         let progress = step.progress || agent.default_progress;
         let is_first_progress = progress && !first_progress_seen;
@@ -494,7 +500,8 @@ mod tests {
     fn output_references_resolve() {
         let mut outputs = BTreeMap::new();
         outputs.insert("scan".to_string(), "the scan".to_string());
-        let text = resolve_output_references("Combine {outputs.scan} and {outputs.missing}", &outputs);
+        let text =
+            resolve_output_references("Combine {outputs.scan} and {outputs.missing}", &outputs);
         assert_eq!(text, "Combine the scan and {outputs.missing}");
         // Unclosed reference passes through untouched.
         let text = resolve_output_references("tail {outputs.scan", &outputs);
@@ -509,7 +516,14 @@ mod tests {
         // Empty template → default ({task} first step, {previous} later).
         let text = interpolate_task("", "{task}", "ORIGINAL", None, &outputs, &chain_dir);
         assert_eq!(text, "ORIGINAL");
-        let text = interpolate_task("", "{previous}", "ORIGINAL", Some("PREV"), &outputs, &chain_dir);
+        let text = interpolate_task(
+            "",
+            "{previous}",
+            "ORIGINAL",
+            Some("PREV"),
+            &outputs,
+            &chain_dir,
+        );
         assert_eq!(text, "PREV");
         // Full stack: outputs → task → previous → chain_dir.
         let text = interpolate_task(

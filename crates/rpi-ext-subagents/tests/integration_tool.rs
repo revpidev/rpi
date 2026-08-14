@@ -73,7 +73,10 @@ fn tool_surface_integration() {
     // FR-P1-04); the async path has its own assertions above.
     std::fs::create_dir_all(dir.join("agent").join("extensions").join("subagent")).unwrap();
     std::fs::write(
-        dir.join("agent").join("extensions").join("subagent").join("config.json"),
+        dir.join("agent")
+            .join("extensions")
+            .join("subagent")
+            .join("config.json"),
         r#"{"asyncByDefault": false}"#,
     )
     .unwrap();

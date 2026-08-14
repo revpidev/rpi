@@ -391,18 +391,22 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
     };
     let mut config = ModelScopeConfig::default();
     if let Some(enforce) = object.get("enforce") {
-        config.enforce = Some(enforce.as_bool().ok_or_else(|| {
-            "have invalid 'modelScope.enforce'; expected a boolean.".to_string()
-        })?);
+        config.enforce =
+            Some(enforce.as_bool().ok_or_else(|| {
+                "have invalid 'modelScope.enforce'; expected a boolean.".to_string()
+            })?);
     }
     if let Some(strict) = object.get("strict") {
-        config.strict = Some(strict.as_bool().ok_or_else(|| {
-            "have invalid 'modelScope.strict'; expected a boolean.".to_string()
-        })?);
+        config.strict =
+            Some(strict.as_bool().ok_or_else(|| {
+                "have invalid 'modelScope.strict'; expected a boolean.".to_string()
+            })?);
     }
     if let Some(allow) = object.get("allow") {
         let Some(items) = allow.as_array() else {
-            return Err("have invalid 'modelScope.allow'; expected an array of strings.".to_string());
+            return Err(
+                "have invalid 'modelScope.allow'; expected an array of strings.".to_string(),
+            );
         };
         let mut patterns = Vec::new();
         for item in items {
@@ -444,7 +448,9 @@ pub fn resolve_subagent_model_override(
     };
     let resolved = match explicit {
         None => parent_model.map(|(provider, id)| format!("{provider}/{id}")),
-        Some(explicit) => resolve_model_candidate(Some(explicit), available_models, preferred_provider),
+        Some(explicit) => {
+            resolve_model_candidate(Some(explicit), available_models, preferred_provider)
+        }
     };
     if let Some(resolved) = resolved.as_deref() {
         if scope.is_some_and(|s| s.enforced()) {
@@ -519,7 +525,8 @@ pub fn build_model_candidates(
         let Some(raw) = raw_entry else {
             continue;
         };
-        let Some(normalized) = resolve_model_candidate(Some(raw), available_models, preferred_provider)
+        let Some(normalized) =
+            resolve_model_candidate(Some(raw), available_models, preferred_provider)
         else {
             continue;
         };
@@ -529,7 +536,9 @@ pub fn build_model_candidates(
         if (index > 0 || scope.is_some_and(|s| s.strict == Some(true)))
             && scope.is_some_and(|s| s.enforced())
         {
-            if let Some(violation) = check_model_scope(Some(&normalized), scope, ModelSource::Inherited) {
+            if let Some(violation) =
+                check_model_scope(Some(&normalized), scope, ModelSource::Inherited)
+            {
                 if violation.is_error {
                     return Err(violation.message);
                 }
@@ -672,13 +681,13 @@ mod tests {
 
     #[test]
     fn date_stamp_stripping() {
-        assert_eq!(
-            strip_trailing_date_stamp("claude-5-2025-10-01"),
-            "claude-5"
-        );
+        assert_eq!(strip_trailing_date_stamp("claude-5-2025-10-01"), "claude-5");
         assert_eq!(strip_trailing_date_stamp("claude-5-20251001"), "claude-5");
         // Implausible dates stay.
-        assert_eq!(strip_trailing_date_stamp("claude-5-3050-13-45"), "claude-5-3050-13-45");
+        assert_eq!(
+            strip_trailing_date_stamp("claude-5-3050-13-45"),
+            "claude-5-3050-13-45"
+        );
     }
 
     #[test]
@@ -703,7 +712,10 @@ mod tests {
             Some("openai/gpt-5.5".to_string())
         );
         // Qualified query never crosses providers.
-        assert_eq!(fuzzy_resolve_model("openai/claude-5", &registry, None), None);
+        assert_eq!(
+            fuzzy_resolve_model("openai/claude-5", &registry, None),
+            None
+        );
         // Unknown model: no match.
         assert_eq!(fuzzy_resolve_model("nope", &registry, None), None);
     }
@@ -743,7 +755,10 @@ mod tests {
     fn scope_glob_matching() {
         assert!(matches_scope_pattern("anthropic/claude-5", "anthropic/*"));
         assert!(matches_scope_pattern("Anthropic/Claude-5", "anthropic/*"));
-        assert!(matches_scope_pattern("anthropic/claude-5:high", "anthropic/*"));
+        assert!(matches_scope_pattern(
+            "anthropic/claude-5:high",
+            "anthropic/*"
+        ));
         assert!(!matches_scope_pattern("openai/gpt-4o", "anthropic/*"));
         assert!(matches_scope_pattern("openai/gpt-4o", "*/gpt-*"));
         // Regex specials are escaped: a pattern dot only matches a dot.
@@ -758,15 +773,15 @@ mod tests {
             allow: Some(vec!["anthropic/*".to_string()]),
         };
         let violation =
-            check_model_scope(Some("openai/gpt-4o"), Some(&scope), ModelSource::Explicit)
-                .unwrap();
+            check_model_scope(Some("openai/gpt-4o"), Some(&scope), ModelSource::Explicit).unwrap();
         assert!(violation.is_error);
         let violation =
-            check_model_scope(Some("openai/gpt-4o"), Some(&scope), ModelSource::Inherited)
-                .unwrap();
+            check_model_scope(Some("openai/gpt-4o"), Some(&scope), ModelSource::Inherited).unwrap();
         assert!(!violation.is_error);
         // In-scope → None; no allow list → None.
-        assert!(check_model_scope(Some("anthropic/x"), Some(&scope), ModelSource::Explicit).is_none());
+        assert!(
+            check_model_scope(Some("anthropic/x"), Some(&scope), ModelSource::Explicit).is_none()
+        );
         let empty = ModelScopeConfig {
             enforce: Some(true),
             strict: None,
@@ -841,7 +856,10 @@ mod tests {
         };
         let candidates = build_model_candidates(
             Some("claude-5"),
-            &["openai/gpt-4o".to_string(), "anthropic/claude-5".to_string()],
+            &[
+                "openai/gpt-4o".to_string(),
+                "anthropic/claude-5".to_string(),
+            ],
             Some(&registry),
             None,
             Some(&scope),
@@ -856,8 +874,12 @@ mod tests {
     #[test]
     fn retryable_failure_classification() {
         assert!(is_retryable_model_failure(Some("rate limit exceeded")));
-        assert!(is_retryable_model_failure(Some("Error 429: too many requests")));
-        assert!(is_retryable_model_failure(Some("model overloaded, try again")));
+        assert!(is_retryable_model_failure(Some(
+            "Error 429: too many requests"
+        )));
+        assert!(is_retryable_model_failure(Some(
+            "model overloaded, try again"
+        )));
         assert!(!is_retryable_model_failure(None));
         // Tool failures inside the child are not model failures — but the
         // upstream prefix only anchors to single-token tool names, so

@@ -75,15 +75,19 @@ pub fn ensure_channel(dir: &Path) {
 }
 
 /// `formatChildMessage` header (L151): reason title + run context lines.
-pub fn format_child_message(reason: &str, run_id: &str, agent: &str, child_index: usize, message: &str) -> String {
+pub fn format_child_message(
+    reason: &str,
+    run_id: &str,
+    agent: &str,
+    child_index: usize,
+    message: &str,
+) -> String {
     let title = match reason {
         "need_decision" => "Subagent needs a decision",
         "interview_request" => "Subagent requests structured input",
         _ => "Subagent progress update",
     };
-    format!(
-        "{title}\nRun: {run_id}\nAgent: {agent}\nChild index: {child_index}\n\n{message}"
-    )
+    format!("{title}\nRun: {run_id}\nAgent: {agent}\nChild index: {child_index}\n\n{message}")
 }
 
 /// One pending request projected for the parent listing.
@@ -103,11 +107,7 @@ pub fn read_requests(dir: &Path) -> Vec<Value> {
             }
         }
     }
-    requests.sort_by(|a, b| {
-        a["createdAt"]
-            .as_str()
-            .cmp(&b["createdAt"].as_str())
-    });
+    requests.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
     requests
 }
 
@@ -136,9 +136,10 @@ impl ChildSupervisorContext {
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
             .unwrap_or(0);
-        let orchestrator_session_id = std::env::var(crate::launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
-            .ok()
-            .unwrap_or_default();
+        let orchestrator_session_id =
+            std::env::var(crate::launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
+                .ok()
+                .unwrap_or_default();
         Some(Self {
             channel_dir: PathBuf::from(channel_dir),
             run_id,
@@ -173,13 +174,16 @@ impl ChildSupervisorContext {
             reason,
             "need_decision" | "interview_request" | "progress_update"
         ) {
-            return error_result("reason must be need_decision, interview_request, or progress_update.");
+            return error_result(
+                "reason must be need_decision, interview_request, or progress_update.",
+            );
         }
         let message = params
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let formatted = format_child_message(reason, &self.run_id, &self.agent, self.child_index, message);
+        let formatted =
+            format_child_message(reason, &self.run_id, &self.agent, self.child_index, message);
         let request_id = crate::runner::budget::random_run_id();
         let request = json!({
             "type": "subagent.supervisor.request",
@@ -196,10 +200,15 @@ impl ChildSupervisorContext {
         });
         let serialized = request.to_string();
         if serialized.len() > MAX_REQUEST_BYTES {
-            return error_result("supervisor request exceeds the 64 KiB channel limit; shorten the message.");
+            return error_result(
+                "supervisor request exceeds the 64 KiB channel limit; shorten the message.",
+            );
         }
         ensure_channel(&self.channel_dir);
-        let request_path = self.channel_dir.join("requests").join(format!("{request_id}.json"));
+        let request_path = self
+            .channel_dir
+            .join("requests")
+            .join(format!("{request_id}.json"));
         if let Err(error) = std::fs::write(&request_path, serialized) {
             return error_result(&format!("failed to write the supervisor request: {error}"));
         }
@@ -208,7 +217,10 @@ impl ChildSupervisorContext {
             return ok_result("Progress update delivered.");
         }
         // Poll the reply inbox (≤500ms interval, 10min timeout, L272-279).
-        let reply_path = self.channel_dir.join("replies").join(format!("{request_id}.json"));
+        let reply_path = self
+            .channel_dir
+            .join("replies")
+            .join(format!("{request_id}.json"));
         let deadline = Instant::now() + Duration::from_millis(DEFAULT_ASK_TIMEOUT_MS);
         loop {
             if let Ok(raw) = std::fs::read_to_string(&reply_path) {
@@ -222,11 +234,14 @@ impl ChildSupervisorContext {
                 if reason == "interview_request" {
                     // Fenced JSON extraction (L179-189).
                     if let Some(start) = message.find("```") {
-                        if let Some(body) = message[start + 3..].strip_prefix("json\n").or_else(|| {
-                            message[start + 3..].split_once('\n').map(|(_, rest)| rest)
-                        }) {
+                        if let Some(body) = message[start + 3..]
+                            .strip_prefix("json\n")
+                            .or_else(|| message[start + 3..].split_once('\n').map(|(_, rest)| rest))
+                        {
                             if let Some(end) = body.find("```") {
-                                if let Ok(parsed) = serde_json::from_str::<Value>(body[..end].trim()) {
+                                if let Ok(parsed) =
+                                    serde_json::from_str::<Value>(body[..end].trim())
+                                {
                                     return json!({
                                         "content": [{ "type": "text", "text": message }],
                                         "details": { "structured": parsed },
@@ -311,7 +326,10 @@ pub fn parent_supervisor_action(
             // see it, so the id alone is the key).
             if let Ok(channel_entries) = std::fs::read_dir(channels_root) {
                 for channel in channel_entries.flatten() {
-                    let request_path = channel.path().join("requests").join(format!("{reply_to}.json"));
+                    let request_path = channel
+                        .path()
+                        .join("requests")
+                        .join(format!("{reply_to}.json"));
                     if !request_path.exists() {
                         continue;
                     }
@@ -332,7 +350,9 @@ pub fn parent_supervisor_action(
                     return ok_result(&format!("Replied to supervisor request {reply_to}."));
                 }
             }
-            error_result(&format!("No pending supervisor request matches '{reply_to}'."))
+            error_result(&format!(
+                "No pending supervisor request matches '{reply_to}'."
+            ))
         }
         other => error_result(&format!(
             "Unknown subagent_supervisor action \"{other}\". Supported: pending, reply."
@@ -403,13 +423,21 @@ mod tests {
         assert_eq!(tools.as_ref().unwrap().len(), 1);
 
         apply_intercom_bridge("fork-only", Some("fork"), &mut tools, &mut prompt);
-        assert!(tools.as_ref().unwrap().contains(&"contact_supervisor".to_string()));
+        assert!(tools
+            .as_ref()
+            .unwrap()
+            .contains(&"contact_supervisor".to_string()));
         assert!(prompt.contains("Intercom orchestration channel:"));
 
         apply_intercom_bridge("always", None, &mut tools, &mut prompt);
         // Idempotent: no duplicate tool or prompt block.
         assert_eq!(
-            tools.as_ref().unwrap().iter().filter(|t| *t == "contact_supervisor").count(),
+            tools
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|t| *t == "contact_supervisor")
+                .count(),
             1
         );
         assert_eq!(prompt.matches("Intercom orchestration channel:").count(), 1);
@@ -443,14 +471,12 @@ mod tests {
 
         // Owning session sees it and can reply.
         let pending = parent_supervisor_action("pending", None, None, "session-a", &root);
-        assert!(pending["content"][0]["text"].as_str().unwrap().contains("req1"));
-        let reply = parent_supervisor_action(
-            "reply",
-            Some("req1"),
-            Some("Ship it."),
-            "session-a",
-            &root,
-        );
+        assert!(pending["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("req1"));
+        let reply =
+            parent_supervisor_action("reply", Some("req1"), Some("Ship it."), "session-a", &root);
         assert_eq!(reply["isError"], Value::Bool(false));
         assert!(channel.join("replies").join("req1.json").exists());
         assert!(!channel.join("requests").join("req1.json").exists());

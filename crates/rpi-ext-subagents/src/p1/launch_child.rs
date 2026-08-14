@@ -145,8 +145,7 @@ fn resolve_call_timeout(object: &serde_json::Map<String, Value>) -> Option<u64> 
 
 /// Acceptance ledger per child run (FR-P1-09) — keyed by run id + child
 /// index; the details assembly drains it.
-pub static GATE_LEDGER: Mutex<BTreeMap<String, (u32, Value)>> =
-    Mutex::new(BTreeMap::new());
+pub static GATE_LEDGER: Mutex<BTreeMap<String, (u32, Value)>> = Mutex::new(BTreeMap::new());
 
 /// `getSubagentSessionRoot` fallback (extension/index.ts:224-231): no parent
 /// session → a fresh temp directory.
@@ -215,15 +214,16 @@ impl RunCtx {
                     .unwrap_or_else(mkdtemp_session_root),
             },
         };
-        let session_root = if object.get("sessionDir").is_some() || config.default_session_dir.is_some()
-        {
-            session_root
-        } else {
-            session_root.join(&run_id)
-        };
+        let session_root =
+            if object.get("sessionDir").is_some() || config.default_session_dir.is_some() {
+                session_root
+            } else {
+                session_root.join(&run_id)
+            };
         let artifacts_enabled = object.get("artifacts") != Some(&Value::Bool(false));
-        let preference = crate::artifacts::ArtifactDirPreference::parse(Some(config.artifact_dir_preference()))
-            .unwrap_or(crate::artifacts::ArtifactDirPreference::Project);
+        let preference =
+            crate::artifacts::ArtifactDirPreference::parse(Some(config.artifact_dir_preference()))
+                .unwrap_or(crate::artifacts::ArtifactDirPreference::Project);
         let artifacts_dir = artifacts_enabled.then(|| {
             crate::artifacts::get_artifacts_dir(
                 parent_session_file.as_deref(),
@@ -325,7 +325,8 @@ pub async fn run_child_async(
         let branch_file = if spec.child_index == 0 {
             ctx.session_root.join("fork.jsonl")
         } else {
-            ctx.session_root.join(format!("fork-{}.jsonl", spec.child_index))
+            ctx.session_root
+                .join(format!("fork-{}.jsonl", spec.child_index))
         };
         match session_fork::create_fork_session(
             ctx.parent_session_file.as_deref(),
@@ -395,7 +396,10 @@ pub async fn run_child_async(
         Some(skills) => skills.clone(),
         None => agent.skills.clone(),
     };
-    let skill_cwd = spec.skill_primary_cwd.clone().unwrap_or_else(|| effective_cwd.clone());
+    let skill_cwd = spec
+        .skill_primary_cwd
+        .clone()
+        .unwrap_or_else(|| effective_cwd.clone());
     let (resolved_skills, missing_skills) = skills::resolve_skills_with_fallback(
         &skill_names,
         &skill_cwd,
@@ -504,7 +508,10 @@ pub async fn run_child_async(
 
     let child_max_depth = budget::resolve_child_max_depth(
         budget::resolve_current_max_depth(
-            ctx.config.max_subagent_depth.as_ref().and_then(Value::as_u64),
+            ctx.config
+                .max_subagent_depth
+                .as_ref()
+                .and_then(Value::as_u64),
         ),
         agent.max_subagent_depth,
     );
@@ -527,12 +534,10 @@ pub async fn run_child_async(
         &mut child_tools,
         &mut bridge_prompt_source,
     );
-    let supervisor_channel = if bridge_prompt_source != system_prompt || child_tools != agent.tools {
-        let dir = crate::p1::supervisor::channel_dir(
-            &ctx.run_id,
-            &agent.name,
-            spec.child_index as usize,
-        );
+    let supervisor_channel = if bridge_prompt_source != system_prompt || child_tools != agent.tools
+    {
+        let dir =
+            crate::p1::supervisor::channel_dir(&ctx.run_id, &agent.name, spec.child_index as usize);
         crate::p1::supervisor::ensure_channel(&dir);
         Some(dir)
     } else {

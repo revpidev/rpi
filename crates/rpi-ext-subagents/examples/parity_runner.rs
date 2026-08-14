@@ -169,8 +169,8 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        let line = serde_json::to_string(&json!({ "name": name, "output": output }))
-            .unwrap_or_default();
+        let line =
+            serde_json::to_string(&json!({ "name": name, "output": output })).unwrap_or_default();
         println!("{line}");
     }
 }

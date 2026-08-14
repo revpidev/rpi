@@ -553,11 +553,11 @@ fn e2e_fixed_child_full_pipeline() {
         // Step 2's prompt received step 1's output via {previous} and the
         // original task via {task} on step 1 (prompt dump files).
         // The interpolated task rides argv (Task: ...), not the system prompt.
-        let step0_argv = std::fs::read_to_string(dump.join("child-0").join("argv.txt"))
-            .unwrap_or_default();
+        let step0_argv =
+            std::fs::read_to_string(dump.join("child-0").join("argv.txt")).unwrap_or_default();
         assert!(step0_argv.contains("gather the plan"), "{step0_argv}");
-        let step1_argv = std::fs::read_to_string(dump.join("child-1").join("argv.txt"))
-            .unwrap_or_default();
+        let step1_argv =
+            std::fs::read_to_string(dump.join("child-1").join("argv.txt")).unwrap_or_default();
         assert!(
             step1_argv.contains("review this:"),
             "step 2 template reached the child: {step1_argv}"
@@ -588,7 +588,10 @@ fn e2e_fixed_child_full_pipeline() {
         assert_eq!(result["isError"], Value::Bool(false), "{result}");
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Background run"), "{text}");
-        let status_file = result["details"]["statusFile"].as_str().unwrap().to_string();
+        let status_file = result["details"]["statusFile"]
+            .as_str()
+            .unwrap()
+            .to_string();
         // The driver finishes quickly (fixed child); wait for the terminal
         // status (subagent_wait core loop).
         let wait = rpi_ext_subagents::execute_tool_for_test(

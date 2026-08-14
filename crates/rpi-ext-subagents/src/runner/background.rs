@@ -72,20 +72,28 @@ pub struct AsyncControl {
 
 impl AsyncControl {
     pub fn request_stop(&self) {
-        *self.stop_requested.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *self
+            .stop_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
     }
     pub fn stop_requested(&self) -> bool {
-        *self.stop_requested.lock().unwrap_or_else(|e| e.into_inner())
+        *self
+            .stop_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
     pub fn request_interrupt(&self) {
-        *self.interrupt_requested.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *self
+            .interrupt_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = true;
     }
 }
 
 /// Registry of live and recently finished async runs (process-wide; one host
 /// process at a time owns each run, per ADR-0019 ownership rules).
-pub static ASYNC_RUNS: Mutex<BTreeMap<String, Arc<AsyncRunHandle>>> =
-    Mutex::new(BTreeMap::new());
+pub static ASYNC_RUNS: Mutex<BTreeMap<String, Arc<AsyncRunHandle>>> = Mutex::new(BTreeMap::new());
 
 fn register_run(handle: Arc<AsyncRunHandle>) {
     ASYNC_RUNS
@@ -127,10 +135,7 @@ pub fn status_snapshot(handle: &AsyncRunHandle) -> Value {
 }
 
 fn update_status(handle: &AsyncRunHandle, mutate: impl FnOnce(&mut Value)) {
-    let mut status = handle
-        .status
-        .write()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
     mutate(&mut status);
     status["updatedAt"] = json!(iso8601(now_millis()));
     let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
@@ -257,7 +262,6 @@ impl SpawnBudgetLedger {
         self.write(&state);
         Ok(next)
     }
-
 }
 
 /// Active async capacity slots (active-async-capacity.ts): one owner file per
@@ -273,7 +277,9 @@ impl ActiveAsyncCapacity {
             dir: spawn_budgets_dir()
                 .parent()
                 .map(|p| p.join("session-active-async-capacity"))
-                .unwrap_or_else(|| crate::paths::temp_root_dir().join("session-active-async-capacity"))
+                .unwrap_or_else(|| {
+                    crate::paths::temp_root_dir().join("session-active-async-capacity")
+                })
                 .join(sha256_hex(session_id)),
         }
     }
@@ -384,11 +390,7 @@ pub fn receipt(run_id: &str, run_dir: &Path) -> Value {
 }
 
 /// Initialize the run directory and status document, register the run.
-pub fn start_run(
-    run_id: &str,
-    session_id: Option<&str>,
-    body: &AsyncBody,
-) -> Arc<AsyncRunHandle> {
+pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Arc<AsyncRunHandle> {
     let run_dir = async_runs_dir().join(run_id);
     let _ = std::fs::create_dir_all(run_dir.join("control"));
     let status = Arc::new(RwLock::new(json!({
@@ -433,8 +435,6 @@ pub fn start_run(
     register_run(handle.clone());
     handle
 }
-
-
 
 /// Drive one async run to a terminal state. Called as a spawned runtime
 /// task; performs the composite body, updates the status document, writes the
@@ -498,17 +498,30 @@ pub async fn drive_run(
                 Err(error) => finish_failed(&handle, &error, &notify).await,
             }
         }
-        AsyncBody::Tasks { entries, concurrency } => {
+        AsyncBody::Tasks {
+            entries,
+            concurrency,
+        } => {
             for (index, _) in entries.iter().enumerate() {
                 mark_step(&handle, index, "queued");
             }
-            match crate::p1::parallel::run_parallel_async(&entries, &agents, &ctx, concurrency, None)
-                .await
+            match crate::p1::parallel::run_parallel_async(
+                &entries,
+                &agents,
+                &ctx,
+                concurrency,
+                None,
+            )
+            .await
             {
                 Ok(outcomes) => {
                     let mut aggregate = String::new();
                     for (index, outcome) in outcomes.iter().enumerate() {
-                        let state = if outcome.exit_code == 0 { "complete" } else { "failed" };
+                        let state = if outcome.exit_code == 0 {
+                            "complete"
+                        } else {
+                            "failed"
+                        };
                         mark_step(&handle, index, state);
                         set_step_field(&handle, index, |step| {
                             step["exitCode"] = json!(outcome.exit_code);
@@ -522,7 +535,11 @@ pub async fn drive_run(
                     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
                     finish(
                         &handle,
-                        if any_failed { STATE_FAILED } else { STATE_COMPLETE },
+                        if any_failed {
+                            STATE_FAILED
+                        } else {
+                            STATE_COMPLETE
+                        },
                         aggregate.trim(),
                         &notify,
                     )
@@ -531,12 +548,23 @@ pub async fn drive_run(
                 Err(error) => finish_failed(&handle, &error, &notify).await,
             }
         }
-        AsyncBody::Steps { steps, original_task } => {
+        AsyncBody::Steps {
+            steps,
+            original_task,
+        } => {
             mark_step(&handle, 0, "running");
             match crate::p1::chain::run_chain_async(&steps, &agents, &ctx, &original_task).await {
                 Ok((completed, failed)) => {
                     for step in &completed {
-                        mark_step(&handle, step.index, if step.exit_code == 0 { "complete" } else { "failed" });
+                        mark_step(
+                            &handle,
+                            step.index,
+                            if step.exit_code == 0 {
+                                "complete"
+                            } else {
+                                "failed"
+                            },
+                        );
                         set_step_field(&handle, step.index, |target| {
                             target["exitCode"] = json!(step.exit_code);
                             if let Some(error) = &step.error {
@@ -551,8 +579,12 @@ pub async fn drive_run(
                     match failed {
                         Some(failure) => {
                             mark_step(&handle, failure.index, "failed");
-                            finish_failed(&handle, failure.error.as_deref().unwrap_or("chain step failed"), &notify)
-                                .await
+                            finish_failed(
+                                &handle,
+                                failure.error.as_deref().unwrap_or("chain step failed"),
+                                &notify,
+                            )
+                            .await
                         }
                         None => finish(&handle, STATE_COMPLETE, &last_output, &notify).await,
                     }
@@ -583,9 +615,17 @@ fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnc
     });
 }
 
-fn record_step_result(handle: &Arc<AsyncRunHandle>, index: usize, result: &crate::runner::foreground::ForegroundRunResult) {
+fn record_step_result(
+    handle: &Arc<AsyncRunHandle>,
+    index: usize,
+    result: &crate::runner::foreground::ForegroundRunResult,
+) {
     set_step_field(handle, index, |step| {
-        step["status"] = if result.exit_code == 0 { json!("complete") } else { json!("failed") };
+        step["status"] = if result.exit_code == 0 {
+            json!("complete")
+        } else {
+            json!("failed")
+        };
         step["exitCode"] = json!(result.exit_code);
         if let Some(model) = &result.model {
             step["model"] = json!(model);
@@ -642,7 +682,8 @@ impl AsyncNotify {
             });
             // sendMessage is synchronous through the ABI envelope; fire it
             // and treat acceptance as any non-error response.
-            let response = crate::host_call_static(calls, "sendMessage", json!({ "message": message }));
+            let response =
+                crate::host_call_static(calls, "sendMessage", json!({ "message": message }));
             if response.get("error").is_none() {
                 let _ = std::fs::remove_file(&result_path);
             }
@@ -722,8 +763,8 @@ pub fn deliver_steer(
     mode: &str,
     target_index: Option<usize>,
 ) -> Result<Value, String> {
-    let handle = find_run(run_id)
-        .ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    let handle =
+        find_run(run_id).ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
     let index = target_index.unwrap_or(0);
     let inbox = steer_inbox_dir(&handle.run_dir, index);
     std::fs::create_dir_all(&inbox).map_err(|e| e.to_string())?;
@@ -762,7 +803,8 @@ pub fn read_run_status(run_id: &str) -> Option<Value> {
 /// `requestAsyncInterrupt`: pause marker; the run becomes `paused` between
 /// children and can be `resume`d.
 pub fn interrupt_run(query: &str) -> Result<Value, String> {
-    let handle = find_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
+    let handle =
+        find_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
     handle.control.request_interrupt();
     let control_dir = handle.run_dir.join("control");
     let _ = std::fs::create_dir_all(&control_dir);
@@ -862,10 +904,7 @@ pub fn reconcile_stale_runs() {
         ) {
             continue;
         }
-        let owner_alive = status["ownerPid"]
-            .as_u64()
-            .map(pid_alive)
-            .unwrap_or(false);
+        let owner_alive = status["ownerPid"].as_u64().map(pid_alive).unwrap_or(false);
         if owner_alive {
             // Another live host process owns it — do not touch.
             continue;
@@ -885,11 +924,7 @@ pub fn reconcile_stale_runs() {
 /// Wait for runs to reach a terminal state (`subagent_wait` core,
 /// subagent-wait.ts waitForSubagents subset): first-terminal (default) or
 /// all-terminal, bounded by `timeout_ms`.
-pub async fn wait_for_runs(
-    id: Option<&str>,
-    all: bool,
-    timeout_ms: u64,
-) -> Result<Value, String> {
+pub async fn wait_for_runs(id: Option<&str>, all: bool, timeout_ms: u64) -> Result<Value, String> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
     let is_terminal = |state: &str| {
         matches!(
@@ -1006,10 +1041,9 @@ mod tests {
         )
         .unwrap();
         reconcile_stale_runs();
-        let status: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("status.json")).unwrap(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("status.json")).unwrap())
+                .unwrap();
         assert_eq!(status["state"], json!(STATE_FAILED));
         let _ = std::fs::remove_dir_all(&dir);
     }

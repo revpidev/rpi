@@ -25,8 +25,8 @@ mod diagnostic;
 mod error;
 mod launch;
 mod p1;
-mod prompts;
 mod paths;
+mod prompts;
 mod runner;
 mod runtime;
 mod session_fork;
@@ -81,8 +81,10 @@ pub fn host_call_static(channel: &AsyncHostCalls, method: &str, args: Value) -> 
         "seq": 0,
     }))
     .unwrap_or_default();
-    let response =
-        (channel.call)(channel.cookie as rpi_ext_host::native::PluginCookie, RVec::from(request));
+    let response = (channel.call)(
+        channel.cookie as rpi_ext_host::native::PluginCookie,
+        RVec::from(request),
+    );
     serde_json::from_slice(&response[..]).unwrap_or(Value::Null)
 }
 
@@ -159,7 +161,9 @@ impl HostContext for HostCallsContext<'_> {
         for item in items {
             let model = item.get("model");
             let (Some(provider), Some(id)) = (
-                model.and_then(|m| m.get("provider")).and_then(Value::as_str),
+                model
+                    .and_then(|m| m.get("provider"))
+                    .and_then(Value::as_str),
                 model.and_then(|m| m.get("id")).and_then(Value::as_str),
             ) else {
                 continue;
@@ -379,9 +383,10 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     "Prompt shortcut: {}",
                     spec.description.as_deref().unwrap_or(name)
                 );
-                if let Err(error) =
-                    register("registerCommand", json!({ "name": name, "description": description }))
-                {
+                if let Err(error) = register(
+                    "registerCommand",
+                    json!({ "name": name, "description": description }),
+                ) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
             }
@@ -553,7 +558,10 @@ fn dispatch_message(message: &Value) -> Value {
     };
     match message.get("kind").and_then(Value::as_str) {
         Some("toolExecute") => {
-            let tool_name = message.get("toolName").and_then(Value::as_str).unwrap_or("");
+            let tool_name = message
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let params = message.get("params").cloned().unwrap_or(Value::Null);
             // Child-safe mode blocks mutating management actions before
             // execution (fanout-child.ts allowlist, L174-189).
@@ -585,10 +593,9 @@ fn dispatch_message(message: &Value) -> Value {
                 });
             }
             if tool_name == "subagent_supervisor" {
-                let orchestrator_session_id = std::env::var(
-                    launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
-                )
-                .unwrap_or_default();
+                let orchestrator_session_id =
+                    std::env::var(launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
+                        .unwrap_or_default();
                 // The parent's own session id comes from its newest session
                 // file (TE-D16 derivation), falling back to the env.
                 let session_id = if orchestrator_session_id.is_empty() {
@@ -632,9 +639,14 @@ fn dispatch_message(message: &Value) -> Value {
             };
             let settings = config::read_settings_pair(&host.cwd());
             let config = config::load_config();
-            if let Some(outcome) =
-                prompts::handle_prompt_command(name, args, &host, &settings, &config, &state.runtime)
-            {
+            if let Some(outcome) = prompts::handle_prompt_command(
+                name,
+                args,
+                &host,
+                &settings,
+                &config,
+                &state.runtime,
+            ) {
                 return outcome;
             }
             commands::handle_command(name, args, &host, &settings, &config, &state.runtime)
@@ -654,9 +666,7 @@ fn dispatch_message(message: &Value) -> Value {
                 (PluginMode::Parent, "session_shutdown") => {
                     // Harvest async runs (ADR-0019 interactive branch), then
                     // sweep live children (SIGTERM → 3s → SIGKILL).
-                    state
-                        .runtime
-                        .spawn(async_runner_shutdown());
+                    state.runtime.spawn(async_runner_shutdown());
                     Value::Null
                 }
                 (PluginMode::Parent, "agent_end") => {
@@ -764,26 +774,21 @@ pub mod test_support {
 
         /// Remove the ledger file (test isolation).
         pub fn reset_for_test(&self) {
-            let _ = std::fs::remove_file(crate::runner::background::spawn_budgets_dir().join(
-                format!("{}.json", self.session_id),
-            ));
+            let _ = std::fs::remove_file(
+                crate::runner::background::spawn_budgets_dir()
+                    .join(format!("{}.json", self.session_id)),
+            );
             // The real filename is hashed; remove via the probe path list.
             // (SpawnBudgetLedger paths are hash-keyed; the reset removes
             // every file in the budgets dir for test isolation.)
-            if let Ok(entries) =
-                std::fs::read_dir(crate::runner::background::spawn_budgets_dir())
-            {
+            if let Ok(entries) = std::fs::read_dir(crate::runner::background::spawn_budgets_dir()) {
                 for entry in entries.flatten() {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
 
-        pub fn reserve_for_test(
-            &self,
-            amount: u64,
-            limit: Option<u64>,
-        ) -> Result<(), String> {
+        pub fn reserve_for_test(&self, amount: u64, limit: Option<u64>) -> Result<(), String> {
             self.ledger.reserve(amount, limit)
         }
     }

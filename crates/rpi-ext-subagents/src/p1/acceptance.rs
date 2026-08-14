@@ -50,24 +50,40 @@ pub fn required_evidence_for_level(level: &str) -> &'static [&'static str] {
 /// `inferLevel` (acceptance.ts:77-147) — the inference inputs the structured
 /// surface carries: agent name, optional acceptanceRole, task text, async,
 /// writer detection. Returns `(level, review_required)`.
-pub fn infer_level(agent_name: &str, acceptance_role: Option<&str>, task: &str, is_async: bool) -> (String, bool) {
+pub fn infer_level(
+    agent_name: &str,
+    acceptance_role: Option<&str>,
+    task: &str,
+    is_async: bool,
+) -> (String, bool) {
     let lowered_task = task.to_lowercase();
     let read_only_name = ["reviewer", "oracle", "scout", "researcher", "analyst"]
         .iter()
         .any(|name| agent_name.contains(name));
     let risky_task = [
-        "release", "migration", "security", "data-loss", "destructive", "post-review",
+        "release",
+        "migration",
+        "security",
+        "data-loss",
+        "destructive",
+        "post-review",
         "fix pass",
     ]
     .iter()
     .any(|word| lowered_task.contains(word));
-    let writer = acceptance_role == Some("writer") || (!read_only_name && acceptance_role.is_some());
+    let writer =
+        acceptance_role == Some("writer") || (!read_only_name && acceptance_role.is_some());
 
     if (is_async && writer) || risky_task {
         // risky → checked with a required reviewer pass.
         return ("checked".to_string(), true);
     }
-    if writer || (!read_only_name && acceptance_role.is_none() && !risky_task && is_task_mutation(&lowered_task)) {
+    if writer
+        || (!read_only_name
+            && acceptance_role.is_none()
+            && !risky_task
+            && is_task_mutation(&lowered_task))
+    {
         return ("checked".to_string(), false);
     }
     if read_only_name || is_read_only_task(&lowered_task) {
@@ -77,9 +93,18 @@ pub fn infer_level(agent_name: &str, acceptance_role: Option<&str>, task: &str, 
 }
 
 fn is_task_mutation(lowered_task: &str) -> bool {
-    ["implement", "fix", "refactor", "write", "edit", "update", "delete", "add "]
-        .iter()
-        .any(|word| lowered_task.contains(word))
+    [
+        "implement",
+        "fix",
+        "refactor",
+        "write",
+        "edit",
+        "update",
+        "delete",
+        "add ",
+    ]
+    .iter()
+    .any(|word| lowered_task.contains(word))
 }
 
 fn is_read_only_task(lowered_task: &str) -> bool {
@@ -111,11 +136,7 @@ pub fn normalize_report_field(key: &str) -> Result<&'static str, String> {
         "diffSummary" | "diff_summary" => "diffSummary",
         "reviewFindings" | "review_findings" => "reviewFindings",
         "manualNotes" | "manual_notes" | "notes" => "manualNotes",
-        other => {
-            return Err(format!(
-                "unsupported acceptance report field '{other}'"
-            ))
-        }
+        other => return Err(format!("unsupported acceptance report field '{other}'")),
     })
 }
 
@@ -141,8 +162,8 @@ fn normalized_token(value: &str) -> String {
 pub fn normalize_criterion_status(value: &str) -> String {
     let token = normalized_token(value);
     match token.as_str() {
-        "satisfied" | "met" | "complete" | "completed" | "done" | "pass" | "passed"
-        | "success" | "succeeded" => "satisfied".to_string(),
+        "satisfied" | "met" | "complete" | "completed" | "done" | "pass" | "passed" | "success"
+        | "succeeded" => "satisfied".to_string(),
         "not-satisfied" | "not-met" | "unmet" | "incomplete" | "fail" | "failed" => {
             "not-satisfied".to_string()
         }
@@ -155,9 +176,7 @@ pub fn normalize_criterion_status(value: &str) -> String {
 pub fn normalize_command_result(value: &str) -> String {
     let token = normalized_token(value);
     match token.as_str() {
-        "passed" | "pass" | "success" | "successful" | "succeeded" | "ok" => {
-            "passed".to_string()
-        }
+        "passed" | "pass" | "success" | "successful" | "succeeded" | "ok" => "passed".to_string(),
         "failed" | "fail" | "failure" | "error" => "failed".to_string(),
         "not-run" | "not-executed" | "skip" | "skipped" => "not-run".to_string(),
         _ => value.to_string(),
@@ -313,8 +332,7 @@ mod tests {
             &["manual-notes", "residual-risks"]
         );
         assert_eq!(required_evidence_for_level("none").len(), 0);
-        assert!(required_evidence_for_level("verified")
-            .contains(&"validation-output"));
+        assert!(required_evidence_for_level("verified").contains(&"validation-output"));
     }
 
     #[test]
@@ -350,7 +368,8 @@ mod tests {
             Some(Err(message)) => assert!(message.contains("bogus"), "{message}"),
             other => panic!("expected error, got {other:?}"),
         }
-        let report = "```acceptance\n{\"changed_files\": [\"a.rs\"], \"changedFiles\": [\"b.rs\"]}\n```";
+        let report =
+            "```acceptance\n{\"changed_files\": [\"a.rs\"], \"changedFiles\": [\"b.rs\"]}\n```";
         match parse_acceptance_report(report) {
             Some(Err(message)) => assert!(message.contains("twice"), "{message}"),
             other => panic!("expected duplicate error, got {other:?}"),

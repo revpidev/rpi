@@ -39,7 +39,8 @@ pub const BUNDLED_PROMPTS: [(&str, &str); 5] = [
 ];
 
 /// The bundled orchestration skill body (SKILL.md + references).
-pub const ORCHESTRATION_SKILL_SKILL_MD: &str = include_str!("../assets/skills/pi-subagents/SKILL.md");
+pub const ORCHESTRATION_SKILL_SKILL_MD: &str =
+    include_str!("../assets/skills/pi-subagents/SKILL.md");
 pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 4] = [
     (
         "constraints-and-recipes.md",
@@ -367,7 +368,8 @@ mod tests {
         let spec = parse_template("---\ndescription: d\nsubagent: true\n---\nbody");
         assert_eq!(spec.subagent, "delegate");
         // chain splits on ->.
-        let spec = parse_template("---\ndescription: d\nchain: scout -> worker -> reviewer\n---\nb");
+        let spec =
+            parse_template("---\ndescription: d\nchain: scout -> worker -> reviewer\n---\nb");
         assert_eq!(spec.chain, vec!["scout", "worker", "reviewer"]);
     }
 

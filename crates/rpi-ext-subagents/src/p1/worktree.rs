@@ -23,10 +23,7 @@ use crate::config::ExtensionConfig;
 
 /// `runGit` (worktree.ts): cwd-bound git invocation.
 fn run_git(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
+    Command::new("git").args(args).current_dir(cwd).output()
 }
 
 fn run_git_checked(cwd: &Path, args: &[&str], context: &str) -> Result<String, String> {
@@ -59,7 +56,10 @@ fn build_worktree_branch(run_id: &str, index: usize) -> String {
 /// `resolveWorktreeBaseDir` (worktree.ts:191-215): config > env
 /// `RPI_SUBAGENTS_WORKTREE_DIR` > system temp; relative resolves against the
 /// repo root; must not sit inside the extensions dir; created on demand.
-pub fn resolve_worktree_base_dir(config: &ExtensionConfig, repo_root: &Path) -> Result<PathBuf, String> {
+pub fn resolve_worktree_base_dir(
+    config: &ExtensionConfig,
+    repo_root: &Path,
+) -> Result<PathBuf, String> {
     let raw = config
         .worktree_base_dir
         .clone()
@@ -82,8 +82,12 @@ pub fn resolve_worktree_base_dir(config: &ExtensionConfig, repo_root: &Path) -> 
             extensions_dir.to_string_lossy()
         ));
     }
-    std::fs::create_dir_all(&resolved)
-        .map_err(|e| format!("failed to create worktree base directory {}: {e}", resolved.to_string_lossy()))?;
+    std::fs::create_dir_all(&resolved).map_err(|e| {
+        format!(
+            "failed to create worktree base directory {}: {e}",
+            resolved.to_string_lossy()
+        )
+    })?;
     Ok(resolved)
 }
 
@@ -93,14 +97,15 @@ fn build_worktree_path(base_dir: &Path, run_id: &str, index: usize) -> PathBuf {
 
 /// `resolveRepoCwdRelative` (worktree.ts:224-234).
 pub fn resolve_repo_cwd_relative(cwd: &Path) -> Result<String, String> {
-    let check = run_git(cwd, &["rev-parse", "--is-inside-work-tree"])
-        .map_err(|e| e.to_string())?;
-    if !check.status.success()
-        || String::from_utf8_lossy(&check.stdout).trim() != "true"
-    {
+    let check = run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).map_err(|e| e.to_string())?;
+    if !check.status.success() || String::from_utf8_lossy(&check.stdout).trim() != "true" {
         return Err("worktree isolation requires a git repository".to_string());
     }
-    let raw_prefix = run_git_checked(cwd, &["rev-parse", "--show-prefix"], "rev-parse --show-prefix")?;
+    let raw_prefix = run_git_checked(
+        cwd,
+        &["rev-parse", "--show-prefix"],
+        "rev-parse --show-prefix",
+    )?;
     let trimmed = raw_prefix.trim().trim_end_matches(['/', '\\']).to_string();
     if trimmed == "." || trimmed.is_empty() {
         Ok(String::new())
@@ -139,12 +144,22 @@ pub fn create_worktree(
     let worktree_path = build_worktree_path(base_dir, run_id, index);
     run_git_checked(
         toplevel,
-        &["worktree", "add", &worktree_path.to_string_lossy(), "-b", &branch, "HEAD"],
+        &[
+            "worktree",
+            "add",
+            &worktree_path.to_string_lossy(),
+            "-b",
+            &branch,
+            "HEAD",
+        ],
         "git worktree add",
     )
     .map_err(|message| {
         if message.is_empty() {
-            format!("failed to create worktree {}", worktree_path.to_string_lossy())
+            format!(
+                "failed to create worktree {}",
+                worktree_path.to_string_lossy()
+            )
         } else {
             message
         }
@@ -164,8 +179,16 @@ pub fn create_worktree(
         }
         if let Some((hook, timeout_ms)) = config.worktree_setup_hook() {
             let hook_synthetic = run_worktree_setup_hook(
-                &hook, timeout_ms, toplevel, &worktree_path, &agent_cwd, &branch, index, run_id,
-                base_commit, agent,
+                &hook,
+                timeout_ms,
+                toplevel,
+                &worktree_path,
+                &agent_cwd,
+                &branch,
+                index,
+                run_id,
+                base_commit,
+                agent,
             )?;
             synthetic_paths.extend(hook_synthetic);
         }
@@ -182,7 +205,15 @@ pub fn create_worktree(
     match result {
         Ok(info) => Ok(info),
         Err(error) => {
-            let _ = run_git(toplevel, &["worktree", "remove", "--force", &worktree_path.to_string_lossy()]);
+            let _ = run_git(
+                toplevel,
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    &worktree_path.to_string_lossy(),
+                ],
+            );
             let _ = run_git(toplevel, &["branch", "-D", &branch_for_cleanup]);
             Err(error)
         }
@@ -461,8 +492,7 @@ pub fn cleanup_worktree(
     remove_synthetic_paths(worktree);
     let dirty = run_git(&worktree.path, &["status", "--porcelain"])
         .map(|output| {
-            output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
         })
         .unwrap_or(false);
     if dirty {
@@ -476,19 +506,32 @@ pub fn cleanup_worktree(
     }
     run_git_checked(
         toplevel,
-        &["worktree", "remove", "--force", &worktree.path.to_string_lossy()],
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &worktree.path.to_string_lossy(),
+        ],
         "git worktree remove",
     )?;
-    run_git_checked(toplevel, &["branch", "-D", &worktree.branch], "git branch -D")?;
+    run_git_checked(
+        toplevel,
+        &["branch", "-D", &worktree.branch],
+        "git branch -D",
+    )?;
     Ok(())
 }
 
 /// Resolve the repo toplevel + base commit for a run ("clean HEAD" means the
 /// current HEAD; upstream snapshots it as `baseCommit` before branching).
 pub fn resolve_repo_base(cwd: &Path) -> Result<(PathBuf, String), String> {
-    let toplevel = run_git_checked(cwd, &["rev-parse", "--show-toplevel"], "git rev-parse --show-toplevel")?
-        .trim()
-        .to_string();
+    let toplevel = run_git_checked(
+        cwd,
+        &["rev-parse", "--show-toplevel"],
+        "git rev-parse --show-toplevel",
+    )?
+    .trim()
+    .to_string();
     let head = run_git_checked(cwd, &["rev-parse", "HEAD"], "git rev-parse HEAD")?
         .trim()
         .to_string();
@@ -532,8 +575,17 @@ mod tests {
 
         let config = ExtensionConfig::default();
         let base_dir = resolve_worktree_base_dir(&config, &toplevel).unwrap();
-        let worktree = create_worktree(&toplevel, "", "run1", 0, &base_commit, &base_dir, Some("worker"), &config)
-            .unwrap();
+        let worktree = create_worktree(
+            &toplevel,
+            "",
+            "run1",
+            0,
+            &base_commit,
+            &base_dir,
+            Some("worker"),
+            &config,
+        )
+        .unwrap();
         assert!(worktree.path.join(".git").exists() || worktree.path.exists());
         assert_eq!(worktree.agent_cwd, worktree.path);
 

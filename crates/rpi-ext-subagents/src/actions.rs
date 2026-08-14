@@ -596,7 +596,6 @@ pub fn format_subagents_browser(agents: &[AgentConfig]) -> String {
     lines.join("\n")
 }
 
-
 /// `actionScope` (agent-management.ts:84): `user` | `project`, default user.
 fn action_scope(params: &Value) -> &'static str {
     match params.get("agentScope").and_then(Value::as_str) {
@@ -697,17 +696,16 @@ fn manage_create_update(
     }
     ToolOutcome::text(format!(
         "Agent '{name}' {} at {}.",
-        if action == "create" { "created" } else { "updated" },
+        if action == "create" {
+            "created"
+        } else {
+            "updated"
+        },
         target.to_string_lossy()
     ))
 }
 
-fn manage_delete(
-    name: &str,
-    cwd: &Path,
-    settings: &SettingsPair,
-    scope: &str,
-) -> ToolOutcome {
+fn manage_delete(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
     let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
     let Some(agent) = discover::resolve_agent_name(&agents, name).ok().flatten() else {
         return ToolOutcome::error(format!("Unknown agent: {name}"));
@@ -727,12 +725,7 @@ fn manage_delete(
     ToolOutcome::text(format!("Agent '{name}' deleted."))
 }
 
-fn manage_eject(
-    name: &str,
-    cwd: &Path,
-    settings: &SettingsPair,
-    scope: &str,
-) -> ToolOutcome {
+fn manage_eject(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
     let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
     let Some(agent) = discover::resolve_agent_name(&agents, name).ok().flatten() else {
         return ToolOutcome::error(format!("Unknown agent: {name}"));
@@ -793,9 +786,7 @@ fn manage_disable_enable(
     let Some(root_object) = root.as_object_mut() else {
         return ToolOutcome::error("settings root is not an object.".to_string());
     };
-    let subagents = root_object
-        .entry("subagents")
-        .or_insert_with(|| json!({}));
+    let subagents = root_object.entry("subagents").or_insert_with(|| json!({}));
     if !subagents.is_object() {
         return ToolOutcome::error("settings subagents key is not an object.".to_string());
     }
@@ -839,12 +830,7 @@ fn manage_disable_enable(
     ))
 }
 
-fn manage_reset(
-    name: &str,
-    cwd: &Path,
-    settings: &SettingsPair,
-    scope: &str,
-) -> ToolOutcome {
+fn manage_reset(name: &str, cwd: &Path, settings: &SettingsPair, scope: &str) -> ToolOutcome {
     let target = scope_agent_dir(cwd, scope).join(format!("{name}.md"));
     let mut notes = Vec::new();
     if target.exists() {
@@ -895,7 +881,6 @@ fn manage_reset(
     let _ = settings;
     ToolOutcome::text(format!("Reset agent '{name}': {}.", notes.join("; ")))
 }
-
 
 /// `getAgentRefinementPath` (agent-refinements.ts:155):
 /// `<cwd>/.rpi/subagents/refinements/<safeAgent>.md`.
@@ -998,8 +983,7 @@ fn manage_refine(
     let path = refinement_path(cwd, name);
     match action {
         "refine.show" => {
-            let (current, snapshots) = read_refinement(&path)
-                .unwrap_or((String::new(), json!([])));
+            let (current, snapshots) = read_refinement(&path).unwrap_or((String::new(), json!([])));
             let count = snapshots.as_array().map(|a| a.len()).unwrap_or(0);
             if current.is_empty() && count == 0 {
                 return ToolOutcome::text(format!("No refinement recorded for '{name}'."));

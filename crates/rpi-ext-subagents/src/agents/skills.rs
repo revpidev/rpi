@@ -249,7 +249,12 @@ mod tests {
         assert!(names.contains(&"dir-skill"));
         assert!(names.contains(&"file-skill"));
         assert_eq!(
-            skills.iter().find(|s| s.name == "dir-skill").unwrap().description.as_deref(),
+            skills
+                .iter()
+                .find(|s| s.name == "dir-skill")
+                .unwrap()
+                .description
+                .as_deref(),
             Some("from project")
         );
 

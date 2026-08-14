@@ -130,10 +130,7 @@ impl MemoryConfig {
         if raw.is_empty() || raw == "false" {
             return None;
         }
-        let body = raw
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim();
+        let body = raw.trim_start_matches('{').trim_end_matches('}').trim();
         // Try `key: value` pairs first.
         let mut scope: Option<&'static str> = None;
         let mut path: Option<String> = None;
@@ -182,7 +179,10 @@ impl MemoryConfig {
     pub fn resolve_dir(&self, cwd: &Path, agent_name: &str) -> Option<PathBuf> {
         if self.path.is_empty()
             || self.path.contains('\0')
-            || self.path.split(['/']).any(|segment| segment == "." || segment == "..")
+            || self
+                .path
+                .split(['/'])
+                .any(|segment| segment == "." || segment == "..")
             || self.path.contains(':')
         {
             return None;
@@ -192,7 +192,10 @@ impl MemoryConfig {
         } else {
             crate::paths::get_project_config_dir(cwd).join("agent-memory")
         };
-        Some(base.join(&self.path).join(sanitize_memory_segment(agent_name)))
+        Some(
+            base.join(&self.path)
+                .join(sanitize_memory_segment(agent_name)),
+        )
     }
 }
 
@@ -701,7 +704,12 @@ pub fn discover_agents_with_user_dirs(
     let default_extensions = settings.default_extensions.clone();
 
     let mut builtin = crate::agents::builtin::load_builtin_agents(builtin_dir);
-    apply_subagent_defaults(&mut builtin, &default_model, &default_thinking, &default_extensions);
+    apply_subagent_defaults(
+        &mut builtin,
+        &default_model,
+        &default_thinking,
+        &default_extensions,
+    );
     apply_builtin_overrides(&mut builtin, settings);
 
     let mut user: Vec<AgentConfig> = if scope == "project" {

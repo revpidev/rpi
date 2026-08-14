@@ -207,12 +207,14 @@ const PROMPT_REDACTED: &str = "[prompt redacted]";
 /// waits).
 pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     let start = std::time::Instant::now();
-    let artifact_paths = input
-        .artifacts_dir
-        .as_ref()
-        .map(|dir| {
-            artifacts::get_artifact_paths(dir, &input.run_id, &input.agent_name, Some(input.child_index))
-        });
+    let artifact_paths = input.artifacts_dir.as_ref().map(|dir| {
+        artifacts::get_artifact_paths(
+            dir,
+            &input.run_id,
+            &input.agent_name,
+            Some(input.child_index),
+        )
+    });
     let mut attempted_models = Vec::new();
     if let Some(model) = &input.model {
         attempted_models.push(model.clone());

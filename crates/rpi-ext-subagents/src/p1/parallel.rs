@@ -42,10 +42,7 @@ pub struct TaskEntry {
 
 /// Parse and validate the `tasks` array (workflow `runs.all` items +
 /// `resolveTopLevelParallelMaxTasks` cap).
-pub fn parse_tasks(
-    tasks: &Value,
-    max_tasks: u64,
-) -> Result<Vec<TaskEntry>, String> {
+pub fn parse_tasks(tasks: &Value, max_tasks: u64) -> Result<Vec<TaskEntry>, String> {
     let Some(items) = tasks.as_array() else {
         return Err("tasks must be an array of task objects.".to_string());
     };
@@ -75,7 +72,9 @@ pub fn parse_tasks(
             ));
         }
         if !seen_keys.insert(key.clone()) {
-            return Err(format!("Duplicate task key '{key}': task keys must be unique."));
+            return Err(format!(
+                "Duplicate task key '{key}': task keys must be unique."
+            ));
         }
         for field in FORBIDDEN_ENTRY_FIELDS {
             if object.contains_key(field) {
@@ -260,8 +259,7 @@ pub async fn run_parallel_async(
     let outcomes: Vec<Option<ParallelTaskOutcome>> = async {
         // Owned entries: the stream closure must not borrow the items —
         // `map` over `&(index, &TaskEntry)` trips the HRTB bound (rust#89937).
-        let indexed: Vec<(usize, TaskEntry)> =
-            entries.iter().cloned().enumerate().collect();
+        let indexed: Vec<(usize, TaskEntry)> = entries.iter().cloned().enumerate().collect();
         let agents = Arc::new(agents.to_vec());
         let results = stream::iter(indexed)
             .map(|(index, entry)| {
@@ -318,7 +316,12 @@ async fn launch_one(
     let mut spec = entry.spec.clone();
     let mut prepared = None;
     if let Some(plan) = worktree {
-        if plan.enabled.get(entry.spec.child_index as usize).copied().unwrap_or(false) {
+        if plan
+            .enabled
+            .get(entry.spec.child_index as usize)
+            .copied()
+            .unwrap_or(false)
+        {
             let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
             let cwd_relative = crate::p1::worktree::resolve_repo_cwd_relative(&cwd).ok()?;
             let info = crate::p1::worktree::create_worktree(
@@ -347,16 +350,30 @@ async fn launch_one(
             &plan.base_commit,
             &patch_dir,
         ) {
-            let status = if outcome.result.exit_code == 0 { "complete" } else { "failed" };
-            let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, plan.manifest_path.as_deref());
-            plan.diffs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((entry.spec.child_index as usize, outcome.agent_name.clone(), status.to_string(), diff));
+            let status = if outcome.result.exit_code == 0 {
+                "complete"
+            } else {
+                "failed"
+            };
+            let _ = crate::p1::worktree::cleanup_worktree(
+                &plan.toplevel,
+                &info,
+                plan.manifest_path.as_deref(),
+            );
+            plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).push((
+                entry.spec.child_index as usize,
+                outcome.agent_name.clone(),
+                status.to_string(),
+                diff,
+            ));
         } else {
             // Dirty worktree without a recorded patch: keep it for
             // inspection (cleanup_worktree refuses).
-            let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, plan.manifest_path.as_deref());
+            let _ = crate::p1::worktree::cleanup_worktree(
+                &plan.toplevel,
+                &info,
+                plan.manifest_path.as_deref(),
+            );
         }
     }
     Some(project_outcome(entry, &outcome))
@@ -451,7 +468,11 @@ pub fn aggregate_parallel_outputs(results: &[ParallelTaskOutcome]) -> String {
     results
         .iter()
         .map(|r| {
-            let header = format!("=== Parallel Task {} ({}) ===", r.details["index"].as_u64().unwrap_or(0) + 1, r.agent);
+            let header = format!(
+                "=== Parallel Task {} ({}) ===",
+                r.details["index"].as_u64().unwrap_or(0) + 1,
+                r.agent
+            );
             let has_output = !r.output.trim().is_empty();
             let status = if r.timed_out {
                 Some(match &r.error {
@@ -470,7 +491,10 @@ pub fn aggregate_parallel_outputs(results: &[ParallelTaskOutcome]) -> String {
             } else if !has_output && r.output_target_path.is_some() && !r.output_target_exists {
                 Some(format!(
                     "EMPTY OUTPUT (expected output file missing: {})",
-                    r.output_target_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
+                    r.output_target_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default()
                 ))
             } else if !has_output && r.output_target_path.is_none() {
                 Some("EMPTY OUTPUT (no textual response returned)".to_string())

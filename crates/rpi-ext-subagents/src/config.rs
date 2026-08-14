@@ -177,7 +177,7 @@ impl ExtensionConfig {
     /// truthy/falsy word set) > configured boolean/object > true. Invalid env
     /// values upstream throw; here they warn and fall through so a bad env
     /// cannot brick tool registration (load-time relaxation, TE-D15 style).
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn wait_tool_enabled(&self) -> bool {
         const ENV: &str = "RPI_SUBAGENT_WAIT_TOOL_ENABLED";
         if let Ok(raw) = std::env::var(ENV) {
@@ -185,7 +185,9 @@ impl ExtensionConfig {
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" | "enabled" => return true,
                 "0" | "false" | "no" | "off" | "disabled" => return false,
-                _ => tracing::warn!(env = %ENV, value = %raw, "invalid waitTool env value; ignoring"),
+                _ => {
+                    tracing::warn!(env = %ENV, value = %raw, "invalid waitTool env value; ignoring")
+                }
             }
         }
         match &self.wait_tool {
@@ -200,11 +202,16 @@ impl ExtensionConfig {
 
     /// `globalConcurrencyLimit` with the upstream default 20
     /// (DEFAULT_GLOBAL_CONCURRENCY_LIMIT, parallel-utils.ts:131).
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn global_concurrency_limit(&self) -> u64 {
         match &self.global_concurrency_limit {
             Some(Value::Number(n)) => n.as_u64().filter(|v| *v >= 1).unwrap_or(20),
-            Some(Value::String(s)) => s.trim().parse::<u64>().ok().filter(|v| *v >= 1).unwrap_or(20),
+            Some(Value::String(s)) => s
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|v| *v >= 1)
+                .unwrap_or(20),
             _ => 20,
         }
     }
@@ -212,7 +219,7 @@ impl ExtensionConfig {
     /// `maxSubagentSpawnsPerSession` (FR-P1-04): env
     /// `RPI_SUBAGENT_MAX_SPAWNS_PER_SESSION` > config value; `None` =
     /// unlimited.
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn max_subagent_spawns_per_session(&self) -> Option<u64> {
         let parse = |value: Option<&Value>| -> Option<u64> {
             match value {
@@ -231,7 +238,7 @@ impl ExtensionConfig {
     }
 
     /// `maxActiveAsyncRunsPerSession`; `None` = unlimited (types.ts:1838).
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn max_active_async_runs_per_session(&self) -> Option<u64> {
         self.max_active_async_runs_per_session.filter(|v| *v > 0)
     }
@@ -239,13 +246,16 @@ impl ExtensionConfig {
     /// `worktreeSetupHook` resolved to `(command, timeout_ms)` (worktree.ts
     /// `runWorktreeSetupHook` L336-379 + default 30000ms at L115). Accepts the
     /// string form documented in extension/index.ts:12 and the object form.
-        #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn worktree_setup_hook(&self) -> Option<(String, u64)> {
         let value = self.worktree_setup_hook.as_ref()?;
         let (command, timeout) = match value {
             Value::String(command) => (Some(command.clone()), None),
             Value::Object(object) => (
-                object.get("command").and_then(Value::as_str).map(str::to_string),
+                object
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 object.get("timeoutMs").and_then(Value::as_u64),
             ),
             _ => (None, None),
@@ -367,10 +377,12 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         // wait-config.ts:22-29: boolean, or object whose `enabled` (when
         // present) is a boolean.
         let valid = wait_tool.is_boolean()
-            || wait_tool.as_object().is_some_and(|o| match o.get("enabled") {
-                None => true,
-                Some(enabled) => enabled.is_boolean(),
-            });
+            || wait_tool
+                .as_object()
+                .is_some_and(|o| match o.get("enabled") {
+                    None => true,
+                    Some(enabled) => enabled.is_boolean(),
+                });
         if !valid {
             return Err(
                 "config.waitTool must be a boolean or an object with optional enabled boolean"
@@ -403,7 +415,10 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
             return Err("config.intercomBridge must be a JSON object".into());
         };
         if let Some(mode) = bridge_object.get("mode") {
-            if !mode.as_str().is_some_and(|m| matches!(m, "off" | "always" | "fork-only")) {
+            if !mode
+                .as_str()
+                .is_some_and(|m| matches!(m, "off" | "always" | "fork-only"))
+            {
                 return Err(
                     "config.intercomBridge.mode must be \"always\", \"fork-only\", or \"off\""
                         .into(),
@@ -687,8 +702,12 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                         });
                     }
                     "fallbackModels" => {
-                        parsed_entry.fallback_models =
-                            Some(parse_override_string_array_or_false(field, path, name, "fallbackModels")?);
+                        parsed_entry.fallback_models = Some(parse_override_string_array_or_false(
+                            field,
+                            path,
+                            name,
+                            "fallbackModels",
+                        )?);
                     }
                     "thinking" => {
                         parsed_entry.thinking = Some(match field {
@@ -774,8 +793,9 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                         );
                     }
                     "skills" => {
-                        parsed_entry.skills =
-                            Some(parse_override_string_array_or_false(field, path, name, "skills")?);
+                        parsed_entry.skills = Some(parse_override_string_array_or_false(
+                            field, path, name, "skills",
+                        )?);
                     }
                     _ => ignored.push(key.clone()),
                 }
@@ -1026,10 +1046,7 @@ mod tests {
         assert!(scope.enforced());
         assert_eq!(
             scope.allow,
-            Some(vec![
-                "anthropic/*".to_string(),
-                "openai/*".to_string()
-            ])
+            Some(vec!["anthropic/*".to_string(), "openai/*".to_string()])
         );
         assert_eq!(
             settings.overrides.get("researcher").unwrap().tools,
@@ -1049,14 +1066,23 @@ mod tests {
         assert_eq!(worker.system_prompt.as_deref(), Some("custom"));
         assert_eq!(worker.inherit_skills, Some(false));
         // completionGuard is beyond the documented set → ignored, not fatal.
-        assert!(settings.overrides.get("reviewer").unwrap().disabled.is_none());
+        assert!(settings
+            .overrides
+            .get("reviewer")
+            .unwrap()
+            .disabled
+            .is_none());
         std::fs::write(&path, r#"{"subagents":{"disableBuiltins":"yes"}}"#).unwrap();
         assert!(read_subagent_settings(&path).is_err());
         std::fs::write(&path, r#"{"subagents":{"defaultThinking":""}}"#).unwrap();
         assert!(read_subagent_settings(&path).is_err());
         std::fs::write(&path, r#"{"subagents":{"modelScope":{"enforce":"yes"}}}"#).unwrap();
         assert!(read_subagent_settings(&path).is_err());
-        std::fs::write(&path, r#"{"subagents":{"agentOverrides":{"x":{"thinking":5}}}}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"subagents":{"agentOverrides":{"x":{"thinking":5}}}}"#,
+        )
+        .unwrap();
         assert!(read_subagent_settings(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1074,7 +1100,10 @@ mod tests {
         .unwrap();
         assert_eq!(config.parallel_max_tasks(), 6);
         assert_eq!(config.parallel_concurrency(None), 2);
-        assert_eq!(config.parallel_concurrency(Some(&serde_json::json!("3"))), 3);
+        assert_eq!(
+            config.parallel_concurrency(Some(&serde_json::json!("3"))),
+            3
+        );
         // defaults
         let empty = parse("{}").unwrap();
         assert_eq!(empty.parallel_max_tasks(), 8);
@@ -1085,10 +1114,7 @@ mod tests {
         assert_eq!(empty.max_active_async_runs_per_session(), None);
         assert_eq!(config.max_subagent_spawns_per_session(), Some(100));
         assert_eq!(empty.max_subagent_spawns_per_session(), None);
-        assert_eq!(
-            config.single_run_output_base_dir.as_deref(),
-            Some("out")
-        );
+        assert_eq!(config.single_run_output_base_dir.as_deref(), Some("out"));
         assert_eq!(config.worktree_base_dir.as_deref(), Some("/tmp/wt"));
         assert_eq!(
             config.worktree_setup_hook(),
@@ -1099,7 +1125,12 @@ mod tests {
         assert!(parse(r#"{"waitTool":"yes"}"#).is_err());
         assert!(parse(r#"{"intercomBridge":{"mode":"weird"}}"#).is_err());
         assert!(parse(r#"{"parallel":{"maxTasks":0}}"#).is_ok()); // resolved at use site
-        assert_eq!(parse(r#"{"parallel":{"maxTasks":0}}"#).unwrap().parallel_max_tasks(), 8);
+        assert_eq!(
+            parse(r#"{"parallel":{"maxTasks":0}}"#)
+                .unwrap()
+                .parallel_max_tasks(),
+            8
+        );
     }
 
     #[test]
@@ -1144,12 +1175,11 @@ mod tests {
             user_settings.default_thinking.clone()
         };
         assert_eq!(default_thinking.as_deref(), Some("high"));
-        let disable_thinking =
-            if project_present && project_settings.disable_thinking.is_some() {
-                project_settings.disable_thinking == Some(true)
-            } else {
-                user_settings.disable_thinking == Some(true)
-            };
+        let disable_thinking = if project_present && project_settings.disable_thinking.is_some() {
+            project_settings.disable_thinking == Some(true)
+        } else {
+            user_settings.disable_thinking == Some(true)
+        };
         assert!(!disable_thinking);
         let model_scope = if project_present && project_settings.model_scope.is_some() {
             project_settings.model_scope.clone()
@@ -1158,11 +1188,7 @@ mod tests {
         };
         // Project file present but without modelScope → the user-level scope
         // still applies (only an explicit project value masks it).
-        assert_eq!(
-            model_scope.and_then(|s| s.allow).map(|a| a.len()),
-            Some(1)
-        );
+        assert_eq!(model_scope.and_then(|s| s.allow).map(|a| a.len()), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

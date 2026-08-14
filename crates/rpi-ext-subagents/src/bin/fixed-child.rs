@@ -14,9 +14,9 @@ fn main() {
         // flat files (flat keeps the P0 single-run assertions stable;
         // index 0 also lands in child-0/ for composite scenarios).
         let child_index = std::env::var("RPI_SUBAGENT_CHILD_INDEX").ok();
-        let indexed_dir = child_index.as_deref().map(|index| {
-            std::path::PathBuf::from(&dump_dir).join(format!("child-{index}"))
-        });
+        let indexed_dir = child_index
+            .as_deref()
+            .map(|index| std::path::PathBuf::from(&dump_dir).join(format!("child-{index}")));
         if let Some(indexed) = &indexed_dir {
             let _ = std::fs::create_dir_all(indexed);
         }

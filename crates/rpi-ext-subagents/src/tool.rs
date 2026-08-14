@@ -254,7 +254,8 @@ fn execute_subagent_tool_inner(
         .get("foregroundOnly")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let depth_check = budget::check_depth(config.max_subagent_depth.as_ref().and_then(Value::as_u64));
+    let depth_check =
+        budget::check_depth(config.max_subagent_depth.as_ref().and_then(Value::as_u64));
     if !wants_async
         && !foreground_only
         && depth_check.depth == 0
@@ -307,7 +308,11 @@ fn execute_subagent_tool_inner(
 
     let mut spec = crate::p1::launch_child::ChildSpec::from_params(&object);
     // Top-level `gate` shorthand (FR-P1-09): verified acceptance for the run.
-    if let Some(gate) = object.get("gate").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+    if let Some(gate) = object
+        .get("gate")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
         if spec.gate.is_none() {
             spec.gate = Some(gate.to_string());
         }
@@ -452,7 +457,9 @@ fn assemble_single_details(
         .or(ctx.top_timeout_ms)
         .or(agent.default_timeout_ms)
         .or_else(|| ctx.config.resolve_default_timeout_ms())
-        .or(Some(crate::runner::foreground::DEFAULT_FOREGROUND_TIMEOUT_MS));
+        .or(Some(
+            crate::runner::foreground::DEFAULT_FOREGROUND_TIMEOUT_MS,
+        ));
     if let Some(timeout) = timeout {
         details["timeoutMs"] = json!(timeout);
     }
@@ -480,7 +487,10 @@ fn build_worktree_plan(
     object: &serde_json::Map<String, Value>,
     ctx: &crate::p1::launch_child::RunCtx,
 ) -> Result<Option<std::sync::Arc<crate::p1::parallel::WorktreePlan>>, String> {
-    let top_worktree = object.get("worktree").and_then(Value::as_bool).unwrap_or(false);
+    let top_worktree = object
+        .get("worktree")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let enabled: Vec<bool> = entries
         .iter()
         .map(|entry| entry.worktree_override.unwrap_or(top_worktree))
@@ -490,15 +500,17 @@ fn build_worktree_plan(
     }
     let (toplevel, base_commit) = crate::p1::worktree::resolve_repo_base(&ctx.base_cwd)?;
     let base_dir = crate::p1::worktree::resolve_worktree_base_dir(&ctx.config, &toplevel)?;
-    Ok(Some(std::sync::Arc::new(crate::p1::parallel::WorktreePlan {
-        toplevel,
-        base_commit,
-        base_dir,
-        enabled,
-        config: ctx.config.clone(),
-        manifest_path: None,
-        diffs: std::sync::Mutex::new(Vec::new()),
-    })))
+    Ok(Some(std::sync::Arc::new(
+        crate::p1::parallel::WorktreePlan {
+            toplevel,
+            base_commit,
+            base_dir,
+            enabled,
+            config: ctx.config.clone(),
+            manifest_path: None,
+            diffs: std::sync::Mutex::new(Vec::new()),
+        },
+    )))
 }
 
 /// `tasks` composition dispatch (FR-P1-01, ADR-0018).
@@ -509,18 +521,20 @@ fn dispatch_tasks(
     runtime: &crate::PluginRuntime,
 ) -> ToolOutcome {
     let max_tasks = ctx.config.parallel_max_tasks();
-    let entries =
-        match crate::p1::parallel::parse_tasks(object.get("tasks").unwrap_or(&Value::Null), max_tasks)
-        {
-            Ok(entries) => entries,
-            Err(error) => return ToolOutcome::error(error),
-        };
-    let concurrency = ctx
-        .config
-        .parallel_concurrency(object.get("concurrency")) as usize;
+    let entries = match crate::p1::parallel::parse_tasks(
+        object.get("tasks").unwrap_or(&Value::Null),
+        max_tasks,
+    ) {
+        Ok(entries) => entries,
+        Err(error) => return ToolOutcome::error(error),
+    };
+    let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
     // Worktree isolation (FR-P1-06): top-level `worktree: true` defaults
     // every task in; per-task `worktree: false` opts out.
-    let top_worktree = object.get("worktree").and_then(Value::as_bool).unwrap_or(false);
+    let top_worktree = object
+        .get("worktree")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let worktree_plan = if top_worktree {
         match build_worktree_plan(&entries, object, ctx) {
             Ok(plan) => plan,
@@ -543,7 +557,13 @@ fn dispatch_tasks(
     if let Some(plan) = &worktree_plan {
         crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
     }
-    record_runs(&outcomes.iter().map(|o| (o.agent.clone(), o.exit_code, 0, o.error.clone())).collect::<Vec<_>>(), &ctx.run_id);
+    record_runs(
+        &outcomes
+            .iter()
+            .map(|o| (o.agent.clone(), o.exit_code, 0, o.error.clone()))
+            .collect::<Vec<_>>(),
+        &ctx.run_id,
+    );
 
     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
     let text = crate::p1::parallel::aggregate_parallel_outputs(&outcomes);
@@ -594,7 +614,10 @@ fn dispatch_steps(
     let (text, is_error) = match (&completed.last(), &failed) {
         (Some(last), None) => (last.output.clone(), false),
         (_, Some(failure)) => {
-            let error = failure.error.clone().unwrap_or_else(|| "Chain step failed".to_string());
+            let error = failure
+                .error
+                .clone()
+                .unwrap_or_else(|| "Chain step failed".to_string());
             let mut lines = vec![format!(
                 "Chain failed at step {} ({}): {error}",
                 failure.index + 1,
@@ -648,9 +671,11 @@ fn dispatch_async(
             Ok(entries) => entries,
             Err(error) => return ToolOutcome::error(error),
         };
-        let concurrency =
-            ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
-        crate::runner::background::AsyncBody::Tasks { entries, concurrency }
+        let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
+        crate::runner::background::AsyncBody::Tasks {
+            entries,
+            concurrency,
+        }
     } else if has_steps {
         let steps = match crate::p1::chain::parse_steps(object.get("steps").unwrap_or(&Value::Null))
         {
@@ -662,7 +687,10 @@ fn dispatch_async(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        crate::runner::background::AsyncBody::Steps { steps, original_task }
+        crate::runner::background::AsyncBody::Steps {
+            steps,
+            original_task,
+        }
     } else {
         let spec = crate::p1::launch_child::ChildSpec::from_params(object);
         match discover::resolve_agent_name(agents, &spec.agent_name) {
@@ -676,10 +704,12 @@ fn dispatch_async(
         }
     };
 
-    let session_id = ctx
-        .parent_session_file
-        .as_ref()
-        .map(|p| p.file_stem().unwrap_or_default().to_string_lossy().to_string());
+    let session_id = ctx.parent_session_file.as_ref().map(|p| {
+        p.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    });
     let planned = match &body {
         crate::runner::background::AsyncBody::Single { .. } => 1,
         crate::runner::background::AsyncBody::Tasks { entries, .. } => entries.len() as u64,
@@ -707,11 +737,7 @@ fn dispatch_async(
         Err(error) => return ToolOutcome::error(error),
     };
 
-    let handle = crate::runner::background::start_run(
-        &ctx.run_id,
-        session_id.as_deref(),
-        &body,
-    );
+    let handle = crate::runner::background::start_run(&ctx.run_id, session_id.as_deref(), &body);
     let notify = crate::runner::background::AsyncNotify {
         calls: host.async_calls(),
     };
