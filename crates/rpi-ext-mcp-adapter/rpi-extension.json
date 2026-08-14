@@ -3,6 +3,6 @@
   "version": "0.1.0",
   "description": "MCP client adapter: single `mcp` proxy tool with lazy server lifecycle (port of pi-mcp-adapter @ v2.24.0)",
   "native": "librpi_ext_mcp_adapter.so",
-  "capabilities": ["tools", "commands", "session"],
+  "capabilities": ["tools", "commands", "session", "ui"],
   "rpiAbi": 1
 }

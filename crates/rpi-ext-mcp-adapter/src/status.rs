@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::manager::{ConnectionStatus, McpServerManager};
-use crate::metadata::McpConfig;
+use crate::metadata::{McpConfig, ServerEntry};
 
 /// `MCP_STATUS_EVENT` (types.ts:16): versioned event channel.
 pub const MCP_STATUS_EVENT: &str = "pi-mcp-adapter/status/v1";
@@ -57,12 +57,14 @@ pub struct McpStatusSnapshot {
     pub disabled_count: u64,
 }
 
-/// `mcpFooterStatus` setting (types.ts / settings).
+/// `mcpFooterStatus` setting (types.ts / settings). Upstream default is
+/// `"full"` (`state.config.settings?.mcpFooterStatus ?? "full"`,
+/// init.ts:535), so an unset/unknown value maps to `Full`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FooterStatus {
+    #[default]
     Full,
     Compact,
-    #[default]
     Off,
 }
 
@@ -108,6 +110,88 @@ pub fn build_footer_text(snapshot: &McpStatusSnapshot, mode: FooterStatus) -> Op
                 Some(format!("MCP: {} tools", snapshot.total_tools))
             }
         }
+    }
+}
+
+/// `formatMcpStatus` (utils.ts:294-297): `mcpFooterStatus === "off"` →
+/// `None` (clear the status); prefix with "🔌 MCP: " unless
+/// `showStatusIcon === false`.
+pub fn format_status_bar_text(config: &McpConfig, message: &str) -> Option<String> {
+    if config
+        .settings
+        .as_ref()
+        .and_then(|s| s.get("mcpFooterStatus"))
+        .and_then(Value::as_str)
+        == Some("off")
+    {
+        return None;
+    }
+    let prefix = if config
+        .settings
+        .as_ref()
+        .and_then(|s| s.get("showStatusIcon"))
+        == Some(&Value::Bool(false))
+    {
+        "MCP: "
+    } else {
+        "🔌 MCP: "
+    };
+    Some(format!("{prefix}{message}"))
+}
+
+/// `updateStatusBar` (init.ts:520-556): build the footer status-bar text
+/// for key "mcp" (`None` clears the status). Reads connection state
+/// without triggering connections.
+pub fn build_status_bar_text(config: &McpConfig, manager: &McpServerManager) -> Option<String> {
+    let entries: Vec<(&String, &ServerEntry)> = config.mcp_servers.iter().collect();
+    if entries.is_empty() {
+        return None;
+    }
+    let disabled_count = entries
+        .iter()
+        .filter(|(_, definition)| definition.is_disabled())
+        .count();
+    let enabled_count = entries.len() - disabled_count;
+    if enabled_count == 0 {
+        return None;
+    }
+    let connected_count = manager
+        .get_all_connections()
+        .into_iter()
+        .filter(|(name, connection)| {
+            connection.status() == ConnectionStatus::Connected
+                && config
+                    .mcp_servers
+                    .get(name)
+                    .is_some_and(|definition| !definition.is_disabled())
+        })
+        .count();
+
+    let footer_status = FooterStatus::from_settings(config.settings.as_ref());
+    if footer_status == FooterStatus::Off {
+        return None;
+    }
+    let status = if footer_status == FooterStatus::Compact {
+        format!("MCP {connected_count}/{enabled_count}")
+    } else {
+        let plural = if enabled_count == 1 {
+            "server"
+        } else {
+            "servers"
+        };
+        let mut text = format!("{enabled_count} {plural} enabled");
+        if connected_count > 0 {
+            text.push_str(&format!(" ({connected_count} connected)"));
+        }
+        if disabled_count > 0 {
+            text.push_str(&format!(" ({disabled_count} disabled)"));
+        }
+        text
+    };
+    if footer_status == FooterStatus::Compact {
+        Some(status)
+    } else {
+        format_status_bar_text(config, &status)
     }
 }
 
@@ -267,6 +351,7 @@ pub fn snapshot_to_json(snapshot: &McpStatusSnapshot) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use indexmap::IndexMap;
     use serde_json::json;
 
     #[test]
@@ -340,7 +425,96 @@ mod tests {
             FooterStatus::Compact
         );
 
-        assert_eq!(FooterStatus::from_settings(None), FooterStatus::Off);
+        let settings = json!({ "mcpFooterStatus": "off" })
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            FooterStatus::from_settings(Some(&settings)),
+            FooterStatus::Off
+        );
+
+        // Upstream default is "full" (init.ts:535 `?? "full"`).
+        assert_eq!(FooterStatus::from_settings(None), FooterStatus::Full);
+    }
+
+    /// `formatMcpStatus` (utils.ts:294-297): off → None; icon prefix unless
+    /// `showStatusIcon === false`.
+    #[test]
+    fn format_status_bar_prefix_respects_show_status_icon() {
+        let mut settings = serde_json::Map::new();
+        settings.insert("mcpFooterStatus".to_string(), json!("off"));
+        let config_off = McpConfig {
+            settings: Some(settings),
+            ..Default::default()
+        };
+        assert!(format_status_bar_text(&config_off, "msg").is_none());
+
+        let config_icon = McpConfig::default();
+        let text = format_status_bar_text(&config_icon, "msg").unwrap();
+        assert!(text.starts_with("🔌 MCP: "), "got: {text}");
+
+        let mut settings = serde_json::Map::new();
+        settings.insert("showStatusIcon".to_string(), json!(false));
+        let config_no_icon = McpConfig {
+            settings: Some(settings),
+            ..Default::default()
+        };
+        let text = format_status_bar_text(&config_no_icon, "msg").unwrap();
+        assert!(text.starts_with("MCP: "), "got: {text}");
+    }
+
+    #[test]
+    fn status_bar_empty_config_clears() {
+        let config = McpConfig::default();
+        assert!(build_status_bar_text(&config, &McpServerManager::new(None)).is_none());
+    }
+
+    #[test]
+    fn status_bar_compact_format() {
+        let mut servers = IndexMap::new();
+        servers.insert(
+            "a".to_string(),
+            ServerEntry(json!({}).as_object().cloned().unwrap_or_default()),
+        );
+        servers.insert(
+            "b".to_string(),
+            ServerEntry(
+                json!({ "disabled": true })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        let mut settings = serde_json::Map::new();
+        settings.insert("mcpFooterStatus".to_string(), json!("compact"));
+        let config = McpConfig {
+            mcp_servers: servers,
+            settings: Some(settings),
+            ..Default::default()
+        };
+        // Not connected yet: "MCP 0/1".
+        let text = build_status_bar_text(&config, &McpServerManager::new(None)).unwrap();
+        assert_eq!(text, "MCP 0/1");
+    }
+
+    #[test]
+    fn status_bar_disabled_only_config_clears() {
+        let mut servers = IndexMap::new();
+        servers.insert(
+            "b".to_string(),
+            ServerEntry(
+                json!({ "disabled": true })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        let config = McpConfig {
+            mcp_servers: servers,
+            ..Default::default()
+        };
+        assert!(build_status_bar_text(&config, &McpServerManager::new(None)).is_none());
     }
 
     #[test]

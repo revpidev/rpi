@@ -29,6 +29,7 @@ pub mod metadata;
 pub mod oauth;
 pub mod protocol;
 pub mod proxy;
+pub mod render;
 pub mod runtime;
 pub mod search;
 pub mod session_recovery;
@@ -184,6 +185,10 @@ fn sync_tool_surface(state: &PluginState) {
                 "description": description,
                 "promptSnippet": "MCP gateway — status, search, describe, auth, and single MCP tool calls",
                 "parameters": proxy::tool_parameters_schema(),
+                // renderMcpToolResult (index.ts:719): the host attaches the
+                // render closure and dispatches {"kind":"render","what":
+                // "toolResult"} back here (host_call.rs:263-281).
+                "renderResult": true,
             },
         }));
         proxy_registered = true;
@@ -215,6 +220,27 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// `updateStatusBar` (init.ts:520-556) wired to `ui.setStatus`: computes
+/// the "mcp" footer text from the ready runtime (no runtime yet → clear)
+/// and publishes it to the host.
+fn update_status_bar(state: &PluginState) {
+    let text = state
+        .dispatcher
+        .try_runtime()
+        .and_then(|runtime| status::build_status_bar_text(&runtime.config, &runtime.manager));
+    set_status(state, text);
+}
+
+/// Publish (or clear, on `None`) the "mcp" footer status entry.
+fn set_status(state: &PluginState, text: Option<String>) {
+    host_call(
+        &state.calls,
+        state.cookie,
+        "ui.setStatus",
+        json!({ "key": "mcp", "text": text }),
+    );
 }
 
 /// Shared host-call helper (same request envelope as `rpi-test-native-plugin`).
@@ -358,6 +384,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         on_ready: Some(Arc::new(|| {
             if let Some(plugin) = STATE.get() {
                 sync_tool_surface(plugin);
+                update_status_bar(plugin);
                 let freeze = plugin
                     .dispatcher
                     .try_runtime()
@@ -373,7 +400,9 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         .frozen = true;
                 }
                 // state.onToolMetadataUpdated (index.ts:313-321): skipped
-                // when frozen (prompt-cache red line R7).
+                // when frozen (prompt-cache red line R7). Every metadata
+                // refresh is also a status-bar repaint point (upstream calls
+                // updateStatusBar at the same sites).
                 if let Some(runtime) = plugin.dispatcher.try_runtime() {
                     *runtime
                         .on_metadata_updated
@@ -388,6 +417,22 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                             if !frozen {
                                 sync_tool_surface(plugin);
                             }
+                            update_status_bar(plugin);
+                        }
+                    }));
+                    // Transient lazy-connect status (init.ts:588-591).
+                    *runtime
+                        .on_connecting
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(|server| {
+                        if let Some(plugin) = STATE.get() {
+                            let text = plugin.dispatcher.try_runtime().and_then(|rt| {
+                                status::format_status_bar_text(
+                                    &rt.config,
+                                    &format!("connecting to {server}..."),
+                                )
+                            });
+                            set_status(plugin, text);
                         }
                     }));
                 }
@@ -396,6 +441,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         on_connect_sync: Some(Arc::new(|| {
             if let Some(plugin) = STATE.get() {
                 sync_tool_surface(plugin);
+                update_status_bar(plugin);
             }
         })),
     });
@@ -471,6 +517,21 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 .block_on(async move { dispatcher.execute(&params, &native_tools).await });
             pack(&result)
         }
+        // Render protocol (host_call.rs:263-281): the host dispatches a
+        // synchronous `{"kind":"render","what":"toolResult",...}` and
+        // expects a ComponentTree back. Pure JSON only — never touches the
+        // plugin runtime.
+        Some("render") => {
+            if message.get("what").and_then(Value::as_str) == Some("toolResult") {
+                let tree = render::render_mcp_tool_result(
+                    message.get("result").unwrap_or(&Value::Null),
+                    message.get("options").unwrap_or(&Value::Null),
+                    message.get("context").unwrap_or(&Value::Null),
+                );
+                return pack(&tree);
+            }
+            pack(&Value::Null)
+        }
         Some("event") => match message.get("event").and_then(Value::as_str) {
             Some("session_start") => {
                 // index.ts:376-414: stop the previous runtime, then
@@ -489,10 +550,19 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
             Some("session_shutdown") => {
                 // G4 red line: all spawned MCP server processes are reaped
                 // here (lifecycle graceful_shutdown -> manager close_all ->
-                // stdio child shutdown).
+                // stdio child shutdown). The "mcp" status bar entry is
+                // cleared with the shutdown snapshot (publishMcpStatus-
+                // Shutdown, mcp-status.ts:92-106 + updateStatusBar on the
+                // empty runtime).
                 state
                     .runtime
                     .block_on(state.dispatcher.clone().shutdown_owned());
+                host_call(
+                    &state.calls,
+                    state.cookie,
+                    "ui.setStatus",
+                    json!({ "key": "mcp", "text": null }),
+                );
                 pack(&Value::Null)
             }
             Some("tool_result") => {

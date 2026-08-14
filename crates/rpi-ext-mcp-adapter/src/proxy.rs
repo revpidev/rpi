@@ -88,7 +88,14 @@ pub struct McpRuntime {
     /// after init completes; fired with (server, reason) at metadata
     /// refresh points. The hook itself decides about freezeDirectTools.
     pub on_metadata_updated: Mutex<Option<MetadataUpdatedHook>>,
+    /// Transient "connecting to <server>..." status (init.ts:588-591
+    /// `lazyConnect`): set by the plugin after init; fired just before a
+    /// lazy `manager.connect` attempt so the footer can show progress.
+    pub on_connecting: Mutex<Option<ConnectingHook>>,
 }
+
+/// Callback fired before a lazy connect attempt (init.ts:588-591).
+type ConnectingHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Callback fired at metadata refresh points (index.ts:313-321).
 type MetadataUpdatedHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
@@ -199,6 +206,7 @@ pub async fn initialize_mcp(
         server_instructions: Mutex::new(HashMap::new()),
         cache_path: cache_path.clone(),
         on_metadata_updated: Mutex::new(None),
+        on_connecting: Mutex::new(None),
     });
 
     let enabled: Vec<(&String, &ServerEntry)> = config
@@ -546,7 +554,8 @@ pub fn flush_metadata_cache(state: &McpRuntime) {
     }
 }
 
-/// `lazyConnect` (init.ts:569-614), P0 cut (no UI status).
+/// `lazyConnect` (init.ts:569-614). The transient "connecting..." footer
+/// status fires via `on_connecting` just before the connect attempt.
 pub async fn lazy_connect(state: &McpRuntime, server_name: &str) -> bool {
     if state.owner_cancel.is_cancelled() {
         return false;
@@ -571,9 +580,22 @@ pub async fn lazy_connect(state: &McpRuntime, server_name: &str) -> bool {
     if definition.is_disabled() {
         return false;
     }
+    // init.ts:588-591: transient footer status while the connect is in
+    // flight; the metadata-updated hook paints the final state after.
+    let on_connecting = state
+        .on_connecting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(hook) = on_connecting {
+        hook(server_name);
+    }
     match state.manager.connect(server_name, definition).await {
         Ok(connection) => {
             if connection.status() == ConnectionStatus::NeedsAuth {
+                // Repaint: clears the transient "connecting..." status
+                // (upstream updateStatusBar, proxy-modes.ts:760).
+                notify_metadata_updated(state, server_name, "lazy-connect-needs-auth");
                 return false;
             }
             state.failures.clear(server_name);
@@ -588,6 +610,8 @@ pub async fn lazy_connect(state: &McpRuntime, server_name: &str) -> bool {
                 .failures
                 .record(server_name, &error.to_string(), state.owner_cancel.clone());
             debug!(server = %server_name, "MCP: lazy connect failed");
+            // Repaint: clears the transient status (proxy-modes.ts:760).
+            notify_metadata_updated(state, server_name, "lazy-connect-failed");
             false
         }
     }
