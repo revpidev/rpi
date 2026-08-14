@@ -8,9 +8,11 @@
 //! `runSingleSubagent` flow, subagent-executor.ts:5450-5700); the single path
 //! now routes through here so all four consumers cannot drift.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::agents::discover::{self, AgentConfig, ContextMode};
 use crate::agents::skills;
@@ -51,6 +53,12 @@ pub struct ChildSpec {
     /// Steer inbox dir (FR-P1-04): background children poll it for injected
     /// messages; `None` clears the env (foreground runs).
     pub steer_inbox: Option<PathBuf>,
+    /// Acceptance gate command (FR-P1-09): runs host-side after the child;
+    /// a failing gate fails the run. Inferred gates only record.
+    pub gate: Option<String>,
+    /// Budget payloads inherited from the top-level call (FR-P1-09).
+    pub turn_budget: Option<Value>,
+    pub tool_budget: Option<Value>,
     /// Skill resolution fallback cwd (chain scratch dir); defaults to base.
     pub skill_fallback_cwd: Option<PathBuf>,
     /// Extra cwd for skill resolution when the chain dir differs.
@@ -103,6 +111,13 @@ impl ChildSpec {
             timeout_ms: resolve_call_timeout(object),
             child_index: 0,
             skills: None,
+            gate: object
+                .get("gate")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+            turn_budget: object.get("turnBudget").cloned(),
+            tool_budget: object.get("toolBudget").cloned(),
             session_file: object
                 .get("sessionFile")
                 .and_then(Value::as_str)
@@ -127,6 +142,11 @@ fn resolve_call_timeout(object: &serde_json::Map<String, Value>) -> Option<u64> 
     let max_runtime = as_positive(object.get("maxRuntimeMs"));
     timeout.or(max_runtime)
 }
+
+/// Acceptance ledger per child run (FR-P1-09) — keyed by run id + child
+/// index; the details assembly drains it.
+pub static GATE_LEDGER: Mutex<BTreeMap<String, (u32, Value)>> =
+    Mutex::new(BTreeMap::new());
 
 /// `getSubagentSessionRoot` fallback (extension/index.ts:224-231): no parent
 /// session → a fresh temp directory.
@@ -159,6 +179,9 @@ pub struct RunCtx {
     pub top_thinking: Option<String>,
     pub top_context: Option<ContextMode>,
     pub top_timeout_ms: Option<u64>,
+    pub top_turn_budget: Option<Value>,
+    pub top_tool_budget: Option<Value>,
+    pub usage_budget: Option<Value>,
     pub artifacts_dir: Option<PathBuf>,
     pub session_root: PathBuf,
 }
@@ -226,6 +249,9 @@ impl RunCtx {
                 None => None,
             },
             top_timeout_ms: resolve_call_timeout(object),
+            top_turn_budget: object.get("turnBudget").cloned(),
+            top_tool_budget: object.get("toolBudget").cloned(),
+            usage_budget: object.get("usageBudget").cloned(),
             settings,
             config,
             base_cwd: effective_cwd,
@@ -379,6 +405,19 @@ pub async fn run_child_async(
         return Err(format!("Skills not found: {}", missing_skills.join(", ")));
     }
     let mut system_prompt = agent.system_prompt.trim().to_string();
+    // Budget instruction injection (FR-P1-09, turn-budget.ts L26-39).
+    let budget_prompt = crate::p1::acceptance::build_budget_prompt(
+        spec.turn_budget.as_ref().or(ctx.top_turn_budget.as_ref()),
+        spec.tool_budget.as_ref().or(ctx.top_tool_budget.as_ref()),
+    );
+    if !budget_prompt.is_empty() {
+        if system_prompt.is_empty() {
+            system_prompt = budget_prompt.clone();
+        } else {
+            system_prompt = format!("{system_prompt}\n\n{budget_prompt}");
+        }
+    }
+
     if !resolved_skills.is_empty() {
         let injection = skills::build_skill_injection(&resolved_skills);
         if system_prompt.is_empty() {
@@ -488,7 +527,7 @@ pub async fn run_child_async(
         agent_inherit_skills: agent.inherit_skills,
         task: task_text,
         task_delivery: None,
-        cwd: effective_cwd,
+        cwd: effective_cwd.clone(),
         session_dir,
         session_file,
         model: candidates.first().cloned(),
@@ -511,7 +550,88 @@ pub async fn run_child_async(
         steer_inbox: spec.steer_inbox.clone(),
     };
 
-    let result = foreground::run_foreground_with_fallback(&input, &candidates).await;
+    let mut result = foreground::run_foreground_with_fallback(&input, &candidates).await;
+
+    // Acceptance ledger (FR-P1-09): inferred level + parsed fenced report;
+    // explicit gates run host-side and failing gates fail the run.
+    {
+        let (level, review_required) = crate::p1::acceptance::infer_level(
+            &agent.name,
+            agent.acceptance_role.as_deref(),
+            &spec.task,
+            false,
+        );
+        let report = crate::p1::acceptance::parse_acceptance_report(&result.final_output);
+        if let Some(Err(message)) = &report {
+            tracing::warn!(%message, "invalid acceptance report in child output");
+        }
+        // Evidence completeness for the inferred level
+        // (`reportEvidenceStatus` shape): kinds the report omits are marked
+        // missing (presence = the field exists and is non-empty).
+        let mut evidence_status = serde_json::Map::new();
+        let rank = crate::p1::acceptance::level_rank(&level).unwrap_or(0);
+        for evidence_level_rank in [1u8, 2, 3] {
+            if rank < evidence_level_rank {
+                continue;
+            }
+            let evidence_level = match evidence_level_rank {
+                1 => "attested",
+                2 => "checked",
+                _ => "verified",
+            };
+            for kind in crate::p1::acceptance::required_evidence_for_level(evidence_level) {
+                let present = report.as_ref().map(|r| r.is_ok()).unwrap_or(false)
+                    && report
+                        .as_ref()
+                        .and_then(|r| r.as_ref().ok())
+                        .and_then(|fields| fields.get(&kind.replace('-', "")))
+                        .map(|value| {
+                            value.as_array().is_some_and(|items| !items.is_empty())
+                                || value.as_str().is_some_and(|s| !s.trim().is_empty())
+                                || value.as_bool().unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                evidence_status.insert(
+                    kind.to_string(),
+                    json!(if present { "satisfied" } else { "missing" }),
+                );
+            }
+        }
+        let ledger = json!({
+            "level": level,
+            "reviewRequired": review_required,
+            "reportParsed": report.as_ref().map(|r| r.is_ok()).unwrap_or(false),
+            "reportError": match report.as_ref() {
+                Some(Err(message)) => Some(message.clone()),
+                _ => None,
+            },
+            "evidenceStatus": evidence_status,
+        });
+        if let Some(gate) = &spec.gate {
+            let explicit = true;
+            match crate::p1::acceptance::run_gate_command(gate, &effective_cwd) {
+                Ok(passed) if passed => {}
+                outcome => {
+                    let message = match outcome {
+                        Err(error) => format!("Acceptance gate error: {error}"),
+                        _ => format!("Acceptance gate failed: {gate}"),
+                    };
+                    if explicit {
+                        result.exit_code = result.exit_code.max(1);
+                        result.error = Some(match result.error.take() {
+                            Some(existing) => format!("{existing}; {message}"),
+                            None => message,
+                        });
+                    }
+                }
+            }
+        }
+        // Ride the ledger for the details assembly (drained by tool.rs).
+        GATE_LEDGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(input.run_id.clone(), (input.child_index, ledger));
+    }
 
     // Output file: write the full output to the declared path on success.
     let mut saved_output_path = None;

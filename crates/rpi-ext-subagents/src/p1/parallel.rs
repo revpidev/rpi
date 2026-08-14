@@ -122,6 +122,13 @@ pub fn parse_tasks(
                 child_index: index as u32,
                 skills: string_list(object.get("skill"))
                     .or_else(|| string_list(object.get("skills"))),
+                gate: object
+                    .get("gate")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+                turn_budget: None,
+                tool_budget: None,
                 session_file: None,
                 steer_inbox: None,
                 skill_fallback_cwd: None,

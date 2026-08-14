@@ -363,6 +363,8 @@ pub async fn run_chain_async(
             INITIAL_PROGRESS_CONTENT,
         );
     }
+    let usage_budget = ctx.usage_budget.clone();
+    let mut accumulated_cost = 0.0f64;
     let mut outputs: BTreeMap<String, String> = BTreeMap::new();
     let mut completed: Vec<StepOutcome> = Vec::new();
     let mut previous_output: Option<String> = None;
@@ -422,12 +424,29 @@ pub async fn run_chain_async(
             timeout_ms: step.timeout_ms,
             child_index: index as u32,
             skills: Some(skills),
+            gate: None,
+            turn_budget: None,
+            tool_budget: None,
             session_file: None,
             steer_inbox: None,
             skill_fallback_cwd: Some(ctx.base_cwd.clone()),
             skill_primary_cwd: Some(chain_dir.clone()),
         };
+        // Usage-budget gate (FR-P1-09, usage-budget.ts): exhausted budgets
+        // skip the launch instead of running over.
+        if !crate::p1::acceptance::usage_budget_allows_launch(
+            usage_budget.as_ref(),
+            accumulated_cost,
+        )? {
+            break;
+        }
         let outcome = launch_child::run_child_async(&spec, &agent, ctx).await?;
+        accumulated_cost += outcome
+            .result
+            .usage
+            .get("cost")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
         let mut details = json!({
             "index": index,
             "agent": outcome.agent_name,

@@ -143,6 +143,27 @@ pub fn tool_parameters_schema() -> Value {
                 "minimum": 1,
                 "description": "Parallel concurrency cap for tasks; overrides parallel.concurrency (default 4)."
             },
+            "gate": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Acceptance gate shorthand (FR-P1-09): the command runs host-side after the child; a failing gate fails the run. Equivalent to acceptance {level: verified, verify: [the command]}."
+            },
+            "turnBudget": {
+                "type": "object",
+                "description": "Turn budget {maxTurns, graceTurns=1} (FR-P1-09): injected into child instructions; children wrap up before the cap."
+            },
+            "toolBudget": {
+                "type": "object",
+                "description": "Tool budget {soft?, hard, block?} (FR-P1-09): soft warns, hard caps tool calls."
+            },
+            "usageBudget": {
+                "type": "object",
+                "description": "Usage budget {tokens?{soft,hard}, costUsd?{soft,hard}} (FR-P1-09): exhausted budgets skip further launches in composite runs."
+            },
+            "foregroundOnly": {
+                "type": "boolean",
+                "description": "Never force this run to background, even with forceTopLevelAsync."
+            },
             "agentScope": {
                 "type": "string",
                 "enum": ["user", "project", "both"],
@@ -284,7 +305,14 @@ fn execute_subagent_tool_inner(
         return dispatch_steps(&object, &agents, &ctx, runtime);
     }
 
-    let spec = crate::p1::launch_child::ChildSpec::from_params(&object);
+    let mut spec = crate::p1::launch_child::ChildSpec::from_params(&object);
+    // Top-level `gate` shorthand (FR-P1-09): verified acceptance for the run.
+    if let Some(gate) = object.get("gate").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+        if spec.gate.is_none() {
+            spec.gate = Some(gate.to_string());
+        }
+        let _ = crate::p1::acceptance::normalize_gate(gate);
+    }
     let agent = match discover::resolve_agent_name(&agents, &spec.agent_name) {
         Ok(Some(agent)) => agent.clone(),
         Ok(None) => return ToolOutcome::error(format!("Unknown agent: {}", spec.agent_name)),
@@ -391,6 +419,15 @@ fn assemble_single_details(
     }
     if let Some(error) = &result.error {
         single["error"] = json!(error);
+    }
+    // Acceptance ledger (FR-P1-09): inferred level + gate outcome.
+    {
+        let mut ledger_map = crate::p1::launch_child::GATE_LEDGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((_, ledger)) = ledger_map.remove(&ctx.run_id) {
+            single["acceptance"] = ledger;
+        }
     }
     if let Some(session_file) = &result.session_file {
         single["sessionFile"] = json!(session_file.to_string_lossy());
@@ -716,6 +753,9 @@ fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::laun
         top_thinking: ctx.top_thinking.clone(),
         top_context: ctx.top_context,
         top_timeout_ms: ctx.top_timeout_ms,
+        top_turn_budget: ctx.top_turn_budget.clone(),
+        top_tool_budget: ctx.top_tool_budget.clone(),
+        usage_budget: ctx.usage_budget.clone(),
         artifacts_dir: ctx.artifacts_dir.clone(),
         session_root: ctx.session_root.clone(),
     }
