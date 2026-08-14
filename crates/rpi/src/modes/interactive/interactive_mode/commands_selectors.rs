@@ -433,35 +433,15 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
         }
         SettingsChange::TuiMode(mode) => {
             // onTuiModeChange (interactive-mode.ts:4559-4567 @ b103937d3):
-            // switch → on failure, roll back selector value + show rejection
-            // status (no persistence); on success, persist + show confirmation.
-            if !ui.switch_tui_mode(mode, true, true) {
-                // Roll back the selector's displayed value to the actual mode
-                // (interactive-mode.ts:4561 `selector.getSettingsList().
-                // updateValue("tui-mode", this.ui.mode)`).
-                let actual_mode = ui.ui.mode();
-                let mode_str = match actual_mode {
-                    rpi_tui::tui::TuiMode::Regular => "regular",
-                    rpi_tui::tui::TuiMode::Fullscreen => "fullscreen",
-                };
-                if let Some(weak) = lock(&ui.settings_selector_weak).as_ref() {
-                    if let Some(selector) = weak.upgrade() {
-                        selector
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get_settings_list()
-                            .update_value("tui-mode", mode_str);
-                    }
-                }
-                ui.show_status("Close active overlays before changing TUI mode");
-            } else {
-                session.settings_manager(|s| s.set_tui_mode(mode));
-                let mode_str = match mode {
-                    rpi_tui::tui::TuiMode::Regular => "regular",
-                    rpi_tui::tui::TuiMode::Fullscreen => "fullscreen",
-                };
-                ui.show_status(&format!("TUI mode: {mode_str}"));
-            }
+            // routed through the drain (`UiCommand::SwitchTuiMode`) — this
+            // callback fires inside the settings selector's `handle_input`
+            // with the renderer's inner lock held, and `switch_tui_mode`'s
+            // `capture_render_state`/`stop`/`start` take that same lock
+            // (non-reentrant): calling them here would self-deadlock the
+            // driver thread (the "/settings tui-mode switch hang" bug).
+            // The drain handler performs the switch and the
+            // rollback/persist/status follow-up.
+            ui.push(UiCommand::SwitchTuiMode(mode));
         }
         SettingsChange::FullscreenExitOutput(output) => {
             // onFullscreenExitOutputChange (interactive-mode.ts:4569-4571).
@@ -3656,6 +3636,74 @@ mod tests {
             "no rebuild while streaming (interactive-mode.ts:4273-4288)"
         );
         assert!(lock(&ui.streaming).is_some(), "stream survives the change");
+    }
+
+    /// Regression: the tui-mode settings callback fires inside the settings
+    /// selector's `handle_input` with the renderer's inner lock held
+    /// (`TuiMainScreen::tick` → `lock_inner().handle_input(...)`). The switch
+    /// must be deferred to the drain (`UiCommand::SwitchTuiMode`): the
+    /// synchronous path calls `capture_render_state`/`stop`/`start`, which
+    /// take that same non-reentrant mutex — the driver thread self-deadlocked
+    /// (the "/settings tui-mode switch hang").
+    #[tokio::test]
+    async fn settings_tui_mode_change_is_deferred_to_the_drain() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        assert_eq!(ui.ui.mode(), rpi_tui::tui::TuiMode::Regular);
+
+        apply_settings_change(ui, SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen));
+        // Queue-only: no synchronous renderer access, no persistence yet.
+        assert_eq!(
+            ui.ui.mode(),
+            rpi_tui::tui::TuiMode::Regular,
+            "the switch must not run inside the dispatch"
+        );
+        assert_eq!(
+            session.settings_manager(|s| s.get_tui_mode()),
+            rpi_tui::tui::TuiMode::Regular,
+            "not persisted before the switch succeeds"
+        );
+
+        // The drain performs the switch + persists + confirms.
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), rpi_tui::tui::TuiMode::Fullscreen);
+        assert_eq!(
+            session.settings_manager(|s| s.get_tui_mode()),
+            rpi_tui::tui::TuiMode::Fullscreen
+        );
+
+        // And back to regular through the same deferred path.
+        apply_settings_change(ui, SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Regular));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), rpi_tui::tui::TuiMode::Regular);
+        assert_eq!(
+            session.settings_manager(|s| s.get_tui_mode()),
+            rpi_tui::tui::TuiMode::Regular
+        );
+    }
+
+    /// The overlay-open rejection survives the deferral: no switch, no
+    /// persistence (rollback path through the drain).
+    #[tokio::test]
+    async fn settings_tui_mode_change_rejection_still_not_persisted() {
+        let (mode, _terminal, session, _tmp) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let overlay = shared_component_from_boxed(Box::new(rpi_tui::tui::Container::new()));
+        let _handle = ui.ui.show_overlay(overlay, None);
+        assert!(ui.ui.has_overlay_entries());
+
+        apply_settings_change(ui, SettingsChange::TuiMode(rpi_tui::tui::TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(
+            ui.ui.mode(),
+            rpi_tui::tui::TuiMode::Regular,
+            "overlay rejection: mode unchanged"
+        );
+        assert_eq!(
+            session.settings_manager(|s| s.get_tui_mode()),
+            rpi_tui::tui::TuiMode::Regular,
+            "overlay rejection: not persisted"
+        );
     }
 
     /// Regression: selector/keybinding callbacks run on the TUI driver

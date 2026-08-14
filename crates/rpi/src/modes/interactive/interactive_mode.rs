@@ -421,6 +421,15 @@ pub(crate) enum UiCommand {
     /// a component callback (lock contract); automatic pairs resolve the
     /// terminal appearance asynchronously and push the resolved branch name.
     ApplyThemeName(String),
+    /// Mode-internal: hot-swap the TUI renderer from the `/settings`
+    /// tui-mode change (interactive-mode.ts:4559-4567). MUST be routed
+    /// through the drain: the settings callback fires inside the focused
+    /// component's `handle_input`, which runs with the renderer's inner
+    /// lock held (`TuiMainScreen::tick` / `TuiAltScreen` equivalent), and
+    /// `switch_tui_mode` calls blocking-lock APIs (`capture_render_state`,
+    /// `stop`, `start`) that would self-deadlock the non-reentrant mutex if
+    /// invoked synchronously from the dispatch.
+    SwitchTuiMode(TuiMode),
     /// Mode-internal: the git branch watcher observed a branch change and
     /// already updated the `FooterDataProvider`; the drain invalidates the
     /// footer (upstream `onBranchChange` subscriber,
@@ -1952,6 +1961,40 @@ impl InteractiveUi {
                     }
                 };
                 self.apply_theme(Arc::new(theme));
+            }
+            UiCommand::SwitchTuiMode(mode) => {
+                // onTuiModeChange (interactive-mode.ts:4559-4567 @ b103937d3),
+                // applied from the drain (see the variant's doc comment):
+                // switch → on failure, roll back the selector value + show
+                // rejection status (no persistence); on success, persist +
+                // show confirmation.
+                if !self.switch_tui_mode(mode, true, true) {
+                    // Roll back the selector's displayed value to the actual
+                    // mode (interactive-mode.ts:4561 `selector.getSettingsList()
+                    // .updateValue("tui-mode", this.ui.mode)`).
+                    let actual_mode = self.ui.mode();
+                    let mode_str = match actual_mode {
+                        TuiMode::Regular => "regular",
+                        TuiMode::Fullscreen => "fullscreen",
+                    };
+                    if let Some(weak) = lock(&self.settings_selector_weak).as_ref() {
+                        if let Some(selector) = weak.upgrade() {
+                            selector
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_settings_list()
+                                .update_value("tui-mode", mode_str);
+                        }
+                    }
+                    self.show_status("Close active overlays before changing TUI mode");
+                } else {
+                    self.session().settings_manager(|s| s.set_tui_mode(mode));
+                    let mode_str = match mode {
+                        TuiMode::Regular => "regular",
+                        TuiMode::Fullscreen => "fullscreen",
+                    };
+                    self.show_status(&format!("TUI mode: {mode_str}"));
+                }
             }
             UiCommand::GitBranchChanged => {
                 // `onBranchChange` subscriber (interactive-mode.ts:807-809):
@@ -4950,6 +4993,7 @@ mod tests {
             UiCommand::Escape => "escape",
             UiCommand::ThemeChanged => "theme_changed",
             UiCommand::ApplyThemeName(_) => "apply_theme_name",
+            UiCommand::SwitchTuiMode(_) => "switch_tui_mode",
             UiCommand::GitBranchChanged => "git_branch_changed",
             UiCommand::NewVersionAvailable(_) => "new_version_available",
             UiCommand::ShareAbort => "share_abort",
