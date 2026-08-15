@@ -30,7 +30,10 @@ impl PluginRuntime {
         self.runtime.block_on(future)
     }
 
-    /// Fire-and-forget task on the plugin runtime (shutdown sweeps).
+    /// Fire-and-forget task on the plugin runtime (async run bodies). The
+    /// lifecycle paths (agent_end drain, session_shutdown harvest) use
+    /// `block_on` instead — the host must observe their completion before
+    /// exit, which a detached task cannot guarantee.
     pub fn spawn<F>(&self, future: F)
     where
         F: std::future::Future<Output = ()> + Send + 'static,

@@ -143,19 +143,21 @@ fn resolve_call_timeout(object: &serde_json::Map<String, Value>) -> Option<u64> 
     timeout.or(max_runtime)
 }
 
-/// Acceptance ledger per child run (FR-P1-09) — keyed by run id + child
-/// index; the details assembly drains it.
-pub static GATE_LEDGER: Mutex<BTreeMap<String, (u32, Value)>> = Mutex::new(BTreeMap::new());
+/// Acceptance ledger per child run (FR-P1-09) — keyed by (run id, child
+/// index) so parallel children never clobber each other; the details
+/// assembly drains it.
+pub static GATE_LEDGER: Mutex<BTreeMap<(String, u32), Value>> = Mutex::new(BTreeMap::new());
 
 /// `getSubagentSessionRoot` fallback (extension/index.ts:224-231): no parent
-/// session → a fresh temp directory.
+/// session → a fresh temp directory. 0700 like upstream `mkdtempSync` — the
+/// child session transcripts are private.
 fn mkdtemp_session_root() -> PathBuf {
     let base = crate::paths::temp_dir().join("rpi-subagent-session-");
     let base = base.to_string_lossy().to_string();
     for _ in 0..32 {
         let candidate = format!("{base}{}", budget::random_run_id());
         let path = PathBuf::from(&candidate);
-        if std::fs::create_dir(&path).is_ok() {
+        if crate::paths::create_private_dir_all(&path).is_ok() && path.is_dir() {
             return path;
         }
     }
@@ -574,7 +576,7 @@ pub async fn run_child_async(
         child_index: spec.child_index,
         child_max_subagent_depth: child_max_depth,
         artifacts_dir: ctx.artifacts_dir.clone(),
-        include_jsonl: false,
+        include_jsonl: ctx.config.include_jsonl(),
         include_transcript: true,
         parent_session_id: ctx.parent_session_file.as_ref().map(|p| {
             p.file_stem()
@@ -635,7 +637,7 @@ pub async fn run_child_async(
                 );
             }
         }
-        let ledger = json!({
+        let mut ledger = json!({
             "level": level,
             "reviewRequired": review_required,
             "reportParsed": report.as_ref().map(|r| r.is_ok()).unwrap_or(false),
@@ -647,8 +649,23 @@ pub async fn run_child_async(
         });
         if let Some(gate) = &spec.gate {
             let explicit = true;
-            match crate::p1::acceptance::run_gate_command(gate, &effective_cwd) {
-                Ok(passed) if passed => {}
+            // Memoized by workspace state (FR-P1-09 / acceptance.ts
+            // runMemoizedVerifyCommand): same command + same tree = cached
+            // verdict instead of a re-run.
+            let (gate_passed, memoized) = crate::p1::acceptance::run_memoized_gate_command(
+                gate,
+                &effective_cwd,
+                &ctx.run_id,
+                ctx.artifacts_dir.as_deref(),
+            );
+            match gate_passed {
+                Ok(true) => {
+                    if memoized {
+                        if let Some(object) = ledger.as_object_mut() {
+                            object.insert("gateMemoized".to_string(), json!(true));
+                        }
+                    }
+                }
                 outcome => {
                     let message = match outcome {
                         Err(error) => format!("Acceptance gate error: {error}"),
@@ -668,7 +685,26 @@ pub async fn run_child_async(
         GATE_LEDGER
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(input.run_id.clone(), (input.child_index, ledger));
+            .insert((input.run_id.clone(), input.child_index), ledger.clone());
+        // The acceptance ledger is part of the run record (design §3.5:
+        // "_meta.json … P1 补 acceptance ledger") — merge it into the
+        // per-child metadata file the foreground run just wrote.
+        if let Some(artifacts_dir) = &ctx.artifacts_dir {
+            let paths = crate::artifacts::get_artifact_paths(
+                artifacts_dir,
+                &input.run_id,
+                &agent.name,
+                Some(input.child_index),
+            );
+            if let Ok(raw) = std::fs::read_to_string(&paths.metadata_path) {
+                if let Ok(mut metadata) = serde_json::from_str::<Value>(&raw) {
+                    if let Some(target) = metadata.as_object_mut() {
+                        target.insert("acceptance".to_string(), ledger);
+                    }
+                    let _ = crate::artifacts::write_metadata(&paths.metadata_path, &metadata);
+                }
+            }
+        }
     }
 
     // Output file: write the full output to the declared path on success.

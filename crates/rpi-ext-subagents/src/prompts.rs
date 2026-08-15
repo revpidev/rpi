@@ -91,11 +91,14 @@ pub fn prompt_directories(cwd: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Load a template by name: bundled first, then user/project dirs.
+/// Load a template by name: bundled first, then user/project dirs. The name
+/// is user/model input joined into a path — path-shaped names are rejected
+/// (C1).
 pub fn load_template(name: &str, cwd: &Path) -> Option<String> {
     if let Some((_, body)) = BUNDLED_PROMPTS.iter().find(|(n, _)| *n == name) {
         return Some((*body).to_string());
     }
+    crate::paths::ensure_safe_component(name, "Template name").ok()?;
     for dir in prompt_directories(cwd) {
         let path = dir.join(format!("{name}.md"));
         if let Ok(body) = std::fs::read_to_string(&path) {

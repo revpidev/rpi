@@ -25,6 +25,8 @@ libc.workspace = true
 # bounded-concurrency parallel runs (p1/parallel.rs).
 regex.workspace = true
 futures.workspace = true
+# Session ledger file names (ADR-0019 §4 `<sha256(sessionId)>.json`).
+sha2.workspace = true
 
 # Test-only fixed child (design §5.3 e2e); not part of the distributed plugin.
 [[bin]]

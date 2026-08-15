@@ -94,6 +94,13 @@ pub trait HostContext {
     fn cwd(&self) -> PathBuf;
     fn parent_model(&self) -> Option<String>;
     fn parent_session_file(&self, settings: &config::SettingsPair) -> Option<PathBuf>;
+    /// `ctx.hasUI`: authority-gated actions (grant-spawn-budget) are limited
+    /// to the root interactive parent session (upstream
+    /// subagent-executor.ts:5241-5260). Defaults to `false` — test fakes
+    /// must opt in explicitly.
+    fn has_ui(&self) -> bool {
+        false
+    }
     /// `ctx.scopedModels` projection: `(provider, id)` pairs for
     /// `launch::model` fuzzy resolution (FR-P1-05). Returns an empty list
     /// when the host reports none — resolution then falls back to verbatim.
@@ -130,6 +137,12 @@ impl HostContext for HostCallsContext<'_> {
         let provider = model.get("provider").and_then(Value::as_str)?;
         let id = model.get("id").and_then(Value::as_str)?;
         Some(format!("{provider}/{id}"))
+    }
+
+    fn has_ui(&self) -> bool {
+        host_call_ok(self.calls, self.cookie, "ctx.hasUI", json!({}))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
     }
 
     /// No ABI accessor for the session file (TE04 must not change
@@ -665,18 +678,26 @@ fn dispatch_message(message: &Value) -> Value {
                 }
                 (PluginMode::Parent, "session_shutdown") => {
                     // Harvest async runs (ADR-0019 interactive branch), then
-                    // sweep live children (SIGTERM → 3s → SIGKILL).
-                    state.runtime.spawn(async_runner_shutdown());
+                    // sweep live children (SIGTERM → 3s → SIGKILL). Blocking
+                    // here is the point: `dispose` waits for this dispatch to
+                    // return, so a fire-and-forget spawn would be cancelled by
+                    // process exit before the signal ladder ran. The ladder is
+                    // bounded (3s grace), so interactive exit is not stalled.
+                    state.runtime.block_on(async_runner_shutdown());
                     Value::Null
                 }
                 (PluginMode::Parent, "agent_end") => {
                     // Headless auto-drain (ADR-0019 print branch,
                     // auto-drain.ts): wait for outstanding runs before exit.
+                    // Dispatch is synchronous, so blocking here blocks the
+                    // host's `agent_end` handling — print mode therefore waits
+                    // for async runs to finish (upstream parity), bounded by
+                    // the 30min drain timeout.
                     let has_ui = host_call_ok(&state.calls, state.cookie, "ctx.hasUI", json!({}))
                         .and_then(|value| value.as_bool())
                         .unwrap_or(false);
                     if !has_ui {
-                        state.runtime.spawn(async_move_drain());
+                        state.runtime.block_on(async_move_drain());
                     }
                     Value::Null
                 }
@@ -756,7 +777,9 @@ fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
 }
 
 /// Integration-test probes (not part of the plugin surface): budget-ledger
-/// access for deterministic rejection scenarios.
+/// access for deterministic rejection scenarios. Same shape as mcp-adapter's
+/// test seam (kept ungated so integration tests share the process state).
+#[doc(hidden)]
 pub mod test_support {
     /// Thin wrapper over the session spawn-budget ledger.
     pub struct SpawnBudgetLedgerProbe {
@@ -795,6 +818,7 @@ pub mod test_support {
 }
 
 /// Test seam: drive a tool execution against an installed state.
+#[doc(hidden)]
 pub fn execute_for_test(params: &Value) -> Value {
     dispatch_message(&json!({
         "kind": "toolExecute",
@@ -805,6 +829,7 @@ pub fn execute_for_test(params: &Value) -> Value {
 }
 
 /// Test seam: drive a named tool execution (subagent_wait, supervisor tools)
+#[doc(hidden)]
 /// against an installed state.
 pub fn execute_tool_for_test(tool_name: &str, params: &Value) -> Value {
     dispatch_message(&json!({
@@ -816,6 +841,7 @@ pub fn execute_tool_for_test(tool_name: &str, params: &Value) -> Value {
 }
 
 /// Test seam: install with a fake host (mcp-adapter `install_for_test`
+#[doc(hidden)]
 /// pattern; one install per test binary because of the OnceLock state).
 pub fn install_for_test(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     install(calls, cookie)

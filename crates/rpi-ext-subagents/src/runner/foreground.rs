@@ -72,7 +72,8 @@ fn unregister_child(id: u64) {
 
 /// Signal every live child spawned for `run_id` (async stop): SIGTERM now,
 /// SIGKILL after the shutdown grace. Signals are pid-direct (ladder style of
-/// `kill_all_children_for_shutdown`).
+/// `kill_all_children_for_shutdown`); the shared 3s grace bounds how long a
+/// TERM-trapping child can outlive the stop request.
 pub fn request_stop_for_run(run_id: &str) {
     let children: Vec<(u32, Arc<tokio::sync::Mutex<Child>>)> = {
         LIVE_CHILDREN
@@ -83,8 +84,15 @@ pub fn request_stop_for_run(run_id: &str) {
             .map(|(pid, _, child)| (*pid, child.clone()))
             .collect()
     };
+    let term = std::time::Instant::now();
+    for (pid, _) in &children {
+        signal_pid(*pid, Signal::Term);
+    }
+    let elapsed = term.elapsed();
+    if elapsed < Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) {
+        std::thread::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) - elapsed);
+    }
     for (pid, _) in children {
-        signal_pid(pid, Signal::Term);
         signal_pid(pid, Signal::Kill);
     }
 }
@@ -324,6 +332,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     }
 
     let (child_id, child_pid, child_handle) = register_child(child, &input.run_id);
+    // Persist the pid for the stale-run reconciler (ADR-0019 crash branch):
+    // a host crash orphans these children (independent process group, full
+    // stdout pipe), and the next plugin init reaps them by recorded pid.
+    crate::runner::background::record_child_pid(&input.run_id, child_pid);
     // Take the pipes under a short lock; the run must NOT hold the child lock
     // while streams are open (the wait below re-acquires it).
     let (stdout, stderr) = {

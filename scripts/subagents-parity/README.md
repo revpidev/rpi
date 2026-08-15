@@ -59,6 +59,16 @@ node scripts/subagents-parity/run-parity.mjs
 （当前 9+6+5 用例全 MATCH；其中 fanout 变量真值、orchestrator
 session-id 等两处实现缺口即由对拍发现并修复）。
 
+## 环境隔离（运行前须知）
+
+`run-parity.mjs` 两条腿都以**清除后的环境**启动子进程：`PI_SUBAGENT_PARENT_SESSION`
+与 `RPI_SUBAGENT_PARENT_SESSION` 一律删除（`cleanSessionEnv`）。原因：上游腿的
+`pi-args.ts` 会回退读取 shell 里的 `PI_*` 值，rust 腿读 `RPI_*`（桥接层把
+`PI_SUBAGENT_*` 改名为 `RPI_SUBAGENT_*`）——若在外层 shell 导出过其中任一键，
+它的值只到达一条腿，args 模式会有 8 例假 MISMATCH（`fork-session-file` 之外的
+用例都走环境回退）。2026-08-15 前的 harness 未做此隔离；如需复现旧行为可手动
+导出该键并观察误报。
+
 ## 已知不适用面
 
 - 工具描述全文：入口从 workflowScript 换成结构化参数（ADR-0016），

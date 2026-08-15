@@ -148,15 +148,31 @@ pub fn format_output_artifact_content(
     lines.join("\n")
 }
 
-/// `writeMetadata` (artifacts.ts:221-224) — two-space indented JSON.
+/// `writeMetadata` (artifacts.ts:221-224) — two-space indented JSON, written
+/// atomically (tmp file + rename, upstream `writeAtomicJson`): concurrent
+/// readers never observe a torn document and multi-writer races resolve to
+/// one whole file.
 pub fn write_metadata(file_path: &Path, metadata: &Value) -> std::io::Result<()> {
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
-        file_path,
-        serde_json::to_string_pretty(metadata).unwrap_or_default(),
-    )
+    let body = serde_json::to_string_pretty(metadata).unwrap_or_default();
+    let tmp = file_path.with_extension(format!("tmp-{}", std::process::id() as u64 ^ nanos_now()));
+    std::fs::write(&tmp, body)?;
+    // Same-directory rename is atomic on unix; propagate its error after
+    // cleaning the leftover tmp file.
+    let result = std::fs::rename(&tmp, file_path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn nanos_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 pub fn append_jsonl(file_path: &Path, line: &str) {

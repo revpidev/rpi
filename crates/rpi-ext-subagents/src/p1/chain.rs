@@ -40,6 +40,11 @@ pub struct StepSpec {
     /// Named output binding (`as:`) for `{outputs.<name>}` references.
     pub binding: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Per-step `cwd` override (ADR-0018 steps schema).
+    pub cwd: Option<PathBuf>,
+    /// Per-step `gate` command (ADR-0018 steps schema): runs after the step,
+    /// failure fails the step.
+    pub gate: Option<String>,
 }
 
 /// Parse and validate the `steps` array.
@@ -149,6 +154,16 @@ pub fn parse_steps(steps: &Value) -> Result<Vec<StepSpec>, String> {
                 Some(Value::Number(n)) if n.is_u64() && n.as_u64().unwrap_or(0) > 0 => n.as_u64(),
                 _ => None,
             },
+            cwd: object
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(crate::paths::expand_tilde_and_resolve),
+            gate: object
+                .get("gate")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
         });
     }
     Ok(specs)
@@ -422,7 +437,7 @@ pub async fn run_chain_async(
             model: step.model.clone(),
             thinking: step.thinking.clone(),
             context: step.context,
-            cwd: None,
+            cwd: step.cwd.clone(),
             output: match output_override {
                 Some(path) => OutputOverride::Path(path),
                 None => OutputOverride::Disabled,
@@ -430,7 +445,7 @@ pub async fn run_chain_async(
             timeout_ms: step.timeout_ms,
             child_index: index as u32,
             skills: Some(skills),
-            gate: None,
+            gate: step.gate.clone(),
             turn_budget: None,
             tool_budget: None,
             session_file: None,

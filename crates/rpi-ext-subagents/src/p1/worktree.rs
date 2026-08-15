@@ -178,6 +178,7 @@ pub fn create_worktree(
             synthetic_paths.push("node_modules".to_string());
         }
         if let Some((hook, timeout_ms)) = config.worktree_setup_hook() {
+            let hook = resolve_worktree_setup_hook(&hook, toplevel)?;
             let hook_synthetic = run_worktree_setup_hook(
                 &hook,
                 timeout_ms,
@@ -237,12 +238,49 @@ fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> bool {
     }
 }
 
+/// `validateHookPath` (worktree.ts:268-294): non-empty, `~/` expandable,
+/// absolute or repo-relative (a bare name is rejected), must exist and be a
+/// file.
+fn resolve_worktree_setup_hook(hook: &str, repo_root: &Path) -> Result<PathBuf, String> {
+    if hook.trim().is_empty() {
+        return Err("worktree setup hook path cannot be empty".to_string());
+    }
+    let expanded = if let Some(rest) = hook.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join(rest)
+    } else {
+        PathBuf::from(hook)
+    };
+    let resolved = if expanded.is_absolute() {
+        expanded
+    } else if hook.contains('/') || hook.contains('\\') {
+        repo_root.join(expanded)
+    } else {
+        return Err(
+            "worktree setup hook must be an absolute path or a repo-relative path".to_string(),
+        );
+    };
+    if !resolved.exists() {
+        return Err(format!(
+            "worktree setup hook not found: {}",
+            resolved.display()
+        ));
+    }
+    if resolved.is_dir() {
+        return Err(format!(
+            "worktree setup hook must be a file, got directory: {}",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 /// `runWorktreeSetupHook` (worktree.ts:336-379): stdin = the v1 payload,
 /// stdout = JSON object `{ syntheticPaths?: string[] }`; non-zero exit,
 /// malformed stdout, or timeout (default 30s) fail the setup.
 #[allow(clippy::too_many_arguments)]
 fn run_worktree_setup_hook(
-    hook: &str,
+    hook: &Path,
     timeout_ms: u64,
     toplevel: &Path,
     worktree_path: &Path,
@@ -256,7 +294,6 @@ fn run_worktree_setup_hook(
     let stdin = json!({
         "version": 1,
         "repoRoot": toplevel.to_string_lossy(),
-        "version": 1,
         "worktreePath": worktree_path.to_string_lossy(),
         "agentCwd": agent_cwd.to_string_lossy(),
         "branch": branch,
@@ -274,15 +311,22 @@ fn run_worktree_setup_hook(
         .spawn()
         .map_err(|e| format!("worktree setup hook failed to start: {e}"))?;
     // Timeout via a watchdog thread (spawnSync-equivalent): the waiter runs
-    // on its own thread, the watchdog polls it.
+    // on its own thread, the watchdog polls it. On timeout the hook process
+    // is killed (Node spawnSync {timeout} sends its killSignal) — a runaway
+    // hook must not outlive the worktree it was mutating.
+    let hook_pid = child.id();
     let mut child = child;
     if let Some(mut stdin_handle) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin_handle.write_all(stdin.as_bytes());
     }
     let waiter = std::thread::spawn(move || child.wait_with_output());
-    let output = wait_with_timeout(waiter, std::time::Duration::from_millis(timeout_ms))
-        .map_err(|_| format!("worktree setup hook timed out after {timeout_ms}ms"))?;
+    let output = wait_with_timeout(
+        waiter,
+        std::time::Duration::from_millis(timeout_ms),
+        hook_pid,
+    )
+    .map_err(|_| format!("worktree setup hook timed out after {timeout_ms}ms"))?;
     if !output.status.success() {
         return Err(format!(
             "worktree setup hook failed (exit {:?}): {}",
@@ -312,9 +356,11 @@ fn run_worktree_setup_hook(
 fn wait_with_timeout(
     waiter: std::thread::JoinHandle<std::io::Result<std::process::Output>>,
     timeout: std::time::Duration,
+    hook_pid: u32,
 ) -> std::io::Result<std::process::Output> {
-    // The watchdog polls the join handle; on timeout the hook process was
-    // already detached by taking stdin/stdout — its exit is not waited on.
+    // The watchdog polls the join handle; on timeout the hook process is
+    // killed through the SIGTERM → 500ms → SIGKILL ladder before returning —
+    // leaving it alive would race the worktree rollback deletion.
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if waiter.is_finished() {
@@ -323,12 +369,43 @@ fn wait_with_timeout(
                 .map_err(|_| std::io::Error::other("hook thread panicked"))?;
         }
         if std::time::Instant::now() >= deadline {
+            kill_hook_process(hook_pid);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "hook timeout",
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Signal ladder for a timed-out hook process (SIGTERM, short grace, then
+/// SIGKILL — Node's spawnSync timeout sends its default killSignal SIGTERM;
+/// the KILL backstop covers hooks that trap TERM).
+fn kill_hook_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return;
+        }
+        // Safety: kill(2) with a checked pid.
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
     }
 }
 
@@ -554,6 +631,64 @@ mod tests {
             PathBuf::from("/tmp/wt/rpi-worktree-ab12-2")
         );
         assert_eq!(safe_patch_agent_name("scout/reviewer"), "scout_reviewer");
+    }
+
+    #[test]
+    fn resolve_worktree_setup_hook_validates() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Bare name (no separator) is rejected (worktree.ts:280-282).
+        assert!(resolve_worktree_setup_hook("bare-hook", &dir).is_err());
+        // Missing path is rejected.
+        assert!(resolve_worktree_setup_hook("./missing-hook", &dir).is_err());
+        // Directory is rejected.
+        assert!(resolve_worktree_setup_hook("./sub", &dir).is_err());
+        // Existing executable file resolves (absolute and repo-relative).
+        let hook = dir.join("hook.sh");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 0\n").unwrap();
+        let resolved = resolve_worktree_setup_hook("./hook.sh", &dir).unwrap();
+        assert_eq!(resolved, hook);
+        let absolute = resolve_worktree_setup_hook(&hook.to_string_lossy(), &dir).unwrap();
+        assert_eq!(absolute, hook);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_hook_process_is_killed() {
+        // A hook that ignores SIGTERM must still die within the ladder:
+        // trap '' TERM keeps it alive past the grace, SIGKILL ends it.
+        let dir = std::env::temp_dir().join(format!("rpi-sub-hookkill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hook = dir.join("stubborn-hook.sh");
+        std::fs::write(&hook, "#!/bin/sh\ntrap '' TERM\nsleep 30\necho '{}'\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let result = run_worktree_setup_hook(
+            &hook, 300, // ms — well under the hook's 30s sleep
+            &dir, &dir, &dir, "branch", 0, "run", "deadbeef", None,
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // The hook process is gone: no `sh -c "sleep 30"` from this test is
+        // left behind. The waiter thread joined, so wait_with_output reaped it.
+        let leftover = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "pgrep -f '{}' | grep -v $$ || true",
+                hook.display()
+            ))
+            .output()
+            .unwrap();
+        assert!(
+            leftover.stdout.is_empty(),
+            "timed-out hook should have been killed, found: {}",
+            String::from_utf8_lossy(&leftover.stdout)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

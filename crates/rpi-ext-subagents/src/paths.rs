@@ -17,6 +17,39 @@ pub const ENV_SESSION_DIR: &str = "RPI_CODING_AGENT_SESSION_DIR";
 pub const CONFIG_DIR_NAME: &str = ".rpi";
 pub const PROJECT_SUBAGENTS_RELATIVE_DIR: &str = ".rpi/subagents";
 
+/// Create `path` (and parents) with 0700 on unix — run/session/slot
+/// directories hold task text, model output, and steer messages that other
+/// local users have no business reading (upstream `mkdtempSync` semantics).
+pub fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Reject model-controlled strings before they are joined into filesystem
+/// paths (upstream `sanitizeName`, agent-management.ts:96, strips hostile
+/// characters at agent creation; rpi applies the guard at every join site —
+/// agent names, run ids, reply ids, template names). A path component must
+/// be non-empty, not `.`/`..`, and contain no separators or NUL.
+pub fn ensure_safe_component(value: &str, what: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{what} cannot be empty."));
+    }
+    if value == "." || value == ".." {
+        return Err(format!("{what} must be a plain name, not '{value}'."));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains('\0') {
+        return Err(format!(
+            "{what} must not contain path separators: '{value}'."
+        ));
+    }
+    Ok(())
+}
+
 /// `getAgentDir` equivalent (utils.ts:97-102, `PI_CODING_AGENT_DIR ?? ~/.pi/agent`
 /// → `RPI_CODING_AGENT_DIR ?? ~/.rpi/agent`).
 pub fn get_agent_dir() -> PathBuf {
@@ -255,6 +288,18 @@ mod tests {
     fn encode_cwd_dir_name_matches_host_rule() {
         assert_eq!(encode_cwd_dir_name("/home/x/repo"), "--home-x-repo--");
         assert_eq!(encode_cwd_dir_name("C:\\dev\\repo"), "--C--dev-repo--");
+    }
+
+    #[test]
+    fn safe_component_rejects_traversal_shapes() {
+        assert!(ensure_safe_component("worker", "Agent name").is_ok());
+        assert!(ensure_safe_component("a-b_2.x", "Agent name").is_ok());
+        for hostile in ["", ".", "..", "../evil", "a/b", "a\\b", "..\\evil"] {
+            assert!(
+                ensure_safe_component(hostile, "Agent name").is_err(),
+                "{hostile:?} should be rejected"
+            );
+        }
     }
 
     #[test]

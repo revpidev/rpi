@@ -322,8 +322,14 @@ pub fn parent_supervisor_action(
             let (Some(reply_to), Some(message)) = (reply_to, message) else {
                 return error_result("action \"reply\" requires replyTo and message.");
             };
-            // Find the matching request across channels (wrong sessions never
-            // see it, so the id alone is the key).
+            // The id joins filesystem paths — reject path-shaped input (C1).
+            if let Err(error) = crate::paths::ensure_safe_component(reply_to, "replyTo") {
+                return error_result(&error);
+            }
+            // Find the matching request across channels; only requests this
+            // session owns are visible (upstream resolves replies through the
+            // session-filtered pending map, native-supervisor-channel.ts
+            // 571-576 + 674).
             if let Ok(channel_entries) = std::fs::read_dir(channels_root) {
                 for channel in channel_entries.flatten() {
                     let request_path = channel
@@ -331,6 +337,15 @@ pub fn parent_supervisor_action(
                         .join("requests")
                         .join(format!("{reply_to}.json"));
                     if !request_path.exists() {
+                        continue;
+                    }
+                    let Ok(raw) = std::fs::read_to_string(&request_path) else {
+                        continue;
+                    };
+                    let Ok(request) = serde_json::from_str::<Value>(&raw) else {
+                        continue;
+                    };
+                    if !request_matches_session(&request, orchestrator_session_id) {
                         continue;
                     }
                     let reply = json!({

@@ -176,6 +176,13 @@ pub fn handle_management_action_with(
     deps: &ActionDeps<'_>,
 ) -> ToolOutcome {
     let raw_params = deps.params.clone().unwrap_or(Value::Null);
+    // Model-controlled names reach filesystem joins (agent files, settings
+    // keys) — reject path-shaped input up front (C1, upstream sanitizeName).
+    if let Some(name) = agent_name {
+        if let Err(message) = crate::paths::ensure_safe_component(name, "Agent name") {
+            return ToolOutcome::error(message);
+        }
+    }
     match action {
         "list" => {
             let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
@@ -395,13 +402,31 @@ pub fn handle_management_action_with(
                 .get("additional")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
-            let session_id = raw_params
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let Some(session_id) = session_id else {
+            // Root interactive parent only (upstream
+            // subagent-executor.ts:5241-5260 + schemas.ts:285: "Root
+            // interactive parent with native user confirmation only").
+            let Some(host) = deps.host else {
                 return ToolOutcome::error(
-                    "action \"grant-spawn-budget\" requires a session id in an interactive session."
+                    "action \"grant-spawn-budget\" is available only from the root interactive parent session."
+                        .to_string(),
+                );
+            };
+            if !host.has_ui() {
+                return ToolOutcome::error(
+                    "action \"grant-spawn-budget\" is available only from the root interactive parent session (ctx.hasUI is false here)."
+                        .to_string(),
+                );
+            }
+            // The session id is derived from the host's current session
+            // (TE-D16) — never trusted from the call parameters, so a grant
+            // cannot target another session's ledger.
+            let Some(session_id) = host
+                .parent_session_file(settings)
+                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .filter(|s| !s.is_empty())
+            else {
+                return ToolOutcome::error(
+                    "action \"grant-spawn-budget\" requires an active interactive session."
                         .to_string(),
                 );
             };

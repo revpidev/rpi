@@ -269,6 +269,13 @@ fn e2e_fixed_child_full_pipeline() {
         .unwrap()
         .join(format!("{run_id}_scout_0_transcript.jsonl"))
         .exists());
+    // FR-P0-09 fifth artifact: the raw child event stream, on by default
+    // (`artifactConfig.includeJsonl !== false`, execution.ts:1517-1519).
+    assert!(base
+        .parent()
+        .unwrap()
+        .join(format!("{run_id}_scout_0.jsonl"))
+        .exists());
     let meta: Value = serde_json::from_str(
         &std::fs::read_to_string(
             base.parent()

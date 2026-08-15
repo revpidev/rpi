@@ -36,12 +36,30 @@ function materialize(mode) {
 	return modeFile;
 }
 
+// Both legs run with the ambient parent-session env keys cleared: the
+// upstream runner falls back to PI_SUBAGENT_PARENT_SESSION from the shell
+// while the rust runner reads RPI_SUBAGENT_PARENT_SESSION (the bridge renames
+// PI_SUBAGENT_* → RPI_*), so a value exported in the surrounding shell
+// reaches exactly one leg and eight args cases mismatch spuriously.
+function cleanSessionEnv(env) {
+	const cleaned = { ...env };
+	delete cleaned.PI_SUBAGENT_PARENT_SESSION;
+	delete cleaned.RPI_SUBAGENT_PARENT_SESSION;
+	return cleaned;
+}
+
 function runUpstream(mode) {
 	const modeFile = materialize(mode);
 	const result = spawnSync(
 		TSX,
 		[`${HERE}/upstream-runner.mjs`, mode, modeFile],
-		{ encoding: "utf-8", env: { ...process.env, PI_CODING_AGENT_PACKAGE_ROOT: "/tmp" } },
+		{
+			encoding: "utf-8",
+			env: cleanSessionEnv({
+				...process.env,
+				PI_CODING_AGENT_PACKAGE_ROOT: "/tmp",
+			}),
+		},
 	);
 	if (result.status !== 0) {
 		throw new Error(`upstream runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);
@@ -59,7 +77,10 @@ function runRust(mode) {
 		REPO,
 		"target/debug/examples/parity_runner",
 	);
-	const result = spawnSync(binary, [mode, modeFile], { encoding: "utf-8" });
+	const result = spawnSync(binary, [mode, modeFile], {
+		encoding: "utf-8",
+		env: cleanSessionEnv({ ...process.env }),
+	});
 	if (result.status !== 0) {
 		throw new Error(`rust parity_runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);
 	}

@@ -210,6 +210,9 @@ pub struct WorktreePlan {
     /// Patches + manifest land beside the base dir (upstream handoffs/).
     pub manifest_path: Option<std::path::PathBuf>,
     pub diffs: std::sync::Mutex<Vec<(usize, String, String, crate::p1::worktree::WorktreeDiff)>>,
+    /// Worktrees kept dirty (patch capture failed) — `finalize` retries
+    /// their cleanup once the handoff manifest exists.
+    pub kept: std::sync::Mutex<Vec<crate::p1::worktree::WorktreeInfo>>,
 }
 
 /// One aggregated task result (`ParallelTaskResult`).
@@ -256,7 +259,7 @@ pub async fn run_parallel_async(
     worktree: Option<std::sync::Arc<WorktreePlan>>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
     let concurrency = concurrency.max(1);
-    let outcomes: Vec<Option<ParallelTaskOutcome>> = async {
+    let outcomes: Vec<Option<Result<ParallelTaskOutcome, String>>> = async {
         // Owned entries: the stream closure must not borrow the items —
         // `map` over `&(index, &TaskEntry)` trips the HRTB bound (rust#89937).
         let indexed: Vec<(usize, TaskEntry)> = entries.iter().cloned().enumerate().collect();
@@ -271,48 +274,59 @@ pub async fn run_parallel_async(
                 }
             })
             .buffer_unordered(concurrency)
-            .collect::<Vec<(usize, Option<ParallelTaskOutcome>)>>()
+            .collect::<Vec<(usize, Option<Result<ParallelTaskOutcome, String>>)>>()
             .await;
-        let mut slots: Vec<Option<ParallelTaskOutcome>> = vec![None; entries.len()];
+        let mut slots: Vec<Option<Result<ParallelTaskOutcome, String>>> = vec![None; entries.len()];
         for (index, outcome) in results {
             slots[index] = outcome;
         }
         slots
     }
     .await;
-    // Slot for a task whose agent resolution failed stays None → SKIPPED
-    // projection below; per-entry errors are reported, never abort the batch.
+    // A task whose launch failed (agent resolution, worktree creation, launch
+    // error) projects to SKIPPED below with its reason preserved; per-entry
+    // failures never abort the batch.
     Ok(outcomes
         .into_iter()
         .zip(entries.iter())
-        .map(|(outcome, entry)| match outcome {
-            Some(outcome) => outcome,
-            None => ParallelTaskOutcome {
+        .map(|(outcome, entry)| {
+            let skipped = |reason: String| ParallelTaskOutcome {
                 agent: entry.spec.agent_name.clone(),
-                output: String::new(),
+                output: format!("(skipped — {reason})"),
                 exit_code: -1,
-                error: None,
+                error: Some(reason),
                 timed_out: false,
                 output_target_path: None,
                 output_target_exists: false,
                 details: json!({ "skipped": true }),
-            },
+            };
+            match outcome {
+                Some(Ok(outcome)) => outcome,
+                Some(Err(reason)) => skipped(reason),
+                None => skipped("launch failed without a reason".to_string()),
+            }
         })
         .collect())
 }
 
+/// Launch one entry. `Some(Ok(..))` = ran; `Some(Err(reason))` = skipped
+/// with the reason preserved (agent resolution or worktree creation failed);
+/// `None` = unexpected launch failure without a message.
 async fn launch_one(
     entry: &TaskEntry,
     agents: &[AgentConfig],
     ctx: &RunCtx,
     worktree: Option<&WorktreePlan>,
-) -> Option<ParallelTaskOutcome> {
-    let agent = discover::resolve_agent_name(agents, &entry.spec.agent_name)
-        .ok()?
-        .cloned()?;
+) -> Option<Result<ParallelTaskOutcome, String>> {
+    let agent = match discover::resolve_agent_name(agents, &entry.spec.agent_name) {
+        Ok(Some(agent)) => agent.clone(),
+        Ok(None) => return Some(Err(format!("Unknown agent: {}", entry.spec.agent_name))),
+        Err(message) => return Some(Err(message)),
+    };
     // Worktree isolation (FR-P1-06): create → redirect cwd → run → capture
     // patch → journal → cleanup. Creation failure skips the child entirely
-    // (upstream: "creation failure does not start the child").
+    // (upstream: "creation failure does not start the child") — with the
+    // failure text kept so the aggregate can say why.
     let mut spec = entry.spec.clone();
     let mut prepared = None;
     if let Some(plan) = worktree {
@@ -323,8 +337,11 @@ async fn launch_one(
             .unwrap_or(false)
         {
             let cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
-            let cwd_relative = crate::p1::worktree::resolve_repo_cwd_relative(&cwd).ok()?;
-            let info = crate::p1::worktree::create_worktree(
+            let cwd_relative = match crate::p1::worktree::resolve_repo_cwd_relative(&cwd) {
+                Ok(relative) => relative,
+                Err(message) => return Some(Err(message)),
+            };
+            let info = match crate::p1::worktree::create_worktree(
                 &plan.toplevel,
                 &cwd_relative,
                 &ctx.run_id,
@@ -333,15 +350,18 @@ async fn launch_one(
                 &plan.base_dir,
                 Some(&entry.spec.agent_name),
                 &plan.config,
-            )
-            .ok()?;
+            ) {
+                Ok(info) => info,
+                Err(message) => return Some(Err(message)),
+            };
             spec.cwd = Some(info.agent_cwd.clone());
             prepared = Some(info);
         }
     }
-    let outcome: ChildOutcome = launch_child::run_child_async(&spec, &agent, ctx)
-        .await
-        .ok()?;
+    let outcome: ChildOutcome = match launch_child::run_child_async(&spec, &agent, ctx).await {
+        Ok(outcome) => outcome,
+        Err(message) => return Some(Err(message)),
+    };
     if let (Some(plan), Some(info)) = (worktree, prepared) {
         let patch_dir = plan.base_dir.join("patches");
         if let Ok(diff) = crate::p1::worktree::capture_worktree_diff(
@@ -368,40 +388,56 @@ async fn launch_one(
             ));
         } else {
             // Dirty worktree without a recorded patch: keep it for
-            // inspection (cleanup_worktree refuses).
+            // inspection (cleanup_worktree refuses) — remember it so
+            // `finalize_worktree_handoff` can retry once the manifest
+            // journals the surviving patches.
             let _ = crate::p1::worktree::cleanup_worktree(
                 &plan.toplevel,
                 &info,
                 plan.manifest_path.as_deref(),
             );
+            plan.kept
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(info);
         }
     }
-    Some(project_outcome(entry, &outcome))
+    Some(Ok(project_outcome(entry, &outcome, &ctx.run_id)))
 }
 
 /// Write the handoff manifest after a worktree batch finishes (upstream
-/// writes it before cleanup so `handoffRecordsPatch` passes).
+/// writes it before cleanup so `handoffRecordsPatch` passes), then retry the
+/// cleanup of worktrees kept dirty earlier — now that the manifest journals
+/// the surviving patches, `cleanup_worktree` accepts them.
 pub fn finalize_worktree_handoff(plan: &WorktreePlan, run_id: &str, cwd: &std::path::Path) {
     let diffs = plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if diffs.is_empty() {
-        return;
+    let path = (!diffs.is_empty()).then(|| {
+        crate::p1::worktree::write_handoff_manifest(
+            &plan.base_dir,
+            run_id,
+            "parallel",
+            cwd,
+            &plan.base_commit,
+            &diffs,
+        )
+    });
+    let kept: Vec<_> = plan
+        .kept
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect();
+    for info in kept {
+        let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, path.as_deref());
     }
-    let path = crate::p1::worktree::write_handoff_manifest(
-        &plan.base_dir,
-        run_id,
-        "parallel",
-        cwd,
-        &plan.base_commit,
-        &diffs,
-    );
-    // Re-run cleanup attempts now that the manifest exists (dirty worktrees
-    // kept earlier can be pruned once their patch is journaled).
-    // The manifest path is returned for status/reporting.
-    let _ = path;
 }
 
 /// `ParallelTaskResult` projection off the shared child outcome.
-pub fn project_outcome(entry: &TaskEntry, outcome: &ChildOutcome) -> ParallelTaskOutcome {
+pub fn project_outcome(
+    entry: &TaskEntry,
+    outcome: &ChildOutcome,
+    run_id: &str,
+) -> ParallelTaskOutcome {
     let output_target_path = outcome.saved_output_path.clone();
     let output_target_exists = output_target_path
         .as_ref()
@@ -414,12 +450,12 @@ pub fn project_outcome(entry: &TaskEntry, outcome: &ChildOutcome) -> ParallelTas
         timed_out: outcome.result.timed_out,
         output_target_path,
         output_target_exists,
-        details: child_details(entry, outcome),
+        details: child_details(entry, outcome, run_id),
     }
 }
 
 /// Per-child details entry (types.ts:1014-1115 `results[]` items).
-pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome) -> Value {
+pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome, run_id: &str) -> Value {
     let result = &outcome.result;
     let mut single = json!({
         "index": entry.spec.child_index,
@@ -459,6 +495,16 @@ pub fn child_details(entry: &TaskEntry, outcome: &ChildOutcome) -> Value {
     if let Some(saved) = &outcome.saved_output_path {
         single["savedOutputPath"] = json!(saved.to_string_lossy());
     }
+    // Acceptance ledger (FR-P1-09): drain this child's entry so parallel
+    // results carry the same acceptance info as single runs.
+    {
+        let mut ledger_map = crate::p1::launch_child::GATE_LEDGER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(ledger) = ledger_map.remove(&(run_id.to_string(), entry.spec.child_index)) {
+            single["acceptance"] = ledger;
+        }
+    }
     single
 }
 
@@ -480,7 +526,11 @@ pub fn aggregate_parallel_outputs(results: &[ParallelTaskOutcome]) -> String {
                     None => "TIMED OUT".to_string(),
                 })
             } else if r.exit_code == -1 {
-                Some("SKIPPED".to_string())
+                // Skip reason rides in `error` (upstream "(skipped — …)").
+                Some(match &r.error {
+                    Some(error) => format!("SKIPPED: {error}"),
+                    None => "SKIPPED".to_string(),
+                })
             } else if r.exit_code != 0 {
                 Some(match &r.error {
                     Some(error) => format!("FAILED (exit code {}): {error}", r.exit_code),

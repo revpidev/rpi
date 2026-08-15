@@ -430,7 +430,7 @@ fn assemble_single_details(
         let mut ledger_map = crate::p1::launch_child::GATE_LEDGER
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some((_, ledger)) = ledger_map.remove(&ctx.run_id) {
+        if let Some(ledger) = ledger_map.remove(&(ctx.run_id.clone(), 0)) {
             single["acceptance"] = ledger;
         }
     }
@@ -480,6 +480,20 @@ fn assemble_single_details(
     details
 }
 
+/// Per-task worktree enablement (FR-P1-06): each task takes its own
+/// `worktree` override over the top-level default; `None` when nothing ends
+/// up enabled (no plan, no repo probe).
+fn worktree_enabled_flags(
+    entries: &[crate::p1::parallel::TaskEntry],
+    top_worktree: bool,
+) -> Option<Vec<bool>> {
+    let enabled: Vec<bool> = entries
+        .iter()
+        .map(|entry| entry.worktree_override.unwrap_or(top_worktree))
+        .collect();
+    enabled.iter().any(|e| *e).then_some(enabled)
+}
+
 /// Build the worktree plan for a parallel batch when any task opts in
 /// (top-level `worktree: true` or per-task `worktree: true`).
 fn build_worktree_plan(
@@ -491,13 +505,9 @@ fn build_worktree_plan(
         .get("worktree")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let enabled: Vec<bool> = entries
-        .iter()
-        .map(|entry| entry.worktree_override.unwrap_or(top_worktree))
-        .collect();
-    if !enabled.iter().any(|e| *e) {
+    let Some(enabled) = worktree_enabled_flags(entries, top_worktree) else {
         return Ok(None);
-    }
+    };
     let (toplevel, base_commit) = crate::p1::worktree::resolve_repo_base(&ctx.base_cwd)?;
     let base_dir = crate::p1::worktree::resolve_worktree_base_dir(&ctx.config, &toplevel)?;
     Ok(Some(std::sync::Arc::new(
@@ -509,6 +519,7 @@ fn build_worktree_plan(
             config: ctx.config.clone(),
             manifest_path: None,
             diffs: std::sync::Mutex::new(Vec::new()),
+            kept: std::sync::Mutex::new(Vec::new()),
         },
     )))
 }
@@ -530,18 +541,12 @@ fn dispatch_tasks(
     };
     let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
     // Worktree isolation (FR-P1-06): top-level `worktree: true` defaults
-    // every task in; per-task `worktree: false` opts out.
-    let top_worktree = object
-        .get("worktree")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let worktree_plan = if top_worktree {
-        match build_worktree_plan(&entries, object, ctx) {
-            Ok(plan) => plan,
-            Err(error) => return ToolOutcome::error(error),
-        }
-    } else {
-        None
+    // every task in (per-task `worktree: false` opts out) and a per-task
+    // `worktree: true` opts in on its own — `build_worktree_plan` returns
+    // None when no task ends up enabled.
+    let worktree_plan = match build_worktree_plan(&entries, object, ctx) {
+        Ok(plan) => plan,
+        Err(error) => return ToolOutcome::error(error),
     };
     let outcomes = match crate::p1::parallel::run_parallel(
         &entries,
@@ -567,12 +572,13 @@ fn dispatch_tasks(
 
     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
     let text = crate::p1::parallel::aggregate_parallel_outputs(&outcomes);
+    let total_usage = sum_usage(&outcomes);
     let details = json!({
         "mode": "parallel",
         "runId": ctx.run_id,
         "results": outcomes.iter().map(|o| o.details.clone()).collect::<Vec<_>>(),
-        "totalChildUsage": sum_usage(&outcomes),
-        "totalCost": 0.0,
+        "totalChildUsage": total_usage.clone(),
+        "totalCost": total_usage["cost"].as_f64().unwrap_or(0.0),
     });
     ToolOutcome {
         text,
@@ -672,9 +678,16 @@ fn dispatch_async(
             Err(error) => return ToolOutcome::error(error),
         };
         let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
+        // Same worktree opt-in as the foreground path (FR-P1-06): top-level
+        // or per-task `worktree: true`.
+        let worktree_plan = match build_worktree_plan(&entries, object, ctx) {
+            Ok(plan) => plan,
+            Err(error) => return ToolOutcome::error(error),
+        };
         crate::runner::background::AsyncBody::Tasks {
             entries,
             concurrency,
+            worktree_plan,
         }
     } else if has_steps {
         let steps = match crate::p1::chain::parse_steps(object.get("steps").unwrap_or(&Value::Null))
@@ -699,8 +712,7 @@ fn dispatch_async(
             Err(message) => return ToolOutcome::error(message),
         }
         crate::runner::background::AsyncBody::Single {
-            agent_name: spec.agent_name,
-            task: spec.task,
+            spec: Box::new(spec),
         }
     };
 
@@ -802,10 +814,30 @@ fn record_runs(records: &[(String, i32, u64, Option<String>)], run_id: &str) {
     }
 }
 
-fn sum_usage(_outcomes: &[crate::p1::parallel::ParallelTaskOutcome]) -> Value {
-    // Usage sums ride on the per-child results; the aggregate keeps the same
-    // shape as the single run (upstream totalChildUsage).
-    json!({})
+fn sum_usage(outcomes: &[crate::p1::parallel::ParallelTaskOutcome]) -> Value {
+    // Aggregate over the per-child usage blocks, keeping the single-run
+    // usage shape (upstream totalChildUsage): token counters and cost sum;
+    // a missing block contributes nothing.
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_write = 0u64;
+    let mut cost = 0.0f64;
+    for outcome in outcomes {
+        let usage = outcome.details["usage"].clone();
+        input += usage["input"].as_u64().unwrap_or(0);
+        output += usage["output"].as_u64().unwrap_or(0);
+        cache_read += usage["cacheRead"].as_u64().unwrap_or(0);
+        cache_write += usage["cacheWrite"].as_u64().unwrap_or(0);
+        cost += usage["cost"].as_f64().unwrap_or(0.0);
+    }
+    json!({
+        "input": input,
+        "output": output,
+        "cacheRead": cache_read,
+        "cacheWrite": cache_write,
+        "cost": cost,
+    })
 }
 /// `formatFailedSingleRunOutput` (executor 1846-1857).
 fn format_failed_single_run_output(
@@ -851,6 +883,42 @@ mod tests {
         assert_eq!(
             parse(r#"{"timeoutMs":0}"#).unwrap_err(),
             "timeoutMs must be a positive integer."
+        );
+    }
+
+    #[test]
+    fn worktree_flags_per_task_opt_in() {
+        let entries = |raw: &str| {
+            crate::p1::parallel::parse_tasks(&serde_json::from_str::<Value>(raw).unwrap(), 32)
+                .unwrap()
+        };
+        // No top-level flag, no per-task flags → no plan.
+        assert_eq!(
+            worktree_enabled_flags(
+                &entries(r#"[{"agent":"worker","task":"a"},{"agent":"worker","task":"b"}]"#),
+                false
+            ),
+            None
+        );
+        // Top-level true defaults every task in; per-task false opts out.
+        assert_eq!(
+            worktree_enabled_flags(
+                &entries(
+                    r#"[{"agent":"worker","task":"a"},{"agent":"worker","task":"b","worktree":false}]"#
+                ),
+                true
+            ),
+            Some(vec![true, false])
+        );
+        // Per-task true opts in on its own (FR-P1-06 child-level switch).
+        assert_eq!(
+            worktree_enabled_flags(
+                &entries(
+                    r#"[{"agent":"worker","task":"a"},{"agent":"worker","task":"b","worktree":true}]"#
+                ),
+                false
+            ),
+            Some(vec![false, true])
         );
     }
 }

@@ -255,17 +255,181 @@ pub fn parse_acceptance_report(output: &str) -> Option<Result<BTreeMap<String, V
     None
 }
 
+/// `DEFAULT_VERIFY_TIMEOUT_MS` (acceptance.ts:1041): gate/verify commands
+/// that exceed it are aborted (SIGTERM → 1s → SIGKILL) and reported as
+/// timed out (`abortVerification`, acceptance.ts:1162-1172).
+pub const DEFAULT_VERIFY_TIMEOUT_MS: u64 = 120_000;
+
 /// Gate/verify command execution (`runVerifyCommands` subset: default 120s
-/// timeout, cwd-bound; failures fail explicit gates).
+/// timeout, cwd-bound; failures fail explicit gates). A gate that runs past
+/// the timeout is killed through the ladder and surfaces as `Err` — a model
+/// supplied `gate: "sleep infinity"` must not hang the composite run.
 pub fn run_gate_command(command: &str, cwd: &std::path::Path) -> Result<bool, String> {
+    run_gate_command_with_timeout(command, cwd, DEFAULT_VERIFY_TIMEOUT_MS)
+}
+
+/// `run_gate_command` with an explicit budget (tests shrink it).
+pub fn run_gate_command_with_timeout(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_ms: u64,
+) -> Result<bool, String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-    let output = Command::new(shell)
+    let mut command_builder = Command::new(shell);
+    command_builder
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        // Own process group so the abort ladder can signal the whole tree —
+        // `sh -c "sleep 30 & sleep 30"` must not leak grandchildren.
+        use std::os::unix::process::CommandExt;
+        command_builder.process_group(0);
+    }
+    let mut child = command_builder
+        .spawn()
         .map_err(|e| format!("gate command failed to start: {e}"))?;
-    Ok(output.status.success())
+    let gate_pid = child.id();
+    let waiter = std::thread::spawn(move || child.wait());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if waiter.is_finished() {
+            let status = waiter
+                .join()
+                .map_err(|_| "gate command waiter failed".to_string())?
+                .map_err(|e| format!("gate command failed: {e}"))?;
+            return Ok(status.success());
+        }
+        if std::time::Instant::now() >= deadline {
+            abort_gate_process(gate_pid);
+            return Err(format!("gate command timed out after {timeout_ms}ms"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// Memoized gate execution (`runMemoizedVerifyCommand`, acceptance.ts:
+/// 1084-1144): the cache key covers the command, its cwd, the timeout and
+/// the workspace state (git HEAD + a digest of the working-tree diff), and
+/// verdicts persist under `<artifacts>/acceptance/verify/<runId>/`. Returns
+/// `(verdict, memoized)`; without a git repo or artifacts dir the gate just
+/// runs.
+pub fn run_memoized_gate_command(
+    command: &str,
+    cwd: &std::path::Path,
+    run_id: &str,
+    artifacts_dir: Option<&std::path::Path>,
+) -> (Result<bool, String>, bool) {
+    let Some(artifacts_dir) = artifacts_dir else {
+        return (run_gate_command(command, cwd), false);
+    };
+    let Some(workspace_state) = workspace_state_digest(cwd) else {
+        return (run_gate_command(command, cwd), false);
+    };
+    let cache_key = format!(
+        "{}-{}",
+        workspace_state,
+        fnv1a_hex(&format!(
+            "{command}|{}|{DEFAULT_VERIFY_TIMEOUT_MS}",
+            cwd.to_string_lossy()
+        ))
+    );
+    let cache_path = artifacts_dir
+        .join("acceptance")
+        .join("verify")
+        .join(run_id)
+        .join(format!("{cache_key}.json"));
+    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+        if let Ok(cached) = serde_json::from_str::<Value>(&raw) {
+            if let Some(passed) = cached["passed"].as_bool() {
+                return (Ok(passed), true);
+            }
+        }
+    }
+    let verdict = run_gate_command(command, cwd);
+    if let Ok(passed) = &verdict {
+        let _ = std::fs::create_dir_all(cache_path.parent().unwrap_or(&cache_path));
+        let _ = std::fs::write(
+            &cache_path,
+            json!({
+                "command": command,
+                "passed": passed,
+                "cachedAt": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+            })
+            .to_string(),
+        );
+    }
+    (verdict, false)
+}
+
+/// Workspace state for gate memoization: `git rev-parse HEAD` plus a digest
+/// of `git diff` (staged + unstaged), mirroring the upstream cache key's
+/// tree-state component. `None` outside a git repo (no caching).
+fn workspace_state_digest(cwd: &std::path::Path) -> Option<String> {
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("diff")
+        .arg("HEAD")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    Some(format!(
+        "{}-{}",
+        String::from_utf8_lossy(&head.stdout).trim(),
+        fnv1a_hex(&String::from_utf8_lossy(&diff.stdout))
+    ))
+}
+
+/// FNV-1a digest for cache keys (non-cryptographic by design — it only
+/// distinguishes key strings).
+fn fnv1a_hex(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+fn abort_gate_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return;
+        }
+        // Safety: kill(2) with a checked negative pid (process group).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 /// Turn/tool budget system-prompt injection (turn-budget.ts L26-39 +
@@ -322,6 +486,125 @@ pub fn usage_budget_allows_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn memoized_gate_reuses_verdict_per_workspace_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rpi-sub-memo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .output();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.email", "t@t"])
+            .output();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["config", "user.name", "t"])
+            .output();
+        std::fs::write(repo.join("f.txt"), "one").unwrap();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "-A"])
+            .output();
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["commit", "-qm", "base"])
+            .output();
+        let artifacts = dir.join("artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let gate_path = dir.join("count-gate.sh");
+        std::fs::write(&gate_path, "#!/bin/sh\ncount=$(cat counter 2>/dev/null || echo 0)\necho $((count+1)) > counter\nexit 0\n").unwrap();
+        std::fs::set_permissions(&gate_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gate = format!("'{}'", gate_path.display());
+        // Same workspace state + command → second run is memoized (the
+        // counting gate runs exactly once).
+        let (first, memoized_first) =
+            run_memoized_gate_command(&gate, &repo, "memo-run", Some(&artifacts));
+        assert_eq!(first, Ok(true));
+        assert!(!memoized_first);
+        let (second, memoized_second) =
+            run_memoized_gate_command(&gate, &repo, "memo-run", Some(&artifacts));
+        assert_eq!(second, Ok(true));
+        assert!(memoized_second);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("counter")).unwrap(),
+            "1\n",
+            "memoized gate must not re-execute"
+        );
+        // Different run id → separate cache namespace (upstream keys the
+        // cache directory by runId), so the gate runs again.
+        let (third, memoized_third) =
+            run_memoized_gate_command(&gate, &repo, "memo-run-2", Some(&artifacts));
+        assert_eq!(third, Ok(true));
+        assert!(!memoized_third);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("counter")).unwrap(),
+            "2\n"
+        );
+        // Same run id but the workspace changed → fresh execution.
+        std::fs::write(repo.join("f.txt"), "two").unwrap();
+        let (fourth, memoized_fourth) =
+            run_memoized_gate_command(&gate, &repo, "memo-run-2", Some(&artifacts));
+        assert_eq!(fourth, Ok(true));
+        assert!(!memoized_fourth);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("counter")).unwrap(),
+            "3\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gate_command_success_and_failure() {
+        let cwd = std::env::temp_dir();
+        assert_eq!(run_gate_command("true", &cwd), Ok(true));
+        assert_eq!(run_gate_command("false", &cwd), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gate_command_times_out_and_kills_process_group() {
+        let cwd = std::env::temp_dir();
+        // Background sleeps survive the shell exiting; only the process-group
+        // ladder reaches them. "sleep 45" is unique to this test so the
+        // system-wide process check cannot trip over sibling tests (the
+        // worktree hook-kill test uses "sleep 30").
+        let started = std::time::Instant::now();
+        let result = run_gate_command_with_timeout("sleep 45 & sleep 45", &cwd, 300);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The whole group is gone shortly after.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut remaining = 1usize;
+        while std::time::Instant::now() < deadline {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg("ps -eo args= | grep -c '[s]leep 45' || true")
+                .output()
+                .unwrap();
+            remaining = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            if remaining == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(remaining, 0, "gate process group should be reaped");
+    }
 
     #[test]
     fn level_ranks_and_evidence() {

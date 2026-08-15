@@ -47,6 +47,9 @@ pub struct ExtensionConfig {
     pub max_subagent_spawns_per_run: Option<Value>,
     pub artifact_dir: Option<String>,
     pub cleanup_days: Option<u64>,
+    /// `artifactConfig.includeJsonl` (execution.ts:1517-1519: on unless
+    /// explicitly `false`) — whether child raw event streams land on disk.
+    pub artifacts_include_jsonl: Option<bool>,
     /// `forceTopLevelAsync` (default false; FR-P1-04): depth-0 runs forced
     /// into background mode unless `foregroundOnly` (top-level-async.ts:10-12).
     pub force_top_level_async: Option<bool>,
@@ -98,6 +101,7 @@ impl ExtensionConfig {
             max_subagent_spawns_per_run: None,
             artifact_dir: None,
             cleanup_days: None,
+            artifacts_include_jsonl: None,
             force_top_level_async: None,
             global_concurrency_limit: None,
             max_subagent_spawns_per_session: None,
@@ -117,8 +121,14 @@ impl ExtensionConfig {
         self.artifact_dir.as_deref().unwrap_or("project")
     }
 
-    /// `artifactConfig.cleanupDays` with the upstream default 7
-    /// (DEFAULT_ARTIFACT_CONFIG, types.ts:1958-1967).
+    /// `artifactConfig.includeJsonl` with the upstream default `true`
+    /// (execution.ts:1517-1519 — the raw child event stream is written
+    /// unless the config says `false`).
+    pub fn include_jsonl(&self) -> bool {
+        self.artifacts_include_jsonl.unwrap_or(true)
+    }
+
+    /// `artifactConfig.cleanupDays` with the upstream default 7    /// (DEFAULT_ARTIFACT_CONFIG, types.ts:1958-1967).
     pub fn cleanup_days_or_default(&self) -> u64 {
         self.cleanup_days.unwrap_or(7)
     }
@@ -439,6 +449,12 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
                         "config.artifactConfig.cleanupDays must be a non-negative integer".into(),
                     )
                 }
+            }
+        }
+        if let Some(include_jsonl) = artifact.get("includeJsonl") {
+            match include_jsonl.as_bool() {
+                Some(value) => config.artifacts_include_jsonl = Some(value),
+                None => return Err("config.artifactConfig.includeJsonl must be a boolean".into()),
             }
         }
     }

@@ -159,15 +159,11 @@ fn append_event(run_dir: &Path, event: &str, data: Value) {
 // ---------------------------------------------------------------------------
 
 fn sha256_hex(input: &str) -> String {
-    // Minimal FNV-driven digest is NOT cryptographic, but the hash here only
-    // keys a directory name for per-session ledgers (upstream uses sha256 for
-    // the same purpose); collision-resistance requirements are trivial.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    use sha2::{Digest, Sha256};
+    // ADR-0019 §4: ledger/slot file names are `<sha256(sessionId)>.json`
+    // (same as upstream).
+    let digest = Sha256::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Session spawn budget file (spawn-budget.ts `state.subagentSpawns`):
@@ -196,6 +192,42 @@ impl SpawnBudgetLedger {
         let _ = crate::artifacts::write_metadata(&self.path, value);
     }
 
+    /// Run `body` under the ledger's advisory cross-process lock (flock on a
+    /// sibling lockfile): the read-modify-write of `reserve`/`grant` is
+    /// atomic against other host processes (ADR-0019 §4 "atomically
+    /// bumped"). The lock lives on the fd — a crashed holder releases it
+    /// automatically.
+    fn with_lock<T>(&self, body: impl FnOnce(&Self) -> T) -> Result<T, String> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if let Some(parent) = self.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let lock_path = self.path.with_extension("lock");
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| format!("failed to open the spawn-budget lock: {e}"))?;
+            // Safety: flock(2) on a regular file fd we own.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                return Err("failed to lock the spawn-budget ledger".to_string());
+            }
+            let result = body(self);
+            let _ = file.sync_data();
+            Ok(result)
+        }
+        #[cfg(not(unix))]
+        {
+            // No flock on this platform — degrade to the unlocked RMW (the
+            // ledger still resolves to a whole file via atomic rename).
+            Ok(body(self))
+        }
+    }
+
     #[cfg(test)]
     fn snapshot(&self) -> Value {
         self.read()
@@ -203,28 +235,31 @@ impl SpawnBudgetLedger {
 
     /// `preflight/reserveSpawnBudget` (spawn-budget.ts:59-86): the effective
     /// ceiling is `configured + granted` (grants extend it); the used count
-    /// never resets within a session.
+    /// never resets within a session. The check-then-bump runs under the
+    /// ledger lock so concurrent hosts cannot oversubscribe.
     pub fn reserve(&self, amount: u64, configured_limit: Option<u64>) -> Result<(), String> {
-        let mut state = self.read();
-        let count = state["count"].as_u64().unwrap_or(0);
-        let granted = state["granted"].as_u64().unwrap_or(0);
-        if let Some(limit) = configured_limit {
-            if count + amount > limit + granted {
-                return Err(format!(
-                    "Subagent spawn budget exhausted for this session: {} of {} spawns used (grant more with subagent({{action:\"grant-spawn-budget\"}})).",
-                    count,
-                    limit + granted
-                ));
+        self.with_lock(|ledger| {
+            let mut state = ledger.read();
+            let count = state["count"].as_u64().unwrap_or(0);
+            let granted = state["granted"].as_u64().unwrap_or(0);
+            if let Some(limit) = configured_limit {
+                if count + amount > limit + granted {
+                    return Err(format!(
+                        "Subagent spawn budget exhausted for this session: {} of {} spawns used (grant more with subagent({{action:\"grant-spawn-budget\"}})).",
+                        count,
+                        limit + granted
+                    ));
+                }
             }
-        }
-        state["count"] = json!(count + amount);
-        self.write(&state);
-        Ok(())
+            state["count"] = json!(count + amount);
+            ledger.write(&state);
+            Ok(())
+        })?
     }
 
     /// `grantSpawnBudget` (spawn-budget.ts:99-118): grants extend the
     /// effective ceiling; the cumulative grant is capped at the *original*
-    /// configured limit (`grantRemaining`).
+    /// configured limit (`grantRemaining`). Locked like `reserve`.
     pub fn grant(&self, extra: u64, configured_limit: Option<u64>) -> Result<u64, String> {
         if extra == 0 {
             return Err(
@@ -232,35 +267,37 @@ impl SpawnBudgetLedger {
                     .to_string(),
             );
         }
-        let mut state = self.read();
-        let granted = state["granted"].as_u64().unwrap_or(0);
-        let Some(limit) = configured_limit else {
-            return Err(
-                "The current session has no configured spawn cap, so it does not need a budget grant."
-                    .to_string(),
-            );
-        };
-        let grant_remaining = limit.saturating_sub(granted);
-        if extra > grant_remaining {
-            return Err(format!(
-                "Spawn budget grant rejected: {extra} requested but only {grant_remaining} of the original configured limit remains grantable."
-            ));
-        }
-        let next = granted + extra;
-        state["granted"] = json!(next);
-        if let Some(history) = state["grantHistory"].as_array_mut() {
-            history.push(json!({
-                "at": iso8601(now_millis()),
-                "granted": extra,
-            }));
-            // grantHistory keeps the last 20 entries (spawn-budget.ts).
-            let overflow = history.len().saturating_sub(20);
-            for _ in 0..overflow {
-                history.remove(0);
+        self.with_lock(|ledger| {
+            let mut state = ledger.read();
+            let granted = state["granted"].as_u64().unwrap_or(0);
+            let Some(limit) = configured_limit else {
+                return Err(
+                    "The current session has no configured spawn cap, so it does not need a budget grant."
+                        .to_string(),
+                );
+            };
+            let grant_remaining = limit.saturating_sub(granted);
+            if extra > grant_remaining {
+                return Err(format!(
+                    "Spawn budget grant rejected: {extra} requested but only {grant_remaining} of the original configured limit remains grantable."
+                ));
             }
-        }
-        self.write(&state);
-        Ok(next)
+            let next = granted + extra;
+            state["granted"] = json!(next);
+            if let Some(history) = state["grantHistory"].as_array_mut() {
+                history.push(json!({
+                    "at": iso8601(now_millis()),
+                    "granted": extra,
+                }));
+                // grantHistory keeps the last 20 entries (spawn-budget.ts).
+                let overflow = history.len().saturating_sub(20);
+                for _ in 0..overflow {
+                    history.remove(0);
+                }
+            }
+            ledger.write(&state);
+            Ok(next)
+        })?
     }
 }
 
@@ -306,6 +343,13 @@ impl ActiveAsyncCapacity {
                 }
             }
             let _ = std::fs::create_dir_all(&slot_dir);
+            #[cfg(unix)]
+            {
+                // Slot dirs are 0700 like upstream (active-async-capacity.ts:
+                // 125,244 — `mkdirSync(..., {mode: 0o700})`).
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&slot_dir, std::fs::Permissions::from_mode(0o700));
+            }
             let claimed = std::fs::create_dir(slot_dir.join("capacity.claim"));
             if claimed.is_err() {
                 continue;
@@ -356,20 +400,95 @@ fn pid_alive(pid: u64) -> bool {
     }
 }
 
+/// Kernel boot-relative start time of `pid` (`/proc/<pid>/stat` field 22,
+/// ADR-0019 §3 `ownerBootId`): distinguishes a live pid from a reused one.
+pub fn process_boot_id(pid: u64) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let raw = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Fields after the comm paren (which may contain spaces) — overall
+        // field 3 is the first after it, so starttime (field 22) is index 19.
+        let after_comm = raw.rsplit_once(')')?.1;
+        after_comm
+            .split_whitespace()
+            .nth(19)
+            .and_then(|token| token.parse().ok())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Whether `pid` is alive AND started at `boot_id` (pid-reuse guard). A
+/// recorded `boot_id` of `None` (non-unix) degrades to a liveness check.
+fn pid_matches(pid: u64, boot_id: Option<u64>) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    match boot_id {
+        Some(expected) => process_boot_id(pid) == Some(expected),
+        None => true,
+    }
+}
+
+/// Persist a spawned child pid for `run_id` (ADR-0019 crash branch): the
+/// stale-run reconciler reads these to signal orphaned children whose owner
+/// host died. Append-only, so parallel children never clobber each other.
+pub fn record_child_pid(run_id: &str, pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let run_dir = async_runs_dir().join(run_id);
+    // Only async runs keep a run directory; foreground runs have no
+    // reconciler surface (their dispatch dies with the host).
+    if !run_dir.is_dir() {
+        return;
+    }
+    crate::artifacts::append_jsonl(
+        &run_dir.join("children.jsonl"),
+        &json!({
+            "pid": pid,
+            "bootId": process_boot_id(pid as u64),
+            "startedAt": iso8601(now_millis()),
+        })
+        .to_string(),
+    );
+}
+
+/// Read the recorded child pids for a run directory (empty when absent).
+fn recorded_child_pids(run_dir: &Path) -> Vec<(u64, Option<u64>)> {
+    std::fs::read_to_string(run_dir.join("children.jsonl"))
+        .ok()
+        .map(|raw| {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter_map(|entry| {
+                    let pid = entry["pid"].as_u64()?;
+                    let boot_id = entry["bootId"].as_u64();
+                    Some((pid, boot_id))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Runner lifecycle
 // ---------------------------------------------------------------------------
 
 /// The composite body to execute — mirrors the foreground dispatch shapes
-/// (single / parallel tasks / chain steps).
+/// (single / parallel tasks / chain steps). `Single` carries the full
+/// resolved `ChildSpec` so async keeps every foreground field (output, gate,
+/// model, cwd, budgets…); only the steer inbox is re-pointed at the run dir.
 pub enum AsyncBody {
     Single {
-        agent_name: String,
-        task: String,
+        spec: Box<crate::p1::launch_child::ChildSpec>,
     },
     Tasks {
         entries: Vec<crate::p1::parallel::TaskEntry>,
         concurrency: usize,
+        worktree_plan: Option<std::sync::Arc<crate::p1::parallel::WorktreePlan>>,
     },
     Steps {
         steps: Vec<crate::p1::chain::StepSpec>,
@@ -392,6 +511,9 @@ pub fn receipt(run_id: &str, run_dir: &Path) -> Value {
 /// Initialize the run directory and status document, register the run.
 pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Arc<AsyncRunHandle> {
     let run_dir = async_runs_dir().join(run_id);
+    // 0700 (C3): the run dir holds status/events/steer messages — task text
+    // and model output other local users should not read.
+    let _ = crate::paths::create_private_dir_all(&run_dir);
     let _ = std::fs::create_dir_all(run_dir.join("control"));
     let status = Arc::new(RwLock::new(json!({
         "runId": run_id,
@@ -405,6 +527,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
         "createdAt": iso8601(now_millis()),
         "updatedAt": iso8601(now_millis()),
         "ownerPid": std::process::id(),
+        "ownerBootId": process_boot_id(std::process::id() as u64),
         "steps": [],
     })));
     let handle = Arc::new(AsyncRunHandle {
@@ -416,8 +539,8 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
     {
         let mut current = status.write().unwrap_or_else(|e| e.into_inner());
         let step_agents: Vec<Value> = match body {
-            AsyncBody::Single { agent_name, .. } => {
-                vec![json!({ "agent": agent_name, "status": "pending" })]
+            AsyncBody::Single { spec, .. } => {
+                vec![json!({ "agent": spec.agent_name, "status": "pending" })]
             }
             AsyncBody::Tasks { entries, .. } => entries
                 .iter()
@@ -459,11 +582,17 @@ pub async fn drive_run(
         }
     };
     match body {
-        AsyncBody::Single { agent_name, task } => {
-            let agent = match crate::agents::discover::resolve_agent_name(&agents, &agent_name) {
+        AsyncBody::Single { mut spec } => {
+            let agent = match crate::agents::discover::resolve_agent_name(&agents, &spec.agent_name)
+            {
                 Ok(Some(agent)) => agent.clone(),
                 Ok(None) => {
-                    finish_failed(&handle, &format!("Unknown agent: {agent_name}"), &notify).await;
+                    finish_failed(
+                        &handle,
+                        &format!("Unknown agent: {}", spec.agent_name),
+                        &notify,
+                    )
+                    .await;
                     return;
                 }
                 Err(message) => {
@@ -471,12 +600,9 @@ pub async fn drive_run(
                     return;
                 }
             };
-            let spec = crate::p1::launch_child::ChildSpec {
-                agent_name,
-                task,
-                steer_inbox: Some(steer_inbox_dir(&handle.run_dir, 0)),
-                ..Default::default()
-            };
+            // The run dir steer inbox is the async control surface; every
+            // other field keeps its foreground meaning (B2: no silent loss).
+            spec.steer_inbox = Some(steer_inbox_dir(&handle.run_dir, 0));
             mark_step(&handle, 0, "running");
             match crate::p1::launch_child::run_child_async(&spec, &agent, &ctx).await {
                 Ok(outcome) => {
@@ -501,19 +627,23 @@ pub async fn drive_run(
         AsyncBody::Tasks {
             entries,
             concurrency,
+            worktree_plan,
         } => {
             for (index, _) in entries.iter().enumerate() {
                 mark_step(&handle, index, "queued");
             }
-            match crate::p1::parallel::run_parallel_async(
+            let outcome = crate::p1::parallel::run_parallel_async(
                 &entries,
                 &agents,
                 &ctx,
                 concurrency,
-                None,
+                worktree_plan.clone(),
             )
-            .await
-            {
+            .await;
+            if let Some(plan) = &worktree_plan {
+                crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
+            }
+            match outcome {
                 Ok(outcomes) => {
                     let mut aggregate = String::new();
                     for (index, outcome) in outcomes.iter().enumerate() {
@@ -790,8 +920,13 @@ pub fn deliver_steer(
     Ok(request)
 }
 
-/// Read a finished or live run's status.json by id (resume lookup).
+/// Read a finished or live run's status.json by id (resume lookup). The id
+/// is model-controlled and joins a filesystem path — path-shaped ids are
+/// rejected before the lookup (C1).
 pub fn read_run_status(run_id: &str) -> Option<Value> {
+    if crate::paths::ensure_safe_component(run_id, "Run id").is_err() {
+        return None;
+    }
     if let Some(handle) = find_run(run_id) {
         return Some(status_snapshot(&handle));
     }
@@ -883,8 +1018,9 @@ pub async fn harvest_for_shutdown() {
 }
 
 /// Stale-run reconciliation at plugin init (ADR-0019 crash branch): runs
-/// stuck in queued/running whose owner host pid is dead are marked failed
-/// (their children were reaped by the P0 sweep or died with the host).
+/// stuck in queued/running whose owner host pid is dead get their recorded
+/// children signalled (SIGTERM → bounded poll → SIGKILL, bootId-guarded
+/// against pid reuse) and are then marked failed(stale).
 pub fn reconcile_stale_runs() {
     let Ok(entries) = std::fs::read_dir(async_runs_dir()) else {
         return;
@@ -904,10 +1040,24 @@ pub fn reconcile_stale_runs() {
         ) {
             continue;
         }
-        let owner_alive = status["ownerPid"].as_u64().map(pid_alive).unwrap_or(false);
+        let owner_alive = status["ownerPid"]
+            .as_u64()
+            .map(|pid| pid_matches(pid, status["ownerBootId"].as_u64()))
+            .unwrap_or(false);
         if owner_alive {
             // Another live host process owns it — do not touch.
             continue;
+        }
+        // Reap the orphaned children (ADR-0019: "signal and reap"): the
+        // recorded pids survive the host crash in an independent process
+        // group and would otherwise hang forever on the full stdout pipe.
+        let mut reaped = Vec::new();
+        for (pid, boot_id) in recorded_child_pids(&run_dir) {
+            if !pid_matches(pid, boot_id) {
+                continue;
+            }
+            reap_orphan_pid(pid);
+            reaped.push(pid);
         }
         status["state"] = json!(STATE_FAILED);
         status["error"] = json!("stale: owning host process exited before the run finished");
@@ -916,8 +1066,30 @@ pub fn reconcile_stale_runs() {
         append_event(
             &run_dir,
             "run.reconciled",
-            json!({ "reason": "owner-dead" }),
+            json!({ "reason": "owner-dead", "reapedChildPids": reaped }),
         );
+    }
+}
+
+/// Signal ladder for one orphaned child pid, bounded (the reconciler runs on
+/// the plugin init path): SIGTERM, poll up to 1s, then SIGKILL.
+fn reap_orphan_pid(pid: u64) {
+    #[cfg(unix)]
+    {
+        // Safety: kill(2) with a checked pid.
+        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + Duration::from_millis(1000);
+        while std::time::Instant::now() < deadline {
+            if !pid_alive(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
     }
 }
 
@@ -1046,5 +1218,102 @@ mod tests {
                 .unwrap();
         assert_eq!(status["state"], json!(STATE_FAILED));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_reconciler_reaps_orphaned_child_processes() {
+        use std::process::Command;
+        // A stand-in for a subagent child that outlived its crashed host:
+        // independent process group, still running.
+        let mut orphan = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = orphan.id() as u64;
+        let dir = async_runs_dir().join(format!("recon-orphan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // children.jsonl first: status.json is the reconciler's entry
+        // condition, and a concurrent test's reconcile sweep must not mark
+        // the run terminal before the pid record exists.
+        crate::artifacts::append_jsonl(
+            &dir.join("children.jsonl"),
+            &json!({ "pid": pid, "bootId": process_boot_id(pid) }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": "orphans",
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000, // not a live pid on this system
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        // The recorded pid was signalled through the ladder. The sleep child
+        // is this test process's own child, so after SIGTERM it lingers as a
+        // zombie until waited — poll try_wait (pid_alive stays true for
+        // zombies, kill(pid,0) succeeds).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let exited = loop {
+            match orphan.try_wait().expect("try_wait") {
+                Some(_) => break true,
+                None if std::time::Instant::now() >= deadline => break false,
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        assert!(exited, "orphan child should have been reaped");
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(events.contains("run.reconciled"));
+        assert!(events.contains(&format!("{pid}")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_reconciler_skips_reused_pids() {
+        use std::process::Command;
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id() as u64;
+        let dir = async_runs_dir().join(format!("recon-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // bootId deliberately wrong → the live pid must not be signalled.
+        // Written before status.json for the same race reason as above.
+        crate::artifacts::append_jsonl(
+            &dir.join("children.jsonl"),
+            &json!({ "pid": pid, "bootId": 1 }).to_string(),
+        );
+        crate::artifacts::write_metadata(
+            &dir.join("status.json"),
+            &json!({
+                "runId": "reuse",
+                "state": STATE_RUNNING,
+                "ownerPid": 4000000,
+            }),
+        )
+        .unwrap();
+        reconcile_stale_runs();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(pid_alive(pid), "mismatched bootId must be left alone");
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_child_pid_writes_only_for_async_runs() {
+        // The async-runs root holds no directory for this id → no file.
+        record_child_pid("no-such-run-id-xyz", 4242);
+        assert!(!async_runs_dir()
+            .join("no-such-run-id-xyz")
+            .join("children.jsonl")
+            .exists());
     }
 }

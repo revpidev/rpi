@@ -1,11 +1,14 @@
 //! Child-side required-tools availability diagnostic (ADR-0017).
 //!
 //! Port of pi-subagents `src/runs/shared/tool-availability.ts` @ v0.48.0
-//! (56f97234) with the P0 exemption set: upstream children always carry the
-//! plugin's own supervisor tools (`registerNativeSupervisorClient`), rpi P0
-//! does not have them yet (FR-P1-10), so `intercom` and `contact_supervisor`
-//! count as available until TE05 — every other missing tool fails the run
-//! with the upstream message.
+//! (56f97234). The ADR-0017 P0 exemption set (`intercom`,
+//! `contact_supervisor` counted as always-available) was removed with TE05's
+//! supervisor channel: `contact_supervisor` is now checked against the
+//! child's real tool list like any other tool, and an `intercom` requirement
+//! (the name agent frontmatters inherited from the upstream host) is
+//! satisfied by the registered `contact_supervisor` — a mapping, not an
+//! exemption. Every other missing tool fails the run with the upstream
+//! message.
 
 use std::io::Write;
 use std::path::Path;
@@ -15,8 +18,21 @@ use serde_json::{json, Value};
 /// `PI_CORE_CHILD_TOOLS` (tool-availability.ts:16).
 pub const PI_CORE_CHILD_TOOLS: [&str; 7] = ["bash", "edit", "find", "grep", "ls", "read", "write"];
 
-/// ADR-0017 P0 exemption set (removed in TE05 with the supervisor channel).
-pub const P0_EXEMPT_TOOLS: [&str; 2] = ["intercom", "contact_supervisor"];
+/// Frontmatter tool names satisfied by a differently-named registered tool:
+/// upstream-host agents advertise `intercom`; rpi children carry the
+/// supervisor client as `contact_supervisor` (FR-P1-10).
+const TOOL_ALIASES: [(&str, &str); 1] = [("intercom", "contact_supervisor")];
+
+/// Whether a required tool is satisfied by the available set, honouring the
+/// alias table above.
+fn requirement_satisfied(required: &str, available: &std::collections::BTreeSet<&str>) -> bool {
+    if available.contains(required) {
+        return true;
+    }
+    TOOL_ALIASES
+        .iter()
+        .any(|(name, provider)| name == &required && available.contains(provider))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChildToolDiagnostic {
@@ -33,16 +49,14 @@ pub fn write_child_tool_diagnostic(
     available: &[String],
     agent: Option<&str>,
 ) -> Option<ChildToolDiagnostic> {
-    let mut available_names: std::collections::BTreeSet<&str> = available
+    let available_names: std::collections::BTreeSet<&str> = available
         .iter()
         .map(String::as_str)
         .chain(PI_CORE_CHILD_TOOLS.iter().copied())
-        .chain(P0_EXEMPT_TOOLS.iter().copied())
         .collect();
-    let _ = &mut available_names;
     let missing: Vec<String> = required
         .iter()
-        .filter(|name| !available_names.contains(name.as_str()))
+        .filter(|name| !requirement_satisfied(name, &available_names))
         .cloned()
         .collect();
     if missing.is_empty() {
@@ -149,10 +163,13 @@ mod tests {
             "web_search".to_string(),
             "intercom".to_string(),
         ];
-        let available = vec!["read".to_string()];
+        let available = vec!["read".to_string(), "contact_supervisor".to_string()];
         let diagnostic =
             write_child_tool_diagnostic(&path, &required, &available, Some("researcher"));
         let diagnostic = diagnostic.expect("web_search missing");
+        // `intercom` is satisfied by the registered `contact_supervisor`
+        // (alias mapping, TE05 follow-up of ADR-0017) — only the genuinely
+        // absent tool is reported.
         assert_eq!(diagnostic.missing, vec!["web_search".to_string()]);
         let message = format_child_tool_diagnostic(&diagnostic);
         assert!(message
@@ -165,12 +182,10 @@ mod tests {
             "read".to_string(),
             "web_search".to_string(),
             "intercom".to_string(),
-            "contact_supervisor".to_string(),
         ];
         let everything = vec![
             "read".to_string(),
             "web_search".to_string(),
-            "intercom".to_string(),
             "contact_supervisor".to_string(),
         ];
         assert!(write_child_tool_diagnostic(&path, &all_available, &everything, None).is_none());
