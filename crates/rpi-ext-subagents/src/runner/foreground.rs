@@ -35,6 +35,23 @@ use crate::runner::events::{
     DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_MAX_OUTPUT_LINES, MAX_CHILD_PENDING_LINE_BYTES,
     MAX_CHILD_STDERR_BYTES,
 };
+use crate::runner::streaming::{self, StreamMeta};
+
+/// One streaming frame push (`onUpdate` payload, execution.ts:824-845):
+/// `(content text, details JSON)`. Bound to the FFI sink in `tool.rs`,
+/// collectors in tests — same seam pattern as the smart-fetch FramePush.
+pub type StreamFrameSink = Arc<dyn Fn(&str, &Value) + Send + Sync>;
+
+/// Async step-activity projection (FR-C): `(child index, {currentTool,
+/// currentPath, turnCount, toolCount})` written into the run status so
+/// `subagent_wait` can show live tool lines.
+pub type StepStatusSink = Arc<dyn Fn(u32, &Value) + Send + Sync>;
+
+/// The activity-timer tick upstream arms whenever `onUpdate` is present
+/// (execution.ts:1009-1019). The derivation engine the timer also feeds is
+/// out of TE09 scope; the tick still pushes a frame so long quiet stretches
+/// keep the durationMs/lastActivityAt projection fresh.
+const ACTIVITY_TICK_MS: u64 = 1000;
 
 pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const FINAL_STOP_GRACE_MS: u64 = 1000;
@@ -148,7 +165,7 @@ fn signal_pid(pid: u32, signal: Signal) {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ForegroundRunInput {
     pub agent_name: String,
     pub agent_system_prompt: String,
@@ -180,10 +197,25 @@ pub struct ForegroundRunInput {
     pub parent_session_id: Option<String>,
     pub self_extension: Option<String>,
     pub fanout_authorized: bool,
+    /// Resolved skill names (`shared.resolvedSkillNames`) for the streaming
+    /// progress snapshot; None drops the `skills` field (upstream spreads
+    /// undefined away).
+    pub resolved_skill_names: Option<Vec<String>>,
+    /// Context mode label ("fresh"/"fork") carried by the streaming result
+    /// snapshot (the terminal `context` field's streaming counterpart).
+    pub context_label: String,
     /// Steer inbox for async children (FR-P1-04); None clears the env.
     pub steer_inbox: Option<PathBuf>,
     /// Supervisor channel dir (FR-P1-10); None clears the env.
     pub supervisor_channel: Option<PathBuf>,
+    /// Streaming frame sink (TE09 FR-A): every progress-bearing child event
+    /// and each 1s activity tick pushes a `{mode:"single", ...}` snapshot
+    /// (execution.ts fireUpdate). None = non-streaming run (no dispatch id).
+    pub stream_sink: Option<StreamFrameSink>,
+    /// Step activity projection (TE09 FR-C): async runs mirror currentTool/
+    /// currentPath into their status document so `subagent_wait` shows live
+    /// tool lines. None for plain foreground runs.
+    pub step_status: Option<StepStatusSink>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,6 +229,8 @@ pub struct ForegroundRunResult {
     pub timed_out: bool,
     pub process_signal: Option<String>,
     pub tool_count: u64,
+    /// Assistant turns (`AgentProgress.turnCount` terminal projection).
+    pub turns: u64,
     pub duration_ms: u64,
     pub artifact_paths: Option<ArtifactPaths>,
     pub session_file: Option<PathBuf>,
@@ -397,16 +431,32 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     });
 
     // stdout reader: bounded line reader + event accumulation + artifacts.
+    // The child state lives in the shared slot directly (the streaming face
+    // reads snapshots between lines); the run no longer copies it out.
     let stdout_state = state.clone();
     let stdout_raw = raw_tail.clone();
     let stdout_terminal = terminal_seen.clone();
     let stdout_protocol_error = stream_error.clone();
+    let stream_meta = StreamMeta {
+        index: input.child_index,
+        agent: input.agent_name.clone(),
+        skills: input.resolved_skill_names.clone(),
+        model: input.model.clone(),
+        thinking: input.thinking.clone(),
+        started_at_ms: artifacts::now_millis(),
+    };
+    let frame_sink = input.stream_sink.clone();
+    let step_status = input.step_status.clone();
+    let child_index = input.child_index;
+    let context_label = input.context_label.clone();
+    // Ticker-side copies (the stdout task above owns the originals).
+    let ticker_meta = stream_meta.clone();
+    let ticker_context = context_label.clone();
     let stdout_task = tokio::spawn(async move {
         let Some(mut stdout) = stdout else {
             return;
         };
         let mut buffer = vec![0u8; 64 * 1024];
-        let mut reader_state = ChildRunState::default();
         let mut terminal = false;
 
         // Protocol-limit path (execution.ts:1047-1062): record the error and
@@ -448,13 +498,45 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                         .push(line.as_bytes());
                     return;
                 }
-                let outcome = reader_state.process_line(trimmed);
+                let now_ms = artifacts::now_millis();
+                let (outcome, snapshot) = {
+                    let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
+                    let outcome = state.process_line(trimmed, now_ms);
+                    let snapshot = outcome.progress_event.then(|| state.clone());
+                    (outcome, snapshot)
+                };
                 match outcome.lifecycle {
                     ChildLifecycleAction::StartDrain => terminal = true,
                     ChildLifecycleAction::CancelDrain => terminal = false,
                     ChildLifecycleAction::None => {}
                 }
                 stdout_terminal.store(terminal, Ordering::SeqCst);
+                // Per-event streaming face (execution.ts:914/929/972/1005
+                // fireUpdate): one frame per progress-bearing event.
+                if let Some(snapshot) = snapshot {
+                    if let Some(status) = &step_status {
+                        status(
+                            child_index,
+                            &json!({
+                                "currentTool": snapshot.current_tool,
+                                "currentToolArgs": snapshot.current_tool_args,
+                                "currentToolStartedAt": snapshot.current_tool_started_at,
+                                "currentPath": snapshot.current_path,
+                                "turnCount": snapshot.turns,
+                                "toolCount": snapshot.tool_count,
+                            }),
+                        );
+                    }
+                    if let Some(sink) = &frame_sink {
+                        let (text, details) = streaming::single_update_details(
+                            &snapshot,
+                            &stream_meta,
+                            &context_label,
+                            now_ms,
+                        );
+                        sink(&text, &details);
+                    }
+                }
             },
             on_limit,
         );
@@ -474,7 +556,6 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         line_reader.end();
         let exceeded = line_reader.exceeded();
         drop(line_reader);
-        *stdout_state.lock().unwrap_or_else(|e| e.into_inner()) = reader_state;
         if exceeded {
             // The on_limit callback already recorded the protocol error and
             // started the kill ladder; this keeps the flag observable.
@@ -522,7 +603,38 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // Wait for the process itself first — piped readers can outlive the child
     // when a grandchild inherits the descriptors. Post-exit stdio guard
     // (execution.ts:1075 idleMs 2s/hardMs 8s) approximated by the hard cap.
-    let exit_status = child_handle.lock().await.wait().await;
+    // With a streaming sink the wait races the 1s activity tick
+    // (execution.ts:1009-1019: the interval fires updateActivityState +
+    // fireUpdate while onUpdate is attached; the derivation engine feeding
+    // activityState is out of scope, the tick itself stays).
+    let exit_status = if input.stream_sink.is_some() {
+        let ticker_state = state.clone();
+        let ticker_sink = input
+            .stream_sink
+            .clone()
+            .unwrap_or_else(|| Arc::new(|_text: &str, _details: &Value| {}));
+        let ticker_meta = ticker_meta.clone();
+        let ticker_context = ticker_context.clone();
+        let mut tick = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        tick.tick().await; // intervals fire immediately; upstream waits 1s
+        let mut child_guard = child_handle.lock().await;
+        loop {
+            tokio::select! {
+                status = child_guard.wait() => break status,
+                _ = tick.tick() => {
+                    let now_ms = artifacts::now_millis();
+                    let snapshot =
+                        ticker_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let (text, details) =
+                        streaming::single_update_details(&snapshot, &ticker_meta, &ticker_context, now_ms);
+                    ticker_sink(&text, &details);
+                }
+            }
+        }
+    } else {
+        child_handle.lock().await.wait().await
+    };
     let mut stdout_task = Some(stdout_task);
     let mut stderr_task = Some(stderr_task);
     let drained = tokio::time::timeout(Duration::from_millis(POST_EXIT_DRAIN_HARD_MS), async {
@@ -789,6 +901,7 @@ fn synthesize_exit(
         timed_out,
         process_signal,
         tool_count: state.tool_count,
+        turns: state.turns,
         duration_ms,
         artifact_paths: None,
         session_file: None,
@@ -815,6 +928,7 @@ fn failed_result(
         timed_out: false,
         process_signal: None,
         tool_count: 0,
+        turns: 0,
         duration_ms: start.elapsed().as_millis() as u64,
         artifact_paths,
         session_file: None,

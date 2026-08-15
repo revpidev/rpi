@@ -12,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -367,6 +368,58 @@ pub fn run_chain(
     runtime.block_on(run_chain_async(steps, agents, ctx, original_task))
 }
 
+/// Chain-mode streaming projection (TE09 FR-B, chain-execution.ts:448-479):
+/// the completed steps' terminal details + progress snapshots that every
+/// in-flight step frame re-wraps into `{mode:"chain", ...}`.
+#[derive(Default)]
+struct ChainStreamProjection {
+    results: Vec<Value>,
+    progress: Vec<Value>,
+}
+
+/// Terminal per-step progress (`compactCompletedProgress` shape over the
+/// finished child): the AgentProgress field set with the final status.
+fn terminal_step_progress(
+    index: usize,
+    agent: &str,
+    result: &crate::runner::foreground::ForegroundRunResult,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("index".to_string(), json!(index as u32));
+    map.insert("agent".to_string(), json!(agent));
+    map.insert(
+        "status".to_string(),
+        json!(if result.exit_code == 0 {
+            "completed"
+        } else {
+            "failed"
+        }),
+    );
+    map.insert("task".to_string(), json!("[prompt redacted]"));
+    map.insert("recentTools".to_string(), json!([]));
+    map.insert("recentOutput".to_string(), json!([]));
+    map.insert("toolCount".to_string(), json!(result.tool_count));
+    map.insert("turnCount".to_string(), json!(result.turns));
+    let input_tokens = result
+        .usage
+        .get("input")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = result
+        .usage
+        .get("output")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    map.insert("tokens".to_string(), json!(input_tokens + output_tokens));
+    if let Some(model) = &result.model {
+        map.insert("model".to_string(), json!(model));
+    }
+    map.insert("inputTokens".to_string(), json!(input_tokens));
+    map.insert("outputTokens".to_string(), json!(output_tokens));
+    map.insert("durationMs".to_string(), json!(result.duration_ms));
+    Value::Object(map)
+}
+
 /// Async core (see [`run_chain`]) — direct call from runtime tasks.
 pub async fn run_chain_async(
     steps: &[StepSpec],
@@ -383,7 +436,12 @@ pub async fn run_chain_async(
     }
     let usage_budget = ctx.usage_budget.clone();
     let mut accumulated_cost = 0.0f64;
-    let mut outputs: BTreeMap<String, String> = BTreeMap::new();
+    let outputs: std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let projection = std::sync::Arc::new(std::sync::Mutex::new(ChainStreamProjection::default()));
+    // chainAgents (types.ts:1052): the declared step agent list.
+    let chain_agents: Vec<String> = steps.iter().map(|step| step.agent_name.clone()).collect();
+    let total_steps = steps.len();
     let mut completed: Vec<StepOutcome> = Vec::new();
     let mut previous_output: Option<String> = None;
     let mut first_progress_seen = false;
@@ -392,12 +450,13 @@ pub async fn run_chain_async(
             .cloned()
             .ok_or_else(|| format!("Unknown agent: {}", step.agent_name))?;
         let default_template = if index == 0 { "{task}" } else { "{previous}" };
+        let outputs_snapshot = outputs.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let task = interpolate_task(
             &step.task_template,
             default_template,
             original_task,
             previous_output.as_deref(),
-            &outputs,
+            &outputs_snapshot,
             &chain_dir,
         );
         // Step-level behavior resolution (resolveStepBehavior L272-299):
@@ -461,7 +520,43 @@ pub async fn run_chain_async(
         )? {
             break;
         }
-        let outcome = launch_child::run_child_async(&spec, &agent, ctx).await?;
+        // TE09 FR-B (chain-execution.ts:448-479): under a dispatch sink every
+        // step's streaming frame is re-wrapped as a chain-mode snapshot —
+        // accumulated terminal results/progress + the live step frame,
+        // chainAgents/totalSteps/currentStepIndex/outputs riding along.
+        let mut step_ctx = ctx.clone();
+        if let Some(sink) = ctx.frame_sink.clone() {
+            let projection = projection.clone();
+            let outputs = outputs.clone();
+            let chain_agents = chain_agents.clone();
+            step_ctx.frame_sink = Some(Arc::new(move |text: &str, details: &Value| {
+                let (mut results, mut progress) = {
+                    let projection = projection.lock().unwrap_or_else(|e| e.into_inner());
+                    (projection.results.clone(), projection.progress.clone())
+                };
+                results.extend(details["results"].as_array().cloned().unwrap_or_default());
+                progress.extend(details["progress"].as_array().cloned().unwrap_or_default());
+                let outputs_json: Value = {
+                    let outputs = outputs.lock().unwrap_or_else(|e| e.into_inner());
+                    outputs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), json!(value)))
+                        .collect()
+                };
+                let chain_details = json!({
+                    "mode": "chain",
+                    "results": results,
+                    "progress": progress,
+                    "controlEvents": details["controlEvents"].clone(),
+                    "chainAgents": chain_agents,
+                    "totalSteps": total_steps,
+                    "currentStepIndex": index,
+                    "outputs": outputs_json,
+                });
+                sink(text, &chain_details);
+            }));
+        }
+        let outcome = launch_child::run_child_async(&spec, &agent, &step_ctx).await?;
         accumulated_cost += outcome
             .result
             .usage
@@ -495,11 +590,25 @@ pub async fn run_chain_async(
             error: outcome.result.error.clone(),
             details,
         };
+        // Terminal projection into the chain accumulator (FR-B): the next
+        // step's frames carry this step's final details + progress.
+        {
+            let mut projection = projection.lock().unwrap_or_else(|e| e.into_inner());
+            projection.results.push(step_outcome.details.clone());
+            projection.progress.push(terminal_step_progress(
+                index,
+                &outcome.agent_name,
+                &outcome.result,
+            ));
+        }
         if outcome.result.exit_code != 0 {
             return Ok((completed, Some(step_outcome)));
         }
         if let Some(binding) = &step.binding {
-            outputs.insert(binding.clone(), outcome.result.final_output.clone());
+            outputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(binding.clone(), outcome.result.final_output.clone());
         }
         previous_output = Some(outcome.result.final_output);
         completed.push(step_outcome);

@@ -9,7 +9,7 @@
 //!
 //! Intentional differences: none in the protocol limits or parsing rules.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 pub const MAX_CHILD_PENDING_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_CHILD_STDERR_BYTES: usize = 128 * 1024;
@@ -840,7 +840,8 @@ fn aggregate_projector_accepts(prefix: &str) -> Option<AggregateProjection> {
 }
 
 /// Accumulated child facts extracted from the JSONL stream (the `processLine`
-/// subset, execution.ts:848-1007).
+/// subset, execution.ts:848-1007) plus the streaming-progress projection
+/// (TE09 FR-A: the `AgentProgress` fields execution.ts:891-1006 maintains).
 #[derive(Debug, Default, Clone)]
 pub struct ChildRunState {
     pub messages: Vec<Value>,
@@ -854,18 +855,50 @@ pub struct ChildRunState {
     pub turns: u64,
     pub agent_settled_received: bool,
     pub assistant_error: Option<String>,
+    // Streaming progress face (execution.ts:891-929 + :931-1006).
+    pub current_tool: Option<String>,
+    pub current_tool_args: Option<String>,
+    pub current_tool_started_at: Option<u64>,
+    pub current_path: Option<String>,
+    /// Unbounded in memory; the streamed snapshot bounds it to the last 32
+    /// (`MAX_STREAMED_RECENT_TOOLS`).
+    pub recent_tools: Vec<RecentToolEntry>,
+    /// Bounded in memory to the last 50 lines (`appendRecentOutput`).
+    pub recent_output: Vec<String>,
+    pub last_activity_at: Option<u64>,
+}
+
+/// One `recentTools` entry (`tool_execution_end` push, execution.ts:916-922).
+#[derive(Debug, Default, Clone)]
+pub struct RecentToolEntry {
+    pub tool: String,
+    pub args: String,
+    pub end_ms: u64,
 }
 
 /// One parsed line's contribution (mirrors processLine's per-event handling).
 #[derive(Debug, Default, Clone)]
 pub struct LineOutcome {
     pub lifecycle: ChildLifecycleAction,
+    /// Whether the line was a progress-bearing event (drives the streaming
+    /// frame push — upstream fires the update per event, execution.ts:914/
+    /// 929/972/1005).
+    pub progress_event: bool,
 }
 
 impl ChildRunState {
     /// Process one stdout line. Non-JSON / non-object lines are ignored by the
-    /// caller (they only feed the raw tail), same as upstream.
-    pub fn process_line(&mut self, line: &str) -> LineOutcome {
+    /// caller (they only feed the raw tail), same as upstream. `now_ms` is the
+    /// event timestamp source (`Date.now()` upstream).
+    pub fn process_line(&mut self, line: &str, now_ms: u64) -> LineOutcome {
+        let outcome = self.process_line_inner(line, now_ms);
+        if outcome.progress_event {
+            self.last_activity_at = Some(now_ms);
+        }
+        outcome
+    }
+
+    fn process_line_inner(&mut self, line: &str, now_ms: u64) -> LineOutcome {
         let mut outcome = LineOutcome::default();
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return outcome;
@@ -886,17 +919,49 @@ impl ChildRunState {
                 );
             }
             "tool_execution_start" => {
+                // execution.ts:891-914: currentTool projection.
                 self.tool_count += 1;
+                let tool_args = match value.get("args") {
+                    Some(args) if args.as_object().is_some() => args.clone(),
+                    _ => json!({}),
+                };
+                self.current_tool = value
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                self.current_tool_args = self
+                    .current_tool
+                    .as_ref()
+                    .map(|_| super::display::extract_tool_args_preview(&tool_args));
+                self.current_tool_started_at = Some(now_ms);
+                self.current_path = super::display::resolve_current_path(
+                    value.get("toolName").and_then(Value::as_str),
+                    Some(&tool_args),
+                );
+                outcome.progress_event = true;
+            }
+            "tool_execution_end" => {
+                // execution.ts:916-929: recentTools push + current* clear.
+                if let Some(tool) = self.current_tool.take() {
+                    self.recent_tools.push(RecentToolEntry {
+                        tool,
+                        args: self.current_tool_args.take().unwrap_or_default(),
+                        end_ms: now_ms,
+                    });
+                }
+                self.current_tool_started_at = None;
+                self.current_path = None;
+                outcome.progress_event = true;
             }
             "message_end" | "tool_result_end" => {
-                self.process_message_end(&value, &mut outcome);
+                self.process_message_end(event_type, &value, &mut outcome);
             }
             _ => {}
         }
         outcome
     }
 
-    fn process_message_end(&mut self, event: &Value, outcome: &mut LineOutcome) {
+    fn process_message_end(&mut self, event_type: &str, event: &Value, outcome: &mut LineOutcome) {
         // `tool_result_end` carries the toolResult message under `message`.
         let Some(message) = event.get("message") else {
             return;
@@ -941,7 +1006,25 @@ impl ChildRunState {
             if message.get("stopReason").and_then(Value::as_str) == Some("stop") && !has_tool_call {
                 outcome.lifecycle = project_child_lifecycle(None, false, true);
             }
+            // recentOutput append (execution.ts:962, inside the assistant
+            // block): the assistant text's last 10 lines.
+            if let Some(content) = message.get("content") {
+                super::streaming::append_recent_output(
+                    self,
+                    &super::streaming::recent_output_lines(content),
+                );
+            }
+        } else if event_type == "tool_result_end" {
+            // execution.ts:977-978: tool results append unconditionally
+            // (message_end of other roles does not).
+            if let Some(content) = message.get("content") {
+                super::streaming::append_recent_output(
+                    self,
+                    &super::streaming::recent_output_lines(content),
+                );
+            }
         }
+        outcome.progress_event = true;
         self.messages.push(message.clone());
     }
 
@@ -1327,6 +1410,7 @@ mod tests {
         let mut state = ChildRunState::default();
         let outcome = state.process_line(
             r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input":10,"output":5,"cacheRead":2,"cacheWrite":1,"cost":{"total":0.25}},"model":"faux/1","stopReason":"stop"}}"#,
+            0,
         );
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::StartDrain);
         assert_eq!(state.usage_input, 10);
@@ -1334,11 +1418,11 @@ mod tests {
         assert_eq!(state.usage_cost_total, 0.25);
         assert_eq!(state.model.as_deref(), Some("faux/1"));
         assert_eq!(state.messages.len(), 1);
-        let outcome = state.process_line(r#"{"type":"agent_settled"}"#);
+        let outcome = state.process_line(r#"{"type":"agent_settled"}"#, 1);
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::StartDrain);
-        let outcome = state.process_line(r#"{"type":"agent_end","willRetry":true}"#);
+        let outcome = state.process_line(r#"{"type":"agent_end","willRetry":true}"#, 2);
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::CancelDrain);
-        let outcome = state.process_line("not json");
+        let outcome = state.process_line("not json", 3);
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::None);
     }
 
@@ -1355,6 +1439,7 @@ mod tests {
                 "type": "message_end", "message": message
             })
             .to_string(),
+            0,
         );
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::None);
     }

@@ -63,7 +63,7 @@ pub fn handle_command(
                 if run.fork {
                     params["context"] = json!("fork");
                 }
-                tool::execute_subagent_tool(&params, host, settings, config, runtime)
+                tool::execute_subagent_tool(&params, host, settings, config, runtime, None)
             }
             Err(usage) => json!({
                 "content": [{ "type": "text", "text": usage }],
@@ -87,6 +87,7 @@ pub fn handle_command(
             settings,
             config,
             runtime,
+            None,
         ),
         _ => Value::Null,
     }

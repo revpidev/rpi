@@ -16,15 +16,53 @@ struct FakeHost {
     model: Value,
 }
 
+/// TE09: host-call observation sinks — `toolUpdate` partial frames and
+/// `sendMessage` custom messages, collected for the streaming/notify
+/// assertions (static because the host trampoline is a plain extern "C" fn).
+static TOOL_UPDATES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+static SENT_MESSAGES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+
+fn take_tool_updates() -> Vec<Value> {
+    TOOL_UPDATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
+}
+
+fn take_sent_messages() -> Vec<Value> {
+    SENT_MESSAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
+}
+
 // Safety: the trampoline only dereferences the cookie as `&FakeHost`.
 extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<u8> {
     let host = unsafe { &*(host_ptr as *const FakeHost) };
     let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
     let method = parsed.get("call").and_then(Value::as_str).unwrap_or("");
     let response = match method {
-        "registerTool" | "registerCommand" | "on" | "registerFlag" => json!({ "ok": true }),
+        "registerTool" | "registerCommand" | "registerMessageRenderer" | "on" | "registerFlag" => {
+            json!({ "ok": true })
+        }
         "ctx.cwd" => json!({ "ok": host.cwd.to_string_lossy() }),
         "ctx.model" => json!({ "ok": host.model }),
+        "toolUpdate" => {
+            TOOL_UPDATES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(parsed["args"].clone());
+            json!({ "ok": true })
+        }
+        "sendMessage" => {
+            SENT_MESSAGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(parsed["args"]["message"].clone());
+            json!({ "ok": true })
+        }
         _ => json!({ "error": { "kind": "unknownMethod", "message": method } }),
     };
     RVec::from(serde_json::to_vec(&response).unwrap_or_default())
@@ -578,6 +616,43 @@ fn e2e_fixed_child_full_pipeline() {
         // Chain scratch dir materialized under .rpi/subagents/chain-runs.
         let chain_root = sandbox.project.join(".rpi/subagents/chain-runs");
         assert!(chain_root.exists(), "chain-runs root exists");
+
+        // ---- Scenario 10b (TE09 FR-B): chain-mode streaming frames ------
+        {
+            let dump = sandbox.dump("chain-stream");
+            std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+            std::env::set_var("RPI_E2E_MODE", "ok");
+            take_tool_updates();
+            let result = execute(json!({
+                "steps": [
+                    { "agent": "scout", "task": "first {task}" },
+                    { "agent": "reviewer", "task": "second {previous}" }
+                ],
+                "task": "the plan",
+                "async": false
+            }));
+            assert_eq!(result["isError"], Value::Bool(false), "{result}");
+            let frames = take_tool_updates();
+            assert!(!frames.is_empty(), "chain frames reached the host");
+            let first = &frames[0]["update"]["details"];
+            assert_eq!(first["mode"], json!("chain"));
+            assert_eq!(first["totalSteps"], json!(2));
+            assert_eq!(first["currentStepIndex"], json!(0));
+            assert_eq!(first["chainAgents"], json!(["scout", "reviewer"]));
+            assert_eq!(first["outputs"], json!({}));
+            assert_eq!(first["results"].as_array().unwrap().len(), 1);
+            assert_eq!(first["progress"].as_array().unwrap().len(), 1);
+            // Step 2 frames accumulate step 1's terminal result + progress.
+            let second_step_first = frames
+                .iter()
+                .find(|frame| frame["update"]["details"]["currentStepIndex"] == json!(1))
+                .expect("step-2 frames arrived");
+            let details = &second_step_first["update"]["details"];
+            assert_eq!(details["results"].as_array().unwrap().len(), 2);
+            assert_eq!(details["progress"].as_array().unwrap().len(), 2);
+            assert_eq!(details["progress"][0]["status"], json!("completed"));
+            assert_eq!(details["progress"][0]["agent"], json!("scout"));
+        }
     }
 
     // ---- Scenario 11 (TE05): background run lifecycle (FR-P1-04) ------
@@ -616,6 +691,129 @@ fn e2e_fixed_child_full_pipeline() {
         let events = std::fs::read_to_string(&events_file).unwrap_or_default();
         assert!(events.contains("run.started"), "{events}");
         assert!(events.contains("run.finished"));
+    }
+
+    // ---- Scenario 13 (TE09): foreground streaming snapshots (FR-A) ----
+    {
+        let dump = sandbox.dump("streaming");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "tools");
+        take_tool_updates();
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "streaming run",
+            "async": false,
+            "timeoutMs": 30000
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let frames = take_tool_updates();
+        assert!(!frames.is_empty(), "streaming frames reached the host");
+        let first = &frames[0];
+        // toolUpdate envelope: toolCallId + the partial AgentToolResult.
+        assert_eq!(first["toolCallId"], json!("test"));
+        assert_eq!(
+            first["update"]["content"][0]["text"],
+            json!("(running...)"),
+            "first frame (tool_execution_start) has no output yet"
+        );
+        let details = &first["update"]["details"];
+        assert_eq!(details["mode"], json!("single"));
+        assert_eq!(details["controlEvents"], json!([]));
+        let progress = &details["progress"][0];
+        assert_eq!(progress["agent"], json!("scout"));
+        assert_eq!(progress["status"], json!("running"));
+        assert_eq!(progress["currentTool"], json!("read"));
+        assert_eq!(progress["currentToolArgs"], json!("/tmp/e2e.rs"));
+        assert_eq!(progress["currentPath"], json!("/tmp/e2e.rs"));
+        assert_eq!(progress["toolCount"], json!(1));
+        assert_eq!(details["results"][0].get("messages"), None);
+        // After tool_execution_end + the final message: recentTools carries
+        // the finished call, the frame text is the final output, and the
+        // streamed result embeds the bounded toolCalls summary.
+        let last = frames.last().unwrap();
+        assert_eq!(
+            last["update"]["content"][0]["text"],
+            json!("Analyzed the file")
+        );
+        let details = &last["update"]["details"];
+        let progress = &details["progress"][0];
+        assert_eq!(
+            progress["recentTools"][0]["tool"],
+            json!("read"),
+            "tool_execution_end moved the call into recentTools"
+        );
+        assert_eq!(progress["currentTool"], Value::Null);
+        assert_eq!(progress["turnCount"], json!(1));
+        assert_eq!(
+            progress["recentOutput"],
+            json!(["file contents here", "Analyzed the file"])
+        );
+        assert_eq!(
+            details["results"][0]["toolCalls"][0]["text"],
+            json!("read /tmp/e2e.rs")
+        );
+    }
+
+    // ---- Scenario 14 (TE09): notify 归位 + renderer (FR-D) --------------
+    {
+        let dump = sandbox.dump("notify");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        take_sent_messages();
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "notify run",
+            "async": true,
+            "timeoutMs": 30000
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 30000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let messages = take_sent_messages();
+        let notify = messages
+            .iter()
+            .find(|m| m["customType"] == json!("subagent-notify"))
+            .expect("completion notification arrived as subagent-notify");
+        // Wire shape (notify.ts sendCompletion): no details field on the
+        // message; the renderer re-parses the content text. `display` is
+        // false for completed background runs (only non-completed or
+        // foreground sources force it true upstream).
+        assert!(notify.get("details").is_none());
+        assert_eq!(notify["display"], json!(false));
+        let content = notify["content"].as_str().unwrap();
+        assert!(
+            content.starts_with("Background task completed: **scout**"),
+            "{content}"
+        );
+        assert!(content.contains("Fixed child result: analysis complete"));
+
+        // The registered renderer maps the message onto a ComponentTree
+        // (host render dispatch).
+        let tree = rpi_ext_subagents::render_message_for_test(
+            "subagent-notify",
+            notify,
+            &json!({ "expanded": false }),
+        );
+        let children = tree["children"].as_array().unwrap();
+        assert!(children[0]["props"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("✓ scout completed"));
+        assert_eq!(children[0]["props"]["fg"], json!("success"));
+        assert!(children[1]["props"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("  ⎿  Fixed child result"));
+        // The old self-made type is gone.
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m["customType"] == json!("subagent-async-complete")),
+            "legacy type no longer injected"
+        );
     }
 
     // ---- Scenario 12 (TE05): budget rejection paths (FR-P1-04/09) -----

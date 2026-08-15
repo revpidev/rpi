@@ -62,6 +62,9 @@ pub struct AsyncRunHandle {
     pub status: Arc<RwLock<Value>>,
     pub control: Arc<AsyncControl>,
     pub run_dir: PathBuf,
+    /// Wall-clock start (epoch ms) for the completion-notification
+    /// `durationMs` (notify.ts buildCompletionDetails).
+    pub started_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -535,6 +538,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
         status: status.clone(),
         control: Arc::new(AsyncControl::default()),
         run_dir: run_dir.clone(),
+        started_ms: now_millis(),
     });
     {
         let mut current = status.write().unwrap_or_else(|e| e.into_inner());
@@ -565,7 +569,7 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
 /// bus event.
 pub async fn drive_run(
     handle: Arc<AsyncRunHandle>,
-    ctx: RunCtx,
+    mut ctx: RunCtx,
     body: AsyncBody,
     notify: AsyncNotify,
 ) {
@@ -573,6 +577,29 @@ pub async fn drive_run(
     if handle.control.stop_requested() {
         finish_stopped(&handle, &notify).await;
         return;
+    }
+    // TE09 FR-C: single/chain runs mirror each child's currentTool/currentPath
+    // into their status steps so `subagent_wait` shows live tool lines
+    // (upstream asyncWaitUpdate reads step.currentTool, subagent-wait.ts:327).
+    // The dispatch-owned frame sink never crosses into the background task.
+    ctx.frame_sink = None;
+    if matches!(body, AsyncBody::Single { .. } | AsyncBody::Steps { .. }) {
+        let status_handle = handle.clone();
+        ctx.step_status = Some(std::sync::Arc::new(move |index: u32, activity: &Value| {
+            set_step_field(&status_handle, index as usize, |step| {
+                step["currentTool"] = activity["currentTool"].clone();
+                step["currentPath"] = activity["currentPath"].clone();
+                if let Some(started_at) = activity["currentToolStartedAt"].as_u64() {
+                    step["currentToolStartedAt"] = json!(started_at);
+                }
+                if let Some(turns) = activity["turnCount"].as_u64() {
+                    step["turnCount"] = json!(turns);
+                }
+                if let Some(tools) = activity["toolCount"].as_u64() {
+                    step["toolCount"] = json!(tools);
+                }
+            });
+        }));
     }
     let agents = match ctx.discover("both") {
         Ok(agents) => agents,
@@ -640,9 +667,11 @@ pub async fn drive_run(
                 worktree_plan.clone(),
             )
             .await;
-            if let Some(plan) = &worktree_plan {
-                crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd);
-            }
+            // Parallel handoff manifest path rides the completion
+            // notification (`SubagentNotifyDetails.handoffPath`).
+            let handoff_path = worktree_plan.as_ref().and_then(|plan| {
+                crate::p1::parallel::finalize_worktree_handoff(plan, &ctx.run_id, &ctx.base_cwd)
+            });
             match outcome {
                 Ok(outcomes) => {
                     let mut aggregate = String::new();
@@ -663,7 +692,7 @@ pub async fn drive_run(
                         aggregate.push('\n');
                     }
                     let any_failed = outcomes.iter().any(|o| o.exit_code != 0);
-                    finish(
+                    finish_with_handoff(
                         &handle,
                         if any_failed {
                             STATE_FAILED
@@ -671,6 +700,7 @@ pub async fn drive_run(
                             STATE_COMPLETE
                         },
                         aggregate.trim(),
+                        handoff_path.as_deref(),
                         &notify,
                     )
                     .await;
@@ -766,6 +796,18 @@ fn record_step_result(
         if let Some(error) = &result.error {
             step["error"] = json!(error);
         }
+        // Terminal steps drop the live-activity fields (upstream shows
+        // currentTool only for pending/running steps).
+        if let Some(object) = step.as_object_mut() {
+            for key in [
+                "currentTool",
+                "currentToolArgs",
+                "currentToolStartedAt",
+                "currentPath",
+            ] {
+                object.remove(key);
+            }
+        }
     });
 }
 
@@ -793,7 +835,23 @@ pub struct AsyncNotify {
 }
 
 impl AsyncNotify {
-    async fn send(&self, run_id: &str, state: &str, output: &str) {
+    /// `sendCompletion` (notify.ts:169-187 + buildCompletionDetails
+    /// :196-238) over the rpi status document. The wire shape is upstream's:
+    /// `{customType: "subagent-notify", content, display}` — the details
+    /// live inside the content text and the renderer re-parses
+    /// (`parseSubagentNotifyContent`). `display` is true for anything a
+    /// completed background run would not show inline (upstream:
+    /// `source === "foreground" || status !== "completed"`; rpi has no
+    /// detached foreground face, so just the status test).
+    async fn send(
+        &self,
+        handle: &Arc<AsyncRunHandle>,
+        state: &str,
+        output: &str,
+        handoff_path: Option<&Path>,
+    ) {
+        let status = status_snapshot(handle);
+        let run_id = &handle.run_id;
         let result_path = async_results_dir().join(format!("{run_id}.json"));
         let result = json!({
             "runId": run_id,
@@ -802,13 +860,42 @@ impl AsyncNotify {
             "completedAt": iso8601(now_millis()),
         });
         let _ = crate::artifacts::write_metadata(&result_path, &result);
+
+        let notify_status: &'static str = match state {
+            STATE_COMPLETE => "completed",
+            STATE_STOPPED => "stopped",
+            _ => "failed",
+        };
+        // agent: the run's last declared step agent (single/chain carry the
+        // child agents; a parallel batch reports its mode — upstream's
+        // CompletionNotification.agent comes from the run record).
+        let steps = status["steps"].as_array().cloned().unwrap_or_default();
+        let agent = steps
+            .iter()
+            .rev()
+            .find_map(|step| step["agent"].as_str().map(str::to_string))
+            .unwrap_or_else(|| status["mode"].as_str().unwrap_or("unknown").to_string());
+        let session_file = steps
+            .iter()
+            .find_map(|step| step["sessionFile"].as_str().map(str::to_string));
+        let details = crate::messages::SubagentNotifyDetails {
+            agent,
+            status: notify_status,
+            source: None,
+            task_info: None,
+            result_preview: output.to_string(),
+            duration_ms: Some(now_millis().saturating_sub(handle.started_ms)),
+            handoff_path: handoff_path.map(|p| p.to_string_lossy().to_string()),
+            session_label: session_file.as_deref().map(|_| "Session file".to_string()),
+            session_value: session_file,
+        };
+        let content = crate::messages::format_single_completion(&details);
+        let display = notify_status != "completed";
         if let Some(calls) = &self.calls {
-            let display = format!("[subagent {run_id}] {state}");
             let message = json!({
-                "customType": "subagent-async-complete",
-                "content": output,
+                "customType": "subagent-notify",
+                "content": content,
                 "display": display,
-                "details": result,
             });
             // sendMessage is synchronous through the ABI envelope; fire it
             // and treat acceptance as any non-error response.
@@ -832,7 +919,18 @@ impl AsyncNotify {
     }
 }
 
+/// `finish` without a handoff manifest (single/chain paths).
 async fn finish(handle: &Arc<AsyncRunHandle>, state: &str, output: &str, notify: &AsyncNotify) {
+    finish_with_handoff(handle, state, output, None, notify).await;
+}
+
+async fn finish_with_handoff(
+    handle: &Arc<AsyncRunHandle>,
+    state: &str,
+    output: &str,
+    handoff_path: Option<&Path>,
+    notify: &AsyncNotify,
+) {
     let stopped = handle.control.stop_requested();
     let state = if stopped { STATE_STOPPED } else { state };
     update_status(handle, |status| {
@@ -847,11 +945,11 @@ async fn finish(handle: &Arc<AsyncRunHandle>, state: &str, output: &str, notify:
         }
     });
     append_event(
-        &handle.run_dir,
+        handle.run_dir.as_path(),
         "run.finished",
         json!({ "runId": handle.run_id, "state": state }),
     );
-    notify.send(&handle.run_id, state, output).await;
+    notify.send(handle, state, output, handoff_path).await;
     unregister_run(&handle.run_id);
 }
 
@@ -861,11 +959,11 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         status["error"] = json!(error);
     });
     append_event(
-        &handle.run_dir,
+        handle.run_dir.as_path(),
         "run.failed",
         json!({ "runId": handle.run_id, "error": error }),
     );
-    notify.send(&handle.run_id, STATE_FAILED, error).await;
+    notify.send(handle, STATE_FAILED, error, None).await;
     unregister_run(&handle.run_id);
 }
 
@@ -913,7 +1011,7 @@ pub fn deliver_steer(
     let request_path = inbox.join(format!("{request_id}.json"));
     std::fs::write(&request_path, request.to_string()).map_err(|e| e.to_string())?;
     append_event(
-        &handle.run_dir,
+        handle.run_dir.as_path(),
         "control.steer",
         json!({ "runId": handle.run_id, "id": request_id, "targetIndex": index }),
     );
@@ -949,7 +1047,7 @@ pub fn interrupt_run(query: &str) -> Result<Value, String> {
             .to_string(),
     );
     append_event(
-        &handle.run_dir,
+        handle.run_dir.as_path(),
         "control.interrupt",
         json!({ "runId": handle.run_id }),
     );
@@ -1096,8 +1194,14 @@ fn reap_orphan_pid(pid: u64) {
 /// Wait for runs to reach a terminal state (`subagent_wait` core,
 /// subagent-wait.ts waitForSubagents subset): first-terminal (default) or
 /// all-terminal, bounded by `timeout_ms`.
-pub async fn wait_for_runs(id: Option<&str>, all: bool, timeout_ms: u64) -> Result<Value, String> {
-    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+pub async fn wait_for_runs(
+    id: Option<&str>,
+    all: bool,
+    timeout_ms: u64,
+    on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> Result<Value, String> {
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_millis(timeout_ms.max(1));
     let is_terminal = |state: &str| {
         matches!(
             state,
@@ -1142,6 +1246,13 @@ pub async fn wait_for_runs(id: Option<&str>, all: bool, timeout_ms: u64) -> Resu
                 "runs": terminal,
             }));
         }
+        if let Some(on_update) = on_update {
+            on_update(&async_wait_update(
+                &snapshots,
+                0,
+                started.elapsed().as_millis() as u64,
+            ));
+        }
         if std::time::Instant::now() >= deadline {
             return Ok(json!({
                 "waited": 0,
@@ -1152,6 +1263,125 @@ pub async fn wait_for_runs(id: Option<&str>, all: bool, timeout_ms: u64) -> Resu
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// `asyncWaitUpdate` (subagent-wait.ts:322-338) over rpi status snapshots:
+/// the headline plus one activity line per active step, joined with " · ",
+/// then the run list below. rpi has no background provider items, so
+/// `provider_count` is always 0 (the template keeps the upstream shape).
+pub fn async_wait_update(runs: &[Value], provider_count: usize, elapsed_ms: u64) -> String {
+    let mut headline_parts = vec![format!(
+        "Waiting {} for {} async run(s) and {} provider item(s).",
+        crate::runner::display::format_duration(elapsed_ms),
+        runs.len(),
+        provider_count,
+    )];
+    for run in runs {
+        let steps = run["steps"].as_array().cloned().unwrap_or_default();
+        let active: Vec<&Value> = steps
+            .iter()
+            .filter(|step| matches!(step["status"].as_str(), Some("pending") | Some("running")))
+            .collect();
+        if active.is_empty() {
+            headline_parts.push(format!(
+                "{}: {}",
+                run["runId"].as_str().unwrap_or_default(),
+                run["state"].as_str().unwrap_or_default(),
+            ));
+            continue;
+        }
+        for step in active {
+            let current = match step["currentTool"].as_str() {
+                Some(tool) => tool.to_string(),
+                None if step["status"].as_str() == Some("pending") => "queued".to_string(),
+                None => "thinking…".to_string(),
+            };
+            let mut line = format!("{}: {current}", step["agent"].as_str().unwrap_or_default());
+            if let Some(path) = step["currentPath"].as_str() {
+                line.push_str(&format!(" {}", crate::runner::display::shorten_path(path)));
+            }
+            headline_parts.push(line);
+        }
+    }
+    let headline = headline_parts.join(" · ");
+    let run_list = if runs.is_empty() {
+        String::new()
+    } else {
+        format_async_run_list(runs)
+    };
+    [headline, run_list]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `formatActivityFacts` subset (async-status.ts:489-503) over a status
+/// step: tool + running duration, currentPath, turns, tool count. Absent
+/// fields drop (upstream filters undefined).
+fn format_step_activity(step: &Value, now_ms: u64) -> Option<String> {
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(tool) = step["currentTool"].as_str() {
+        let duration = step["currentToolStartedAt"]
+            .as_u64()
+            .map(|started| crate::runner::display::format_duration(now_ms.saturating_sub(started)));
+        match duration {
+            Some(duration) => facts.push(format!("tool {tool} {duration}")),
+            None => facts.push(format!("tool {tool}")),
+        }
+    }
+    if let Some(path) = step["currentPath"].as_str() {
+        facts.push(crate::runner::display::shorten_path(path));
+    }
+    if let Some(turns) = step["turnCount"].as_u64() {
+        facts.push(format!("{turns} turns"));
+    }
+    if let Some(tools) = step["toolCount"].as_u64() {
+        facts.push(format!("{tools} tools"));
+    }
+    (!facts.is_empty()).then(|| facts.join(" | "))
+}
+
+/// `formatAsyncRunList` (async-status.ts:554-576) over the rpi status field
+/// subset: run header line + per-step lines; the upstream fields rpi status
+/// does not carry (cwd, context label, parallel groups, nested children,
+/// output files) drop out of their segments. The `steps {n}` label follows
+/// the `currentStep === undefined` branch (rpi status has no currentStep).
+pub fn format_async_run_list(runs: &[Value]) -> String {
+    if runs.is_empty() {
+        return "No active async runs.".to_string();
+    }
+    let now_ms = crate::artifacts::now_millis();
+    let mut lines = vec![format!("Active async runs: {}", runs.len()), String::new()];
+    for run in runs {
+        let steps = run["steps"].as_array().cloned().unwrap_or_default();
+        lines.push(format!(
+            "- {} | {} | {} | steps {}",
+            run["runId"].as_str().unwrap_or_default(),
+            run["state"].as_str().unwrap_or_default(),
+            run["mode"].as_str().unwrap_or_default(),
+            steps.len(),
+        ));
+        for (index, step) in steps.iter().enumerate() {
+            let mut parts = vec![
+                format!(
+                    "{}. {}",
+                    index + 1,
+                    step["agent"].as_str().unwrap_or_default()
+                ),
+                step["status"].as_str().unwrap_or_default().to_string(),
+            ];
+            if let Some(activity) = format_step_activity(step, now_ms) {
+                parts.push(activity);
+            }
+            lines.push(format!("  {}", parts.join(" | ")));
+        }
+        if let Some(error) = run["error"].as_str() {
+            lines.push(format!("  Error: {error}"));
+        }
+        lines.push(String::new());
+    }
+    lines.join("\n").trim_end().to_string()
 }
 
 #[cfg(test)]
@@ -1196,7 +1426,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_unknown_run_errors() {
-        assert!(wait_for_runs(Some("nope"), false, 10).await.is_err());
+        assert!(wait_for_runs(Some("nope"), false, 10, None).await.is_err());
     }
 
     #[test]
@@ -1305,6 +1535,81 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wait_update_headline_and_run_list() {
+        // subagent-wait.ts:322-338: headline + per-step activity lines
+        // joined with " · ", run list below.
+        let running = json!({
+            "runId": "ab12cd34",
+            "state": "running",
+            "mode": "single",
+            "steps": [
+                { "agent": "scout", "status": "running", "currentTool": "read", "currentPath": "/tmp/a.rs" },
+            ],
+        });
+        let text = async_wait_update(std::slice::from_ref(&running), 0, 2_500);
+        assert!(
+            text.starts_with(
+                "Waiting 2.5s for 1 async run(s) and 0 provider item(s). · scout: read /tmp/a.rs"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\nActive async runs: 1"));
+        assert!(text.contains("- ab12cd34 | running | single | steps 1"));
+        assert!(text.contains("  1. scout | running"));
+
+        // Steps without currentTool project queued/thinking (pending →
+        // "queued", running → "thinking…").
+        let pending = json!({
+            "runId": "ff001122",
+            "state": "running",
+            "mode": "chain",
+            "steps": [
+                { "agent": "scout", "status": "complete" },
+                { "agent": "worker", "status": "pending" },
+                { "agent": "worker", "status": "running" },
+            ],
+        });
+        let text = async_wait_update(&[pending], 0, 90_000);
+        assert!(text.contains("worker: queued"), "{text}");
+        assert!(text.contains("worker: thinking…"), "{text}");
+        assert!(text.contains("Waiting 1m30s for 1 async run(s)"), "{text}");
+
+        // Empty input: headline only (no run list).
+        let text = async_wait_update(&[], 0, 100);
+        assert_eq!(
+            text,
+            "Waiting 100ms for 0 async run(s) and 0 provider item(s)."
+        );
+    }
+
+    #[test]
+    fn run_list_activity_facts() {
+        // async-status.ts formatStepLine subset: status + activity facts
+        // (tool duration, path, turns, tools).
+        let run = json!({
+            "runId": "ab12cd34",
+            "state": "running",
+            "mode": "single",
+            "steps": [
+                {
+                    "agent": "scout",
+                    "status": "running",
+                    "currentTool": "read",
+                    "currentToolStartedAt": crate::artifacts::now_millis().saturating_sub(2_500),
+                    "currentPath": "/tmp/a.rs",
+                    "turnCount": 3,
+                    "toolCount": 7,
+                },
+            ],
+        });
+        let text = format_async_run_list(&[run]);
+        assert!(
+            text.contains("1. scout | running | tool read 2.5s | /tmp/a.rs | 3 turns | 7 tools"),
+            "{text}"
+        );
     }
 
     #[test]

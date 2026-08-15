@@ -43,6 +43,27 @@ node scripts/mcp-parity/run-mcp-parity.mjs     # 全场景，非零退出码 = �
   （本 stub 的 resource_metadata 指向不可达端口 → error）；P0 rpi 侧止于
   needs-auth 连接状态（FR-P0-08 范围）。OAuth 续流的对拍归 TE03。
 
+## renderCall 纯函数对拍（TE09 FR-E）
+
+```bash
+cargo build -p rpi-ext-mcp-adapter --example render_call_parity
+node scripts/mcp-parity/run-render-call-parity.mjs
+```
+
+- 共享用例 `render-call-fixtures.json`（proxy/direct/render 三类 19 例，
+  镜像上游 `__tests__/tool-result-renderer.test.ts` 样例 + 边界）。
+- 上游腿 `render-call-upstream.mjs`（tsx 直跑钉死导出函数）；
+  `render-call-hooks.mjs` 把 `@earendil-works/pi-tui` 映射到最小值 stub
+  （`render-call-host-pi-tui.mjs`）——该文件对 pi-tui 是**值 import**
+  （构造 `Text`），协议腿的 throwing stub 不适用；stub 的 `render` 只按
+  换行分割（宽度 wrap 是 pi-tui 渲染职责，不在对拍面，用例行宽 < 80）。
+- rpi 腿 `examples/render_call_parity.rs`（读同一 fixtures，render 用例
+  提取组件树 text 行拼接）。产物
+  `fixtures/generated/mcp-parity/render-call-parity-{upstream,rpi}.json` +
+  `render-call-parity.md`，进 git 作证据链。
+- 该腿在首次运行时抓到并修正 `args:{}` 的 JS truthiness 差异（上游空
+  对象恒真值输出 `"{}"` 摘要行）。
+
 ## 组件
 
 - `fixture-server.mjs`：共享 fixture 服务器（stdio / http × 4 profile），帧

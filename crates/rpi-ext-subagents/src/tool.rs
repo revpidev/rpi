@@ -179,14 +179,19 @@ pub fn tool_parameters_schema() -> Value {
 }
 
 /// The whole tool entry point. Returns the AgentToolResult JSON.
+/// `tool_call_id` is the in-flight dispatch id (ADR-0015): present → the
+/// run installs a `toolUpdate` streaming seam; None (test seams) keeps the
+/// run non-streaming.
 pub fn execute_subagent_tool(
     params: &Value,
     host: &dyn HostContext,
     settings: &SettingsPair,
     config: &crate::config::ExtensionConfig,
     runtime: &crate::PluginRuntime,
+    tool_call_id: Option<&str>,
 ) -> Value {
-    let outcome = execute_subagent_tool_inner(params, host, settings, config, runtime);
+    let outcome =
+        execute_subagent_tool_inner(params, host, settings, config, runtime, tool_call_id);
     outcome.to_tool_result()
 }
 
@@ -196,6 +201,7 @@ fn execute_subagent_tool_inner(
     settings: &SettingsPair,
     config: &crate::config::ExtensionConfig,
     runtime: &crate::PluginRuntime,
+    tool_call_id: Option<&str>,
 ) -> ToolOutcome {
     let object = params.as_object().cloned().unwrap_or_default();
 
@@ -290,7 +296,11 @@ fn execute_subagent_tool_inner(
         .unwrap_or("both");
 
     // Shared per-call context (cwd, session root, artifacts, model registry).
-    let ctx = crate::p1::launch_child::RunCtx::from_host(host, &object, config.clone());
+    let mut ctx = crate::p1::launch_child::RunCtx::from_host(host, &object, config.clone());
+    // TE09 FR-A: install the streaming seam under a real dispatch id. The
+    // composite paths decide per shape below (single/chain stream, parallel
+    // does not — upstream wraps only those).
+    ctx.frame_sink = tool_call_id.and_then(|id| host.tool_update_sink(id));
     let agents = match ctx.discover(scope) {
         Ok(agents) => agents,
         Err(error) => return ToolOutcome::error(error),
@@ -531,6 +541,11 @@ fn dispatch_tasks(
     ctx: &crate::p1::launch_child::RunCtx,
     runtime: &crate::PluginRuntime,
 ) -> ToolOutcome {
+    // Parallel batches never stream (upstream has no onUpdate wrapper on
+    // the parallel composition — TE09 Out list); drop any dispatch sink.
+    let mut ctx = ctx.clone();
+    ctx.frame_sink = None;
+    let ctx = &ctx;
     let max_tasks = ctx.config.parallel_max_tasks();
     let entries = match crate::p1::parallel::parse_tasks(
         object.get("tasks").unwrap_or(&Value::Null),
@@ -776,27 +791,12 @@ fn dispatch_async(
     }
 }
 
-/// `RunCtx` clone for the driver task (the struct is not `Clone` because of
-/// the settings pair; rebuild the cloneable parts the driver touches).
+/// `RunCtx` clone for the driver task. The streaming seam is dispatch-owned
+/// (it dies with the toolExecute call); the async run never frames.
 fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::launch_child::RunCtx {
-    crate::p1::launch_child::RunCtx {
-        settings: ctx.settings.clone(),
-        config: ctx.config.clone(),
-        base_cwd: ctx.base_cwd.clone(),
-        parent_session_file: ctx.parent_session_file.clone(),
-        parent_model: ctx.parent_model.clone(),
-        registry: ctx.registry.clone(),
-        run_id: ctx.run_id.clone(),
-        top_model: ctx.top_model.clone(),
-        top_thinking: ctx.top_thinking.clone(),
-        top_context: ctx.top_context,
-        top_timeout_ms: ctx.top_timeout_ms,
-        top_turn_budget: ctx.top_turn_budget.clone(),
-        top_tool_budget: ctx.top_tool_budget.clone(),
-        usage_budget: ctx.usage_budget.clone(),
-        artifacts_dir: ctx.artifacts_dir.clone(),
-        session_root: ctx.session_root.clone(),
-    }
+    let mut clone = ctx.clone();
+    clone.frame_sink = None;
+    clone
 }
 
 fn record_runs(records: &[(String, i32, u64, Option<String>)], run_id: &str) {

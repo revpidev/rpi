@@ -329,7 +329,7 @@ pub fn handle_prompt_command(
         let task = substitute_arguments(&spec.body, &positional);
         let params = build_delegation_params(&spec, &flags, &task);
         return Some(crate::tool::execute_subagent_tool(
-            &params, host, settings, config, runtime,
+            &params, host, settings, config, runtime, None,
         ));
     }
     // Bundled prompt shortcut: expand the template into the chat.

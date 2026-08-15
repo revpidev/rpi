@@ -24,6 +24,7 @@ mod description;
 mod diagnostic;
 mod error;
 mod launch;
+mod messages;
 mod p1;
 mod paths;
 mod prompts;
@@ -41,6 +42,8 @@ use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativ
 use serde_json::{json, Value};
 
 pub use runtime::PluginRuntime;
+
+use crate::runner::foreground::StreamFrameSink;
 
 /// Host-call handle + plugin-owned runtime, established once by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
@@ -113,6 +116,42 @@ pub trait HostContext {
     fn async_calls(&self) -> Option<AsyncHostCalls> {
         None
     }
+
+    /// Streaming seam for a foreground dispatch (TE09 FR-A): the
+    /// `toolUpdate` sender addressed to `tool_call_id` (ADR-0015), or `None`
+    /// when the caller has no host channel (test fakes stay non-streaming).
+    fn tool_update_sink(&self, tool_call_id: &str) -> Option<StreamFrameSink> {
+        let _ = tool_call_id;
+        None
+    }
+}
+
+/// Per-dispatch `toolUpdate` sender (ADR-0015, `tools` capability) — the
+/// subagents counterpart of the smart-fetch UpdateSink: one partial
+/// AgentToolResult frame; response errors are swallowed (the host drops
+/// unknown/stale ids by design, settle semantics).
+struct ToolUpdateSink {
+    calls: AsyncHostCalls,
+    tool_call_id: String,
+}
+
+impl ToolUpdateSink {
+    fn push(&self, content_text: &str, details: &Value) {
+        // Response errors are swallowed: the host drops unknown/stale ids by
+        // design (ADR-0015 settle semantics), so a late frame is not this
+        // plugin's failure to report.
+        let _ = host_call_static(
+            &self.calls,
+            "toolUpdate",
+            json!({
+                "toolCallId": self.tool_call_id,
+                "update": {
+                    "content": [{ "type": "text", "text": content_text }],
+                    "details": details,
+                }
+            }),
+        );
+    }
 }
 
 struct HostCallsContext<'a> {
@@ -160,6 +199,16 @@ impl HostContext for HostCallsContext<'_> {
             call: self.calls.call,
             cookie: self.cookie,
         })
+    }
+
+    fn tool_update_sink(&self, tool_call_id: &str) -> Option<StreamFrameSink> {
+        let sink = ToolUpdateSink {
+            calls: self.async_calls()?,
+            tool_call_id: tool_call_id.to_string(),
+        };
+        Some(std::sync::Arc::new(move |text: &str, details: &Value| {
+            sink.push(text, details)
+        }))
     }
 
     fn scoped_models(&self) -> Vec<launch::model::AvailableModel> {
@@ -425,6 +474,25 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
                 }
             }
+            // Message renderers (TE09 FR-D, extension/index.ts:481-539 —
+            // rpi registers the three with real injectors or defended
+            // types): `subagent-notify` (completion notifications),
+            // `subagent_steering_notice` and `subagent_control_notice`
+            // (underscore constants, steering-notices.ts:4 /
+            // control-notices.ts:5). The slash pair stays unregistered —
+            // rpi never injects those types (TE09 Out list).
+            for custom_type in [
+                "subagent-notify",
+                "subagent_steering_notice",
+                "subagent_control_notice",
+            ] {
+                if let Err(error) = register(
+                    "registerMessageRenderer",
+                    json!({ "customType": custom_type }),
+                ) {
+                    return json!({"error": {"kind": "init", "message": error.to_string()}});
+                }
+            }
             // Parent-side supervisor tool (FR-P1-10).
             if let Err(error) = register(
                 "registerTool",
@@ -592,7 +660,11 @@ fn dispatch_message(message: &Value) -> Value {
                 }
             }
             if tool_name == "subagent_wait" {
-                return execute_subagent_wait(&params, state);
+                let tool_call_id = message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                return execute_subagent_wait(&params, state, tool_call_id);
             }
             if tool_name == "contact_supervisor" {
                 if let Some(context) = crate::p1::supervisor::ChildSupervisorContext::from_env() {
@@ -638,7 +710,43 @@ fn dispatch_message(message: &Value) -> Value {
             };
             let settings = config::read_settings_pair(&host.cwd());
             let config = config::load_config();
-            tool::execute_subagent_tool(&params, &host, &settings, &config, &state.runtime)
+            // ADR-0015: the host forwards the toolCallId so `toolUpdate`
+            // frames can address the in-flight execution (test seams may
+            // omit it — the run then skips streaming).
+            let tool_call_id = message
+                .get("toolCallId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty());
+            tool::execute_subagent_tool(
+                &params,
+                &host,
+                &settings,
+                &config,
+                &state.runtime,
+                tool_call_id,
+            )
+        }
+        // Render protocol (host_call.rs:454-499): the host dispatches a
+        // synchronous `{"kind":"render","what":"message",...}` for a
+        // registered customType; pure JSON, never touches the runtime.
+        // A `null` tree falls back to the host's default rendering.
+        Some("render") => {
+            if message.get("what").and_then(Value::as_str) == Some("message") {
+                let custom_type = message
+                    .get("message")
+                    .and_then(|m| m.get("customType"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let payload = message.get("message").unwrap_or(&Value::Null);
+                let options = message.get("options").unwrap_or(&Value::Null);
+                return match custom_type {
+                    "subagent-notify" => messages::render_subagent_notify(payload, options),
+                    "subagent_steering_notice" => messages::render_subagent_steering(payload),
+                    "subagent_control_notice" => messages::render_subagent_control(payload),
+                    _ => Value::Null,
+                };
+            }
+            Value::Null
         }
         Some("command") => {
             let name = message.get("name").and_then(Value::as_str).unwrap_or("");
@@ -722,8 +830,9 @@ async fn async_move_drain() {
     }
 }
 
-/// `subagent_wait` execution (subagent-wait.ts waitForSubagents subset).
-fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
+/// `subagent_wait` execution (subagent-wait.ts waitForSubagents subset +
+/// the per-cycle asyncWaitUpdate stream, TE09 FR-C).
+fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Option<&str>) -> Value {
     let config = config::load_config();
     if !config.wait_tool_enabled() {
         return json!({
@@ -758,8 +867,25 @@ fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
         .and_then(Value::as_u64)
         .filter(|v| *v > 0)
         .unwrap_or(30 * 60 * 1000);
+    // The live-activity stream rides the same toolUpdate seam as the
+    // foreground snapshots (upstream deps.onUpdate, subagent-wait.ts:578).
+    let update_sink = tool_call_id.and_then(|tool_call_id| {
+        let host = HostCallsContext {
+            calls: &state.calls,
+            cookie: state.cookie,
+        };
+        host.tool_update_sink(tool_call_id)
+    });
     let result = state.runtime.block_on(async {
-        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms).await
+        type WaitUpdate = Box<dyn Fn(&str) + Send + Sync>;
+        let on_update: Option<WaitUpdate> = update_sink.as_ref().map(|sink| {
+            let sink = std::sync::Arc::clone(sink);
+            Box::new(move |text: &str| sink(text, &wait_update_details())) as WaitUpdate
+        });
+        let on_update = on_update
+            .as_ref()
+            .map(|boxed| &**boxed as &(dyn Fn(&str) + Send + Sync));
+        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms, on_update).await
     });
     match result {
         Ok(waited) => json!({
@@ -774,6 +900,12 @@ fn execute_subagent_wait(params: &Value, state: &PluginState) -> Value {
             "isError": true,
         }),
     }
+}
+
+/// The `subagent_wait` partial-frame details: upstream `result()` carries
+/// `mode:"management"` (subagent-wait.ts:309-319).
+fn wait_update_details() -> Value {
+    json!({ "mode": "management", "results": [] })
 }
 
 /// Integration-test probes (not part of the plugin surface): budget-ledger
@@ -837,6 +969,26 @@ pub fn execute_tool_for_test(tool_name: &str, params: &Value) -> Value {
         "toolName": tool_name,
         "toolCallId": "test",
         "params": params,
+    }))
+}
+
+/// Test seam: drive the message-render dispatch for a registered customType
+/// (TE09 FR-D) — the same `{"kind":"render","what":"message"}` envelope the
+/// host forwards through `registerMessageRenderer`.
+#[doc(hidden)]
+pub fn render_message_for_test(custom_type: &str, message: &Value, options: &Value) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert("customType".to_string(), json!(custom_type));
+    if let Some(object) = message.as_object() {
+        for (key, value) in object {
+            payload.insert(key.clone(), value.clone());
+        }
+    }
+    dispatch_message(&json!({
+        "kind": "render",
+        "what": "message",
+        "message": Value::Object(payload),
+        "options": options,
     }))
 }
 
@@ -994,7 +1146,7 @@ pub mod child_stream_replay {
 
     impl ChildRunStatePublic {
         pub fn process_line_public(&mut self, line: &str) {
-            let _ = self.process_line(line);
+            let _ = self.process_line(line, crate::artifacts::now_millis());
         }
 
         pub fn messages_public(&self) -> &[serde_json::Value] {

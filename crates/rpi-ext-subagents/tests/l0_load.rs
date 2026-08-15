@@ -93,8 +93,9 @@ async fn l0_load_capability_denied_and_full_surface() {
     );
     let _ = std::fs::remove_dir_all(denied_package.parent().unwrap());
 
-    // 2. The real manifest surface loads clean and registers the tool.
-    let package = package("full", r#"["tools","commands","session"]"#, &plugin);
+    // 2. The real manifest surface loads clean and registers the tool
+    //    (TE09: `ui` joins the capabilities for registerMessageRenderer).
+    let package = package("full", r#"["tools","commands","session","events","ui"]"#, &plugin);
     let host = NativeExtensionHost::new(sandbox.join("proj").to_string_lossy().as_ref());
     let errors = host.load_paths(&[package]).await;
     assert!(errors.is_empty(), "{errors:?}");

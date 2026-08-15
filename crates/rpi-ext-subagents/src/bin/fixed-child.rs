@@ -90,6 +90,28 @@ fn main() {
             );
             emit(&mut out, r#"{"type":"agent_settled"}"#);
         }
+        // TE09: a run with real tool activity — tool_execution_start/end
+        // pairs, a tool result and the final assistant message, so the
+        // streaming snapshots carry currentTool/recentTools/toolCalls.
+        "tools" => {
+            emit(
+                &mut out,
+                r#"{"type":"tool_execution_start","toolName":"read","args":{"path":"/tmp/e2e.rs"}}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"tool_execution_end","toolName":"read"}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"tool_result_end","message":{"role":"toolResult","content":[{"type":"text","text":"file contents here"}]}}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"read","arguments":{"path":"/tmp/e2e.rs"}},{"type":"text","text":"Analyzed the file"}],"usage":{"input":50,"output":10,"cost":{"total":0.1}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_settled"}"#);
+        }
         "willretry" => {
             emit(&mut out, r#"{"type":"agent_end","willRetry":true}"#);
             emit(

@@ -29,7 +29,9 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
     let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
     let method = parsed.get("call").and_then(Value::as_str).unwrap_or("");
     let response = match method {
-        "registerTool" | "registerCommand" | "on" | "registerFlag" => json!({ "ok": true }),
+        "registerTool" | "registerCommand" | "registerMessageRenderer" | "on" | "registerFlag" => {
+            json!({ "ok": true })
+        }
         "ctx.cwd" => json!({ "ok": host.cwd.to_string_lossy() }),
         "ctx.model" => json!({ "ok": host.model }),
         _ => json!({ "error": { "kind": "unknownMethod", "message": method } }),

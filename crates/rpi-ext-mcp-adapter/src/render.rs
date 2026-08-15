@@ -1,17 +1,25 @@
-//! Tool-result renderer (renderResult): builds the ComponentTree for MCP
-//! tool results so the host collapses long output instead of the generic
-//! fallback full expansion.
+//! Tool-call and tool-result renderers (renderCall + renderResult): the
+//! call lines summarize the invocation (`mcp call …`), the result tree lets
+//! the host collapse long output instead of the generic fallback full
+//! expansion.
 //!
 //! Port of `tool-result-renderer.ts` @ 3d953f90: `renderMcpToolResult`
 //! (:269-297) + `collectCollapsedResultLines` (:188-238) +
-//! `formatMcpToolResultIdentity` (:240-252).
+//! `formatMcpToolResultIdentity` (:240-252) (result face), and
+//! `formatMcpProxyToolCallLines` (:124-152) / `formatMcpDirectToolCallLines`
+//! (:154-161) / `formatJsonish` (:104-118) / `renderToolCallLines`
+//! (:163-169) / `renderMcpProxyToolCall` + `createMcpDirectToolCallRenderer`
+//! (:171-179) (call face, TE09 FR-E).
 //!
 //! Upstream returns rpi-tui components (Text/CollapsibleText with theme
 //! colors); the native ABI renders declaratively, so this module returns a
-//! static ComponentTree text node (`rpi.component-tree.v1`). The theme
-//! colors and the width-dependent CollapsibleText re-clamping are dropped:
-//! the static text carries the final line/char-clamped output, with the
-//! "(Ctrl+O to expand)" hint folded into the text when truncated.
+//! static ComponentTree text node (`rpi.component-tree.v1`). For the result
+//! face the theme colors and the width-dependent CollapsibleText
+//! re-clamping are dropped: the static text carries the final
+//! line/char-clamped output, with the "(Ctrl+O to expand)" hint folded into
+//! the text when truncated. The call face keeps the toolTitle/muted split
+//! via a `column` node (ComponentTree v1 has no inline spans, so the title
+//! line and the muted remainder become two styled text children).
 
 use serde_json::{json, Value};
 
@@ -19,6 +27,9 @@ use serde_json::{json, Value};
 pub const DEFAULT_MAX_COLLAPSED_LINES: usize = 3;
 /// `DEFAULT_MAX_COLLAPSED_CHARS` (tool-result-renderer.ts:37).
 pub const DEFAULT_MAX_COLLAPSED_CHARS: usize = 8000;
+/// `DEFAULT_MAX_CALL_INPUT_CHARS` (tool-result-renderer.ts:35) — the call
+/// args summary budget for both call-line formatters.
+pub const DEFAULT_MAX_CALL_INPUT_CHARS: usize = 1500;
 
 /// `McpToolResultDisplay` (tool-result-renderer.ts:30-33).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -226,6 +237,178 @@ pub fn render_mcp_tool_result(result: &Value, options: &Value, context: &Value) 
     json!({ "type": "text", "props": { "text": output_lines.join("\n") } })
 }
 
+// ===== Tool-call renderer (renderCall, TE09 FR-E) =====
+
+/// `truncateText` (tool-result-renderer.ts:99-102): keep the first
+/// `max_chars - 1` chars and append `…`. Upstream slices by JS UTF-16 code
+/// units; the Rust port slices on the char boundary at or before the budget
+/// (same precedent as `collect_collapsed_result_lines`).
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut end = max_chars.saturating_sub(1);
+    let bounded: Vec<char> = value.chars().collect();
+    if end > bounded.len() {
+        end = bounded.len();
+    }
+    bounded[..end].iter().collect::<String>() + "\u{2026}"
+}
+
+/// `formatJsonish` (tool-result-renderer.ts:104-118): a string input is
+/// parsed as JSON first (falling back to the raw string), then pretty
+/// printed with 2-space indent and truncated.
+pub fn format_jsonish(value: &Value, max_chars: usize) -> String {
+    let rendered = match value {
+        Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(parsed) => serde_json::to_string_pretty(&parsed),
+            Err(_) => Ok(raw.clone()),
+        },
+        other => serde_json::to_string_pretty(other),
+    };
+    // serde_json cannot fail on an already-valid Value; the Err arm mirrors
+    // upstream's `String(value)` fallback for symmetry.
+    match rendered {
+        Ok(text) => truncate_text(&text, max_chars),
+        Err(_) => truncate_text(&value.to_string(), max_chars),
+    }
+}
+
+/// `hasUsefulObjectContent` (tool-result-renderer.ts:120-122).
+fn has_useful_object_content(value: &Value) -> bool {
+    value.as_object().is_some_and(|map| !map.is_empty())
+}
+
+/// `formatMcpProxyToolCallLines` (tool-result-renderer.ts:124-152):
+/// branch priority `action === "ui-messages"` → `tool` → `connect` →
+/// `describe` → `search` → `server` → any `action` → `mcp status`. A
+/// present-but-empty `args` (empty string/object) omits the summary line
+/// (upstream truthiness); `regex` must be exactly true and
+/// `includeSchemas` exactly false to annotate.
+pub fn format_mcp_proxy_tool_call_lines(args: &Value, max_input_chars: usize) -> Vec<String> {
+    let arg_str = |key: &str| args.get(key).and_then(Value::as_str);
+    let is_true = |key: &str| args.get(key) == Some(&Value::Bool(true));
+    let is_false = |key: &str| args.get(key) == Some(&Value::Bool(false));
+
+    if arg_str("action") == Some("ui-messages") {
+        return vec![format!("mcp {}", arg_str("action").unwrap_or_default())];
+    }
+
+    if let Some(tool) = arg_str("tool") {
+        let target = match arg_str("server") {
+            Some(server) => format!("{tool} @ {server}"),
+            None => tool.to_string(),
+        };
+        let mut lines = vec![format!("mcp call {target}")];
+        // Truthy args (JS truthiness): `""`/`0`/`false`/null/absent skip
+        // the summary line; any object (even `{}`) or array is truthy and
+        // formats through `formatJsonish` (`"{}"` for the empty object).
+        let args_present = match args.get("args") {
+            None | Some(Value::Null) => false,
+            Some(Value::String(raw)) => !raw.is_empty(),
+            Some(Value::Number(number)) => number.as_f64() != Some(0.0),
+            Some(Value::Bool(flag)) => *flag,
+            Some(Value::Object(_)) | Some(Value::Array(_)) => true,
+        };
+        if args_present {
+            lines.push(format_jsonish(&args["args"], max_input_chars));
+        }
+        return lines;
+    }
+
+    if let Some(connect) = arg_str("connect") {
+        return vec![format!("mcp connect {connect}")];
+    }
+    if let Some(describe) = arg_str("describe") {
+        return vec![format!("mcp describe {describe}")];
+    }
+
+    if let Some(search) = arg_str("search") {
+        let mut line = format!("mcp search {search}");
+        if let Some(server) = arg_str("server") {
+            line.push_str(&format!(" @ {server}"));
+        }
+        if is_true("regex") {
+            line.push_str(" (regex)");
+        }
+        if is_false("includeSchemas") {
+            line.push_str(" (schemas hidden)");
+        }
+        return vec![line];
+    }
+
+    if let Some(server) = arg_str("server") {
+        return vec![format!("mcp list {server}")];
+    }
+    if let Some(action) = arg_str("action") {
+        return vec![format!("mcp {action}")];
+    }
+
+    vec!["mcp status".to_string()]
+}
+
+/// `formatMcpDirectToolCallLines` (tool-result-renderer.ts:154-161): the
+/// displayName alone when the args carry no useful object content.
+pub fn format_mcp_direct_tool_call_lines(
+    display_name: &str,
+    args: &Value,
+    max_input_chars: usize,
+) -> Vec<String> {
+    if !has_useful_object_content(args) {
+        return vec![display_name.to_string()];
+    }
+    vec![
+        display_name.to_string(),
+        format_jsonish(args, max_input_chars),
+    ]
+}
+
+/// `renderToolCallLines` (tool-result-renderer.ts:163-169): first line in
+/// the `toolTitle` color (bold when the theme bolds titles — upstream wraps
+/// `theme.bold` when present, rpi themes always do), remainder muted.
+/// Upstream joins everything into one `Text`; ComponentTree v1 has no
+/// inline spans, so the title line and the muted remainder ride a `column`
+/// of two styled text children (visually identical line output).
+pub fn render_tool_call_lines(lines: &[String]) -> Value {
+    let title = lines.first().cloned().unwrap_or_else(|| "mcp".to_string());
+    let rest = if lines.len() > 1 {
+        lines[1..].join("\n")
+    } else {
+        String::new()
+    };
+    let mut children = vec![json!({
+        "type": "text",
+        "props": { "text": title, "fg": "toolTitle", "bold": true },
+    })];
+    if !rest.is_empty() {
+        children.push(json!({
+            "type": "text",
+            "props": { "text": rest, "fg": "muted" },
+        }));
+    }
+    json!({ "type": "column", "props": {}, "children": children })
+}
+
+/// `renderMcpProxyToolCall` (tool-result-renderer.ts:171-174): format the
+/// proxy args into call lines and render them. The default input budget is
+/// the upstream constant (call sites never override it).
+pub fn render_mcp_proxy_tool_call(args: &Value) -> Value {
+    render_tool_call_lines(&format_mcp_proxy_tool_call_lines(
+        args,
+        DEFAULT_MAX_CALL_INPUT_CHARS,
+    ))
+}
+
+/// `createMcpDirectToolCallRenderer(displayName)` (tool-result-renderer.ts:
+/// 176-179), uncurried: the display name is the dispatch toolName.
+pub fn render_mcp_direct_tool_call(display_name: &str, args: &Value) -> Value {
+    render_tool_call_lines(&format_mcp_direct_tool_call_lines(
+        display_name,
+        args,
+        DEFAULT_MAX_CALL_INPUT_CHARS,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +552,188 @@ mod tests {
         );
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "a\n[image: image/png]\nb\n…\n(Ctrl+O to expand)");
+    }
+
+    // ===== renderCall parity cases (upstream
+    // __tests__/tool-result-renderer.test.ts:24-76, 281-291) =====
+
+    const MAX: usize = DEFAULT_MAX_CALL_INPUT_CHARS;
+
+    #[test]
+    fn proxy_call_with_json_string_args_and_server() {
+        // test.ts:24-35.
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({
+                "tool": "cf-portal_list_worker_tail_events",
+                "server": "cf-portal",
+                "args": "{\"accountId\":\"abc\",\"scriptName\":\"worker\"}",
+            }),
+            MAX,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "mcp call cf-portal_list_worker_tail_events @ cf-portal".to_string(),
+                "{\n  \"accountId\": \"abc\",\n  \"scriptName\": \"worker\"\n}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_call_with_object_args_and_no_server() {
+        // test.ts:37-47.
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({
+                "tool": "cf-portal_list_worker_tail_events",
+                "args": { "accountId": "abc", "limit": 10 },
+            }),
+            MAX,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "mcp call cf-portal_list_worker_tail_events".to_string(),
+                "{\n  \"accountId\": \"abc\",\n  \"limit\": 10\n}".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_discovery_branches() {
+        // test.ts:49-56.
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({ "search": "tail events", "server": "cf-portal", "regex": true }),
+            MAX,
+        );
+        assert_eq!(lines, vec!["mcp search tail events @ cf-portal (regex)"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "connect": "cf-portal" }), MAX);
+        assert_eq!(lines, vec!["mcp connect cf-portal"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "server": "cf-portal" }), MAX);
+        assert_eq!(lines, vec!["mcp list cf-portal"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({}), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+    }
+
+    #[test]
+    fn proxy_ui_messages_wins_over_server() {
+        // test.ts:58-60.
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({ "action": "ui-messages", "server": "cf-portal" }),
+            MAX,
+        );
+        assert_eq!(lines, vec!["mcp ui-messages"]);
+    }
+
+    #[test]
+    fn proxy_search_annotations_are_exact_match() {
+        // `regex` must be exactly true, `includeSchemas` exactly false
+        // (upstream `===` comparisons).
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({ "search": "q", "regex": false, "includeSchemas": true }),
+            MAX,
+        );
+        assert_eq!(lines, vec!["mcp search q"]);
+        let lines = format_mcp_proxy_tool_call_lines(
+            &json!({ "search": "q", "includeSchemas": false }),
+            MAX,
+        );
+        assert_eq!(lines, vec!["mcp search q (schemas hidden)"]);
+    }
+
+    #[test]
+    fn proxy_args_truthiness_follows_js() {
+        // `""`/0/false/null/absent skip the summary line; `{}` (any object)
+        // is truthy and formats as `{}` (verified against upstream).
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t" }), MAX),
+            vec!["mcp call t"]
+        );
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "args": "" }), MAX),
+            vec!["mcp call t"]
+        );
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "args": null }), MAX),
+            vec!["mcp call t"]
+        );
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "args": 0 }), MAX),
+            vec!["mcp call t"]
+        );
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "args": {} }), MAX),
+            vec!["mcp call t", "{}"]
+        );
+        assert_eq!(
+            format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "args": [1] }), MAX),
+            vec!["mcp call t", "[\n  1\n]"]
+        );
+    }
+
+    #[test]
+    fn direct_tool_with_and_without_args() {
+        // test.ts:62-76.
+        let lines = format_mcp_direct_tool_call_lines(
+            "cf-portal_list_worker_tail_events",
+            &json!({ "accountId": "abc", "scriptName": "worker" }),
+            MAX,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "cf-portal_list_worker_tail_events".to_string(),
+                "{\n  \"accountId\": \"abc\",\n  \"scriptName\": \"worker\"\n}".to_string(),
+            ]
+        );
+        assert_eq!(
+            format_mcp_direct_tool_call_lines("cf-portal_status", &json!({}), MAX),
+            vec!["cf-portal_status"]
+        );
+    }
+
+    #[test]
+    fn jsonish_truncates_at_the_char_budget() {
+        // `truncateText`: first max-1 chars + "…".
+        let long = json!("x".repeat(1600));
+        let out = format_jsonish(&long, 100);
+        assert_eq!(out.chars().count(), 100);
+        assert!(out.ends_with('…'));
+        // A JSON string input is re-parsed and pretty-printed.
+        let out = format_jsonish(&json!("{\"b\":1}"), 100);
+        assert_eq!(out, "{\n  \"b\": 1\n}");
+        // Non-JSON strings pass through unchanged (still budgeted).
+        let out = format_jsonish(&json!("plain text"), 100);
+        assert_eq!(out, "plain text");
+    }
+
+    #[test]
+    fn render_call_tree_splits_title_and_muted_rest() {
+        // test.ts:281-291 render shape: first line toolTitle, rest muted.
+        let tree = render_mcp_proxy_tool_call(&json!({ "tool": "test_tool", "server": "demo" }));
+        assert_eq!(tree["type"], json!("column"));
+        let children = tree["children"].as_array().unwrap();
+        assert_eq!(
+            children[0]["props"]["text"],
+            json!("mcp call test_tool @ demo")
+        );
+        assert_eq!(children[0]["props"]["fg"], json!("toolTitle"));
+        assert_eq!(children[0]["props"]["bold"], json!(true));
+        assert_eq!(children.len(), 1);
+
+        let tree = render_mcp_direct_tool_call("test_tool", &json!({ "key": "value" }));
+        let children = tree["children"].as_array().unwrap();
+        assert_eq!(children[0]["props"]["text"], json!("test_tool"));
+        assert_eq!(
+            children[1]["props"]["text"],
+            json!("{\n  \"key\": \"value\"\n}")
+        );
+        assert_eq!(children[1]["props"]["fg"], json!("muted"));
+    }
+
+    #[test]
+    fn empty_call_lines_default_the_title() {
+        // renderToolCallLines destructures `[title = "mcp", ...rest]`.
+        let tree = render_tool_call_lines(&[]);
+        assert_eq!(tree["children"][0]["props"]["text"], json!("mcp"));
     }
 }

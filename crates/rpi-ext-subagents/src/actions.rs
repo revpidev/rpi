@@ -278,6 +278,7 @@ pub fn handle_management_action_with(
                                 Some(handle.run_id.as_str()),
                                 false,
                                 15_000,
+                                None,
                             )
                             .await
                             {
@@ -387,7 +388,7 @@ pub fn handle_management_action_with(
             let host_cwd = host.cwd();
             let settings = crate::config::read_settings_pair(&host_cwd);
             let config = crate::config::load_config();
-            let result = crate::tool::execute_subagent_tool(&params, host, &settings, &config, runtime);
+            let result = crate::tool::execute_subagent_tool(&params, host, &settings, &config, runtime, None);
             ToolOutcome {
                 text: result["content"][0]["text"]
                     .as_str()

@@ -409,7 +409,11 @@ async fn launch_one(
 /// writes it before cleanup so `handoffRecordsPatch` passes), then retry the
 /// cleanup of worktrees kept dirty earlier — now that the manifest journals
 /// the surviving patches, `cleanup_worktree` accepts them.
-pub fn finalize_worktree_handoff(plan: &WorktreePlan, run_id: &str, cwd: &std::path::Path) {
+pub fn finalize_worktree_handoff(
+    plan: &WorktreePlan,
+    run_id: &str,
+    cwd: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let diffs = plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let path = (!diffs.is_empty()).then(|| {
         crate::p1::worktree::write_handoff_manifest(
@@ -430,6 +434,7 @@ pub fn finalize_worktree_handoff(plan: &WorktreePlan, run_id: &str, cwd: &std::p
     for info in kept {
         let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, path.as_deref());
     }
+    path
 }
 
 /// `ParallelTaskResult` projection off the shared child outcome.

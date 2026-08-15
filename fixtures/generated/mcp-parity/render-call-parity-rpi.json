@@ -1,0 +1,117 @@
+[
+  {
+    "name": "proxy-call-json-string-args-with-server",
+    "lines": [
+      "mcp call cf-portal_list_worker_tail_events @ cf-portal",
+      "{\n  \"accountId\": \"abc\",\n  \"scriptName\": \"worker\"\n}"
+    ]
+  },
+  {
+    "name": "proxy-call-object-args-no-server",
+    "lines": [
+      "mcp call cf-portal_list_worker_tail_events",
+      "{\n  \"accountId\": \"abc\",\n  \"limit\": 10\n}"
+    ]
+  },
+  {
+    "name": "proxy-search-regex-server",
+    "lines": [
+      "mcp search tail events @ cf-portal (regex)"
+    ]
+  },
+  {
+    "name": "proxy-search-schemas-hidden",
+    "lines": [
+      "mcp search q (schemas hidden)"
+    ]
+  },
+  {
+    "name": "proxy-search-no-annotations",
+    "lines": [
+      "mcp search q"
+    ]
+  },
+  {
+    "name": "proxy-connect",
+    "lines": [
+      "mcp connect cf-portal"
+    ]
+  },
+  {
+    "name": "proxy-describe",
+    "lines": [
+      "mcp describe fixture_echo"
+    ]
+  },
+  {
+    "name": "proxy-list-server",
+    "lines": [
+      "mcp list cf-portal"
+    ]
+  },
+  {
+    "name": "proxy-empty-args",
+    "lines": [
+      "mcp status"
+    ]
+  },
+  {
+    "name": "proxy-empty-string-args",
+    "lines": [
+      "mcp call t"
+    ]
+  },
+  {
+    "name": "proxy-empty-object-args",
+    "lines": [
+      "mcp call t",
+      "{}"
+    ]
+  },
+  {
+    "name": "proxy-ui-messages-wins",
+    "lines": [
+      "mcp ui-messages"
+    ]
+  },
+  {
+    "name": "proxy-other-action",
+    "lines": [
+      "mcp auth-start"
+    ]
+  },
+  {
+    "name": "proxy-truncation-budget",
+    "lines": [
+      "mcp call long_call",
+      "{\n  \"blob\": \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n}"
+    ]
+  },
+  {
+    "name": "direct-with-args",
+    "lines": [
+      "cf-portal_list_worker_tail_events",
+      "{\n  \"accountId\": \"abc\",\n  \"scriptName\": \"worker\"\n}"
+    ]
+  },
+  {
+    "name": "direct-empty-args",
+    "lines": [
+      "cf-portal_status"
+    ]
+  },
+  {
+    "name": "direct-array-args-degrade",
+    "lines": [
+      "weird_tool"
+    ]
+  },
+  {
+    "name": "render-proxy-lines",
+    "rendered": "mcp call test_tool @ demo"
+  },
+  {
+    "name": "render-direct-lines",
+    "rendered": "test_tool\n{\n  \"key\": \"value\"\n}"
+  }
+]

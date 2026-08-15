@@ -294,8 +294,12 @@ pub fn direct_tool_definition(spec: &DirectToolSpec) -> Value {
             "description": if spec.description.is_empty() { "(no description)" } else { &spec.description },
             "promptSnippet": prompt_snippet,
             "parameters": normalize_direct_tool_input_schema(spec.input_schema.as_ref()),
-            // renderMcpToolResult for direct tools (index.ts:161-162): the
-            // shared MCP result renderer handles collapse on the host side.
+            // createMcpDirectToolCallRenderer + renderMcpToolResult for direct
+            // tools (index.ts:161-162): the call lines show displayName +
+            // jsonish args, the shared MCP result renderer handles collapse.
+            // Both render through the host's {"kind":"render"} dispatch;
+            // toolCall uses the registered (prefixed) name as displayName.
+            "renderCall": true,
             "renderResult": true,
         },
     })

@@ -185,9 +185,11 @@ fn sync_tool_surface(state: &PluginState) {
                 "description": description,
                 "promptSnippet": "MCP gateway — status, search, describe, auth, and single MCP tool calls",
                 "parameters": proxy::tool_parameters_schema(),
-                // renderMcpToolResult (index.ts:719): the host attaches the
-                // render closure and dispatches {"kind":"render","what":
-                // "toolResult"} back here (host_call.rs:263-281).
+                // renderMcpProxyToolCall (index.ts:698) + renderMcpToolResult
+                // (index.ts:719): the host attaches the render closures and
+                // dispatches {"kind":"render","what":"toolCall"|"toolResult"}
+                // back here (host_call.rs:245-289).
+                "renderCall": true,
                 "renderResult": true,
             },
         }));
@@ -517,18 +519,45 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 .block_on(async move { dispatcher.execute(&params, &native_tools).await });
             pack(&result)
         }
-        // Render protocol (host_call.rs:263-281): the host dispatches a
-        // synchronous `{"kind":"render","what":"toolResult",...}` and
-        // expects a ComponentTree back. Pure JSON only — never touches the
-        // plugin runtime.
+        // Render protocol (host_call.rs:245-289): the host dispatches a
+        // synchronous `{"kind":"render","what":"toolCall"|"toolResult",...}`
+        // and expects a ComponentTree back. Pure JSON only — never touches
+        // the plugin runtime. toolCall renders carry `toolName` (TE-D31):
+        // the proxy "mcp" tool gets the proxy call lines, every direct tool
+        // renders its own (prefixed) name as displayName.
         Some("render") => {
-            if message.get("what").and_then(Value::as_str) == Some("toolResult") {
-                let tree = render::render_mcp_tool_result(
-                    message.get("result").unwrap_or(&Value::Null),
-                    message.get("options").unwrap_or(&Value::Null),
-                    message.get("context").unwrap_or(&Value::Null),
-                );
-                return pack(&tree);
+            match (
+                message.get("what").and_then(Value::as_str),
+                message.get("toolName").and_then(Value::as_str),
+            ) {
+                (Some("toolResult"), _) => {
+                    let tree = render::render_mcp_tool_result(
+                        message.get("result").unwrap_or(&Value::Null),
+                        message.get("options").unwrap_or(&Value::Null),
+                        message.get("context").unwrap_or(&Value::Null),
+                    );
+                    return pack(&tree);
+                }
+                (Some("toolCall"), Some("mcp")) => {
+                    let tree = render::render_mcp_proxy_tool_call(
+                        message
+                            .get("context")
+                            .and_then(|c| c.get("args"))
+                            .unwrap_or(&Value::Null),
+                    );
+                    return pack(&tree);
+                }
+                (Some("toolCall"), Some(display_name)) => {
+                    let tree = render::render_mcp_direct_tool_call(
+                        display_name,
+                        message
+                            .get("context")
+                            .and_then(|c| c.get("args"))
+                            .unwrap_or(&Value::Null),
+                    );
+                    return pack(&tree);
+                }
+                _ => {}
             }
             pack(&Value::Null)
         }

@@ -10,6 +10,7 @@
 #                  driving the crate example conformance_driver
 #   e2e-parity     pi -p vs rpi -p five-mode tool-result parity
 #                  (needs a working model provider login for BOTH CLIs)
+#   render-call-parity  renderCall pure-function byte parity (TE09 FR-E)
 #
 # Usage:
 #   bash scripts/mcp-parity/run-parity-suite.sh [leg ...]     # default: all
@@ -36,7 +37,7 @@ CONFORMANCE_SCENARIOS=(
   elicitation-sep1034-client-defaults
 )
 
-ALL_LEGS=(mcp-parity oauth-parity conformance e2e-parity)
+ALL_LEGS=(mcp-parity render-call-parity oauth-parity conformance e2e-parity)
 if [[ $# -gt 0 ]]; then
   LEGS=("$@")
 else
@@ -76,6 +77,16 @@ if [[ " ${LEGS[*]} " == *" mcp-parity "* ]]; then
     LEG_STATUS[mcp-parity]=PASS
   else
     LEG_STATUS[mcp-parity]=FAIL
+  fi
+fi
+
+# --- render-call-parity (TE09 FR-E) ------------------------------------------
+if [[ " ${LEGS[*]} " == *" render-call-parity "* ]]; then
+  log "leg render-call-parity"
+  if node "$SCRIPT_DIR/run-render-call-parity.mjs"; then
+    LEG_STATUS[render-call-parity]=PASS
+  else
+    LEG_STATUS[render-call-parity]=FAIL
   fi
 fi
 

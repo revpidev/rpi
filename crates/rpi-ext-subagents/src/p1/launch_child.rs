@@ -165,6 +165,7 @@ fn mkdtemp_session_root() -> PathBuf {
 }
 
 /// Everything the composite runners share for one delegation call.
+#[derive(Clone)]
 pub struct RunCtx {
     pub settings: SettingsPair,
     pub config: ExtensionConfig,
@@ -185,6 +186,13 @@ pub struct RunCtx {
     pub usage_budget: Option<Value>,
     pub artifacts_dir: Option<PathBuf>,
     pub session_root: PathBuf,
+    /// Streaming frame sink (TE09 FR-A): foreground dispatches install the
+    /// toolUpdate seam here; parallel/async paths leave it None (upstream
+    /// wraps only the single and chain foreground flows).
+    pub frame_sink: Option<crate::runner::foreground::StreamFrameSink>,
+    /// Step activity projection (TE09 FR-C): async runs install a sink that
+    /// mirrors currentTool/currentPath into the run status document.
+    pub step_status: Option<crate::runner::foreground::StepStatusSink>,
 }
 
 impl RunCtx {
@@ -263,6 +271,11 @@ impl RunCtx {
             run_id,
             artifacts_dir,
             session_root,
+            // Streaming sinks are per-dispatch concerns: the tool layer
+            // installs them on the assembled ctx (None here keeps the
+            // non-streaming default for every other constructor caller).
+            frame_sink: None,
+            step_status: None,
         }
     }
 
@@ -586,8 +599,17 @@ pub async fn run_child_async(
         }),
         self_extension,
         fanout_authorized,
+        resolved_skill_names: (!resolved_skills.is_empty()).then(|| {
+            resolved_skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect()
+        }),
+        context_label: context.as_str().to_string(),
         steer_inbox: spec.steer_inbox.clone(),
         supervisor_channel,
+        stream_sink: ctx.frame_sink.clone(),
+        step_status: ctx.step_status.clone(),
     };
 
     let mut result = foreground::run_foreground_with_fallback(&input, &candidates).await;
