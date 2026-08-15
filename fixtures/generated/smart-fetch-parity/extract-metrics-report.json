@@ -1,0 +1,294 @@
+{
+  "summary": {
+    "corpusSize": 36,
+    "titleMatchRate": 1,
+    "metadata": {
+      "author": {
+        "agree": 6,
+        "both": 13,
+        "rate": 0.46153846153846156
+      },
+      "published": {
+        "agree": 6,
+        "both": 6,
+        "rate": 1
+      },
+      "site": {
+        "agree": 1,
+        "both": 7,
+        "rate": 0.14285714285714285
+      },
+      "language": {
+        "agree": 35,
+        "both": 35,
+        "rate": 1
+      }
+    },
+    "contentTokenF1": {
+      "min": 0.4459,
+      "median": 0.9937,
+      "mean": 0.948,
+      "pagesBelow0_85": 3
+    },
+    "thresholds": {
+      "titleTarget": 1,
+      "metadataTarget": 0.9,
+      "contentF1CalibrationInitial": 0.85,
+      "note": "TE06 records calibrated initial values; TE07 pins the thresholds into the acceptance script."
+    }
+  },
+  "pages": [
+    {
+      "name": "article-1.html",
+      "titleUpstream": "Article 1 — study of pattern",
+      "titleRust": "Article 1 — study of pattern",
+      "titleMatch": true,
+      "f1": 0.9961
+    },
+    {
+      "name": "article-2.html",
+      "titleUpstream": "Article 2 — study of detail",
+      "titleRust": "Article 2 — study of detail",
+      "titleMatch": true,
+      "f1": 0.9959
+    },
+    {
+      "name": "article-3.html",
+      "titleUpstream": "Article 3 — study of structure",
+      "titleRust": "Article 3 — study of structure",
+      "titleMatch": true,
+      "f1": 0.9937
+    },
+    {
+      "name": "article-4.html",
+      "titleUpstream": "Article 4 — study of detail",
+      "titleRust": "Article 4 — study of detail",
+      "titleMatch": true,
+      "f1": 0.996
+    },
+    {
+      "name": "article-5.html",
+      "titleUpstream": "Article 5 — study of detail",
+      "titleRust": "Article 5 — study of detail",
+      "titleMatch": true,
+      "f1": 0.9918
+    },
+    {
+      "name": "article-6.html",
+      "titleUpstream": "Article 6 — study of resolution",
+      "titleRust": "Article 6 — study of resolution",
+      "titleMatch": true,
+      "f1": 0.9955
+    },
+    {
+      "name": "code-1.html",
+      "titleUpstream": "Snippet collection 1",
+      "titleRust": "Snippet collection 1",
+      "titleMatch": true,
+      "f1": 0.9929
+    },
+    {
+      "name": "code-2.html",
+      "titleUpstream": "Snippet collection 2",
+      "titleRust": "Snippet collection 2",
+      "titleMatch": true,
+      "f1": 0.9944
+    },
+    {
+      "name": "code-3.html",
+      "titleUpstream": "Snippet collection 3",
+      "titleRust": "Snippet collection 3",
+      "titleMatch": true,
+      "f1": 0.9936
+    },
+    {
+      "name": "code-4.html",
+      "titleUpstream": "Snippet collection 4",
+      "titleRust": "Snippet collection 4",
+      "titleMatch": true,
+      "f1": 0.9942
+    },
+    {
+      "name": "code-5.html",
+      "titleUpstream": "Snippet collection 5",
+      "titleRust": "Snippet collection 5",
+      "titleMatch": true,
+      "f1": 0.9934
+    },
+    {
+      "name": "code-6.html",
+      "titleUpstream": "Snippet collection 6",
+      "titleRust": "Snippet collection 6",
+      "titleMatch": true,
+      "f1": 0.9939
+    },
+    {
+      "name": "docs-1.html",
+      "titleUpstream": "Handbook §1: context",
+      "titleRust": "Handbook §1: context",
+      "titleMatch": true,
+      "f1": 0.9623
+    },
+    {
+      "name": "docs-2.html",
+      "titleUpstream": "Handbook §2: method",
+      "titleRust": "Handbook §2: method",
+      "titleMatch": true,
+      "f1": 0.9592
+    },
+    {
+      "name": "docs-3.html",
+      "titleUpstream": "Handbook §3: resolution",
+      "titleRust": "Handbook §3: resolution",
+      "titleMatch": true,
+      "f1": 0.969
+    },
+    {
+      "name": "docs-4.html",
+      "titleUpstream": "Handbook §4: boundary",
+      "titleRust": "Handbook §4: boundary",
+      "titleMatch": true,
+      "f1": 0.9607
+    },
+    {
+      "name": "docs-5.html",
+      "titleUpstream": "Handbook §5: instance",
+      "titleRust": "Handbook §5: instance",
+      "titleMatch": true,
+      "f1": 0.9676
+    },
+    {
+      "name": "docs-6.html",
+      "titleUpstream": "Handbook §6: transition",
+      "titleRust": "Handbook §6: transition",
+      "titleMatch": true,
+      "f1": 0.9623
+    },
+    {
+      "name": "edge-no-title.html",
+      "titleUpstream": "",
+      "titleRust": "",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "edge-thin.html",
+      "titleUpstream": "Thin page",
+      "titleRust": "Thin page",
+      "titleMatch": true,
+      "f1": 0.8889
+    },
+    {
+      "name": "footnote-1.html",
+      "titleUpstream": "Citations and footnotes",
+      "titleRust": "Citations and footnotes",
+      "titleMatch": true,
+      "f1": 0.9952
+    },
+    {
+      "name": "footnote-2.html",
+      "titleUpstream": "Long form with notes",
+      "titleRust": "Long form with notes",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "forum-1.html",
+      "titleUpstream": "Discussion: context thread 1",
+      "titleRust": "Discussion: context thread 1",
+      "titleMatch": true,
+      "f1": 0.6087
+    },
+    {
+      "name": "forum-2.html",
+      "titleUpstream": "Discussion: signal thread 2",
+      "titleRust": "Discussion: signal thread 2",
+      "titleMatch": true,
+      "f1": 0.4459
+    },
+    {
+      "name": "forum-3.html",
+      "titleUpstream": "Discussion: analysis thread 3",
+      "titleRust": "Discussion: analysis thread 3",
+      "titleMatch": true,
+      "f1": 0.5665
+    },
+    {
+      "name": "forum-4.html",
+      "titleUpstream": "Discussion: boundary thread 4",
+      "titleRust": "Discussion: boundary thread 4",
+      "titleMatch": true,
+      "f1": 0.9854
+    },
+    {
+      "name": "forum-5.html",
+      "titleUpstream": "Discussion: resolution thread 5",
+      "titleRust": "Discussion: resolution thread 5",
+      "titleMatch": true,
+      "f1": 0.9851
+    },
+    {
+      "name": "forum-6.html",
+      "titleUpstream": "Discussion: framework thread 6",
+      "titleRust": "Discussion: framework thread 6",
+      "titleMatch": true,
+      "f1": 0.9861
+    },
+    {
+      "name": "lang-de.html",
+      "titleUpstream": "Deutscher Artikel",
+      "titleRust": "Deutscher Artikel",
+      "titleMatch": true,
+      "f1": 0.9538
+    },
+    {
+      "name": "lang-ja.html",
+      "titleUpstream": "日本語の記事",
+      "titleRust": "日本語の記事",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-1.html",
+      "titleUpstream": "Benchmark results 1",
+      "titleRust": "Benchmark results 1",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-2.html",
+      "titleUpstream": "Benchmark results 2",
+      "titleRust": "Benchmark results 2",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-3.html",
+      "titleUpstream": "Benchmark results 3",
+      "titleRust": "Benchmark results 3",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-4.html",
+      "titleUpstream": "Benchmark results 4",
+      "titleRust": "Benchmark results 4",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-5.html",
+      "titleUpstream": "Benchmark results 5",
+      "titleRust": "Benchmark results 5",
+      "titleMatch": true,
+      "f1": 1
+    },
+    {
+      "name": "table-6.html",
+      "titleUpstream": "Benchmark results 6",
+      "titleRust": "Benchmark results 6",
+      "titleMatch": true,
+      "f1": 1
+    }
+  ]
+}

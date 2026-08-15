@@ -1,0 +1,1392 @@
+[
+  {
+    "name": "invalid-url",
+    "input": {
+      "opts": {
+        "url": "not a url"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": []
+    },
+    "output": {
+      "result": {
+        "error": "Invalid URL: not a url",
+        "code": "invalid_url",
+        "phase": "validation",
+        "retryable": false,
+        "url": "not a url"
+      },
+      "requestHeadersSeen": null,
+      "requestTimeout": null,
+      "requestProxy": null,
+      "requestRedirect": null
+    }
+  },
+  {
+    "name": "unsupported-protocol",
+    "input": {
+      "opts": {
+        "url": "ftp://example.com/f"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": []
+    },
+    "output": {
+      "result": {
+        "error": "Only http/https URLs supported, got ftp:",
+        "code": "unsupported_protocol",
+        "phase": "validation",
+        "retryable": false,
+        "url": "ftp://example.com/f"
+      },
+      "requestHeadersSeen": null,
+      "requestTimeout": null,
+      "requestProxy": null,
+      "requestRedirect": null
+    }
+  },
+  {
+    "name": "http-404",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/missing"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 404,
+          "statusText": "Not Found",
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "gone"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 404 Not Found for https://ex.com/missing.",
+        "code": "http_error",
+        "phase": "connecting",
+        "retryable": false,
+        "url": "https://ex.com/missing",
+        "finalUrl": "https://ex.com/missing",
+        "statusCode": 404,
+        "statusText": "Not Found",
+        "timeoutMs": 15000,
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "http-500-retryable",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/err"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 500,
+          "statusText": "Internal Server Error",
+          "body": ""
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 500 Internal Server Error for https://ex.com/err.",
+        "code": "http_error",
+        "phase": "connecting",
+        "retryable": true,
+        "url": "https://ex.com/err",
+        "finalUrl": "https://ex.com/err",
+        "statusCode": 500,
+        "statusText": "Internal Server Error",
+        "timeoutMs": 15000
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "http-429-retryable",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/limited"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 429,
+          "statusText": "Too Many Requests",
+          "body": ""
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Server returned HTTP 429 Too Many Requests for https://ex.com/limited.",
+        "code": "http_error",
+        "phase": "connecting",
+        "retryable": true,
+        "url": "https://ex.com/limited",
+        "finalUrl": "https://ex.com/limited",
+        "statusCode": 429,
+        "statusText": "Too Many Requests",
+        "timeoutMs": 15000
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "dns-error",
+    "input": {
+      "opts": {
+        "url": "https://no-such-host.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "getaddrinfo ENOTFOUND no-such-host.example.com: dns error"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "DNS error: failed to lookup address for no-such-host.example.com. Check the URL and try again.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": false,
+        "url": "https://no-such-host.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "connect-error",
+    "input": {
+      "opts": {
+        "url": "https://refused.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "connect ECONNREFUSED 127.0.0.1:443: connection refused"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Connection failed to refused.example.com. The server may be unreachable or blocking requests.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": true,
+        "url": "https://refused.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "tls-error",
+    "input": {
+      "opts": {
+        "url": "https://self-signed.example.com/x"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "unable to verify the first certificate: ssl handshake error"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "TLS/SSL error connecting to self-signed.example.com. The server's certificate may be invalid.",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": false,
+        "url": "https://self-signed.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "timeout-error",
+    "input": {
+      "opts": {
+        "url": "https://slow.example.com/x",
+        "timeoutMs": 1500
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "operation timed out"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Timeout of 1500ms exceeded while connecting to https://slow.example.com/x.",
+        "code": "timeout",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 1500,
+        "url": "https://slow.example.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 1500,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "unknown-profile",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/x",
+        "browser": "chrome_99"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "Invalid browser profile: chrome_99. Available profiles: chrome_100"
+          }
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Request failed while connecting for https://ex.com/x: Invalid browser profile: chrome_99. Available profiles: chrome_100",
+        "code": "network_error",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/x"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "json-response-markdown-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"b\":1,\"a\":[1,2]}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 9,
+        "content": "```json\n{\n  \"b\": 1,\n  \"a\": [\n    1,\n    2\n  ]\n}\n```",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "json-response-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"k\":\"v\"}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"k\": \"v\"\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "json-body-text-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "{\"k\":1}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"k\": 1\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "json-body-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "{\"k\":1}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api",
+        "finalUrl": "https://ex.com/api",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "<pre><code class=\"language-json\">{\n  &quot;k&quot;: 1\n}</code></pre>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "invalid-json-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/api",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{broken"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Invalid JSON response"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "non-json-json-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/page",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/xml"
+          },
+          "body": "<x>not json</x>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Not a JSON response (content-type: application/xml)",
+        "code": "unexpected_response",
+        "phase": "loading",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/page",
+        "finalUrl": "https://ex.com/page",
+        "mimeType": "application/xml"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "plain-text-response",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/robots.txt"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "User-agent: *\nDisallow: /"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/robots.txt",
+        "finalUrl": "https://ex.com/robots.txt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "User-agent: *\nDisallow: /",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "plain-text-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/robots.txt",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "a < b & c"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/robots.txt",
+        "finalUrl": "https://ex.com/robots.txt",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 5,
+        "content": "<pre>a &lt; b &amp; c</pre>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "markdown-content-type",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/readme"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Heading\n\ntext"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/readme",
+        "finalUrl": "https://ex.com/readme",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 3,
+        "content": "# Heading\n\ntext",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "extraction-success-markdown",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article"
+      },
+      "defuddleResult": {
+        "content": "Extracted **article** body.",
+        "wordCount": 4,
+        "title": "Fixture Article",
+        "author": "A. Author",
+        "published": "2026-02-03",
+        "site": "Example",
+        "language": "en"
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "Fixture Article",
+        "author": "A. Author",
+        "published": "2026-02-03",
+        "site": "Example",
+        "language": "en",
+        "wordCount": 4,
+        "content": "Extracted **article** body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "extraction-success-text-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "content": "Extracted **article** body.",
+        "wordCount": 4
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "Extracted article body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "extraction-success-html-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/article",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "content": "<p>cleaned</p>",
+        "wordCount": 1
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/article",
+        "finalUrl": "https://ex.com/article",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 1,
+        "content": "<p>cleaned</p>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "dom-fallback-markdown",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "# Head\n\nFallback **bold** paragraph.\n\n- one\n- two",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "dom-fallback-text",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback",
+        "format": "text"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "HeadFallback bold paragraph.onetwo",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "dom-fallback-html-uses-raw-body",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/fallback",
+        "format": "html"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/fallback",
+        "finalUrl": "https://ex.com/fallback",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "<html><head><title>FB</title></head><body><h1>Head</h1><p>Fallback <b>bold</b> paragraph.</p><ul><li>one</li><li>two</li></ul></body></html>",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "no-content",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/empty"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Empty</title></head><body><script>ignored()</script></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/empty",
+        "finalUrl": "https://ex.com/empty",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 1,
+        "content": "ignored()",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "maxchars-truncation",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/long",
+        "maxChars": 20
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "0123456789012345678901234567890123456789"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/long",
+        "finalUrl": "https://ex.com/long",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "01234567890123456789\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "maxchars-astral-variant",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/emoji",
+        "maxChars": 7
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "a😀b😀c😀d😀e😀f😀g😀h"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/emoji",
+        "finalUrl": "https://ex.com/emoji",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "a😀b😀c\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "raw-no-maxchars",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/raw",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><body>raw body 1234567890</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw",
+        "finalUrl": "https://ex.com/raw",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "<html><body>raw body 1234567890</body></html>",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "raw-explicit-maxchars",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/raw",
+        "format": "raw",
+        "maxChars": 8
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"key\":\"value\"}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw",
+        "finalUrl": "https://ex.com/raw",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "{\"key\":\"\n\n[... truncated]",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "application/json"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "non-html-content-type",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/binaryish"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream"
+          },
+          "body": "binary-ish textual body"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Request failed while downloading the response for https://ex.com/binaryish: not used in parity scenarios",
+        "code": "download_error",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/binaryish",
+        "finalUrl": "https://ex.com/binaryish",
+        "statusCode": 200,
+        "statusText": "OK",
+        "mimeType": "application/octet-stream"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "custom-headers-merge",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/headers",
+        "headers": {
+          "Accept": "text/custom",
+          "X-Token": "secret"
+        }
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "ok"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/headers",
+        "finalUrl": "https://ex.com/headers",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 1,
+        "content": "ok",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/custom",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Token": "secret"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "format-raw-accept-header",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/accept",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "ok"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/accept",
+        "finalUrl": "https://ex.com/accept",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "ok",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "format-json-accept-header",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/accept",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"ok\":true}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/accept",
+        "finalUrl": "https://ex.com/accept",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"ok\": true\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  }
+]

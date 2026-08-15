@@ -1,0 +1,1545 @@
+{
+  "markdownToText": [
+    {
+      "name": "headings",
+      "input": "# Title\n## Sub\nnormal",
+      "output": "Title\nSub\nnormal"
+    },
+    {
+      "name": "emphasis",
+      "input": "**bold** and *ital* alone",
+      "output": "bold and ital alone"
+    },
+    {
+      "name": "links-and-images",
+      "input": "[text](https://x) and ![alt](img.png)",
+      "output": "text and !alt"
+    },
+    {
+      "name": "image-only-link-precedence",
+      "input": "a [l](u) ![img](y) b",
+      "output": "a l !img b"
+    },
+    {
+      "name": "quotes",
+      "input": "> quoted line\nnormal",
+      "output": "quoted line\nnormal"
+    },
+    {
+      "name": "lists",
+      "input": "- dash\n* star\n+ plus\n1. ordered",
+      "output": "• dash\n• star\n• plus\n1. ordered"
+    },
+    {
+      "name": "inline-code",
+      "input": "use `cargo test` now",
+      "output": "use cargo test now"
+    },
+    {
+      "name": "multiline",
+      "input": "# H\n\npara one\n\n- a\n- b\n\n> q\n\n**x**",
+      "output": "H\n\npara one\n\n• a\n• b\n\nq\n\nx"
+    },
+    {
+      "name": "no-markup",
+      "input": "plain text  with  spaces",
+      "output": "plain text  with  spaces"
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "output": ""
+    }
+  ],
+  "truncateContent": [
+    {
+      "name": "under",
+      "input": {
+        "content": "abc",
+        "maxChars": 10
+      },
+      "output": "abc"
+    },
+    {
+      "name": "exact",
+      "input": {
+        "content": "abcde",
+        "maxChars": 5
+      },
+      "output": "abcde"
+    },
+    {
+      "name": "over",
+      "input": {
+        "content": "abcdef",
+        "maxChars": 3
+      },
+      "output": "abc\n\n[... truncated]"
+    },
+    {
+      "name": "ascii-mid-word",
+      "input": {
+        "content": "0123456789",
+        "maxChars": 4
+      },
+      "output": "0123\n\n[... truncated]"
+    },
+    {
+      "name": "astral-bmp-mix",
+      "input": {
+        "content": "a😀b😀c😀d😀",
+        "maxChars": 4
+      },
+      "output": "a😀b\n\n[... truncated]"
+    },
+    {
+      "name": "astral-count-variant",
+      "input": {
+        "content": "😀😀😀😀",
+        "maxChars": 3
+      },
+      "output": "😀�\n\n[... truncated]"
+    },
+    {
+      "name": "newline-boundary",
+      "input": {
+        "content": "line1\nline2\nline3",
+        "maxChars": 7
+      },
+      "output": "line1\nl\n\n[... truncated]"
+    }
+  ],
+  "estimateWordCount": [
+    {
+      "name": "simple",
+      "input": "one two three",
+      "output": 3
+    },
+    {
+      "name": "padded",
+      "input": "   spaces   everywhere   ",
+      "output": 2
+    },
+    {
+      "name": "tabs-newlines",
+      "input": "a\tb\nc\r\nd",
+      "output": 4
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "output": 0
+    },
+    {
+      "name": "whitespace-only",
+      "input": " \n\t ",
+      "output": 0
+    },
+    {
+      "name": "unicode-words",
+      "input": "日本語 テキスト 対拍",
+      "output": 3
+    }
+  ],
+  "escapeHtml": [
+    {
+      "name": "all-escapes",
+      "input": "<a href=\"x\">&'</a>",
+      "output": "&lt;a href=&quot;x&quot;&gt;&amp;&#39;&lt;/a&gt;"
+    },
+    {
+      "name": "clean",
+      "input": "plain",
+      "output": "plain"
+    },
+    {
+      "name": "unicode",
+      "input": "café — emoji 😀",
+      "output": "café — emoji 😀"
+    }
+  ],
+  "parseAndFormatJson": [
+    {
+      "name": "object",
+      "input": "{\"b\":1,\"a\":[1,2]}",
+      "output": {
+        "formatted": "{\n  \"b\": 1,\n  \"a\": [\n    1,\n    2\n  ]\n}"
+      }
+    },
+    {
+      "name": "nested",
+      "input": "{\"x\":{\"y\":[{\"z\":null,true,false}]}}",
+      "output": {
+        "error": "Invalid JSON response"
+      }
+    },
+    {
+      "name": "float",
+      "input": "{\"pi\":3.14159,\"exp\":1e21,\"tiny\":0.000001}",
+      "output": {
+        "formatted": "{\n  \"pi\": 3.14159,\n  \"exp\": 1e+21,\n  \"tiny\": 0.000001\n}"
+      }
+    },
+    {
+      "name": "string-escapes",
+      "input": "{\"s\":\"line\\nbreak\\t\\\"quoted\\\"\"}",
+      "output": {
+        "formatted": "{\n  \"s\": \"line\\nbreak\\t\\\"quoted\\\"\"\n}"
+      }
+    },
+    {
+      "name": "array-root",
+      "input": "[1,\"two\",{\"three\":3}]",
+      "output": {
+        "formatted": "[\n  1,\n  \"two\",\n  {\n    \"three\": 3\n  }\n]"
+      }
+    },
+    {
+      "name": "invalid",
+      "input": "{invalid}",
+      "output": {
+        "error": "Invalid JSON response"
+      }
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "output": {
+        "error": "Invalid JSON response"
+      }
+    },
+    {
+      "name": "null-root",
+      "input": "null",
+      "output": {
+        "formatted": "null"
+      }
+    },
+    {
+      "name": "unicode-string",
+      "input": "{\"ja\":\"日本語\"}",
+      "output": {
+        "formatted": "{\n  \"ja\": \"日本語\"\n}"
+      }
+    }
+  ],
+  "renderJsonContent": [
+    {
+      "name": "json",
+      "input": {
+        "format": "json",
+        "formatted": "{\n  \"k\": \"v<&>\"\n}"
+      },
+      "output": "{\n  \"k\": \"v<&>\"\n}"
+    },
+    {
+      "name": "text",
+      "input": {
+        "format": "text",
+        "formatted": "{\n  \"k\": \"v<&>\"\n}"
+      },
+      "output": "{\n  \"k\": \"v<&>\"\n}"
+    },
+    {
+      "name": "html",
+      "input": {
+        "format": "html",
+        "formatted": "{\n  \"k\": \"v<&>\"\n}"
+      },
+      "output": "<pre><code class=\"language-json\">{\n  &quot;k&quot;: &quot;v&lt;&amp;&gt;&quot;\n}</code></pre>"
+    },
+    {
+      "name": "markdown",
+      "input": {
+        "format": "markdown",
+        "formatted": "{\n  \"k\": \"v<&>\"\n}"
+      },
+      "output": "```json\n{\n  \"k\": \"v<&>\"\n}\n```"
+    },
+    {
+      "name": "raw",
+      "input": {
+        "format": "raw",
+        "formatted": "{\n  \"k\": \"v<&>\"\n}"
+      },
+      "output": "```json\n{\n  \"k\": \"v<&>\"\n}\n```"
+    }
+  ],
+  "stripExtractorComments": [
+    {
+      "name": "md-comments",
+      "input": {
+        "format": "markdown",
+        "content": "article body\n\n---\n\n## Comments\n\n- first\n- second\n"
+      },
+      "output": "article body"
+    },
+    {
+      "name": "text-comments",
+      "input": {
+        "format": "text",
+        "content": "article body\n\n---\n\n## Comments\n\n- first\n- second\n"
+      },
+      "output": "article body"
+    },
+    {
+      "name": "html-comments",
+      "input": {
+        "format": "html",
+        "content": "<p>body</p>\n<hr><div class=\"t comments\"><p>c1</p></div>"
+      },
+      "output": "<p>body</p>"
+    },
+    {
+      "name": "no-comments",
+      "input": {
+        "format": "markdown",
+        "content": "article body only"
+      },
+      "output": "article body only"
+    }
+  ],
+  "metadataHeaders": [
+    {
+      "name": "metadata-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": true
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n> Site: ex.com\n> Language: en\n> Words: 42\n> Browser: chrome_145/windows"
+    },
+    {
+      "name": "compact-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": false
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01"
+    },
+    {
+      "name": "response-text-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": true
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n> Site: ex.com\n> Language: en\n> Words: 42\n> Browser: chrome_145/windows"
+    },
+    {
+      "name": "response-text-compact-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": false
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01"
+    },
+    {
+      "name": "metadata-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Words: 0\n> Browser: b/o"
+    },
+    {
+      "name": "compact-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f"
+    },
+    {
+      "name": "response-text-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Words: 0\n> Browser: b/o"
+    },
+    {
+      "name": "response-text-compact-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f"
+    },
+    {
+      "name": "metadata-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n> Words: 1\n> Browser: b/o"
+    },
+    {
+      "name": "compact-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> Content-Type: application/json"
+    },
+    {
+      "name": "response-text-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n> Words: 1\n> Browser: b/o"
+    },
+    {
+      "name": "response-text-compact-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> Content-Type: application/json"
+    },
+    {
+      "name": "metadata-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf\n> Browser: b/o"
+    },
+    {
+      "name": "compact-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf"
+    },
+    {
+      "name": "response-text-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf\n> Browser: b/o"
+    },
+    {
+      "name": "response-text-compact-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf"
+    }
+  ],
+  "responseTexts": [
+    {
+      "name": "metadata-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": true
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n> Site: ex.com\n> Language: en\n> Words: 42\n> Browser: chrome_145/windows\n\nbody"
+    },
+    {
+      "name": "compact-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": false
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n\nbody"
+    },
+    {
+      "name": "response-text-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": true
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n> Site: ex.com\n> Language: en\n> Words: 42\n> Browser: chrome_145/windows\n\nbody"
+    },
+    {
+      "name": "response-text-compact-content_full",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "https://ex.com/a",
+          "finalUrl": "https://ex.com/final",
+          "title": "T",
+          "author": "A",
+          "published": "2026-01-01",
+          "site": "ex.com",
+          "language": "en",
+          "wordCount": 42,
+          "content": "body",
+          "browser": "chrome_145",
+          "os": "windows"
+        },
+        "verbose": false
+      },
+      "output": "> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n\nbody"
+    },
+    {
+      "name": "metadata-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Words: 0\n> Browser: b/o\n\nx"
+    },
+    {
+      "name": "compact-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n\nx"
+    },
+    {
+      "name": "response-text-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Words: 0\n> Browser: b/o\n\nx"
+    },
+    {
+      "name": "response-text-compact-content_sparse",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 0,
+          "content": "x",
+          "browser": "b",
+          "os": "o"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n\nx"
+    },
+    {
+      "name": "metadata-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n> Words: 1\n> Browser: b/o\n\nx"
+    },
+    {
+      "name": "compact-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n\nx"
+    },
+    {
+      "name": "response-text-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n> Words: 1\n> Browser: b/o\n\nx"
+    },
+    {
+      "name": "response-text-compact-content_with_type",
+      "input": {
+        "result": {
+          "kind": "content",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "",
+          "language": "",
+          "wordCount": 1,
+          "content": "x",
+          "browser": "b",
+          "os": "o",
+          "contentType": "application/json"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> Content-Type: application/json\n\nx"
+    },
+    {
+      "name": "metadata-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf\n> Browser: b/o"
+    },
+    {
+      "name": "compact-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf"
+    },
+    {
+      "name": "response-text-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": true
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf\n> Browser: b/o"
+    },
+    {
+      "name": "response-text-compact-file",
+      "input": {
+        "result": {
+          "kind": "file",
+          "url": "u",
+          "finalUrl": "f",
+          "title": "",
+          "author": "",
+          "published": "",
+          "site": "s",
+          "language": "",
+          "wordCount": 0,
+          "content": "",
+          "browser": "b",
+          "os": "o",
+          "filePath": "/tmp/x/report.pdf",
+          "fileSize": 12345,
+          "mimeType": "application/pdf"
+        },
+        "verbose": false
+      },
+      "output": "> URL: f\n> File size: 12345\n> Mime type: application/pdf\n> File path: /tmp/x/report.pdf"
+    }
+  ],
+  "errorResponseTexts": [
+    {
+      "name": "invalid-url",
+      "input": {
+        "error": "Invalid URL: nope",
+        "code": "invalid_url",
+        "phase": "validation",
+        "retryable": false,
+        "url": "nope"
+      },
+      "output": "Error: Invalid URL: nope"
+    },
+    {
+      "name": "unsupported-protocol",
+      "input": {
+        "error": "Only http/https URLs supported, got ftp:",
+        "code": "unsupported_protocol",
+        "phase": "validation",
+        "retryable": false,
+        "url": "ftp://x"
+      },
+      "output": "Error: Only http/https URLs supported, got ftp:"
+    },
+    {
+      "name": "http-500",
+      "input": {
+        "error": "Server returned HTTP 500 Internal Server Error for u.",
+        "code": "http_error",
+        "phase": "connecting",
+        "retryable": true,
+        "statusCode": 500,
+        "statusText": "Internal Server Error",
+        "timeoutMs": 15000,
+        "url": "u",
+        "finalUrl": "f"
+      },
+      "output": "Error: Server returned HTTP 500 Internal Server Error for u.\n\n> URL: u\n> Final URL: f\n> Phase: connecting\n> Timeout: 15000ms (15s)\n> HTTP status: 500 Internal Server Error\n\nThe server failed while processing the request. Retrying later may help."
+    },
+    {
+      "name": "http-429",
+      "input": {
+        "error": "Server returned HTTP 429 Too Many Requests for u.",
+        "code": "http_error",
+        "phase": "waiting",
+        "retryable": true,
+        "statusCode": 429,
+        "statusText": "Too Many Requests",
+        "timeoutMs": 8000,
+        "url": "u"
+      },
+      "output": "Error: Server returned HTTP 429 Too Many Requests for u.\n\n> URL: u\n> Phase: waiting for the server response\n> Timeout: 8000ms (8.0s)\n> HTTP status: 429 Too Many Requests\n\nThe server rate-limited this request. Retrying later or using a different proxy may help."
+    },
+    {
+      "name": "http-401",
+      "input": {
+        "error": "Auth",
+        "code": "http_error",
+        "statusCode": 401,
+        "statusText": "Unauthorized",
+        "timeoutMs": 5000,
+        "url": "u",
+        "retryable": false
+      },
+      "output": "Error: Auth\n\n> URL: u\n> Timeout: 5000ms (5.0s)\n> HTTP status: 401 Unauthorized\n\nThe server rejected this request. Authentication, a different browser profile, or a different proxy may be required."
+    },
+    {
+      "name": "http-403-no-status-text",
+      "input": {
+        "error": "Auth",
+        "code": "http_error",
+        "statusCode": 403,
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "Error: Auth\n\n> URL: u\n> HTTP status: 403\n\nThe server rejected this request. Authentication, a different browser profile, or a different proxy may be required."
+    },
+    {
+      "name": "timeout-connecting",
+      "input": {
+        "error": "Timeout of 5000ms exceeded while connecting to https://x/.",
+        "code": "timeout",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 5000,
+        "url": "u",
+        "finalUrl": "f"
+      },
+      "output": "Error: Timeout of 5000ms exceeded while connecting to https://x/.\n\n> URL: u\n> Final URL: f\n> Phase: connecting\n> Timeout: 5000ms (5.0s)\n> Suggested timeoutMs: 30000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-waiting",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "waiting",
+        "retryable": true,
+        "timeoutMs": 3333,
+        "url": "u"
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: waiting for the server response\n> Timeout: 3333ms (3.3s)\n> Suggested timeoutMs: 30000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-loading-file",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 10000,
+        "url": "u",
+        "statusCode": 200,
+        "statusText": "OK",
+        "mimeType": "application/zip",
+        "contentLength": 1572864,
+        "downloadedBytes": 393216
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: downloading the response body\n> Timeout: 10000ms (10s)\n> HTTP status: 200 OK\n> Mime type: application/zip\n> Content-Length: 1572864 bytes (1.50 MB)\n> Downloaded before failure: 393216 bytes (384.0 KB)\n> Suggested timeoutMs: 60000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-loading-text-response",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 7000,
+        "url": "u",
+        "mimeType": "text/html",
+        "contentLength": 0,
+        "downloadedBytes": 512
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: downloading the response body\n> Timeout: 7000ms (7.0s)\n> Mime type: text/html\n> Content-Length: 0 bytes (0 B)\n> Downloaded before failure: 512 bytes (512 B)\n> Suggested timeoutMs: 15000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-loading-no-length",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 15000,
+        "url": "u",
+        "downloadedBytes": 0
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: downloading the response body\n> Timeout: 15000ms (15s)\n> Downloaded before failure: 0 bytes (0 B)\n> Suggested timeoutMs: 30000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-processing",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "processing",
+        "retryable": true,
+        "timeoutMs": 4000,
+        "url": "u"
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: processing the response\n> Timeout: 4000ms (4.0s)\n> Suggested timeoutMs: 8000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "timeout-unknown-phase",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "unknown",
+        "retryable": true,
+        "timeoutMs": 20000,
+        "url": "u",
+        "contentLength": 5368709120,
+        "downloadedBytes": 524288
+      },
+      "output": "Error: t\n\n> URL: u\n> Phase: unknown\n> Timeout: 20000ms (20s)\n> Content-Length: 5368709120 bytes (5.00 GB)\n> Downloaded before failure: 524288 bytes (512.0 KB)\n> Suggested timeoutMs: 40000\n\nThe timeoutMs parameter is configurable. Retry this call with a higher timeoutMs value."
+    },
+    {
+      "name": "download-error",
+      "input": {
+        "error": "Unable to create a unique temp file for u",
+        "code": "download_error",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 9000,
+        "url": "u",
+        "mimeType": "application/zip",
+        "contentLength": 1024,
+        "downloadedBytes": 1024
+      },
+      "output": "Error: Unable to create a unique temp file for u\n\n> URL: u\n> Phase: downloading the response body\n> Timeout: 9000ms (9.0s)\n> Mime type: application/zip\n> Content-Length: 1024 bytes (1.00 KB)\n> Downloaded before failure: 1024 bytes (1.00 KB)\n\nThe download failed before completion. Retrying may help, especially if the connection was interrupted."
+    },
+    {
+      "name": "no-content",
+      "input": {
+        "error": "No content extracted from u.",
+        "code": "no_content",
+        "phase": "processing",
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "Error: No content extracted from u."
+    },
+    {
+      "name": "unexpected-response",
+      "input": {
+        "error": "Not a JSON response (content-type: text/html)",
+        "code": "unexpected_response",
+        "phase": "loading",
+        "retryable": false,
+        "url": "u",
+        "timeoutMs": 15000
+      },
+      "output": "Error: Not a JSON response (content-type: text/html)"
+    },
+    {
+      "name": "network-retryable",
+      "input": {
+        "error": "Request failed while fetching u: x",
+        "code": "network_error",
+        "phase": "unknown",
+        "retryable": true,
+        "url": "u"
+      },
+      "output": "Error: Request failed while fetching u: x\n\nRetrying this request may help."
+    },
+    {
+      "name": "network-dns-summary",
+      "input": {
+        "error": "DNS error: failed to lookup address for host.",
+        "code": "network_error",
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "Error: DNS error: failed to lookup address for host."
+    },
+    {
+      "name": "error-only",
+      "input": {
+        "error": "Invalid JSON response"
+      },
+      "output": "Error: Invalid JSON response"
+    }
+  ],
+  "errorSummaries": [
+    {
+      "name": "invalid-url",
+      "input": {
+        "error": "Invalid URL: nope",
+        "code": "invalid_url",
+        "phase": "validation",
+        "retryable": false,
+        "url": "nope"
+      },
+      "output": "That URL is invalid."
+    },
+    {
+      "name": "unsupported-protocol",
+      "input": {
+        "error": "Only http/https URLs supported, got ftp:",
+        "code": "unsupported_protocol",
+        "phase": "validation",
+        "retryable": false,
+        "url": "ftp://x"
+      },
+      "output": "Only http and https URLs are supported."
+    },
+    {
+      "name": "http-500",
+      "input": {
+        "error": "Server returned HTTP 500 Internal Server Error for u.",
+        "code": "http_error",
+        "phase": "connecting",
+        "retryable": true,
+        "statusCode": 500,
+        "statusText": "Internal Server Error",
+        "timeoutMs": 15000,
+        "url": "u",
+        "finalUrl": "f"
+      },
+      "output": "Server responded with 500 Internal Server Error"
+    },
+    {
+      "name": "http-429",
+      "input": {
+        "error": "Server returned HTTP 429 Too Many Requests for u.",
+        "code": "http_error",
+        "phase": "waiting",
+        "retryable": true,
+        "statusCode": 429,
+        "statusText": "Too Many Requests",
+        "timeoutMs": 8000,
+        "url": "u"
+      },
+      "output": "Server responded with 429 Too Many Requests"
+    },
+    {
+      "name": "http-401",
+      "input": {
+        "error": "Auth",
+        "code": "http_error",
+        "statusCode": 401,
+        "statusText": "Unauthorized",
+        "timeoutMs": 5000,
+        "url": "u",
+        "retryable": false
+      },
+      "output": "Server responded with 401 Unauthorized"
+    },
+    {
+      "name": "http-403-no-status-text",
+      "input": {
+        "error": "Auth",
+        "code": "http_error",
+        "statusCode": 403,
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "Server responded with 403"
+    },
+    {
+      "name": "timeout-connecting",
+      "input": {
+        "error": "Timeout of 5000ms exceeded while connecting to https://x/.",
+        "code": "timeout",
+        "phase": "connecting",
+        "retryable": true,
+        "timeoutMs": 5000,
+        "url": "u",
+        "finalUrl": "f"
+      },
+      "output": "Timed out while connecting to the server."
+    },
+    {
+      "name": "timeout-waiting",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "waiting",
+        "retryable": true,
+        "timeoutMs": 3333,
+        "url": "u"
+      },
+      "output": "The server took too long to start responding."
+    },
+    {
+      "name": "timeout-loading-file",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 10000,
+        "url": "u",
+        "statusCode": 200,
+        "statusText": "OK",
+        "mimeType": "application/zip",
+        "contentLength": 1572864,
+        "downloadedBytes": 393216
+      },
+      "output": "Timed out while downloading the file."
+    },
+    {
+      "name": "timeout-loading-text-response",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 7000,
+        "url": "u",
+        "mimeType": "text/html",
+        "contentLength": 0,
+        "downloadedBytes": 512
+      },
+      "output": "Timed out while downloading the response."
+    },
+    {
+      "name": "timeout-loading-no-length",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 15000,
+        "url": "u",
+        "downloadedBytes": 0
+      },
+      "output": "Timed out while downloading the response."
+    },
+    {
+      "name": "timeout-processing",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "processing",
+        "retryable": true,
+        "timeoutMs": 4000,
+        "url": "u"
+      },
+      "output": "Timed out while processing the response."
+    },
+    {
+      "name": "timeout-unknown-phase",
+      "input": {
+        "error": "t",
+        "code": "timeout",
+        "phase": "unknown",
+        "retryable": true,
+        "timeoutMs": 20000,
+        "url": "u",
+        "contentLength": 5368709120,
+        "downloadedBytes": 524288
+      },
+      "output": "The request timed out."
+    },
+    {
+      "name": "download-error",
+      "input": {
+        "error": "Unable to create a unique temp file for u",
+        "code": "download_error",
+        "phase": "loading",
+        "retryable": true,
+        "timeoutMs": 9000,
+        "url": "u",
+        "mimeType": "application/zip",
+        "contentLength": 1024,
+        "downloadedBytes": 1024
+      },
+      "output": "The file could not be saved locally."
+    },
+    {
+      "name": "no-content",
+      "input": {
+        "error": "No content extracted from u.",
+        "code": "no_content",
+        "phase": "processing",
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "No readable content could be extracted from the page."
+    },
+    {
+      "name": "unexpected-response",
+      "input": {
+        "error": "Not a JSON response (content-type: text/html)",
+        "code": "unexpected_response",
+        "phase": "loading",
+        "retryable": false,
+        "url": "u",
+        "timeoutMs": 15000
+      },
+      "output": "The response format was unexpected."
+    },
+    {
+      "name": "network-retryable",
+      "input": {
+        "error": "Request failed while fetching u: x",
+        "code": "network_error",
+        "phase": "unknown",
+        "retryable": true,
+        "url": "u"
+      },
+      "output": "The request failed before a usable response was returned."
+    },
+    {
+      "name": "network-dns-summary",
+      "input": {
+        "error": "DNS error: failed to lookup address for host.",
+        "code": "network_error",
+        "retryable": false,
+        "url": "u"
+      },
+      "output": "DNS error — could not resolve the hostname."
+    },
+    {
+      "name": "error-only",
+      "input": {
+        "error": "Invalid JSON response"
+      },
+      "output": "Invalid JSON response"
+    }
+  ],
+  "batchResponseText": [
+    {
+      "name": "mixed-batch",
+      "input": {
+        "verbose": true,
+        "result": {
+          "items": [
+            {
+              "index": 0,
+              "request": {
+                "url": "https://ex.com/a"
+              },
+              "status": "done",
+              "progress": 1,
+              "result": {
+                "kind": "content",
+                "url": "https://ex.com/a",
+                "finalUrl": "https://ex.com/final",
+                "title": "T",
+                "author": "A",
+                "published": "2026-01-01",
+                "site": "ex.com",
+                "language": "en",
+                "wordCount": 42,
+                "content": "body",
+                "browser": "chrome_145",
+                "os": "windows"
+              }
+            },
+            {
+              "index": 1,
+              "request": {
+                "url": "bad"
+              },
+              "status": "error",
+              "progress": 1,
+              "error": "Error: Invalid URL: bad"
+            },
+            {
+              "index": 2,
+              "request": {
+                "url": "https://ex.com/c"
+              },
+              "status": "error",
+              "progress": 1,
+              "error": "Error: Server returned HTTP 500 Internal Server Error for https://ex.com/c.\n\nThe server failed while processing the request. Retrying later may help."
+            }
+          ],
+          "total": 3,
+          "succeeded": 1,
+          "failed": 2,
+          "batchConcurrency": 8
+        }
+      },
+      "output": "> Requests: 3\n> Succeeded: 1\n> Failed: 2\n> Concurrency: 8\n\n## [1/3] https://ex.com/final\n> URL: https://ex.com/final\n> Title: T\n> Author: A\n> Published: 2026-01-01\n> Site: ex.com\n> Language: en\n> Words: 42\n> Browser: chrome_145/windows\n\nbody\n\n## [2/3] bad\n> URL: bad\n> Status: error\n> Error: Invalid URL: bad\n\n## [3/3] https://ex.com/c\nError: Server returned HTTP 500 Internal Server Error for https://ex.com/c.\n\nThe server failed while processing the request. Retrying later may help."
+    }
+  ]
+}

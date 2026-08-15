@@ -1,0 +1,11 @@
+{
+  "name": "rpi-smart-fetch",
+  "version": "0.1.0",
+  "description": "Fingerprinted web fetch extension: `web_fetch` tool with browser-grade TLS/HTTP2 emulation (wreq), readability extraction (dom_smoothie [VARIANT]) with a 1:1 DOM fallback chain, five output formats and a structured error model.",
+  "native": "librpi_ext_smart_fetch.so",
+  "capabilities": [
+    "tools",
+    "session"
+  ],
+  "rpiAbi": 1
+}

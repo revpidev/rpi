@@ -1,0 +1,83 @@
+{
+  "resolveFetchToolDefaults": [
+    {
+      "name": "empty",
+      "input": {},
+      "output": {
+        "maxChars": 50000,
+        "timeoutMs": 15000,
+        "browser": "chrome_145",
+        "os": "windows",
+        "removeImages": false,
+        "includeReplies": "extractors",
+        "batchConcurrency": 8
+      }
+    },
+    {
+      "name": "full",
+      "input": {
+        "maxChars": 1000,
+        "timeoutMs": 2000,
+        "browser": "firefox_147",
+        "os": "macos",
+        "removeImages": true,
+        "includeReplies": false,
+        "batchConcurrency": 4
+      },
+      "output": {
+        "maxChars": 1000,
+        "timeoutMs": 2000,
+        "browser": "firefox_147",
+        "os": "macos",
+        "removeImages": true,
+        "includeReplies": false,
+        "batchConcurrency": 4
+      }
+    },
+    {
+      "name": "concurrency-fraction",
+      "input": {
+        "batchConcurrency": 3.7
+      },
+      "output": {
+        "maxChars": 50000,
+        "timeoutMs": 15000,
+        "browser": "chrome_145",
+        "os": "windows",
+        "removeImages": false,
+        "includeReplies": "extractors",
+        "batchConcurrency": 3
+      }
+    },
+    {
+      "name": "concurrency-zero",
+      "input": {
+        "batchConcurrency": 0
+      },
+      "output": {
+        "maxChars": 50000,
+        "timeoutMs": 15000,
+        "browser": "chrome_145",
+        "os": "windows",
+        "removeImages": false,
+        "includeReplies": "extractors",
+        "batchConcurrency": 8
+      }
+    },
+    {
+      "name": "concurrency-negative",
+      "input": {
+        "batchConcurrency": -2
+      },
+      "output": {
+        "maxChars": 50000,
+        "timeoutMs": 15000,
+        "browser": "chrome_145",
+        "os": "windows",
+        "removeImages": false,
+        "includeReplies": "extractors",
+        "batchConcurrency": 1
+      }
+    }
+  ]
+}

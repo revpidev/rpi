@@ -1,0 +1,57 @@
+[package]
+name = "rpi-ext-smart-fetch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# L0 native extension plugin (delegation-free fetch): rlib for in-process
+# tests, cdylib is the distributed artifact loaded by rpi-ext-host
+# (design §2.1, TE06).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# URL parsing/validation (extract.ts `new URL` semantics) across the pipeline.
+url.workspace = true
+# meta-refresh scan, deburr whitelist chain, markdown/text transforms.
+regex.workspace = true
+
+# Browser TLS/HTTP2 fingerprint stack (design §3.1). Upstream wreq-js 2.3.1
+# rides the wreq 6.0.0-rc engine line; the 5.x stable line tops out at
+# chrome_137 and does NOT cover the pinned default `chrome_145` profile —
+# version ↔ profile coverage matrix is recorded in the TE06 task file.
+# socks: FR-P0-4 socks5 proxy; gzip/brotli/deflate/zstd: transparent response
+# decompression to match wreq-js behavior.
+wreq = { version = "6.0.0-rc.29", features = ["socks", "gzip", "brotli", "deflate", "zstd"] }
+wreq-util = { version = "3.0.0-rc.14", features = ["emulation-serde"] }
+
+# Extraction engine (design §3.2, declared [VARIANT]): Readability port whose
+# TextMode::Markdown natively serializes the cleaned article to markdown
+# (no separate html→markdown crate needed).
+dom_smoothie = "0.18"
+# HTML5-tolerant DOM for the 1:1 DOM fallback chain, alternate links and
+# textContent fallback (design §3.3).
+scraper = "0.24"
+# lodash deburr stand-in (design §3.4): ASCII folding + upstream whitelist
+# regex chain; drift cases go into fixtures.
+deunicode = "1"
+# MIME→extension mapping for download filenames (design §3.4; differences
+# against upstream `mime-types` patched in download.rs).
+mime_guess = "2"
+# Download filename UUID fallback (extract.ts randomUUID()).
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+# Host-integration smoke (tests/l0_load.rs): drives the cdylib through the
+# real NativeExtensionHost (same dev-dependency shape as rpi-ext-subagents).
+rpi-ext-host.workspace = true
+rpi-ai.workspace = true

@@ -1,0 +1,26 @@
+{
+  "_comment": "TE06 FR-P0-3 manual fingerprint acceptance (design §5.4): chrome_145/windows profile against tls.peet.ws from both stacks on 2026-08-15. Re-run when wreq is upgraded: scripts/smart-fetch-parity/README.md. Not a CI gate.",
+  "upstream": {
+    "stack": "wreq-js 2.3.1 (npm, bundled wreq 6.0.0-rc engine, linux-x64-gnu napi)",
+    "profile": "chrome_145/windows",
+    "tls_ja3_hash": "a441e7ff35c32ebb0c1251892e0228e0",
+    "tls_ja4": "t13d1516h2_8daaf6152771_d8a2da3f94cd",
+    "tls_peetprint_hash": "1d4ffe9b0e34acac0bd883fa7f79d7b5",
+    "http2_akamai_fingerprint_hash": "52d84b11737d980aef856699f885ca86"
+  },
+  "rpi": {
+    "stack": "wreq 6.0.0-rc.29 + wreq-util 3.0.0-rc.14 (crates.io, linux x86_64)",
+    "profile": "chrome_145/windows",
+    "tls_ja3_hash": "b3329f3d337e8a426533b21a764edbb7",
+    "tls_ja4": "t13d1516h2_8daaf6152771_d8a2da3f94cd",
+    "tls_peetprint_hash": "1d4ffe9b0e34acac0bd883fa7f79d7b5",
+    "http2_akamai_fingerprint_hash": "52d84b11737d980aef856699f885ca86"
+  },
+  "verdict": {
+    "ja4_identical": true,
+    "peetprint_identical": true,
+    "http2_identical": true,
+    "ja3_differs": "engine point-release drift in TLS extension ordering between the 2.3.1-bundled engine and crates.io 6.0.0-rc.29; JA4 (order-insensitive modern standard), the TLS peetprint and the full HTTP2 SETTINGS/priority fingerprint match byte-for-byte",
+    "distinguishable_from_default_stack": "the emulated JA4 t13d1516h2_8daaf6152771_d8a2da3f94cd and Chrome-145 header set (sec-ch-ua v=145, Chrome UA string — asserted server-side in tests/mock_server.rs) are structurally distinct from a rustls/default-stack client (different cipher-suite set and order, no sec-ch-ua headers)"
+  }
+}

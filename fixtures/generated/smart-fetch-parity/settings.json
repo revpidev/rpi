@@ -1,0 +1,56 @@
+{
+  "resolvePiSmartFetchSettings": [
+    {
+      "name": "both-empty",
+      "input": {
+        "global": {},
+        "project": {}
+      },
+      "output": {
+        "verboseByDefault": false,
+        "tempDir": "<TMPDIR>/smart-fetch-pi"
+      }
+    },
+    {
+      "name": "aliases-and-guards",
+      "input": {
+        "global": {
+          "webFetchVerboseByDefault": true,
+          "smartFetchDefaultMaxChars": "bad",
+          "webFetchDefaultMaxChars": 8000,
+          "smartFetchDefaultOs": "Haiku",
+          "smartFetchTempDir": " "
+        },
+        "project": {
+          "smartFetchDefaultOs": "ios",
+          "smartFetchDefaultIncludeReplies": false
+        }
+      },
+      "output": {
+        "verboseByDefault": true,
+        "maxChars": 8000,
+        "os": "ios",
+        "includeReplies": false,
+        "tempDir": "<TMPDIR>/smart-fetch-pi"
+      }
+    },
+    {
+      "name": "project-overrides",
+      "input": {
+        "global": {
+          "smartFetchDefaultMaxChars": 1000,
+          "smartFetchDefaultBrowser": "chrome_140"
+        },
+        "project": {
+          "smartFetchDefaultMaxChars": 2000
+        }
+      },
+      "output": {
+        "verboseByDefault": false,
+        "maxChars": 2000,
+        "browser": "chrome_140",
+        "tempDir": "<TMPDIR>/smart-fetch-pi"
+      }
+    }
+  ]
+}
