@@ -1,0 +1,1136 @@
+[
+  {
+    "name": "three-items-mixed-outcomes",
+    "input": {
+      "requests": [
+        {
+          "url": "https://ex.com/a"
+        },
+        {
+          "url": "https://ex.com/missing"
+        },
+        {
+          "url": "https://ex.com/doc"
+        }
+      ],
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "first body"
+        },
+        {
+          "status": 404,
+          "statusText": "Not Found",
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "gone"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "third body"
+        }
+      ],
+      "defuddleResult": {
+        "wordCount": 0
+      }
+    },
+    "output": {
+      "snapshots": [
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 1,
+          "succeeded": 1,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 1,
+          "succeeded": 1,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 1,
+          "succeeded": 1,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "Server responded with 404 Not Found"
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 2,
+          "succeeded": 1,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "Server responded with 404 Not Found"
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 2,
+          "succeeded": 1,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "Server responded with 404 Not Found"
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 2,
+          "succeeded": 1,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "Server responded with 404 Not Found"
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 2,
+          "succeeded": 1,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/a",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/missing",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "Server responded with 404 Not Found"
+            },
+            {
+              "index": 2,
+              "url": "https://ex.com/doc",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 3,
+          "completed": 3,
+          "succeeded": 2,
+          "failed": 1,
+          "batchConcurrency": 1
+        }
+      ],
+      "result": {
+        "items": [
+          {
+            "index": 0,
+            "request": {
+              "url": "https://ex.com/a",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "done",
+            "progress": 1,
+            "result": {
+              "kind": "content",
+              "url": "https://ex.com/a",
+              "finalUrl": "https://ex.com/a",
+              "title": "",
+              "author": "",
+              "published": "",
+              "site": "ex.com",
+              "language": "",
+              "wordCount": 2,
+              "content": "first body",
+              "browser": "chrome_145",
+              "os": "windows"
+            }
+          },
+          {
+            "index": 1,
+            "request": {
+              "url": "https://ex.com/missing",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "error",
+            "progress": 1,
+            "error": "Error: Server returned HTTP 404 Not Found for https://ex.com/missing.\n\n> URL: https://ex.com/missing\n> Final URL: https://ex.com/missing\n> Phase: downloading the response body\n> Timeout: 15000ms (15s)\n> HTTP status: 404 Not Found\n> Mime type: text/html"
+          },
+          {
+            "index": 2,
+            "request": {
+              "url": "https://ex.com/doc",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "done",
+            "progress": 1,
+            "result": {
+              "kind": "content",
+              "url": "https://ex.com/doc",
+              "finalUrl": "https://ex.com/doc",
+              "title": "",
+              "author": "",
+              "published": "",
+              "site": "ex.com",
+              "language": "",
+              "wordCount": 2,
+              "content": "third body",
+              "browser": "chrome_145",
+              "os": "windows"
+            }
+          }
+        ],
+        "total": 3,
+        "succeeded": 2,
+        "failed": 1,
+        "batchConcurrency": 1
+      }
+    }
+  },
+  {
+    "name": "attachment-with-content-length",
+    "input": {
+      "requests": [
+        {
+          "url": "https://ex.com/data.bin",
+          "tempDir": "/tmp/smart-fetch-parity-downloads"
+        }
+      ],
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/octet-stream",
+            "content-length": "9"
+          },
+          "body": "123456789",
+          "stream": true
+        }
+      ],
+      "defuddleResult": {
+        "wordCount": 0
+      }
+    },
+    "output": {
+      "snapshots": [
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/data.bin",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 1,
+          "succeeded": 1,
+          "failed": 0,
+          "batchConcurrency": 1
+        }
+      ],
+      "result": {
+        "items": [
+          {
+            "index": 0,
+            "request": {
+              "url": "https://ex.com/data.bin",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "done",
+            "progress": 1,
+            "result": {
+              "kind": "file",
+              "url": "https://ex.com/data.bin",
+              "finalUrl": "https://ex.com/data.bin",
+              "title": "",
+              "author": "",
+              "published": "",
+              "site": "ex.com",
+              "language": "",
+              "wordCount": 0,
+              "content": "",
+              "browser": "chrome_145",
+              "os": "windows",
+              "filePath": "<FILE>",
+              "fileSize": 9,
+              "mimeType": "application/octet-stream"
+            }
+          }
+        ],
+        "total": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "batchConcurrency": 1
+      }
+    }
+  },
+  {
+    "name": "transport-error-item",
+    "input": {
+      "requests": [
+        {
+          "url": "https://no-such-host.example.com/x"
+        },
+        {
+          "url": "https://ex.com/ok"
+        }
+      ],
+      "fetchScript": [
+        {
+          "throw": {
+            "message": "getaddrinfo ENOTFOUND no-such-host.example.com: dns error"
+          }
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "fine"
+        }
+      ],
+      "defuddleResult": {
+        "wordCount": 0
+      }
+    },
+    "output": {
+      "snapshots": [
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "DNS error — could not resolve the hostname."
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "DNS error — could not resolve the hostname."
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "DNS error — could not resolve the hostname."
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "DNS error — could not resolve the hostname."
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 1,
+          "succeeded": 0,
+          "failed": 1,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://no-such-host.example.com/x",
+              "status": "error",
+              "progress": 1,
+              "statusStartedAt": 0,
+              "error": "DNS error — could not resolve the hostname."
+            },
+            {
+              "index": 1,
+              "url": "https://ex.com/ok",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 2,
+          "completed": 2,
+          "succeeded": 1,
+          "failed": 1,
+          "batchConcurrency": 1
+        }
+      ],
+      "result": {
+        "items": [
+          {
+            "index": 0,
+            "request": {
+              "url": "https://no-such-host.example.com/x",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "error",
+            "progress": 1,
+            "error": "Error: DNS error: failed to lookup address for no-such-host.example.com. Check the URL and try again."
+          },
+          {
+            "index": 1,
+            "request": {
+              "url": "https://ex.com/ok",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "done",
+            "progress": 1,
+            "result": {
+              "kind": "content",
+              "url": "https://ex.com/ok",
+              "finalUrl": "https://ex.com/ok",
+              "title": "",
+              "author": "",
+              "published": "",
+              "site": "ex.com",
+              "language": "",
+              "wordCount": 1,
+              "content": "fine",
+              "browser": "chrome_145",
+              "os": "windows"
+            }
+          }
+        ],
+        "total": 2,
+        "succeeded": 1,
+        "failed": 1,
+        "batchConcurrency": 1
+      }
+    }
+  },
+  {
+    "name": "extraction-item",
+    "input": {
+      "requests": [
+        {
+          "url": "https://ex.com/article"
+        }
+      ],
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ],
+      "defuddleResult": {
+        "content": "Extracted body.",
+        "wordCount": 2
+      }
+    },
+    "output": {
+      "snapshots": [
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "queued",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "connecting",
+              "progress": 0,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "loading",
+              "progress": 0.51,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "loading",
+              "progress": 0.95,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "processing",
+              "progress": 0.96,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "processing",
+              "progress": 0.96,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 0,
+          "succeeded": 0,
+          "failed": 0,
+          "batchConcurrency": 1
+        },
+        {
+          "items": [
+            {
+              "index": 0,
+              "url": "https://ex.com/article",
+              "status": "done",
+              "progress": 1,
+              "statusStartedAt": 0
+            }
+          ],
+          "total": 1,
+          "completed": 1,
+          "succeeded": 1,
+          "failed": 0,
+          "batchConcurrency": 1
+        }
+      ],
+      "result": {
+        "items": [
+          {
+            "index": 0,
+            "request": {
+              "url": "https://ex.com/article",
+              "browser": "chrome_145",
+              "os": "windows",
+              "maxChars": 50000,
+              "format": "markdown",
+              "removeImages": false,
+              "includeReplies": "extractors",
+              "timeoutMs": 15000
+            },
+            "status": "done",
+            "progress": 1,
+            "result": {
+              "kind": "content",
+              "url": "https://ex.com/article",
+              "finalUrl": "https://ex.com/article",
+              "title": "",
+              "author": "",
+              "published": "",
+              "site": "",
+              "language": "",
+              "wordCount": 2,
+              "content": "Extracted body.",
+              "browser": "chrome_145",
+              "os": "windows"
+            }
+          }
+        ],
+        "total": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "batchConcurrency": 1
+      }
+    }
+  }
+]

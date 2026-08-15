@@ -3147,6 +3147,7 @@ dependencies = [
  "futures",
  "mime_guess",
  "regex",
+ "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
  "scraper",

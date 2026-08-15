@@ -631,11 +631,62 @@ fn default_transport(request: HttpRequest) -> futures_boxed::BoxedFetch {
     futures_boxed::boxed(fetch_owned(request))
 }
 
+// ===== execution hooks (FR-P2-A, types.ts:207-216) =====
+
+/// `FetchProgressUpdate` (types.ts:207-211). `phase` is the pipeline
+/// position label every upstream emit site carries (event type name or
+/// terminal marker).
+#[derive(Debug, Clone)]
+pub struct FetchProgressUpdate {
+    pub status: &'static str,
+    pub progress: f64,
+    pub phase: &'static str,
+}
+
+/// `FetchExecutionHooks` (types.ts:213-216): the progress-event seam. The
+/// execute layer plugs toolUpdate streaming in (FR-P2-B), the parity
+/// harness an event collector; `None` hooks (default) keep the pipeline
+/// silent. `Arc<dyn Fn>` so recursive hops and batch workers can share one
+/// sink.
+/// The `onStatusChange` callback shape (types.ts:214).
+pub type StatusChangeFn = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+/// The `onProgressChange` callback shape (types.ts:215).
+pub type ProgressChangeFn = std::sync::Arc<dyn Fn(&FetchProgressUpdate) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct FetchExecutionHooks {
+    pub on_status_change: Option<StatusChangeFn>,
+    pub on_progress_change: Option<ProgressChangeFn>,
+}
+
+impl FetchExecutionHooks {
+    /// `emitStatus` (extract.ts:633-637).
+    fn emit_status(&self, status: &'static str) {
+        if let Some(callback) = &self.on_status_change {
+            callback(status);
+        }
+    }
+
+    /// `emitProgress` (extract.ts:626-630). Crate-visible: the download
+    /// branch emits per-chunk `body_progress` frames (FR-P2-A).
+    pub(crate) fn emit_progress(&self, status: &'static str, progress: f64, phase: &'static str) {
+        if let Some(callback) = &self.on_progress_change {
+            callback(&FetchProgressUpdate {
+                status,
+                progress,
+                phase,
+            });
+        }
+    }
+}
+
 /// The fetch pipeline with a pluggable extractor and transport. The default
 /// engine is `dom_smoothie` ([VARIANT], design §3.2).
 pub struct FetchPipeline {
     pub extractor: Box<dyn Extractor>,
     pub transport: TransportFn,
+    /// Progress-event sink (FR-P2-A); default silent.
+    pub hooks: FetchExecutionHooks,
 }
 
 impl Default for FetchPipeline {
@@ -643,15 +694,39 @@ impl Default for FetchPipeline {
         FetchPipeline {
             extractor: Box::new(DomSmoothieExtractor),
             transport: std::sync::Arc::new(default_transport),
+            hooks: FetchExecutionHooks::default(),
+        }
+    }
+}
+
+impl FetchPipeline {
+    /// Default engines with an explicit hook sink (the execute layer's
+    /// streaming pipeline; FR-P2-B).
+    pub fn with_hooks(hooks: FetchExecutionHooks) -> Self {
+        FetchPipeline {
+            hooks,
+            ..FetchPipeline::default()
         }
     }
 }
 
 impl FetchPipeline {
     /// `defuddleFetch` entry (extract.ts:1704-1709): recursion budgets start
-    /// at zero.
+    /// at zero, the pipeline's own hook sink serves.
     pub async fn fetch(&self, opts: &crate::types::FetchOptions) -> FetchOutcome {
-        self.fetch_inner(opts, 0, 0).await
+        self.fetch_with_hooks(opts, &self.hooks).await
+    }
+
+    /// `executeFetchToolCall` shape (tool.ts:157-163): an explicit hook sink
+    /// overrides the pipeline's — the batch worker pool builds per-item
+    /// hooks (upstream passes per-item `FetchExecutionHooks` into
+    /// `executeItem`, tool.ts:285-294).
+    pub async fn fetch_with_hooks(
+        &self,
+        opts: &crate::types::FetchOptions,
+        hooks: &FetchExecutionHooks,
+    ) -> FetchOutcome {
+        self.fetch_inner(opts, 0, 0, hooks).await
     }
 
     /// `fetchWithClientRedirects` with recursion budgets
@@ -663,12 +738,14 @@ impl FetchPipeline {
         opts: &'a crate::types::FetchOptions,
         client_side_redirect_count: u32,
         alternate_link_fallback_count: u32,
+        hooks: &'a FetchExecutionHooks,
     ) -> futures_boxed::BoxedOutcome<'a> {
         futures_boxed::boxed_outcome(async move {
             self.fetch_step(
                 opts,
                 client_side_redirect_count,
                 alternate_link_fallback_count,
+                hooks,
             )
             .await
         })
@@ -679,6 +756,7 @@ impl FetchPipeline {
         opts: &crate::types::FetchOptions,
         client_side_redirect_count: u32,
         alternate_link_fallback_count: u32,
+        hooks: &FetchExecutionHooks,
     ) -> FetchOutcome {
         let browser = opts
             .browser
@@ -742,13 +820,30 @@ impl FetchPipeline {
 
         let mut context = FetchErrorContext::new(&opts.url, timeout_ms);
 
+        // FR-P2-A (extract.ts:1194): the pipeline-open progress event.
+        // Upstream emits before the transport call; URL/protocol rejections
+        // above never reach it (they sit outside the try block).
+        hooks.emit_progress("connecting", 0.0, "fetch_start");
+
         // FR-P0-5/6 transport + status handling (extract.ts:1230-1256).
         let response = match (self.transport)(request).await {
             Ok(response) => response,
             Err(failure) => {
+                // extract.ts:1698-1699 (catch): transport throws emit the
+                // terminal error pair. return-path errors (below) never do.
+                hooks.emit_status("error");
+                hooks.emit_progress("error", 1.0, "error");
                 return FetchOutcome::Error(map_fetch_failure(&failure, &context));
             }
         };
+
+        // FR-P2-A (TE-D27): the engine event stream (wreq-js
+        // onRequestEvent) is unreachable, so response arrival approximates
+        // the `response_headers` event (mapRequestEventToProgress). The
+        // event also advances the error-context phase (extract.ts:1219-1224:
+        // response_headers/body_progress/body_complete → loading).
+        context.phase = FetchErrorPhase::Loading;
+        hooks.emit_progress("loading", 0.51, "response_headers");
 
         context.final_url = Some(response.final_url.clone());
         context.status_code = Some(response.status);
@@ -796,7 +891,12 @@ impl FetchPipeline {
             || !is_textual_content_type(&content_type);
         if should_download_to_file {
             context.phase = FetchErrorPhase::Loading;
-            return crate::download::build_file_result(
+            // FR-P2-A (TE-D27): per-chunk `body_progress` approximation on
+            // the download path only (FR-P2-A scope); the terminal events
+            // mirror extract.ts:1278-1283 (`file_done` on success — a file
+            // error returns silently) and the catch pair on failure.
+            let content_length = context.content_length;
+            let outcome = crate::download::build_file_result(
                 &opts.url,
                 response.body,
                 &final_url,
@@ -806,8 +906,22 @@ impl FetchPipeline {
                 &os,
                 opts.temp_dir.as_deref(),
                 &context,
+                hooks,
+                content_length,
             )
             .await;
+            match &outcome {
+                FetchOutcome::Result(_) => {
+                    hooks.emit_progress("loading", 0.95, "body_complete");
+                    hooks.emit_status("done");
+                    hooks.emit_progress("done", 1.0, "file_done");
+                }
+                FetchOutcome::Error(_) => {
+                    hooks.emit_status("error");
+                    hooks.emit_progress("error", 1.0, "error");
+                }
+            }
+            return outcome;
         }
 
         context.phase = FetchErrorPhase::Loading;
@@ -815,7 +929,9 @@ impl FetchPipeline {
             Ok(body) => body,
             Err(error) => {
                 // Body-read failures classify like upstream's transport
-                // throws (extract.ts:1696-1701).
+                // throws (extract.ts:1696-1701) — the catch pair fires.
+                hooks.emit_status("error");
+                hooks.emit_progress("error", 1.0, "error");
                 let failure = http::FetchFailure::Transport {
                     failure: http::classify_transport_error(&error),
                     final_url: Some(final_url.clone()),
@@ -823,6 +939,11 @@ impl FetchPipeline {
                 return FetchOutcome::Error(map_fetch_failure(&failure, &context));
             }
         };
+
+        // FR-P2-A (TE-D27): buffered-read completion approximates the
+        // `body_complete` event; the text pipeline is two-valued
+        // (0.51 → 0.95, no per-chunk frames).
+        hooks.emit_progress("loading", 0.95, "body_complete");
 
         // FR-P1-2 meta refresh (extract.ts:1290-1312): applies to every
         // format (the check precedes the raw/json branches upstream).
@@ -852,6 +973,7 @@ impl FetchPipeline {
                     &opts.with_url(redirect_target),
                     client_side_redirect_count + 1,
                     alternate_link_fallback_count,
+                    hooks,
                 )
                 .await;
         }
@@ -873,6 +995,8 @@ impl FetchPipeline {
                 .unwrap_or_default();
             result.content_type =
                 Some(normalize_content_type(&content_type)).filter(|mime| !mime.is_empty());
+            hooks.emit_status("done");
+            hooks.emit_progress("done", 1.0, "raw_done");
             return FetchOutcome::Result(result);
         }
 
@@ -900,6 +1024,7 @@ impl FetchPipeline {
                                 &opts.with_url(alternate_links[0].clone()),
                                 client_side_redirect_count,
                                 alternate_link_fallback_count + 1,
+                                hooks,
                             )
                             .await;
                     }
@@ -924,7 +1049,11 @@ impl FetchPipeline {
             return match build_json_result(
                 &opts.url, &final_url, &raw_body, format, max_chars, &browser, &os,
             ) {
-                Ok(result) => FetchOutcome::Result(result),
+                Ok(result) => {
+                    hooks.emit_status("done");
+                    hooks.emit_progress("done", 1.0, "json_done");
+                    FetchOutcome::Result(result)
+                }
                 Err(error) => FetchOutcome::Error(error),
             };
         }
@@ -934,12 +1063,18 @@ impl FetchPipeline {
             return match build_json_result(
                 &opts.url, &final_url, &raw_body, format, max_chars, &browser, &os,
             ) {
-                Ok(result) => FetchOutcome::Result(result),
+                Ok(result) => {
+                    hooks.emit_status("done");
+                    hooks.emit_progress("done", 1.0, "json_done");
+                    FetchOutcome::Result(result)
+                }
                 Err(error) => FetchOutcome::Error(error),
             };
         }
 
         if is_plain_text_content_type(&content_type) {
+            hooks.emit_status("done");
+            hooks.emit_progress("done", 1.0, "plain_text_done");
             return FetchOutcome::Result(build_plain_text_result(
                 &opts.url, &final_url, &raw_body, format, max_chars, &browser, &os,
             ));
@@ -969,6 +1104,9 @@ impl FetchPipeline {
         // FR-P0-7 extraction (extract.ts:1514-1643) with the FR-P1-3 alternate
         // fallbacks (extract.ts:1521-1543, 1617-1655).
         context.phase = FetchErrorPhase::Processing;
+        // extract.ts:1515-1520: the extracting pair precedes the DOM work.
+        hooks.emit_status("processing");
+        hooks.emit_progress("processing", 0.96, "extracting");
         // All DOM work happens up front: scraper's `Html` is not `Send`
         // (non-atomic tendril counters), so the documents are dropped before
         // any recursive await. Upstream parses two same-source documents
@@ -999,6 +1137,7 @@ impl FetchPipeline {
                     &opts.with_url(alternate_links[0].clone()),
                     client_side_redirect_count,
                     alternate_link_fallback_count + 1,
+                    hooks,
                 )
                 .await,
             )
@@ -1110,6 +1249,9 @@ impl FetchPipeline {
         result.published = extracted.published.clone().unwrap_or_default();
         result.site = extracted.site.clone().unwrap_or_default();
         result.language = extracted.language.clone().unwrap_or_default();
+        // extract.ts:1693-1694: the extraction-success terminal pair.
+        hooks.emit_status("done");
+        hooks.emit_progress("done", 1.0, "done");
         FetchOutcome::Result(result)
     }
 }

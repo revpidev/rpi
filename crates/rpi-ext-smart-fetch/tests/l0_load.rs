@@ -336,6 +336,298 @@ async fn l0_load_capability_denied_and_full_surface() {
         result.details
     );
 
+    // 8. FR-P2-B/D: toolUpdate streams partial frames (ADR-0015 sink → the
+    // on_update callback here). A local mock responder answers in
+    // milliseconds, so spinner ticks are not asserted (time-dependent) —
+    // the EVENT frames are: fetch_start(connecting) → response_headers
+    // (loading 0.51) → body_complete (0.95) → done(1).
+    let server = common::Responder::start(vec![(
+        "200 OK".to_string(),
+        vec![("Content-Type", "text/plain".to_string())],
+        "streamed body".to_string(),
+    )]);
+    let frames: std::sync::Arc<std::sync::Mutex<Vec<rpi_agent::types::AgentToolResult>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frames_for_update = std::sync::Arc::clone(&frames);
+    let request = rpi_ext_host::types::ToolExecuteRequest {
+        tool_call_id: "l0-stream".to_owned(),
+        params: serde_json::json!({ "url": server.url("/doc") }),
+        signal: tokio_util::sync::CancellationToken::new(),
+        on_update: Some(Box::new(move |update| {
+            frames_for_update.lock().unwrap().push(update);
+        })),
+    };
+    let result = (definition.execute)(request, host.core().create_context())
+        .await
+        .expect("streaming web_fetch executes");
+    // Clone the frames out under a short-lived guard (clippy: never hold a
+    // std MutexGuard across the batch await further down).
+    let frames: Vec<_> = frames.lock().unwrap().clone();
+    assert!(frames.len() >= 3, "event frames arrived: {}", frames.len());
+    for frame in frames.iter() {
+        let text = frame
+            .content
+            .iter()
+            .map(|block| match block {
+                rpi_ai::types::ToolResultContent::Text(text) => text.text.clone(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(
+            text.starts_with("Fetching http://127.0.0.1:"),
+            "frame text: {text}"
+        );
+        assert!(text.ends_with("..."), "frame text: {text}");
+    }
+    let statuses: Vec<String> = frames
+        .iter()
+        .map(|frame| {
+            frame
+                .details
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(statuses.first().map(String::as_str), Some("connecting"));
+    assert_eq!(statuses.last().map(String::as_str), Some("done"));
+    let mut monotonic = true;
+    for pair in frames.windows(2) {
+        let a = pair[0].details.get("progress").and_then(|p| p.as_f64());
+        let b = pair[1].details.get("progress").and_then(|p| p.as_f64());
+        if let (Some(a), Some(b)) = (a, b) {
+            monotonic &= b >= a;
+        }
+    }
+    assert!(monotonic, "progress monotonic: {statuses:?}");
+    // The terminal frame carries the spinnerTick field (time-dependent
+    // value, presence-only assertion).
+    assert!(result.details.get("spinnerTick").is_some());
+
+    // 9. FR-P2-C: batch progress snapshots stream through toolUpdate — the
+    // initial all-queued frame, per-item frames, and the terminal
+    // completed==total snapshot.
+    let server = common::Responder::start(vec![(
+        "200 OK".to_string(),
+        vec![("Content-Type", "text/plain".to_string())],
+        "batch streamed".to_string(),
+    )]);
+    let batch_frames: std::sync::Arc<std::sync::Mutex<Vec<rpi_agent::types::AgentToolResult>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let batch_frames_for_update = std::sync::Arc::clone(&batch_frames);
+    let request = rpi_ext_host::types::ToolExecuteRequest {
+        tool_call_id: "l0-batch-stream".to_owned(),
+        params: serde_json::json!({
+            "requests": [
+                { "url": server.url("/one") },
+                { "url": "not a url" },
+            ],
+        }),
+        signal: tokio_util::sync::CancellationToken::new(),
+        on_update: Some(Box::new(move |update| {
+            batch_frames_for_update.lock().unwrap().push(update);
+        })),
+    };
+    let result = (batch_definition.execute)(request, host.core().create_context())
+        .await
+        .expect("streaming batch executes");
+    let batch_frames: Vec<_> = batch_frames.lock().unwrap().clone();
+    assert!(
+        batch_frames.len() >= 3,
+        "batch frames arrived: {}",
+        batch_frames.len()
+    );
+    let first_text = batch_frames[0]
+        .content
+        .iter()
+        .map(|block| match block {
+            rpi_ai::types::ToolResultContent::Text(text) => text.text.clone(),
+            _ => String::new(),
+        })
+        .collect::<String>();
+    assert_eq!(
+        first_text, "Started batch fetch for 2 URLs (0/2 complete).",
+        "initial frame text"
+    );
+    let first_snapshot = batch_frames[0].details.get("batchProgress");
+    assert_eq!(
+        first_snapshot
+            .and_then(|p| p.get("items"))
+            .and_then(|items| items.get(0))
+            .and_then(|item| item.get("status")),
+        Some(&serde_json::json!("queued")),
+        "initial all-queued frame"
+    );
+    let last_snapshot = batch_frames
+        .last()
+        .unwrap()
+        .details
+        .get("batchProgress")
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(last_snapshot.get("completed"), Some(&serde_json::json!(2)));
+    assert_eq!(last_snapshot.get("total"), Some(&serde_json::json!(2)));
+    assert_eq!(last_snapshot.get("succeeded"), Some(&serde_json::json!(1)));
+    assert_eq!(last_snapshot.get("failed"), Some(&serde_json::json!(1)));
+    // The final result details keep the TE06/07 snapshot shape + spinnerTick.
+    assert!(result.details.get("spinnerTick").is_some());
+    assert_eq!(
+        result
+            .details
+            .get("batchProgress")
+            .and_then(|p| p.get("completed")),
+        Some(&serde_json::json!(2))
+    );
+
+    // 10. FR-P2-E: renderCall/renderResult produce ComponentTree v1 JSON
+    // through the host's render closure wiring (host_call.rs render arms
+    // carry the toolName so the two-tool dispatch resolves).
+    let render_call = definition.render_call.as_ref().expect("renderCall wired");
+    let context = rpi_ext_host::types::ToolRenderContext {
+        args: serde_json::json!({ "url": "https://example.com/x" }),
+        tool_call_id: "l0-render".to_owned(),
+        cwd: "/tmp".to_owned(),
+        execution_started: true,
+        args_complete: true,
+        is_partial: false,
+        expanded: false,
+        show_images: false,
+        is_error: false,
+    };
+    let call_tree = render_call(context).expect("renderCall returns a tree");
+    assert_eq!(call_tree["type"], serde_json::json!("text"));
+    assert_eq!(
+        call_tree["props"]["text"],
+        serde_json::json!("web_fetch https://example.com/x")
+    );
+
+    let render_result = definition
+        .render_result
+        .as_ref()
+        .expect("renderResult wired");
+    let partial_tree = render_result(
+        rpi_agent::types::AgentToolResult {
+            content: vec![],
+            details: serde_json::json!({
+                "status": "loading", "progress": 0.51,
+                "url": "https://example.com/x", "spinnerTick": 1,
+            }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        },
+        rpi_ext_host::types::ToolRenderResultOptions {
+            expanded: false,
+            is_partial: true,
+        },
+        rpi_ext_host::types::ToolRenderContext {
+            args: serde_json::json!({}),
+            tool_call_id: "l0-render".to_owned(),
+            cwd: "/tmp".to_owned(),
+            execution_started: true,
+            args_complete: true,
+            is_partial: true,
+            expanded: false,
+            show_images: false,
+            is_error: false,
+        },
+    )
+    .expect("partial renderResult returns a tree");
+    let partial_text = partial_tree["props"]["text"].as_str().unwrap_or_default();
+    assert!(
+        partial_text.contains('█'),
+        "progress bar glyphs: {partial_text}"
+    );
+
+    let final_tree = render_result(
+        rpi_agent::types::AgentToolResult {
+            content: vec![],
+            details: serde_json::json!({
+                "fetchResult": {
+                    "kind": "content",
+                    "title": "T",
+                    "content": "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9",
+                }
+            }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        },
+        rpi_ext_host::types::ToolRenderResultOptions {
+            expanded: false,
+            is_partial: false,
+        },
+        rpi_ext_host::types::ToolRenderContext {
+            args: serde_json::json!({}),
+            tool_call_id: "l0-render".to_owned(),
+            cwd: "/tmp".to_owned(),
+            execution_started: true,
+            args_complete: true,
+            is_partial: false,
+            expanded: false,
+            show_images: false,
+            is_error: false,
+        },
+    )
+    .expect("final renderResult returns a tree");
+    assert_eq!(final_tree["type"], serde_json::json!("column"));
+    let joined = serde_json::to_string(&final_tree).unwrap_or_default();
+    assert!(joined.contains("Title: T"), "metadata line: {joined}");
+    assert!(
+        joined.contains("(2 more lines, Ctrl+O to expand)"),
+        "collapse hint: {joined}"
+    );
+
+    let batch_render_result = batch_definition
+        .render_result
+        .as_ref()
+        .expect("batch renderResult wired");
+    let batch_tree = batch_render_result(
+        rpi_agent::types::AgentToolResult {
+            content: vec![],
+            details: serde_json::json!({
+                "batchProgress": {
+                    "items": [
+                        { "index": 0, "url": "https://ex.com/a", "status": "done", "progress": 1.0 },
+                        { "index": 1, "url": "https://ex.com/b", "status": "error", "progress": 1.0, "error": "boom" },
+                    ],
+                    "total": 2, "completed": 2, "succeeded": 1, "failed": 1,
+                    "batchConcurrency": 3,
+                },
+                "spinnerTick": 0,
+            }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        },
+        rpi_ext_host::types::ToolRenderResultOptions {
+            expanded: true,
+            is_partial: false,
+        },
+        rpi_ext_host::types::ToolRenderContext {
+            args: serde_json::json!({}),
+            tool_call_id: "l0-render".to_owned(),
+            cwd: "/tmp".to_owned(),
+            execution_started: true,
+            args_complete: true,
+            is_partial: false,
+            expanded: true,
+            show_images: false,
+            is_error: false,
+        },
+    )
+    .expect("batch renderResult returns a tree");
+    let joined = serde_json::to_string(&batch_tree).unwrap_or_default();
+    assert!(
+        joined.contains("batch_web_fetch 2/2 done · ok 1 · err 1 · concurrency 3"),
+        "batch summary: {joined}"
+    );
+    assert!(
+        joined.contains("error: boom"),
+        "expanded error line: {joined}"
+    );
+
     let _ = std::fs::remove_dir_all(package.parent().unwrap());
     let _ = std::fs::remove_dir_all(&sandbox);
 }

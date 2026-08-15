@@ -51,9 +51,13 @@ mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio.workspace = true
+# `test-util` gates `#[tokio::test(start_paused = true)]` for the
+# deterministic spinner-timing tests (FR-P2-D).
+tokio = { workspace = true, features = ["test-util"] }
 tokio-util.workspace = true
 # Host-integration smoke (tests/l0_load.rs): drives the cdylib through the
 # real NativeExtensionHost (same dev-dependency shape as rpi-ext-subagents).
 rpi-ext-host.workspace = true
 rpi-ai.workspace = true
+# l0 render-hook assertions construct AgentToolResult payloads.
+rpi-agent.workspace = true

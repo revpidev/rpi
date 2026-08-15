@@ -12,9 +12,10 @@ use crate::constants::{
     DEFAULT_BATCH_CONCURRENCY, DEFAULT_BROWSER, DEFAULT_MAX_CHARS, DEFAULT_OS, DEFAULT_TIMEOUT_MS,
 };
 use crate::format::{
-    build_fetch_error_response_text, build_fetch_response_text, build_header, HeaderValue,
+    build_fetch_error_response_text, build_fetch_response_text, build_header,
+    build_user_facing_fetch_error_summary, HeaderValue,
 };
-use crate::pipeline::FetchPipeline;
+use crate::pipeline::{FetchExecutionHooks, FetchPipeline};
 use crate::types::{
     FetchOptions, FetchOutcome, FetchResult, FetchToolConfig, FetchToolDefaults, IncludeReplies,
     OutputFormat, WebFetchParams,
@@ -222,15 +223,228 @@ pub fn batch_item_from_parse_failure(
     }
 }
 
+// ===== batch progress stream (FR-P2-C, tool.ts:165-216) =====
+
+/// `PROGRESS_BY_STATUS` (tool.ts:165-173) — done/error both render 1; the
+/// intermediate states never appear in a final snapshot.
+pub fn progress_by_status(status: &str) -> f64 {
+    match status {
+        "waiting" => 0.11,
+        "loading" => 0.51,
+        "processing" => 0.96,
+        "done" | "error" => 1.0,
+        // queued / connecting / unknown
+        _ => 0.0,
+    }
+}
+
+/// `BatchFetchItemProgress` (types.ts:91-98).
+#[derive(Debug, Clone)]
+pub struct BatchFetchItemProgress {
+    pub index: usize,
+    pub url: String,
+    pub status: String,
+    pub progress: f64,
+    pub status_started_at: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// `BatchFetchProgressSnapshot` (types.ts:109-116) — shallow-copied item
+/// list plus the derived counters (`buildProgressSnapshot`, tool.ts:188-216).
+#[derive(Debug, Clone)]
+pub struct BatchFetchProgressSnapshot {
+    pub items: Vec<BatchFetchItemProgress>,
+    pub total: u64,
+    pub completed: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub batch_concurrency: u64,
+}
+
+/// JSON number normalization: JS `JSON.stringify(0)` renders `0`, serde
+/// would render `0.0` for f64 — integral values serialize as integers so
+/// both sides compare equal.
+pub fn progress_json(value: f64) -> serde_json::Value {
+    if value.fract() == 0.0 && value.is_finite() {
+        json!(value as i64)
+    } else {
+        json!(value)
+    }
+}
+
+fn progress_item_json(item: &BatchFetchItemProgress) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    map.insert("index".to_string(), json!(item.index));
+    map.insert("url".to_string(), json!(item.url));
+    map.insert("status".to_string(), json!(item.status));
+    map.insert("progress".to_string(), progress_json(item.progress));
+    if let Some(started_at) = item.status_started_at {
+        map.insert("statusStartedAt".to_string(), json!(started_at));
+    }
+    if let Some(error) = &item.error {
+        map.insert("error".to_string(), json!(error));
+    }
+    serde_json::Value::Object(map)
+}
+
+impl BatchFetchProgressSnapshot {
+    /// The details payload shape (index.ts:701-707 rides this JSON under
+    /// `details.batchProgress`).
+    pub fn to_json(&self) -> serde_json::Value {
+        json!({
+            "items": self.items.iter().map(progress_item_json).collect::<Vec<_>>(),
+            "total": self.total,
+            "completed": self.completed,
+            "succeeded": self.succeeded,
+            "failed": self.failed,
+            "batchConcurrency": self.batch_concurrency,
+        })
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `createInitialProgressItems` (tool.ts:175-186) — the raw request array
+/// (JSON values, pre-parse) so malformed `url` fields render like upstream's
+/// `String(request.url ?? "")`.
+fn create_initial_progress_items(entries: &[serde_json::Value]) -> Vec<BatchFetchItemProgress> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| BatchFetchItemProgress {
+            index,
+            url: js_template_render(entry.get("url").unwrap_or(&serde_json::Value::Null)),
+            status: "queued".to_string(),
+            progress: progress_by_status("queued"),
+            status_started_at: Some(now_ms()),
+            error: None,
+        })
+        .collect()
+}
+
+/// `buildProgressSnapshot` (tool.ts:188-216).
+fn build_progress_snapshot(
+    items: &[BatchFetchItemProgress],
+    batch_concurrency: u64,
+) -> BatchFetchProgressSnapshot {
+    let mut completed = 0u64;
+    let mut succeeded = 0u64;
+    let mut failed = 0u64;
+    for item in items {
+        match item.status.as_str() {
+            "done" => {
+                completed += 1;
+                succeeded += 1;
+            }
+            "error" => {
+                completed += 1;
+                failed += 1;
+            }
+            _ => {}
+        }
+    }
+    BatchFetchProgressSnapshot {
+        items: items.to_vec(),
+        total: items.len() as u64,
+        completed,
+        succeeded,
+        failed,
+        batch_concurrency,
+    }
+}
+
+/// The shared progress table + snapshot sink (`progressItems` +
+/// `emitProgress`/`updateProgress`, tool.ts:237-265). The emit callback runs
+/// OUTSIDE the table lock (coding-standards §6.5 — the execute-layer sink
+/// makes a synchronous FFI `toolUpdate` call).
+pub type BatchProgressSink = Arc<dyn Fn(&BatchFetchProgressSnapshot) + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct BatchProgressState {
+    table: Arc<Mutex<Vec<BatchFetchItemProgress>>>,
+    batch_concurrency: Arc<u64>,
+    sink: Option<BatchProgressSink>,
+}
+
+impl BatchProgressState {
+    fn new(
+        items: Vec<BatchFetchItemProgress>,
+        batch_concurrency: u64,
+        sink: Option<BatchProgressSink>,
+    ) -> Self {
+        BatchProgressState {
+            table: Arc::new(Mutex::new(items)),
+            batch_concurrency: Arc::new(batch_concurrency),
+            sink,
+        }
+    }
+
+    /// The pre-worker initial frame (tool.ts:267) — all items queued.
+    fn emit_initial(&self) {
+        self.emit();
+    }
+
+    fn emit(&self) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let snapshot = {
+            let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            build_progress_snapshot(&table, *self.batch_concurrency)
+        };
+        sink(&snapshot);
+    }
+
+    /// `updateProgress` (tool.ts:246-265): status change, progress from the
+    /// table unless overridden (clamped), `statusStartedAt` kept when the
+    /// status is unchanged, error only set (never cleared).
+    fn update(&self, index: usize, status: &str, error: Option<String>, progress: Option<f64>) {
+        {
+            let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(item) = table.get_mut(index) else {
+                return;
+            };
+            let status_unchanged = item.status == status;
+            item.status = status.to_string();
+            item.progress = match progress {
+                Some(value) => value.clamp(0.0, 1.0),
+                None => progress_by_status(status),
+            };
+            if !status_unchanged {
+                item.status_started_at = Some(now_ms());
+            }
+            if let Some(error) = error {
+                item.error = Some(error);
+            }
+        }
+        self.emit();
+    }
+
+    /// `buildProgressSnapshot` over the live table (the execute layer reads
+    /// the latest state for spinner frames).
+    pub fn snapshot(&self) -> Option<BatchFetchProgressSnapshot> {
+        let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+        Some(build_progress_snapshot(&table, *self.batch_concurrency))
+    }
+}
+
 /// `executeBatchFetchToolCall` (tool.ts:218-348): a worker pool of
 /// `min(concurrency, len)` claim-next workers — bounded in-flight requests,
 /// per-item error isolation, results kept in input order (each worker writes
-/// by index). Progress snapshots ride only in the final result (the
-/// `on_update` ABI gap, design §1.3 #3).
-pub async fn execute_batch_fetch(
+/// by index). FR-P2-C: the per-item `FetchExecutionHooks` bridge into the
+/// shared progress table and every change emits a snapshot frame (the
+/// execute layer streams them through `toolUpdate`).
+pub async fn execute_batch_fetch_with_progress(
     pipeline: &FetchPipeline,
     requests: &[WebFetchParams],
     defaults: &FetchToolDefaults,
+    progress: Option<BatchProgressState>,
+    index_map: &[usize],
 ) -> BatchFetchResult {
     let worker_count = if requests.is_empty() {
         0
@@ -241,6 +455,10 @@ pub async fn execute_batch_fetch(
         Arc::new(Mutex::new((0..requests.len()).map(|_| None).collect()));
     let next_index = Arc::new(AtomicUsize::new(0));
 
+    // NOTE: the initial all-queued frame is the CALLER's (tool.ts:267 —
+    // `executeBatchFetchToolCall` emits once before the workers start);
+    // `execute_batch_entries` owns it here.
+
     // Upstream's `nextIndex` claim loop (tool.ts:269-333), one async worker
     // per slot polled concurrently — the single-threaded event-loop
     // concurrency profile of `Promise.all(Array.from(..., worker))`.
@@ -248,6 +466,7 @@ pub async fn execute_batch_fetch(
     for _ in 0..worker_count {
         let results = Arc::clone(&results);
         let next_index = Arc::clone(&next_index);
+        let progress = progress.clone();
         // Borrows pipeline/requests/defaults outlive the join below.
         workers.push(async move {
             loop {
@@ -255,15 +474,69 @@ pub async fn execute_batch_fetch(
                 if index >= requests.len() {
                     return;
                 }
+                // Progress-table coordinates are the INPUT positions; the
+                // pool only carries the well-formed requests, so its claim
+                // index maps back through `index_map` (identity for the
+                // parse-clean call path).
+                let global_index = index_map[index];
                 let request = &requests[index];
                 let opts = build_fetch_options_from_params(request, defaults);
-                let outcome = pipeline.fetch(&opts).await;
+                // The per-item hooks (tool.ts:285-294): `done` never reaches
+                // the table through the hooks (the terminal frame lands
+                // after the outcome is recorded below).
+                let hooks = match &progress {
+                    Some(progress) => {
+                        let on_status = {
+                            let progress = progress.clone();
+                            move |status: &str| {
+                                if status == "done" {
+                                    return;
+                                }
+                                progress.update(global_index, status, None, None);
+                            }
+                        };
+                        let on_progress = {
+                            let progress = progress.clone();
+                            move |update: &crate::pipeline::FetchProgressUpdate| {
+                                if update.status == "done" {
+                                    return;
+                                }
+                                progress.update(
+                                    global_index,
+                                    update.status,
+                                    None,
+                                    Some(update.progress),
+                                );
+                            }
+                        };
+                        FetchExecutionHooks {
+                            on_status_change: Some(Arc::new(on_status)),
+                            on_progress_change: Some(Arc::new(on_progress)),
+                        }
+                    }
+                    None => FetchExecutionHooks::default(),
+                };
+                let outcome = pipeline.fetch_with_hooks(&opts, &hooks).await;
+                // tool.ts:296-320: `results[index]` lands first, then the
+                // terminal progress frame; error items carry the user-facing
+                // summary in the progress table (the full error text rides
+                // the result item).
+                let terminal_frame = match &outcome {
+                    FetchOutcome::Error(error) => {
+                        ("error", Some(build_user_facing_fetch_error_summary(error)))
+                    }
+                    FetchOutcome::Result(_) => ("done", None),
+                };
                 let item = batch_item_from_outcome(index, &opts, outcome);
                 // recover a poisoned lock (the critical section cannot panic;
                 // every request must land its item or the count invariant
                 // downstream breaks)
                 let mut slot = results.lock().unwrap_or_else(|error| error.into_inner());
                 slot[index] = Some(item);
+                drop(slot);
+                if let Some(progress) = &progress {
+                    progress.update(global_index, terminal_frame.0, terminal_frame.1, None);
+                }
             }
         });
     }
@@ -294,6 +567,16 @@ pub async fn execute_batch_fetch(
         items,
         batch_concurrency: defaults.batch_concurrency,
     }
+}
+
+/// `executeBatchFetchToolCall` without a progress sink (mock-server compat).
+pub async fn execute_batch_fetch(
+    pipeline: &FetchPipeline,
+    requests: &[WebFetchParams],
+    defaults: &FetchToolDefaults,
+) -> BatchFetchResult {
+    let index_map: Vec<usize> = (0..requests.len()).collect();
+    execute_batch_fetch_with_progress(pipeline, requests, defaults, None, &index_map).await
 }
 
 /// The batch tool payload (index.ts:673-681): `requests` + `verbose`.
@@ -496,24 +779,47 @@ fn js_template_render(value: &serde_json::Value) -> String {
 /// Drive a parsed batch through the pipeline (worker pool above), folding
 /// parse failures in as error items at their input positions. The pool only
 /// carries the well-formed requests — the failures never touch the wire.
+/// FR-P2-C: the shared progress table spans the FULL input (created from the
+/// raw entries before parsing, like upstream's `createInitialProgressItems`);
+/// parse-failure positions flip to `error` before the pool starts (the
+/// TE-D26 degradation — upstream rejects the whole call in the host layer).
 pub async fn execute_batch_entries(
     pipeline: &FetchPipeline,
     entries: &[serde_json::Value],
     defaults: &FetchToolDefaults,
+    on_progress: Option<BatchProgressSink>,
 ) -> BatchFetchResult {
+    let progress = BatchProgressState::new(
+        create_initial_progress_items(entries),
+        defaults.batch_concurrency,
+        on_progress,
+    );
+    progress.emit_initial();
+
     let parsed = parse_batch_requests(entries);
     let mut valid_positions = Vec::new();
     let mut valid_requests = Vec::new();
     for (index, entry) in parsed.iter().enumerate() {
-        if let Ok(params) = entry {
-            valid_positions.push(index);
-            valid_requests.push(params.clone());
+        match entry {
+            Ok(params) => {
+                valid_positions.push(index);
+                valid_requests.push(params.clone());
+            }
+            Err((_, message)) => {
+                progress.update(index, "error", Some(message.clone()), None);
+            }
         }
     }
-    let mut pool_items = execute_batch_fetch(pipeline, &valid_requests, defaults)
-        .await
-        .items
-        .into_iter();
+    let mut pool_items = execute_batch_fetch_with_progress(
+        pipeline,
+        &valid_requests,
+        defaults,
+        Some(progress),
+        &valid_positions,
+    )
+    .await
+    .items
+    .into_iter();
 
     let mut items = Vec::with_capacity(parsed.len());
     for (index, entry) in parsed.iter().enumerate() {

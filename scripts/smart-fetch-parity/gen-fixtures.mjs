@@ -52,27 +52,79 @@ function run(functionName, cases, fn) {
 // `stream: true` wraps the body in a ReadableStream so the TE07 download
 // branch (`streamResponseToFile`'s getReader path) runs for real instead of
 // tripping the old "not used in parity scenarios" readable() stub.
-function makeResponse({ status = 200, statusText = "OK", url, headers = {}, body = "", stream = false }) {
+function makeResponse({ status = 200, statusText = "OK", url, headers = {}, body = "", stream = false, onBodyRead }) {
   const headerMap = new Map(Object.entries(headers));
   const bytes = new TextEncoder().encode(body);
+  const fireBodyRead = onBodyRead ?? (() => {});
+  const realStream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(bytes);
+      controller.close();
+    },
+  });
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText,
     url,
     headers: { get: (name) => headerMap.get(name.toLowerCase()) ?? null },
+    // The body stream proxies getReader so the synthesized engine events
+    // fire at consumption time (the real wreq-js stream emits body_progress/
+    // body_complete as the body is read, not when fetch() resolves).
     body: stream
-      ? new ReadableStream({
-          start(controller) {
-            controller.enqueue(bytes);
-            controller.close();
+      ? {
+          getReader() {
+            fireBodyRead();
+            return realStream.getReader();
           },
-        })
+          get locked() {
+            return realStream.locked;
+          },
+        }
       : null,
-    text: async () => body,
-    arrayBuffer: async () => bytes.buffer,
+    text: async () => {
+      fireBodyRead();
+      return body;
+    },
+    arrayBuffer: async () => {
+      fireBodyRead();
+      return bytes.buffer;
+    },
     readable: () => {
       throw new Error("not used in parity scenarios");
+    },
+  };
+}
+
+// The synthesized engine-event pair both drives share (TE-D27 alignment):
+// response_headers at fetch() resolve, body_progress/body_complete when the
+// body is consumed. body_progress only fires with a content-length.
+function engineEventBridge(options, step, url) {
+  const headerMap = new Map(
+    Object.entries({ ...(step.headers ?? {}) }).map(([k, v]) => [k.toLowerCase(), v]),
+  );
+  const emit = (event) => options?.onRequestEvent?.(event);
+  const contentLengthRaw = headerMap.get("content-length");
+  const contentLength = contentLengthRaw ? Number(contentLengthRaw) : null;
+  if (typeof options?.onRequestEvent !== "function") {
+    return { fireBodyRead: () => {} };
+  }
+  emit({
+    type: "response_headers",
+    url,
+    status: step.status ?? 200,
+    contentLength,
+  });
+  return {
+    fireBodyRead: () => {
+      if (contentLength && contentLength > 0 && step.body) {
+        emit({
+          type: "body_progress",
+          contentLength,
+          downloadedBytes: new TextEncoder().encode(step.body).length,
+        });
+      }
+      emit({ type: "body_complete" });
     },
   };
 }
@@ -84,8 +136,14 @@ const DOWNLOAD_TEMP_DIR = "/tmp/smart-fetch-parity-downloads";
 
 // Drive `defuddleFetch` with a scripted transport + defuddle and return the
 // raw FetchResult/FetchError JSON plus the request options the transport saw.
+// TE08: also collects the FetchExecutionHooks event stream (status/progress
+// pairs, in fire order) — the mock synthesizes the engine `onRequestEvent`
+// frames the rpi pipeline emits at its own positions (TE-D27 alignment:
+// response arrival ≈ response_headers, buffered read end ≈ body_complete;
+// body_progress only when a content-length header exists — download path).
 async function drivePipeline({ fetchScript, defuddleResult, opts }) {
   const captured = { calls: [] };
+  const progressEvents = [];
   // work on a copy: the scenario's fetchScript stays intact for the fixture
   const script = [...fetchScript];
   const fetchDependency = async (url, options) => {
@@ -97,7 +155,8 @@ async function drivePipeline({ fetchScript, defuddleResult, opts }) {
       if (step.throw.name) error.name = step.throw.name;
       throw error;
     }
-    return makeResponse({ url, ...step });
+    const { fireBodyRead } = engineEventBridge(options, step, url);
+    return makeResponse({ url, ...step, onBodyRead: fireBodyRead });
   };
   const defuddleDependency = async () =>
     defuddleResult ?? { content: undefined, wordCount: 0 };
@@ -107,8 +166,21 @@ async function drivePipeline({ fetchScript, defuddleResult, opts }) {
     defuddle: defuddleDependency,
     getProfiles: () => ["chrome_145"],
   });
-  const result = await defuddleFetch(opts, {});
-  return { result, captured };
+  const hooks = {
+    onStatusChange(status) {
+      progressEvents.push({ kind: "status", status });
+    },
+    onProgressChange(update) {
+      progressEvents.push({
+        kind: "progress",
+        status: update.status,
+        progress: update.progress,
+        phase: update.phase ?? null,
+      });
+    },
+  };
+  const result = await defuddleFetch(opts, hooks);
+  return { result, captured, progressEvents };
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +762,7 @@ writeFileSync(join(OUT_DIR, "settings.json"), JSON.stringify(settingsOut, null, 
 
 const pipelineOut = [];
 for (const scenario of pipelineScenarios) {
-  const { result, captured } = await drivePipeline(scenario);
+  const { result, captured, progressEvents } = await drivePipeline(scenario);
   pipelineOut.push({
     name: scenario.name,
     input: { opts: scenario.opts, defuddleResult: scenario.defuddleResult ?? { content: undefined, wordCount: 0 }, fetchScript: scenario.fetchScript },
@@ -700,12 +772,125 @@ for (const scenario of pipelineScenarios) {
       requestTimeout: captured.calls[0]?.options?.timeout ?? null,
       requestProxy: captured.calls[0]?.options?.proxy ?? null,
       requestRedirect: captured.calls[0]?.options?.redirect ?? null,
+      // TE08 FR-P2-A parity surface: the hooks event stream in fire order.
+      progressEvents,
     },
   });
 }
 writeFileSync(join(OUT_DIR, "pipeline.json"), JSON.stringify(pipelineOut, null, 2) + "\n");
 
+// ---------------------------------------------------------------------------
+// E. batch progress snapshots (TE08 FR-P2-C) — `executeBatchFetchToolCall`
+// with batchConcurrency 1 (deterministic frame order) and the same mocked
+// transport per request. statusStartedAt is a wall-clock timestamp on both
+// sides: masked to 0 in the fixture (assertion-side masking mirrors it).
+// ---------------------------------------------------------------------------
+
+const batchProgressScenarios = [
+  {
+    name: "three-items-mixed-outcomes",
+    requests: [{ url: "https://ex.com/a" }, { url: "https://ex.com/missing" }, { url: "https://ex.com/doc" }],
+    fetchScript: [
+      { status: 200, headers: { "content-type": "text/plain" }, body: "first body" },
+      { status: 404, statusText: "Not Found", headers: { "content-type": "text/html" }, body: "gone" },
+      { status: 200, headers: { "content-type": "text/plain" }, body: "third body" },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    // attachment with a content-length: exercises the per-chunk
+    // body_progress frames on the download path (TE-D27 approximation).
+    name: "attachment-with-content-length",
+    requests: [{ url: "https://ex.com/data.bin", tempDir: DOWNLOAD_TEMP_DIR }],
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "application/octet-stream", "content-length": "9" },
+        body: "123456789",
+        stream: true,
+      },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    name: "transport-error-item",
+    requests: [{ url: "https://no-such-host.example.com/x" }, { url: "https://ex.com/ok" }],
+    fetchScript: [
+      { throw: { message: "getaddrinfo ENOTFOUND no-such-host.example.com: dns error" } },
+      { status: 200, headers: { "content-type": "text/plain" }, body: "fine" },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    name: "extraction-item",
+    requests: [{ url: "https://ex.com/article" }],
+    fetchScript: [{ status: 200, headers: { "content-type": "text/html" }, body: HTML_ARTICLE }],
+    defuddleResult: { content: "Extracted body.", wordCount: 2 },
+  },
+];
+
+async function driveBatchProgress({ requests, fetchScript, defuddleResult }) {
+  const script = [...fetchScript];
+  const fetchDependency = async (url, options) => {
+    const step = script.shift();
+    if (!step) throw new Error("unexpected extra fetch call");
+    if (step.throw) {
+      const error = new Error(step.throw.message);
+      if (step.throw.name) error.name = step.throw.name;
+      throw error;
+    }
+    // Same synthesized engine events as drivePipeline (TE-D27 alignment).
+    const { fireBodyRead } = engineEventBridge(options, step, url);
+    return makeResponse({ url, ...step, onBodyRead: fireBodyRead });
+  };
+  const defuddleDependency = async () =>
+    defuddleResult ?? { content: undefined, wordCount: 0 };
+  const defuddleFetch = extract.createDefuddleFetch({
+    fetch: fetchDependency,
+    defuddle: defuddleDependency,
+    getProfiles: () => ["chrome_145"],
+  });
+
+  const snapshots = [];
+  const result = await tool.executeBatchFetchToolCall({ requests }, tool.resolveFetchToolDefaults({}), {
+    batchConcurrency: 1,
+    onProgress(snapshot) {
+      snapshots.push(
+        JSON.parse(
+          JSON.stringify(snapshot, (key, value) =>
+            key === "statusStartedAt" ? 0 : sanitizeLoneSurrogates(value),
+          ),
+        ),
+      );
+    },
+    // Route items through the mocked pipeline (the default executeItem would
+    // hit the real network): params are already FetchOptions-shaped for
+    // these scenarios.
+    executeItem: (params, _defaults, hooks) =>
+      defuddleFetch(params, hooks ?? {}),
+  });
+  return {
+    snapshots,
+    result: JSON.parse(
+      JSON.stringify(result, (key, value) => (key === "filePath" ? "<FILE>" : value)),
+    ),
+  };
+}
+
+const batchProgressOut = [];
+rmSync(DOWNLOAD_TEMP_DIR, { recursive: true, force: true });
+for (const scenario of batchProgressScenarios) {
+  const { snapshots, result } = await driveBatchProgress(scenario);
+  batchProgressOut.push({
+    name: scenario.name,
+    input: { requests: scenario.requests, fetchScript: scenario.fetchScript, defuddleResult: scenario.defuddleResult ?? { content: undefined, wordCount: 0 } },
+    output: { snapshots, result },
+  });
+}
+writeFileSync(join(OUT_DIR, "batch-progress.json"), JSON.stringify(batchProgressOut, null, 2) + "\n");
+
 console.log(
   `wrote: format.json (${Object.entries(formatOut).reduce((n, [, v]) => n + v.length, 0)} cases), ` +
-    `tool.json, settings.json, pipeline.json (${pipelineOut.length} scenarios)`,
+    `tool.json, settings.json, pipeline.json (${pipelineOut.length} scenarios), ` +
+    `batch-progress.json (${batchProgressOut.length} scenarios)`,
 );

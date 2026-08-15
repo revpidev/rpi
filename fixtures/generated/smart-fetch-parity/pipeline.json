@@ -21,7 +21,8 @@
       "requestHeadersSeen": null,
       "requestTimeout": null,
       "requestProxy": null,
-      "requestRedirect": null
+      "requestRedirect": null,
+      "progressEvents": []
     }
   },
   {
@@ -46,7 +47,8 @@
       "requestHeadersSeen": null,
       "requestTimeout": null,
       "requestProxy": null,
-      "requestRedirect": null
+      "requestRedirect": null,
+      "progressEvents": []
     }
   },
   {
@@ -73,7 +75,7 @@
       "result": {
         "error": "Server returned HTTP 404 Not Found for https://ex.com/missing.",
         "code": "http_error",
-        "phase": "connecting",
+        "phase": "loading",
         "retryable": false,
         "url": "https://ex.com/missing",
         "finalUrl": "https://ex.com/missing",
@@ -88,7 +90,21 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
     }
   },
   {
@@ -112,7 +128,7 @@
       "result": {
         "error": "Server returned HTTP 500 Internal Server Error for https://ex.com/err.",
         "code": "http_error",
-        "phase": "connecting",
+        "phase": "loading",
         "retryable": true,
         "url": "https://ex.com/err",
         "finalUrl": "https://ex.com/err",
@@ -126,7 +142,21 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
     }
   },
   {
@@ -150,7 +180,7 @@
       "result": {
         "error": "Server returned HTTP 429 Too Many Requests for https://ex.com/limited.",
         "code": "http_error",
-        "phase": "connecting",
+        "phase": "loading",
         "retryable": true,
         "url": "https://ex.com/limited",
         "finalUrl": "https://ex.com/limited",
@@ -164,7 +194,21 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        }
+      ]
     }
   },
   {
@@ -198,7 +242,25 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
     }
   },
   {
@@ -232,7 +294,25 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
     }
   },
   {
@@ -266,7 +346,25 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
     }
   },
   {
@@ -302,7 +400,25 @@
       },
       "requestTimeout": 1500,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
     }
   },
   {
@@ -338,7 +454,25 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "status",
+          "status": "error"
+        },
+        {
+          "kind": "progress",
+          "status": "error",
+          "progress": 1,
+          "phase": "error"
+        }
+      ]
     }
   },
   {
@@ -381,7 +515,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -425,7 +589,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -469,7 +663,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -513,7 +737,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -546,7 +800,27 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
     }
   },
   {
@@ -586,7 +860,27 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
     }
   },
   {
@@ -629,7 +923,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -673,7 +997,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -716,7 +1070,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -765,7 +1149,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -810,7 +1234,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -855,7 +1319,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -898,7 +1402,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -942,7 +1486,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -986,7 +1570,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -1029,7 +1653,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -1073,7 +1737,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -1117,7 +1811,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -1162,7 +1886,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
     }
   },
   {
@@ -1208,7 +1962,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
     }
   },
   {
@@ -1256,7 +2040,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
     }
   },
   {
@@ -1304,7 +2118,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -1349,7 +2193,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
     }
   },
   {
@@ -1393,7 +2267,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -1445,7 +2349,65 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -1497,7 +2459,55 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "raw_done"
+        }
+      ]
     }
   },
   {
@@ -1541,7 +2551,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -1615,7 +2665,117 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        }
+      ]
     }
   },
   {
@@ -1666,7 +2826,55 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "json_done"
+        }
+      ]
     }
   },
   {
@@ -1716,7 +2924,65 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -1767,7 +3033,65 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "plain_text_done"
+        }
+      ]
     }
   },
   {
@@ -1811,7 +3135,47 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "processing"
+        },
+        {
+          "kind": "progress",
+          "status": "processing",
+          "progress": 0.96,
+          "phase": "extracting"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "done"
+        }
+      ]
     }
   },
   {
@@ -1860,7 +3224,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
     }
   },
   {
@@ -1909,7 +3303,37 @@
       },
       "requestTimeout": 15000,
       "requestProxy": null,
-      "requestRedirect": "follow"
+      "requestRedirect": "follow",
+      "progressEvents": [
+        {
+          "kind": "progress",
+          "status": "connecting",
+          "progress": 0,
+          "phase": "fetch_start"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.51,
+          "phase": "response_headers"
+        },
+        {
+          "kind": "progress",
+          "status": "loading",
+          "progress": 0.95,
+          "phase": "body_complete"
+        },
+        {
+          "kind": "status",
+          "status": "done"
+        },
+        {
+          "kind": "progress",
+          "status": "done",
+          "progress": 1,
+          "phase": "file_done"
+        }
+      ]
     }
   }
 ]

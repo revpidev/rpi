@@ -12,7 +12,7 @@ use regex::Regex;
 
 use crate::constants::DEFAULT_TEMP_DIR_NAME;
 use crate::http::ResponseBody;
-use crate::pipeline::{map_fetch_failure, FetchErrorContext};
+use crate::pipeline::{map_fetch_failure, FetchErrorContext, FetchExecutionHooks};
 use crate::types::{FetchError, FetchOutcome, FetchResult};
 
 /// `deburr` (lodash): Latin-1/Latin Extended-A diacritics fold to ASCII.
@@ -301,6 +301,30 @@ pub async fn stream_response_to_file(
     body: ResponseBody,
     file_path: &Path,
 ) -> Result<u64, (ResponseBody, DownloadFailure)> {
+    stream_response_to_file_with_progress(body, file_path, &FetchExecutionHooks::default(), None)
+        .await
+}
+
+/// `streamResponseToFile` with the FR-P2-A progress seam: each accepted
+/// chunk emits a `body_progress` event at
+/// `0.51 + fraction × 0.44` (mapRequestEventToProgress) when the content
+/// length is known — without one the upstream mapping stays at 0.51 (no
+/// information), so no frame is emitted (TE-D27).
+pub async fn stream_response_to_file_with_progress(
+    body: ResponseBody,
+    file_path: &Path,
+    hooks: &FetchExecutionHooks,
+    content_length: Option<u64>,
+) -> Result<u64, (ResponseBody, DownloadFailure)> {
+    // mapRequestEventToProgress `body_progress` (extract.ts:875-895).
+    let body_progress = |downloaded: u64| {
+        let Some(content_length) = content_length.filter(|len| *len > 0) else {
+            return;
+        };
+        let fraction = (downloaded as f64 / content_length as f64).clamp(0.0, 1.0);
+        hooks.emit_progress("loading", 0.51 + fraction * 0.44, "body_progress");
+    };
+
     if let Some(parent) = file_path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             return Err((body, DownloadFailure::io(&error, 0)));
@@ -334,6 +358,10 @@ pub async fn stream_response_to_file(
                     error,
                 ));
             }
+            // One buffered chunk (mock transports): the single frame the
+            // buffered body can produce.
+            downloaded_bytes = bytes.len() as u64;
+            body_progress(downloaded_bytes);
             finalize_permissions(file_path);
             Ok(bytes.len() as u64)
         }
@@ -357,6 +385,7 @@ pub async fn stream_response_to_file(
                     None => break,
                 };
                 downloaded_bytes += chunk.len() as u64;
+                body_progress(downloaded_bytes);
                 if let Err(error) = file.write_all(&chunk) {
                     return Err(fail(
                         ResponseBody::Full(Vec::new()),
@@ -406,6 +435,8 @@ pub async fn build_file_result(
     os: &str,
     temp_dir: Option<&str>,
     context: &FetchErrorContext,
+    hooks: &FetchExecutionHooks,
+    content_length: Option<u64>,
 ) -> FetchOutcome {
     // extract.ts:1057-1058: `opts.tempDir || join(tmpdir(), "smart-fetch")`.
     // rpi derives the default subdirectory from the product name — the same
@@ -431,7 +462,7 @@ pub async fn build_file_result(
         if attempt > 100 {
             break;
         }
-        match stream_response_to_file(body, &file_path).await {
+        match stream_response_to_file_with_progress(body, &file_path, hooks, content_length).await {
             Ok(file_size) => {
                 let mut result = FetchResult::content(opts_url, final_url, 0, "", browser, os);
                 result.kind = "file".to_string();

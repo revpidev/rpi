@@ -244,12 +244,18 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         })
                     }),
                     render_call: if has_render_call {
+                        let render_tool_name = name.clone();
                         Some(Arc::new(move |context| {
                             let value =
                                 serde_json::to_value(&context).map_err(|e| e.to_string())?;
                             let forward = render_call.clone();
                             let result = forward.dispatch_blocking(
-                                json!({"kind": "render", "what": "toolCall", "context": value}),
+                                json!({
+                                    "kind": "render",
+                                    "what": "toolCall",
+                                    "toolName": render_tool_name,
+                                    "context": value
+                                }),
                                 false,
                             )?;
                             if result.is_null() {
@@ -261,11 +267,13 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         None
                     },
                     render_result: if has_render_result {
+                        let render_tool_name = name.clone();
                         Some(Arc::new(move |result, options, context| {
                             let forward = render_result.clone();
                             let payload = json!({
                                 "kind": "render",
                                 "what": "toolResult",
+                                "toolName": render_tool_name,
                                 "result": result,
                                 "options": options,
                                 "context": context,

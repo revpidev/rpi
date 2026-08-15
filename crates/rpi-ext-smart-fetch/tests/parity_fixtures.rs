@@ -17,7 +17,9 @@ use rpi_ext_smart_fetch::batch::{self, BatchFetchItemResult, BatchFetchResult};
 use rpi_ext_smart_fetch::extract::{ExtractOptions, Extractor};
 use rpi_ext_smart_fetch::format;
 use rpi_ext_smart_fetch::http::{FetchFailure, HttpRequest, HttpResponse};
-use rpi_ext_smart_fetch::pipeline::{futures_boxed, FetchPipeline, TransportFn};
+use rpi_ext_smart_fetch::pipeline::{
+    futures_boxed, FetchExecutionHooks, FetchPipeline, TransportFn,
+};
 use rpi_ext_smart_fetch::settings;
 use rpi_ext_smart_fetch::types::FetchToolConfig;
 use rpi_ext_smart_fetch::types::{
@@ -624,9 +626,32 @@ async fn parity_pipeline_scenarios() {
             })
         });
 
+        // TE08 FR-P2-A: collect the hooks event stream the same way the
+        // generator records `progressEvents` (status frames as-is,
+        // progress frames with status/progress/phase).
+        let events: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_for_status = Arc::clone(&events);
+        let events_for_progress = Arc::clone(&events);
+        let hooks = FetchExecutionHooks {
+            on_status_change: Some(Arc::new(move |status| {
+                events_for_status
+                    .lock()
+                    .unwrap()
+                    .push(json!({ "kind": "status", "status": status }));
+            })),
+            on_progress_change: Some(Arc::new(move |update| {
+                events_for_progress.lock().unwrap().push(json!({
+                    "kind": "progress",
+                    "status": update.status,
+                    "progress": batch::progress_json(update.progress),
+                    "phase": update.phase,
+                }));
+            })),
+        };
         let pipeline = FetchPipeline {
             extractor: Box::new(scripted_extraction),
             transport,
+            hooks,
         };
         let outcome = pipeline.fetch(&opts).await;
         let actual_result = match outcome {
@@ -685,6 +710,15 @@ async fn parity_pipeline_scenarios() {
             continue;
         }
 
+        // TE08 FR-P2-A: the hooks event stream parity.
+        let actual_events = Value::Array(events.lock().unwrap().clone());
+        let expected_events = output.get("progressEvents").cloned().unwrap_or(Value::Null);
+        if actual_events != expected_events {
+            failures.push(format!(
+                "{name}: progress events mismatch\n  expected: {expected_events}\n  actual:   {actual_events}"
+            ));
+        }
+
         // request assertions — only meaningful when a request was made
         // (upstream records nulls when URL validation rejected first)
         let expected_headers = output
@@ -739,4 +773,208 @@ async fn parity_pipeline_scenarios() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+/// TE08 FR-P2-C: replay the batch-progress fixtures (concurrency 1 on both
+/// sides — deterministic frame order). `statusStartedAt` is a wall-clock
+/// timestamp: masked to 0 in the fixture, masked here the same way; file
+/// results carry a generated path — masked to `<FILE>` on both sides.
+#[tokio::test]
+async fn parity_batch_progress_snapshots() {
+    let fixtures = load("batch-progress.json");
+    let scenarios = fixtures.as_array().cloned().unwrap_or_default();
+    assert!(!scenarios.is_empty(), "batch-progress fixtures missing");
+
+    let mut failures: Vec<String> = Vec::new();
+    for scenario in &scenarios {
+        let name = scenario.get("name").and_then(Value::as_str).unwrap_or("");
+        let input = scenario.get("input").cloned().unwrap_or(Value::Null);
+        let output = scenario.get("output").cloned().unwrap_or(Value::Null);
+        let entries = input
+            .get("requests")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let script: Vec<Value> = input
+            .get("fetchScript")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let scripted_extraction = ScriptedExtractor(extracted_from_json(
+            input.get("defuddleResult").expect("defuddle"),
+        ));
+
+        let steps: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(script));
+        let transport: TransportFn = {
+            let steps = Arc::clone(&steps);
+            Arc::new(move |_request: HttpRequest| {
+                let steps = Arc::clone(&steps);
+                futures_boxed::boxed(async move {
+                    let step = steps.lock().unwrap().first().cloned();
+                    if step.is_some() {
+                        steps.lock().unwrap().remove(0);
+                    }
+                    let Some(step) = step else {
+                        return Err(FetchFailure::InvalidInput(
+                            "unexpected extra fetch call".to_string(),
+                        ));
+                    };
+                    if let Some(throw) = step.get("throw") {
+                        return Err(FetchFailure::Transport {
+                            failure: rpi_ext_smart_fetch::http::TransportFailure::Other {
+                                message: str_field(throw, "message"),
+                            },
+                            final_url: None,
+                        });
+                    }
+                    let mut headers = std::collections::HashMap::new();
+                    for (key, value) in step
+                        .get("headers")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(value) = value.as_str() {
+                            headers.insert(key.to_lowercase(), value.to_string());
+                        }
+                    }
+                    let body = str_field(&step, "body").into_bytes();
+                    let body = if step.get("stream").and_then(Value::as_bool) == Some(true) {
+                        // The generator's ReadableStream shape: one chunk.
+                        rpi_ext_smart_fetch::http::ResponseBody::Full(body)
+                    } else {
+                        rpi_ext_smart_fetch::http::ResponseBody::Full(body)
+                    };
+                    Ok(HttpResponse {
+                        final_url: _request_url(&_request),
+                        status: step.get("status").and_then(Value::as_u64).unwrap_or(200) as u16,
+                        status_text: step
+                            .get("statusText")
+                            .and_then(Value::as_str)
+                            .unwrap_or("OK")
+                            .to_string(),
+                        headers,
+                        body,
+                    })
+                })
+            })
+        };
+        let pipeline = FetchPipeline {
+            extractor: Box::new(scripted_extraction),
+            transport,
+            hooks: FetchExecutionHooks::default(),
+        };
+
+        // Concurrency 1 mirrors the generator's `batchConcurrency: 1`.
+        let defaults = batch::resolve_fetch_tool_defaults(&FetchToolConfig {
+            batch_concurrency: Some(1.0),
+            ..FetchToolConfig::default()
+        });
+
+        let snapshots: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let snapshots_for_sink = Arc::clone(&snapshots);
+        let sink: batch::BatchProgressSink = Arc::new(move |snapshot| {
+            let mut json = snapshot.to_json();
+            // Mask the wall-clock timestamp like the generator does.
+            if let Some(items) = json.get_mut("items").and_then(Value::as_array_mut) {
+                for item in items {
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert("statusStartedAt".to_string(), json!(0));
+                    }
+                }
+            }
+            snapshots_for_sink.lock().unwrap().push(json);
+        });
+
+        let result = batch::execute_batch_entries(&pipeline, &entries, &defaults, Some(sink)).await;
+
+        let actual_snapshots = Value::Array(snapshots.lock().unwrap().clone());
+        let expected_snapshots = output.get("snapshots").cloned().unwrap_or(Value::Null);
+        if actual_snapshots != expected_snapshots {
+            failures.push(format!(
+                "{name}: snapshots mismatch\\n  expected: {expected_snapshots}\\n  actual:   {actual_snapshots}"
+            ));
+        }
+
+        // The final result shape (request options ride per item like the
+        // generator's `request` field — compare status/progress/result).
+        let mut actual_result =
+            serde_json::to_value(batch_result_parity_json(&result)).unwrap_or(Value::Null);
+        mask_file_paths(&mut actual_result);
+        let mut expected_result = output.get("result").cloned().unwrap_or(Value::Null);
+        mask_file_paths(&mut expected_result);
+        if strip_nullish(actual_result.clone()) != strip_nullish(expected_result.clone()) {
+            failures.push(format!(
+                "{name}: result mismatch\\n  expected: {expected_result}\\n  actual:   {actual_result}"
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} batch progress parity failures:\\n{}",
+        failures.len(),
+        failures.join("\\n")
+    );
+}
+
+fn _request_url(request: &HttpRequest) -> String {
+    request.url.clone()
+}
+
+/// The comparison shape for a batch result: per-item status/progress with
+/// the outcome serialized like upstream's items (request omitted — the
+/// normalized options differ by engine defaults bookkeeping).
+fn batch_result_parity_json(result: &batch::BatchFetchResult) -> Value {
+    let items: Vec<Value> = result
+        .items
+        .iter()
+        .map(|item| {
+            let mut map = serde_json::Map::new();
+            map.insert("index".to_string(), json!(item.index));
+            if let Some(request) = &item.request {
+                map.insert("request".to_string(), batch::fetch_options_json(request));
+            }
+            map.insert("status".to_string(), json!(item.status));
+            map.insert("progress".to_string(), json!(1));
+            if let Some(error) = &item.error {
+                map.insert("error".to_string(), json!(error));
+            }
+            if let Some(fetch) = &item.result {
+                map.insert(
+                    "result".to_string(),
+                    serde_json::to_value(fetch).unwrap_or(Value::Null),
+                );
+            }
+            Value::Object(map)
+        })
+        .collect();
+    json!({
+        "items": items,
+        "total": result.total,
+        "succeeded": result.succeeded,
+        "failed": result.failed,
+        "batchConcurrency": result.batch_concurrency,
+    })
+}
+
+/// Replace generated download paths with the generator's `<FILE>` mask.
+fn mask_file_paths(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "filePath" {
+                    *entry = json!("<FILE>");
+                } else {
+                    mask_file_paths(entry);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                mask_file_paths(item);
+            }
+        }
+        _ => {}
+    }
 }
