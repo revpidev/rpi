@@ -884,6 +884,11 @@ pub struct LineOutcome {
     /// frame push — upstream fires the update per event, execution.ts:914/
     /// 929/972/1005).
     pub progress_event: bool,
+    /// Every successfully parsed NON-lifecycle event refreshes
+    /// `lastActivityAt` (execution.ts:888 updates it before the per-type
+    /// dispatch — unknown event types included; the lifecycle arms return
+    /// early above it and do not).
+    pub activity_event: bool,
 }
 
 impl ChildRunState {
@@ -892,7 +897,7 @@ impl ChildRunState {
     /// event timestamp source (`Date.now()` upstream).
     pub fn process_line(&mut self, line: &str, now_ms: u64) -> LineOutcome {
         let outcome = self.process_line_inner(line, now_ms);
-        if outcome.progress_event {
+        if outcome.activity_event {
             self.last_activity_at = Some(now_ms);
         }
         outcome
@@ -957,6 +962,12 @@ impl ChildRunState {
                 self.process_message_end(event_type, &value, &mut outcome);
             }
             _ => {}
+        }
+        // execution.ts:888: every non-lifecycle event (known or not)
+        // refreshes the activity timestamp; the agent_settled/agent_end
+        // arms mirror upstream's early return above that line.
+        if !matches!(event_type, "agent_settled" | "agent_end") {
+            outcome.activity_event = true;
         }
         outcome
     }
@@ -1035,17 +1046,26 @@ impl ChildRunState {
             self.usage_cache_read,
             self.usage_cache_write,
             self.usage_cost_total,
+            self.turns,
         )
     }
 }
 
-pub fn json_usage(input: u64, output: u64, cache_read: u64, cache_write: u64, cost: f64) -> Value {
+pub fn json_usage(
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+    turns: u64,
+) -> Value {
     serde_json::json!({
         "input": input,
         "output": output,
         "cacheRead": cache_read,
         "cacheWrite": cache_write,
         "cost": cost,
+        "turns": turns,
     })
 }
 
@@ -1274,6 +1294,27 @@ mod tests {
                                    // 10 bytes > 8: drop 2 from the front ("ab"), é stays whole.
         assert_eq!(tail.text(), "cdefghé");
         assert_eq!(tail.byte_length(), 8);
+    }
+
+    #[test]
+    fn last_activity_refreshes_on_every_non_lifecycle_event() {
+        // execution.ts:888 updates lastActivityAt before the per-type
+        // dispatch: unknown event types count, the lifecycle arms
+        // (agent_settled/agent_end early return) do not.
+        let mut state = ChildRunState::default();
+        state.process_line(r#"{"type":"unknown_thing","v":1}"#, 1_000);
+        assert_eq!(state.last_activity_at, Some(1_000), "unknown type counts");
+        state.process_line(r#"{"type":"agent_settled"}"#, 2_000);
+        assert_eq!(
+            state.last_activity_at,
+            Some(1_000),
+            "lifecycle arm returns above the activity line"
+        );
+        state.process_line(
+            r#"{"type":"tool_execution_start","toolName":"bash"}"#,
+            3_000,
+        );
+        assert_eq!(state.last_activity_at, Some(3_000));
     }
 
     #[test]

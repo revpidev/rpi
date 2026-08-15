@@ -137,18 +137,26 @@ fn base_tool_properties() -> Map<String, Value> {
     .clone()
 }
 
-/// The `verbose` compat flag (index.ts:480-487 / 673-681).
-fn verbose_property() -> Value {
+/// The `verbose` compat flag (index.ts:480-487 web / :673-681 batch): the
+/// two tools differ by ONE word pair — the batch description says the full
+/// header is kept "for successful results", the single tool says "to the
+/// agent". Both verbatim.
+fn verbose_property(batch: bool) -> Value {
+    let kept = if batch {
+        "for successful results"
+    } else {
+        "to the agent"
+    };
     json!({
         "type": "boolean",
-        "description": "Compatibility flag. pi currently returns the full metadata header to the agent regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from pi settings."
+        "description": format!("Compatibility flag. pi currently returns the full metadata header {kept} regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from pi settings.")
     })
 }
 
 /// `web_fetch` parameter schema (FR-P0-1): base surface + `verbose`.
 fn tool_parameters_schema() -> Value {
     let mut properties = base_tool_properties();
-    properties.insert("verbose".to_string(), verbose_property());
+    properties.insert("verbose".to_string(), verbose_property(false));
     json!({
         "type": "object",
         "properties": properties,
@@ -175,7 +183,7 @@ fn batch_tool_parameters_schema() -> Value {
             "description": "Array of fetch requests. Each item accepts the same parameters as the single-item fetch tool."
         }),
     );
-    properties.insert("verbose".to_string(), verbose_property());
+    properties.insert("verbose".to_string(), verbose_property(true));
     json!({
         "type": "object",
         "properties": properties,

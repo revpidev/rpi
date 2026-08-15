@@ -499,11 +499,37 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                     return;
                 }
                 let now_ms = artifacts::now_millis();
-                let (outcome, snapshot) = {
+                // Build the bounded snapshot products UNDER the lock — no
+                // full-state clone (upstream holds the live result object by
+                // reference; cloning `messages` per event is an O(n²) face
+                // it does not have). `messages` never leaves the lock: the
+                // frame builder walks it for the bounded summaries only.
+                let (outcome, status_fields, frame) = {
                     let mut state = stdout_state.lock().unwrap_or_else(|e| e.into_inner());
                     let outcome = state.process_line(trimmed, now_ms);
-                    let snapshot = outcome.progress_event.then(|| state.clone());
-                    (outcome, snapshot)
+                    if !outcome.progress_event {
+                        (outcome, None, None)
+                    } else {
+                        let status_fields = step_status.as_ref().map(|_| {
+                            json!({
+                                "currentTool": state.current_tool.clone(),
+                                "currentToolArgs": state.current_tool_args.clone(),
+                                "currentToolStartedAt": state.current_tool_started_at,
+                                "currentPath": state.current_path.clone(),
+                                "turnCount": state.turns,
+                                "toolCount": state.tool_count,
+                            })
+                        });
+                        let frame = frame_sink.as_ref().map(|_| {
+                            streaming::single_update_details(
+                                &state,
+                                &stream_meta,
+                                &context_label,
+                                now_ms,
+                            )
+                        });
+                        (outcome, status_fields, frame)
+                    }
                 };
                 match outcome.lifecycle {
                     ChildLifecycleAction::StartDrain => terminal = true,
@@ -513,27 +539,13 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 stdout_terminal.store(terminal, Ordering::SeqCst);
                 // Per-event streaming face (execution.ts:914/929/972/1005
                 // fireUpdate): one frame per progress-bearing event.
-                if let Some(snapshot) = snapshot {
+                if let Some(fields) = status_fields {
                     if let Some(status) = &step_status {
-                        status(
-                            child_index,
-                            &json!({
-                                "currentTool": snapshot.current_tool,
-                                "currentToolArgs": snapshot.current_tool_args,
-                                "currentToolStartedAt": snapshot.current_tool_started_at,
-                                "currentPath": snapshot.current_path,
-                                "turnCount": snapshot.turns,
-                                "toolCount": snapshot.tool_count,
-                            }),
-                        );
+                        status(child_index, &fields);
                     }
+                }
+                if let Some((text, details)) = frame {
                     if let Some(sink) = &frame_sink {
-                        let (text, details) = streaming::single_update_details(
-                            &snapshot,
-                            &stream_meta,
-                            &context_label,
-                            now_ms,
-                        );
                         sink(&text, &details);
                     }
                 }
@@ -618,16 +630,40 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         let mut tick = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // intervals fire immediately; upstream waits 1s
+                           // execution.ts:1009: the initial fireUpdate fires as soon as the
+                           // line handler is attached — the first frame must not wait for the
+                           // first 1s tick (a quiet child would otherwise stay invisible for
+                           // up to a second). Snapshot is built under the lock, pushed outside.
+        {
+            let (text, details) = {
+                let snapshot = ticker_state.lock().unwrap_or_else(|e| e.into_inner());
+                streaming::single_update_details(
+                    &snapshot,
+                    &ticker_meta,
+                    &ticker_context,
+                    artifacts::now_millis(),
+                )
+            };
+            ticker_sink(&text, &details);
+        }
         let mut child_guard = child_handle.lock().await;
         loop {
             tokio::select! {
                 status = child_guard.wait() => break status,
                 _ = tick.tick() => {
                     let now_ms = artifacts::now_millis();
-                    let snapshot =
-                        ticker_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let (text, details) =
-                        streaming::single_update_details(&snapshot, &ticker_meta, &ticker_context, now_ms);
+                    // Build under the lock, push outside it (same discipline
+                    // as the per-event path — no full-state clone).
+                    let (text, details) = {
+                        let state =
+                            ticker_state.lock().unwrap_or_else(|e| e.into_inner());
+                        streaming::single_update_details(
+                            &state,
+                            &ticker_meta,
+                            &ticker_context,
+                            now_ms,
+                        )
+                    };
                     ticker_sink(&text, &details);
                 }
             }
@@ -922,7 +958,7 @@ fn failed_result(
         exit_code: 1,
         error: Some(message),
         final_output: String::new(),
-        usage: events::json_usage(0, 0, 0, 0, 0.0),
+        usage: events::json_usage(0, 0, 0, 0, 0.0, 0),
         model: None,
         thinking: input.thinking.clone(),
         timed_out: false,

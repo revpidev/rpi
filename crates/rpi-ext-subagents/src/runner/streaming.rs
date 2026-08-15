@@ -207,10 +207,14 @@ pub fn snapshot_progress(state: &ChildRunState, meta: &StreamMeta, now_ms: u64) 
 }
 
 /// `snapshotStreamResult` (execution.ts:272-284): the streaming `single`
-/// result — the terminal-details shape minus the unbounded `messages`, plus
-/// the bounded `toolCalls` summary and the progress snapshot. `exitCode`
-/// and error fields are absent while running (upstream leaves them unset
-/// and JSON.stringify drops them).
+/// result — `snapshotResult` spread (the terminal-details shape) minus the
+/// unbounded `messages`, plus the bounded `toolCalls` summary and the
+/// progress snapshot. The runtime `SingleResult` starts with
+/// `exitCode: 0` and `outputState: "absent"` (execution.ts:406-407 — both
+/// only move at terminal processing, so every streaming frame carries the
+/// initial values); `timedOut` is NOT set while running (upstream only
+/// assigns it on timeout, so JSON.stringify drops it from frames), and
+/// error fields likewise stay absent.
 pub fn snapshot_stream_result(
     state: &ChildRunState,
     meta: &StreamMeta,
@@ -222,8 +226,9 @@ pub fn snapshot_stream_result(
     map.insert("agent".to_string(), json!(meta.agent));
     map.insert("task".to_string(), json!("[prompt redacted]"));
     map.insert("context".to_string(), json!(context));
+    map.insert("exitCode".to_string(), json!(0));
+    map.insert("outputState".to_string(), json!("absent"));
     map.insert("usage".to_string(), state.usage_json());
-    map.insert("timedOut".to_string(), json!(false));
     if let Some(model) = state.model.clone().or_else(|| meta.model.clone()) {
         map.insert("model".to_string(), json!(model));
     }
@@ -382,6 +387,19 @@ mod tests {
         assert!(result.get("messages").is_none());
         assert_eq!(result["toolCalls"][0]["text"], json!("$ cargo test"));
         assert_eq!(result["progress"], *progress);
+        // Runtime SingleResult initials carried into every streaming frame
+        // (execution.ts:406-407): exitCode 0 / outputState "absent" — both
+        // only move at terminal processing. `timedOut` is NOT in the frame:
+        // upstream assigns it only on timeout, undefined drops from JSON.
+        assert_eq!(result["exitCode"], json!(0));
+        assert_eq!(result["outputState"], json!("absent"));
+        assert!(result.get("timedOut").is_none());
+        // usage carries the emptyUsage() shape (execution.ts:112-114),
+        // turns included.
+        assert_eq!(
+            result["usage"],
+            json!({"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0, "cost": 0.1, "turns": 1})
+        );
     }
 
     #[test]

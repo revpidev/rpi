@@ -240,19 +240,27 @@ pub fn render_mcp_tool_result(result: &Value, options: &Value, context: &Value) 
 // ===== Tool-call renderer (renderCall, TE09 FR-E) =====
 
 /// `truncateText` (tool-result-renderer.ts:99-102): keep the first
-/// `max_chars - 1` chars and append `…`. Upstream slices by JS UTF-16 code
-/// units; the Rust port slices on the char boundary at or before the budget
-/// (same precedent as `collect_collapsed_result_lines`).
+/// `max_chars - 1` UTF-16 code units and append `…`. BOTH the budget check
+/// and the cut are UTF-16 (`value.length` / `slice` upstream) — a
+/// `chars().count()` check would under-count astral input (emoji) and skip
+/// truncation entirely. The cut lands on a whole char at or before the
+/// budget (a JS cut mid-surrogate-pair only yields a replacement char;
+/// same precedent as subagents display.rs `truncate_display_text`).
 fn truncate_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
+    if value.encode_utf16().count() <= max_chars {
         return value.to_string();
     }
-    let mut end = max_chars.saturating_sub(1);
-    let bounded: Vec<char> = value.chars().collect();
-    if end > bounded.len() {
-        end = bounded.len();
+    let mut units = 0usize;
+    let mut out = String::new();
+    for ch in value.chars() {
+        let width = ch.len_utf16();
+        if units + width > max_chars.saturating_sub(1) {
+            break;
+        }
+        units += width;
+        out.push(ch);
     }
-    bounded[..end].iter().collect::<String>() + "\u{2026}"
+    out + "\u{2026}"
 }
 
 /// `formatJsonish` (tool-result-renderer.ts:104-118): a string input is
@@ -736,6 +744,23 @@ mod tests {
         // Non-JSON strings pass through unchanged (still budgeted).
         let out = format_jsonish(&json!("plain text"), 100);
         assert_eq!(out, "plain text");
+    }
+
+    #[test]
+    fn jsonish_budget_counts_utf16_code_units() {
+        // `value.length` is UTF-16: 80 astral chars are 160 units — over a
+        // 100-unit budget even though chars().count() says 80. The budget
+        // check must not under-count astral input into skipping truncation.
+        let astral = "\u{1F600}".repeat(80);
+        let out = format_jsonish(&json!(astral.clone()), 100);
+        assert!(out.ends_with('…'), "{out}");
+        // 49 whole chars (98 units) + ellipsis; the cut never splits a
+        // surrogate pair (upstream's mid-pair cut only yields U+FFFD).
+        assert_eq!(out.chars().count(), 50);
+        assert_eq!(out.chars().filter(|c| *c == '\u{1F600}').count(), 49);
+        // Under the budget in BOTH counting systems: unchanged.
+        let small = "\u{1F600}".repeat(40);
+        assert_eq!(format_jsonish(&json!(small.clone()), 100), small);
     }
 
     #[test]

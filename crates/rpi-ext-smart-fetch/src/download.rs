@@ -22,6 +22,20 @@ fn deburr(value: &str) -> String {
     deunicode::deunicode(value).to_string()
 }
 
+/// `/^"|"$/g` (extract.ts:143/153): strip at most ONE leading and ONE
+/// trailing quote — `trim_matches('"')` eats every quote and would turn
+/// `""name""` into `name` where upstream keeps `"name"`.
+fn strip_one_quote_pair(value: &str) -> &str {
+    let mut result = value;
+    if let Some(rest) = result.strip_prefix('"') {
+        result = rest;
+    }
+    if let Some(rest) = result.strip_suffix('"') {
+        result = rest;
+    }
+    result
+}
+
 /// `sanitizeBaseName` (extract.ts:100-111).
 pub fn sanitize_base_name(value: &str) -> String {
     static RE_SLASHES: LazyLock<Regex> =
@@ -126,7 +140,7 @@ pub fn extract_content_disposition_filename(content_disposition: &str) -> Dispos
                 Some((_, rest)) => rest,
                 None => value,
             };
-            let encoded = encoded.trim_matches('"');
+            let encoded = strip_one_quote_pair(encoded);
             decode_content_disposition_filename(encoded)
         }
         None => match RE_FILENAME.captures(content_disposition) {
@@ -143,10 +157,7 @@ pub fn extract_content_disposition_filename(content_disposition: &str) -> Dispos
         return DispositionName::default();
     }
     // strip surrounding quotes, then turn path separators into dashes
-    let sanitized = raw_filename
-        .trim_start_matches('"')
-        .trim_end_matches('"')
-        .to_string();
+    let sanitized = strip_one_quote_pair(&raw_filename).to_string();
     let sanitized = sanitized.replace(['/', '\\'], "-");
     let (name, ext) = parse_name_ext(&sanitized);
     let base = if name.is_empty() {
@@ -362,7 +373,13 @@ pub async fn stream_response_to_file_with_progress(
             // buffered body can produce.
             downloaded_bytes = bytes.len() as u64;
             body_progress(downloaded_bytes);
-            finalize_permissions(file_path);
+            if let Err(error) = finalize_permissions(file_path) {
+                return Err(fail(
+                    ResponseBody::Full(Vec::new()),
+                    downloaded_bytes,
+                    error,
+                ));
+            }
             Ok(bytes.len() as u64)
         }
         ResponseBody::Stream(response) => {
@@ -401,22 +418,33 @@ pub async fn stream_response_to_file_with_progress(
                     error,
                 ));
             }
-            finalize_permissions(file_path);
+            if let Err(error) = finalize_permissions(file_path) {
+                return Err(fail(
+                    ResponseBody::Full(Vec::new()),
+                    downloaded_bytes,
+                    error,
+                ));
+            }
             Ok(downloaded_bytes)
         }
     }
 }
 
 /// Post-write `chmod(filePath, 0o600)` (extract.ts:269/308/330): the open-time
-/// mode goes through the process umask, the explicit chmod pins it.
-fn finalize_permissions(file_path: &Path) {
+/// mode goes through the process umask, the explicit chmod pins it. A failed
+/// chmod THROWS upstream (the `await chmod` sits inside the try), failing the
+/// download — it is not silently skipped.
+fn finalize_permissions(file_path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))
     }
     #[cfg(not(unix))]
-    let _ = file_path;
+    {
+        let _ = file_path;
+        Ok(())
+    }
 }
 
 /// `buildFileResult` (extract.ts:1048-1117). Streams the response into the
@@ -514,8 +542,9 @@ pub async fn build_file_result(
         content_length: None,
         downloaded_bytes: None,
     };
+    // extract.ts:1107-1116: the terminal literal carries timeoutMs but NOT
+    // contentLength (the never-started write has no length to report).
     error.timeout_ms = Some(context.timeout_ms);
-    error.content_length = context.content_length;
     FetchOutcome::Error(error)
 }
 
@@ -585,6 +614,27 @@ mod tests {
         assert_eq!(sanitize_extension(".TXT"), ".txt");
         assert_eq!(sanitize_extension("tar.gz"), ".targz");
         assert_eq!(sanitize_extension(""), "");
+    }
+
+    #[test]
+    fn quote_stripping_removes_one_pair_only() {
+        // extract.ts:143/153 `replace(/^"|"$/g, "")` — ONE leading and ONE
+        // trailing quote, never the whole run: `""x""` keeps `"x"`. The
+        // sanitize chain then dashes the inner quotes away.
+        assert_eq!(strip_one_quote_pair("\"name\""), "name");
+        assert_eq!(strip_one_quote_pair("\"name"), "name");
+        assert_eq!(strip_one_quote_pair("name\""), "name");
+        assert_eq!(strip_one_quote_pair("\"\"name\"\""), "\"name\"");
+        assert_eq!(strip_one_quote_pair("no quotes"), "no quotes");
+        // End to end: double-wrapped filename still resolves (inner quotes
+        // are invalid chars, sanitized to nothing by the base-name chain).
+        let target = resolve_download_target(
+            "https://example.com/x",
+            "attachment; filename=\"\"Report.pdf\"\"",
+            "application/pdf",
+            "00000000-0000-0000-0000-000000000000",
+        );
+        assert_eq!(target.file_name, "Report.pdf");
     }
 
     #[test]

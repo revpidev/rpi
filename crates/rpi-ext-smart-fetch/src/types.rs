@@ -262,11 +262,11 @@ impl<'de> Deserialize<'de> for FetchErrorPhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchError {
     pub error: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<FetchErrorCode>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<FetchErrorPhase>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
     #[serde(rename = "timeoutMs", default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,

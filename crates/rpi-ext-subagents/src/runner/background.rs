@@ -1216,32 +1216,70 @@ pub async fn wait_for_runs(
             STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
         )
     };
+    // subagent-wait.ts:552-566: the wait tracks the runs ACTIVE WHEN IT
+    // STARTED (`initialAsyncIds`) — runs launched during the wait never
+    // join, and runs already terminal before it are not waitable (the id
+    // path picks from the active candidates only, :518-545).
+    let initial_ids: Vec<String> = {
+        let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        match id {
+            Some(query) => {
+                let resolve = || {
+                    runs.values()
+                        .find(|h| h.run_id == query)
+                        .or_else(|| {
+                            let mut prefix_matches: Vec<_> = runs
+                                .values()
+                                .filter(|h| h.run_id.starts_with(query))
+                                .collect();
+                            if prefix_matches.len() == 1 {
+                                prefix_matches.pop()
+                            } else {
+                                None
+                            }
+                        })
+                        .filter(|h| {
+                            let status = h.status.read().unwrap_or_else(|e| e.into_inner());
+                            !is_terminal(status["state"].as_str().unwrap_or(""))
+                        })
+                        .map(|h| h.run_id.clone())
+                };
+                match resolve() {
+                    Some(run_id) => vec![run_id],
+                    // Unknown or already-terminal id (subagent-wait.ts:549).
+                    None => {
+                        return Err(format!(
+                            "No active run matched \"{query}\". Nothing to wait for."
+                        ))
+                    }
+                }
+            }
+            None => runs
+                .values()
+                .filter(|h| {
+                    let status = h.status.read().unwrap_or_else(|e| e.into_inner());
+                    !is_terminal(status["state"].as_str().unwrap_or(""))
+                })
+                .map(|h| h.run_id.clone())
+                .collect(),
+        }
+    };
+    if initial_ids.is_empty() {
+        // subagent-wait.ts:548-551 (no provider items in rpi).
+        return Err(
+            "No active async runs or registered provider work in this session. Nothing to wait for."
+                .to_string(),
+        );
+    }
     loop {
         let snapshots: Vec<Value> = {
             // Single lock acquisition: `find_run` takes the same mutex and
             // std::sync::Mutex is not reentrant (deadlock otherwise).
             let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
-            match id {
-                Some(query) => {
-                    let handle = runs.get(query).cloned().or_else(|| {
-                        let mut prefix_matches: Vec<_> = runs
-                            .values()
-                            .filter(|h| h.run_id.starts_with(query))
-                            .collect();
-                        if prefix_matches.len() == 1 {
-                            prefix_matches.pop().cloned()
-                        } else {
-                            None
-                        }
-                    });
-                    match handle {
-                        Some(handle) => vec![status_snapshot(&handle)],
-                        // Unknown id: nothing to wait for (upstream errors).
-                        None => return Err(format!("No async run matches '{query}'.")),
-                    }
-                }
-                None => runs.values().map(|h| status_snapshot(h)).collect(),
-            }
+            initial_ids
+                .iter()
+                .filter_map(|run_id| runs.get(run_id.as_str()).map(|h| status_snapshot(h)))
+                .collect()
         };
         let terminal: Vec<&Value> = snapshots
             .iter()
@@ -1255,8 +1293,15 @@ pub async fn wait_for_runs(
             }));
         }
         if let Some(on_update) = on_update {
+            // Only the still-active subset of the initial set renders
+            // (subagent-wait.ts:578-581 `activeInitialRuns`).
+            let still_active: Vec<Value> = snapshots
+                .iter()
+                .filter(|s| !is_terminal(s["state"].as_str().unwrap_or("")))
+                .cloned()
+                .collect();
             on_update(&async_wait_update(
-                &snapshots,
+                &still_active,
                 0,
                 started.elapsed().as_millis() as u64,
             ));
@@ -1435,6 +1480,44 @@ mod tests {
     #[tokio::test]
     async fn wait_for_unknown_run_errors() {
         assert!(wait_for_runs(Some("nope"), false, 10, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_without_active_runs_errors_instead_of_spinning() {
+        // subagent-wait.ts:548-551: no active runs (a TERMINAL run left in
+        // the registry does not count — :552 snapshots the active set only)
+        // → the upstream "Nothing to wait for." message, not a poll loop
+        // that burns the whole timeout.
+        let handle = terminal_test_run("wait-terminal");
+        let error = wait_for_runs(None, false, 10, None)
+            .await
+            .expect_err("terminal-only registry has nothing to wait for");
+        assert!(
+            error.contains("Nothing to wait for"),
+            "upstream message: {error}"
+        );
+        // An explicitly-requested id that is already terminal also fails
+        // (the id path picks from ACTIVE candidates, :518-545).
+        let error = wait_for_runs(Some("wait-terminal"), false, 10, None)
+            .await
+            .expect_err("terminal id is not waitable");
+        assert!(error.contains("No active run matched"), "{error}");
+        unregister_run(&handle.run_id);
+    }
+
+    /// A registry handle whose status doc is already terminal.
+    fn terminal_test_run(run_id: &str) -> Arc<AsyncRunHandle> {
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.to_string(),
+            status: Arc::new(RwLock::new(
+                json!({ "runId": run_id, "state": STATE_COMPLETE }),
+            )),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: std::env::temp_dir(),
+            started_ms: 0,
+        });
+        register_run(handle.clone());
+        handle
     }
 
     #[test]

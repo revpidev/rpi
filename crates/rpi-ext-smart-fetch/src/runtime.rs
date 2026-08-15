@@ -3,8 +3,9 @@
 //! synchronously, so the async wreq pipeline runs here and dispatch blocks
 //! on it. Not shared with the host runtime — no cross-runtime handles.
 
-/// Plugin-owned runtime. One worker is enough for the single-fetch P0
-/// pipeline; TE07's bounded-concurrency batch revisits sizing.
+/// Plugin-owned runtime. Two workers since TE07: the batch worker pool
+/// drives bounded-concurrent fetches through here (a single worker would
+/// serialize them; more adds nothing — wreq spawns its own I/O tasks).
 pub struct PluginRuntime {
     runtime: tokio::runtime::Runtime,
 }

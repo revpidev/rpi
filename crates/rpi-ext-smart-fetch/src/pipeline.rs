@@ -97,15 +97,22 @@ pub fn resolve_accept_header(format: OutputFormat) -> &'static str {
     }
 }
 
-/// `decodeHtmlAttribute` (extract.ts:922-929).
+/// `decodeHtmlAttribute` (extract.ts:922-929): every entity matches
+/// case-INSENSITIVELY (`/gi` flags upstream — `&AMP;` decodes just like
+/// `&amp;`).
 pub fn decode_html_attribute(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    use std::sync::LazyLock;
+    static AMP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)&amp;").expect("valid"));
+    static QUOT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)&quot;").expect("valid"));
+    static APOS: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)&(#39|apos);").expect("valid"));
+    static LT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)&lt;").expect("valid"));
+    static GT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)&gt;").expect("valid"));
+    let value = AMP.replace_all(value, "&");
+    let value = QUOT.replace_all(&value, "\"");
+    let value = APOS.replace_all(&value, "'");
+    let value = LT.replace_all(&value, "<");
+    GT.replace_all(&value, ">").into_owned()
 }
 
 /// `parseContentLengthHeader` (extract.ts:654-658): parseInt semantics —
@@ -1264,6 +1271,16 @@ fn should_strip_replies(site: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_attribute_entities_decode_case_insensitively() {
+        // extract.ts:922-929 uses /gi — `&AMP;` decodes like `&amp;`.
+        assert_eq!(decode_html_attribute("&AMP;"), "&");
+        assert_eq!(decode_html_attribute("&QuOt;"), "\"");
+        assert_eq!(decode_html_attribute("&#39;"), "'");
+        assert_eq!(decode_html_attribute("&APOS;"), "'");
+        assert_eq!(decode_html_attribute("a&lt;b&amp;&GT;c"), "a<b&>c");
+    }
 
     #[test]
     fn content_type_classification() {

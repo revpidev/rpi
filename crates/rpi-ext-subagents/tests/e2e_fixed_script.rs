@@ -725,11 +725,14 @@ fn e2e_fixed_child_full_pipeline() {
         assert!(!frames.is_empty(), "streaming frames reached the host");
         let first = &frames[0];
         // toolUpdate envelope: toolCallId + the partial AgentToolResult.
+        // The initial frame (execution.ts:1009 fireUpdate right after the
+        // handler attaches) fires BEFORE any event: no tool, no output —
+        // the first frame must not wait for the first 1s activity tick.
         assert_eq!(first["toolCallId"], json!("test"));
         assert_eq!(
             first["update"]["content"][0]["text"],
             json!("(running...)"),
-            "first frame (tool_execution_start) has no output yet"
+            "initial frame precedes every event"
         );
         let details = &first["update"]["details"];
         assert_eq!(details["mode"], json!("single"));
@@ -737,11 +740,21 @@ fn e2e_fixed_child_full_pipeline() {
         let progress = &details["progress"][0];
         assert_eq!(progress["agent"], json!("scout"));
         assert_eq!(progress["status"], json!("running"));
+        assert_eq!(progress["currentTool"], Value::Null);
+        assert_eq!(progress["toolCount"], json!(0));
+        assert_eq!(details["results"][0].get("messages"), None);
+        // The second frame is the first progress-bearing event
+        // (tool_execution_start): the read tool lights up.
+        let second = &frames[1];
+        let progress = &second["update"]["details"]["progress"][0];
         assert_eq!(progress["currentTool"], json!("read"));
         assert_eq!(progress["currentToolArgs"], json!("/tmp/e2e.rs"));
         assert_eq!(progress["currentPath"], json!("/tmp/e2e.rs"));
         assert_eq!(progress["toolCount"], json!(1));
-        assert_eq!(details["results"][0].get("messages"), None);
+        assert_eq!(
+            second["update"]["details"]["results"][0].get("messages"),
+            None
+        );
         // After tool_execution_end + the final message: recentTools carries
         // the finished call, the frame text is the final output, and the
         // streamed result embeds the bounded toolCalls summary.

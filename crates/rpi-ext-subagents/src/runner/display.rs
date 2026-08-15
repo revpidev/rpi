@@ -160,14 +160,55 @@ pub fn sanitize_display_text(value: &str) -> String {
 
 /// `formatDuration` (formatters.ts:50-54): ms → `250ms` / `1.2s` /
 /// `3m05s`-style `minutes m seconds s` (no hours unit, unbounded minutes).
+/// The seconds arm goes through `toFixed(1)` — JS rounds ties away from
+/// zero (1250ms → "1.3s"), Rust's `{:.1}` breaks ties to even ("1.2s").
 pub fn format_duration(ms: u64) -> String {
     if ms < 1000 {
         return format!("{ms}ms");
     }
     if ms < 60_000 {
-        return format!("{:.1}s", ms as f64 / 1000.0);
+        return format!("{}s", js_to_fixed_1(ms as f64 / 1000.0));
     }
     format!("{}m{}s", ms / 60_000, (ms % 60_000) / 1000)
+}
+
+/// `Number.prototype.toFixed(1)` for the non-negative domain (durations):
+/// nearest to the double's exact decimal expansion, ties to the LARGER
+/// value. Same bit-decomposition port as smart-fetch `format::js_to_fixed`
+/// (exact-tie detection via `value = M·2^e`; multiplying by 10 first is
+/// NOT faithful — `2.675f64 * 100.0 == 267.5` while the double's exact
+/// value prints "2.67" in JS).
+fn js_to_fixed_1(value: f64) -> String {
+    if let Some(floor) = exact_tie_floor_1(value) {
+        return format!("{:.1}", (floor + 1) as f64 / 10.0);
+    }
+    format!("{:.1}", value)
+}
+
+/// When `value · 10` is exactly `m + 0.5`, returns `Some(m)`.
+fn exact_tie_floor_1(value: f64) -> Option<u64> {
+    let bits = value.to_bits();
+    if bits >> 63 != 0 {
+        return None; // non-negative domain only (durations)
+    }
+    let biased = ((bits >> 52) & 0x7ff) as i64;
+    let mantissa = bits & 0x000f_ffff_ffff_ffff;
+    let (m, e) = if biased == 0 {
+        if mantissa == 0 {
+            return None;
+        }
+        (mantissa, -1074i64)
+    } else {
+        (mantissa | (1u64 << 52), biased - 1023 - 52)
+    };
+    let trailing = m.trailing_zeros() as i64;
+    if trailing + e + 1 != -1 {
+        return None;
+    }
+    let odd_part = m >> trailing;
+    // value·10 = odd_part·5 / 2 — odd numerator ⇒ exactly x.5.
+    let numerator = odd_part.checked_mul(5u64)?;
+    Some((numerator - 1) / 2)
 }
 
 /// `shortenPath` (formatters.ts:125-131): `$HOME` prefix → `~`.
@@ -424,6 +465,13 @@ mod tests {
         assert_eq!(format_duration(60_000), "1m0s");
         assert_eq!(format_duration(185_000), "3m5s");
         assert_eq!(format_duration(3_700_000), "61m40s");
+        // toFixed(1) breaks exact ties AWAY from zero — Rust's {:.1} would
+        // print the half-even "1.2s"/"1.8s" for these exact-half doubles.
+        assert_eq!(format_duration(1250), "1.3s");
+        assert_eq!(format_duration(1750), "1.8s");
+        // A hair below the tie still rounds down (the double's exact value
+        // is under x.x5).
+        assert_eq!(format_duration(1249), "1.2s");
     }
 
     #[test]

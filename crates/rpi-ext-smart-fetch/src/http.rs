@@ -386,8 +386,12 @@ pub fn classify_transport_error(error: &wreq::Error) -> TransportFailure {
     }
 }
 
-/// Final URL of a failed request attempt, when the engine retained one
-/// (upstream: `errorContext.finalUrl` from request events / response.url).
+/// Final URL of a failed request attempt — BEST EFFORT: `wreq::Error::uri()`
+/// returns the URL the request STARTED at (the crates.io engine exposes no
+/// redirect history on errors), so after redirects this is the original
+/// URL, not the final hop. Upstream's `errorContext.finalUrl` comes from
+/// the request-event stream / `response.url` (post-redirect); same
+/// engine-face root cause as TE-D27 (see its closing addendum).
 pub fn error_final_url(error: &wreq::Error) -> Option<String> {
     error.uri().map(|uri| uri.to_string())
 }

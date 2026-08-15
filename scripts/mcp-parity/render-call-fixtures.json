@@ -15,73 +15,123 @@
       "kind": "proxy",
       "args": {
         "tool": "cf-portal_list_worker_tail_events",
-        "args": { "accountId": "abc", "limit": 10 }
+        "args": {
+          "accountId": "abc",
+          "limit": 10
+        }
       }
     },
     {
       "name": "proxy-search-regex-server",
       "kind": "proxy",
-      "args": { "search": "tail events", "server": "cf-portal", "regex": true }
+      "args": {
+        "search": "tail events",
+        "server": "cf-portal",
+        "regex": true
+      }
     },
     {
       "name": "proxy-search-schemas-hidden",
       "kind": "proxy",
-      "args": { "search": "q", "includeSchemas": false }
+      "args": {
+        "search": "q",
+        "includeSchemas": false
+      }
     },
     {
       "name": "proxy-search-no-annotations",
       "kind": "proxy",
-      "args": { "search": "q", "regex": false, "includeSchemas": true }
+      "args": {
+        "search": "q",
+        "regex": false,
+        "includeSchemas": true
+      }
     },
     {
       "name": "proxy-connect",
       "kind": "proxy",
-      "args": { "connect": "cf-portal" }
+      "args": {
+        "connect": "cf-portal"
+      }
     },
     {
       "name": "proxy-describe",
       "kind": "proxy",
-      "args": { "describe": "fixture_echo" }
+      "args": {
+        "describe": "fixture_echo"
+      }
     },
     {
       "name": "proxy-list-server",
       "kind": "proxy",
-      "args": { "server": "cf-portal" }
+      "args": {
+        "server": "cf-portal"
+      }
     },
-    { "name": "proxy-empty-args", "kind": "proxy", "args": {} },
+    {
+      "name": "proxy-empty-args",
+      "kind": "proxy",
+      "args": {}
+    },
     {
       "name": "proxy-empty-string-args",
       "kind": "proxy",
-      "args": { "tool": "t", "args": "" }
+      "args": {
+        "tool": "t",
+        "args": ""
+      }
     },
     {
       "name": "proxy-empty-object-args",
       "kind": "proxy",
-      "args": { "tool": "t", "args": {} }
+      "args": {
+        "tool": "t",
+        "args": {}
+      }
     },
     {
       "name": "proxy-ui-messages-wins",
       "kind": "proxy",
-      "args": { "action": "ui-messages", "server": "cf-portal" }
+      "args": {
+        "action": "ui-messages",
+        "server": "cf-portal"
+      }
     },
     {
       "name": "proxy-other-action",
       "kind": "proxy",
-      "args": { "action": "auth-start" }
+      "args": {
+        "action": "auth-start"
+      }
     },
     {
       "name": "proxy-truncation-budget",
       "kind": "proxy",
       "args": {
         "tool": "long_call",
-        "args": { "blob": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }
+        "args": {
+          "blob": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        }
+      }
+    },
+    {
+      "name": "proxy-truncation-unicode-astral",
+      "kind": "proxy",
+      "args": {
+        "tool": "emoji_blob",
+        "args": {
+          "blob": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"
+        }
       }
     },
     {
       "name": "direct-with-args",
       "kind": "direct",
       "displayName": "cf-portal_list_worker_tail_events",
-      "args": { "accountId": "abc", "scriptName": "worker" }
+      "args": {
+        "accountId": "abc",
+        "scriptName": "worker"
+      }
     },
     {
       "name": "direct-empty-args",
@@ -93,38 +143,58 @@
       "name": "direct-array-args-degrade",
       "kind": "direct",
       "displayName": "weird_tool",
-      "args": [1, 2, 3]
+      "args": [
+        1,
+        2,
+        3
+      ]
     },
     {
       "name": "proxy-empty-branch-key-tool",
       "kind": "proxy",
-      "args": { "tool": "" }
+      "args": {
+        "tool": ""
+      }
     },
     {
       "name": "proxy-empty-branch-key-connect-search-server",
       "kind": "proxy",
-      "args": { "connect": "", "search": "", "server": "" }
+      "args": {
+        "connect": "",
+        "search": "",
+        "server": ""
+      }
     },
     {
       "name": "proxy-empty-branch-key-action",
       "kind": "proxy",
-      "args": { "action": "" }
+      "args": {
+        "action": ""
+      }
     },
     {
       "name": "proxy-empty-server-annotation-is-falsy",
       "kind": "proxy",
-      "args": { "tool": "t", "server": "" }
+      "args": {
+        "tool": "t",
+        "server": ""
+      }
     },
     {
       "name": "render-proxy-lines",
       "kind": "render-proxy",
-      "args": { "tool": "test_tool", "server": "demo" }
+      "args": {
+        "tool": "test_tool",
+        "server": "demo"
+      }
     },
     {
       "name": "render-direct-lines",
       "kind": "render-direct",
       "displayName": "test_tool",
-      "args": { "key": "value" }
+      "args": {
+        "key": "value"
+      }
     }
   ]
 }
