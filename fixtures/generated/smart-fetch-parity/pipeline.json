@@ -1215,7 +1215,8 @@
     "name": "non-html-content-type",
     "input": {
       "opts": {
-        "url": "https://ex.com/binaryish"
+        "url": "https://ex.com/binaryish",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
       },
       "defuddleResult": {
         "wordCount": 0
@@ -1226,21 +1227,27 @@
           "headers": {
             "content-type": "application/octet-stream"
           },
-          "body": "binary-ish textual body"
+          "body": "binary-ish textual body",
+          "stream": true
         }
       ]
     },
     "output": {
       "result": {
-        "error": "Request failed while downloading the response for https://ex.com/binaryish: not used in parity scenarios",
-        "code": "download_error",
-        "phase": "loading",
-        "retryable": true,
-        "timeoutMs": 15000,
+        "kind": "file",
         "url": "https://ex.com/binaryish",
         "finalUrl": "https://ex.com/binaryish",
-        "statusCode": 200,
-        "statusText": "OK",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/binaryish.bin",
+        "fileSize": 23,
         "mimeType": "application/octet-stream"
       },
       "requestHeadersSeen": {
@@ -1382,6 +1389,522 @@
       },
       "requestHeadersSeen": {
         "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "meta-refresh-follow",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/start"
+      },
+      "defuddleResult": {
+        "content": "Final page body.",
+        "wordCount": 3,
+        "title": "Fixture Article"
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/final\"></head><body>redirecting…</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><title>Fixture Article</title></head><body><article><h1>Main Title</h1><p>This article has enough words for readability scoring thresholds so the extractor path is exercised properly across formats.</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/final",
+        "finalUrl": "https://ex.com/final",
+        "title": "Fixture Article",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 3,
+        "content": "Final page body.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "meta-refresh-follow-raw-format",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/start",
+        "format": "raw"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"2;url=https://ex.com/raw-target\"></head><body>redirecting…</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain"
+          },
+          "body": "raw landed body"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/raw-target",
+        "finalUrl": "https://ex.com/raw-target",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "raw landed body",
+        "browser": "chrome_145",
+        "os": "windows",
+        "contentType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/json,application/xml;q=0.9,text/markdown;q=0.8,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "meta-refresh-delay-30-not-followed",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/slowmeta"
+      },
+      "defuddleResult": {
+        "content": "Content stays on page.",
+        "wordCount": 4
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"30;url=/final\"></head><body>still here</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/slowmeta",
+        "finalUrl": "https://ex.com/slowmeta",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 4,
+        "content": "Content stays on page.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "meta-refresh-limit-exceeded",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/hop-0"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-1\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-2\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-3\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-4\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-5\"></head><body>loop</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><meta http-equiv=\"refresh\" content=\"0;url=/hop-6\"></head><body>loop</body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "error": "Client-side redirect limit (5) exceeded while fetching https://ex.com/hop-5.",
+        "code": "too_many_redirects",
+        "phase": "loading",
+        "retryable": false,
+        "timeoutMs": 15000,
+        "url": "https://ex.com/hop-5",
+        "finalUrl": "https://ex.com/hop-5",
+        "mimeType": "text/html"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "alternate-json-format-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/page",
+        "format": "json"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"application/json\" href=\"/api.json\"></head><body>not json</body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/json"
+          },
+          "body": "{\"alt\":true}"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/api.json",
+        "finalUrl": "https://ex.com/api.json",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 4,
+        "content": "{\n  \"alt\": true\n}",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "application/json,text/json,application/ld+json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "alternate-empty-content-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/emptyish"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/full.md\"></head><body><script>only a script</script></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Alternate Body\n\nPlenty of markdown words on the alternate endpoint."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/full.md",
+        "finalUrl": "https://ex.com/full.md",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 11,
+        "content": "# Alternate Body\n\nPlenty of markdown words on the alternate endpoint.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "alternate-thin-content-fallback",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/thin"
+      },
+      "defuddleResult": {
+        "content": "too thin",
+        "wordCount": 2
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"text/markdown\" href=\"/full.md\"></head><body><article><p>too thin</p></article></body></html>"
+        },
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/markdown"
+          },
+          "body": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold."
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/full.md",
+        "finalUrl": "https://ex.com/full.md",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 17,
+        "content": "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold.",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "alternate-thin-content-unqualified-type-kept",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/thin-alone"
+      },
+      "defuddleResult": {
+        "content": "too thin but no qualified alternate",
+        "wordCount": 6
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/html"
+          },
+          "body": "<html><head><link rel=\"alternate\" type=\"application/rss+xml\" href=\"/feed.xml\"></head><body><article><p>too thin but no qualified alternate</p></article></body></html>"
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "content",
+        "url": "https://ex.com/thin-alone",
+        "finalUrl": "https://ex.com/thin-alone",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "",
+        "language": "",
+        "wordCount": 6,
+        "content": "too thin but no qualified alternate",
+        "browser": "chrome_145",
+        "os": "windows"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "download-attachment-disposition",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/files/report.pdf",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "application/pdf",
+            "content-disposition": "attachment; filename=\"Mock Report.pdf\""
+          },
+          "body": "PDF-BYTES-0123456789",
+          "stream": true
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "file",
+        "url": "https://ex.com/files/report.pdf",
+        "finalUrl": "https://ex.com/files/report.pdf",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/Mock-Report.pdf",
+        "fileSize": 20,
+        "mimeType": "application/pdf"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+      },
+      "requestTimeout": 15000,
+      "requestProxy": null,
+      "requestRedirect": "follow"
+    }
+  },
+  {
+    "name": "download-filename-star-disposition",
+    "input": {
+      "opts": {
+        "url": "https://ex.com/dl",
+        "tempDir": "/tmp/smart-fetch-parity-downloads"
+      },
+      "defuddleResult": {
+        "wordCount": 0
+      },
+      "fetchScript": [
+        {
+          "status": 200,
+          "headers": {
+            "content-type": "text/plain",
+            "content-disposition": "attachment; filename*=UTF-8''na%C3%AFve%20doc.txt"
+          },
+          "body": "plain but forced to download by disposition",
+          "stream": true
+        }
+      ]
+    },
+    "output": {
+      "result": {
+        "kind": "file",
+        "url": "https://ex.com/dl",
+        "finalUrl": "https://ex.com/dl",
+        "title": "",
+        "author": "",
+        "published": "",
+        "site": "ex.com",
+        "language": "",
+        "wordCount": 0,
+        "content": "",
+        "browser": "chrome_145",
+        "os": "windows",
+        "filePath": "/tmp/smart-fetch-parity-downloads/naive-doc.txt",
+        "fileSize": 43,
+        "mimeType": "text/plain"
+      },
+      "requestHeadersSeen": {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9"
       },
       "requestTimeout": 15000,

@@ -1,13 +1,7 @@
 //! Core fetch pipeline — 1:1 port of upstream
 //! `packages/core/src/extract.ts:fetchWithClientRedirects` @ b0111612
-//! (FR-P0-2/5/6/8/9/10/11).
-//!
-//! TE06 P0 scope: the single-fetch text pipeline end to end. Three upstream
-//! behaviors ship as pure functions here but are NOT wired into the loop yet
-//! (TE07): meta-refresh recursion (FR-P1-2), alternate-link fallback
-//! (FR-P1-3) and the attachment/binary download branch (FR-P1-4) — a
-//! non-textual response therefore falls through to the upstream
-//! "Not an HTML page" terminal error instead of becoming a file result.
+//! (FR-P0-2/5/6/8/9/10/11 + FR-P1-2/3/4 recursion, download and fallback
+//! branches).
 //! Phase tracking marks by pipeline position (design §3.1): send()-stage
 //! timeouts report `connecting` (upstream's event stream would split that
 //! into connecting/waiting — declared deviation, task file).
@@ -30,9 +24,11 @@ use crate::types::{
 };
 
 /// Patch table for `mime_guess` ↔ `mime-types` (npm) drift in
-/// download-extension mapping (design §3.4). Starts empty; the parity
-/// fixtures arbitrate which entries are needed.
-pub static MIME_PATCH_TABLE: LazyLock<HashMap<&'static str, String>> = LazyLock::new(HashMap::new);
+/// download-extension mapping (design §3.4). The parity fixtures arbitrate
+/// which entries are needed — `application/octet-stream` is the first
+/// recorded divergence (mime-types maps `.bin`, mime_guess picks `.aaf`).
+pub static MIME_PATCH_TABLE: LazyLock<HashMap<&'static str, String>> =
+    LazyLock::new(|| HashMap::from([("application/octet-stream", ".bin".to_string())]));
 
 // ===== content-type & response classification (extract.ts:75-98, 346-349, 904-920) =====
 
@@ -598,6 +594,7 @@ pub type TransportFn =
 /// future resolving to the transport result.
 pub mod futures_boxed {
     use crate::http::{FetchFailure, HttpResponse};
+    use crate::types::FetchOutcome;
 
     pub type BoxedFetch = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<HttpResponse, FetchFailure>> + Send>,
@@ -607,6 +604,20 @@ pub mod futures_boxed {
     pub fn boxed<F>(future: F) -> BoxedFetch
     where
         F: std::future::Future<Output = Result<HttpResponse, FetchFailure>> + Send + 'static,
+    {
+        Box::pin(future)
+    }
+
+    /// Boxed pipeline outcome — the recursion seam for meta-refresh and
+    /// alternate-follow hops (a bare `async fn` recursion would need the
+    /// future's type to contain itself). Borrowed: the hop re-enters the
+    /// same pipeline with a cloned-options request.
+    pub type BoxedOutcome<'a> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = FetchOutcome> + Send + 'a>>;
+
+    pub fn boxed_outcome<'a, F>(future: F) -> BoxedOutcome<'a>
+    where
+        F: std::future::Future<Output = FetchOutcome> + Send + 'a,
     {
         Box::pin(future)
     }
@@ -637,14 +648,38 @@ impl Default for FetchPipeline {
 }
 
 impl FetchPipeline {
-    /// `defuddleFetch` entry (extract.ts:1704-1709).
+    /// `defuddleFetch` entry (extract.ts:1704-1709): recursion budgets start
+    /// at zero.
     pub async fn fetch(&self, opts: &crate::types::FetchOptions) -> FetchOutcome {
-        self.fetch_inner(opts).await
+        self.fetch_inner(opts, 0, 0).await
     }
 
-    async fn fetch_inner(&self, opts: &crate::types::FetchOptions) -> FetchOutcome {
-        // TE07 recursion budget args (clientSideRedirectCount /
-        // alternateLinkFallbackCount) arrive with FR-P1-2/P1-3 wiring.
+    /// `fetchWithClientRedirects` with recursion budgets
+    /// `client_side_redirect_count` / `alternate_link_fallback_count`
+    /// (extract.ts:1134-1138). Boxed recursion: the async fn's self-referential
+    /// future would otherwise grow unboundedly per hop.
+    fn fetch_inner<'a>(
+        &'a self,
+        opts: &'a crate::types::FetchOptions,
+        client_side_redirect_count: u32,
+        alternate_link_fallback_count: u32,
+    ) -> futures_boxed::BoxedOutcome<'a> {
+        futures_boxed::boxed_outcome(async move {
+            self.fetch_step(
+                opts,
+                client_side_redirect_count,
+                alternate_link_fallback_count,
+            )
+            .await
+        })
+    }
+
+    async fn fetch_step(
+        &self,
+        opts: &crate::types::FetchOptions,
+        client_side_redirect_count: u32,
+        alternate_link_fallback_count: u32,
+    ) -> FetchOutcome {
         let browser = opts
             .browser
             .clone()
@@ -749,18 +784,78 @@ impl FetchPipeline {
             .header("content-type")
             .unwrap_or_default()
             .to_string();
-        let raw_body = response.body;
+        let content_disposition = response
+            .header("content-disposition")
+            .unwrap_or_default()
+            .to_string();
 
-        // TE07 FR-P1-4: attachment/non-textual download branch
-        // (`isAttachmentDisposition(contentDisposition) ||
-        // !isTextualContentType(contentType)`) wires here. P0 falls through
-        // to the text pipeline, so binaries terminate at the "Not an HTML
-        // page" guard below.
-
-        // TE07 FR-P1-2: meta-refresh recursion (extract.ts:1290-1312) wires
-        // here via `extract_client_side_redirect(&raw_body, &final_url)`.
+        // FR-P1-4 download branch (extract.ts:1262-1286): attachments and
+        // non-textual bodies stream to the temp dir, never through
+        // extraction.
+        let should_download_to_file = is_attachment_disposition(&content_disposition)
+            || !is_textual_content_type(&content_type);
+        if should_download_to_file {
+            context.phase = FetchErrorPhase::Loading;
+            return crate::download::build_file_result(
+                &opts.url,
+                response.body,
+                &final_url,
+                &content_type,
+                &content_disposition,
+                &browser,
+                &os,
+                opts.temp_dir.as_deref(),
+                &context,
+            )
+            .await;
+        }
 
         context.phase = FetchErrorPhase::Loading;
+        let raw_body = match response.body.read_all().await {
+            Ok(body) => body,
+            Err(error) => {
+                // Body-read failures classify like upstream's transport
+                // throws (extract.ts:1696-1701).
+                let failure = http::FetchFailure::Transport {
+                    failure: http::classify_transport_error(&error),
+                    final_url: Some(final_url.clone()),
+                };
+                return FetchOutcome::Error(map_fetch_failure(&failure, &context));
+            }
+        };
+
+        // FR-P1-2 meta refresh (extract.ts:1290-1312): applies to every
+        // format (the check precedes the raw/json branches upstream).
+        if let Some(redirect_target) = extract_client_side_redirect(&raw_body, &final_url) {
+            if client_side_redirect_count >= MAX_CLIENT_SIDE_REDIRECTS {
+                return FetchOutcome::Error(FetchError {
+                    error: format!(
+                        "Client-side redirect limit ({MAX_CLIENT_SIDE_REDIRECTS}) exceeded while fetching {}.",
+                        opts.url
+                    ),
+                    code: Some(crate::types::FetchErrorCode::TooManyRedirects),
+                    phase: Some(FetchErrorPhase::Loading),
+                    retryable: Some(false),
+                    timeout_ms: Some(timeout_ms),
+                    url: Some(opts.url.clone()),
+                    final_url: Some(final_url.clone()),
+                    status_code: None,
+                    status_text: None,
+                    mime_type: Some(normalize_content_type(&content_type))
+                        .filter(|mime| !mime.is_empty()),
+                    content_length: context.content_length,
+                    downloaded_bytes: None,
+                });
+            }
+            return self
+                .fetch_inner(
+                    &opts.with_url(redirect_target),
+                    client_side_redirect_count + 1,
+                    alternate_link_fallback_count,
+                )
+                .await;
+        }
+
         let json_response = is_json_response(&content_type, &raw_body);
 
         // FR-P0-8 raw format (extract.ts:1316-1404). The X/Twitter oEmbed
@@ -783,8 +878,33 @@ impl FetchPipeline {
 
         if format == OutputFormat::Json {
             if !json_response {
-                // TE07 FR-P1-3: alternate-link fallback before the terminal
-                // error (extract.ts:1408-1425).
+                // FR-P1-3 (extract.ts:1406-1437): an HTML body may carry a
+                // qualified alternate link worth following before the
+                // terminal error.
+                if HTML_CONTENT_TYPES
+                    .iter()
+                    .any(|value| content_type.contains(value))
+                {
+                    // scraper's `Html` is not `Send` (non-atomic tendril
+                    // counters) — finish the DOM work and drop the document
+                    // before the recursive await.
+                    let alternate_links = {
+                        let document = Html::parse_document(&raw_body);
+                        extract_qualified_alternate_links(&document, &final_url, format)
+                    };
+                    if !alternate_links.is_empty()
+                        && alternate_link_fallback_count < MAX_ALTERNATE_LINK_FALLBACKS
+                    {
+                        return self
+                            .fetch_inner(
+                                &opts.with_url(alternate_links[0].clone()),
+                                client_side_redirect_count,
+                                alternate_link_fallback_count + 1,
+                            )
+                            .await;
+                    }
+                }
+
                 return FetchOutcome::Error(FetchError {
                     error: format!("Not a JSON response (content-type: {content_type})"),
                     code: Some(crate::types::FetchErrorCode::UnexpectedResponse),
@@ -846,10 +966,43 @@ impl FetchPipeline {
             });
         }
 
-        // FR-P0-7 extraction (extract.ts:1514-1643).
+        // FR-P0-7 extraction (extract.ts:1514-1643) with the FR-P1-3 alternate
+        // fallbacks (extract.ts:1521-1543, 1617-1655).
         context.phase = FetchErrorPhase::Processing;
-        let extraction_document = Html::parse_document(&raw_body);
-        let fallback_document = Html::parse_document(&raw_body);
+        // All DOM work happens up front: scraper's `Html` is not `Send`
+        // (non-atomic tendril counters), so the documents are dropped before
+        // any recursive await. Upstream parses two same-source documents
+        // (`extractionDocument` feeds Defuddle; the Rust adapter consumes the
+        // raw HTML string directly, so only the fallback document exists).
+        let (alternate_links, fallback_text, fallback_markdown) = {
+            let fallback_document = Html::parse_document(&raw_body);
+            let alternate_links =
+                extract_qualified_alternate_links(&fallback_document, &final_url, format);
+            let fallback_text = crate::extract::extract_dom_text_fallback(&fallback_document);
+            let fallback_markdown = if format == OutputFormat::Markdown {
+                crate::extract::extract_dom_markdown_fallback(&fallback_document)
+            } else {
+                String::new()
+            };
+            (alternate_links, fallback_text, fallback_markdown)
+        };
+
+        // `tryAlternateLinkFallback` (extract.ts:1529-1543).
+        let try_alternate = || async {
+            if alternate_links.is_empty()
+                || alternate_link_fallback_count >= MAX_ALTERNATE_LINK_FALLBACKS
+            {
+                return None;
+            }
+            Some(
+                self.fetch_inner(
+                    &opts.with_url(alternate_links[0].clone()),
+                    client_side_redirect_count,
+                    alternate_link_fallback_count + 1,
+                )
+                .await,
+            )
+        };
 
         let extracted = self.extractor.extract(
             &raw_body,
@@ -863,10 +1016,12 @@ impl FetchPipeline {
 
         let (mut extracted_content, mut word_count) =
             if extracted.content.as_deref().unwrap_or("").is_empty() || extracted.word_count == 0 {
-                let fallback_text = crate::extract::extract_dom_text_fallback(&fallback_document);
                 if fallback_text.is_empty() {
-                    // TE07 FR-P1-3: alternate fallback before no_content
-                    // (extract.ts:1620-1621); P0 terminates.
+                    // extract.ts:1619-1621: alternate fallback before the
+                    // no_content terminal.
+                    if let Some(alternate_result) = try_alternate().await {
+                        return alternate_result;
+                    }
                     return FetchOutcome::Error(FetchError {
                         error: format!(
                             "No content extracted from {}. May need JS rendering or is blocked.",
@@ -889,12 +1044,10 @@ impl FetchPipeline {
                 let content = match format {
                     OutputFormat::Html => raw_body.clone(),
                     OutputFormat::Markdown => {
-                        let rendered =
-                            crate::extract::extract_dom_markdown_fallback(&fallback_document);
-                        if rendered.is_empty() {
+                        if fallback_markdown.is_empty() {
                             fallback_text.clone()
                         } else {
-                            rendered
+                            fallback_markdown.clone()
                         }
                     }
                     _ => fallback_text.clone(),
@@ -904,16 +1057,22 @@ impl FetchPipeline {
                 (extracted.content.unwrap_or_default(), extracted.word_count)
             };
 
-        // Thin-content alternate check (extract.ts:1645-1655): P0 computes
-        // the pair but has no alternate to follow (TE07 wires the recursion);
-        // `let _ =` keeps the 30-word rule visible at the port site.
+        // Thin-content alternate check (extract.ts:1645-1655): follow when
+        // min(engine wordCount, rendered word count) drops below 30 — and
+        // keep the thin result when there is nothing (left) to follow.
         let extracted_text_word_count = if format == OutputFormat::Text {
             estimate_word_count(&extracted_content)
         } else {
             estimate_word_count(&markdown_to_text(&extracted_content))
         };
-        let _thin_content = std::cmp::min(word_count, extracted_text_word_count)
-            < MIN_EXTRACTED_WORDS_BEFORE_ALTERNATE_FALLBACK;
+        if std::cmp::min(word_count, extracted_text_word_count)
+            < MIN_EXTRACTED_WORDS_BEFORE_ALTERNATE_FALLBACK
+            && !alternate_links.is_empty()
+        {
+            if let Some(alternate_result) = try_alternate().await {
+                return alternate_result;
+            }
+        }
 
         // includeReplies=false comment stripping (extract.ts:1657-1673) —
         // only meaningful when the engine emits comment markers; the
@@ -951,7 +1110,6 @@ impl FetchPipeline {
         result.published = extracted.published.clone().unwrap_or_default();
         result.site = extracted.site.clone().unwrap_or_default();
         result.language = extracted.language.clone().unwrap_or_default();
-        let _ = &extraction_document;
         FetchOutcome::Result(result)
     }
 }

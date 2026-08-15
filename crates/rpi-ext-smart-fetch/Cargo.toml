@@ -29,8 +29,10 @@ regex.workspace = true
 # version ↔ profile coverage matrix is recorded in the TE06 task file.
 # socks: FR-P0-4 socks5 proxy; gzip/brotli/deflate/zstd: transparent response
 # decompression to match wreq-js behavior.
-wreq = { version = "6.0.0-rc.29", features = ["socks", "gzip", "brotli", "deflate", "zstd"] }
+wreq = { version = "6.0.0-rc.29", features = ["socks", "gzip", "brotli", "deflate", "zstd", "stream"] }
 wreq-util = { version = "3.0.0-rc.14", features = ["emulation-serde"] }
+# Stream combinator for the wreq bytes_stream (FR-P1-4 download path).
+futures = { workspace = true }
 
 # Extraction engine (design §3.2, declared [VARIANT]): Readability port whose
 # TextMode::Markdown natively serializes the cleaned article to markdown

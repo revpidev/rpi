@@ -90,12 +90,14 @@ async fn l0_load_capability_denied_and_full_surface() {
             .any(|error| error.error.contains("capabilityDenied")),
         "expected capabilityDenied load error, got {errors:?}"
     );
+    // both packaged copies (cdylib ≈ .5 GB with debug info) are cleaned up —
+    // leaked copies once filled /tmp
     let _ = std::fs::remove_dir_all(denied_package.parent().unwrap());
 
     // 2. The manifest surface loads clean and registers web_fetch.
     let package = package("full", r#"["tools","session"]"#, &plugin);
     let host = NativeExtensionHost::new(sandbox.join("proj").to_string_lossy().as_ref());
-    let errors = host.load_paths(&[package]).await;
+    let errors = host.load_paths(std::slice::from_ref(&package)).await;
     assert!(errors.is_empty(), "{errors:?}");
     let definition = host
         .get_tool_definition("web_fetch")
@@ -202,5 +204,138 @@ async fn l0_load_capability_denied_and_full_surface() {
         Some(&serde_json::json!("error"))
     );
 
+    // 5. FR-P1-5: settings are read per execute — global <agentDir> +
+    // project `.rpi`, project overriding global per key.
+    std::fs::write(
+        sandbox.join("agent/settings.json"),
+        serde_json::json!({
+            "smartFetchDefaultBatchConcurrency": 2,
+            "webFetchDefaultMaxChars": 333,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.join("proj/.rpi/settings.json"),
+        serde_json::json!({ "smartFetchDefaultBatchConcurrency": 3 }).to_string(),
+    )
+    .unwrap();
+
+    // 6. FR-P1-1: batch_web_fetch registers with the upstream schema and
+    // fans out with bounded concurrency + per-item isolation.
+    let batch_definition = host
+        .get_tool_definition("batch_web_fetch")
+        .expect("batch_web_fetch registered");
+    let batch_description = batch_definition.description.as_str();
+    assert!(
+        batch_description.contains("bounded concurrency"),
+        "batch description registered: {batch_description}"
+    );
+    let batch_schema = serde_json::to_value(&batch_definition.parameters).unwrap_or_default();
+    let requests_schema = batch_schema
+        .get("properties")
+        .and_then(|p| p.get("requests"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        requests_schema.get("minItems"),
+        Some(&serde_json::json!(1)),
+        "requests minItems: {requests_schema}"
+    );
+    assert_eq!(
+        requests_schema
+            .get("items")
+            .and_then(|i| i.get("additionalProperties")),
+        Some(&serde_json::json!(false))
+    );
+
+    let server = common::Responder::start(vec![
+        (
+            "200 OK".to_string(),
+            vec![("Content-Type", "text/plain".to_string())],
+            "batch body one".to_string(),
+        ),
+        (
+            "200 OK".to_string(),
+            vec![("Content-Type", "text/plain".to_string())],
+            "batch body two".to_string(),
+        ),
+    ]);
+    let request = rpi_ext_host::types::ToolExecuteRequest {
+        tool_call_id: "l0-batch".to_owned(),
+        params: serde_json::json!({
+            "requests": [
+                { "url": server.url("/one") },
+                { "url": "not a url" },
+                { "url": server.url("/two") },
+            ],
+        }),
+        signal: tokio_util::sync::CancellationToken::new(),
+        on_update: None,
+    };
+    let result = (batch_definition.execute)(request, host.core().create_context())
+        .await
+        .expect("batch executes");
+    let text = result
+        .content
+        .iter()
+        .map(|block| match block {
+            rpi_ai::types::ToolResultContent::Text(text) => text.text.clone(),
+            _ => String::new(),
+        })
+        .collect::<String>();
+    assert!(text.contains("> Requests: 3"), "{text}");
+    assert!(text.contains("> Succeeded: 2"), "{text}");
+    assert!(text.contains("> Failed: 1"), "{text}");
+    // input order kept: [1/3] ok, [2/3] error, [3/3] ok
+    let one = text.find("## [1/3]").expect("item 1");
+    let error_item = text.find("## [2/3]").expect("item 2");
+    let two = text.find("## [3/3]").expect("item 3");
+    assert!(one < error_item && error_item < two, "{text}");
+    assert!(
+        text[error_item..two].contains("Invalid URL: not a url"),
+        "{}",
+        text
+    );
+    // project settings override global: concurrency 3, not 2
+    assert!(text.contains("> Concurrency: 3"), "{text}");
+    // the final progress snapshot rides details (on_update gap, design §1.3 #3)
+    let details = result.details.clone();
+    assert_eq!(
+        details
+            .get("batchProgress")
+            .and_then(|p| p.get("completed")),
+        Some(&serde_json::json!(3)),
+        "details: {details}"
+    );
+    assert_eq!(
+        details
+            .get("batchProgress")
+            .and_then(|p| p.get("batchConcurrency")),
+        Some(&serde_json::json!(3))
+    );
+    assert_eq!(
+        details.get("batchResult").and_then(|r| r.get("succeeded")),
+        Some(&serde_json::json!(2))
+    );
+
+    // 7. global settings apply to web_fetch defaults too (maxChars 333).
+    let request = rpi_ext_host::types::ToolExecuteRequest {
+        tool_call_id: "l0-settings".to_owned(),
+        params: serde_json::json!({ "url": server.url("/three") }),
+        signal: tokio_util::sync::CancellationToken::new(),
+        on_update: None,
+    };
+    let result = (definition.execute)(request, host.core().create_context())
+        .await
+        .expect("web_fetch executes");
+    assert_eq!(
+        result.details.get("maxChars"),
+        Some(&serde_json::json!(333)),
+        "global webFetchDefaultMaxChars applied: {}",
+        result.details
+    );
+
+    let _ = std::fs::remove_dir_all(package.parent().unwrap());
     let _ = std::fs::remove_dir_all(&sandbox);
 }

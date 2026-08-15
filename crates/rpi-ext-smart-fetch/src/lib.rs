@@ -1,13 +1,15 @@
 //! rpi-smart-fetch: fingerprinted web fetch extension (L0 native plugin,
-//! TE06 P0 core).
+//! TE06 P0 core + TE07 P1 enhancements).
 //!
-//! Port of pi-smart-fetch v0.3.17 (b0111612) — registers the `web_fetch`
-//! tool: browser-grade TLS/HTTP2 fingerprinting via wreq (upstream wreq-js
-//! engine line), readability extraction via dom_smoothie with a 1:1 DOM
-//! fallback chain, five output formats, maxChars truncation and the
-//! structured FetchError model. See docs: `rpi-docs/extensions/pi-smart-fetch/`
-//! (requirements/design) — extraction-engine divergence is a declared
-//! [VARIANT] accepted by metric-based parity (design §3.2).
+//! Port of pi-smart-fetch v0.3.17 (b0111612) — registers the `web_fetch` and
+//! `batch_web_fetch` tools: browser-grade TLS/HTTP2 fingerprinting via wreq
+//! (upstream wreq-js engine line), readability extraction via dom_smoothie
+//! with a 1:1 DOM fallback chain, five output formats, maxChars truncation,
+//! the structured FetchError model, meta-refresh/alternate recursion,
+//! streaming attachment downloads and settings.json global defaults. See
+//! docs: `rpi-docs/extensions/pi-smart-fetch/` (requirements/design) —
+//! extraction-engine divergence is a declared [VARIANT] accepted by
+//! metric-based parity (design §3.2).
 //!
 //! Async model (design §2.2): the host calls the cdylib synchronously; the
 //! pipeline runs on a plugin-owned tokio runtime via `block_on`, never on
@@ -29,15 +31,20 @@ use std::sync::OnceLock;
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
 use rpi_ext_host::native::{PluginCookie, RpiHostCalls, RpiNativeModule, RpiNativeModule_Ref};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::pipeline::FetchPipeline;
 use crate::runtime::PluginRuntime;
+use crate::settings::ResolvedSettings;
+use crate::types::FetchToolDefaults;
 use crate::types::{FetchOutcome, WebFetchParams};
 
 /// Plugin state established once by `rpi_extension_init`.
 struct PluginState {
     runtime: PluginRuntime,
+    /// Host handle for the per-execute `ctx.cwd` lookup (FR-P1-5). `None` in
+    /// test installs that never registered through a real host.
+    host: Option<(RpiHostCalls, usize)>,
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
@@ -53,65 +60,120 @@ fn tool_description() -> String {
     .join(" ")
 }
 
+/// Upstream `batchToolDescription` (index.ts:36-41), verbatim.
+fn batch_tool_description() -> String {
+    [
+        "Fetch multiple URLs with browser-grade TLS fingerprinting and readable extraction.",
+        "Each request accepts the same parameters as web_fetch and fans out with bounded concurrency.",
+        "Returns full per-item metadata to the agent and streams compact per-item progress in the pi TUI.",
+        "Does NOT execute JavaScript — use a browser automation tool for JS-heavy pages.",
+    ]
+    .join(" ")
+}
+
 /// Upstream `promptSnippet` (index.ts:477-479), verbatim.
 const TOOL_PROMPT_SNIPPET: &str = "web_fetch(url, browser?, os?, headers?, maxChars?, timeoutMs?, format?, removeImages?, includeReplies?, proxy?, verbose?): fetch browser-fingerprinted readable web content with full agent metadata and a compact pi preview";
 
-/// `web_fetch` parameter schema (FR-P0-1): the upstream TypeBox object
-/// (index.ts:479-487 + tool.ts:52-116) with field names, types and
-/// descriptions carried 1:1; the five-literal format union and the
-/// boolean|"extractors" includeReplies union render as JSON-Schema enums.
+/// Upstream batch `promptSnippet` (index.ts:671-672), verbatim.
+const BATCH_TOOL_PROMPT_SNIPPET: &str = "batch_web_fetch(requests, verbose?): fetch multiple URLs concurrently with full agent metadata and per-item progress in the pi TUI";
+
+/// The shared parameter surface (tool.ts:52-116, `createBaseFetchToolParameterProperties`):
+/// field names, types and descriptions carried 1:1; the five-literal format
+/// union and the boolean|"extractors" includeReplies union render as
+/// JSON-Schema enums.
+fn base_tool_properties() -> Map<String, Value> {
+    json!({
+        "url": {"type": "string", "description": "URL to fetch (http/https only)"},
+        "browser": {
+            "type": "string",
+            "description": "Browser profile for TLS fingerprinting. Default: \"chrome_145\". Examples: chrome_145, firefox_147, safari_26, edge_145, opera_127"
+        },
+        "os": {
+            "type": "string",
+            "description": "OS profile for fingerprinting. Default: \"windows\". Options: windows, macos, linux, android, ios"
+        },
+        "headers": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Custom HTTP headers to send. By default, Accept and Accept-Language are set automatically."
+        },
+        "maxChars": {
+            "type": "number",
+            "description": "Maximum characters to return. Default: 50000"
+        },
+        "timeoutMs": {
+            "type": "number",
+            "description": "Request timeout in milliseconds. Default: 15000"
+        },
+        "format": {
+            "type": "string",
+            "enum": ["markdown", "html", "text", "json", "raw"],
+            "description": "Output format. \"markdown\" (default), \"html\" (cleaned HTML), \"text\" (plain text, no formatting), \"json\" (pretty-printed JSON), or \"raw\" (full raw server response without extraction or truncation, for further parsing)"
+        },
+        "removeImages": {
+            "type": "boolean",
+            "description": "Strip image references from output. Default: false"
+        },
+        "includeReplies": {
+            "anyOf": [
+                {"type": "boolean"},
+                {"type": "string", "enum": ["extractors"]}
+            ],
+            "description": "Include replies/comments: 'extractors' for site-specific only (default), true for all, false for none"
+        },
+        "proxy": {
+            "type": "string",
+            "description": "Proxy URL (http://user:pass@host:port or socks5://host:port)"
+        }
+    })
+    .as_object()
+    .expect("literal object")
+    .clone()
+}
+
+/// The `verbose` compat flag (index.ts:480-487 / 673-681).
+fn verbose_property() -> Value {
+    json!({
+        "type": "boolean",
+        "description": "Compatibility flag. pi currently returns the full metadata header to the agent regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from pi settings."
+    })
+}
+
+/// `web_fetch` parameter schema (FR-P0-1): base surface + `verbose`.
 fn tool_parameters_schema() -> Value {
+    let mut properties = base_tool_properties();
+    properties.insert("verbose".to_string(), verbose_property());
     json!({
         "type": "object",
-        "properties": {
-            "url": {"type": "string", "description": "URL to fetch (http/https only)"},
-            "browser": {
-                "type": "string",
-                "description": "Browser profile for TLS fingerprinting. Default: \"chrome_145\". Examples: chrome_145, firefox_147, safari_26, edge_145, opera_127"
-            },
-            "os": {
-                "type": "string",
-                "description": "OS profile for fingerprinting. Default: \"windows\". Options: windows, macos, linux, android, ios"
-            },
-            "headers": {
-                "type": "object",
-                "additionalProperties": {"type": "string"},
-                "description": "Custom HTTP headers to send. By default, Accept and Accept-Language are set automatically."
-            },
-            "maxChars": {
-                "type": "number",
-                "description": "Maximum characters to return. Default: 50000"
-            },
-            "timeoutMs": {
-                "type": "number",
-                "description": "Request timeout in milliseconds. Default: 15000"
-            },
-            "format": {
-                "type": "string",
-                "enum": ["markdown", "html", "text", "json", "raw"],
-                "description": "Output format. \"markdown\" (default), \"html\" (cleaned HTML), \"text\" (plain text, no formatting), \"json\" (pretty-printed JSON), or \"raw\" (full raw server response without extraction or truncation, for further parsing)"
-            },
-            "removeImages": {
-                "type": "boolean",
-                "description": "Strip image references from output. Default: false"
-            },
-            "includeReplies": {
-                "anyOf": [
-                    {"type": "boolean"},
-                    {"type": "string", "enum": ["extractors"]}
-                ],
-                "description": "Include replies/comments: 'extractors' for site-specific only (default), true for all, false for none"
-            },
-            "proxy": {
-                "type": "string",
-                "description": "Proxy URL (http://user:pass@host:port or socks5://host:port)"
-            },
-            "verbose": {
-                "type": "boolean",
-                "description": "Compatibility flag. pi currently returns the full metadata header to the agent regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from pi settings."
-            }
-        },
+        "properties": properties,
         "required": ["url"]
+    })
+}
+
+/// `batch_web_fetch` parameter schema (FR-P1-1, tool.ts:118-133): `requests`
+/// (minItems 1, per-item base surface with `additionalProperties: false`) +
+/// `verbose`.
+fn batch_tool_parameters_schema() -> Value {
+    let item = json!({
+        "type": "object",
+        "properties": base_tool_properties(),
+        "additionalProperties": false
+    });
+    let mut properties = Map::new();
+    properties.insert(
+        "requests".to_string(),
+        json!({
+            "type": "array",
+            "items": item,
+            "minItems": 1,
+            "description": "Array of fetch requests. Each item accepts the same parameters as the single-item fetch tool."
+        }),
+    );
+    properties.insert("verbose".to_string(), verbose_property());
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": ["requests"]
     })
 }
 
@@ -131,19 +193,31 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         Ok(())
     };
 
-    let definition = json!({
+    let web_fetch = json!({
         "name": "web_fetch",
         "label": "web_fetch",
         "description": tool_description(),
         "promptSnippet": TOOL_PROMPT_SNIPPET,
         "parameters": tool_parameters_schema(),
     });
-    if let Err(error) = register(definition) {
+    if let Err(error) = register(web_fetch) {
+        return json!({"error": {"kind": "init", "message": error.to_string()}});
+    }
+
+    let batch_web_fetch = json!({
+        "name": "batch_web_fetch",
+        "label": "batch_web_fetch",
+        "description": batch_tool_description(),
+        "promptSnippet": BATCH_TOOL_PROMPT_SNIPPET,
+        "parameters": batch_tool_parameters_schema(),
+    });
+    if let Err(error) = register(batch_web_fetch) {
         return json!({"error": {"kind": "init", "message": error.to_string()}});
     }
 
     match STATE.set(PluginState {
         runtime: plugin_runtime,
+        host: Some((calls, cookie)),
     }) {
         Ok(()) => json!({"ok": true}),
         // Idempotent init (ambient + explicit load): first instance serves.
@@ -151,8 +225,38 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     }
 }
 
-/// `web_fetch` execute (index.ts:489-626, P0 subset — no spinner/onUpdate
-/// stream: the on_update ABI gap, design §1.3 #3).
+/// The per-execute runtime state (index.ts:496-499 / 684-687): settings are
+/// re-read on EVERY call (`loadPiSmartFetchSettings(ctx.cwd, getAgentDir())`)
+/// and folded into tool defaults.
+fn resolve_runtime(state: &PluginState) -> (ResolvedSettings, FetchToolDefaults) {
+    let cwd = state
+        .host
+        .as_ref()
+        .and_then(|(calls, cookie)| {
+            let request = serde_json::to_vec(&json!({"call": "ctx.cwd", "args": {}, "seq": 0}))
+                .unwrap_or_default();
+            let response = (calls.call)(*cookie as PluginCookie, RVec::from(request));
+            let response: Value = serde_json::from_slice(&response[..]).unwrap_or(Value::Null);
+            response
+                .get("ok")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| ".".to_string());
+
+    let resolved = settings::load_settings(std::path::Path::new(&cwd));
+    let defaults = batch::resolve_fetch_tool_defaults(&resolved.config);
+    (resolved, defaults)
+}
+
+/// `web_fetch` execute (index.ts:489-626, no spinner/onUpdate stream: the
+/// on_update ABI gap, design §1.3 #3).
 fn execute_web_fetch(params: &Value, state: &PluginState) -> Value {
     let parsed_params: WebFetchParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
@@ -173,10 +277,9 @@ fn execute_web_fetch(params: &Value, state: &PluginState) -> Value {
         }
     };
 
-    // TE07 FR-P1-5: per-execute settings read (loadPiSmartFetchSettings)
-    // replaces the plain defaults here.
-    let defaults = batch::resolve_fetch_tool_defaults(&types::FetchToolConfig::default());
-    let verbose = parsed_params.verbose.unwrap_or(false);
+    // FR-P1-5: per-execute settings read (no caching, upstream semantics).
+    let (resolved, defaults) = resolve_runtime(state);
+    let verbose = parsed_params.verbose.unwrap_or(resolved.verbose_by_default);
     let format = parsed_params
         .format
         .map(types::OutputFormat::from)
@@ -233,6 +336,42 @@ fn execute_web_fetch(params: &Value, state: &PluginState) -> Value {
     }
 }
 
+/// `batch_web_fetch` execute (index.ts:683-771, progress snapshots only in
+/// the final result — the on_update ABI gap, design §1.3 #3).
+fn execute_batch_web_fetch(params: &Value, state: &PluginState) -> Value {
+    let parsed: batch::BatchWebFetchParams = match serde_json::from_value(params.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return json!({
+                "content": [{ "type": "text", "text":
+                    format!("Error: Unexpected batch_web_fetch failure.\n\n{error}")
+                }],
+                "details": {
+                    "error": true,
+                    "userErrorSummary": "The request failed before a usable response was returned.",
+                },
+            });
+        }
+    };
+
+    let (resolved, defaults) = resolve_runtime(state);
+    let verbose = parsed.verbose.unwrap_or(resolved.verbose_by_default);
+
+    let pipeline = FetchPipeline::default();
+    let batch_result = state.runtime.block_on(batch::execute_batch_entries(
+        &pipeline,
+        &parsed.requests,
+        &defaults,
+    ));
+
+    // index.ts:753-755: the agent text carries the FULL per-item headers.
+    let response_text = batch::build_batch_fetch_response_text(&batch_result, true);
+    json!({
+        "content": [{ "type": "text", "text": response_text }],
+        "details": batch::batch_details_json(&batch_result, verbose),
+    })
+}
+
 fn dispatch_message(message: &Value) -> Value {
     let Some(state) = STATE.get() else {
         return Value::Null;
@@ -240,7 +379,10 @@ fn dispatch_message(message: &Value) -> Value {
     match message.get("kind").and_then(Value::as_str) {
         Some("toolExecute") => {
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            execute_web_fetch(&params, state)
+            match message.get("toolName").and_then(Value::as_str) {
+                Some("batch_web_fetch") => execute_batch_web_fetch(&params, state),
+                _ => execute_web_fetch(&params, state),
+            }
         }
         _ => Value::Null,
     }

@@ -232,9 +232,11 @@ pub struct HttpRequest {
     pub timeout_ms: u64,
 }
 
-/// A response whose body has been fully read (P0 text pipeline; FR-P1-4 adds
-/// streaming). `body` is lossy UTF-8, matching JS `response.text()`.
-#[derive(Debug, Clone)]
+/// A response whose status/headers are lifted and whose body arrives as
+/// either buffered bytes (mock transports, parity fixtures) or the live
+/// engine stream (real wreq — the FR-P1-4 download path consumes it without
+/// buffering, the text pipeline reads it to end).
+#[derive(Debug)]
 pub struct HttpResponse {
     pub final_url: String,
     pub status: u16,
@@ -242,12 +244,65 @@ pub struct HttpResponse {
     /// Lower-cased header name → joined values (multi-value joined with ",
     /// " like the fetch `Headers.get` contract).
     pub headers: HashMap<String, String>,
-    pub body: String,
+    pub body: ResponseBody,
+}
+
+/// Response body source: upstream's `FetchResponseLike` exposes `body`
+/// (ReadableStream), `readable()` and `text()` — the pipeline picks per
+/// branch (`response.text()` for text, `streamResponseToFile` for downloads).
+pub enum ResponseBody {
+    /// Fully-buffered bytes (scripted test transports; the upstream parity
+    /// generator's `arrayBuffer`-shaped mocks).
+    Full(Vec<u8>),
+    /// The live wreq response: status/headers already lifted into
+    /// [`HttpResponse`], the body streams via `bytes_stream()`. Boxed — the
+    /// engine response dwarfs the buffered variant.
+    Stream(Box<wreq::Response>),
+}
+
+impl std::fmt::Debug for ResponseBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResponseBody::Full(bytes) => f.debug_tuple("Full").field(&bytes.len()).finish(),
+            ResponseBody::Stream(_) => f.debug_tuple("Stream").finish(),
+        }
+    }
+}
+
+impl ResponseBody {
+    /// `await response.text()` — lossy UTF-8 (JS keeps invalid sequences as
+    /// U+FFFD replacement chars, `String::from_utf8_lossy` matches).
+    pub async fn read_all(self) -> Result<String, wreq::Error> {
+        match self {
+            ResponseBody::Full(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            ResponseBody::Stream(response) => {
+                let bytes = response.bytes().await?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        }
+    }
 }
 
 impl HttpResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_lowercase()).map(String::as_str)
+    }
+
+    /// A buffered response (mock transports) from plain parts.
+    pub fn buffered(
+        final_url: impl Into<String>,
+        status: u16,
+        status_text: impl Into<String>,
+        headers: HashMap<String, String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        HttpResponse {
+            final_url: final_url.into(),
+            status,
+            status_text: status_text.into(),
+            headers,
+            body: ResponseBody::Full(body.into()),
+        }
     }
 }
 
@@ -391,13 +446,6 @@ pub async fn fetch(request: &HttpRequest) -> Result<HttpResponse, FetchFailure> 
             })
             .or_insert_with(|| value.to_string());
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| FetchFailure::Transport {
-            failure: classify_transport_error(&error),
-            final_url: Some(final_url.clone()),
-        })?;
 
     Ok(HttpResponse {
         final_url,
@@ -406,7 +454,9 @@ pub async fn fetch(request: &HttpRequest) -> Result<HttpResponse, FetchFailure> 
         // exposes the engine's, which is the canonical set).
         status_text: status.canonical_reason().unwrap_or("").to_string(),
         headers,
-        body: String::from_utf8_lossy(&bytes).into_owned(),
+        // Body stays live: the pipeline decides per branch whether to read it
+        // to end (text) or stream it to disk (FR-P1-4 download).
+        body: ResponseBody::Stream(Box::new(response)),
     })
 }
 

@@ -12,7 +12,7 @@
 // exported callers: buildFetchErrorResponseText, createDefuddleFetch with a
 // mocked transport/defuddle — the same trick the upstream unit tests use.
 
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // The pinned upstream sources resolve their bare imports (typebox, linkedom,
@@ -49,22 +49,38 @@ function run(functionName, cases, fn) {
 }
 
 // A FetchResponseLike built from plain data (upstream unit-test shape).
-function makeResponse({ status = 200, statusText = "OK", url, headers = {}, body = "" }) {
+// `stream: true` wraps the body in a ReadableStream so the TE07 download
+// branch (`streamResponseToFile`'s getReader path) runs for real instead of
+// tripping the old "not used in parity scenarios" readable() stub.
+function makeResponse({ status = 200, statusText = "OK", url, headers = {}, body = "", stream = false }) {
   const headerMap = new Map(Object.entries(headers));
+  const bytes = new TextEncoder().encode(body);
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText,
     url,
     headers: { get: (name) => headerMap.get(name.toLowerCase()) ?? null },
-    body: null,
+    body: stream
+      ? new ReadableStream({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        })
+      : null,
     text: async () => body,
-    arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+    arrayBuffer: async () => bytes.buffer,
     readable: () => {
       throw new Error("not used in parity scenarios");
     },
   };
 }
+
+// Fixed download directory for the file-result scenarios: both the generator
+// (upstream) and the Rust replay clear it before running, so the EEXIST
+// retry path stays out of the deterministic fixtures.
+const DOWNLOAD_TEMP_DIR = "/tmp/smart-fetch-parity-downloads";
 
 // Drive `defuddleFetch` with a scripted transport + defuddle and return the
 // raw FetchResult/FetchError JSON plus the request options the transport saw.
@@ -442,8 +458,15 @@ const pipelineScenarios = [
   },
   {
     name: "non-html-content-type",
-    opts: { url: "https://ex.com/binaryish" },
-    fetchScript: [{ status: 200, headers: { "content-type": "application/octet-stream" }, body: "binary-ish textual body" }],
+    opts: { url: "https://ex.com/binaryish", tempDir: DOWNLOAD_TEMP_DIR },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "application/octet-stream" },
+        body: "binary-ish textual body",
+        stream: true,
+      },
+    ],
   },
   {
     name: "custom-headers-merge",
@@ -460,11 +483,149 @@ const pipelineScenarios = [
     opts: { url: "https://ex.com/accept", format: "json" },
     fetchScript: [{ status: 200, headers: { "content-type": "application/json" }, body: '{"ok":true}' }],
   },
+  // -------------------------------------------------------------------------
+  // TE07 parity set: meta-refresh recursion (FR-P1-2), alternate fallback
+  // (FR-P1-3) and the download branch (FR-P1-4).
+  // -------------------------------------------------------------------------
+  {
+    name: "meta-refresh-follow",
+    opts: { url: "https://ex.com/start" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><meta http-equiv="refresh" content="0;url=/final"></head><body>redirecting…</body></html>`,
+      },
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: HTML_ARTICLE,
+      },
+    ],
+    defuddleResult: { content: "Final page body.", wordCount: 3, title: "Fixture Article" },
+  },
+  {
+    name: "meta-refresh-follow-raw-format",
+    opts: { url: "https://ex.com/start", format: "raw" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><meta http-equiv="refresh" content="2;url=https://ex.com/raw-target"></head><body>redirecting…</body></html>`,
+      },
+      { status: 200, headers: { "content-type": "text/plain" }, body: "raw landed body" },
+    ],
+  },
+  {
+    name: "meta-refresh-delay-30-not-followed",
+    opts: { url: "https://ex.com/slowmeta" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><meta http-equiv="refresh" content="30;url=/final"></head><body>still here</body></html>`,
+      },
+    ],
+    defuddleResult: { content: "Content stays on page.", wordCount: 4 },
+  },
+  {
+    name: "meta-refresh-limit-exceeded",
+    opts: { url: "https://ex.com/hop-0" },
+    fetchScript: [0, 1, 2, 3, 4, 5].map((hop) => ({
+      status: 200,
+      headers: { "content-type": "text/html" },
+      body: `<html><head><meta http-equiv="refresh" content="0;url=/hop-${hop + 1}"></head><body>loop</body></html>`,
+    })),
+  },
+  {
+    name: "alternate-json-format-fallback",
+    opts: { url: "https://ex.com/page", format: "json" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="application/json" href="/api.json"></head><body>not json</body></html>`,
+      },
+      { status: 200, headers: { "content-type": "application/json" }, body: '{"alt":true}' },
+    ],
+  },
+  {
+    name: "alternate-empty-content-fallback",
+    opts: { url: "https://ex.com/emptyish" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="text/markdown" href="/full.md"></head><body><script>only a script</script></body></html>`,
+      },
+      { status: 200, headers: { "content-type": "text/markdown" }, body: "# Alternate Body\n\nPlenty of markdown words on the alternate endpoint." },
+    ],
+    defuddleResult: { content: undefined, wordCount: 0 },
+  },
+  {
+    name: "alternate-thin-content-fallback",
+    opts: { url: "https://ex.com/thin" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="text/markdown" href="/full.md"></head><body><article><p>too thin</p></article></body></html>`,
+      },
+      { status: 200, headers: { "content-type": "text/markdown" }, body: "# Full Alternate\n\nThis alternate response carries a comfortable amount of words for the thin-content fallback threshold." },
+    ],
+    defuddleResult: { content: "too thin", wordCount: 2 },
+  },
+  {
+    name: "alternate-thin-content-unqualified-type-kept",
+    opts: { url: "https://ex.com/thin-alone" },
+    fetchScript: [
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: `<html><head><link rel="alternate" type="application/rss+xml" href="/feed.xml"></head><body><article><p>too thin but no qualified alternate</p></article></body></html>`,
+      },
+    ],
+    defuddleResult: { content: "too thin but no qualified alternate", wordCount: 6 },
+  },
+  {
+    name: "download-attachment-disposition",
+    opts: { url: "https://ex.com/files/report.pdf", tempDir: DOWNLOAD_TEMP_DIR },
+    fetchScript: [
+      {
+        status: 200,
+        headers: {
+          "content-type": "application/pdf",
+          "content-disposition": 'attachment; filename="Mock Report.pdf"',
+        },
+        body: "PDF-BYTES-0123456789",
+        stream: true,
+      },
+    ],
+  },
+  {
+    name: "download-filename-star-disposition",
+    opts: { url: "https://ex.com/dl", tempDir: DOWNLOAD_TEMP_DIR },
+    fetchScript: [
+      {
+        status: 200,
+        headers: {
+          "content-type": "text/plain",
+          "content-disposition": "attachment; filename*=UTF-8''na%C3%AFve%20doc.txt",
+        },
+        body: "plain but forced to download by disposition",
+        stream: true,
+      },
+    ],
+  },
 ];
 
 // ---------------------------------------------------------------------------
 // generate
 // ---------------------------------------------------------------------------
+
+// Fresh download dir so the file-result fixtures stay deterministic (a
+// leftover file would trip the EEXIST retry and shift the recorded path).
+rmSync(DOWNLOAD_TEMP_DIR, { recursive: true, force: true });
 
 mkdirSync(OUT_DIR, { recursive: true });
 

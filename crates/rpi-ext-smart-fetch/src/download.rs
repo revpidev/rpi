@@ -1,11 +1,19 @@
 //! Download filename derivation and sanitization — a pure-function port of
 //! the `resolveDownloadTarget` chain in upstream `extract.ts:100-211` @
-//! b0111612 (FR-P1-4 surface; TE06 ships the functions + fixtures, TE07
-//! wires the streaming download path).
+//! b0111612 — plus the streaming-to-disk path (`streamResponseToFile`
+//! extract.ts:228-344 and `buildFileResult` extract.ts:1048-1117) wired in
+//! TE07 (FR-P1-4).
 
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+use crate::constants::DEFAULT_TEMP_DIR_NAME;
+use crate::http::ResponseBody;
+use crate::pipeline::{map_fetch_failure, FetchErrorContext};
+use crate::types::{FetchError, FetchOutcome, FetchResult};
 
 /// `deburr` (lodash): Latin-1/Latin Extended-A diacritics fold to ASCII.
 /// `deunicode` folds the whole Unicode range — a superset of lodash deburr;
@@ -233,6 +241,297 @@ pub fn resolve_download_target(
 pub struct DownloadTarget {
     pub file_name: String,
     pub extension: String,
+}
+
+// ===== streaming download path (FR-P1-4, extract.ts:213-344 + 1048-1117) =====
+
+/// A download failure carrying the bytes already streamed — the port of the
+/// `errorContext.downloadedBytes` bookkeeping upstream's `onRequestEvent`
+/// `body_progress` events provide (the crates.io engine has no event stream,
+/// declared deviation TE-D23; counting at the write loop recovers the number).
+#[derive(Debug)]
+pub struct DownloadFailure {
+    pub message: String,
+    pub downloaded_bytes: u64,
+    /// `true` for the `EEXIST` retry signal (create_new collisions).
+    pub already_exists: bool,
+}
+
+impl DownloadFailure {
+    fn io(error: &std::io::Error, downloaded_bytes: u64) -> Self {
+        DownloadFailure {
+            message: error.to_string(),
+            downloaded_bytes,
+            already_exists: error.kind() == ErrorKind::AlreadyExists,
+        }
+    }
+}
+
+/// `cleanupPartialFile` (extract.ts:213-226): best-effort unlink; a missing
+/// file is fine (ENOENT), other failures propagate.
+fn cleanup_partial_file(file_path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(file_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Open the target for exclusive creation with 0600 (Node's
+/// `createWriteStream(path, { flags: "wx", mode: 0o600 })`).
+fn create_exclusive(file_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(file_path)
+}
+
+/// `streamResponseToFile` (extract.ts:228-344): stream the body to
+/// `file_path` with exclusive creation and 0600, counting bytes; on failure
+/// remove the partial file (unless the failure is the EEXIST retry signal)
+/// and surface the byte count for the error context. The unconsumed body
+/// rides back on error — EEXIST fires at file-open time, before the stream
+/// is read, so the retry loop re-streams it (upstream re-`getReader()`s the
+/// same untouched stream).
+pub async fn stream_response_to_file(
+    body: ResponseBody,
+    file_path: &Path,
+) -> Result<u64, (ResponseBody, DownloadFailure)> {
+    if let Some(parent) = file_path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return Err((body, DownloadFailure::io(&error, 0)));
+        }
+    }
+
+    let mut downloaded_bytes = 0u64;
+    let mut file = match create_exclusive(file_path) {
+        Ok(file) => file,
+        Err(error) => return Err((body, DownloadFailure::io(&error, 0))),
+    };
+
+    use std::io::Write as _;
+    let fail = |body: ResponseBody,
+                downloaded_bytes: u64,
+                error: std::io::Error|
+     -> (ResponseBody, DownloadFailure) {
+        let failure = DownloadFailure::io(&error, downloaded_bytes);
+        if !failure.already_exists {
+            let _ = cleanup_partial_file(file_path);
+        }
+        (body, failure)
+    };
+
+    match body {
+        ResponseBody::Full(bytes) => {
+            if let Err(error) = file.write_all(&bytes) {
+                return Err(fail(
+                    ResponseBody::Full(Vec::new()),
+                    downloaded_bytes,
+                    error,
+                ));
+            }
+            finalize_permissions(file_path);
+            Ok(bytes.len() as u64)
+        }
+        ResponseBody::Stream(response) => {
+            use futures::StreamExt as _;
+            let mut stream = response.bytes_stream();
+            loop {
+                let chunk = match stream.next().await {
+                    Some(Ok(chunk)) => chunk,
+                    Some(Err(error)) => {
+                        let failure = DownloadFailure {
+                            message: error.to_string(),
+                            downloaded_bytes,
+                            already_exists: false,
+                        };
+                        let _ = cleanup_partial_file(file_path);
+                        // A mid-stream failure never retries, so the body
+                        // need not be returned intact.
+                        return Err((ResponseBody::Full(Vec::new()), failure));
+                    }
+                    None => break,
+                };
+                downloaded_bytes += chunk.len() as u64;
+                if let Err(error) = file.write_all(&chunk) {
+                    return Err(fail(
+                        ResponseBody::Full(Vec::new()),
+                        downloaded_bytes,
+                        error,
+                    ));
+                }
+            }
+            if let Err(error) = file.flush() {
+                return Err(fail(
+                    ResponseBody::Full(Vec::new()),
+                    downloaded_bytes,
+                    error,
+                ));
+            }
+            finalize_permissions(file_path);
+            Ok(downloaded_bytes)
+        }
+    }
+}
+
+/// Post-write `chmod(filePath, 0o600)` (extract.ts:269/308/330): the open-time
+/// mode goes through the process umask, the explicit chmod pins it.
+fn finalize_permissions(file_path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = file_path;
+}
+
+/// `buildFileResult` (extract.ts:1048-1117). Streams the response into the
+/// temp dir (EEXIST retries up to 100 times with `<base>-<n>` names) and
+/// builds the `kind: "file"` FetchResult; failures map into the FetchError
+/// model exactly like upstream's rethrow through `buildThrownFetchError`
+/// (message-regex classification at `phase: loading` with a mime type).
+#[allow(clippy::too_many_arguments)]
+pub async fn build_file_result(
+    opts_url: &str,
+    mut body: crate::http::ResponseBody,
+    final_url: &str,
+    content_type: &str,
+    content_disposition: &str,
+    browser: &str,
+    os: &str,
+    temp_dir: Option<&str>,
+    context: &FetchErrorContext,
+) -> FetchOutcome {
+    // extract.ts:1057-1058: `opts.tempDir || join(tmpdir(), "smart-fetch")`.
+    // rpi derives the default subdirectory from the product name — the same
+    // declared [VARIANT] as the settings layer (requirements §3).
+    let temp_dir: PathBuf = match temp_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::temp_dir().join(DEFAULT_TEMP_DIR_NAME),
+    };
+    if let Err(error) = std::fs::create_dir_all(&temp_dir) {
+        return download_error_from_io(&error.to_string(), content_type, final_url, context);
+    }
+
+    let target = resolve_download_target(
+        final_url,
+        content_disposition,
+        content_type,
+        &uuid::Uuid::new_v4().to_string(),
+    );
+    let mut file_path = temp_dir.join(&target.file_name);
+    let mut attempt = 1u32;
+
+    loop {
+        if attempt > 100 {
+            break;
+        }
+        match stream_response_to_file(body, &file_path).await {
+            Ok(file_size) => {
+                let mut result = FetchResult::content(opts_url, final_url, 0, "", browser, os);
+                result.kind = "file".to_string();
+                result.site = url::Url::parse(final_url)
+                    .map(|parsed| parsed.host_str().unwrap_or_default().to_string())
+                    .unwrap_or_default();
+                result.file_path = Some(file_path.to_string_lossy().into_owned());
+                result.file_size = Some(file_size);
+                result.mime_type = Some(crate::pipeline::normalize_content_type(content_type))
+                    .filter(|mime| !mime.is_empty());
+                return FetchOutcome::Result(result);
+            }
+            Err((returned_body, failure)) => {
+                body = returned_body;
+                if failure.already_exists {
+                    // extract.ts:1096-1100: `<sanitized original base>-<attempt>`
+                    // — `fileName` stays the INITIAL name through the retries.
+                    let (name, _) = parse_name_ext(&target.file_name);
+                    let next_base = {
+                        let sanitized = sanitize_base_name(&name);
+                        if sanitized.is_empty() {
+                            uuid::Uuid::new_v4().to_string()
+                        } else {
+                            sanitized
+                        }
+                    };
+                    file_path = temp_dir.join(format!("{next_base}-{attempt}{}", target.extension));
+                    attempt += 1;
+                    continue;
+                }
+                return download_error_from(failure, content_type, final_url, context);
+            }
+        }
+    }
+
+    // extract.ts:1107-1116: 100 collisions exhausted.
+    let mut error = FetchError {
+        error: format!("Unable to create a unique temp file for {final_url}"),
+        code: Some(crate::types::FetchErrorCode::DownloadError),
+        phase: Some(crate::types::FetchErrorPhase::Loading),
+        retryable: Some(true),
+        timeout_ms: None,
+        url: Some(opts_url.to_string()),
+        final_url: Some(final_url.to_string()),
+        status_code: None,
+        status_text: None,
+        mime_type: Some(crate::pipeline::normalize_content_type(content_type))
+            .filter(|mime| !mime.is_empty()),
+        content_length: None,
+        downloaded_bytes: None,
+    };
+    error.timeout_ms = Some(context.timeout_ms);
+    error.content_length = context.content_length;
+    FetchOutcome::Error(error)
+}
+
+/// Map a mid-download failure through the transport classifier — upstream's
+/// rethrow lands in the outer `catch` → `buildThrownFetchError(error, ctx)`
+/// with `phase: loading` and a mime type set, producing `download_error` for
+/// unclassified messages.
+fn download_error_from(
+    failure: DownloadFailure,
+    content_type: &str,
+    final_url: &str,
+    context: &FetchErrorContext,
+) -> FetchOutcome {
+    let classified = crate::http::classify_message(&failure.message).unwrap_or(
+        crate::http::TransportFailure::Other {
+            message: failure.message.clone(),
+        },
+    );
+    let mut context = context.clone();
+    context.final_url = Some(final_url.to_string());
+    context.phase = crate::types::FetchErrorPhase::Loading;
+    context.mime_type =
+        Some(crate::pipeline::normalize_content_type(content_type)).filter(|mime| !mime.is_empty());
+    context.downloaded_bytes = Some(failure.downloaded_bytes);
+    let fetch_failure = crate::http::FetchFailure::Transport {
+        failure: classified,
+        final_url: Some(final_url.to_string()),
+    };
+    FetchOutcome::Error(map_fetch_failure(&fetch_failure, &context))
+}
+
+fn download_error_from_io(
+    message: &str,
+    content_type: &str,
+    final_url: &str,
+    context: &FetchErrorContext,
+) -> FetchOutcome {
+    download_error_from(
+        DownloadFailure {
+            message: message.to_string(),
+            downloaded_bytes: 0,
+            already_exists: false,
+        },
+        content_type,
+        final_url,
+        context,
+    )
 }
 
 #[cfg(test)]

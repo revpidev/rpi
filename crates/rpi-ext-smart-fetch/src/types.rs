@@ -70,16 +70,14 @@ pub struct FetchOptions {
     pub include_replies: Option<IncludeReplies>,
     pub proxy: Option<String>,
     pub timeout_ms: Option<u64>,
-    /// TE07 FR-P1-4 download branch reads this.
-    #[allow(dead_code)]
+    /// FR-P1-4 download branch consumes this (settings-resolved temp dir).
     pub temp_dir: Option<String>,
 }
 
 impl FetchOptions {
     /// `fetchWithClientRedirects` recursion re-enters with a replaced `url`,
-    /// everything else preserved (meta refresh / alternate follow-up;
-    /// TE07 FR-P1-2/P1-3 wiring).
-    #[allow(dead_code)]
+    /// everything else preserved (meta refresh / alternate follow-up,
+    /// extract.ts:1306-1311 / 1418-1423 / 1537-1542).
     pub fn with_url(&self, url: String) -> Self {
         let mut next = self.clone();
         next.url = url;

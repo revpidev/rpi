@@ -44,13 +44,11 @@ pub const HTML_CONTENT_TYPES: [&str; 4] = [
     "text/markdown",
 ];
 
-/// `MAX_CLIENT_SIDE_REDIRECTS` (extract.ts:71) — meta refresh budget.
-/// Consumed by the TE07 FR-P1-2 recursion wiring.
-#[allow(dead_code)]
+/// `MAX_CLIENT_SIDE_REDIRECTS` (extract.ts:71) — meta refresh budget
+/// (FR-P1-2 recursion wiring).
 pub const MAX_CLIENT_SIDE_REDIRECTS: u32 = 5;
 
-/// `MAX_ALTERNATE_LINK_FALLBACKS` (extract.ts:72) — TE07 FR-P1-3 wiring.
-#[allow(dead_code)]
+/// `MAX_ALTERNATE_LINK_FALLBACKS` (extract.ts:72) — FR-P1-3 recursion budget.
 pub const MAX_ALTERNATE_LINK_FALLBACKS: u32 = 3;
 
 /// `MIN_EXTRACTED_WORDS_BEFORE_ALTERNATE_FALLBACK` (extract.ts:73) — the

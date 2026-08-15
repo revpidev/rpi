@@ -30,11 +30,28 @@
       "mean": 0.948,
       "pagesBelow0_85": 3
     },
+    "pinnedGate": {
+      "titleRate": 1,
+      "publishedRate": 1,
+      "languageRate": 1,
+      "authorMetaBackedRate": 1,
+      "siteMetaBackedRate": 1,
+      "nonForumF1Mean": 0.985,
+      "nonForumF1PerPageMin": 0.8889,
+      "forumF1PerPageMin": 0.4459,
+      "violations": []
+    },
     "thresholds": {
-      "titleTarget": 1,
-      "metadataTarget": 0.9,
-      "contentF1CalibrationInitial": 0.85,
-      "note": "TE06 records calibrated initial values; TE07 pins the thresholds into the acceptance script."
+      "titleRate": 1,
+      "publishedRate": 1,
+      "languageRate": 1,
+      "authorMetaBackedRate": 1,
+      "siteMetaBackedRate": 1,
+      "nonForumF1PerPageMin": 0.85,
+      "nonForumF1MeanMin": 0.93,
+      "forumF1PerPageMin": 0.4,
+      "calibrated": "2026-08-15 TE06 corpus (36 pages), pinned at TE07 acceptance",
+      "note": "Extraction-engine (dom_smoothie) upgrades MUST recalibrate — the gate fails loudly here."
     }
   },
   "pages": [

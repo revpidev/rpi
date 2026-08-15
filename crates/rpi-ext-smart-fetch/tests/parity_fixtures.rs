@@ -292,6 +292,7 @@ fn parity_batch_response_text() {
                 result: item.get("result").map(|result| {
                     serde_json::from_value(result.clone()).expect("FetchResult replays")
                 }),
+                request: None,
             });
         }
         let batch = BatchFetchResult {
@@ -535,15 +536,17 @@ async fn parity_pipeline_scenarios() {
     let scenarios = scenarios.as_array().cloned().unwrap_or_default();
     assert!(!scenarios.is_empty(), "pipeline fixtures missing");
 
-    // Declared P0 scope exceptions (TE06 task file):
+    // Declared scope exceptions:
     // - maxchars-astral-variant: FR-P0-9 [VARIANT] — UTF-16 vs char-boundary
     //   truncation drift; the fixture records the upstream sample, content is
     //   compared by char-prefix only.
-    // - non-html-content-type: upstream streams binaries to a temp file
-    //   (FR-P1-4, TE07); the P0 pipeline terminates at "Not an HTML page".
-    //   Re-assert equality once the download branch lands.
-    const SKIP_RESULT: [&str; 1] = ["non-html-content-type"];
+    // TE07 wired the download branch: non-html-content-type and the
+    // download-* scenarios now replay the file-result shape byte-for-byte
+    // (same fixed temp dir, cleared up front like the generator does).
+    const SKIP_RESULT: [&str; 0] = [];
     const ASTRAL_VARIANT: [&str; 1] = ["maxchars-astral-variant"];
+    let download_dir = std::path::Path::new("/tmp/smart-fetch-parity-downloads");
+    let _ = std::fs::remove_dir_all(download_dir);
 
     let mut failures = Vec::new();
     for scenario in &scenarios {
@@ -614,7 +617,9 @@ async fn parity_pipeline_scenarios() {
                         .unwrap_or("OK")
                         .to_string(),
                     headers,
-                    body: str_field(&step, "body"),
+                    body: rpi_ext_smart_fetch::http::ResponseBody::Full(
+                        str_field(&step, "body").into_bytes(),
+                    ),
                 })
             })
         });

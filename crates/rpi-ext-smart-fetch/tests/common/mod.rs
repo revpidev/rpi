@@ -121,3 +121,107 @@ impl Responder {
 
 #[allow(dead_code)]
 pub const HTML_PAGE: &str = "<html><head><title>Mock Page</title></head><body><article><h1>Mock Article</h1><p>This mock article carries enough sentences and words for readability scoring so the extraction path produces a real content result in the pipeline integration tests without any network access whatsoever.</p><p>A second paragraph keeps the candidate score comfortably above the thresholds used by the extraction engine.</p></article></body></html>";
+
+/// A concurrency-observing responder (FR-P1-1 verification): one thread per
+/// connection, an in-flight gauge, and a per-request delay so overlapping
+/// requests are actually observable. Every request gets the same response.
+#[allow(dead_code)]
+pub struct ConcurrentResponder {
+    pub port: u16,
+    max_in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[allow(dead_code)]
+impl ConcurrentResponder {
+    pub fn start(
+        status_line: &str,
+        headers: Vec<(String, String)>,
+        body: String,
+        delay_ms: u64,
+    ) -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local port");
+        let port = listener.local_addr().expect("addr").port();
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+
+        let mut response = format!("HTTP/1.1 {status_line}\r\n");
+        let mut has_length = false;
+        for (name, value) in &headers {
+            response.push_str(&format!("{name}: {value}\r\n"));
+            if name.eq_ignore_ascii_case("content-length") {
+                has_length = true;
+            }
+        }
+        if !has_length {
+            response.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        response.push_str("Connection: close\r\n\r\n");
+        response.push_str(&body);
+
+        let max_clone = std::sync::Arc::clone(&max_in_flight);
+        let shutdown_clone = std::sync::Arc::clone(&shutdown);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                if shutdown_clone.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(mut stream) = stream else { return };
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                max_clone.fetch_max(current, Ordering::SeqCst);
+                let response = response.clone();
+                let in_flight = std::sync::Arc::clone(&in_flight);
+                thread::spawn(move || {
+                    // read the request head first (header-only GETs)
+                    let mut buffer = [0u8; 8192];
+                    let mut read = 0usize;
+                    while let Ok(n) = stream.read(&mut buffer[read..]) {
+                        read += n;
+                        if n == 0
+                            || read >= buffer.len()
+                            || buffer[..read].windows(4).any(|w| w == b"\r\n\r\n")
+                        {
+                            break;
+                        }
+                    }
+                    if delay_ms > 0 {
+                        thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    }
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        ConcurrentResponder {
+            port,
+            max_in_flight,
+            shutdown,
+        }
+    }
+
+    pub fn url(&self, path: &str) -> String {
+        format!("http://127.0.0.1:{}{path}", self.port)
+    }
+
+    /// The high-water mark of simultaneously open requests.
+    pub fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn stop(&self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Drop for ConcurrentResponder {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}

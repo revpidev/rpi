@@ -1,7 +1,9 @@
 //! Settings normalization — 1:1 port of upstream
-//! `packages/pi-smart-fetch/src/settings.ts` @ b0111612 (FR-P1-5 surface;
-//! TE06 ships the pure resolution + fixtures, TE07 wires the per-execute
-//! file reads from `~/.rpi/agent/settings.json` + `.rpi/settings.json`).
+//! `packages/pi-smart-fetch/src/settings.ts` @ b0111612 (FR-P1-5): pure
+//! resolution (TE06, parity-fixtured) plus the per-execute file reads from
+//! `~/.rpi/agent/settings.json` + `<cwd>/.rpi/settings.json` (TE07).
+
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -170,6 +172,55 @@ impl FingerprintOs<'_> {
     }
 }
 
+// ===== per-execute file reads (FR-P1-5, settings.ts:180-200) =====
+
+/// `getAgentDir` derivation as the rpi host applies it (rpi/src/config.rs
+/// `getAgentDir`, ADR-0001): `RPI_CODING_AGENT_DIR` env override, else
+/// `~/.rpi/agent`. The plugin resolves it itself — no `ctx.agentDir` ABI
+/// method exists (design §1.3 #4); the unit test pins the rule against
+/// drift with the host's derivation.
+pub fn agent_dir() -> PathBuf {
+    if let Some(env_dir) = std::env::var_os("RPI_CODING_AGENT_DIR") {
+        if !env_dir.is_empty() {
+            return PathBuf::from(env_dir);
+        }
+    }
+    home_dir()
+        .map(|home| home.join(".rpi").join("agent"))
+        .unwrap_or_else(|| PathBuf::from(".rpi/agent"))
+}
+
+/// `HOME` / `USERPROFILE` (same helper shape as the sibling plugins).
+fn home_dir() -> Option<PathBuf> {
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            if !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+/// `readSettingsFile` (settings.ts:180-186): missing/unparsable → `{}` —
+/// never an error.
+pub fn read_settings_file(path: &Path) -> Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+/// `loadPiSmartFetchSettings` (settings.ts:188-200): global
+/// `<agentDir>/settings.json` + project `<cwd>/.rpi/settings.json`, project
+/// overriding global per key. Read on EVERY execute — no caching (upstream
+/// semantics; settings edits apply to the next tool call).
+pub fn load_settings(cwd: &Path) -> ResolvedSettings {
+    let global = read_settings_file(&agent_dir().join("settings.json"));
+    let project = read_settings_file(&cwd.join(".rpi").join("settings.json"));
+    resolve_settings(&global, &project)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +266,45 @@ mod tests {
             .temp_dir
             .as_deref()
             .is_some_and(|dir| dir.ends_with(DEFAULT_TEMP_DIR_NAME)));
+    }
+
+    #[test]
+    fn agent_dir_pins_the_host_derivation() {
+        // design §1.3 #4: RPI_CODING_AGENT_DIR wins; otherwise ~/.rpi/agent.
+        // Env-var tests serialize (process-global state).
+        struct Guard;
+        impl Guard {
+            fn new() -> Self {
+                std::env::remove_var("RPI_CODING_AGENT_DIR");
+                Guard
+            }
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                std::env::remove_var("RPI_CODING_AGENT_DIR");
+            }
+        }
+        let _guard = Guard::new();
+        let derived = agent_dir();
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                derived,
+                PathBuf::from(home).join(".rpi").join("agent"),
+                "default derivation must mirror the host's getAgentDir"
+            );
+        }
+        std::env::set_var("RPI_CODING_AGENT_DIR", "/tmp/rpi-agent-override");
+        assert_eq!(agent_dir(), PathBuf::from("/tmp/rpi-agent-override"));
+    }
+
+    #[test]
+    fn missing_settings_files_read_as_empty() {
+        let dir = std::env::temp_dir().join("rpi-smart-fetch-no-such-settings");
+        assert_eq!(read_settings_file(&dir), json!({}));
+        // parse failure → empty, not an error
+        let bad = std::env::temp_dir().join("rpi-smart-fetch-bad.json");
+        std::fs::write(&bad, "{not json").unwrap();
+        assert_eq!(read_settings_file(&bad), json!({}));
+        let _ = std::fs::remove_file(&bad);
     }
 }
