@@ -115,6 +115,30 @@ pub struct NativePlugin {
     context: Box<NativeCallContext>,
 }
 
+/// Per-path `RpiNativeModule_Ref` load (no per-type memoization): open the
+/// library, check the abi_stable layout, and materialize the module table
+/// from THIS library's root-module loader symbol. The library is leaked by
+/// `lib_header_from_raw_library` (documented) — the module refs it hands
+/// out are `'static`.
+fn load_native_module_at(path: &Path) -> Result<RpiNativeModule_Ref, String> {
+    use abi_stable::library::{lib_header_from_raw_library, RawLibrary};
+    let raw = RawLibrary::load_at(path).map_err(|e| format!("open: {e}"))?;
+    // `lib_header_from_raw_library` does NOT leak — dropping `raw` would
+    // dlclose the library and dangle every 'static ref handed out (the
+    // in-tree `load_from` leaks it for exactly this reason; match it).
+    let raw: &'static RawLibrary = Box::leak(Box::new(raw));
+    // Safety: the library is leaked above (alive for the process lifetime);
+    // the layout check below makes the module-table read layout-compatible.
+    let header =
+        unsafe { lib_header_from_raw_library(raw) }.map_err(|e| format!("root module: {e}"))?;
+    header
+        .ensure_layout::<RpiNativeModule_Ref>()
+        .map_err(|e| format!("layout: {e}"))?;
+    // Safety: layout (and abi version, checked inside) verified above.
+    unsafe { header.init_root_module_with_unchecked_layout::<RpiNativeModule_Ref>() }
+        .map_err(|e| format!("init: {e}"))
+}
+
 /// Load a native plugin (`loadExtension` for a dynamic library): load the
 /// module, run `rpi_extension_init`, keep the handles on the extension.
 pub async fn load_native_plugin(
@@ -122,7 +146,17 @@ pub async fn load_native_plugin(
     api: ExtensionApi,
     capabilities: HashSet<Capability>,
 ) -> Result<(), String> {
-    let module = RpiNativeModule_Ref::load_from_file(path)
+    // Per-path module load. `RpiNativeModule_Ref::load_from_file` CANNOT be
+    // used here: `RootModule::load_from` memoizes in a per-TYPE global
+    // (`root_module_statics().root_mod.try_init`) — "once the root module is
+    // loaded, this will return the already loaded root module" — so the
+    // second plugin path would silently get the FIRST plugin's module table
+    // and re-run its init (found loading all three plugins together: every
+    // extension registered the first .so's tools). The raw-library face
+    // below loads each path independently; `lib_header_from_raw_library`
+    // leaks the library, matching the `'static` module refs `NativePlugin`
+    // already keeps for the process lifetime.
+    let module = load_native_module_at(path)
         .map_err(|e| format!("load dynamic library {}: {e}", path.display()))?;
     let dispatch_fn = module.rpi_dispatch();
     let init_fn = module.rpi_extension_init();
