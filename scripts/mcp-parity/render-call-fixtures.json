@@ -96,6 +96,26 @@
       "args": [1, 2, 3]
     },
     {
+      "name": "proxy-empty-branch-key-tool",
+      "kind": "proxy",
+      "args": { "tool": "" }
+    },
+    {
+      "name": "proxy-empty-branch-key-connect-search-server",
+      "kind": "proxy",
+      "args": { "connect": "", "search": "", "server": "" }
+    },
+    {
+      "name": "proxy-empty-branch-key-action",
+      "kind": "proxy",
+      "args": { "action": "" }
+    },
+    {
+      "name": "proxy-empty-server-annotation-is-falsy",
+      "kind": "proxy",
+      "args": { "tool": "t", "server": "" }
+    },
+    {
       "name": "render-proxy-lines",
       "kind": "render-proxy",
       "args": { "tool": "test_tool", "server": "demo" }

@@ -198,10 +198,18 @@ async fn l0_load_capability_denied_and_full_surface() {
         .collect::<String>();
     assert_eq!(text, "Error: Invalid URL: not a url");
     // upstream returns fetch errors as normal tool results (no error flag on
-    // the AgentToolResult itself — the error rides the content text)
+    // the AgentToolResult itself — the error rides the content text). The
+    // error frame's status/phase echo the LATEST progress state, not a
+    // hardcoded error/error (index.ts:576-577 spreads latestDetails): URL
+    // validation is a return-path error that never emits a progress event,
+    // so the frame keeps the initial connecting/fetch_start state.
     assert_eq!(
         result.details.get("status"),
-        Some(&serde_json::json!("error"))
+        Some(&serde_json::json!("connecting"))
+    );
+    assert_eq!(
+        result.details.get("phase"),
+        Some(&serde_json::json!("fetch_start"))
     );
 
     // 5. FR-P1-5: settings are read per execute — global <agentDir> +

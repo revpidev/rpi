@@ -898,9 +898,17 @@ impl AsyncNotify {
                 "display": display,
             });
             // sendMessage is synchronous through the ABI envelope; fire it
-            // and treat acceptance as any non-error response.
-            let response =
-                crate::host_call_static(calls, "sendMessage", json!({ "message": message }));
+            // and treat acceptance as any non-error response. The options
+            // carry `triggerTurn: true` — upstream sendCompletion always
+            // sends one (notify.ts:178-182: `result.triggerTurn !== false`,
+            // true by default) so a finished run wakes the parent session to
+            // process the result; the rpi host default is false (a silent
+            // append), which would lose that wake-up semantics.
+            let response = crate::host_call_static(
+                calls,
+                "sendMessage",
+                json!({ "message": message, "options": { "triggerTurn": true } }),
+            );
             if response.get("error").is_none() {
                 let _ = std::fs::remove_file(&result_path);
             }

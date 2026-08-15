@@ -527,16 +527,32 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
         }
     };
 
-    // The final-frame spinnerTick: the last counter value (0 when the run
-    // never streamed — test dispatches without an id).
-    let final_spinner_tick = latest
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .spinner_tick;
+    // The final-frame spinnerTick (0 when the run never streamed — test
+    // dispatches without an id) plus the latest status/phase. The error
+    // frame echoes those instead of hardcoding error/error — upstream
+    // spreads `latestDetails` (index.ts:576-577): an in-engine error has
+    // already emitted {status:"error", phase:"error"} (extract.ts catch),
+    // while a return-path error (URL validation and friends) never emits,
+    // so the frame keeps the initial connecting/fetch_start state.
+    let (final_spinner_tick, latest_status, latest_phase) = {
+        let latest = latest.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            latest.spinner_tick,
+            latest.status.clone(),
+            latest.phase.clone(),
+        )
+    };
 
     match outcome {
         FetchOutcome::Error(error) => {
             let error_text = format::build_fetch_error_response_text(&error);
+            // Field-set note (index.ts:551-565): the upstream error details
+            // literal carries only error/errorText/userErrorSummary/verbose/
+            // status/phase/url/spinnerTick. rpi additionally keeps format/
+            // maxChars/started/progress (1) — the rpi renderer reads
+            // `progress` for the bar and TE08 accepted that shape; the two
+            // extra fields are additive and no consumer branches on their
+            // absence upstream.
             json!({
                 "content": [{ "type": "text", "text": error_text }],
                 "details": {
@@ -547,9 +563,9 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
                     "format": format.as_str(),
                     "maxChars": defaults.max_chars,
                     "started": true,
-                    "status": "error",
+                    "status": latest_status,
                     "progress": 1,
-                    "phase": "error",
+                    "phase": latest_phase,
                     "url": opts_url,
                     "spinnerTick": final_spinner_tick,
                 },

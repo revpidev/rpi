@@ -281,12 +281,19 @@ fn has_useful_object_content(value: &Value) -> bool {
 
 /// `formatMcpProxyToolCallLines` (tool-result-renderer.ts:124-152):
 /// branch priority `action === "ui-messages"` → `tool` → `connect` →
-/// `describe` → `search` → `server` → any `action` → `mcp status`. A
-/// present-but-empty `args` (empty string/object) omits the summary line
-/// (upstream truthiness); `regex` must be exactly true and
-/// `includeSchemas` exactly false to annotate.
+/// `describe` → `search` → `server` → any `action` → `mcp status`. Every
+/// branch key is tested with JS truthiness — a present-but-EMPTY string
+/// (`if (args.tool)` etc.) is falsy and falls through to the next branch,
+/// ending at `mcp status`; the same applies to the `server` annotations and
+/// to the nested `args` summary line (empty string/0/false/null skip it);
+/// `regex` must be exactly true and `includeSchemas` exactly false to
+/// annotate.
 pub fn format_mcp_proxy_tool_call_lines(args: &Value, max_input_chars: usize) -> Vec<String> {
-    let arg_str = |key: &str| args.get(key).and_then(Value::as_str);
+    let arg_str = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
     let is_true = |key: &str| args.get(key) == Some(&Value::Bool(true));
     let is_false = |key: &str| args.get(key) == Some(&Value::Bool(false));
 
@@ -612,6 +619,31 @@ mod tests {
         assert_eq!(lines, vec!["mcp list cf-portal"]);
         let lines = format_mcp_proxy_tool_call_lines(&json!({}), MAX);
         assert_eq!(lines, vec!["mcp status"]);
+    }
+
+    #[test]
+    fn proxy_empty_branch_keys_are_falsy() {
+        // JS truthiness on every branch key (`if (args.tool)` etc.): an
+        // empty string falls through to the next branch, ending at
+        // `mcp status` — a present-but-empty key must NOT match.
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "tool": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "connect": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "describe": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "search": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "server": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "action": "" }), MAX);
+        assert_eq!(lines, vec!["mcp status"]);
+        // empty `server` annotation is falsy too: no `@ ` suffix, and the
+        // `server` branch itself is skipped so a lone tool call renders bare.
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "tool": "t", "server": "" }), MAX);
+        assert_eq!(lines, vec!["mcp call t"]);
+        let lines = format_mcp_proxy_tool_call_lines(&json!({ "search": "s", "server": "" }), MAX);
+        assert_eq!(lines, vec!["mcp search s"]);
     }
 
     #[test]

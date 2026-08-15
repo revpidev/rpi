@@ -21,6 +21,9 @@ struct FakeHost {
 /// assertions (static because the host trampoline is a plain extern "C" fn).
 static TOOL_UPDATES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 static SENT_MESSAGES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+/// Full `sendMessage` call args (message + options) — the triggerTurn
+/// assertion needs the options half the message-only sink drops.
+static SENT_MESSAGE_CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 fn take_tool_updates() -> Vec<Value> {
     TOOL_UPDATES
@@ -32,6 +35,14 @@ fn take_tool_updates() -> Vec<Value> {
 
 fn take_sent_messages() -> Vec<Value> {
     SENT_MESSAGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
+}
+
+fn take_sent_message_calls() -> Vec<Value> {
+    SENT_MESSAGE_CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .drain(..)
@@ -61,6 +72,10 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(parsed["args"]["message"].clone());
+            SENT_MESSAGE_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(parsed["args"].clone());
             json!({ "ok": true })
         }
         _ => json!({ "error": { "kind": "unknownMethod", "message": method } }),
@@ -760,6 +775,7 @@ fn e2e_fixed_child_full_pipeline() {
         std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
         std::env::set_var("RPI_E2E_MODE", "ok");
         take_sent_messages();
+        take_sent_message_calls();
         let result = execute(json!({
             "agent": "scout",
             "task": "notify run",
@@ -783,6 +799,15 @@ fn e2e_fixed_child_full_pipeline() {
         // foreground sources force it true upstream).
         assert!(notify.get("details").is_none());
         assert_eq!(notify["display"], json!(false));
+        // Upstream sendCompletion always passes an options object with
+        // `triggerTurn: true` (notify.ts:178-182: `result.triggerTurn !==
+        // false`, true by default) — the completion wakes the parent
+        // session to process the result instead of silently appending.
+        let call = take_sent_message_calls()
+            .into_iter()
+            .find(|call| call["message"]["customType"] == json!("subagent-notify"))
+            .expect("subagent-notify sendMessage call recorded");
+        assert_eq!(call["options"]["triggerTurn"], json!(true));
         let content = notify["content"].as_str().unwrap();
         assert!(
             content.starts_with("Background task completed: **scout**"),

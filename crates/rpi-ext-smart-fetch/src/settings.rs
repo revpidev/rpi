@@ -97,6 +97,10 @@ pub fn normalize_settings(input: &Value) -> NormalizedSettings {
             &source,
             &["smartFetchVerboseByDefault", "webFetchVerboseByDefault"],
         ),
+        // `as u64` truncation is faithful for these two: a fractional
+        // 0 < v < 1 becomes Some(0) — an empty-content cap / a zero timeout —
+        // which is exactly what upstream's kept-fraction value does at its
+        // consumers (slice(0, 0.5) → empty, 0.5ms → instant timeout).
         default_max_chars: positive_u64(&["smartFetchDefaultMaxChars", "webFetchDefaultMaxChars"]),
         default_timeout_ms: positive_u64(&["smartFetchDefaultTimeoutMs"]),
         default_browser: read_non_empty_string(&source, &["smartFetchDefaultBrowser"]),
@@ -106,11 +110,19 @@ pub fn normalize_settings(input: &Value) -> NormalizedSettings {
             &source,
             &["smartFetchDefaultIncludeReplies"],
         ),
-        default_batch_concurrency: positive_u64(&[
-            "smartFetchDefaultBatchConcurrency",
-            "webFetchDefaultBatchConcurrency",
-        ])
-        .map(|value| value as f64),
+        // Unlike the two above, batch concurrency must keep the fraction:
+        // upstream normalizes to a raw number and `resolveBatchConcurrency`
+        // floors with a lower bound of 1 (tool.ts:29-35) — 0.5 resolves to
+        // 1, not the default. Routing through positive_u64 would truncate
+        // 0.5 to 0 first and `resolve_batch_concurrency` would then read it
+        // as unset (default 8).
+        default_batch_concurrency: read_positive_number(
+            &source,
+            &[
+                "smartFetchDefaultBatchConcurrency",
+                "webFetchDefaultBatchConcurrency",
+            ],
+        ),
         temp_dir: read_non_empty_string(&source, &["smartFetchTempDir", "webFetchTempDir"]),
     }
 }
@@ -266,6 +278,29 @@ mod tests {
             .temp_dir
             .as_deref()
             .is_some_and(|dir| dir.ends_with(DEFAULT_TEMP_DIR_NAME)));
+    }
+
+    #[test]
+    fn fractional_batch_concurrency_floors_to_one_not_default() {
+        // settings.ts keeps the raw number; resolveBatchConcurrency
+        // (tool.ts:29-35) floors with a lower bound of 1: 0.5 → 1, NOT the
+        // default 8 (an integer-truncating read would hand 0 to the
+        // resolver, which treats 0 as unset).
+        let resolved = resolve_settings(
+            &json!({ "smartFetchDefaultBatchConcurrency": 0.5 }),
+            &json!({}),
+        );
+        assert_eq!(resolved.config.batch_concurrency, Some(0.5));
+        assert_eq!(
+            crate::batch::resolve_batch_concurrency(resolved.config.batch_concurrency),
+            1
+        );
+        // Integer values are unaffected.
+        let resolved = resolve_settings(
+            &json!({ "smartFetchDefaultBatchConcurrency": 3 }),
+            &json!({}),
+        );
+        assert_eq!(resolved.config.batch_concurrency, Some(3.0));
     }
 
     #[test]

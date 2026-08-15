@@ -7,7 +7,9 @@
 //! reproduced by hand:
 //! - `getProfiles()` / `validateBrowserProfile` / `validateOperatingSystem`
 //!   (wreq-js.js:938-948): profile acceptance is pinned to the upstream
-//!   2.3.1 profile SET (120 names) rather than the newer wreq-util VARIANTS,
+//!   2.3.1 profile SET (125 names, verified byte-for-byte including order
+//!   against the pinned wreq-js 2.3.1 binary's `getProfiles()`) rather
+//!   than the newer wreq-util VARIANTS,
 //!   so a name upstream rejects is rejected here too, and the
 //!   "Available profiles: …" message lists exactly the upstream set;
 //! - `onRequestEvent` phase tracking does not exist in the crates.io engine —
@@ -390,6 +392,34 @@ pub fn error_final_url(error: &wreq::Error) -> Option<String> {
     error.uri().map(|uri| uri.to_string())
 }
 
+/// Redact userinfo from a proxy URL before it enters an agent-facing error
+/// message. The URL failed to parse (that is why it is being reported), so
+/// this is string-level: within the authority (between `://` and the first
+/// path/query/fragment delimiter) everything up to and including the LAST
+/// `@` is userinfo under WHATWG parsing — it collapses to `***@`. URLs
+/// without a scheme separator or without userinfo pass through unchanged.
+fn redact_proxy_userinfo(proxy: &str) -> String {
+    let Some(scheme_end) = proxy.find("://") else {
+        return proxy.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = proxy[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(proxy.len());
+    let authority = &proxy[authority_start..authority_end];
+    match authority.rfind('@') {
+        Some(at) => {
+            let mut redacted = String::with_capacity(proxy.len());
+            redacted.push_str(&proxy[..authority_start]);
+            redacted.push_str("***@");
+            redacted.push_str(&proxy[authority_start + at + 1..]);
+            redacted
+        }
+        None => proxy.to_string(),
+    }
+}
+
 /// Execute one fingerprinted request (FR-P0-3/4/5). The client is built per
 /// request — emulation, proxy and timeout all vary per call, mirroring the
 /// upstream wreq-js fetch options object.
@@ -411,7 +441,13 @@ pub async fn fetch(request: &HttpRequest) -> Result<HttpResponse, FetchFailure> 
         .timeout(Duration::from_millis(request.timeout_ms));
     if let Some(proxy) = &request.proxy {
         let proxy = wreq::Proxy::all(proxy).map_err(|error| {
-            FetchFailure::InvalidInput(format!("Invalid proxy URL: {proxy} ({error})"))
+            // rpi-only error face (upstream passes opts.proxy straight to the
+            // engine and never echoes it) — redact userinfo so credentials
+            // in the URL cannot leak into the agent-facing message.
+            FetchFailure::InvalidInput(format!(
+                "Invalid proxy URL: {} ({error})",
+                redact_proxy_userinfo(proxy)
+            ))
         })?;
         builder = builder.proxy(proxy);
     }
@@ -528,8 +564,37 @@ mod tests {
     }
 
     #[test]
+    fn redact_proxy_userinfo_strips_credentials() {
+        // credentials in the authority collapse to ***@ (WHATWG last-@)
+        assert_eq!(
+            redact_proxy_userinfo("http://user:secret@proxy.example:8080"),
+            "http://***@proxy.example:8080"
+        );
+        // an unencoded @ in the password still redacts up to the last @
+        assert_eq!(
+            redact_proxy_userinfo("http://user:p@ss@proxy.example:1080"),
+            "http://***@proxy.example:1080"
+        );
+        // path/query after the authority survive
+        assert_eq!(
+            redact_proxy_userinfo("socks5h://u:p@h:1/a?b=c"),
+            "socks5h://***@h:1/a?b=c"
+        );
+        // no userinfo / no scheme separator pass through unchanged
+        assert_eq!(
+            redact_proxy_userinfo("socks5://proxy.local:1080"),
+            "socks5://proxy.local:1080"
+        );
+        assert_eq!(redact_proxy_userinfo("not a url"), "not a url");
+    }
+
+    #[test]
     fn profile_index_is_complete_and_ordered() {
         assert_eq!(PROFILE_INDEX.len(), UPSTREAM_PROFILES.len());
+        // The absolute count pins the documented set (upstream wreq-js 2.3.1
+        // `getProfiles()` returns exactly 125 names) so a doc/code drift
+        // fails here instead of surfacing in review.
+        assert_eq!(PROFILE_INDEX.len(), 125);
         // VARIANTS order puts chrome first — the join order upstream renders.
         assert_eq!(PROFILE_INDEX[0].0, "chrome_100");
     }

@@ -107,6 +107,30 @@
     ]
   },
   {
+    "name": "proxy-empty-branch-key-tool",
+    "lines": [
+      "mcp status"
+    ]
+  },
+  {
+    "name": "proxy-empty-branch-key-connect-search-server",
+    "lines": [
+      "mcp status"
+    ]
+  },
+  {
+    "name": "proxy-empty-branch-key-action",
+    "lines": [
+      "mcp status"
+    ]
+  },
+  {
+    "name": "proxy-empty-server-annotation-is-falsy",
+    "lines": [
+      "mcp call t"
+    ]
+  },
+  {
     "name": "render-proxy-lines",
     "rendered": "mcp call test_tool @ demo"
   },
