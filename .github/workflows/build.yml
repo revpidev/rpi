@@ -8,14 +8,12 @@ name: build
 #   - Linux arm64 musl   aarch64-unknown-linux-musl  musl.cc cross toolchain (static single file)
 #   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc-aarch64-linux-gnu
 #
-# Triggers: push to main / 0.* dev branches builds and uploads artifacts (downloadable for
-# debugging); tag v* additionally publishes to GitHub Release; workflow_dispatch for manual runs.
+# Triggers: tag v* builds and publishes to GitHub Release; branch pushes no longer
+# trigger builds. workflow_dispatch remains for manual runs (e.g. packaging smoke
+# tests without cutting a tag).
 
 on:
   push:
-    branches:
-      - main
-      - "0.*"
     tags:
       - "v*"
   workflow_dispatch:
@@ -27,6 +25,13 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # First-party L0 extension crates shipped as .rpix archives in the same
+      # GitHub Release as the main binary (design: extension-distribution.md
+      # §9.2). Crate dir names under crates/ — the only place to extend; the
+      # package name and native carrier filename are read from each crate's
+      # rpi-extension.json at pack time.
+      EXT_CRATES: rpi-ext-subagents rpi-ext-mcp-adapter rpi-ext-smart-fetch
     strategy:
       fail-fast: false
       matrix:
@@ -83,17 +88,24 @@ jobs:
 
       - name: Build (native)
         if: matrix.target == 'x86_64-pc-windows-msvc' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin rpi
+          # First-party extension cdylibs (see EXT_CRATES above)
+          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
       - name: Build (x64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin rpi
+          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
       - name: Build (arm64 musl via cross container)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cross build --release --target ${{ matrix.target }} --bin rpi
+        run: |
+          cross build --release --target ${{ matrix.target }} --bin rpi
+          cross build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
       - name: Build (arm64 glibc)
@@ -102,7 +114,9 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CC: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-ar
-        run: cargo build --release --target ${{ matrix.target }} --bin rpi
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin rpi
+          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
       # ---- Packaging ----
@@ -130,6 +144,44 @@ jobs:
           # scripts/test-install-sh.sh.
           (cd dist && "$SHA256" "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
 
+          # ---- First-party extensions (.rpix; extension-distribution.md §3 / §9.2) ----
+          DIST="$PWD/dist"
+          for CRATE in $EXT_CRATES; do
+            MANIFEST="crates/$CRATE/rpi-extension.json"
+            # Package name / carrier filename come from the manifest, so the
+            # archive always matches what the loader resolves.
+            EXT_NAME=$(jq -r .name "$MANIFEST")
+            NATIVE=$(jq -r .native "$MANIFEST")
+            CRATE_US=${CRATE//-/_}
+            case "$TARGET" in
+              *apple-darwin*) LIB="target/$TARGET/release/lib${CRATE_US}.dylib" ;;
+              *)              LIB="target/$TARGET/release/lib${CRATE_US}.so" ;;
+            esac
+            if [ ! -f "$LIB" ]; then
+              echo "::error::missing cdylib artifact: $LIB"
+              exit 1
+            fi
+            TMP=$(mktemp -d)
+            # Inject lockstep version fields into the packed copy only (§4):
+            # minHostVersion + version = workspace version; the source-tree
+            # manifest stays untouched.
+            jq --arg v "$VERSION" '.version = $v | .minHostVersion = $v' \
+              "$MANIFEST" > "$TMP/rpi-extension.json"
+            # Land the cdylib under the manifest's `native` filename (the
+            # checked-in manifest uses the .so name on every platform).
+            cp "$LIB" "$TMP/$NATIVE"
+            [ -f "crates/$CRATE/LICENSE" ] && cp "crates/$CRATE/LICENSE" "$TMP/"
+            # In-pack checksums: every file except SHA256SUMS itself (the glob
+            # expands before the redirect target is created), coreutils format.
+            (cd "$TMP" && "$SHA256" * > SHA256SUMS)
+            RPIX="${EXT_NAME}-${VERSION}-${TARGET}.rpix"
+            # No top-level directory (§3.1): glob from inside TMP so entries
+            # are bare filenames, not ./-prefixed.
+            (cd "$TMP" && tar -czf "$DIST/$RPIX" *)
+            (cd dist && "$SHA256" "$RPIX" > "$RPIX.sha256")
+            rm -rf "$TMP"
+          done
+
       - name: Package (zip)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -140,6 +192,44 @@ jobs:
           Compress-Archive -Path "target\$TARGET\release\rpi.exe" -DestinationPath "dist\rpi-$VERSION-$TARGET.zip"
           $hash = (Get-FileHash "dist\rpi-$VERSION-$TARGET.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content -Path "dist\rpi-$VERSION-$TARGET.zip.sha256" -Value "$hash  rpi-$VERSION-$TARGET.zip"
+
+          # ---- First-party extensions (.rpix; extension-distribution.md §3 / §9.2) ----
+          $DIST = "$PWD\dist"
+          foreach ($CRATE in $env:EXT_CRATES -split ' ') {
+            $manifest = Get-Content "crates\$CRATE\rpi-extension.json" -Raw | ConvertFrom-Json
+            $EXT_NAME = $manifest.name
+            $NATIVE = $manifest.native
+            $CRATE_US = $CRATE -replace '-', '_'
+            # Windows cdylib artifact is <crate>.dll (the import lib
+            # <crate>.dll.lib must NOT be packed).
+            $LIB = "target\$TARGET\release\$CRATE_US.dll"
+            if (-not (Test-Path $LIB)) {
+              throw "missing cdylib artifact: $LIB"
+            }
+            $TMP = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP "rpix-$CRATE")
+            # Inject lockstep version fields into the packed copy only (§4);
+            # the source-tree manifest stays untouched.
+            $manifest.version = $VERSION
+            $manifest | Add-Member -NotePropertyName minHostVersion -NotePropertyValue $VERSION -Force
+            $manifest | ConvertTo-Json -Depth 10 | Set-Content "$TMP\rpi-extension.json"
+            # Land the cdylib under the manifest's `native` filename (the
+            # checked-in manifest uses the .so name on every platform).
+            Copy-Item $LIB "$TMP\$NATIVE"
+            if (Test-Path "crates\$CRATE\LICENSE") { Copy-Item "crates\$CRATE\LICENSE" $TMP }
+            # In-pack checksums: enumerated before SHA256SUMS exists, so the
+            # file excludes itself; coreutils format.
+            $sums = Get-ChildItem $TMP -File | ForEach-Object {
+              "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+            }
+            Set-Content "$TMP\SHA256SUMS" -Value $sums
+            $RPIX = "$EXT_NAME-$VERSION-$TARGET.rpix"
+            # bsdtar on the runner; explicit file list keeps entries as bare
+            # filenames (no top-level directory, §3.1).
+            $files = (Get-ChildItem $TMP -File).Name
+            tar -czf "$DIST\$RPIX" -C $TMP $files
+            $hash = (Get-FileHash "$DIST\$RPIX" -Algorithm SHA256).Hash.ToLower()
+            Set-Content -Path "$DIST\$RPIX.sha256" -Value "$hash  $RPIX"
+          }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6.0.0
