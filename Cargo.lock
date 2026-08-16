@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "rpi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3045,7 +3045,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -3067,7 +3067,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3098,7 +3098,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "async-trait",
@@ -3115,7 +3115,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-mcp-adapter"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "async-trait",
@@ -3139,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-smart-fetch"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "deunicode",
@@ -3165,7 +3165,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ext-subagents"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "futures",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-test-native-plugin"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "abi_stable",
  "rpi-ext-host",
@@ -3194,7 +3194,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-test-support"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures",
@@ -3208,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "comrak",
