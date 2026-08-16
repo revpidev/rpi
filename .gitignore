@@ -8,5 +8,9 @@
 .tooling/
 .pi-subagents/
 
+# Machine-local cargo env (wreq/btls-sys LIBCLANG_PATH etc. — absolute
+# host paths, each machine configures its own; never commit)
+.cargo/
+
 # Local rpi run artifacts (subagent outputs under $PWD/.rpi/)
 .rpi/
