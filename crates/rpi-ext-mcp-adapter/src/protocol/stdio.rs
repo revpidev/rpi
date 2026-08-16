@@ -163,10 +163,15 @@ impl StdioChild {
             } else {
                 Stdio::piped()
             })
-            // Own process group so a shutdown can reap the whole tree
-            // (coding-standards §11.3).
-            .process_group(0)
             .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            // Own process group so a shutdown can reap the whole tree
+            // (coding-standards §11.3). Unix-only tokio API; Windows has no
+            // process-group concept here, so shutdown falls back to tokio's
+            // default single-process kill (grandchildren are not reaped).
+            cmd.process_group(0);
+        }
         cmd.env_clear().envs(resolve_env(definition)?);
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);

@@ -4,9 +4,9 @@ name: build
 #   - Windows x64        x86_64-pc-windows-msvc     native (bundled MSVC)
 #   - macOS arm64        aarch64-apple-darwin        native (macos-14 arm64 runner)
 #   - Linux x64 glibc    x86_64-unknown-linux-gnu    native
-#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc)
-#   - Linux arm64 musl   aarch64-unknown-linux-musl  musl.cc cross toolchain (static single file)
-#   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc-aarch64-linux-gnu
+#   - Linux x64 musl     x86_64-unknown-linux-musl   apt musl-tools (musl-gcc); binary only
+#   - Linux arm64 musl   aarch64-unknown-linux-musl  cross-rs container (ghcr.io image); binary only
+#   - Linux arm64 glibc  aarch64-unknown-linux-gnu   apt gcc/g++-aarch64-linux-gnu
 #
 # Triggers: tag v* builds and publishes to GitHub Release; branch pushes no longer
 # trigger builds. workflow_dispatch remains for manual runs (e.g. packaging smoke
@@ -65,7 +65,9 @@ jobs:
 
       - name: Install aarch64 gcc (arm64 glibc)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        # g++ is required alongside gcc: btls-sys (BoringSSL, via wreq in
+        # rpi-ext-smart-fetch) compiles C++ through the cmake crate.
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
 
       # arm64 musl: apt has no ready-made toolchain, and the large musl.cc files are
       # unstable on runners (108MB download timeouts); switched to the cross-rs container
@@ -94,18 +96,19 @@ jobs:
           cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
         shell: bash
 
+      # musl targets ship the rpi binary only — no extension cdylibs: stock
+      # rustc does not support cdylib on *-linux-musl (cargo drops the crate
+      # type with a warning and still exits 0 — that, not a cross/mount issue,
+      # was the v0.1.1 aarch64-musl "missing .so" packaging failure), and a
+      # statically-linked musl rpi could not dlopen a native extension anyway.
       - name: Build (x64 musl)
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          cargo build --release --target ${{ matrix.target }} --bin rpi
-          cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
+        run: cargo build --release --target ${{ matrix.target }} --bin rpi
         shell: bash
 
       - name: Build (arm64 musl via cross container)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          cross build --release --target ${{ matrix.target }} --bin rpi
-          cross build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
+        run: cross build --release --target ${{ matrix.target }} --bin rpi
         shell: bash
 
       - name: Build (arm64 glibc)
@@ -114,6 +117,12 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_CC: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-ar
+          # The cmake crate (btls-sys/BoringSSL in rpi-ext-smart-fetch) reads
+          # CC_<target>/CXX_<target> (underscores), not the CARGO_TARGET_*
+          # variables above — without these it silently uses the host gcc and
+          # emits x86-64 objects that fail the aarch64 link.
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
         run: |
           cargo build --release --target ${{ matrix.target }} --bin rpi
           cargo build --release --target ${{ matrix.target }} $(printf ' -p %s' $EXT_CRATES)
@@ -145,7 +154,17 @@ jobs:
           (cd dist && "$SHA256" "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
 
           # ---- First-party extensions (.rpix; extension-distribution.md §3 / §9.2) ----
+          # Skipped on musl (see the build-step comment above: no cdylib
+          # support on *-linux-musl targets).
+          if [[ "$TARGET" == *-musl ]]; then
+            echo "skipping .rpix packaging for $TARGET (musl has no cdylib support)"
+          else
           DIST="$PWD/dist"
+          # If a cdylib ever goes missing again (as on the v0.1.1 aarch64-musl
+          # run), these listings show whether it landed in the profile dir,
+          # only in deps/, or nowhere at all.
+          ls -la "target/$TARGET/release/" | grep -E '\.(so|dylib)$' || true
+          ls -la "target/$TARGET/release/deps/" | grep -E '\.(so|dylib)$' || true
           for CRATE in $EXT_CRATES; do
             MANIFEST="crates/$CRATE/rpi-extension.json"
             # Package name / carrier filename come from the manifest, so the
@@ -181,6 +200,7 @@ jobs:
             (cd dist && "$SHA256" "$RPIX" > "$RPIX.sha256")
             rm -rf "$TMP"
           done
+          fi
 
       - name: Package (zip)
         if: runner.os == 'Windows'

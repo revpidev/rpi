@@ -234,6 +234,8 @@ fn link_node_modules_if_present(toplevel: &Path, worktree_path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
+        // No symlink fallback on non-unix (dependency reuse is unix-only).
+        let _ = worktree_path;
         false
     }
 }

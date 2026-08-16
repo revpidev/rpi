@@ -478,6 +478,8 @@ pub fn process_boot_id(pid: u64) -> Option<u64> {
     }
     #[cfg(not(unix))]
     {
+        // /proc is linux-only; callers degrade to a plain liveness check.
+        let _ = pid;
         None
     }
 }

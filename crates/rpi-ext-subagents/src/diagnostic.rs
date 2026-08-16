@@ -10,6 +10,9 @@
 //! exemption. Every other missing tool fails the run with the upstream
 //! message.
 
+// `Write` is only used by the unix 0o600 write branch below; the
+// `cfg(not(unix))` fallback goes through `std::fs::write`.
+#[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
 
