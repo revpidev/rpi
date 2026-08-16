@@ -170,5 +170,21 @@ fn tool_surface_integration() {
     assert_eq!(result["details"]["mode"], "single");
     assert_eq!(result["details"]["timeoutMs"], json!(2000));
 
+    // subagent_wait nonBlocking: the receipt must carry `details` — the
+    // host deserializes every tool result into AgentToolResult, where a
+    // missing details used to fail the whole execution with
+    // "missing field `details`".
+    let result =
+        rpi_ext_subagents::execute_tool_for_test("subagent_wait", &json!({ "nonBlocking": true }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    assert_eq!(
+        result["details"]["mode"], "management",
+        "nonBlocking receipt carries management details: {result}"
+    );
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("without blocking"));
+
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -13,19 +13,34 @@
 //! - `getOptimisticProgress` time extrapolation is dropped (Out: depends on
 //!   `Date.now`) — bar fill uses the event's static progress value.
 //!
-//! The trees are static JSON built once per render call — the host TUI has
-//! no width feedback channel in the render dispatch, so truncation uses a
-//! fixed assumed width (see [`DEFAULT_RENDER_WIDTH`]; §5.5 manual-check
-//! territory, not a parity surface).
+//! The trees are static JSON built once per render call. Truncation sizes
+//! to the host-reported terminal width when the render context carries one
+//! (`terminalWidth`, a rpi extension — upstream has no width on the
+//! context), falling back to a fixed assumed width (see
+//! [`DEFAULT_RENDER_WIDTH`]; §5.5 manual-check territory, not a parity
+//! surface).
 
 use serde_json::{json, Value};
 
 /// `SPINNER_FRAMES` (index.ts:43), verbatim.
 pub const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The assumed terminal width for the static trees (no width context rides
-/// the render dispatch; the TUI wraps on its own beyond this).
+/// The fallback render width when the context carries no terminal width
+/// (the TUI wraps on its own beyond this).
 pub const DEFAULT_RENDER_WIDTH: usize = 80;
+
+/// Render width from the host context with the fixed fallback: upstream's
+/// context carries no width (fixed 80 assumption), the rpi host forwards
+/// the live terminal width (`terminalWidth`, omitted while unknown). The
+/// lower bound keeps degenerate values from collapsing the bar columns.
+fn context_render_width(context: &Value) -> usize {
+    context
+        .get("terminalWidth")
+        .and_then(Value::as_u64)
+        .filter(|width| *width >= 20)
+        .map(|width| width as usize)
+        .unwrap_or(DEFAULT_RENDER_WIDTH)
+}
 
 /// `maxPreviewLines` (index.ts:292).
 const MAX_PREVIEW_LINES: usize = 7;
@@ -167,7 +182,7 @@ pub fn render_batch_call(args: &Value) -> Value {
 /// The partial (pending) result: the single-item progress row
 /// (`createResponsiveSingleFetchProgressComponent` /
 /// `renderSingleFetchProgressText`, index.ts:379-437).
-fn render_web_fetch_partial(details: &Value) -> Value {
+fn render_web_fetch_partial(details: &Value, context: &Value) -> Value {
     let status = details
         .get("status")
         .and_then(Value::as_str)
@@ -194,7 +209,7 @@ fn render_web_fetch_partial(details: &Value) -> Value {
         status,
         progress,
         spinner_tick as usize,
-        DEFAULT_RENDER_WIDTH,
+        context_render_width(context),
     )
 }
 
@@ -308,7 +323,7 @@ fn render_web_fetch_final(details: &Value, expanded: bool) -> Value {
 
 /// `renderResult` for `web_fetch` (index.ts:637-664). Pure and
 /// synchronous: result/options/context JSON only.
-pub fn render_web_fetch_result(result: &Value, options: &Value, _context: &Value) -> Value {
+pub fn render_web_fetch_result(result: &Value, options: &Value, context: &Value) -> Value {
     let is_partial = options
         .get("isPartial")
         .and_then(Value::as_bool)
@@ -320,7 +335,7 @@ pub fn render_web_fetch_result(result: &Value, options: &Value, _context: &Value
     let details = result.get("details").cloned().unwrap_or(Value::Null);
 
     if is_partial {
-        return render_web_fetch_partial(&details);
+        return render_web_fetch_partial(&details, context);
     }
     if details.get("error").and_then(Value::as_bool) == Some(true) {
         // index.ts:649-661: the user-facing summary wins; then the first
@@ -354,7 +369,7 @@ pub fn render_web_fetch_result(result: &Value, options: &Value, _context: &Value
 /// `renderBatchProgressText` (index.ts:177-223) as a column: the bold
 /// summary line, then one row per item (error rows gain their detail line
 /// when expanded). One color per line (v1).
-pub fn render_batch_result(result: &Value, options: &Value, _context: &Value) -> Value {
+pub fn render_batch_result(result: &Value, options: &Value, context: &Value) -> Value {
     let expanded = options
         .get("expanded")
         .and_then(Value::as_bool)
@@ -396,7 +411,7 @@ pub fn render_batch_result(result: &Value, options: &Value, _context: &Value) ->
                 status,
                 progress,
                 spinner_tick as usize + index,
-                DEFAULT_RENDER_WIDTH,
+                context_render_width(context),
             ));
             // index.ts:215-219: the expanded error detail line.
             if expanded && status == "error" {
@@ -484,6 +499,30 @@ mod tests {
         assert!(text.starts_with("⠸ https://ex.com/a "), "{text}");
         assert_eq!(text.matches('█').count(), 7);
         assert_eq!(tree["props"]["fg"], json!("accent"));
+    }
+
+    #[test]
+    fn partial_row_sizes_to_context_terminal_width() {
+        // terminalWidth forwarding (rpi extension over the fixed-80
+        // upstream assumption): a wide context widens the URL column and
+        // the bar; an absent width keeps the 80 fallback, as does a
+        // degenerate sub-20 value.
+        let result = json!({
+            "content": [],
+            "details": { "status": "loading", "progress": 0.0, "url": "https://example.com/path", "spinnerTick": 0 }
+        });
+        let options = json!({ "isPartial": true });
+        let wide = render_web_fetch_result(&result, &options, &json!({ "terminalWidth": 120 }));
+        let narrow = render_web_fetch_result(&result, &options, &json!({}));
+        let degenerate = render_web_fetch_result(&result, &options, &json!({ "terminalWidth": 8 }));
+        let wide_text = wide["props"]["text"].as_str().unwrap();
+        let narrow_text = narrow["props"]["text"].as_str().unwrap();
+        let degenerate_text = degenerate["props"]["text"].as_str().unwrap();
+        // width 120: url column 98 (URL padded), bar 16 cells; width 80:
+        // url column 60 (URL padded), bar 14 cells.
+        assert!(wide_text.len() > narrow_text.len(), "wide={wide_text:?} narrow={narrow_text:?}");
+        assert!(wide_text.matches('░').count() > narrow_text.matches('░').count());
+        assert_eq!(degenerate_text, narrow_text, "sub-20 width falls back to 80");
     }
 
     #[test]

@@ -112,6 +112,45 @@ fn unregister_run(run_id: &str) {
         .remove(run_id);
 }
 
+/// Terminal runs stay registered (the registry doc contract: "live and
+/// recently finished"). `subagent_wait` and the `stop` action observe the
+/// terminal transition by polling this table — unregistering on finish made
+/// the run vanish from their snapshot set, so both waited out their full
+/// timeout instead of returning within one poll cycle (upstream keeps
+/// terminal runs in the provider items too; `subagent-wait.ts:552` filters
+/// them at wait START, not on completion). Bound the retention so a long
+/// session does not accumulate handles: past the cap the oldest terminal
+/// entries (by `started_ms`) drop off.
+const MAX_RETAINED_TERMINAL_RUNS: usize = 64;
+
+fn prune_terminal_runs() {
+    let terminal_states = [
+        STATE_COMPLETE,
+        STATE_FAILED,
+        STATE_STOPPED,
+        STATE_PAUSED,
+        STATE_REJECTED,
+    ];
+    let is_terminal = |handle: &Arc<AsyncRunHandle>| {
+        let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+        terminal_states.contains(&status["state"].as_str().unwrap_or(""))
+    };
+    let mut runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut terminal: Vec<(u64, String)> = runs
+        .values()
+        .filter(|handle| is_terminal(handle))
+        .map(|handle| (handle.started_ms, handle.run_id.clone()))
+        .collect();
+    if terminal.len() <= MAX_RETAINED_TERMINAL_RUNS {
+        return;
+    }
+    terminal.sort_by_key(|(started, _)| *started);
+    let excess = terminal.len() - MAX_RETAINED_TERMINAL_RUNS;
+    for (_, run_id) in terminal.into_iter().take(excess) {
+        runs.remove(&run_id);
+    }
+}
+
 /// Find a run by exact id or unique id prefix (async-status id resolution).
 pub fn find_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
     let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
@@ -126,6 +165,26 @@ pub fn find_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
         return Some(matches.remove(0).clone());
     }
     None
+}
+
+/// `find_run` restricted to non-terminal runs — the candidate set for the
+/// control actions (steer/interrupt). Terminal runs stay registered for
+/// wait/status reads, but steering a finished run would write an inbox no
+/// child will ever read.
+pub fn find_active_run(query: &str) -> Option<Arc<AsyncRunHandle>> {
+    let handle = find_run(query)?;
+    let terminal = {
+        let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+        matches!(
+            status["state"].as_str().unwrap_or(""),
+            STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+        )
+    };
+    if terminal {
+        None
+    } else {
+        Some(handle)
+    }
 }
 
 /// Snapshot the status document.
@@ -958,7 +1017,9 @@ async fn finish_with_handoff(
         json!({ "runId": handle.run_id, "state": state }),
     );
     notify.send(handle, state, output, handoff_path).await;
-    unregister_run(&handle.run_id);
+    // Terminal handle stays registered (see prune_terminal_runs): wait/stop
+    // poll this table for the terminal transition.
+    prune_terminal_runs();
 }
 
 async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &AsyncNotify) {
@@ -972,7 +1033,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         json!({ "runId": handle.run_id, "error": error }),
     );
     notify.send(handle, STATE_FAILED, error, None).await;
-    unregister_run(&handle.run_id);
+    prune_terminal_runs();
 }
 
 async fn finish_stopped(handle: &Arc<AsyncRunHandle>, notify: &AsyncNotify) {
@@ -999,8 +1060,8 @@ pub fn deliver_steer(
     mode: &str,
     target_index: Option<usize>,
 ) -> Result<Value, String> {
-    let handle =
-        find_run(run_id).ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    let handle = find_active_run(run_id)
+        .ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
     let index = target_index.unwrap_or(0);
     let inbox = steer_inbox_dir(&handle.run_dir, index);
     std::fs::create_dir_all(&inbox).map_err(|e| e.to_string())?;
@@ -1045,7 +1106,7 @@ pub fn read_run_status(run_id: &str) -> Option<Value> {
 /// children and can be `resume`d.
 pub fn interrupt_run(query: &str) -> Result<Value, String> {
     let handle =
-        find_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
+        find_active_run(query).ok_or_else(|| format!("No active async run matches '{query}'."))?;
     handle.control.request_interrupt();
     let control_dir = handle.run_dir.join("control");
     let _ = std::fs::create_dir_all(&control_dir);
@@ -1207,6 +1268,7 @@ pub async fn wait_for_runs(
     all: bool,
     timeout_ms: u64,
     on_update: Option<&(dyn Fn(&str) + Send + Sync)>,
+    is_aborted: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> Result<Value, String> {
     let started = std::time::Instant::now();
     let deadline = started + Duration::from_millis(timeout_ms.max(1));
@@ -1272,6 +1334,28 @@ pub async fn wait_for_runs(
         );
     }
     loop {
+        // User abort (extension-ABI abort-channel gap): the wait tool is a
+        // synchronous dispatch the runtime cannot cancel, so it polls the
+        // probe each cycle and returns promptly. The runs themselves keep
+        // going — an aborted wait interrupts the *wait*, not the work
+        // (upstream semantics: abort rejects the wait promise only).
+        if let Some(is_aborted) = is_aborted {
+            if is_aborted() {
+                let snapshots: Vec<Value> = {
+                    let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                    initial_ids
+                        .iter()
+                        .filter_map(|run_id| runs.get(run_id.as_str()).map(|h| status_snapshot(h)))
+                        .collect()
+                };
+                return Ok(json!({
+                    "waited": 0,
+                    "all": all,
+                    "aborted": true,
+                    "runs": snapshots,
+                }));
+            }
+        }
         let snapshots: Vec<Value> = {
             // Single lock acquisition: `find_run` takes the same mutex and
             // std::sync::Mutex is not reentrant (deadlock otherwise).
@@ -1438,8 +1522,15 @@ pub fn format_async_run_list(runs: &[Value]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// ASYNC_RUNS is process-global; tests that register handles or wait
+    /// over the "all runs" candidate set must not interleave (a concurrent
+    /// running handle would join another test's wait set). Crate-visible:
+    /// the TE11 fleet tests register scratch handles too and share this
+    /// lock.
+    pub(crate) static REGISTRY_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn spawn_budget_reserve_and_grant() {
@@ -1479,7 +1570,158 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_unknown_run_errors() {
-        assert!(wait_for_runs(Some("nope"), false, 10, None).await.is_err());
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(wait_for_runs(Some("nope"), false, 10, None, None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn aborted_wait_returns_promptly_with_runs_kept_alive() {
+        // The wait tool is a synchronous dispatch the runtime cannot cancel;
+        // the abort probe is the cooperative substitute. An aborted wait must
+        // return within a poll cycle and NOT touch the runs (they keep
+        // running in the background — upstream aborts the wait promise only).
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let handle = running_test_run("wait-aborted");
+        let started = std::time::Instant::now();
+        let result = wait_for_runs(Some("wait-aborted"), false, 60_000, None, Some(&|| true))
+            .await
+            .expect("run was active at wait start");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "aborted wait returns immediately, not after the 60s timeout"
+        );
+        assert_eq!(result["aborted"], json!(true));
+        assert!(result.get("timedOut").is_none());
+        assert_eq!(result["runs"][0]["state"], json!(STATE_RUNNING));
+        // The run itself is untouched.
+        let status = handle.status.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(status["state"], json!(STATE_RUNNING));
+        unregister_run("wait-aborted");
+    }
+
+    #[tokio::test]
+    async fn wait_returns_when_run_reaches_terminal_state() {
+        // Regression: finish used to unregister the handle right after the
+        // terminal transition, so the run vanished from the wait's snapshot
+        // set and the wait burned its whole timeout. The terminal handle
+        // must stay observable until the retention cap prunes it.
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let handle = running_test_run("wait-completes");
+        let waiter = tokio::spawn(async move {
+            wait_for_runs(Some("wait-completes"), false, 5_000, None, None).await
+        });
+        // Let the wait take its initial snapshot (running), then finish the
+        // run the way `finish_with_handoff` does: terminal state, handle
+        // retained.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["state"] = json!(STATE_COMPLETE);
+        }
+        let started = std::time::Instant::now();
+        let result = waiter
+            .await
+            .expect("wait task panicked")
+            .expect("run was active when the wait started");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "wait returned within a poll cycle of the terminal transition, not the 5s timeout"
+        );
+        assert_eq!(result["waited"], json!(1));
+        assert!(result.get("timedOut").is_none());
+        unregister_run("wait-completes");
+    }
+
+    #[tokio::test]
+    async fn wait_all_requires_every_initial_run_terminal() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let first = running_test_run("wait-all-a");
+        let second = running_test_run("wait-all-b");
+        let waiter =
+            tokio::spawn(async move { wait_for_runs(None, true, 2_000, None, None).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for run_id in ["wait-all-a", "wait-all-b"] {
+            let handle = find_run(run_id).unwrap();
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["state"] = json!(STATE_COMPLETE);
+        }
+        let result = waiter
+            .await
+            .expect("wait task panicked")
+            .expect("both runs were active at wait start");
+        assert_eq!(result["waited"], json!(2), "{result}");
+        assert!(result.get("timedOut").is_none());
+        drop(first);
+        drop(second);
+        unregister_run("wait-all-a");
+        unregister_run("wait-all-b");
+    }
+
+    #[tokio::test]
+    async fn terminal_retention_is_bounded() {
+        // finish keeps terminal handles for wait/status reads, but the
+        // retention cap drops the oldest terminal entries.
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for index in 0..=MAX_RETAINED_TERMINAL_RUNS {
+            let handle = running_test_run_started(&format!("prune-{index}"), index as u64);
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["state"] = json!(STATE_COMPLETE);
+        }
+        prune_terminal_runs();
+        let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        let terminal = runs
+            .values()
+            .filter(|h| {
+                let status = h.status.read().unwrap_or_else(|e| e.into_inner());
+                status["state"] == json!(STATE_COMPLETE)
+            })
+            .count();
+        assert_eq!(
+            terminal, MAX_RETAINED_TERMINAL_RUNS,
+            "cap holds exactly MAX_RETAINED_TERMINAL_RUNS terminal entries"
+        );
+        assert!(
+            runs.contains_key(&format!("prune-{MAX_RETAINED_TERMINAL_RUNS}")),
+            "newest terminal run survives"
+        );
+        assert!(!runs.contains_key("prune-0"), "oldest terminal run pruned");
+        drop(runs);
+        for index in 0..=MAX_RETAINED_TERMINAL_RUNS {
+            unregister_run(&format!("prune-{index}"));
+        }
+    }
+
+    /// A registry handle whose status doc is in the running state.
+    fn running_test_run(run_id: &str) -> Arc<AsyncRunHandle> {
+        running_test_run_started(run_id, 0)
+    }
+
+    /// [`running_test_run`] with an explicit start timestamp (retention
+    /// ordering tests).
+    fn running_test_run_started(run_id: &str, started_ms: u64) -> Arc<AsyncRunHandle> {
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.to_string(),
+            status: Arc::new(RwLock::new(
+                json!({ "runId": run_id, "state": STATE_RUNNING }),
+            )),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: std::env::temp_dir(),
+            started_ms,
+        });
+        register_run(handle.clone());
+        handle
     }
 
     #[tokio::test]
@@ -1488,8 +1730,11 @@ mod tests {
         // the registry does not count — :552 snapshots the active set only)
         // → the upstream "Nothing to wait for." message, not a poll loop
         // that burns the whole timeout.
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let handle = terminal_test_run("wait-terminal");
-        let error = wait_for_runs(None, false, 10, None)
+        let error = wait_for_runs(None, false, 10, None, None)
             .await
             .expect_err("terminal-only registry has nothing to wait for");
         assert!(
@@ -1498,7 +1743,7 @@ mod tests {
         );
         // An explicitly-requested id that is already terminal also fails
         // (the id path picks from ACTIVE candidates, :518-545).
-        let error = wait_for_runs(Some("wait-terminal"), false, 10, None)
+        let error = wait_for_runs(Some("wait-terminal"), false, 10, None, None)
             .await
             .expect_err("terminal id is not waitable");
         assert!(error.contains("No active run matched"), "{error}");

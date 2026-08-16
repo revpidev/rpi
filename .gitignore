@@ -7,3 +7,6 @@
 .DS_Store
 .tooling/
 .pi-subagents/
+
+# Local rpi run artifacts (subagent outputs under $PWD/.rpi/)
+.rpi/

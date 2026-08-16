@@ -1326,8 +1326,24 @@ async fn execute_prepared_tool_call(
                 args: args.clone(),
                 partial_result: serde_json::to_value(&partial_result).unwrap_or(Value::Null),
             };
-            let update = emit(event);
-            lock(&update_events).push(update);
+            let mut update = emit(event);
+            // Upstream emits the update synchronously (`emitEvent` enqueues
+            // into the event stream before returning). The Rust sink returns
+            // a future, and parking it in the settle list until `execute`
+            // returns batches every partial frame of a long tool call into
+            // one post-execute avalanche — live progress never reaches the
+            // UI while the tool runs. Poll once with a noop waker instead:
+            // sinks whose first step is a synchronous enqueue (the stream
+            // sink) complete here, frame by frame; genuinely async sinks
+            // (the Agent barrier) park pending in the settle list and keep
+            // the original await-before-return semantics.
+            {
+                let waker = futures::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&waker);
+                if update.as_mut().poll(&mut cx).is_pending() {
+                    lock(&update_events).push(update);
+                }
+            }
         })
     };
 

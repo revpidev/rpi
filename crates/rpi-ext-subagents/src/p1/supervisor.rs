@@ -265,6 +265,7 @@ impl ChildSupervisorContext {
 fn ok_result(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
+        "details": { "mode": "single", "results": [] },
         "isError": false,
     })
 }
@@ -272,6 +273,7 @@ fn ok_result(text: &str) -> Value {
 fn error_result(text: &str) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
+        "details": { "mode": "single", "results": [] },
         "isError": true,
     })
 }

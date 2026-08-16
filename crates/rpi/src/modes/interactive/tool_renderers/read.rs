@@ -482,6 +482,7 @@ mod tests {
             expanded: false,
             show_images: false,
             is_error: false,
+            terminal_width: 0,
         }
     }
 

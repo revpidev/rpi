@@ -460,7 +460,28 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             dispatcher.start_init(cwd, None);
         });
     }
-    json!({"ok": true})
+    // Bridge-ready retry push (2026-08-16 status-bar-loss fix): install()
+    // runs before the TUI binds its UI bridge, so the early
+    // `update_status_bar` lands on the null bridge and is silently dropped;
+    // with lazy servers `on_ready` only fires after the first real use, so
+    // nothing re-pushes and the footer never shows the MCP entry. Retry the
+    // push every 1.5 s until the host reports a UI (15 tries ≈ 22 s covers
+    // startup plus theme reloads); after that the regular refresh hooks
+    // (on_ready / metadata updates / connect sync) keep it current.
+    plugin.runtime.spawn(async move {
+        for _ in 0..15 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            let Some(state) = STATE.get() else { return };
+            let has_ui = host_call_ok(&state.calls, state.cookie, "ctx.hasUI", json!({}))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            update_status_bar(state);
+            if has_ui {
+                return;
+            }
+        }
+    });
+    json!({"ok": true })
 }
 
 #[allow(clippy::missing_safety_doc)]

@@ -23,11 +23,14 @@ mod config;
 mod description;
 mod diagnostic;
 mod error;
+/// TE11 FR-C fleet strip (`pub` for the e2e linger test seam).
+pub mod fleet;
 mod launch;
 mod messages;
 mod p1;
 mod paths;
 mod prompts;
+mod render;
 mod runner;
 mod runtime;
 mod session_fork;
@@ -124,6 +127,15 @@ pub trait HostContext {
         let _ = tool_call_id;
         None
     }
+
+    /// Abort probe for an in-flight dispatch (extension-ABI abort-channel
+    /// gap): polls the host's `ctx.aborted` for `tool_call_id`. `None` when
+    /// the caller has no host channel — waits/foreground runs then simply
+    /// run to completion (test fakes, detached contexts).
+    fn abort_probe(&self, tool_call_id: &str) -> Option<crate::runner::foreground::AbortProbe> {
+        let _ = tool_call_id;
+        None
+    }
 }
 
 /// Per-dispatch `toolUpdate` sender (ADR-0015, `tools` capability) — the
@@ -208,6 +220,17 @@ impl HostContext for HostCallsContext<'_> {
         };
         Some(std::sync::Arc::new(move |text: &str, details: &Value| {
             sink.push(text, details)
+        }))
+    }
+
+    fn abort_probe(&self, tool_call_id: &str) -> Option<crate::runner::foreground::AbortProbe> {
+        let calls = self.async_calls()?;
+        let tool_call_id = tool_call_id.to_string();
+        Some(std::sync::Arc::new(move || {
+            host_call_static(&calls, "ctx.aborted", json!({ "toolCallId": tool_call_id }))
+                .get("ok")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
         }))
     }
 
@@ -417,6 +440,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                         "label": "Subagent",
                         "description": child_safe_tool_description(),
                         "parameters": tool::tool_parameters_schema(),
+                        // TE11 FR-A/FR-B: the host attaches the render hooks
+                        // and dispatches {"kind":"render","what":"toolCall"|
+                        // "toolResult"} back here (host_call.rs render
+                        // protocol, mcp-adapter precedent).
+                        "renderCall": true,
+                        "renderResult": true,
                     }),
                 ) {
                     return json!({"error": {"kind": "init", "message": error.to_string()}});
@@ -434,6 +463,10 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     "description": description::build_subagent_tool_description(&config, &cwd),
                     "promptSnippet": "Delegate focused subtasks to child agent sessions (scout/researcher/worker/reviewer/oracle/delegate) or manage them via action.",
                     "parameters": tool::tool_parameters_schema(),
+                    // TE11 FR-A/FR-B render hooks (see the ChildFanout
+                    // registration note).
+                    "renderCall": true,
+                    "renderResult": true,
                 }),
             ) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
@@ -674,6 +707,7 @@ fn dispatch_message(message: &Value) -> Value {
                     "content": [{ "type": "text", "text":
                         "contact_supervisor is unavailable: no supervisor channel was configured for this session."
                     }],
+                    "details": { "mode": "single", "results": [] },
                     "isError": true,
                 });
             }
@@ -727,11 +761,12 @@ fn dispatch_message(message: &Value) -> Value {
             )
         }
         // Render protocol (host_call.rs:454-499): the host dispatches a
-        // synchronous `{"kind":"render","what":"message",...}` for a
-        // registered customType; pure JSON, never touches the runtime.
+        // synchronous `{"kind":"render","what":"message"|"toolCall"|
+        // "toolResult",...}`; pure JSON, never touches the runtime.
         // A `null` tree falls back to the host's default rendering.
         Some("render") => {
-            if message.get("what").and_then(Value::as_str) == Some("message") {
+            let what = message.get("what").and_then(Value::as_str);
+            if what == Some("message") {
                 let custom_type = message
                     .get("message")
                     .and_then(|m| m.get("customType"))
@@ -745,6 +780,24 @@ fn dispatch_message(message: &Value) -> Value {
                     "subagent_control_notice" => messages::render_subagent_control(payload),
                     _ => Value::Null,
                 };
+            }
+            // TE11 FR-A/FR-B: the `subagent` tool's call title and run card
+            // (mcp-adapter render dispatch precedent — same envelope).
+            if what == Some("toolCall") {
+                let args = message
+                    .get("context")
+                    .and_then(|c| c.get("args"))
+                    .unwrap_or(&Value::Null);
+                return render::render_subagent_tool_call(args);
+            }
+            if what == Some("toolResult") {
+                let result = message.get("result").unwrap_or(&Value::Null);
+                let options = message.get("options").unwrap_or(&Value::Null);
+                let call_args = message
+                    .get("context")
+                    .and_then(|c| c.get("args"))
+                    .unwrap_or(&Value::Null);
+                return render::render_subagent_tool_result(result, options, call_args);
             }
             Value::Null
         }
@@ -839,6 +892,7 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
             "content": [{ "type": "text", "text":
                 "subagent_wait is disabled by config.waitTool or RPI_SUBAGENT_WAIT_TOOL_ENABLED; returning immediately without blocking background work. Active work keeps going, and you can inspect subagents with subagent({ action: \"status\" }) or rely on completion notifications."
             }],
+            "details": { "mode": "management", "disabled": true, "results": [] },
             "isError": false,
         });
     }
@@ -859,6 +913,7 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
             "content": [{ "type": "text", "text":
                 "Registered for background completion notifications; returning without blocking."
             }],
+            "details": { "mode": "management", "nonBlocking": true, "results": [] },
             "isError": false,
         });
     }
@@ -869,32 +924,80 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         .unwrap_or(30 * 60 * 1000);
     // The live-activity stream rides the same toolUpdate seam as the
     // foreground snapshots (upstream deps.onUpdate, subagent-wait.ts:578).
-    let update_sink = tool_call_id.and_then(|tool_call_id| {
+    let (update_sink, abort_probe) = {
         let host = HostCallsContext {
             calls: &state.calls,
             cookie: state.cookie,
         };
-        host.tool_update_sink(tool_call_id)
-    });
+        match tool_call_id {
+            Some(tool_call_id) => (
+                host.tool_update_sink(tool_call_id),
+                host.abort_probe(tool_call_id),
+            ),
+            None => (None, None),
+        }
+    };
     let result = state.runtime.block_on(async {
         type WaitUpdate = Box<dyn Fn(&str) + Send + Sync>;
         let on_update: Option<WaitUpdate> = update_sink.as_ref().map(|sink| {
             let sink = std::sync::Arc::clone(sink);
-            Box::new(move |text: &str| sink(text, &wait_update_details())) as WaitUpdate
+            // Fire-and-forget (2026-08-16 intermittent wait-hang fix): the
+            // toolUpdate FFI runs on the plugin runtime's worker; a host-side
+            // race that stalls it must not stall the wait loop itself — the
+            // loop's correctness (terminal detection, deadline) matters more
+            // than any single live-activity frame, which is display-only.
+            Box::new(move |text: &str| {
+                let sink = std::sync::Arc::clone(&sink);
+                let text = text.to_owned();
+                tokio::spawn(async move {
+                    sink(&text, &wait_update_details());
+                });
+            }) as WaitUpdate
         });
         let on_update = on_update
             .as_ref()
             .map(|boxed| &**boxed as &(dyn Fn(&str) + Send + Sync));
-        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms, on_update).await
+        let abort_probe = abort_probe
+            .as_ref()
+            .map(|probe| &**probe as &(dyn Fn() -> bool + Send + Sync));
+        runner::background::wait_for_runs(id.as_deref(), all, timeout_ms, on_update, abort_probe)
+            .await
     });
     match result {
-        Ok(waited) => json!({
-            "content": [{ "type": "text", "text":
-                format!("Wait finished: {} run(s) reached a terminal state.", waited["waited"].as_u64().unwrap_or(0))
-            }],
-            "details": waited,
-            "isError": false,
-        }),
+        Ok(waited) => {
+            // The aborted branch must read as an interruption, not a
+            // completion — the runs keep going in the background.
+            let text = if waited["aborted"].as_bool().unwrap_or(false) {
+                format!(
+                    "Wait interrupted by user abort: {} run(s) keep running in the background. \
+                     Completion still arrives as a session message; inspect with \
+                     subagent({{action:\"status\"}}) or wait again with subagent_wait.",
+                    waited["runs"].as_array().map(Vec::len).unwrap_or(0)
+                )
+            }
+            // The timeout branch (wait_for_runs deadline) must read as a
+            // timeout, not as "0 finished" — the model would otherwise
+            // misread the run set as empty and re-wait blindly.
+            else if waited["timedOut"].as_bool().unwrap_or(false) {
+                let active = waited["runs"].as_array().map(Vec::len).unwrap_or(0);
+                format!(
+                    "Timed out waiting for background run(s): {} run(s) still active. \
+                     Wait again with subagent_wait (runs keep going) or inspect with \
+                     subagent({{action:\"status\"}}); completion also arrives as a session message.",
+                    active
+                )
+            } else {
+                format!(
+                    "Wait finished: {} run(s) reached a terminal state.",
+                    waited["waited"].as_u64().unwrap_or(0)
+                )
+            };
+            json!({
+                "content": [{ "type": "text", "text": text }],
+                "details": waited,
+                "isError": false,
+            })
+        }
         Err(message) => json!({
             "content": [{ "type": "text", "text": message }],
             "isError": true,
@@ -988,6 +1091,25 @@ pub fn render_message_for_test(custom_type: &str, message: &Value, options: &Val
         "kind": "render",
         "what": "message",
         "message": Value::Object(payload),
+        "options": options,
+    }))
+}
+
+/// Test seam: drive the tool render dispatch (TE11 FR-A/FR-B) — the same
+/// `{"kind":"render","what":"toolCall"|"toolResult"}` envelope the host
+/// forwards through the registerTool render hooks.
+#[doc(hidden)]
+pub fn render_tool_for_test(
+    what: &str,
+    context_args: &Value,
+    result: &Value,
+    options: &Value,
+) -> Value {
+    dispatch_message(&json!({
+        "kind": "render",
+        "what": what,
+        "context": { "args": context_args },
+        "result": result,
         "options": options,
     }))
 }

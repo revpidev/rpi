@@ -193,6 +193,10 @@ pub struct RunCtx {
     /// Step activity projection (TE09 FR-C): async runs install a sink that
     /// mirrors currentTool/currentPath into the run status document.
     pub step_status: Option<crate::runner::foreground::StepStatusSink>,
+    /// Abort probe for the dispatch this context serves (see
+    /// [`crate::runner::foreground::AbortProbe`]); `None` when there is no
+    /// host channel or the context outlives its dispatch (async runs).
+    pub abort_probe: Option<crate::runner::foreground::AbortProbe>,
 }
 
 impl RunCtx {
@@ -276,6 +280,7 @@ impl RunCtx {
             // non-streaming default for every other constructor caller).
             frame_sink: None,
             step_status: None,
+            abort_probe: None,
         }
     }
 
@@ -610,6 +615,7 @@ pub async fn run_child_async(
         supervisor_channel,
         stream_sink: ctx.frame_sink.clone(),
         step_status: ctx.step_status.clone(),
+        abort_probe: ctx.abort_probe.clone(),
     };
 
     let mut result = foreground::run_foreground_with_fallback(&input, &candidates).await;

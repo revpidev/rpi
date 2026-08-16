@@ -73,6 +73,11 @@ pub struct ExtensionConfig {
     /// `waitTool` (FR-P1-04): boolean or `{ enabled?: boolean }`; env
     /// `RPI_SUBAGENT_WAIT_TOOL_ENABLED` overrides (wait-config.ts:30-34).
     pub wait_tool: Option<Value>,
+    /// `fleet` (TE11 FR-C): `{ enabled?, expanded? }` — the persistent fleet
+    /// status widget below the editor. `expanded` shows the per-run tree
+    /// instead of the one-line summary (no keyboard interaction: the widget
+    /// is read-only; TE11 Out — inspector/navigation).
+    pub fleet: Option<Value>,
     /// `worktreeBaseDir` (FR-P1-06): base directory for managed worktrees;
     /// env `RPI_SUBAGENTS_WORKTREE_DIR` overrides; default system temp.
     pub worktree_base_dir: Option<String>,
@@ -110,6 +115,7 @@ impl ExtensionConfig {
             parallel_max_tasks: None,
             parallel_concurrency: None,
             wait_tool: None,
+            fleet: None,
             worktree_base_dir: None,
             worktree_setup_hook: None,
             intercom_bridge: None,
@@ -207,6 +213,42 @@ impl ExtensionConfig {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             _ => true,
+        }
+    }
+
+    /// `fleet.enabled` (TE11 FR-C): env
+    /// `RPI_SUBAGENT_FLEET_ENABLED` > config > true.
+    pub fn fleet_enabled(&self) -> bool {
+        const ENV: &str = "RPI_SUBAGENT_FLEET_ENABLED";
+        if let Ok(raw) = std::env::var(ENV) {
+            let normalized = raw.trim().to_lowercase();
+            match normalized.as_str() {
+                "1" | "true" | "yes" | "on" | "enabled" => return true,
+                "0" | "false" | "no" | "off" | "disabled" => return false,
+                _ => {
+                    tracing::warn!(env = %ENV, value = %raw, "invalid fleet env value; ignoring")
+                }
+            }
+        }
+        match &self.fleet {
+            Some(Value::Bool(b)) => *b,
+            Some(Value::Object(object)) => object
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            _ => true,
+        }
+    }
+
+    /// `fleet.expanded` (TE11 FR-C): config > false. The widget is
+    /// read-only, so the tree form is config-driven (no keyboard toggle).
+    pub fn fleet_expanded(&self) -> bool {
+        match &self.fleet {
+            Some(Value::Object(object)) => object
+                .get("expanded")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            _ => false,
         }
     }
 
@@ -400,6 +442,22 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
             );
         }
         config.wait_tool = Some(wait_tool.clone());
+    }
+    if let Some(fleet) = object.get("fleet") {
+        // TE11 FR-C: boolean, or `{enabled?, expanded?}` with boolean values.
+        let valid = fleet.is_boolean()
+            || fleet.as_object().is_some_and(|o| {
+                o.len() <= 2
+                    && o.get("enabled").is_none_or(Value::is_boolean)
+                    && o.get("expanded").is_none_or(Value::is_boolean)
+            });
+        if !valid {
+            return Err(
+                "config.fleet must be a boolean or an object with optional enabled/expanded booleans"
+                    .into(),
+            );
+        }
+        config.fleet = Some(fleet.clone());
     }
     if let Some(dir) = object.get("worktreeBaseDir") {
         match dir.as_str().filter(|s| !s.trim().is_empty()) {

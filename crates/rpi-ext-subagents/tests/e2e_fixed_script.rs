@@ -24,6 +24,9 @@ static SENT_MESSAGES: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::
 /// Full `sendMessage` call args (message + options) — the triggerTurn
 /// assertion needs the options half the message-only sink drops.
 static SENT_MESSAGE_CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
+/// TE11 FR-C: `ui.setWidget` call args — the fleet strip's push/remove
+/// assertions (content `null` = removal).
+static SET_WIDGET_CALLS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 fn take_tool_updates() -> Vec<Value> {
     TOOL_UPDATES
@@ -43,6 +46,14 @@ fn take_sent_messages() -> Vec<Value> {
 
 fn take_sent_message_calls() -> Vec<Value> {
     SENT_MESSAGE_CALLS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain(..)
+        .collect()
+}
+
+fn take_set_widget_calls() -> Vec<Value> {
+    SET_WIDGET_CALLS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .drain(..)
@@ -73,6 +84,13 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
                 .unwrap_or_else(|e| e.into_inner())
                 .push(parsed["args"]["message"].clone());
             SENT_MESSAGE_CALLS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(parsed["args"].clone());
+            json!({ "ok": true })
+        }
+        "ui.setWidget" => {
+            SET_WIDGET_CALLS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(parsed["args"].clone());
@@ -690,12 +708,24 @@ fn e2e_fixed_child_full_pipeline() {
             .unwrap()
             .to_string();
         // The driver finishes quickly (fixed child); wait for the terminal
-        // status (subagent_wait core loop).
+        // status (subagent_wait core loop). Regression guard: finish used to
+        // unregister the run, so the wait only ever ended by burning this
+        // 30s timeout — assert the terminal observation, not just the
+        // non-error receipt.
         let wait = rpi_ext_subagents::execute_tool_for_test(
             "subagent_wait",
             &json!({ "all": true, "timeoutMs": 30000 }),
         );
         assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        assert_eq!(wait["details"]["waited"], json!(1), "{wait}");
+        assert!(
+            wait["details"]["timedOut"].is_null(),
+            "wait must observe the terminal transition, not time out: {wait}"
+        );
+        assert!(
+            wait["details"]["runs"][0]["state"] == json!("complete"),
+            "{wait}"
+        );
         let status_text = std::fs::read_to_string(&status_file).unwrap_or_default();
         assert!(
             status_text.contains("\"complete\""),
@@ -801,6 +831,11 @@ fn e2e_fixed_child_full_pipeline() {
             &json!({ "all": true, "timeoutMs": 30000 }),
         );
         assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        assert_eq!(wait["details"]["waited"], json!(1), "{wait}");
+        assert!(
+            wait["details"]["timedOut"].is_null(),
+            "wait must observe the terminal transition, not time out: {wait}"
+        );
         let messages = take_sent_messages();
         let notify = messages
             .iter()
@@ -877,6 +912,145 @@ fn e2e_fixed_child_full_pipeline() {
         // no parent session the ledger is "no-session" — assert the direct
         // rejection path instead through a second reserve.
         assert!(ledger.reserve_for_test(1, Some(1)).is_err(), "cap enforced");
+        // The run above still spawned a real background child (no parent
+        // session → the in-dispatch ledger check passes). Wait it out so the
+        // final no-residual-children sweep is not racing its exit — before
+        // the wait-unregister fix this was masked by scenarios 11/14 burning
+        // their full 30s timeouts.
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 10000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+    }
+
+    // ---- Scenario 15 (TE11): render dispatch + fleet widget lifecycle ----
+    {
+        let dump = sandbox.dump("te11");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        // Shrink the fleet linger window so the empty-state removal is
+        // observable without a 60 s wait (atomic seam — env updates race
+        // the loop's worker thread).
+        rpi_ext_subagents::fleet::set_linger_for_test(0);
+        take_set_widget_calls();
+
+        // FR-A: the call title renders through the tool render dispatch
+        // (four shapes).
+        let call = rpi_ext_subagents::render_tool_for_test(
+            "toolCall",
+            &json!({"agent": "researcher", "task": "map the module graph", "async": true}),
+            &Value::Null,
+            &Value::Null,
+        );
+        let title = call["children"][0]["props"]["text"].as_str().unwrap();
+        assert!(title.starts_with("subagent · researcher"), "{title}");
+        assert!(title.ends_with("[async]"), "{title}");
+        assert_eq!(call["children"][0]["props"]["bold"], json!(true));
+        assert!(
+            call["children"][1]["props"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("map the module graph"),
+            "{call}"
+        );
+        for shape in [
+            json!({"tasks": [{}, {}, {}]}),
+            json!({"steps": [{}, {}]}),
+            json!({"action": "status"}),
+        ] {
+            let call = rpi_ext_subagents::render_tool_for_test(
+                "toolCall",
+                &shape,
+                &Value::Null,
+                &Value::Null,
+            );
+            let title = call["children"][0]["props"]["text"].as_str().unwrap();
+            assert!(
+                title.starts_with("subagent · ") && title != "subagent · ",
+                "shape renders a title: {title}"
+            );
+        }
+
+        // FR-B: a real foreground result renders the terminal card.
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "te11 card",
+            "async": false,
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let card = rpi_ext_subagents::render_tool_for_test(
+            "toolResult",
+            &Value::Null,
+            &result,
+            &json!({"expanded": false}),
+        );
+        let head = card["children"][0]["props"]["text"].as_str().unwrap();
+        assert!(head.starts_with("✓ scout · Done"), "{head}");
+        assert_eq!(card["children"][0]["props"]["fg"], json!("success"));
+        assert!(
+            card["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line["props"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .starts_with("output: ")),
+            "artifact path line present: {card}"
+        );
+
+        // FR-C: the fleet strip appears for a background run and removes
+        // itself on the empty snapshot (linger window 0 above).
+        let result = execute(json!({
+            "agent": "scout",
+            "task": "te11 fleet",
+            "async": true,
+            "timeoutMs": 30000
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        // First tick lands within ~one refresh period.
+        let mut pushes = Vec::new();
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            pushes = take_set_widget_calls();
+            if pushes.iter().any(|call| !call["content"].is_null()) {
+                break;
+            }
+        }
+        let push = pushes
+            .iter()
+            .find(|call| !call["content"].is_null())
+            .expect("fleet widget pushed with content");
+        assert_eq!(push["key"], json!("subagent-fleet-status"), "{push}");
+        assert_eq!(push["placement"], json!("belowEditor"), "{push}");
+        assert!(
+            push["content"]["children"].is_array(),
+            "Component form: {push}"
+        );
+
+        // With the fixed-child run quickly terminal and linger 0, the loop
+        // removes the widget and exits within a couple of ticks (no
+        // subagent_wait here — by the time we poll the widget the run is
+        // already terminal and wait would have nothing active to wait on).
+        let mut removal = None;
+        let mut all_calls = Vec::new();
+        for _ in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let calls = take_set_widget_calls();
+            all_calls.extend(calls.iter().cloned());
+            if let Some(call) = calls.iter().rev().find(|call| {
+                call["content"].is_null() && call["key"] == json!("subagent-fleet-status")
+            }) {
+                removal = Some(call.clone());
+                break;
+            }
+        }
+        assert!(
+            removal.is_some(),
+            "fleet widget removed on the empty snapshot; calls seen: {all_calls:?}"
+        );
+        rpi_ext_subagents::fleet::set_linger_for_test(u64::MAX);
     }
 
     // Final sweep: nothing left running.

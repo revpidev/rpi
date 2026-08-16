@@ -28,6 +28,7 @@ pub async fn bind_session_actions(
 ) {
     let actions = Arc::new(SessionHostActions {
         session: session.downgrade(),
+        host_handle: tokio::runtime::Handle::current(),
     });
     host.bind_actions(actions).await;
     // `ExtensionContextActions` half (agent-session.ts:2405-2431,
@@ -39,6 +40,15 @@ pub async fn bind_session_actions(
 
 struct SessionHostActions {
     session: WeakAgentSession,
+    /// Host runtime handle captured at bind time. `sendMessage` /
+    /// `sendUserMessage` arrive as SYNCHRONOUS extension-ABI callbacks, so
+    /// the calling thread can be a plugin-owned runtime worker or even a
+    /// bare `std::thread` — `tokio::spawn` there would either land the
+    /// future on the wrong runtime or panic with "there is no reactor
+    /// running" (and that panic crosses the `extern "C"` trampoline, which
+    /// aborts the process). Spawning on this handle keeps the future on
+    /// the host runtime regardless of the caller's thread.
+    host_handle: tokio::runtime::Handle,
 }
 
 impl SessionHostActions {
@@ -56,7 +66,7 @@ impl SessionHostActions {
         let Some(session) = self.session() else {
             return;
         };
-        tokio::spawn(async move {
+        let future = async move {
             if let Err(error) = future.await {
                 session.extension_runner().emit_error(
                     crate::core::extensions::ExtensionErrorInfo {
@@ -66,7 +76,17 @@ impl SessionHostActions {
                     },
                 );
             }
-        });
+        };
+        // Late calls can race host-runtime shutdown at process exit (a
+        // plugin's background runner delivering its final notification):
+        // `Handle::spawn` panics once the runtime is dropped, and this
+        // whole call chain sits under the `extern "C"` ABI trampoline
+        // where a panic aborts. Swallow that shutdown race — there is no
+        // session loop left to receive the report anyway.
+        let handle = self.host_handle.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            handle.spawn(future);
+        }));
     }
 }
 

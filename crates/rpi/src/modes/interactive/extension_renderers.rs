@@ -100,6 +100,11 @@ fn to_render_context(
         expanded: context.expanded,
         show_images: context.show_images,
         is_error: context.is_error,
+        // 0 = never rendered yet; omit so the renderer keeps its fallback.
+        terminal_width: match context.terminal_width {
+            0 => None,
+            width => Some(width as u64),
+        },
     }
 }
 

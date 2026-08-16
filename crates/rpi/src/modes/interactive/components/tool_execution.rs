@@ -169,6 +169,11 @@ pub struct ToolRenderContext {
     pub expanded: bool,
     pub show_images: bool,
     pub is_error: bool,
+    /// Viewport width the component last rendered at (0 before the first
+    /// render). Forwarded to extension renderers so progress bars size to
+    /// the actual terminal instead of a fixed width (rpi extension over
+    /// upstream, which has no width on the context).
+    pub terminal_width: usize,
 }
 
 /// Options passed to `renderResult` (tool-execution.ts:296-298).
@@ -235,6 +240,9 @@ pub struct ToolExecutionComponent {
     converted_images: HashMap<usize, (String, String)>,
     hide_component: bool,
     theme: Arc<Theme>,
+    /// Last render width (`render` is `&self`; interior mutability keeps the
+    /// context's `terminal_width` current without re-borrowing the tree).
+    last_render_width: std::sync::atomic::AtomicUsize,
 }
 
 impl ToolExecutionComponent {
@@ -278,6 +286,7 @@ impl ToolExecutionComponent {
             converted_images: HashMap::new(),
             hide_component: false,
             theme,
+            last_render_width: std::sync::atomic::AtomicUsize::new(0),
         };
 
         // Always create all shell variants (tool-execution.ts:65-76):
@@ -308,6 +317,9 @@ impl ToolExecutionComponent {
             expanded: self.expanded,
             show_images: self.show_images,
             is_error: self.result.as_ref().is_some_and(|r| r.is_error),
+            terminal_width: self
+                .last_render_width
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -594,6 +606,8 @@ impl ToolExecutionComponent {
 
 impl Component for ToolExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        self.last_render_width
+            .store(width, std::sync::atomic::Ordering::Relaxed);
         if self.hide_component {
             return Vec::new();
         }

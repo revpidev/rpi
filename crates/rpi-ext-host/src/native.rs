@@ -88,6 +88,8 @@ struct NativeCallContext {
     /// In-flight `on_update` sinks (ADR-0015); lives as long as the plugin,
     /// shared by every re-entrant host call.
     tool_updates: crate::wasm::PendingToolUpdates,
+    /// In-flight tool abort signals (see `PendingToolAborts`).
+    tool_aborts: crate::wasm::PendingToolAborts,
 }
 
 /// The host-side trampoline handed to plugins as `PluginHostCall`.
@@ -102,6 +104,7 @@ extern "C" fn host_call_trampoline(cookie: PluginCookie, request: RVec<u8>) -> R
         forward: context.forward.clone(),
         in_command: std::cell::Cell::new(with_in_command(|cell| cell.get())),
         tool_updates: context.tool_updates.clone(),
+        tool_aborts: context.tool_aborts.clone(),
     };
     let response = crate::wasm::handle_host_call(&mut state, &request[..]);
     RVec::from(response)
@@ -171,6 +174,7 @@ pub async fn load_native_plugin(
             cookie: 0,
         }),
         tool_updates: crate::wasm::PendingToolUpdates::default(),
+        tool_aborts: crate::wasm::PendingToolAborts::default(),
     });
     let cookie_ptr = &*cookie_box as *const NativeCallContext as PluginCookie;
     let cookie = cookie_ptr as usize;

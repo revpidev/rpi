@@ -442,6 +442,7 @@ async fn w4_tool_render_override_and_inheritance() {
         expanded: false,
         show_images: false,
         is_error: false,
+        terminal_width: 0,
     };
     let component = definition
         .render_call(&json!({}), &theme, &context)

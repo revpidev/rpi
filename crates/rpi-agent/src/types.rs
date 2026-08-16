@@ -68,7 +68,11 @@ pub type AgentToolCall = rpi_ai::types::ToolCall;
 pub struct AgentToolResult {
     /// Text or image content returned to the model.
     pub content: Vec<ToolResultContent>,
-    /// Arbitrary structured details for logs or UI rendering.
+    /// Arbitrary structured details for logs or UI rendering. Optional on
+    /// the wire like upstream (`details` is a plain JS property an
+    /// extension may omit); a missing field deserializes to `null` instead
+    /// of failing the whole tool result.
+    #[serde(default)]
     pub details: Value,
     /// Usage from the final tool execution itself, if available. Not used for
     /// main LLM context accounting.
@@ -384,6 +388,18 @@ mod tests {
             to_json(&result),
             r#"{"content":[{"type":"text","text":"ok"}],"details":{"lines":1},"terminate":false}"#
         );
+    }
+
+    #[test]
+    fn agent_tool_result_without_details_deserializes() {
+        // Extension tool results cross the ABI as plain JSON; upstream's
+        // `details` is an optional JS property, so a plugin omitting it must
+        // not fail the whole tool execution ("missing field `details`").
+        let result: AgentToolResult =
+            serde_json::from_str(r#"{"content":[{"type":"text","text":"ok"}],"isError":false}"#)
+                .expect("details is optional on the wire");
+        assert_eq!(result.details, Value::Null);
+        assert_eq!(result.content.len(), 1);
     }
 
     #[test]

@@ -47,11 +47,21 @@ pub type StreamFrameSink = Arc<dyn Fn(&str, &Value) + Send + Sync>;
 /// `subagent_wait` can show live tool lines.
 pub type StepStatusSink = Arc<dyn Fn(u32, &Value) + Send + Sync>;
 
+/// Cooperative abort probe (extension-ABI abort-channel gap): polls the
+/// host's `ctx.aborted` for the dispatch's toolCallId. The native dispatch
+/// is a synchronous FFI call the runtime cannot cancel — a foreground run
+/// checks this between child events / each activity tick and shuts its
+/// child down when the user aborts the turn.
+pub type AbortProbe = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The activity-timer tick upstream arms whenever `onUpdate` is present
 /// (execution.ts:1009-1019). The derivation engine the timer also feeds is
 /// out of TE09 scope; the tick still pushes a frame so long quiet stretches
 /// keep the durationMs/lastActivityAt projection fresh.
 const ACTIVITY_TICK_MS: u64 = 1000;
+/// Abort-probe cadence for non-streaming foreground waits (the streaming
+/// path piggybacks on the 1s activity tick).
+const ABORT_POLL_MS: u64 = 500;
 
 pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const FINAL_STOP_GRACE_MS: u64 = 1000;
@@ -216,6 +226,10 @@ pub struct ForegroundRunInput {
     /// currentPath into their status document so `subagent_wait` shows live
     /// tool lines. None for plain foreground runs.
     pub step_status: Option<StepStatusSink>,
+    /// Cooperative abort probe (see [`AbortProbe`]): checked on every
+    /// activity tick and between stdout events while waiting for the child.
+    /// None = no abort channel (test fakes, detached async runs).
+    pub abort_probe: Option<AbortProbe>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -452,6 +466,23 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // Ticker-side copies (the stdout task above owns the originals).
     let ticker_meta = stream_meta.clone();
     let ticker_context = context_label.clone();
+    // execution.ts:1009 fires the initial update synchronously when the
+    // line handler is attached — BEFORE any child event can exist. Push it
+    // before spawning the stdout reader: the reader is a separate task, and
+    // under load its first event frame could otherwise land first, making
+    // the "initial frame" arrive after progress already exists.
+    if let Some(sink) = &frame_sink {
+        let (text, details) = {
+            let snapshot = state.lock().unwrap_or_else(|e| e.into_inner());
+            streaming::single_update_details(
+                &snapshot,
+                &ticker_meta,
+                &ticker_context,
+                artifacts::now_millis(),
+            )
+        };
+        sink(&text, &details);
+    }
     let stdout_task = tokio::spawn(async move {
         let Some(mut stdout) = stdout else {
             return;
@@ -619,6 +650,20 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
     // (execution.ts:1009-1019: the interval fires updateActivityState +
     // fireUpdate while onUpdate is attached; the derivation engine feeding
     // activityState is out of scope, the tick itself stays).
+    //
+    // Abort probe (extension-ABI abort-channel gap): on a user abort the
+    // child gets an immediate SIGKILL — upstream user-level aborts surface
+    // through `kill_on_drop`/direct kills, not a signal ladder. The wait
+    // then settles through the normal exit path with `user_aborted` set so
+    // the synthesized error names the abort instead of the signal.
+    let mut user_aborted = false;
+    let kill_child = |user_aborted: &mut bool| {
+        if !*user_aborted {
+            *user_aborted = true;
+            tracing::info!(run = %input.run_id, "subagent run aborted by user; killing child");
+            signal_pid(child_pid, Signal::Kill);
+        }
+    };
     let exit_status = if input.stream_sink.is_some() {
         let ticker_state = state.clone();
         let ticker_sink = input
@@ -630,27 +675,18 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         let mut tick = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await; // intervals fire immediately; upstream waits 1s
-                           // execution.ts:1009: the initial fireUpdate fires as soon as the
-                           // line handler is attached — the first frame must not wait for the
-                           // first 1s tick (a quiet child would otherwise stay invisible for
-                           // up to a second). Snapshot is built under the lock, pushed outside.
-        {
-            let (text, details) = {
-                let snapshot = ticker_state.lock().unwrap_or_else(|e| e.into_inner());
-                streaming::single_update_details(
-                    &snapshot,
-                    &ticker_meta,
-                    &ticker_context,
-                    artifacts::now_millis(),
-                )
-            };
-            ticker_sink(&text, &details);
-        }
+                           // (the initial frame itself already fired before the
+                           // stdout reader was spawned — see above.)
         let mut child_guard = child_handle.lock().await;
         loop {
             tokio::select! {
                 status = child_guard.wait() => break status,
                 _ = tick.tick() => {
+                    if let Some(probe) = &input.abort_probe {
+                        if probe() {
+                            kill_child(&mut user_aborted);
+                        }
+                    }
                     let now_ms = artifacts::now_millis();
                     // Build under the lock, push outside it (same discipline
                     // as the per-event path — no full-state clone).
@@ -669,7 +705,21 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             }
         }
     } else {
-        child_handle.lock().await.wait().await
+        // No streaming sink → no ticker; poll the probe on a plain interval.
+        let mut child_guard = child_handle.lock().await;
+        loop {
+            if let Some(probe) = &input.abort_probe {
+                if probe() {
+                    kill_child(&mut user_aborted);
+                }
+            }
+            tokio::select! {
+                status = child_guard.wait() => break status,
+                _ = tokio::time::sleep(Duration::from_millis(ABORT_POLL_MS)) => {
+                    continue;
+                }
+            }
+        }
     };
     let mut stdout_task = Some(stdout_task);
     let mut stderr_task = Some(stderr_task);
@@ -713,6 +763,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         child_state,
         exit_status,
         timed_out.load(Ordering::SeqCst),
+        user_aborted,
         stream_error_text.as_deref(),
         tool_diagnostic_error.as_deref(),
         raw_tail_text,
@@ -820,6 +871,7 @@ fn synthesize_exit(
     state: ChildRunState,
     exit_status: std::io::Result<std::process::ExitStatus>,
     timed_out: bool,
+    user_aborted: bool,
     stream_error: Option<&str>,
     tool_diagnostic_error: Option<&str>,
     raw_stdout: String,
@@ -850,6 +902,10 @@ fn synthesize_exit(
             "Subagent timed out after {}ms.",
             input.timeout_ms.unwrap_or_default()
         ))
+    } else if user_aborted {
+        // Named before the signal synthesis below: an abort-kill reads as
+        // "aborted by user", not "terminated by signal SIGKILL".
+        Some("Subagent run aborted by user.".to_string())
     } else {
         None
     };

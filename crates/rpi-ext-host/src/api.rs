@@ -1047,6 +1047,13 @@ impl ExtensionRuntime {
 pub struct ExtensionContext {
     runtime: ExtensionRuntime,
     cwd: String,
+    /// The owning extension's identity, when the context is known to belong
+    /// to exactly one extension (`ExtensionApi::context()`; TE11 FR-E.1).
+    /// Namespaces `setWidget` keys via [`crate::bridges::NamespacedUiBridge`]
+    /// so extensions cannot collide on widget keys. Host-level contexts
+    /// (runner-core event dispatch, which serves whichever extension
+    /// registered the handler) stay `None` and keep raw keys.
+    extension_id: Option<String>,
     /// `before_agent_start` chains system-prompt replacements and exposes
     /// the current value through `ctx.getSystemPrompt()`
     /// (runner.ts:1075-1082).
@@ -1058,6 +1065,22 @@ impl ExtensionContext {
         ExtensionContext {
             runtime,
             cwd,
+            extension_id: None,
+            system_prompt_override: None,
+        }
+    }
+
+    /// Context bound to one extension's identity (TE11 FR-E.1): `ui()`
+    /// returns a widget-key-namespaced view of the shared bridge.
+    pub(crate) fn for_extension(
+        runtime: ExtensionRuntime,
+        cwd: String,
+        extension_id: String,
+    ) -> Self {
+        ExtensionContext {
+            runtime,
+            cwd,
+            extension_id: Some(extension_id),
             system_prompt_override: None,
         }
     }
@@ -1071,6 +1094,7 @@ impl ExtensionContext {
         ExtensionContext {
             runtime,
             cwd,
+            extension_id: None,
             system_prompt_override: Some(current),
         }
     }
@@ -1104,13 +1128,22 @@ impl ExtensionContext {
 
     /// `ctx.ui` (runner.ts:669-672). Upstream defaults to `noOpUIContext`
     /// rather than throwing (runner.ts:269), so an unbound slot yields a
-    /// shared [`crate::bridges::NullUiBridge`].
+    /// shared [`crate::bridges::NullUiBridge`]. Extension-bound contexts
+    /// (TE11 FR-E.1) get a [`crate::bridges::NamespacedUiBridge`] view so
+    /// `setWidget` keys cannot collide across extensions.
     pub fn ui(&self) -> Result<Arc<dyn UiBridge>, ExtError> {
         self.runtime.assert_active()?;
-        Ok(self
+        let bridge: Arc<dyn UiBridge> = self
             .runtime
             .ui_bridge()
-            .unwrap_or_else(|| crate::bridges::NullUiBridge::shared()))
+            .unwrap_or_else(|| crate::bridges::NullUiBridge::shared());
+        Ok(match &self.extension_id {
+            Some(namespace) => Arc::new(crate::bridges::NamespacedUiBridge::new(
+                bridge,
+                namespace.clone(),
+            )),
+            None => bridge,
+        })
     }
 
     /// `pi.events` — tracked bus wrapper (6ca423447). Enforces `assertActive`
@@ -1579,6 +1612,30 @@ impl LoadedExtension {
 // Extension API (createExtensionAPI, loader.ts:230-393)
 // ============================================================================
 
+/// The widget-key namespace for an extension path (TE11 FR-E.1): the file
+/// stem of the extension's path, restricted to identifier-safe characters
+/// so the `{namespace}:{key}` form stays a plain, greppable string.
+/// Synthetic paths (`<inline:…>`) collapse to their inner source name.
+fn extension_namespace(extension_path: &str) -> String {
+    let stem = if extension_path.starts_with('<') && extension_path.ends_with('>') {
+        extension_path[1..extension_path.len() - 1]
+            .split(':')
+            .next()
+            .unwrap_or("temporary")
+            .to_owned()
+    } else {
+        std::path::Path::new(extension_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "extension".to_owned())
+    };
+    if stem.is_empty() {
+        "extension".to_owned()
+    } else {
+        stem
+    }
+}
+
 /// The `pi` object handed to extension factories (`ExtensionAPI`,
 /// types.ts:1179-1414). Cheap to clone; clones share the extension
 /// registration maps and the runtime (upstream closes over the same
@@ -1626,9 +1683,14 @@ impl ExtensionApi {
 
     /// The base extension context this API's extension sees
     /// (event-handler contexts come from the runner core,
-    /// runner.ts:665).
+    /// runner.ts:665). Bound to the extension's identity so `ui()` is
+    /// widget-key-namespaced (TE11 FR-E.1).
     pub fn context(&self) -> ExtensionContext {
-        ExtensionContext::new(self.runtime.clone(), self.cwd.clone())
+        ExtensionContext::for_extension(
+            self.runtime.clone(),
+            self.cwd.clone(),
+            extension_namespace(&self.extension.path),
+        )
     }
 
     // -- event subscription (loader.ts:238-243) ------------------------------

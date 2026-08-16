@@ -1044,6 +1044,11 @@ pub(crate) struct InteractiveUi {
     /// Weak self-reference for callbacks that need the `Arc<InteractiveUi>`
     /// (selector onSelect closures, escape double-press actions).
     self_arc: Mutex<Option<std::sync::Weak<InteractiveUi>>>,
+    /// The extension UI bridge installed on the extension host (T15 W4), so
+    /// [`Self::apply_theme`] can ask it to rebuild mounted widgets against
+    /// the new theme (TE11 FR-E.3 theme replay).
+    extension_ui_bridge:
+        Mutex<Option<Arc<super::interactive_mode::ui_bridge::InteractiveUiBridge>>>,
 
     /// The built-in startup header (only when not quiet), for the
     /// tools-expanded linkage (interactive-mode.ts:3812-3824).
@@ -3236,6 +3241,12 @@ impl InteractiveUi {
         *lock(&self.markdown_theme) = markdown;
         self.ui.invalidate();
         self.update_editor_border_color();
+        // Extension widgets bake theme ANSI codes at mount time; rebuild
+        // them from the bridge's archive so they follow the new theme
+        // (TE11 FR-E.3).
+        if let Some(bridge) = lock(&self.extension_ui_bridge).clone() {
+            bridge.retheme_widgets();
+        }
         self.ui.request_render(false);
     }
 
@@ -3765,6 +3776,7 @@ impl InteractiveMode {
             custom_footer: Mutex::new(None),
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
+            extension_ui_bridge: Mutex::new(None),
             built_in_header: Mutex::new(None),
             streaming: Mutex::new(None),
             pending_tools: Mutex::new(HashMap::new()),
@@ -3881,7 +3893,8 @@ impl InteractiveMode {
         );
 
         // `setUIContext(createExtensionUIContext(), "tui")` (T15 W4): the
-        // interactive bridge on the session's extension host.
+        // interactive bridge on the session's extension host. The bridge is
+        // also kept on the UI for the theme-replay callback (TE11 FR-E.3).
         {
             let runner = self.session.extension_runner();
             if let Some(host) = runner
@@ -3891,12 +3904,9 @@ impl InteractiveMode {
                 })
                 .map(|adapter| adapter.host().clone())
             {
-                host.set_ui(
-                    Some(Arc::new(ui_bridge::InteractiveUiBridge::new(
-                        &self.ui_state,
-                    ))),
-                    rpi_ext_host::types::ExtensionMode::Tui,
-                );
+                let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&self.ui_state));
+                *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
+                host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
             }
         }
 
@@ -7306,6 +7316,62 @@ mod tests {
         assert!(!bridge.get_tools_expanded());
         bridge.set_tools_expanded(true);
         assert!(bridge.get_tools_expanded());
+        mode.shutdown().await;
+    }
+
+    /// TE11 FR-E.3: theme replay — a mounted Component widget bakes the
+    /// current theme's ANSI codes at mount time, so `apply_theme` must
+    /// rebuild it from the bridge's archive; a removed widget stays
+    /// removed.
+    #[tokio::test]
+    async fn te11_widget_theme_replay_rebuilds_on_apply_theme() {
+        use rpi_ext_host::api::{UiBridge, WidgetContent};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        // The harness session carries no extension host, so init never took
+        // the set_ui branch — register the bridge the way that branch does
+        // (the replay contract under test is "the stored bridge is
+        // replayed", which is what apply_theme depends on).
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        *lock(&mode.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
+        let ui = &mode.ui_state;
+        let render_widgets = |ui: &Arc<InteractiveUi>| {
+            lock(&ui.widgets_above)
+                .children
+                .iter()
+                .flat_map(|c| c.render(80))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let tree = serde_json::json!({
+            "type": "text",
+            "props": {"text": "THEME-REPLAY", "fg": "accent"},
+        });
+        bridge.set_widget("k", Some(WidgetContent::Component(tree)), None);
+        let dark = render_widgets(ui);
+        assert!(
+            rpi_test_support::vt::strip_ansi(&dark).contains("THEME-REPLAY"),
+            "{dark:?}"
+        );
+
+        // Switch theme: the archived push is replayed against the new
+        // palette (dark accent ≠ light accent → the rendered bytes change).
+        let light = crate::core::themes::load_theme("light", None).unwrap();
+        ui.apply_theme(Arc::new(light));
+        let replayed = render_widgets(ui);
+        assert!(
+            rpi_test_support::vt::strip_ansi(&replayed).contains("THEME-REPLAY"),
+            "text survives the replay: {replayed:?}"
+        );
+        assert_ne!(dark, replayed, "widget rebuilt with the new theme");
+
+        // Removal clears the archive: a later theme switch re-mounts
+        // nothing.
+        bridge.set_widget("k", None, None);
+        let dark_theme = crate::core::themes::load_theme("dark", None).unwrap();
+        ui.apply_theme(Arc::new(dark_theme));
+        assert!(lock(&ui.widgets_above).children.is_empty());
         mode.shutdown().await;
     }
 

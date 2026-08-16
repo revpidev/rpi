@@ -793,7 +793,10 @@ pub type ComponentTree = Value;
 /// - `text`: `props.text` (string, required); style props `fg` / `bg`
 ///   (theme color names, e.g. `"accent"`, `"muted"`, `"border"`, or
 ///   `"#rrggbb"`), `bold` / `italic` / `underline` / `dim` (booleans);
-///   `paddingX` / `paddingY` (uint, default 0).
+///   `paddingX` / `paddingY` (uint, default 0); `truncate` (bool, default
+///   false — TE11 FR-E.2 additive: clip oversized lines to the render
+///   width, ANSI-preserving with `...`, instead of word-wrapping; a
+///   truncating text renders as a single line).
 /// - `spacer`: `props.lines` (uint, default 1).
 /// - `box`: bordered container; props `paddingX` / `paddingY`, `borderColor`
 ///   (theme color name); `children` stacked vertically.
@@ -812,6 +815,7 @@ pub const COMPONENT_TREE_SCHEMA_V1: &str = r#"{
       "fg": "theme color name | #rrggbb (text)",
       "bg": "theme color name | #rrggbb (text)",
       "bold|italic|underline|dim": "bool (text)",
+      "truncate": "bool (text, default false — clip to render width instead of wrapping)",
       "paddingX|paddingY": "uint (text/box)",
       "lines": "uint (spacer, default 1)",
       "borderColor": "theme color name (box)"
@@ -835,6 +839,12 @@ pub struct ToolRenderContext {
     pub expanded: bool,
     pub show_images: bool,
     pub is_error: bool,
+    /// Viewport width in terminal columns (rpi extension over upstream's
+    /// types.ts:413-438, which carries no width): lets renderers size bars
+    /// and columns to the actual terminal instead of a fixed assumption.
+    /// Omitted on the wire when unknown (the renderer falls back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_width: Option<u64>,
 }
 
 /// `renderCall` placeholder (types.ts:483): returns a declarative

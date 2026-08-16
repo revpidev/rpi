@@ -262,6 +262,20 @@ pub fn handle_management_action_with(
                 };
                 match crate::runner::background::find_run(&id) {
                     Some(handle) => {
+                        // Terminal runs stay registered (wait/status read
+                        // them); stopping one is a no-op — report its final
+                        // state instead of the misleading "Stop requested".
+                        let snapshot = crate::runner::background::status_snapshot(&handle);
+                        let state = snapshot["state"].as_str().unwrap_or_default();
+                        if matches!(
+                            state,
+                            "complete" | "failed" | "stopped" | "paused" | "rejected"
+                        ) {
+                            return ToolOutcome::text(format!(
+                                "Background run {} already reached a terminal state: {state}.",
+                                handle.run_id
+                            ));
+                        }
                         handle.control.request_stop();
                         crate::runner::foreground::request_stop_for_run(&handle.run_id);
                         let run_dir = handle.run_dir.clone();
@@ -278,6 +292,7 @@ pub fn handle_management_action_with(
                                 Some(handle.run_id.as_str()),
                                 false,
                                 15_000,
+                                None,
                                 None,
                             )
                             .await

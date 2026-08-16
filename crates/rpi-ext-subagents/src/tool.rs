@@ -301,6 +301,11 @@ fn execute_subagent_tool_inner(
     // composite paths decide per shape below (single/chain stream, parallel
     // does not — upstream wraps only those).
     ctx.frame_sink = tool_call_id.and_then(|id| host.tool_update_sink(id));
+    // Abort-channel probe for the same dispatch: foreground runs poll it
+    // between child events and tear their child down on a user abort.
+    // Async paths clear it (clone_ctx_for_async) — background runs outlive
+    // the dispatch that spawned them and must not die with its turn.
+    ctx.abort_probe = tool_call_id.and_then(|id| host.abort_probe(id));
     let agents = match ctx.discover(scope) {
         Ok(agents) => agents,
         Err(error) => return ToolOutcome::error(error),
@@ -765,6 +770,12 @@ fn dispatch_async(
     };
 
     let handle = crate::runner::background::start_run(&ctx.run_id, session_id.as_deref(), &body);
+    // TE11 FR-C: the fleet strip's 0→1 boundary — spawn the singleton
+    // refresh loop right after the first run registers (no-op while one is
+    // alive; it exits on the empty snapshot and respawns here).
+    if let Some(calls) = host.async_calls() {
+        crate::fleet::ensure_refresh_loop(runtime, calls);
+    }
     let notify = crate::runner::background::AsyncNotify {
         calls: host.async_calls(),
     };
@@ -791,11 +802,13 @@ fn dispatch_async(
     }
 }
 
-/// `RunCtx` clone for the driver task. The streaming seam is dispatch-owned
-/// (it dies with the toolExecute call); the async run never frames.
+/// `RunCtx` clone for the driver task. The streaming seam and the abort
+/// probe are dispatch-owned (they die with the toolExecute call); the async
+/// run never frames and must not die with the dispatching turn.
 fn clone_ctx_for_async(ctx: &crate::p1::launch_child::RunCtx) -> crate::p1::launch_child::RunCtx {
     let mut clone = ctx.clone();
     clone.frame_sink = None;
+    clone.abort_probe = None;
     clone
 }
 

@@ -82,6 +82,7 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.mode"
         | "ctx.hasUI"
         | "ctx.abort"
+        | "ctx.aborted"
         | "ctx.shutdown"
         | "ctx.compact"
         | "ctx.scopedModels"
@@ -169,6 +170,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let forward_exec = state.forward.clone();
             let tool_name = name.clone();
             let execute_updates = state.tool_updates.clone();
+            let execute_aborts = state.tool_aborts.clone();
             let render_call = state.forward.clone();
             let render_result = state.forward.clone();
             let has_render_call = definition
@@ -207,6 +209,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                         let forward = forward_exec.clone();
                         let tool_name = tool_name.clone();
                         let tool_updates = execute_updates.clone();
+                        let tool_aborts = execute_aborts.clone();
                         Box::pin(async move {
                             let tool_call_id = request.tool_call_id.clone();
                             // ADR-0015: stash the agent's on_update sink so
@@ -223,6 +226,16 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                     .unwrap_or_else(|e| e.into_inner())
                                     .insert(tool_call_id.clone(), sink);
                             }
+                            // Abort-channel gap: the native dispatch below is
+                            // a synchronous FFI call the runtime cannot cancel,
+                            // so expose the execution's CancellationToken to
+                            // the plugin (`ctx.aborted`) for the dispatch
+                            // duration. A blocking tool polls it and returns
+                            // promptly on a user abort.
+                            tool_aborts
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(tool_call_id.clone(), request.signal.clone());
                             let result = forward
                                 .dispatch(
                                     json!({
@@ -234,6 +247,10 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                     false,
                                 )
                                 .await;
+                            tool_aborts
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&tool_call_id);
                             tool_updates
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -346,6 +363,26 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 }
             }
             Ok(Value::Null)
+        }
+
+        // Abort-channel query (see PendingToolAborts): is the in-flight
+        // toolExecute for this toolCallId cancelled? Unknown ids answer
+        // false — a late poll after the dispatch returned is not an abort.
+        "ctx.aborted" => {
+            let tool_call_id = str_arg(&args, "toolCallId").ok_or_else(|| {
+                (
+                    "invalidRequest",
+                    "ctx.aborted: missing toolCallId".to_owned(),
+                )
+            })?;
+            let cancelled = state
+                .tool_aborts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(tool_call_id)
+                .map(|token| token.is_cancelled())
+                .unwrap_or(false);
+            Ok(json!(cancelled))
         }
 
         "registerCommand" => {

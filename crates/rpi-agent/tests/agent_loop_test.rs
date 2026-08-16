@@ -629,6 +629,92 @@ async fn handles_tool_calls_and_results() {
 }
 
 #[tokio::test]
+async fn partial_update_reaches_stream_before_execute_returns() {
+    // Live-progress regression: upstream `onUpdate` emits synchronously
+    // (agent-loop.ts:1301-1302), so a partial frame enters the event stream
+    // WHILE the tool executes. Parking the sink future in the settle list
+    // until `execute` returns batched every frame of a long tool call into
+    // one post-execute avalanche — the UI never showed live progress. The
+    // stream sink is a synchronous enqueue and must complete on the first
+    // poll inside `on_update`.
+    let tool_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let streaming_tool = TestTool::new(
+        "streaming_tool",
+        Arc::new({
+            let tool_finished = tool_finished.clone();
+            let release = release.clone();
+            move |_params, on_update| {
+                let tool_finished = tool_finished.clone();
+                let release = release.clone();
+                Box::pin(async move {
+                    if let Some(on_update) = &on_update {
+                        on_update(AgentToolResult {
+                            content: vec![ToolResultContent::Text(TextContent {
+                                text: "partial frame".to_owned(),
+                                text_signature: None,
+                            })],
+                            details: json!({ "frame": 1 }),
+                            ..Default::default()
+                        });
+                    }
+                    // Hold execution open until the test observed the frame.
+                    release.notified().await;
+                    tool_finished.store(true, Ordering::SeqCst);
+                    ok_result("done".to_owned())
+                })
+            }
+        }),
+    );
+
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(streaming_tool)]),
+    };
+    let (stream_fn, _state) = mock_stream_fn(vec![
+        assistant_message(
+            vec![tool_call("tool-1", "streaming_tool", json!({ "value": "x" }))],
+            StopReason::ToolUse,
+        ),
+        text_assistant("done"),
+    ]);
+    let mut stream = agent_loop(
+        vec![user_message("run the tool")],
+        context,
+        test_config(),
+        None,
+        stream_fn,
+    );
+
+    // The partial frame must arrive while execute is still parked on
+    // `release` — if the emission were deferred to the settle list, this
+    // timeout would expire without any ToolExecutionUpdate.
+    let saw_update = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event, AgentEvent::ToolExecutionUpdate { .. }) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        saw_update,
+        "partial frame must reach the stream before execute returns"
+    );
+    assert!(
+        !tool_finished.load(std::sync::atomic::Ordering::SeqCst),
+        "the tool is still executing when the frame is observed"
+    );
+
+    // Let the run finish (drives the stream to completion).
+    release.notify_one();
+    let (_events, _messages) = collect(stream).await;
+}
+
+#[tokio::test]
 async fn does_not_execute_tool_calls_from_length_truncated_message() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let tool = echo_tool(executed.clone());

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
+use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::tui::Component;
 use serde_json::Value;
 
@@ -26,6 +27,17 @@ pub fn component_from_tree(tree: &Value, theme: &Arc<Theme>) -> Box<dyn Componen
     let node_type = tree.get("type").and_then(Value::as_str).unwrap_or("");
     let props = tree.get("props").cloned().unwrap_or(Value::Null);
     match node_type {
+        // `truncate` (TE11 FR-E.2): clip oversized lines to the render width
+        // (ANSI-preserving, `...` ellipsis) instead of word-wrapping — the
+        // fleet rows and single-line title rows must stay one visual line at
+        // any terminal width, and the extension has no width knowledge of
+        // its own to pre-clip with. Multi-line text truncates to its first
+        // line (single-line component semantics).
+        "text" if bool_prop(&props, "truncate") => Box::new(TruncatedText::new(
+            styled_text(&props, theme),
+            usize_prop(&props, "paddingX"),
+            usize_prop(&props, "paddingY"),
+        )),
         "text" => Box::new(Text::new(
             styled_text(&props, theme),
             usize_prop(&props, "paddingX"),
@@ -89,6 +101,10 @@ fn usize_prop(props: &Value, key: &str) -> usize {
     props.get(key).and_then(Value::as_u64).unwrap_or(0).min(64) as usize
 }
 
+fn bool_prop(props: &Value, key: &str) -> bool {
+    props.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 /// Text styling: `fg` via the theme (color names only in v1), then
 /// bold/italic/underline/dim markers.
 fn styled_text(props: &Value, theme: &Arc<Theme>) -> String {
@@ -123,4 +139,41 @@ fn styled_text(props: &Value, theme: &Arc<Theme>) -> String {
         text = Theme::underline(&text);
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpi_tui::utils::visible_width;
+
+    #[test]
+    fn truncate_prop_clips_instead_of_wrapping() {
+        let theme = Arc::new(crate::core::themes::load_theme("dark", None).unwrap());
+        let long = "a".repeat(120);
+        let truncating = serde_json::json!({
+            "type": "text",
+            "props": {"text": long.clone(), "truncate": true},
+        });
+        let wrapping = serde_json::json!({
+            "type": "text",
+            "props": {"text": long},
+        });
+        let width = 40;
+        let truncated = component_from_tree(&truncating, &theme).render(width);
+        assert_eq!(
+            truncated.len(),
+            1,
+            "truncate renders exactly one line at any text length"
+        );
+        assert!(
+            truncated[0].contains("..."),
+            "truncation is visible (ellipsis)"
+        );
+        let wrapped = component_from_tree(&wrapping, &theme).render(width);
+        assert!(
+            wrapped.len() > 1,
+            "without the prop the default stays word-wrap"
+        );
+        assert_eq!(visible_width(&truncated[0]), width);
+    }
 }

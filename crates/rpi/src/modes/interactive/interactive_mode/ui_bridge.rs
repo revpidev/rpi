@@ -77,6 +77,11 @@ pub struct InteractiveUiBridge {
     ui: Weak<InteractiveUi>,
     /// Widget key → (below_editor, child address) for identity removal.
     widgets: Mutex<HashMap<String, (bool, usize)>>,
+    /// Widget key → last pushed (content, options) — the replay source for
+    /// theme changes (TE11 FR-E.3): pushed widget components bake the
+    /// current theme's ANSI codes into their text, so a theme swap has to
+    /// rebuild them from the archived trees.
+    widget_archive: Mutex<HashMap<String, (WidgetContent, Option<ExtensionWidgetOptions>)>>,
     editor_component: Mutex<Option<ComponentTree>>,
     working_indicator: Mutex<Option<WorkingIndicatorOptions>>,
     next_input_listener: AtomicU64,
@@ -87,6 +92,7 @@ impl InteractiveUiBridge {
         InteractiveUiBridge {
             ui: Arc::downgrade(ui),
             widgets: Mutex::new(HashMap::new()),
+            widget_archive: Mutex::new(HashMap::new()),
             editor_component: Mutex::new(None),
             working_indicator: Mutex::new(None),
             next_input_listener: AtomicU64::new(0),
@@ -127,6 +133,82 @@ impl InteractiveUiBridge {
             ui.hide_selector();
         }
         result
+    }
+
+    /// Build the component for a widget content against the CURRENT theme
+    /// and mount it into its placement container, replacing any existing
+    /// entry under the same key.
+    fn mount_widget(
+        &self,
+        ui: &Arc<InteractiveUi>,
+        key: &str,
+        content: Option<&WidgetContent>,
+        options: Option<&ExtensionWidgetOptions>,
+    ) {
+        // Remove any existing entry first.
+        if let Some((below, address)) = lock(&self.widgets).remove(key) {
+            let container = if below {
+                &ui.widgets_below
+            } else {
+                &ui.widgets_above
+            };
+            super::remove_child_by_address(&mut lock(container), address);
+        }
+        let Some(content) = content else {
+            ui.render_handle.request_render();
+            return;
+        };
+        let component: Box<dyn Component> = match content {
+            WidgetContent::Lines(lines) => {
+                let mut column = rpi_tui::components::r#box::Box::new(0, 0, None);
+                for line in lines {
+                    column.add_child(Box::new(rpi_tui::components::text::Text::new(
+                        line.clone(),
+                        0,
+                        0,
+                        None,
+                    )));
+                }
+                Box::new(column)
+            }
+            WidgetContent::Component(tree) => {
+                component_from_tree(tree, &Arc::clone(&lock(&ui.theme)))
+            }
+        };
+        let below = matches!(
+            options.and_then(|o| o.placement),
+            Some(WidgetPlacement::BelowEditor)
+        );
+        let container = if below {
+            &ui.widgets_below
+        } else {
+            &ui.widgets_above
+        };
+        let mut container = lock(container);
+        container.add_child(component);
+        let address = super::child_address(&**container.children.last().expect("just pushed"));
+        drop(container);
+        lock(&self.widgets).insert(key.to_owned(), (below, address));
+        ui.render_handle.request_render();
+    }
+
+    /// Rebuild every mounted widget against the current theme (TE11
+    /// FR-E.3). Widget components bake theme ANSI codes into their text at
+    /// mount time, so a theme switch leaves them stale; replaying the
+    /// archived pushes rebuilds them without the extensions' involvement.
+    /// Called from [`crate::modes::interactive::InteractiveUi::apply_theme`].
+    pub(crate) fn retheme_widgets(&self) {
+        let Some(ui) = self.ui() else {
+            return;
+        };
+        let archived: Vec<(String, WidgetContent, Option<ExtensionWidgetOptions>)> =
+            lock(&self.widget_archive)
+                .iter()
+                .map(|(key, (content, options))| (key.clone(), content.clone(), *options))
+                .collect();
+        for (key, content, options) in archived {
+            self.mount_widget(&ui, &key, Some(&content), options.as_ref());
+        }
     }
 }
 
@@ -350,48 +432,18 @@ impl UiBridge for InteractiveUiBridge {
         let Some(ui) = self.ui() else {
             return;
         };
-        // Remove any existing entry first.
-        if let Some((below, address)) = lock(&self.widgets).remove(key) {
-            let container = if below {
-                &ui.widgets_below
-            } else {
-                &ui.widgets_above
-            };
-            super::remove_child_by_address(&mut lock(container), address);
+        self.mount_widget(&ui, key, content.as_ref(), options.as_ref());
+        // Archive the push (or forget the removal) for theme replay
+        // (TE11 FR-E.3).
+        let mut archive = lock(&self.widget_archive);
+        match content {
+            Some(content) => {
+                archive.insert(key.to_owned(), (content, options));
+            }
+            None => {
+                archive.remove(key);
+            }
         }
-        let Some(content) = content else {
-            ui.render_handle.request_render();
-            return;
-        };
-        let component: Box<dyn Component> = match content {
-            WidgetContent::Lines(lines) => {
-                let mut column = rpi_tui::components::r#box::Box::new(0, 0, None);
-                for line in lines {
-                    column.add_child(Box::new(rpi_tui::components::text::Text::new(
-                        line, 0, 0, None,
-                    )));
-                }
-                Box::new(column)
-            }
-            WidgetContent::Component(tree) => {
-                component_from_tree(&tree, &Arc::clone(&lock(&ui.theme)))
-            }
-        };
-        let below = matches!(
-            options.and_then(|o| o.placement),
-            Some(WidgetPlacement::BelowEditor)
-        );
-        let container = if below {
-            &ui.widgets_below
-        } else {
-            &ui.widgets_above
-        };
-        let mut container = lock(container);
-        container.add_child(component);
-        let address = super::child_address(&**container.children.last().expect("just pushed"));
-        drop(container);
-        lock(&self.widgets).insert(key.to_owned(), (below, address));
-        ui.render_handle.request_render();
     }
 
     /// `setFooter` — declarative tree replaces the built-in footer region;

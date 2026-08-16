@@ -128,10 +128,24 @@ pub enum DispatchTarget {
 
 impl DispatchTarget {
     /// `rpi_dispatch`-equivalent round trip (serial per extension).
+    ///
+    /// Native dispatches run on the blocking pool: plugin tools may block
+    /// for minutes inside their own runtime (`subagent_wait` polls up to
+    /// its timeoutMs; foreground runs drive whole child processes) — doing
+    /// that inline would pin a runtime worker for the duration, starving
+    /// the TUI and anything else on the runtime. The blocking pool takes
+    /// the hit instead. Concurrency discipline is unchanged from the
+    /// previous inline call: the agent's tool batches already determined
+    /// how many dispatches could be in flight.
     pub async fn dispatch(&self, message: Value, command_context: bool) -> Result<Value, String> {
         match self {
             DispatchTarget::Wasm(forward) => forward.dispatch(message, command_context).await,
-            DispatchTarget::Native(forward) => forward.dispatch(message, command_context),
+            DispatchTarget::Native(forward) => {
+                let forward = forward.clone();
+                tokio::task::spawn_blocking(move || forward.dispatch(message, command_context))
+                    .await
+                    .map_err(|e| format!("native dispatch task failed: {e}"))?
+            }
         }
     }
 
@@ -344,6 +358,18 @@ pub(crate) type PendingToolUpdates = std::sync::Arc<
     >,
 >;
 
+/// In-flight tool execution `CancellationToken`s (the abort-channel gap in
+/// the extension ABI): the execute closure stashes `toolCallId → signal`
+/// for the duration of its `toolExecute` dispatch, so a plugin whose tool
+/// blocks for minutes (`subagent_wait`, child-process drivers) can poll
+/// `ctx.aborted` and return promptly when the user aborts the turn. The
+/// native dispatch is a synchronous FFI call the runtime cannot cancel —
+/// this table is the cooperative substitute. Same lifetime as
+/// [`PendingToolUpdates`]: removed when the dispatch returns.
+pub(crate) type PendingToolAborts = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
+>;
+
 /// State shared with the `rpi_host_call` import closure.
 pub struct HostState {
     pub api: ExtensionApi,
@@ -358,6 +384,8 @@ pub struct HostState {
     /// guest Store (wasm) / plugin call context (native) — shared by the
     /// execute closures this extension registers.
     pub tool_updates: PendingToolUpdates,
+    /// Per-extension in-flight abort signals (see [`PendingToolAborts`]).
+    pub tool_aborts: PendingToolAborts,
 }
 
 /// The `rpi_host_call` response envelopes.
@@ -436,6 +464,7 @@ pub async fn instantiate_and_init(
                 forward,
                 in_command: std::cell::Cell::new(false),
                 tool_updates: PendingToolUpdates::default(),
+                tool_aborts: PendingToolAborts::default(),
             },
         );
         let mut linker = wasmtime::Linker::new(store.engine());

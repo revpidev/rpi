@@ -112,6 +112,14 @@ unicode-segmentation = "1"      # grapheme clusters
 # default-features = false: only the parser/AST are used, no HTML rendering.
 comrak = { version = "0.54", default-features = false }
 
+# Dev/test slimming (2026-08-15): line-tables-only keeps line numbers in
+# backtraces but drops variable-level DWARF. `cargo test` inherits this
+# profile, so the many per-target test binaries drop from ~700 MB to ~1/4.
+# Need full debug info for a one-off debugging session? Override per-run:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo test ...
+[profile.dev]
+debug = "line-tables-only"
+
 # Single self-contained binary target (coding-standards §15.4).
 # No panic = "abort": the TUI relies on a panic hook to restore terminal state.
 [profile.release]
