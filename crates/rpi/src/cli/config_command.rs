@@ -186,6 +186,7 @@ fn prepare_config(
             settings_manager: manager,
             runner: runner.clone(),
             offline: None,
+            registry: None,
         })
         .resolve_all(None)
     };

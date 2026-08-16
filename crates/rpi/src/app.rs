@@ -775,6 +775,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                 settings_manager,
                 runner: None,
                 offline: None,
+                registry: None,
             },
         )
         .resolve(None)

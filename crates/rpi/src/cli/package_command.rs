@@ -34,8 +34,10 @@ use crate::core::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput, DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
 };
 use crate::core::package_manager::{
-    ConfiguredPackage, DefaultPackageManager, PackageCommandRunner, SystemPackageCommandRunner,
+    ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
+    SystemPackageCommandRunner,
 };
+use crate::core::extension_registry::ExtensionInstallInfo;
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::skills::SourceScope;
@@ -55,7 +57,7 @@ use std::sync::Arc;
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
 pub const UPDATE_USAGE: &str =
-    "rpi update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force]";
+    "rpi update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force] [--yes]";
 
 /// `UpdateTarget` (package-manager-cli.ts:35).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,10 @@ pub struct ParsedUpdate {
     /// `--force` — reinstall rpi even when the current version is latest
     /// (self target only; inert for the models target, see module docs).
     pub force: bool,
+    /// `--yes` — rpi-specific (extension-distribution design §7.2 step 5):
+    /// skip the native-extension confirmation prompt on registry/`github:`
+    /// updates.
+    pub yes: bool,
     /// `-a`/`--approve` / `-na`/`--no-approve`.
     pub project_trust_override: Option<bool>,
     /// Bare `rpi update` prints the extensions-skipped note
@@ -122,6 +128,10 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             // Only consumed by the self target (the models refresh always
             // forces; see module docs).
             parsed.force = true;
+        } else if arg == "--yes" {
+            // Rpi-specific: consumed by registry/`github:` extension
+            // updates (the L0 confirmation gate).
+            parsed.yes = true;
         } else if arg == "--extension" {
             let value = rest.get(index + 1);
             match value {
@@ -241,6 +251,8 @@ Options:
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
   --force                 Reinstall pi even if the current version is latest
+  --yes                   Skip the native (L0) extension confirmation prompt
+                          (registry/github: extension installs and updates)
 
 Short forms:
   {APP_NAME} update                Update pi only
@@ -488,11 +500,43 @@ pub fn print_self_update_note(note: &str) {
     println!();
 }
 
+/// Rpi-specific (extension-distribution design §7.2 step 5): interactive
+/// confirmation for a native (L0) extension install/update. The default
+/// answer is no — only an explicit `y`/`yes` confirms (same convention as
+/// the self-uninstall data-dir prompt).
+fn confirm_native_extension_install(info: &ExtensionInstallInfo) -> bool {
+    use std::io::Write;
+    print!(
+        "Install native extension \"{}\" {} (no sandbox, full OS permissions)? [y/N] ",
+        info.name, info.version
+    );
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
+    }
+}
+
+/// Rpi-specific: the install-confirmation callback for package commands.
+/// `--yes` auto-confirms (scripts); an interactive terminal prompts; a
+/// non-interactive run without `--yes` gets `None`, which refuses native
+/// extension installs (design §7.2 step 5).
+fn build_install_confirm(yes: bool) -> Option<InstallConfirmCallback> {
+    use std::io::IsTerminal;
+    if yes {
+        Some(Box::new(|_| true))
+    } else if std::io::stdin().is_terminal() {
+        Some(Box::new(confirm_native_extension_install))
+    } else {
+        None
+    }
+}
+
 /// `handlePackageCommand` for `rpi update` (package-manager-cli.ts:702-735
 /// and the update branch at :818-879). Returns the process exit code.
 /// `args[0]` must be `"update"`.
-pub async fn run_update(args: &[String]) -> i32 {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+pub async fn run_update(args: &[String]) -> i32 {    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let agent_dir = crate::config::get_agent_dir();
     run_update_in(args, &cwd, &agent_dir, None, None, None).await
 }
@@ -608,6 +652,7 @@ pub async fn run_update_in(
                 settings_manager,
                 runner: Some(runner.clone()),
                 offline: None,
+                registry: None,
             },
         );
         manager.set_progress_callback(Some(Box::new(|event| {
@@ -619,6 +664,7 @@ pub async fn run_update_in(
                 }
             }
         })));
+        manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
         if let Err(message) = manager.update(update_source.as_deref()) {
             eprintln!("Error: {message}");
             return 1;
@@ -765,8 +811,9 @@ pub fn run_self_uninstall(args: &[String]) -> i32 {
 // 189-316 non-update branches, 676-816)
 // ---------------------------------------------------------------------------
 
-/// `getPackageCommandUsage("install")` (package-manager-cli.ts:81-82).
-pub const INSTALL_USAGE: &str = "rpi install <source> [-l] [--approve|--no-approve]";
+/// `getPackageCommandUsage("install")` (package-manager-cli.ts:81-82);
+/// `--yes` is rpi-specific (extension-distribution design §7.2 step 5).
+pub const INSTALL_USAGE: &str = "rpi install <source> [-l] [--yes] [--approve|--no-approve]";
 /// `getPackageCommandUsage("remove")` (package-manager-cli.ts:83-84).
 pub const REMOVE_USAGE: &str = "rpi remove <source> [-l] [--approve|--no-approve]";
 /// `getPackageCommandUsage("list")` (package-manager-cli.ts:87-88).
@@ -809,6 +856,9 @@ pub struct ParsedPackageCommand {
     pub source: Option<String>,
     pub local: bool,
     pub project_trust_override: Option<bool>,
+    /// `--yes` — rpi-specific (install only): skip the native-extension
+    /// confirmation prompt.
+    pub yes: bool,
     pub help: bool,
     pub invalid_option: Option<String>,
     pub invalid_argument: Option<String>,
@@ -837,6 +887,7 @@ pub fn parse_package_command(args: &[String]) -> Option<ParsedPackageCommand> {
         source: None,
         local: false,
         project_trust_override: None,
+        yes: false,
         help: false,
         invalid_option: None,
         invalid_argument: None,
@@ -853,6 +904,14 @@ pub fn parse_package_command(args: &[String]) -> Option<ParsedPackageCommand> {
             // Valid for install/remove only (package-manager-cli.ts:223-230).
             if command != PackageCommandKind::List {
                 local = true;
+            } else {
+                parsed.invalid_option.get_or_insert_with(|| arg.clone());
+            }
+        } else if arg == "--yes" {
+            // Rpi-specific, valid for install only (the L0 confirmation
+            // gate; extension-distribution design §7.2 step 5).
+            if command == PackageCommandKind::Install {
+                parsed.yes = true;
             } else {
                 parsed.invalid_option.get_or_insert_with(|| arg.clone());
             }
@@ -899,12 +958,25 @@ pub fn package_command_help(command: PackageCommandKind) -> String {
 
 Install a package and add it to settings.
 
+Sources:
+  <name>[@<range>]        rpi registry extension (range: *, 1.2.3, ^1.2, ~1.2)
+  github:<owner>/<repo>[@<tag>]
+                          GitHub Release artifact directly (tag: v1.2.3);
+                          integrity is checked against the release's own
+                          .sha256 sidecar, not the registry index
+  npm:<spec> / git:<url> / https://... / ssh://... / ./local/path
+                          upstream package sources
+
 Options:
   -l, --local       Install project-locally ({config_dir}/settings.json)
+  --yes             Skip the native (L0) extension confirmation prompt
   -a, --approve     Trust project-local files for this command
   -na, --no-approve Ignore project-local files for this command
 
 Examples:
+  {APP_NAME} install subagents
+  {APP_NAME} install subagents@^0.2
+  {APP_NAME} install github:revpidev/rpi-subagents
   {APP_NAME} install npm:@foo/bar
   {APP_NAME} install git:github.com/user/repo
   {APP_NAME} install git:git@github.com:user/repo
@@ -1162,6 +1234,7 @@ pub fn run_package_command_in(
             settings_manager,
             runner,
             offline: None,
+            registry: None,
         });
     manager.set_progress_callback(Some(Box::new(|event| {
         // Upstream prints `start` messages dim to stdout
@@ -1172,6 +1245,7 @@ pub fn run_package_command_in(
             }
         }
     })));
+    manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
 
     execute_package_command(parsed, &mut manager)
 }

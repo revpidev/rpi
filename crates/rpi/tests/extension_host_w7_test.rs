@@ -99,6 +99,7 @@ fn resolve_extensions(cwd: &Path, agent_dir: &Path) -> Vec<(PathBuf, bool)> {
             settings_manager,
             runner: None,
             offline: None,
+            registry: None,
         },
     )
     .resolve(None)

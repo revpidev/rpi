@@ -485,6 +485,16 @@ pub const ENV_TELEMETRY_URL: &str = "RPI_TELEMETRY_URL";
 /// [`crate::core::remote_catalog_provider`]).
 pub const ENV_MODEL_CATALOG_URL: &str = "RPI_MODEL_CATALOG_URL";
 
+/// Rpi-specific (extension-distribution design §7.2): default extension
+/// registry base URL; the index endpoint is
+/// `<base>/api/extensions/<name>.json` and the download mirror is
+/// `<base>/extensions/download/<owner>/<repo>/<tag>/<file>`.
+pub const DEFAULT_REGISTRY_URL: &str = "https://revpi.dev";
+/// Rpi-specific (extension-distribution design §7.2): override for the
+/// extension registry base URL (mirror or test injection; `"off"` disables
+/// the registry channel entirely via [`resolve_endpoint`]).
+pub const ENV_REGISTRY_URL: &str = "RPI_REGISTRY_URL";
+
 /// Endpoint resolution shared by all three product endpoints: a non-empty
 /// env value wins over a non-empty settings value, which wins over the
 /// default (empty strings fall through, JS `||` semantics); the literal

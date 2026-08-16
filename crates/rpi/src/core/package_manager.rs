@@ -43,6 +43,13 @@
 //!   `skills.rs` instead of the `glob` package's `globSync`.
 //! - The managed npm root sentinel `package.json` keeps the upstream
 //!   literal name `pi-extensions` (invisible implementation detail).
+//! - Rpi-specific addition (extension-distribution design §7, documented
+//!   in [`crate::core::extension_registry`]): two new package sources —
+//!   bare `<name>[@<range>]` (revpi.dev registry) and
+//!   `github:<owner>/<repo>[@<tag>]` (release artifact) — install into the
+//!   extension discovery roots with sha256 verification and an L0
+//!   confirmation gate. They never auto-install from `resolve()` and never
+//!   touch the network in offline mode.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,7 +61,12 @@ use serde_json::Value;
 use sha2::Digest;
 
 use crate::config;
+use crate::core::extension_registry::{
+    self, ExtensionInstallInfo, ExtensionKind, GithubReleaseSource, IntegrityLevel, RegistryIndex,
+    RegistrySource, RegistryTransport,
+};
 use crate::core::git_url::{parse_git_url, GitSource};
+use crate::core::self_update::{parse_sha256_sidecar, sha256_hex};
 use crate::core::settings_manager::{
     PackageSource, PackageSourceFilter, Settings, SettingsManager,
 };
@@ -71,6 +83,20 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_millis(10_000);
 pub const UPDATE_CHECK_CONCURRENCY: usize = 4;
 /// `GIT_UPDATE_CONCURRENCY` (package-manager.ts:40) — consumed by W3.
 pub const GIT_UPDATE_CONCURRENCY: usize = 4;
+
+/// A fully resolved registry/`github:` install (design §7.2 steps 1–4 for
+/// the registry channel, release enumeration for `github:`), ready for the
+/// download → verify → materialize steps.
+#[derive(Debug, Clone)]
+struct ResolvedArtifactInstall {
+    info: ExtensionInstallInfo,
+    /// Download URLs in fallback order (GitHub direct, then site mirror).
+    download_urls: Vec<String>,
+    /// `<file>.sha256` sidecar URLs, same order (github: channel only).
+    sidecar_urls: Vec<String>,
+    /// Registry channel: the index-pinned sha256 of the artifact.
+    index_sha256: Option<String>,
+}
 
 /// `isOfflineModeEnabled` (package-manager.ts:42-46).
 ///
@@ -494,12 +520,18 @@ pub struct NpmSource {
     pub pinned: bool,
 }
 
-/// `ParsedSource` (package-manager.ts:141).
+/// `ParsedSource` (package-manager.ts:141). `Registry` / `GithubRelease`
+/// are rpi-specific additions (extension-distribution design §7.1): bare
+/// `<name>[@<range>]` resolves against the revpi.dev registry index, and
+/// `github:<owner>/<repo>[@<tag>]` installs a GitHub Release artifact
+/// directly (distinct from the `git:` clone channel).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedSource {
     Npm(NpmSource),
     Git(GitSource),
     Local(String),
+    Registry(RegistrySource),
+    GithubRelease(GithubReleaseSource),
 }
 
 /// `isLocalPath` (utils/paths.ts:41-56).
@@ -533,6 +565,16 @@ fn parse_npm_spec(spec: &str) -> (String, Option<String>) {
 
 /// `parseSource` (package-manager.ts:1435-1460): `npm:` prefix → local
 /// path check → git URL → local fallback. Bare names are local paths.
+///
+/// Rpi-specific extension (extension-distribution design §7.1), checked
+/// before the local-path branch:
+/// - `github:<owner>/<repo>[@<tag>]` → [`ParsedSource::GithubRelease`]
+///   (release-artifact install, not a `git:` clone);
+/// - bare `<name>[@<range>]` matching the registry grammar →
+///   [`ParsedSource::Registry`] — unless the string is an existing path,
+///   which keeps its upstream local-source meaning (the check is against
+///   the process cwd, like every other relative-path consumer of the
+///   parsed result).
 pub fn parse_source(source: &str) -> ParsedSource {
     if let Some(spec) = source.strip_prefix("npm:") {
         let spec = spec.trim();
@@ -544,6 +586,16 @@ pub fn parse_source(source: &str) -> ParsedSource {
             range: get_npm_version_range(version.as_deref()),
             version,
         });
+    }
+
+    if let Some(github) = extension_registry::parse_github_release_source(source) {
+        return ParsedSource::GithubRelease(github);
+    }
+
+    if let Some(registry) = extension_registry::parse_registry_source(source) {
+        if !Path::new(source).exists() {
+            return ParsedSource::Registry(registry);
+        }
     }
 
     if is_local_path(source) {
@@ -1005,7 +1057,26 @@ pub struct PackageManagerOptions {
     pub runner: Option<Arc<dyn PackageCommandRunner>>,
     /// Defaults to [`is_offline_mode_enabled`] (env `RPI_OFFLINE`).
     pub offline: Option<bool>,
+    /// Rpi-specific (extension-distribution design §7): registry channel
+    /// override for mirrors/tests. `None` resolves the base URL from
+    /// `RPI_REGISTRY_URL` (default `https://revpi.dev`) and uses the
+    /// reqwest transport.
+    pub registry: Option<RegistryChannel>,
 }
+
+/// Rpi-specific: registry channel wiring (base URL + transport seam).
+pub struct RegistryChannel {
+    /// `None` resolves env/default ([`extension_registry::default_registry_base_url`]).
+    pub base_url: Option<String>,
+    pub transport: Arc<dyn RegistryTransport>,
+}
+
+/// Rpi-specific (extension-distribution design §7.2 step 5): confirmation
+/// gate for native (L0) extension installs. The callback receives the
+/// shown install-info table content; `None` (non-interactive) refuses
+/// native installs. Only consulted for `kind: native` — sandboxed wasm
+/// extensions install without prompting.
+pub type InstallConfirmCallback = Box<dyn Fn(&ExtensionInstallInfo) -> bool + Send + Sync>;
 
 /// `DefaultPackageManager` (package-manager.ts:795).
 pub struct DefaultPackageManager {
@@ -1015,6 +1086,11 @@ pub struct DefaultPackageManager {
     runner: Arc<dyn PackageCommandRunner>,
     offline: bool,
     progress: Option<ProgressCallback>,
+    /// Resolved registry base URL; `None` disables the registry channel
+    /// (`RPI_REGISTRY_URL=off`).
+    registry_base_url: Option<String>,
+    registry_transport: Arc<dyn RegistryTransport>,
+    install_confirm: Option<InstallConfirmCallback>,
 }
 
 /// `getExtensionTempFolder` (package-manager.ts:221-226): create
@@ -1040,11 +1116,25 @@ impl DefaultPackageManager {
             settings_manager,
             runner: None,
             offline: None,
+            registry: None,
         })
     }
 
     pub fn with_options(options: PackageManagerOptions) -> Self {
         let process_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let (registry_base_url, registry_transport) = match options.registry {
+            Some(channel) => (
+                channel
+                    .base_url
+                    .or_else(extension_registry::default_registry_base_url),
+                channel.transport,
+            ),
+            None => (
+                extension_registry::default_registry_base_url(),
+                Arc::new(extension_registry::ReqwestRegistryTransport)
+                    as Arc<dyn RegistryTransport>,
+            ),
+        };
         DefaultPackageManager {
             cwd: resolve_path(&options.cwd.to_string_lossy(), &process_cwd),
             agent_dir: resolve_path(&options.agent_dir.to_string_lossy(), &process_cwd),
@@ -1054,12 +1144,22 @@ impl DefaultPackageManager {
                 .unwrap_or_else(|| Arc::new(SystemPackageCommandRunner)),
             offline: options.offline.unwrap_or_else(is_offline_mode_enabled),
             progress: None,
+            registry_base_url,
+            registry_transport,
+            install_confirm: None,
         }
     }
 
     /// `setProgressCallback` (package-manager.ts:809-811).
     pub fn set_progress_callback(&mut self, callback: Option<ProgressCallback>) {
         self.progress = callback;
+    }
+
+    /// Rpi-specific (extension-distribution design §7.2 step 5): the
+    /// native-extension install confirmation gate. `None` (the default)
+    /// refuses native installs — non-interactive semantics.
+    pub fn set_install_confirm_callback(&mut self, callback: Option<InstallConfirmCallback>) {
+        self.install_confirm = callback;
     }
 
     fn emit_progress(&self, event: &ProgressEvent) {
@@ -1220,11 +1320,21 @@ impl DefaultPackageManager {
 
     /// `getPackageIdentity` (package-manager.ts:1676-1690): npm by name,
     /// git by `host/path`, local by absolute path (scope-relative when a
-    /// scope is given).
+    /// scope is given). Registry sources identify by name, `github:`
+    /// sources by `owner/repo` (the tag never takes part in identity,
+    /// mirroring the git ref).
     pub fn get_package_identity(&self, source: &str, scope: Option<SourceScope>) -> String {
         match parse_source(source) {
             ParsedSource::Npm(npm) => format!("npm:{}", npm.name),
             ParsedSource::Git(git) => format!("git:{}/{}", git.host, git.path),
+            ParsedSource::Registry(registry) => format!("registry:{}", registry.name),
+            ParsedSource::GithubRelease(github) => {
+                format!(
+                    "github:{}/{}",
+                    github.owner.to_lowercase(),
+                    github.repo.to_lowercase()
+                )
+            }
             ParsedSource::Local(path) => match scope {
                 Some(scope) => {
                     let base_dir = self.get_base_dir_for_scope(scope);
@@ -1243,6 +1353,14 @@ impl DefaultPackageManager {
         match parse_source(source) {
             ParsedSource::Npm(npm) => format!("npm:{}", npm.name),
             ParsedSource::Git(git) => format!("git:{}/{}", git.host, git.path),
+            ParsedSource::Registry(registry) => format!("registry:{}", registry.name),
+            ParsedSource::GithubRelease(github) => {
+                format!(
+                    "github:{}/{}",
+                    github.owner.to_lowercase(),
+                    github.repo.to_lowercase()
+                )
+            }
             ParsedSource::Local(path) => format!("local:{}", self.resolve_path(&path).display()),
         }
     }
@@ -1252,6 +1370,14 @@ impl DefaultPackageManager {
         match parse_source(source) {
             ParsedSource::Npm(npm) => format!("npm:{}", npm.name),
             ParsedSource::Git(git) => format!("git:{}/{}", git.host, git.path),
+            ParsedSource::Registry(registry) => format!("registry:{}", registry.name),
+            ParsedSource::GithubRelease(github) => {
+                format!(
+                    "github:{}/{}",
+                    github.owner.to_lowercase(),
+                    github.repo.to_lowercase()
+                )
+            }
             ParsedSource::Local(path) => {
                 let base_dir = self.get_base_dir_for_scope(scope);
                 format!(
@@ -1974,7 +2100,530 @@ impl DefaultPackageManager {
         }
     }
 
+    // -------------------------------------------------------------------
+    // Registry / GitHub-release channel (rpi-specific, extension-
+    // distribution design §7; no upstream counterpart)
+    // -------------------------------------------------------------------
+
+    /// The extension discovery root for a scope (design §3.3): global
+    /// `<agent_dir>/extensions`, project `<cwd>/.rpi/extensions`
+    /// (trust-gated like every project package storage access).
+    fn get_registry_install_root(&self, scope: SourceScope) -> Result<PathBuf, String> {
+        match scope {
+            SourceScope::Project => {
+                self.assert_project_trusted_for_scope(scope)?;
+                Ok(config::get_project_config_dir(&self.cwd).join("extensions"))
+            }
+            _ => Ok(self.agent_dir.join("extensions")),
+        }
+    }
+
+    /// The resolved registry base URL, or an error naming the disablement
+    /// (`RPI_REGISTRY_URL=off`).
+    fn registry_base(&self) -> Result<&str, String> {
+        self.registry_base_url
+            .as_deref()
+            .ok_or_else(|| "The extension registry is disabled (RPI_REGISTRY_URL=off)".to_string())
+    }
+
+    /// Everything needed for install steps 6–7, resolved upfront.
+    /// Registry channel: index fetch → version selection → compatibility
+    /// precheck → artifact selection (design §7.2 steps 1–4).
+    fn resolve_registry_install(
+        &self,
+        source: &RegistrySource,
+    ) -> Result<ResolvedArtifactInstall, String> {
+        let base = self.registry_base()?;
+        let index_url = extension_registry::registry_index_url(base, &source.name);
+        let body = self
+            .registry_transport
+            .get(&index_url, extension_registry::REGISTRY_REQUEST_TIMEOUT)
+            .map_err(|error| {
+                if error.contains("HTTP 404") {
+                    format!(
+                        "No extension named \"{}\" in the registry ({index_url})",
+                        source.name
+                    )
+                } else {
+                    format!(
+                        "Could not resolve \"{}\" from the registry: {error}. If the registry \
+                         is unreachable you can install a GitHub release directly with \
+                         github:<owner>/<repo>[@<tag>]",
+                        source.name
+                    )
+                }
+            })?;
+        let index: RegistryIndex = serde_json::from_slice(&body)
+            .map_err(|error| format!("Invalid registry index for \"{}\": {error}", source.name))?;
+        if index.name != source.name {
+            return Err(format!(
+                "Invalid registry index: expected \"{}\", got \"{}\"",
+                source.name, index.name
+            ));
+        }
+        let kind = ExtensionKind::parse(&index.kind)
+            .ok_or_else(|| format!("Invalid registry index: unknown kind \"{}\"", index.kind))?;
+        let entry = extension_registry::select_registry_version(&index, source.range.as_deref())?;
+        extension_registry::precheck_version_compatibility(
+            entry,
+            rpi_ext_host::wasm::RPI_ABI_VERSION,
+            config::VERSION,
+        )?;
+        if entry.unavailable {
+            return Err(format!(
+                "Version {} of \"{}\" is marked unavailable (the release may have been pulled \
+                 by its author)",
+                entry.version, source.name
+            ));
+        }
+        let artifact =
+            extension_registry::select_artifact(entry, kind, config::build_target())?;
+        let (owner, repo) = index.repository.split_once('/').ok_or_else(|| {
+            format!(
+                "Invalid registry index: repository \"{}\" is not <owner>/<repo>",
+                index.repository
+            )
+        })?;
+        Ok(ResolvedArtifactInstall {
+            info: ExtensionInstallInfo {
+                name: source.name.clone(),
+                version: entry.version.clone(),
+                author: index.author.clone(),
+                homepage: index.homepage.clone(),
+                capabilities: entry.capabilities.clone(),
+                kind,
+                integrity: IntegrityLevel::RegistryIndex,
+            },
+            download_urls: vec![
+                extension_registry::github_download_url(owner, repo, &artifact.release, &artifact.file),
+                extension_registry::mirror_download_url(base, owner, repo, &artifact.release, &artifact.file),
+            ],
+            sidecar_urls: Vec::new(),
+            index_sha256: Some(artifact.sha256.clone()),
+        })
+    }
+
+    /// `github:` channel: release enumeration via the GitHub Releases API
+    /// (the tag, or the latest release), then artifact selection by
+    /// platform (design §3.2 naming).
+    fn resolve_github_install(
+        &self,
+        source: &GithubReleaseSource,
+    ) -> Result<(ResolvedArtifactInstall, String), String> {
+        let api_url =
+            extension_registry::github_release_api_url(&source.owner, &source.repo, source.tag.as_deref());
+        let body = self
+            .registry_transport
+            .get(&api_url, extension_registry::REGISTRY_REQUEST_TIMEOUT)
+            .map_err(|error| {
+                format!(
+                    "Could not resolve github:{}/{}: {error}",
+                    source.owner, source.repo
+                )
+            })?;
+        let release = extension_registry::parse_github_release_json(&body)?;
+        let selection =
+            extension_registry::select_github_asset(&release.assets, config::build_target())?;
+        let mut download_urls = vec![extension_registry::github_download_url(
+            &source.owner,
+            &source.repo,
+            &release.tag,
+            &selection.file,
+        )];
+        // The mirror leg needs the registry base; a disabled registry
+        // (`RPI_REGISTRY_URL=off`) still allows GitHub-direct installs.
+        if let Some(base) = &self.registry_base_url {
+            download_urls.push(extension_registry::mirror_download_url(
+                base,
+                &source.owner,
+                &source.repo,
+                &release.tag,
+                &selection.file,
+            ));
+        }
+        let sidecar_urls = download_urls
+            .iter()
+            .map(|url| format!("{url}.sha256"))
+            .collect();
+        Ok((
+            ResolvedArtifactInstall {
+                info: ExtensionInstallInfo {
+                    name: selection.name.clone(),
+                    version: selection.version.clone(),
+                    // The manifest (read after download) refines these.
+                    author: None,
+                    homepage: Some(format!(
+                        "https://github.com/{}/{}",
+                        source.owner, source.repo
+                    )),
+                    capabilities: Vec::new(),
+                    kind: selection.kind,
+                    integrity: IntegrityLevel::ReleaseSidecar,
+                },
+                download_urls,
+                sidecar_urls,
+                index_sha256: None,
+            },
+            release.tag,
+        ))
+    }
+
+    /// The install-info table (design §7.2 step 5): name / version /
+    /// author / capabilities in full, plus kind and integrity level; L0
+    /// gets the prominent trust warning (pi-mcp-adapter R8).
+    fn print_install_info(info: &ExtensionInstallInfo) {
+        println!("Extension: {} {}", info.name, info.version);
+        println!(
+            "Kind: {}",
+            match info.kind {
+                ExtensionKind::Native => "native (L0)",
+                ExtensionKind::Wasm => "wasm (L1, sandboxed)",
+            }
+        );
+        if let Some(author) = &info.author {
+            println!("Author: {author}");
+        }
+        if let Some(homepage) = &info.homepage {
+            println!("Homepage: {homepage}");
+        }
+        if info.capabilities.is_empty() {
+            println!("Capabilities: (none)");
+        } else {
+            println!("Capabilities: {}", info.capabilities.join(", "));
+        }
+        match info.integrity {
+            IntegrityLevel::RegistryIndex => {
+                println!("Integrity: sha256 pinned by the registry index");
+            }
+            IntegrityLevel::ReleaseSidecar => {
+                println!(
+                    "Integrity: sha256 from the release's own .sha256 sidecar (NOT pinned by \
+                     the registry index — lower assurance)"
+                );
+            }
+        }
+        if info.kind == ExtensionKind::Native {
+            eprintln!(
+                "WARNING: \"{}\" is a native (L0) extension. It runs WITHOUT a sandbox, with \
+                 full OS permissions — exactly like the {APP_NAME} binary itself. Install it \
+                 only if you trust its author.",
+                info.name,
+                APP_NAME = config::APP_NAME,
+            );
+        }
+    }
+
+    /// The L0 confirmation gate (design §7.2 step 5): sandboxed wasm
+    /// extensions pass through; native ones need the callback's consent
+    /// (`--yes` or an interactive prompt), and are refused when no
+    /// callback is installed (non-interactive).
+    fn confirm_native_install(&self, info: &ExtensionInstallInfo) -> Result<(), String> {
+        if info.kind != ExtensionKind::Native {
+            return Ok(());
+        }
+        match &self.install_confirm {
+            Some(confirm) => {
+                if confirm(info) {
+                    Ok(())
+                } else {
+                    Err("Installation aborted.".to_string())
+                }
+            }
+            None => Err(format!(
+                "\"{}\" is a native (L0) extension and needs explicit confirmation; re-run \
+                 with --yes or from an interactive terminal",
+                info.name
+            )),
+        }
+    }
+
+    /// Registry channel install, steps 5–7 (design §7.2): confirm →
+    /// download (GitHub → mirror) → index-anchored sha256 check →
+    /// materialize. A checksum mismatch aborts immediately and never
+    /// switches source (design §6, ADR-0011 boundary).
+    fn run_registry_install(
+        &self,
+        resolved: &ResolvedArtifactInstall,
+        scope: SourceScope,
+    ) -> Result<(), String> {
+        Self::print_install_info(&resolved.info);
+        self.confirm_native_install(&resolved.info)?;
+        let expected = resolved
+            .index_sha256
+            .as_deref()
+            .ok_or_else(|| "registry install without an index sha256".to_string())?;
+        let (_url, bytes) = extension_registry::download_with_fallback(
+            self.registry_transport.as_ref(),
+            &resolved.download_urls,
+            extension_registry::RPIX_DOWNLOAD_TIMEOUT,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not download {} {}: {error}. The release artifact may have been pulled \
+                 by its author",
+                resolved.info.name, resolved.info.version
+            )
+        })?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(format!(
+                "Integrity check failed for {} {}: expected sha256 {expected}, got {actual}. \
+                 The download was discarded.",
+                resolved.info.name, resolved.info.version
+            ));
+        }
+        let root = self.get_registry_install_root(scope)?;
+        extension_registry::materialize_rpix(
+            &bytes,
+            &root,
+            &resolved.info.name,
+            &resolved.info.version,
+        )?;
+        Ok(())
+    }
+
+    /// `github:` channel install (design §7.1): download → sidecar sha256
+    /// check → extract/verify → confirm against the *manifest* (the only
+    /// source of author/capabilities for this channel) → activate with the
+    /// source marker.
+    fn run_github_install(
+        &self,
+        resolved: &ResolvedArtifactInstall,
+        scope: SourceScope,
+        source_string: &str,
+    ) -> Result<(), String> {
+        let (_url, bytes) = extension_registry::download_with_fallback(
+            self.registry_transport.as_ref(),
+            &resolved.download_urls,
+            extension_registry::RPIX_DOWNLOAD_TIMEOUT,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not download {} {}: {error}",
+                resolved.info.name, resolved.info.version
+            )
+        })?;
+        let (_url, sidecar) = extension_registry::download_with_fallback(
+            self.registry_transport.as_ref(),
+            &resolved.sidecar_urls,
+            extension_registry::REGISTRY_REQUEST_TIMEOUT,
+        )
+        .map_err(|error| {
+            format!(
+                "Could not fetch the sha256 sidecar for {}: {error}. Without it the download \
+                 cannot be verified; aborting",
+                resolved.download_urls[0]
+            )
+        })?;
+        let expected = parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar)).ok_or_else(|| {
+            format!(
+                "The sha256 sidecar for {} is malformed; aborting the install",
+                resolved.info.name
+            )
+        })?;
+        let actual = sha256_hex(&bytes);
+        if actual != expected {
+            return Err(format!(
+                "Integrity check failed for {} {}: expected sha256 {expected}, got {actual}. \
+                 The download was discarded.",
+                resolved.info.name, resolved.info.version
+            ));
+        }
+        let root = self.get_registry_install_root(scope)?;
+        let extracted = extension_registry::extract_and_verify_rpix(
+            &bytes,
+            &root,
+            &resolved.info.name,
+            &resolved.info.version,
+        )?;
+        // The manifest is the only metadata source for this channel:
+        // refine the confirmation table with what will actually run.
+        let manifest = &extracted.manifest.raw;
+        let string_field = |key: &str| {
+            manifest
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        let capabilities = manifest
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let kind = if string_field("native").is_some() {
+            ExtensionKind::Native
+        } else {
+            ExtensionKind::Wasm
+        };
+        let info = ExtensionInstallInfo {
+            author: string_field("author").or(resolved.info.author.clone()),
+            homepage: string_field("homepage").or(resolved.info.homepage.clone()),
+            capabilities,
+            kind,
+            ..resolved.info.clone()
+        };
+        Self::print_install_info(&info);
+        if let Err(error) = self.confirm_native_install(&info) {
+            extracted.cleanup();
+            return Err(error);
+        }
+        extension_registry::activate_rpix(extracted, &root, &resolved.info.name, Some(source_string))?;
+        Ok(())
+    }
+
+    fn install_registry_source(
+        &self,
+        source: &RegistrySource,
+        scope: SourceScope,
+    ) -> Result<(), String> {
+        if self.offline {
+            return Err(format!(
+                "Cannot install \"{}\" in offline mode (registry access is disabled)",
+                source.name
+            ));
+        }
+        let resolved = self.resolve_registry_install(source)?;
+        self.run_registry_install(&resolved, scope)
+    }
+
+    fn install_github_source(
+        &self,
+        source: &GithubReleaseSource,
+        scope: SourceScope,
+        source_string: &str,
+    ) -> Result<(), String> {
+        if self.offline {
+            return Err(format!(
+                "Cannot install \"github:{}/{}\" in offline mode",
+                source.owner, source.repo
+            ));
+        }
+        let (resolved, _tag) = self.resolve_github_install(source)?;
+        self.run_github_install(&resolved, scope, source_string)
+    }
+
+    /// Find the install directory of a `github:` source via the
+    /// `.rpi-install-source` markers (offline-safe; the extension name is
+    /// only known from the artifact itself).
+    fn find_github_install_dir(
+        &self,
+        source: &GithubReleaseSource,
+        scope: SourceScope,
+    ) -> Option<PathBuf> {
+        let root = self.get_registry_install_root(scope).ok()?;
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(marker) =
+                std::fs::read_to_string(dir.join(extension_registry::GITHUB_INSTALL_MARKER_FILE))
+            else {
+                continue;
+            };
+            if let ParsedSource::GithubRelease(other) = parse_source(marker.trim()) {
+                if other.owner.eq_ignore_ascii_case(&source.owner)
+                    && other.repo.eq_ignore_ascii_case(&source.repo)
+                {
+                    return Some(dir);
+                }
+            }
+        }
+        None
+    }
+
+    fn remove_registry_install(&self, name: &str, scope: SourceScope) -> Result<(), String> {
+        let root = self.get_registry_install_root(scope)?;
+        let dir = root.join(name);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    fn remove_github_install(
+        &self,
+        source: &GithubReleaseSource,
+        scope: SourceScope,
+    ) -> Result<(), String> {
+        if let Some(dir) = self.find_github_install_dir(source, scope) {
+            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Registry/`github:` update (design §7.2: re-resolve by range and run
+    /// install steps 5–7). A source already at the resolved version is
+    /// skipped.
+    fn update_registry_entry(&self, source: &str, scope: SourceScope) -> Result<(), String> {
+        match parse_source(source) {
+            ParsedSource::Registry(registry) => {
+                let resolved = self.resolve_registry_install(&registry)?;
+                let installed = self
+                    .get_registry_install_root(scope)
+                    .ok()
+                    .map(|root| root.join(&resolved.info.name))
+                    .and_then(|dir| extension_registry::installed_extension_version(&dir));
+                if installed.as_deref() == Some(resolved.info.version.as_str()) {
+                    self.emit_progress(&ProgressEvent {
+                        kind: ProgressKind::Start,
+                        action: ProgressAction::Update,
+                        source: source.to_string(),
+                        message: Some(format!(
+                            "{source} is already up to date ({})",
+                            resolved.info.version
+                        )),
+                    });
+                    return Ok(());
+                }
+                self.with_progress(
+                    ProgressAction::Update,
+                    source,
+                    &format!("Updating {source}..."),
+                    || self.run_registry_install(&resolved, scope),
+                )
+            }
+            ParsedSource::GithubRelease(github) => {
+                let (resolved, _tag) = self.resolve_github_install(&github)?;
+                let installed = self
+                    .find_github_install_dir(&github, scope)
+                    .and_then(|dir| extension_registry::installed_extension_version(&dir));
+                if installed.as_deref() == Some(resolved.info.version.as_str()) {
+                    self.emit_progress(&ProgressEvent {
+                        kind: ProgressKind::Start,
+                        action: ProgressAction::Update,
+                        source: source.to_string(),
+                        message: Some(format!(
+                            "{source} is already up to date ({})",
+                            resolved.info.version
+                        )),
+                    });
+                    return Ok(());
+                }
+                self.with_progress(
+                    ProgressAction::Update,
+                    source,
+                    &format!("Updating {source}..."),
+                    || self.run_github_install(&resolved, scope, source),
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// `installParsedSource` (package-manager.ts:1347-1356).
+    ///
+    /// Registry / `github:` sources are never auto-installed from
+    /// `resolve()`: they materialize into the extension discovery roots at
+    /// explicit `rpi install` time (a native build needs the confirmation
+    /// gate), and the ext-host loader picks them up via its own one-level
+    /// directory discovery (extension-distribution design §3.3).
     fn install_parsed_source(
         &self,
         parsed: &ParsedSource,
@@ -1984,6 +2633,7 @@ impl DefaultPackageManager {
             ParsedSource::Npm(npm) => self.install_npm(npm, scope, scope == SourceScope::Temporary),
             ParsedSource::Git(git) => self.install_git(git, scope),
             ParsedSource::Local(_) => Ok(()),
+            ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => Ok(()),
         }
     }
 
@@ -2009,6 +2659,10 @@ impl DefaultPackageManager {
                         return Err(format!("Path does not exist: {}", resolved.display()));
                     }
                     Ok(())
+                }
+                ParsedSource::Registry(registry) => self.install_registry_source(registry, scope),
+                ParsedSource::GithubRelease(github) => {
+                    self.install_github_source(github, scope, source)
                 }
             },
         )
@@ -2038,6 +2692,10 @@ impl DefaultPackageManager {
                 ParsedSource::Npm(npm) => self.uninstall_npm(npm, scope),
                 ParsedSource::Git(git) => self.remove_git(git, scope),
                 ParsedSource::Local(_) => Ok(()),
+                ParsedSource::Registry(registry) => {
+                    self.remove_registry_install(&registry.name, scope)
+                }
+                ParsedSource::GithubRelease(github) => self.remove_github_install(github, scope),
             },
         )
     }
@@ -2064,6 +2722,12 @@ impl DefaultPackageManager {
                 let path = self.resolve_path_from_base(&local, &base_dir);
                 path.exists().then_some(path)
             }
+            ParsedSource::Registry(registry) => {
+                let root = self.get_registry_install_root(scope).ok()?;
+                let path = root.join(&registry.name);
+                path.exists().then_some(path)
+            }
+            ParsedSource::GithubRelease(github) => self.find_github_install_dir(&github, scope),
         }
     }
 
@@ -2148,6 +2812,7 @@ impl DefaultPackageManager {
 
         let mut npm_candidates: Vec<NpmUpdateTarget> = Vec::new();
         let mut git_candidates: Vec<GitUpdateEntry> = Vec::new();
+        let mut registry_candidates: Vec<ConfiguredUpdateSource> = Vec::new();
         for entry in sources {
             match parse_source(&entry.source) {
                 ParsedSource::Npm(parsed) if !parsed.pinned => {
@@ -2162,6 +2827,15 @@ impl DefaultPackageManager {
                     scope: entry.scope,
                     parsed,
                 }),
+                // Rpi-specific (extension-distribution §7.2): registry and
+                // `github:` sources re-resolve by range/tag and run install
+                // steps 5–7.
+                ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => {
+                    registry_candidates.push(ConfiguredUpdateSource {
+                        source: entry.source.clone(),
+                        scope: entry.scope,
+                    })
+                }
                 _ => {}
             }
         }
@@ -2226,6 +2900,16 @@ impl DefaultPackageManager {
                         GIT_UPDATE_CONCURRENCY,
                     )
                     .map(|_| ())
+                }));
+            }
+            if !registry_candidates.is_empty() {
+                // Registry updates run sequentially: each one may need the
+                // interactive L0 confirmation prompt.
+                handles.push(scope.spawn(|| {
+                    for entry in &registry_candidates {
+                        self.update_registry_entry(&entry.source, entry.scope)?;
+                    }
+                    Ok(())
                 }));
             }
             let mut first_error: Option<String> = None;
@@ -2369,6 +3053,10 @@ impl DefaultPackageManager {
                     scope,
                 }))
             }
+            // Registry/`github:` sources are not part of the startup
+            // update probe (PackageUpdateKind has no variant for them);
+            // `update` re-resolves them by range directly.
+            ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => Ok(None),
         }
     }
 
@@ -2415,6 +3103,16 @@ impl DefaultPackageManager {
                     }
                 }
                 ParsedSource::Local(_) => {}
+                ParsedSource::Registry(registry) => {
+                    if trimmed == registry.name {
+                        return Some(source_str.to_string());
+                    }
+                }
+                ParsedSource::GithubRelease(github) => {
+                    if trimmed == format!("{}/{}", github.owner, github.repo) {
+                        return Some(source_str.to_string());
+                    }
+                }
             }
         }
         None
@@ -3114,6 +3812,14 @@ impl DefaultPackageManager {
                 ParsedSource::Local(_) => {
                     // Invariant: local sources are handled (and continued)
                     // before the install-missing branch above.
+                }
+                ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => {
+                    // Rpi-specific (extension-distribution §3.3): these
+                    // sources materialize into the extension discovery
+                    // roots, which the ext-host loader scans directly —
+                    // no package-origin resolution and, deliberately, no
+                    // auto-install at session startup (a native build needs
+                    // the `rpi install` confirmation gate).
                 }
             }
         }
@@ -3972,6 +4678,7 @@ mod tests {
             settings_manager,
             runner: Some(runner),
             offline: Some(offline),
+            registry: None,
         })
     }
 
@@ -4058,7 +4765,11 @@ mod tests {
             "/absolute/path/to/package",
             "./relative/path/to/package",
             "../relative/path/to/package",
-            "bare-name",
+            // Not the registry grammar (`_`), so still a local path. A
+            // grammar-valid bare name that is not an existing path now
+            // parses as a registry source (extension-distribution design
+            // §7.1; see registry_tests::test_parse_source_registry_and_github_forms).
+            "bare_name",
         ] {
             assert!(
                 matches!(parse_source(source), ParsedSource::Local(_)),
@@ -5673,6 +6384,7 @@ mod update_tests {
             settings_manager,
             runner: Some(runner),
             offline: Some(offline),
+            registry: None,
         })
     }
 
@@ -6143,5 +6855,689 @@ mod update_tests {
             Some(package_root.as_path())
         );
         assert!(theme.enabled);
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    //! Rpi-specific (extension-distribution design §7, no upstream
+    //! counterpart): registry/`github:` source parsing, install with the
+    //! L0 confirmation gate, index- vs sidecar-anchored integrity, mirror
+    //! fallback, remove/update/list wiring and offline behavior. The HTTP
+    //! layer is a scripted [`RegistryTransport`] fake — no network.
+
+    use super::*;
+    use crate::core::extension_registry::GITHUB_INSTALL_MARKER_FILE;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirs {
+        root: PathBuf,
+        cwd: PathBuf,
+        agent_dir: PathBuf,
+    }
+
+    impl TestDirs {
+        fn new() -> Self {
+            let unique = format!(
+                "rpi-pm-registry-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            );
+            let root = std::env::temp_dir().join(unique);
+            let cwd = root.join("cwd");
+            let agent_dir = root.join("agent");
+            std::fs::create_dir_all(&cwd).unwrap();
+            std::fs::create_dir_all(&agent_dir).unwrap();
+            TestDirs {
+                root,
+                cwd,
+                agent_dir,
+            }
+        }
+    }
+
+    impl Drop for TestDirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Any spawned process is a bug in these tests.
+    struct NoSpawnRunner;
+
+    impl PackageCommandRunner for NoSpawnRunner {
+        fn run(&self, _request: &CommandRequest) -> Result<(), String> {
+            Err("unexpected command".to_string())
+        }
+        fn run_capture(&self, _request: &CommandRequest) -> Result<String, String> {
+            Err("unexpected command".to_string())
+        }
+    }
+
+    /// Scripted transport: exact-URL map, `HTTP 404` for anything else.
+    struct MapTransport {
+        responses: Mutex<HashMap<String, Vec<u8>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl MapTransport {
+        fn new() -> Arc<Self> {
+            Arc::new(MapTransport {
+                responses: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn insert(&self, url: &str, body: Vec<u8>) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(url.to_string(), body);
+        }
+
+        fn remove(&self, url: &str) {
+            self.responses.lock().unwrap().remove(url);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl RegistryTransport for MapTransport {
+        fn get(&self, url: &str, _timeout: Duration) -> Result<Vec<u8>, String> {
+            self.calls.lock().unwrap().push(url.to_string());
+            match self.responses.lock().unwrap().get(url) {
+                Some(body) => Ok(body.clone()),
+                None => Err("request failed: HTTP 404".to_string()),
+            }
+        }
+    }
+
+    const REGISTRY_BASE: &str = "https://registry.test";
+
+    fn registry_manager(
+        dirs: &TestDirs,
+        transport: Arc<MapTransport>,
+        confirm: Option<InstallConfirmCallback>,
+        offline: bool,
+        project_trusted: bool,
+    ) -> DefaultPackageManager {
+        let settings_manager = SettingsManager::create(
+            &dirs.cwd,
+            Some(&dirs.agent_dir),
+            crate::core::settings_manager::SettingsManagerCreateOptions { project_trusted },
+        );
+        let mut manager = DefaultPackageManager::with_options(PackageManagerOptions {
+            cwd: dirs.cwd.clone(),
+            agent_dir: dirs.agent_dir.clone(),
+            settings_manager,
+            runner: Some(Arc::new(NoSpawnRunner)),
+            offline: Some(offline),
+            registry: Some(RegistryChannel {
+                base_url: Some(REGISTRY_BASE.to_string()),
+                transport,
+            }),
+        });
+        manager.set_install_confirm_callback(confirm);
+        manager
+    }
+
+    fn manager_ok(
+        dirs: &TestDirs,
+        transport: Arc<MapTransport>,
+    ) -> DefaultPackageManager {
+        registry_manager(dirs, transport, Some(Box::new(|_| true)), false, true)
+    }
+
+    /// Build a `.rpix` (gzipped tar, flat root, coreutils SHA256SUMS).
+    fn build_rpix(name: &str, version: &str, native: bool, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let carrier = if native {
+            format!(r#","native":"lib{name}.so""#)
+        } else {
+            format!(r#","wasm":"dist/{name}.wasm""#)
+        };
+        let manifest = format!(
+            r#"{{"name":"{name}","version":"{version}"{carrier},"capabilities":["tools"],"rpiAbi":1}}"#
+        );
+        let mut all: Vec<(String, Vec<u8>)> =
+            vec![("rpi-extension.json".to_string(), manifest.into_bytes())];
+        for (path, content) in files {
+            all.push((path.to_string(), content.to_vec()));
+        }
+        let sums = all
+            .iter()
+            .map(|(path, content)| format!("{}  {path}\n", sha256_hex(content)))
+            .collect::<String>();
+        all.push(("SHA256SUMS".to_string(), sums.into_bytes()));
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        for (path, content) in &all {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, &content[..]).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// A §5.2 index document with a single native version whose artifact
+    /// targets this build's target triple.
+    fn native_index_json(name: &str, repo: &str, version: &str, sha256: &str) -> String {
+        let target = config::build_target().expect("cargo build injects the target");
+        serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": repo,
+            "author": "acme",
+            "kind": "native",
+            "versions": [{
+                "version": version,
+                "rpiAbi": 1,
+                "capabilities": ["tools"],
+                "artifacts": [{
+                    "target": target,
+                    "file": format!("{name}-{version}-{target}.rpix"),
+                    "sha256": sha256,
+                    "release": format!("v{version}"),
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    fn wasm_index_json(name: &str, repo: &str, version: &str, sha256: &str) -> String {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": repo,
+            "kind": "wasm",
+            "versions": [{
+                "version": version,
+                "rpiAbi": 1,
+                "capabilities": [],
+                "artifacts": [{
+                    "target": null,
+                    "file": format!("{name}-{version}.rpix"),
+                    "sha256": sha256,
+                    "release": format!("v{version}"),
+                }]
+            }]
+        })
+        .to_string()
+    }
+
+    /// Serve an index + its artifact over the fake transport; returns the
+    /// artifact bytes and the GitHub-direct download URL.
+    fn serve_registry_extension(
+        transport: &MapTransport,
+        name: &str,
+        version: &str,
+        native: bool,
+    ) -> (Vec<u8>, String) {
+        let repo = format!("acme/{name}");
+        let target = config::build_target().unwrap();
+        let file = if native {
+            format!("{name}-{version}-{target}.rpix")
+        } else {
+            format!("{name}-{version}.rpix")
+        };
+        let archive = build_rpix(name, version, native, &[]);
+        let index = if native {
+            native_index_json(name, &repo, version, &sha256_hex(&archive))
+        } else {
+            wasm_index_json(name, &repo, version, &sha256_hex(&archive))
+        };
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            index.into_bytes(),
+        );
+        let download = extension_registry::github_download_url(
+            "acme",
+            name,
+            &format!("v{version}"),
+            &file,
+        );
+        transport.insert(&download, archive.clone());
+        (archive, download)
+    }
+
+    fn settings_packages(dirs: &TestDirs) -> String {
+        std::fs::read_to_string(dirs.agent_dir.join("settings.json")).unwrap_or_default()
+    }
+
+    // ---- parse_source forms (design §7.1) ----
+
+    #[test]
+    fn test_parse_source_registry_and_github_forms() {
+        // Bare name and name@range → Registry.
+        let ParsedSource::Registry(registry) = parse_source("subagents") else {
+            panic!("expected registry source");
+        };
+        assert_eq!(registry.name, "subagents");
+        assert_eq!(registry.range, None);
+        let ParsedSource::Registry(registry) = parse_source("subagents@^0.2") else {
+            panic!("expected registry source");
+        };
+        assert_eq!(registry.range.as_deref(), Some("^0.2"));
+
+        // Local paths keep their meaning: `.`/`/` shapes, and an existing
+        // bare directory (`src` exists in the crate root, the cargo test
+        // cwd).
+        assert!(matches!(parse_source("./subagents"), ParsedSource::Local(_)));
+        assert!(matches!(parse_source("foo/bar"), ParsedSource::Local(_)));
+        assert!(matches!(parse_source("src"), ParsedSource::Local(_)));
+        // A bare name with an invalid range tail stays local.
+        assert!(matches!(
+            parse_source("subagents@bogus"),
+            ParsedSource::Local(_)
+        ));
+
+        // github: release-artifact sources.
+        let ParsedSource::GithubRelease(github) = parse_source("github:acme/tools") else {
+            panic!("expected github release source");
+        };
+        assert_eq!(github.owner, "acme");
+        assert_eq!(github.repo, "tools");
+        assert_eq!(github.tag, None);
+        let ParsedSource::GithubRelease(github) = parse_source("github:acme/tools@v1.2.3") else {
+            panic!("expected github release source");
+        };
+        assert_eq!(github.tag.as_deref(), Some("v1.2.3"));
+        // Malformed github: falls back to local (install errors naturally).
+        assert!(matches!(parse_source("github:acme"), ParsedSource::Local(_)));
+
+        // Existing channels are untouched.
+        assert!(matches!(parse_source("npm:foo"), ParsedSource::Npm(_)));
+        assert!(matches!(
+            parse_source("git:github.com/user/repo"),
+            ParsedSource::Git(_)
+        ));
+        assert!(matches!(
+            parse_source("https://github.com/user/repo"),
+            ParsedSource::Git(_)
+        ));
+    }
+
+    #[test]
+    fn test_registry_identity_and_match_keys() {
+        let dirs = TestDirs::new();
+        let manager = manager_ok(&dirs, MapTransport::new());
+        assert_eq!(
+            manager.get_package_identity("subagents@^0.2", None),
+            "registry:subagents"
+        );
+        assert_eq!(
+            manager.get_package_identity("github:Acme/Tools@v1.0.0", None),
+            "github:acme/tools"
+        );
+        // The range never takes part in matching (npm semantics alike).
+        assert!(manager.package_sources_match(
+            &PackageSource::Source("subagents".to_string()),
+            "subagents@~0.2",
+            SourceScope::User,
+        ));
+        assert!(manager.package_sources_match(
+            &PackageSource::Source("github:acme/tools".to_string()),
+            "github:acme/tools@v1.0.0",
+            SourceScope::User,
+        ));
+    }
+
+    // ---- registry install (design §7.2) ----
+
+    #[test]
+    fn test_install_registry_native_with_confirmation() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let (_archive, _url) = serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let confirmed = Arc::new(Mutex::new(Vec::new()));
+        let seen = confirmed.clone();
+        let mut manager = registry_manager(
+            &dirs,
+            transport,
+            Some(Box::new(move |info: &ExtensionInstallInfo| {
+                seen.lock().unwrap().push((
+                    info.name.clone(),
+                    info.version.clone(),
+                    info.kind,
+                    info.capabilities.clone(),
+                ));
+                true
+            })),
+            false,
+            true,
+        );
+        manager.install_and_persist("subagents@^0.2", false).unwrap();
+
+        // Materialized into the global discovery root (design §3.3).
+        let dir = dirs.agent_dir.join("extensions/subagents");
+        assert!(dir.join("rpi-extension.json").is_file());
+        assert!(dir.join("SHA256SUMS").is_file());
+        // The source string persists verbatim.
+        assert!(settings_packages(&dirs).contains("subagents@^0.2"));
+        // The confirmation gate saw the native kind + capabilities table.
+        let seen = confirmed.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "subagents");
+        assert_eq!(seen[0].1, "0.2.0");
+        assert_eq!(seen[0].2, ExtensionKind::Native);
+        assert_eq!(seen[0].3, vec!["tools".to_string()]);
+        // `list` resolves the installed path.
+        assert_eq!(
+            manager.get_installed_path("subagents", SourceScope::User),
+            Some(dir)
+        );
+    }
+
+    #[test]
+    fn test_install_registry_native_refused_without_confirmation() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        // No confirm callback = non-interactive without --yes.
+        let mut manager = registry_manager(&dirs, transport, None, false, true);
+        let error = manager.install_and_persist("subagents", false).unwrap_err();
+        assert!(error.contains("--yes"), "{error}");
+        assert!(!dirs.agent_dir.join("extensions/subagents").exists());
+        assert!(!settings_packages(&dirs).contains("subagents"));
+    }
+
+    #[test]
+    fn test_install_registry_wasm_needs_no_confirmation() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "smartfetch", "1.0.0", false);
+        let mut manager = registry_manager(&dirs, transport, None, false, true);
+        manager.install_and_persist("smartfetch", false).unwrap();
+        assert!(dirs
+            .agent_dir
+            .join("extensions/smartfetch/rpi-extension.json")
+            .is_file());
+    }
+
+    #[test]
+    fn test_install_registry_checksum_mismatch_aborts_without_mirror() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let (archive, download) =
+            serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        // Corrupt the index-pinned sha256.
+        let index = native_index_json("subagents", "acme/subagents", "0.2.0", &"0".repeat(64));
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, "subagents"),
+            index.into_bytes(),
+        );
+        // The mirror would serve the good bytes — it must not be tried.
+        let mirror = extension_registry::mirror_download_url(
+            REGISTRY_BASE,
+            "acme",
+            "subagents",
+            "v0.2.0",
+            download.rsplit('/').next().unwrap(),
+        );
+        transport.insert(&mirror, archive);
+        let mut manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), false, true);
+        let error = manager.install_and_persist("subagents", false).unwrap_err();
+        assert!(error.contains("Integrity check failed"), "{error}");
+        let calls = transport.calls();
+        assert!(calls.contains(&download), "calls: {calls:?}");
+        assert!(!calls.contains(&mirror), "calls: {calls:?}");
+        assert!(!dirs.agent_dir.join("extensions/subagents").exists());
+    }
+
+    #[test]
+    fn test_install_registry_falls_back_to_mirror() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let (archive, download) =
+            serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        // GitHub-direct 404s; the mirror serves the artifact.
+        transport.remove(&download);
+        let mirror = extension_registry::mirror_download_url(
+            REGISTRY_BASE,
+            "acme",
+            "subagents",
+            "v0.2.0",
+            download.rsplit('/').next().unwrap(),
+        );
+        transport.insert(&mirror, archive);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("subagents", false).unwrap();
+        assert!(dirs
+            .agent_dir
+            .join("extensions/subagents/rpi-extension.json")
+            .is_file());
+        let calls = transport.calls();
+        let github_pos = calls.iter().position(|url| url == &download).unwrap();
+        let mirror_pos = calls.iter().position(|url| url == &mirror).unwrap();
+        assert!(github_pos < mirror_pos, "calls: {calls:?}");
+    }
+
+    #[test]
+    fn test_install_registry_offline_and_unknown_name() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let mut manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), true, true);
+        let error = manager.install_and_persist("subagents", false).unwrap_err();
+        assert!(error.contains("offline mode"), "{error}");
+        let manager = manager_ok(&dirs, transport);
+        let error = manager.install("nosuch", false).unwrap_err();
+        assert!(error.contains("No extension named \"nosuch\""), "{error}");
+    }
+
+    #[test]
+    fn test_install_registry_project_scope_trust_gate() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let mut manager = registry_manager(&dirs, transport, Some(Box::new(|_| true)), false, false);
+        let error = manager.install_and_persist("subagents", true).unwrap_err();
+        assert!(error.contains("not trusted"), "{error}");
+
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let mut manager = registry_manager(&dirs, transport, Some(Box::new(|_| true)), false, true);
+        manager.install_and_persist("subagents", true).unwrap();
+        assert!(dirs
+            .cwd
+            .join(".rpi/extensions/subagents/rpi-extension.json")
+            .is_file());
+    }
+
+    // ---- remove / update / list ----
+
+    #[test]
+    fn test_remove_registry_install() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let mut manager = manager_ok(&dirs, transport);
+        manager.install_and_persist("subagents@^0.2", false).unwrap();
+        let removed = manager.remove_and_persist("subagents", false).unwrap();
+        assert!(removed);
+        assert!(!dirs.agent_dir.join("extensions/subagents").exists());
+        assert!(!settings_packages(&dirs).contains("subagents"));
+    }
+
+    #[test]
+    fn test_update_registry_re_resolves_by_range() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("subagents", false).unwrap();
+
+        // The registry publishes 0.2.0 (matching the default `*` range):
+        // update installs it.
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        manager.update(Some("subagents")).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/subagents")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+
+        // Up to date: the second update does not download again.
+        let calls_before = transport.calls().len();
+        manager.update(Some("subagents")).unwrap();
+        assert_eq!(transport.calls().len(), calls_before + 1, "index re-fetch only");
+    }
+
+    // ---- github: channel (design §7.1) ----
+
+    /// Serve a `github:` release: API response + artifact + sidecar.
+    fn serve_github_release(
+        transport: &MapTransport,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+        name: &str,
+        version: &str,
+        native: bool,
+    ) -> (String, String) {
+        let target = config::build_target().unwrap();
+        let file = if native {
+            format!("{name}-{version}-{target}.rpix")
+        } else {
+            format!("{name}-{version}.rpix")
+        };
+        let archive = build_rpix(name, version, native, &[]);
+        let release = serde_json::json!({
+            "tag_name": tag,
+            "assets": [
+                {"name": file},
+                {"name": format!("{file}.sha256")},
+            ]
+        });
+        transport.insert(
+            &extension_registry::github_release_api_url(owner, repo, Some(tag)),
+            release.to_string().into_bytes(),
+        );
+        let download = extension_registry::github_download_url(owner, repo, tag, &file);
+        transport.insert(&download, archive.clone());
+        let sidecar = format!("{}.sha256", download);
+        transport.insert(
+            &sidecar,
+            format!("{}  {file}\n", sha256_hex(&archive)).into_bytes(),
+        );
+        (download, sidecar)
+    }
+
+    #[test]
+    fn test_install_github_release_and_remove_by_marker() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_github_release(
+            &transport,
+            "acme",
+            "tools",
+            "v1.0.0",
+            "tools",
+            "1.0.0",
+            false,
+        );
+        let mut manager = manager_ok(&dirs, transport);
+        manager
+            .install_and_persist("github:acme/tools@v1.0.0", false)
+            .unwrap();
+        let dir = dirs.agent_dir.join("extensions/tools");
+        assert!(dir.join("rpi-extension.json").is_file());
+        // The marker records the source string for offline remove/list.
+        let marker = std::fs::read_to_string(dir.join(GITHUB_INSTALL_MARKER_FILE)).unwrap();
+        assert_eq!(marker.trim(), "github:acme/tools@v1.0.0");
+        // `list` finds the directory through the marker, tag or not.
+        assert_eq!(
+            manager.get_installed_path("github:acme/tools", SourceScope::User),
+            Some(dir.clone())
+        );
+        // remove works without any network (the marker identifies the dir).
+        let removed = manager.remove_and_persist("github:acme/tools", false).unwrap();
+        assert!(removed);
+        assert!(!dir.exists());
+        assert!(!settings_packages(&dirs).contains("github:acme"));
+    }
+
+    #[test]
+    fn test_install_github_release_missing_sidecar_aborts() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let (_download, sidecar) = serve_github_release(
+            &transport,
+            "acme",
+            "tools",
+            "v1.0.0",
+            "tools",
+            "1.0.0",
+            false,
+        );
+        transport.remove(&sidecar);
+        let mut manager = manager_ok(&dirs, transport);
+        let error = manager
+            .install_and_persist("github:acme/tools@v1.0.0", false)
+            .unwrap_err();
+        assert!(error.contains("sidecar"), "{error}");
+        assert!(!dirs.agent_dir.join("extensions/tools").exists());
+    }
+
+    #[test]
+    fn test_update_github_release_to_latest() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_github_release(&transport, "acme", "tools", "v1.0.0", "tools", "1.0.0", false);
+        // The source has no tag: resolution goes through releases/latest.
+        let release = serde_json::json!({
+            "tag_name": "v1.0.0",
+            "assets": [{"name": "tools-1.0.0.rpix"}, {"name": "tools-1.0.0.rpix.sha256"}]
+        });
+        transport.insert(
+            &extension_registry::github_release_api_url("acme", "tools", None),
+            release.to_string().into_bytes(),
+        );
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("github:acme/tools", false).unwrap();
+
+        // A new latest release (1.1.0) is picked up by update.
+        serve_github_release(&transport, "acme", "tools", "v1.1.0", "tools", "1.1.0", false);
+        let release = serde_json::json!({
+            "tag_name": "v1.1.0",
+            "assets": [{"name": "tools-1.1.0.rpix"}, {"name": "tools-1.1.0.rpix.sha256"}]
+        });
+        transport.insert(
+            &extension_registry::github_release_api_url("acme", "tools", None),
+            release.to_string().into_bytes(),
+        );
+        manager.update(Some("github:acme/tools")).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(&dirs.agent_dir.join("extensions/tools"))
+                .as_deref(),
+            Some("1.1.0")
+        );
+        // The marker survives the atomic replacement.
+        assert!(dirs
+            .agent_dir
+            .join("extensions/tools")
+            .join(GITHUB_INSTALL_MARKER_FILE)
+            .is_file());
+    }
+
+    #[test]
+    fn test_offline_update_skips_registry_sources() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("subagents", false).unwrap();
+        // Offline update: no registry access at all (early return).
+        let manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), true, true);
+        manager.update(None).unwrap();
+        assert!(transport.calls().len() < 4, "no new fetches");
     }
 }

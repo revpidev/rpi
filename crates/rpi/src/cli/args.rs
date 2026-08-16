@@ -449,7 +449,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   {APP_NAME} [options] [@files...] [messages...]
 
 {commands_bold}
-  {APP_NAME} install <source> [-l]     Install extension source and add to settings
+  {APP_NAME} install <source> [-l]     Install extension source (registry name, github:, npm:, git:, path)
   {APP_NAME} remove <source> [-l]      Remove extension source from settings
   {APP_NAME} uninstall <source> [-l]   Alias for remove
   {APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
@@ -616,6 +616,7 @@ Extensions can register additional flags (e.g., --plan from plan-mode extension)
   RPI_VERSION_CHECK_URL            - Version check endpoint (default: https://revpi.dev/api/latest-version; "off" disables)
   RPI_TELEMETRY_URL                - Install telemetry endpoint (default: https://revpi.dev/api/report-install; "off" disables)
   RPI_MODEL_CATALOG_URL            - Remote model catalog base URL (default: https://revpi.dev; "off" disables)
+  RPI_REGISTRY_URL                 - Extension registry base URL (default: https://revpi.dev; "off" disables)
 
 {tools_bold}
   read   - Read file contents

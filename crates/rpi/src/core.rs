@@ -10,6 +10,7 @@ pub mod export_html;
 pub mod extension_actions;
 pub mod extension_context;
 pub mod extension_host_adapter;
+pub mod extension_registry;
 pub mod extensions;
 pub mod git_paths;
 pub mod git_url;
