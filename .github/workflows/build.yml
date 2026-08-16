@@ -143,15 +143,17 @@ jobs:
         run: |
           VERSION=${{ steps.version.outputs.version }}
           TARGET=${{ matrix.target }}
-          # macOS has no GNU sha256sum (ships shasum); both platforms print the same format
-          SHA256=$(command -v sha256sum || command -v shasum)
+          # macOS has no GNU sha256sum (ships shasum); both platforms print the same
+          # format. NOTE: shasum defaults to SHA-1 — the fallback must pass -a 256,
+          # otherwise sidecars are 40-hex SHA-1 and break verification (v0.1.1-rc bug).
+          if command -v sha256sum >/dev/null; then SHA256="sha256sum"; else SHA256="shasum -a 256"; fi
           mkdir -p dist
           tar -czf "dist/rpi-${VERSION}-${TARGET}.tar.gz" -C "target/${TARGET}/release" rpi
           # Sidecar must list the basename only: install.sh verifies from a
           # temp dir where the archive lives as <basename> (a dist/ path
           # prefix makes the check fail). Same shape as the fake releases in
           # scripts/test-install-sh.sh.
-          (cd dist && "$SHA256" "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
+          (cd dist && $SHA256 "rpi-${VERSION}-${TARGET}.tar.gz" > "rpi-${VERSION}-${TARGET}.tar.gz.sha256")
 
           # ---- First-party extensions (.rpix; extension-distribution.md §3 / §9.2) ----
           # Skipped on musl (see the build-step comment above: no cdylib
@@ -192,12 +194,12 @@ jobs:
             [ -f "crates/$CRATE/LICENSE" ] && cp "crates/$CRATE/LICENSE" "$TMP/"
             # In-pack checksums: every file except SHA256SUMS itself (the glob
             # expands before the redirect target is created), coreutils format.
-            (cd "$TMP" && "$SHA256" * > SHA256SUMS)
+            (cd "$TMP" && $SHA256 * > SHA256SUMS)
             RPIX="${EXT_NAME}-${VERSION}-${TARGET}.rpix"
             # No top-level directory (§3.1): glob from inside TMP so entries
             # are bare filenames, not ./-prefixed.
             (cd "$TMP" && tar -czf "$DIST/$RPIX" *)
-            (cd dist && "$SHA256" "$RPIX" > "$RPIX.sha256")
+            (cd dist && $SHA256 "$RPIX" > "$RPIX.sha256")
             rm -rf "$TMP"
           done
           fi
