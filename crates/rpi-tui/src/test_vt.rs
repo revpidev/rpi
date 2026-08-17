@@ -33,6 +33,7 @@
 //! suite implements it for its TUI type (delegating to the inherent
 //! `tick`/`has_pending_work` methods).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -119,6 +120,13 @@ struct VtState {
     cursor_hidden: bool,
     /// DECAWM (`\x1b[?7h`/`l`); enabled by default.
     autowrap: bool,
+    /// T33 (ADR-0020): chars this emulator renders as two columns even though
+    /// `unicode-width` measures them as one — simulates terminals whose emoji
+    /// font fallback renders e.g. U+2713 CHECK MARK wide, or CJK-locale
+    /// terminals rendering East Asian Ambiguous chars wide. The TUI's width
+    /// arithmetic uses `unicode-width`, so this injects exactly the renderer/
+    /// terminal width divergence that causes wrap drift on real terminals.
+    divergence_wide_chars: HashSet<char>,
     /// Saved main screen while the alternate screen buffer is active.
     main: Option<SavedScreen>,
     /// Every `write` recorded (upstream `LoggingVirtualTerminal`).
@@ -151,6 +159,7 @@ impl VirtualTerminal {
                 italic: false,
                 cursor_hidden: false,
                 autowrap: true,
+                divergence_wide_chars: HashSet::new(),
                 main: None,
                 writes: Vec::new(),
                 input_handler: None,
@@ -284,6 +293,13 @@ impl VirtualTerminal {
     pub(crate) fn clear_writes(&self) {
         self.lock().writes.clear();
     }
+
+    /// T33 (ADR-0020): make the emulator render `chars` as two columns wide
+    /// even though `unicode-width` measures them as one (see the
+    /// `divergence_wide_chars` field note).
+    pub(crate) fn set_divergence_wide_chars(&self, chars: &[char]) {
+        self.lock().divergence_wide_chars = chars.iter().copied().collect();
+    }
 }
 
 /// xterm `line.translateToString(true)`: trailing never-written cells are
@@ -326,7 +342,12 @@ impl VtState {
     }
 
     fn put_char(&mut self, ch: char) {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let divergent = self.divergence_wide_chars.contains(&ch);
+        let width = if divergent {
+            2
+        } else {
+            UnicodeWidthChar::width(ch).unwrap_or(0)
+        };
         if width == 0 {
             // Combining char: merge into the previous cell's text.
             if self.cursor_col > 0 {
@@ -338,6 +359,13 @@ impl VtState {
                 }
             }
             return;
+        }
+        if divergent && self.autowrap && self.cursor_col == self.cols - 1 {
+            // A wide glyph that no longer fits wraps before it is drawn
+            // (real-terminal behavior, applied only to divergence-injected
+            // chars so the upstream-parity wide-char path stays untouched).
+            self.cursor_col = 0;
+            self.line_feed();
         }
         if self.cursor_col >= self.cols {
             if self.autowrap {
@@ -1033,5 +1061,29 @@ mod tests {
         // Deref keeps the screen-model assertions available.
         terminal.write("alt");
         assert_eq!(terminal.get_viewport()[0], "alt");
+    }
+
+    #[test]
+    fn divergence_wide_chars_render_two_columns_and_wrap_at_the_margin() {
+        let mut vt = VirtualTerminal::new(5, 3);
+        vt.set_divergence_wide_chars(&['✓']);
+        // Mid-line: the glyph occupies two cells, shifting the tail right.
+        vt.write("a✓b");
+        assert_eq!(vt.get_viewport()[0], "a✓b");
+        assert_eq!(vt.get_cursor_position(), (4, 0));
+        // At the margin (one cell left): the wide glyph wraps before drawing,
+        // like a real terminal — the mechanism behind wrap drift (ADR-0020).
+        vt.write("✓");
+        assert_eq!(vt.get_viewport(), vec!["a✓b", "✓", ""]);
+        assert_eq!(vt.get_cursor_position(), (2, 1));
+    }
+
+    #[test]
+    fn divergence_wide_chars_do_not_affect_unlisted_chars() {
+        let mut vt = VirtualTerminal::new(5, 2);
+        vt.set_divergence_wide_chars(&['✓']);
+        vt.write("a→b");
+        // '→' keeps its `unicode-width` measurement of one column.
+        assert_eq!(vt.get_cursor_position(), (3, 0));
     }
 }

@@ -43,7 +43,7 @@ use crate::tui_base::{
     env_flag_is_1, schedule_render, CursorPos, PendingOsc11BackgroundQuery,
     PendingTerminalColorSchemeQuery, RenderSchedule, TerminalSizeCache, TuiBase,
 };
-use crate::utils::visible_width;
+use crate::utils::{slice_by_column, visible_width, width_divergence_extra};
 
 // =============================================================================
 // Kitty image line helpers (tui.ts:21-58)
@@ -221,6 +221,10 @@ pub(crate) struct TuiMainScreenInner {
     hardware_cursor_row: i32,
     max_lines_rendered: usize,
     previous_viewport_top: i32,
+    /// ADR-0020: content of the last overwide line logged to `rpi-crash.log`;
+    /// deduplicates the diagnostic snapshot while a persistent overwide line
+    /// streams (render no longer stops on the first offense).
+    last_overwide_log_line: Option<String>,
 }
 
 impl Deref for TuiMainScreenInner {
@@ -321,6 +325,7 @@ impl TuiMainScreen {
             hardware_cursor_row: 0,
             max_lines_rendered: 0,
             previous_viewport_top: 0,
+            last_overwide_log_line: None,
         };
         TuiMainScreen {
             inner: Arc::new(Mutex::new(inner)),
@@ -1084,7 +1089,8 @@ impl TuiMainScreenInner {
                 i += image_reserved_rows;
                 continue;
             }
-            buffer.push_str(line);
+            let guarded = self.guard_line_width(line, i, width, &new_lines);
+            buffer.push_str(&guarded);
             i += 1;
         }
         buffer.push_str("\x1b[?2026l"); // end synchronized output
@@ -1104,6 +1110,79 @@ impl TuiMainScreenInner {
         self.previous_lines = new_lines;
         self.previous_width = width;
         self.previous_height = height;
+    }
+
+    /// Width guard applied to every line before it is written to the terminal
+    /// (ADR-0020, deviation D-086; rpi addition diverging from upstream, which
+    /// stops the TUI and throws on overwide lines — tui-main-screen.ts:455-479
+    /// @ 4181f66). Two rules:
+    ///
+    /// 1. Overwide lines (`visible_width > width`) are truncated with
+    ///    `slice_by_column`, like the alt-screen renderer does
+    ///    (`tui_alt_screen.rs`), so a component bug cannot kill the session; a
+    ///    diagnostic snapshot is still written to `rpi-crash.log`.
+    /// 2. Lines whose pessimistic width (`visible_width` +
+    ///    `width_divergence_extra`) exceeds the terminal width are truncated
+    ///    until they fit pessimistically, so a terminal that renders
+    ///    divergence-risk characters (emoji-property / East Asian Ambiguous)
+    ///    wider than `unicode-width` measures cannot auto-wrap early and
+    ///    desync the tracked cursor row.
+    fn guard_line_width(
+        &mut self,
+        line: &str,
+        index: usize,
+        width: i32,
+        new_lines: &[String],
+    ) -> String {
+        let width = width.max(0) as usize;
+        let measured = visible_width(line);
+        if measured > width {
+            self.log_overwide_truncation(line, index, width, new_lines);
+            return slice_by_column(line, 0, width, true);
+        }
+        let extra = width_divergence_extra(line);
+        if extra > 0 && measured + extra > width {
+            return slice_by_column(line, 0, width - extra, true);
+        }
+        line.to_string()
+    }
+
+    /// Diagnostic snapshot for a truncated overwide line: same file and
+    /// payload shape as upstream's pre-throw crash log, but the header records
+    /// that rendering continued. Written once per distinct offending line —
+    /// unlike upstream, rendering no longer stops on the first offense, so a
+    /// persistent overwide line would otherwise rewrite the file every frame.
+    fn log_overwide_truncation(
+        &mut self,
+        line: &str,
+        index: usize,
+        width: usize,
+        new_lines: &[String],
+    ) {
+        if self.last_overwide_log_line.as_deref() == Some(line) {
+            return;
+        }
+        let crash_log_path = self.log_directory.join("rpi-crash.log");
+        let mut crash_data = format!(
+            "Overwide rendered line truncated at {} (render continued; not a crash)\nTerminal width: {}\nLine {} visible width: {}\n\n=== All rendered lines ===\n",
+            iso_timestamp_now(),
+            width,
+            index,
+            visible_width(line)
+        );
+        for (i, rendered) in new_lines.iter().enumerate() {
+            crash_data.push_str(&format!(
+                "[{i}] (w={}) {rendered}\n",
+                visible_width(rendered)
+            ));
+        }
+        crash_data.push('\n');
+        if let Some(parent) = crash_log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&crash_log_path, crash_data).is_ok() {
+            self.last_overwide_log_line = Some(line.to_string());
+        }
     }
 
     /// `logRedraw` (tui.ts:1331-1338); env var renamed to `RPI_DEBUG_REDRAW`
@@ -1448,41 +1527,14 @@ impl TuiMainScreenInner {
                 continue;
             }
 
+            // ADR-0020 (deviation D-086): overwide lines are truncated via
+            // `guard_line_width` instead of upstream's stop + throw, so a
+            // component bug cannot kill the session.
             buffer.push_str("\x1b[2K"); // clear current line
-            if !is_image && visible_width(&line) > width.max(0) as usize {
-                // Log all lines to a crash file for debugging.
-                let crash_log_path = self.log_directory.join("rpi-crash.log");
-                let mut crash_data = format!(
-                    "Crash at {}\nTerminal width: {}\nLine {} visible width: {}\n\n=== All rendered lines ===\n",
-                    iso_timestamp_now(),
-                    width,
-                    i,
-                    visible_width(&line)
-                );
-                for (index, rendered) in new_lines.iter().enumerate() {
-                    crash_data.push_str(&format!(
-                        "[{index}] (w={}) {rendered}\n",
-                        visible_width(rendered)
-                    ));
-                }
-                crash_data.push('\n');
-                if let Some(parent) = crash_log_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&crash_log_path, crash_data);
-
-                // Clean up terminal state before throwing.
-                self.stop_internal(TuiStopOptions::default());
-
-                let error_message = format!(
-                    "Rendered line {} exceeds terminal width ({} > {}).\n\nThis is likely caused by a custom TUI component not truncating its output.\nUse visibleWidth() to measure and truncateToWidth() to truncate lines.\n\nDebug log written to: {}",
-                    i,
-                    visible_width(&line),
-                    width,
-                    crash_log_path.display()
-                );
-                panic!("{error_message}");
-            }
+            let line = match is_image {
+                true => line,
+                false => self.guard_line_width(&line, i as usize, width, &new_lines),
+            };
             buffer.push_str(&line);
             i += 1;
         }
@@ -6102,5 +6154,172 @@ mod tests {
             serde_json::from_str::<TuiMode>("\"fullscreen\"").unwrap(),
             TuiMode::Fullscreen
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T33: overwide-line truncation and the full-width divergence guard
+    // (ADR-0020, deviation D-086; no upstream equivalent — upstream stops the
+    // TUI and throws on overwide lines)
+    // -------------------------------------------------------------------------
+
+    /// An overwide line no longer panics: it is truncated to the terminal
+    /// width, rendering continues, and a diagnostic snapshot is written to
+    /// `rpi-crash.log` (once per distinct offending line).
+    #[test]
+    fn overwide_line_is_truncated_and_render_continues() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let log_dir = temp_log_dir();
+        let crash_log = log_dir.join("rpi-crash.log");
+        let tui =
+            TuiMainScreen::with_options(Box::new(terminal.clone()), None, Some(log_dir.clone()));
+        let (component, lines) = test_component(&["short", &"x".repeat(50)]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+
+        // No panic; the overwide line is truncated to the terminal width.
+        assert_eq!(terminal.get_viewport()[1], "x".repeat(40));
+
+        // Rendering continues: later updates still land.
+        set_lines(&lines, &["short", "recovered"]);
+        render_and_flush(&tui);
+        assert_eq!(terminal.get_viewport()[1], "recovered");
+
+        // Diagnostic snapshot records the truncation (and that render
+        // continued), with the same payload shape as upstream's crash log.
+        let log = std::fs::read_to_string(&crash_log).expect("crash log written");
+        assert!(
+            log.starts_with("Overwide rendered line truncated at "),
+            "header: {log}"
+        );
+        assert!(
+            log.contains("(render continued; not a crash)"),
+            "note: {log}"
+        );
+        assert!(log.contains("Terminal width: 40"), "width: {log}");
+        assert!(log.contains("Line 1 visible width: 50"), "line info: {log}");
+
+        // The same offending line again is deduplicated (no rewrite).
+        std::fs::remove_file(&crash_log).expect("remove crash log");
+        set_lines(&lines, &["changed", &"x".repeat(50)]);
+        render_and_flush(&tui);
+        assert!(
+            !crash_log.exists(),
+            "same overwide line must not rewrite the log"
+        );
+
+        // A different overwide line logs a fresh snapshot.
+        set_lines(&lines, &["changed", &"y".repeat(60)]);
+        render_and_flush(&tui);
+        let log = std::fs::read_to_string(&crash_log).expect("crash log rewritten");
+        assert!(log.contains("Line 1 visible width: 60"), "new line: {log}");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// A line measured exactly the terminal width that contains
+    /// divergence-risk characters is truncated pessimistically (by the number
+    /// of risk chars), so a terminal rendering them wider cannot auto-wrap
+    /// early. Pure-ASCII full-width lines are left untouched.
+    #[test]
+    fn full_width_line_with_divergence_risk_is_truncated_pessimistically() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = new_tui(&terminal);
+        let one_risk = format!("{}✓", "a".repeat(39)); // measured 40, extra 1
+        let three_risk = format!("{}✓★✓", "b".repeat(37)); // measured 40, extra 3
+        let ascii_full = "c".repeat(40); // measured 40, extra 0
+        let (component, _lines) = test_component(&[&one_risk, &three_risk, &ascii_full, "next"]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+
+        let viewport = terminal.get_viewport();
+        assert_eq!(viewport[0], "a".repeat(39), "one risk char: drop 1 column");
+        assert_eq!(viewport[1], "b".repeat(37), "three risk chars: drop 3");
+        assert_eq!(viewport[2], ascii_full, "pure ASCII full width stays");
+        assert_eq!(viewport[3], "next");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// The incident reproduction (2026-08-17 "Working..." corruption): a
+    /// spinner line, a growing stream, and a full-width line with a
+    /// divergence-risk char, on a terminal that renders that char wider than
+    /// `unicode-width` measures. The tracked cursor must not desync: the final
+    /// frame appears exactly, row for row, with no stale or shifted rows.
+    #[test]
+    fn streaming_full_width_divergent_lines_do_not_desync_tracked_cursor() {
+        let terminal = VirtualTerminal::new(40, 12);
+        terminal.set_divergence_wide_chars(&['✓']);
+        let tui = new_tui(&terminal);
+        let (component, lines) = test_component(&["start"]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+
+        let spinner = ["⠋", "⠙", "⠹"];
+        for frame in 0..6usize {
+            let mut frame_lines = vec![format!("{} Working...", spinner[frame % 3])];
+            for n in 0..frame {
+                frame_lines.push(format!("row {n}"));
+            }
+            // Measured exactly the terminal width, one divergence-risk char.
+            frame_lines.push(format!("{}✓", "a".repeat(39)));
+            frame_lines.push(format!("tail {frame}"));
+            let refs: Vec<&str> = frame_lines.iter().map(String::as_str).collect();
+            set_lines(&lines, &refs);
+            render_and_flush(&tui);
+        }
+
+        let viewport = terminal.get_viewport();
+        let mut expected = vec!["⠹ Working...".to_string()];
+        for n in 0..5 {
+            expected.push(format!("row {n}"));
+        }
+        expected.push("a".repeat(39)); // conservatively truncated: ✓ dropped
+        expected.push("tail 5".to_string());
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(&viewport[i], want, "viewport row {i}");
+        }
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// Regression (post-T33 report): full-width box-drawing lines — the
+    /// Editor's `─`.repeat(width) borders — are not divergence risks and must
+    /// render in full. `─` is eaw=Neutral and not emoji-capable, so no
+    /// terminal renders it wider than measured.
+    #[test]
+    fn full_width_box_drawing_border_lines_are_not_truncated() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = new_tui(&terminal);
+        let border = "─".repeat(40);
+        let (component, _lines) = test_component(&[&border, "input", &border]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+
+        let viewport = terminal.get_viewport();
+        assert_eq!(viewport[0], border, "top border must render in full");
+        assert_eq!(viewport[1], "input");
+        assert_eq!(viewport[2], border, "bottom border must render in full");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    /// The `full_render` path (here: terminal width change) applies the same
+    /// width guard, so an overwide line cannot wrap during a full redraw.
+    #[test]
+    fn overwide_line_is_truncated_on_full_render_after_resize() {
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = new_tui(&terminal);
+        let (component, _lines) = test_component(&[&"x".repeat(50), "end"]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+        assert_eq!(terminal.get_viewport()[0], "x".repeat(40));
+
+        terminal.resize(30, 10);
+        render_and_flush(&tui);
+        let viewport = terminal.get_viewport();
+        assert_eq!(viewport[0], "x".repeat(30), "truncated to the new width");
+        assert_eq!(viewport[1], "end", "no wrapped tail pushing content down");
+        tui.stop(TuiStopOptions::default());
     }
 }

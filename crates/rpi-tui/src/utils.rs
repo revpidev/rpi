@@ -512,6 +512,59 @@ pub fn visible_width(str: &str) -> usize {
     width
 }
 
+/// Pessimistic extra columns a real terminal may render beyond
+/// [`visible_width`] for this line (ADR-0020; rpi addition, no upstream
+/// equivalent). Counts characters that `unicode-width` measures as one column
+/// but some terminals render as two via **emoji font fallback**: emoji-capable
+/// characters in the `could_be_emoji` blocks (✓ U+2713, ❤, ⌚, ⭐ …) render
+/// wide in terminals that substitute an emoji font, even without VS16. This is
+/// the divergence class observed in the 2026-08-17 wrap-drift incident.
+///
+/// Deliberately NOT counted (first iteration over-counted and erased the
+/// Editor's full-width `─` borders):
+/// - East Asian Ambiguous characters (→ — ± é, and structurally important
+///   box-drawing/block/Braille blocks, all eaw=A or N): wide only in
+///   CJK-locale terminal configurations, where every full-width border line
+///   would drift anyway regardless of this guard. Documented residual
+///   (ADR-0020 后果节).
+/// - Characters already measured as 2 columns (wide CJK, RGI emoji).
+///
+/// ANSI/OSC/APC sequences are ignored. The main-screen renderer truncates
+/// lines whose pessimistic width (`visible_width + width_divergence_extra`)
+/// exceeds the terminal width, so an early auto-wrap cannot desync its
+/// tracked cursor row.
+pub fn width_divergence_extra(str: &str) -> usize {
+    if str.is_empty() || is_printable_ascii(str) {
+        return 0;
+    }
+    let clean = if str.contains('\x1b') {
+        strip_terminal_sequences(str)
+    } else {
+        str.to_string()
+    };
+    clean
+        .chars()
+        .filter(|c| is_divergence_risk_char(*c))
+        .count()
+}
+
+/// See [`width_divergence_extra`]. Char-level view: a char counts when
+/// `unicode-width` measures it as one column and it sits in one of the
+/// emoji-capable blocks.
+fn is_divergence_risk_char(c: char) -> bool {
+    if c.is_ascii() || UnicodeWidthChar::width(c) != Some(1) {
+        return false;
+    }
+    // Emoji-capable blocks (same ranges as `could_be_emoji`, which must stay
+    // byte-exact for width parity — this is a separate, deliberately
+    // conservative use). The pictograph range (U+1F000–U+1FBFF) is omitted:
+    // those chars measure 2 already.
+    let cp = c as u32;
+    (0x2300..=0x23ff).contains(&cp) // Misc technical
+        || (0x2600..=0x27bf).contains(&cp) // Misc symbols, dingbats (✓ U+2713 here)
+        || (0x2b50..=0x2b55).contains(&cp) // Specific stars/circles
+}
+
 /// Normalize text for terminal output without changing logical editor content
 /// (utils.ts:284-306). Some terminals render precomposed Thai/Lao AM vowels
 /// inconsistently during differential repaint. Their compatibility
@@ -5633,6 +5686,50 @@ mod tests {
         for sample in samples {
             assert_eq!(visible_width(sample), 2, "Expected {sample} to be width 2");
         }
+    }
+
+    // ---- widthDivergenceExtra (ADR-0020; rpi addition, no upstream equivalent) ----
+
+    #[test]
+    fn divergence_extra_is_zero_for_ascii_and_wide_only_lines() {
+        assert_eq!(width_divergence_extra(""), 0);
+        assert_eq!(width_divergence_extra("plain ascii"), 0);
+        // Wide chars measure 2 already — no divergence possible.
+        assert_eq!(width_divergence_extra("界界界"), 0);
+        assert_eq!(width_divergence_extra("✅ emoji measured wide"), 0);
+    }
+
+    #[test]
+    fn divergence_extra_ignores_chars_no_terminal_renders_wide() {
+        // Regression (editor borders vanished): box-drawing chars are never
+        // rendered wide — never counted, so full-width border/separator lines
+        // survive.
+        assert_eq!(width_divergence_extra(&"─".repeat(40)), 0);
+        assert_eq!(width_divergence_extra("│─┌┐└┘├┤"), 0);
+        // Braille spinner cells likewise stay narrow everywhere.
+        assert_eq!(width_divergence_extra("⠋ Working..."), 0);
+        // East Asian Ambiguous is a documented residual (CJK-locale-only
+        // divergence; see the function doc): not counted.
+        assert_eq!(width_divergence_extra("a → b ± c — ×"), 0);
+    }
+
+    #[test]
+    fn divergence_extra_counts_emoji_capable_narrow_chars() {
+        // U+2713 CHECK MARK: measured 1, may render 2 via emoji font fallback.
+        assert_eq!(width_divergence_extra("done ✓"), 1);
+        // One per emoji-capable block (misc symbols / dingbats / stars).
+        assert_eq!(width_divergence_extra("✓ ✔ ★"), 3);
+        // Combining/zero-width chars never contribute.
+        assert_eq!(width_divergence_extra("e\u{0301}"), 0);
+    }
+
+    #[test]
+    fn divergence_extra_ignores_ansi_sequences() {
+        assert_eq!(width_divergence_extra("\x1b[31m✓\x1b[0m"), 1);
+        assert_eq!(
+            width_divergence_extra("\x1b]8;;http://x\x07✓\x1b]8;;\x07"),
+            1
+        );
     }
 
     // ---- getGraphemeCellRange (utils.ts:319-341 @ 4181f66) ----

@@ -107,10 +107,15 @@
 //! - `query_terminal_background_color` / `query_terminal_color_scheme` return
 //!   `oneshot::Receiver`s instead of Promises; their timeouts fire from
 //!   `TuiMainScreen::tick`.
-//! - The width-overflow path writes the crash log, stops the TUI and then
-//!   panics with the upstream error message (upstream throws an uncaught
-//!   Error). Redraw/crash log write failures are ignored (upstream would
-//!   throw).
+//! - The width-overflow path truncates the line with `slice_by_column` and
+//!   continues rendering (ADR-0020, deviation D-086; upstream stops the TUI
+//!   and throws). A diagnostic snapshot is still written to `rpi-crash.log`
+//!   (header notes render continued; deduplicated per offending line). Lines
+//!   whose pessimistic width (`visible_width` + `width_divergence_extra`)
+//!   exceeds the terminal width are truncated until they fit pessimistically,
+//!   so terminals rendering divergence-risk characters wider cannot auto-wrap
+//!   early and desync the tracked cursor row. Redraw/log write failures are
+//!   ignored (upstream would throw).
 //! - T30 extension of the frozen component contract: `Component` gains two
 //!   defaulted methods — `layout_node` (replaces upstream's `LAYOUT_NODE`
 //!   symbol protocol, layout-node.ts:48-51) and `as_scroll_view` (scroll
