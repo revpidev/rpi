@@ -109,7 +109,7 @@ fn js_trim(text: &str) -> &str {
         .char_indices()
         .rev()
         .find(|&(_, c)| !is_js_whitespace(c))
-        .map(|(i, _)| start + i + 1)
+        .map(|(i, c)| start + i + c.len_utf8())
         .unwrap_or(start);
     &text[start..end]
 }
@@ -1022,6 +1022,11 @@ mod tests {
         assert_eq!(js_trim("\u{00A0}foo\u{3000}"), "foo");
         assert_eq!(js_trim("   "), "");
         assert_eq!(js_trim(""), "");
+        // Multibyte last non-whitespace char: the end bound must advance by
+        // the char's UTF-8 length, not 1, or the slice panics mid-char.
+        assert_eq!(js_trim(" 云 "), "云");
+        assert_eq!(js_trim("你好 "), "你好");
+        assert_eq!(js_trim("xé "), "xé");
     }
 
     #[test]
