@@ -69,6 +69,17 @@
 //!   - `render_latex` is part of the render cache key (upstream has no such
 //!     cache key); flipping the option without `invalidate()` re-renders
 //!     instead of serving stale lines.
+//!   - A lone `=`/`-` line inside a `$$`/`\[` block is a setext underline to
+//!     CommonMark, so comrak turned the block into a `Heading` before the
+//!     paragraph-scoped recognizer could see it (upstream is immune: marked
+//!     block extensions run ahead of the paragraph/setext rules). Fixed by
+//!     `rewrite_setext_lone_operators`: the copy handed to comrak rewrites
+//!     those lines to same-length `.` bytes, while every slice below uses
+//!     the original source, so the bare `=`/`-` still reaches `render_latex`
+//!     (parity verified byte-for-byte against upstream for `$$`/`\[`/lone
+//!     `-`/indented-`=` cases). Skipped when `render_latex` is off: the raw
+//!     fallbacks there echo comrak node values, which would leak the `.`
+//!     bytes (D-078 supplement).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -704,6 +715,141 @@ fn split_latex_blocks(raw: &str) -> Vec<LatexParagraphSegment<'_>> {
         });
     }
     segments
+}
+
+/// Display-math shadow-source rewrite (D-078 supplement, upstream has no
+/// such failure). Inside an open display block (`$$`/`\[`), a lone line of
+/// `=`/`-` characters is consumed by CommonMark setext-heading parsing
+/// before the render-layer recognizer below ever runs — it only sees
+/// `Paragraph` nodes, and the setext rule has already turned the block into
+/// a `Heading`. Upstream is immune: marked's block tokenizer extensions run
+/// ahead of the paragraph/setext rules, so the `$$` block is captured whole.
+///
+/// Fix: rewrite those lines to `.` bytes in the copy handed to comrak. The
+/// rewrite is byte-for-byte same-length, so every comrak `sourcepos` (byte
+/// columns) stays valid on the original source, which is what all renderer
+/// slicing (`node_slice`/`node_raw`) and the LaTeX input itself use — the
+/// bare `=`/`-` lines therefore reach `render_latex` untouched (the latex
+/// layer handles them fine). Guards: fenced code blocks are tracked and
+/// never entered (their literal comes from the parse source); list/quote
+/// bodies never match the ` {0,3}` block-delimiter lines, matching the
+/// render layer which also only recognizes display blocks in paragraphs.
+/// Not applied when `render_latex` is off: the raw-text fallbacks echo
+/// comrak node values there, which would leak the `.` bytes.
+fn rewrite_setext_lone_operators(source: &str) -> String {
+    // Fast path: no display delimiters at all, nothing can be inside a block.
+    if !(source.contains("$$") || source.contains("\\[")) {
+        return source.to_string();
+    }
+    let mut out = String::with_capacity(source.len());
+    // Open fence: (marker char, marker run length). Fenced blocks protect
+    // their content from both the block tracking and the rewrite.
+    let mut fence: Option<(char, usize)> = None;
+    // Display-block state, tracked by the same ` {0,3}` line shapes that
+    // `tokenize_block_latex` matches: opening lines start with the
+    // delimiter, closing lines end with it, and one-liners like `$$x$$` /
+    // `\[x\]` are self-contained (they open and close within the line, the
+    // lazy block regex ends the block there too).
+    let mut in_dollar_block = false;
+    let mut in_bracket_block = false;
+
+    for line in source.split_inclusive('\n') {
+        let (body, newline) = match line.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (line, ""),
+        };
+        // Lines indented 4+ spaces are outside every `^ {0,3}` block scope,
+        // and a 4+-space lone `=`/`-` is not a setext underline either.
+        let indent = body.len() - body.trim_start_matches(' ').len();
+        let rest = &body[indent..];
+        let ends = body.trim_end_matches([' ', '\t']);
+
+        // Lone `=`/`-` operator line inside a display block → same-length
+        // `.` bytes (comrak columns are byte offsets, so every sourcepos
+        // stays valid on the original source).
+        let lone_rewrite = |body: &str| {
+            let content = body.trim_matches([' ', '\t']);
+            (!content.is_empty()
+                && (content.chars().all(|c| c == '=') || content.chars().all(|c| c == '-')))
+            .then(|| {
+                body.chars()
+                    .map(|c| if c == '=' || c == '-' { '.' } else { c })
+                    .collect::<String>()
+            })
+        };
+
+        let rewritten: Option<String>;
+        if let Some((marker, open_len)) = fence {
+            // Closing fence: same marker char, at least the opening run
+            // length, blank remainder.
+            let run: Vec<char> = rest
+                .chars()
+                .take_while(|&c| c != ' ' && c != '\t')
+                .collect();
+            let closing = indent <= 3
+                && run.first() == Some(&marker)
+                && run.iter().all(|&c| c == marker)
+                && run.len() >= open_len
+                && rest.chars().skip(run.len()).all(|c| c == ' ' || c == '\t');
+            if closing {
+                fence = None;
+            }
+            rewritten = None;
+        } else if indent > 3 {
+            rewritten = None;
+        } else {
+            // Fence opening: ` {0,3}` + ``` or ~~~ (3+).
+            let fence_open = match rest.chars().next() {
+                Some(marker @ ('`' | '~')) => {
+                    let run = rest.chars().take_while(|&c| c == marker).count();
+                    (run >= 3).then_some((marker, run))
+                }
+                _ => None,
+            };
+            if let Some(open) = fence_open {
+                fence = Some(open);
+                rewritten = None;
+            } else {
+                let starts_dollar = rest.starts_with("$$");
+                let ends_dollar = ends.ends_with("$$");
+                let dollar_self_contained = starts_dollar && ends_dollar && ends.len() > 4;
+                let starts_bracket = rest.starts_with("\\[");
+                let bracket_self_contained = starts_bracket && ends.ends_with("\\]");
+                if in_dollar_block {
+                    if ends_dollar {
+                        in_dollar_block = false;
+                        rewritten = None;
+                    } else {
+                        rewritten = lone_rewrite(body);
+                    }
+                } else if in_bracket_block {
+                    if ends.ends_with("\\]") {
+                        in_bracket_block = false;
+                        rewritten = None;
+                    } else {
+                        rewritten = lone_rewrite(body);
+                    }
+                } else if starts_dollar && !dollar_self_contained {
+                    in_dollar_block = true;
+                    rewritten = None;
+                } else if starts_bracket && !bracket_self_contained {
+                    in_bracket_block = true;
+                    rewritten = None;
+                } else {
+                    rewritten = None;
+                }
+            }
+        }
+
+        match rewritten {
+            Some(body_out) => {
+                out.push_str(&body_out);
+                out.push_str(newline);
+            }
+            None => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// Whether the source gap between two blocks contains a blank line. Blank
@@ -2199,9 +2345,25 @@ impl Component for Markdown {
         // Replace tabs with 3 spaces for consistent rendering.
         let normalized_text = transformed_text.replace('\t', "   ");
 
+        // Display-math shadow source (see `rewrite_setext_lone_operators`):
+        // comrak parses the rewritten copy so a setext underline inside a
+        // `$$`/`\[` block cannot cut the paragraph in half before the
+        // render-layer LaTeX recognizer sees it. The rewrite is
+        // same-length, so every sourcepos below still slices the original
+        // `normalized_text`. Skipped when LaTeX rendering is off — the raw
+        // fallbacks there echo comrak node values, which would show the
+        // `.` bytes.
+        let parse_text;
+        let parse_source: &str = if self.options.render_latex {
+            parse_text = rewrite_setext_lone_operators(&normalized_text);
+            &parse_text
+        } else {
+            &normalized_text
+        };
+
         // Parse markdown (comrak replaces marked's lexer).
         let arena = Arena::new();
-        let root = parse_document(&arena, &normalized_text, &parser_options());
+        let root = parse_document(&arena, parse_source, &parser_options());
         trim_partial_closing_fences(root, &normalized_text);
 
         // Convert tokens to styled terminal output.
@@ -3721,6 +3883,109 @@ A=
 
         let display = md("\\[\nx^2");
         assert_eq!(plain(&display, 80), ["\\[", "x^2"]);
+    }
+
+    #[test]
+    fn rewrites_only_lone_operator_lines_inside_display_blocks() {
+        let cases: &[(&str, &str)] = &[
+            // Lone operator lines inside a display block → same-length `.`.
+            ("$$\nx\n=\ny\n$$", "$$\nx\n.\ny\n$$"),
+            ("\\[\nx\n-\ny\n\\]", "\\[\nx\n.\ny\n\\]"),
+            ("  $$\n  ===  \n  $$", "  $$\n  ...  \n  $$"),
+            // Outside any block: setext headings / thematic breaks intact.
+            ("Para\n=", "Para\n="),
+            ("Para\n---", "Para\n---"),
+            // Self-contained one-liners open no block state.
+            ("$$x$$\n\nPara\n=", "$$x$$\n\nPara\n="),
+            ("\\[x\\]\n\nPara\n-", "\\[x\\]\n\nPara\n-"),
+            // Fenced code content is never rewritten.
+            ("```text\n$$\n=\n$$\n```", "```text\n$$\n=\n$$\n```"),
+            // No delimiters at all: fast path, byte-identical.
+            ("a\n=\nb", "a\n=\nb"),
+        ];
+        for (source, expected) in cases {
+            let rewritten = rewrite_setext_lone_operators(source);
+            assert_eq!(&rewritten, expected, "source: {source:?}");
+            assert_eq!(rewritten.len(), source.len(), "source: {source:?}");
+        }
+    }
+
+    #[test]
+    fn renders_display_latex_with_lone_setext_operator_lines() {
+        // Without the shadow-source rewrite, CommonMark turns the lone `=`
+        // line into a setext underline and cuts the block into a Heading +
+        // Paragraph before the LaTeX recognizer runs.
+        let dollar = md("$$\nx + y\n=\nz\n$$");
+        assert_eq!(plain(&dollar, 80), ["x + y = z"]);
+
+        let dash = md("$$\nx + y\n-\nz\n$$");
+        assert_eq!(plain(&dash, 80), ["x + y - z"]);
+
+        let bracket = md("\\[\nx\n-\ny\n\\]");
+        assert_eq!(plain(&bracket, 80), ["x - y"]);
+
+        // Indented + trailing whitespace underline runs are rewritten too.
+        let padded = md("$$\nx\n  =  \ny\n$$");
+        assert_eq!(plain(&padded, 80), ["x = y"]);
+
+        // A list after the block still renders (lone `-` did not leak out).
+        let with_list = md("$$\nx\n=\ny\n$$\n\n- item");
+        assert_eq!(plain(&with_list, 80), ["x = y", "", "- item"]);
+    }
+
+    #[test]
+    fn keeps_setext_headings_outside_display_latex() {
+        let heading = md("Paragraph text\n=");
+        assert_eq!(plain(&heading, 80), ["Paragraph text"]);
+
+        let dash_heading = md("Paragraph text\n---");
+        assert_eq!(plain(&dash_heading, 80), ["Paragraph text"]);
+
+        // `$$x$$` closes within its own line: the following lone `=` is
+        // outside any display block and still forms a setext heading.
+        let after_one_liner = md("$$x$$\n\nParagraph\n=");
+        assert_eq!(plain(&after_one_liner, 80), ["x", "", "Paragraph"]);
+    }
+
+    #[test]
+    fn does_not_rewrite_setext_lines_inside_code_fences() {
+        let source = "```text\n$$\nx\n=\ny\n$$\n```";
+        let markdown = md(source);
+        assert_eq!(
+            plain(&markdown, 80),
+            ["```text", "  $$", "  x", "  =", "  y", "  $$", "```"]
+        );
+    }
+
+    #[test]
+    fn leaves_lone_operator_blocks_unrewritten_when_latex_disabled() {
+        // With rendering off the raw text is echoed from comrak node
+        // values, so the shadow source is skipped and the pre-fix
+        // setext-splitting behavior is preserved.
+        let markdown = Markdown::new(
+            "$$\nx + y\n=\nz\n$$",
+            0,
+            0,
+            theme(),
+            None,
+            Some(MarkdownOptions {
+                render_latex: false,
+                ..Default::default()
+            }),
+        );
+        assert_eq!(plain(&markdown, 80), ["$$", "x + y", "", "z", "$$"]);
+    }
+
+    #[test]
+    fn streams_display_latex_with_lone_operator_line() {
+        // Token-by-token append: every prefix must render without panicking
+        // (pending fallback), and the closed block renders the math.
+        let mut received = String::new();
+        for piece in ["$$", "\nx", " + y", "\n=", "\nz", "\n$$"] {
+            received.push_str(piece);
+            let _ = plain(&md(&received), 80);
+        }
+        assert_eq!(plain(&md(&received), 80), ["x + y = z"]);
     }
 
     #[test]
