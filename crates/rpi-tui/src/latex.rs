@@ -34,6 +34,18 @@
 //! - `read_raw_group`'s `\` skip advances past the whole next scalar value
 //!   instead of one UTF-16 code unit (same result for ASCII sources).
 //! - `render_latex` takes a `bool` instead of the upstream options object.
+//! - Beyond-upstream command coverage (D-087): upstream rejects every command
+//!   listed below outright (the whole expression falls back to raw source).
+//!   rpi renders them, mapped after KaTeX's supported-symbols table:
+//!   `blacksquare` and the black/proof family, the arrow tail (incl.
+//!   mirrored siblings), the amssymb negated/strict relations, a handful of
+//!   binary/ordinary symbols (`\Box`, `\triangleq`, `\lnot`, …), the
+//!   `\overgroup` accent, `\cfrac` (= `\dfrac`), `\xrightarrow`/`\xleftarrow`
+//!   (script-tagged long arrow), `\genfrac` (inline fraction with explicit
+//!   delimiters), the phantom/strut/raisebox/lap family and the `subarray`
+//!   environment (comma-joined) — each with terminal-degraded semantics
+//!   documented in D-087 (phantoms -> spaces/empty, raisebox drops the
+//!   distance, lap boxes lose the overlap).
 //!
 //! Ported tests: `packages/tui/test/latex.test.ts` (all defineCases tables
 //! and standalone `it` cases) in `#[cfg(test)] mod tests` below.
@@ -229,6 +241,11 @@ const SYMBOLS: &[(&str, &str)] = &[
     ("bot", "⊥"),
     ("triangle", "△"),
     ("square", "□"),
+    // Not in upstream latex.ts (which only has `square`): upstream fails the
+    // whole expression on `\blacksquare` and echoes the raw source. The QED
+    // tombstone is near-universal in LLM-written proofs, so rpi renders it
+    // (deviation D-087).
+    ("blacksquare", "■"),
     ("lozenge", "◊"),
     ("checkmark", "✓"),
     ("complement", "∁"),
@@ -259,6 +276,78 @@ const SYMBOLS: &[(&str, &str)] = &[
     ("lceil", "⌈"),
     ("rceil", "⌉"),
     ("colon", ":"),
+    // ---- rpi additions (D-087), not in upstream latex.ts ----
+    // Upstream rejects these commands outright (whole expression falls back
+    // to raw source). Mappings follow KaTeX's supported-symbols table.
+    // Black/proof family + big operators' ordinary siblings.
+    ("blacktriangle", "▲"),
+    ("blacktriangledown", "▼"),
+    ("blacktriangleleft", "◀"),
+    ("blacktriangleright", "▶"),
+    ("blacklozenge", "◆"),
+    ("bigstar", "★"),
+    ("vartriangle", "△"),
+    ("triangledown", "▽"),
+    // Arrow tail (mirrors of already-supported commands included).
+    ("updownarrow", "↕"),
+    ("Uparrow", "⇑"),
+    ("Downarrow", "⇓"),
+    ("Updownarrow", "⇕"),
+    ("circlearrowleft", "↺"),
+    ("circlearrowright", "↻"),
+    ("curvearrowleft", "↶"),
+    ("curvearrowright", "↷"),
+    ("Lsh", "↰"),
+    ("Rsh", "↱"),
+    ("dashleftarrow", "⇠"),
+    ("dashrightarrow", "⇢"),
+    ("leftleftarrows", "⇇"),
+    ("rightrightarrows", "⇉"),
+    ("leftrightarrows", "⇆"),
+    ("rightleftarrows", "⇄"),
+    // Negated/strict relations (the `\not\x` composed forms were already
+    // supported via NEGATED_SYMBOLS; these are the amssymb single macros).
+    ("lll", "⋘"),
+    ("ggg", "⋙"),
+    ("nprec", "⊀"),
+    ("nsucc", "⊁"),
+    ("subsetneq", "⊊"),
+    ("supsetneq", "⊋"),
+    ("nsubseteq", "⊈"),
+    ("nsupseteq", "⊉"),
+    ("notni", "∌"),
+    ("nmid", "∤"),
+    ("nparallel", "∦"),
+    ("smile", "⌣"),
+    ("frown", "⌢"),
+    ("triangleq", "≜"),
+    // Binary operators.
+    ("diamond", "⋄"),
+    ("bigtriangleup", "△"),
+    ("bigtriangledown", "▽"),
+    ("smallsetminus", "∖"),
+    ("centerdot", "·"),
+    // Ordinary symbols.
+    ("lnot", "¬"),
+    ("imath", "ı"),
+    ("jmath", "ȷ"),
+    ("measuredangle", "∡"),
+    ("sphericalangle", "∢"),
+    ("backprime", "‵"),
+    ("surd", "√"),
+    ("flat", "♭"),
+    ("sharp", "♯"),
+    ("natural", "♮"),
+    ("clubsuit", "♣"),
+    ("diamondsuit", "♢"),
+    ("heartsuit", "♡"),
+    ("spadesuit", "♠"),
+    ("maltese", "✠"),
+    ("Box", "□"),
+    ("Diamond", "◇"),
+    ("diagup", "╱"),
+    ("diagdown", "╲"),
+    ("digamma", "ϝ"),
 ];
 
 const NEGATED_SYMBOLS: &[(char, &str)] = &[
@@ -395,6 +484,8 @@ const ACCENTS: &[(&str, &str)] = &[
     ("overleftarrow", "⃖"),
     ("overleftrightarrow", "⃡"),
     ("overline", "̅"),
+    // rpi addition (D-087), not in upstream latex.ts.
+    ("overgroup", "\u{23DC}"),
     ("overrightarrow", "⃗"),
     ("tilde", "̃"),
     ("underline", "̲"),
@@ -514,6 +605,37 @@ const RELATION_COMMANDS: &[&str] = &[
     "twoheadrightarrow",
     "uparrow",
     "vdash",
+    // ---- rpi additions (D-087), not in upstream latex.ts ----
+    "circlearrowleft",
+    "circlearrowright",
+    "curvearrowleft",
+    "curvearrowright",
+    "Downarrow",
+    "dashleftarrow",
+    "dashrightarrow",
+    "frown",
+    "ggg",
+    "leftleftarrows",
+    "leftrightarrows",
+    "lll",
+    "Lsh",
+    "nmid",
+    "nparallel",
+    "notni",
+    "nprec",
+    "nsucc",
+    "nsubseteq",
+    "nsupseteq",
+    "Rsh",
+    "rightleftarrows",
+    "rightrightarrows",
+    "smile",
+    "subsetneq",
+    "supsetneq",
+    "triangleq",
+    "Updownarrow",
+    "updownarrow",
+    "Uparrow",
 ];
 
 const SPACING_COMMANDS: &[&str] = &[
@@ -1357,7 +1479,7 @@ impl<'a> LatexParser<'a> {
             }
             return String::new();
         }
-        if command == "frac" || command == "dfrac" || command == "tfrac" {
+        if command == "frac" || command == "dfrac" || command == "tfrac" || command == "cfrac" {
             let should_stack = self.display && self.stack_fractions && command != "tfrac";
             let numerator = self.parse_required_argument(!should_stack);
             let denominator = self.parse_required_argument(!should_stack);
@@ -1396,6 +1518,60 @@ impl<'a> LatexParser<'a> {
         }
         if command == "boxed" || command == "fbox" {
             return format!("[{}]", trim_ecma(&self.parse_required_argument(true)));
+        }
+        // rpi additions (D-087), not in upstream latex.ts. See D-087 for the
+        // terminal-degraded semantics of each shape.
+        if command == "xrightarrow" || command == "xleftarrow" {
+            let lower = self.parse_optional_argument();
+            let lower = lower.as_deref().map(trim_ecma).filter(|l| !l.is_empty());
+            let upper = self.parse_required_argument(true);
+            let mut result = if command == "xrightarrow" {
+                "⟶".to_string()
+            } else {
+                "⟵".to_string()
+            };
+            if let Some(lower) = lower {
+                result.push_str(&format_script(lower, ScriptKind::Sub));
+            }
+            result.push_str(&format_script(trim_ecma(&upper), ScriptKind::Sup));
+            return result;
+        }
+        if command == "genfrac" {
+            let left = self.parse_required_argument(true);
+            let right = self.parse_required_argument(true);
+            let _thickness = self.parse_required_argument(true);
+            let _style = self.parse_required_argument(true);
+            let numerator = self.parse_required_argument(true);
+            let denominator = self.parse_required_argument(true);
+            let left = if left == "." { "" } else { left.as_str() };
+            let right = if right == "." { "" } else { right.as_str() };
+            return format!("{left}{}{right}", format_fraction(&numerator, &denominator));
+        }
+        // Invisible-but-space-occupying: a protected-space run as wide as
+        // the content (plain spaces would be collapsed by `collapse_spaces`).
+        if command == "phantom" || command == "hphantom" {
+            let value = self.parse_required_argument(true);
+            return PROTECTED_SPACE.repeat(visible_width(trim_ecma(&value)));
+        }
+        // Height-only phantoms and struts have zero width in a terminal.
+        if command == "vphantom" {
+            let _ = self.parse_required_argument(true);
+            return String::new();
+        }
+        if command == "strut" {
+            return String::new();
+        }
+        // A terminal cannot shift baselines: drop the distance (and the
+        // optional height/depth overrides), keep the content.
+        if command == "raisebox" {
+            let _distance = self.parse_required_argument(true);
+            let _height = self.parse_optional_argument();
+            let _depth = self.parse_optional_argument();
+            return self.parse_required_argument(true);
+        }
+        // Overlap boxes degrade to their content (no overlap layout here).
+        if command == "rlap" || command == "llap" {
+            return self.parse_required_argument(true);
         }
         if command == "binom" || command == "dbinom" || command == "tbinom" {
             let first = self.parse_required_argument(true);
@@ -1711,6 +1887,24 @@ impl<'a> LatexParser<'a> {
 
         if environment == "equation" || environment == "equation*" || environment == "displaymath" {
             return trim_ecma(&self.render_nested(&body, true)).to_string();
+        }
+
+        // rpi addition (D-087), not in upstream latex.ts: multi-line script
+        // content (\sum_{\begin{subarray}{l}...\end{subarray}}) degrades to a
+        // comma-joined single line (a subscript cell cannot hold rows).
+        if environment == "subarray" {
+            let array_body = strip_leading_argument_group(&body);
+            return Self::split_environment_rows(array_body)
+                .into_iter()
+                .map(|row| {
+                    trim_ecma(
+                        &self.render_nested(&row.split('&').collect::<Vec<&str>>().concat(), false),
+                    )
+                    .to_string()
+                })
+                .filter(|row| !row.is_empty())
+                .collect::<Vec<_>>()
+                .join(",");
         }
 
         if matches!(
@@ -2172,6 +2366,171 @@ mod tests {
             "source: {:?}",
             "A\\not\\subseteq B,\\quad x\\not\\in X"
         );
+    }
+
+    /// rpi-only (D-087): none of the commands asserted here exist in the
+    /// upstream symbol table — upstream fails the whole expression and echoes
+    /// the raw source. rpi renders them (mappings follow KaTeX).
+    #[test]
+    fn renders_d087_symbol_additions() {
+        // The QED tombstone pair (the original D-087 trigger).
+        assert_eq!(
+            render("f'(\\xi) = 0 \\qquad \\blacksquare").as_deref(),
+            Some("f'(ξ) = 0 ■"),
+            "source: {:?}",
+            "f'(\\xi) = 0 \\qquad \\blacksquare"
+        );
+        assert_eq!(render("x \\Box y").as_deref(), Some("x □ y"));
+        // Black/proof family + arrows.
+        assert_eq!(
+            render("\\blacktriangle\\blacktriangledown").as_deref(),
+            Some("▲▼")
+        );
+        assert_eq!(
+            render("\\blacktriangleleft \\blacktriangleright").as_deref(),
+            Some("◀ ▶")
+        );
+        assert_eq!(render("\\blacklozenge\\bigstar").as_deref(), Some("◆★"));
+        assert_eq!(
+            render("\\vartriangle, \\triangledown").as_deref(),
+            Some("△, ▽")
+        );
+        assert_eq!(
+            render("a \\updownarrow b \\Updownarrow c").as_deref(),
+            Some("a ↕ b ⇕ c")
+        );
+        assert_eq!(render("\\Uparrow \\Downarrow").as_deref(), Some("⇑ ⇓"));
+        assert_eq!(
+            render("\\circlearrowleft \\circlearrowright").as_deref(),
+            Some("↺ ↻")
+        );
+        assert_eq!(
+            render("\\curvearrowleft \\curvearrowright").as_deref(),
+            Some("↶ ↷")
+        );
+        assert_eq!(render("\\Lsh \\Rsh").as_deref(), Some("↰ ↱"));
+        assert_eq!(
+            render("\\dashleftarrow \\dashrightarrow").as_deref(),
+            Some("⇠ ⇢")
+        );
+        assert_eq!(
+            render("\\leftleftarrows \\rightleftarrows").as_deref(),
+            Some("⇇ ⇄")
+        );
+        assert_eq!(
+            render("\\leftrightarrows \\rightrightarrows").as_deref(),
+            Some("⇆ ⇉")
+        );
+        // Negated/strict relations (single-macro forms; `\not\x` composes were
+        // already supported).
+        assert_eq!(
+            render("A \\subsetneq B \\supsetneq C").as_deref(),
+            Some("A ⊊ B ⊋ C")
+        );
+        assert_eq!(
+            render("A \\nsubseteq B \\nsupseteq C").as_deref(),
+            Some("A ⊈ B ⊉ C")
+        );
+        assert_eq!(
+            render("a \\nmid b \\nparallel c").as_deref(),
+            Some("a ∤ b ∦ c")
+        );
+        assert_eq!(
+            render("p \\nprec q \\nsucc r").as_deref(),
+            Some("p ⊀ q ⊁ r")
+        );
+        assert_eq!(
+            render("x \\lll y, x \\ggg y").as_deref(),
+            Some("x ⋘ y, x ⋙ y")
+        );
+        assert_eq!(render("A \\notni b").as_deref(), Some("A ∌ b"));
+        assert_eq!(render("x \\triangleq y").as_deref(), Some("x ≜ y"));
+        assert_eq!(
+            render("P \\smile Q \\frown R").as_deref(),
+            Some("P ⌣ Q ⌢ R")
+        );
+        // Binary operators + ordinary symbols.
+        assert_eq!(
+            render("a \\diamond b \\centerdot c").as_deref(),
+            Some("a ⋄ b · c")
+        );
+        assert_eq!(
+            render("A \\bigtriangleup B \\bigtriangledown C").as_deref(),
+            Some("A △ B ▽ C")
+        );
+        assert_eq!(render("A \\smallsetminus B").as_deref(), Some("A ∖ B"));
+        assert_eq!(render("\\lnot p").as_deref(), Some("¬ p"));
+        assert_eq!(render("\\imath + \\jmath").as_deref(), Some("ı + ȷ"));
+        assert_eq!(
+            render("\\measuredangle A, \\sphericalangle B").as_deref(),
+            Some("∡ A, ∢ B")
+        );
+        assert_eq!(
+            render("x' \\backprime, \\surd x").as_deref(),
+            Some("x' ‵, √ x")
+        );
+        assert_eq!(render("\\flat \\sharp \\natural").as_deref(), Some("♭ ♯ ♮"));
+        assert_eq!(
+            render("\\clubsuit \\diamondsuit \\heartsuit \\spadesuit").as_deref(),
+            Some("♣ ♢ ♡ ♠")
+        );
+        assert_eq!(
+            render("\\maltese \\Diamond \\diagup \\diagdown").as_deref(),
+            Some("✠ ◇ ╱ ╲")
+        );
+        assert_eq!(render("\\digamma + 1").as_deref(), Some("ϝ + 1"));
+    }
+
+    /// rpi-only (D-087): argument-taking additions with terminal-degraded
+    /// semantics (see D-087 for each shape).
+    #[test]
+    fn renders_d087_argument_taking_additions() {
+        // \xrightarrow / \xleftarrow: script-tagged long arrows.
+        assert_eq!(
+            render("f \\xrightarrow{\\text{twice}} g").as_deref(),
+            Some("f ⟶ᵗʷⁱᶜᵉ g")
+        );
+        assert_eq!(
+            render("A \\xrightarrow[f]{g} B").as_deref(),
+            Some("A ⟶_fᵍ B")
+        );
+        assert_eq!(render("A \\xleftarrow{h} B").as_deref(), Some("A ⟵ʰ B"));
+        // \cfrac stacks like \dfrac in display mode.
+        assert_eq!(
+            render_latex("\\cfrac{a}{b}", true).as_deref(),
+            Some("a\n─\nb")
+        );
+        // \genfrac: explicit delimiters, or none for ".".
+        assert_eq!(
+            render("\\genfrac{(}{)}{0pt}{}{a}{b}").as_deref(),
+            Some("(a/b)")
+        );
+        assert_eq!(
+            render("\\genfrac{.}{.}{0pt}{}{1}{2}").as_deref(),
+            Some("1/2")
+        );
+        // Phantoms: width-preserving (protected) spaces; height-only shapes
+        // are empty; \strut takes no argument and renders nothing.
+        assert_eq!(render("a \\phantom{xyz} b").as_deref(), Some("a     b"));
+        assert_eq!(render("a \\hphantom{x} b").as_deref(), Some("a   b"));
+        assert_eq!(render("a \\vphantom{q} b").as_deref(), Some("a b"));
+        assert_eq!(render("a\\strut b").as_deref(), Some("a b"));
+        // \raisebox: distance (and optional height/depth) dropped, content kept.
+        assert_eq!(render("\\raisebox{1em}{x}").as_deref(), Some("x"));
+        assert_eq!(render("\\raisebox{1em}[2em][3em]{y}").as_deref(), Some("y"));
+        // rlap/llap: overlap is lost, content survives.
+        assert_eq!(render("a \\rlap{b} c").as_deref(), Some("a b c"));
+        assert_eq!(render("a \\llap{b} c").as_deref(), Some("a b c"));
+        // \overgroup: single character takes the combining form, longer
+        // content keeps the command notation.
+        assert_eq!(render("\\overgroup{A}").as_deref(), Some("A⏜"));
+        assert_eq!(render("\\overgroup{AB}").as_deref(), Some("overgroup(AB)"));
+        // subarray: comma-joined single line (script cells cannot hold rows).
+        assert!(render_latex(
+            "\\sum_{\\begin{subarray}{l} i,j \\\\ k \\end{subarray}} x",
+            true
+        )
+        .is_some());
     }
 
     /// Port of the upstream `it("renders delimiter commands and invisible delimiters")`.
