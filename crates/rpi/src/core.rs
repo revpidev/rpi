@@ -4,6 +4,7 @@ pub mod agent_session;
 pub mod agent_session_runtime;
 pub mod agent_session_services;
 pub mod auth_guidance;
+pub mod changelog;
 pub mod compaction_runner;
 pub mod environment;
 pub mod export_html;

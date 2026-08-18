@@ -132,10 +132,11 @@ pub async fn report_install(
 /// Returns `Some((enabled, endpoint))` when the ping should fire; the
 /// network stay gated inside [`report_install`].
 ///
-/// Upstream compares changelog entries, not versions; until the changelog
-/// asset lands (T15), version inequality stands in for "new entries"
-/// (D-046). The settings write happens even when the ping is disabled,
-/// matching upstream.
+/// Upstream compares changelog entries, not versions; version inequality
+/// stands in for "new entries" (D-046) — an equivalent approximation here
+/// because the embedded CHANGELOG.md (`core/changelog.rs`) gains a section
+/// with every release. The settings write happens even when the ping is
+/// disabled, matching upstream.
 pub fn prepare_install_report(
     settings: &mut SettingsManager,
     version: &str,
