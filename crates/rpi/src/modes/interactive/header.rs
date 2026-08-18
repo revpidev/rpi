@@ -144,11 +144,14 @@ pub fn startup_instructions(theme: &Theme) -> (String, String) {
     (expanded_instructions, compact_instructions)
 }
 
-/// `onboarding` text (interactive-mode.ts:770-773).
+/// `onboarding` text (interactive-mode.ts:770-773). rpi difference: upstream
+/// promises "look up its docs" (bundled docs fed into the system prompt);
+/// rpi ships no bundled docs (`doc_paths` is `None`, system-prompt.rs), so
+/// the line states the actual capability and points at the site docs.
 pub fn startup_onboarding(theme: &Theme) -> String {
     theme.fg(
         "dim",
-        "Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.",
+        "rpi can explain its own features. Ask how to use or extend it — docs at revpi.dev/docs.",
     )
 }
 
