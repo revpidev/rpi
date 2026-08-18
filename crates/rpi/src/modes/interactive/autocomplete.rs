@@ -392,8 +392,9 @@ mod tests {
     use super::*;
 
     /// The test session's model runtime snapshot is empty unless
-    /// `RPI_TEST_INTERACTIVE_KEY` is set (the models.json `apiKey` is an
-    /// env-var name); clear it so the registry path is deterministic.
+    /// `RPI_TEST_INTERACTIVE_KEY` is set (the models.json `apiKey` is a
+    /// `${VAR}` env reference); clear it so the registry path is
+    /// deterministic.
     fn clear_test_api_key() {
         std::env::remove_var("RPI_TEST_INTERACTIVE_KEY");
     }

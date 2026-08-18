@@ -275,10 +275,13 @@ pub(crate) async fn build_test_session_with_manager(
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     std::fs::write(
         agent_dir.join("models.json"),
+        // `${VAR}` reference (config-value DSL): the harness wants the
+        // provider UNAVAILABLE unless a test explicitly exports the var —
+        // a bare string is a literal key since the composeApiKeyAuth port.
         r#"{"providers": {"custom": {
             "baseUrl": "https://api.example.com/v1",
             "api": "openai-completions",
-            "apiKey": "RPI_TEST_INTERACTIVE_KEY",
+            "apiKey": "${RPI_TEST_INTERACTIVE_KEY}",
             "models": [{"id": "m1", "contextWindow": 200000}]
         }}}"#,
     )
