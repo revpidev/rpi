@@ -1054,6 +1054,12 @@ pub(crate) struct InteractiveUi {
     /// tools-expanded linkage (interactive-mode.ts:3812-3824).
     built_in_header: Mutex<Option<Arc<Mutex<ExpandableText>>>>,
 
+    /// `this.changelogMarkdown` (interactive-mode.ts:1171-1196
+    /// `getChangelogForDisplay`): the new-entry markdown computed at init
+    /// (None when there is nothing newer than `lastChangelogVersion`);
+    /// `/changelog` renders it, falling back to the placeholder.
+    pub(crate) changelog_markdown: Mutex<Option<String>>,
+
     /// Streaming assistant message (interactive-mode.ts:365-366).
     streaming: Mutex<Option<StreamingTrack>>,
     /// Tool call id → component (interactive-mode.ts:369).
@@ -3777,6 +3783,7 @@ impl InteractiveMode {
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
+            changelog_markdown: Mutex::new(None),
             built_in_header: Mutex::new(None),
             streaming: Mutex::new(None),
             pending_tools: Mutex::new(HashMap::new()),
@@ -3915,8 +3922,22 @@ impl InteractiveMode {
         // 1017-1036): a fresh install or version change records
         // `lastChangelogVersion` and fires the anonymous ping (gated by
         // offline / `enableInstallTelemetry` / the endpoint, ADR-0002 §8).
-        // The changelog asset itself is T15; the ping is fire-and-forget.
+        // The ping is fire-and-forget.
         let has_messages = self.session.has_messages();
+        // The DISPLAY half of `getChangelogForDisplay` runs first: it needs
+        // the PREVIOUS `lastChangelogVersion`, which
+        // `prepare_install_report` overwrites as its recording side effect.
+        // Resumed/continued sessions (messages present) skip both, matching
+        // upstream's early return (interactive-mode.ts:1172-1175).
+        *lock(&self.ui_state.changelog_markdown) = if has_messages {
+            None
+        } else {
+            self.session.settings_manager(|settings| {
+                crate::core::changelog::changelog_for_display(
+                    settings.get_last_changelog_version().as_deref(),
+                )
+            })
+        };
         let report = self.session.settings_manager(|settings| {
             crate::core::telemetry::prepare_install_report(settings, VERSION, has_messages)
         });

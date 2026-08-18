@@ -31,9 +31,12 @@
 //!   missing-session-cwd prompt (interactive-mode.ts:5489-5501) are T15
 //!   extension hooks; local import proceeds directly and reports
 //!   failures uniformly.
-//! - Changelog (`handle_changelog_command`): no local changelog asset (T15
-//!   hook), so the placeholder branch of the upstream ternary renders; the
-//!   border + title frame is kept.
+//! - Changelog (`handle_changelog_command`): the embedded CHANGELOG.md asset
+//!   (`core/changelog.rs`, compile-time `include_str!`) replaces upstream's
+//!   package-adjacent file; the display half of `getChangelogForDisplay`
+//!   runs at init (the recording/telemetry side lives in
+//!   `prepare_install_report`, D-046); `normalizeChangelogLinks` is not
+//!   ported (the asset carries no relative links).
 //! - Hotkeys (`handle_hotkeys_command`): the extension-registered shortcuts
 //!   section (interactive-mode.ts:5835-5848) is a T15 hook; the built-in
 //!   sections are identical to upstream.
@@ -441,11 +444,14 @@ impl InteractiveUi {
         });
     }
 
-    /// `handleChangelogCommand` (interactive-mode.ts:5707-5726). No local
-    /// changelog asset (T15 hook), so the placeholder branch of the upstream
-    /// ternary renders; the border + title frame is kept for parity.
+    /// `handleChangelogCommand` (interactive-mode.ts:5707-5726): renders
+    /// `this.changelogMarkdown ?? "No changelog entries found."` — the
+    /// new-entry markdown computed at init from the embedded CHANGELOG.md
+    /// (`changelog_markdown` on the UI state).
     pub(crate) fn handle_changelog_command(&self) {
-        let changelog_markdown = "No changelog entries found.";
+        let changelog_markdown = lock(&self.changelog_markdown)
+            .clone()
+            .unwrap_or_else(|| "No changelog entries found.".to_owned());
         let border_theme = Arc::clone(&lock(&self.theme));
         let border = Box::new(move |text: &str| border_theme.fg("border", text));
 
@@ -1277,6 +1283,34 @@ mod tests {
         );
         // The border frame is present (structure parity).
         assert!(rendered.contains('─'), "rendered: {rendered}");
+    }
+
+    /// The display half of `getChangelogForDisplay` (interactive-mode.ts
+    /// :1171-1196): when init computed the new-entry markdown (stored
+    /// `lastChangelogVersion` older than VERSION — the computation itself is
+    /// covered by `core::changelog` tests), `/changelog` renders it instead
+    /// of the placeholder.
+    #[tokio::test]
+    async fn changelog_command_renders_new_entries_after_version_change() {
+        let (mode, _terminal) = mode_harness().await;
+        let ui = &mode.ui_state;
+        *lock(&ui.changelog_markdown) =
+            crate::core::changelog::changelog_for_display(Some("0.1.0"));
+        assert!(
+            lock(&ui.changelog_markdown).is_some(),
+            "a version behind VERSION yields new entries"
+        );
+        ui.handle_changelog_command();
+        let rendered = chat_render(ui);
+        assert!(rendered.contains("What's New"), "rendered: {rendered}");
+        assert!(
+            !rendered.contains("No changelog entries found."),
+            "new entries must replace the placeholder: {rendered}"
+        );
+        assert!(
+            rendered.contains("0.1.1"),
+            "the new version's section renders: {rendered}"
+        );
     }
 
     // ---------------------------------------------------------------------
