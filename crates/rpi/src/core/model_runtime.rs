@@ -44,16 +44,19 @@ use tokio_util::sync::CancellationToken;
 use rpi_ai::api::anthropic_messages::AnthropicMessages;
 use rpi_ai::api::openai_completions::OpenAiCompletions;
 use rpi_ai::api::openai_responses::OpenAiResponses;
+use rpi_ai::auth::config_value::{
+    get_config_value_env_var_names, is_command_config_value, resolve_config_value_or_throw,
+};
 use rpi_ai::auth::file_store::FileCredentialStore;
 use rpi_ai::auth::helpers::env_api_key_auth;
-use rpi_ai::auth::interaction::AuthInteraction;
+use rpi_ai::auth::interaction::{AuthInteraction, AuthPrompt};
 use rpi_ai::auth::resolve::{
     resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode,
 };
 use rpi_ai::auth::types::{
     ApiKeyAuth, ApiKeyCredential, AuthCheck, AuthContext, AuthOperationOptions, AuthResult,
     AuthType, Credential, CredentialInfo, CredentialStore, CredentialType, DefaultAuthContext,
-    ModifyFn, ProviderAuth,
+    ModelAuth, ModifyFn, ProviderAuth,
 };
 use rpi_ai::models::{
     create_provider, CreateModelsOptions, CreateProviderOptions, Models, ModelsRefreshOptions,
@@ -287,9 +290,10 @@ impl std::fmt::Display for CredentialSynchronizationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Credential {} committed for {}, but local synchronization failed",
+            "Credential {} committed for {}, but local synchronization failed: {}",
             self.operation.as_str(),
-            self.provider_id
+            self.provider_id,
+            self.cause
         )
     }
 }
@@ -551,6 +555,181 @@ fn wrap_provider_auth(
         auth.api_key = Some(wrap_api_key_auth(api_key, headers, auth_header));
     }
     auth
+}
+
+/// `configContextEnv` (provider-composer.ts:287-299): collect the env values
+/// the config values reference, so `resolve_config_value*` can interpolate
+/// them.
+async fn config_context_env(values: &[String], ctx: &dyn AuthContext) -> Option<ProviderEnv> {
+    let mut env = ProviderEnv::new();
+    for value in values {
+        for name in get_config_value_env_var_names(value) {
+            if env.contains_key(&name) {
+                continue;
+            }
+            if let Some(resolved) = ctx.env(&name).await {
+                env.insert(name, resolved);
+            }
+        }
+    }
+    (!env.is_empty()).then_some(env)
+}
+
+/// `composeApiKeyAuth` (provider-composer.ts:301-365): the models.json /
+/// extension `apiKey` is a *config value* — a literal (`"sk-…"` works as
+/// itself), a `$VAR`/`${VAR}` interpolation, or a `!command` — resolved
+/// alongside the inherited base auth. Stored credentials (auth.json) win;
+/// the configured raw key resolves through the config-value DSL. (T09's
+/// intended wiring: this replaces treating the raw string as an env var
+/// NAME, which made literal keys unresolvable without auth.json.)
+struct ConfigApiKeyAuth {
+    name: String,
+    provider_id: String,
+    raw_key: String,
+    inherited: Option<Arc<dyn ApiKeyAuth>>,
+}
+
+impl ConfigApiKeyAuth {
+    fn new(provider_id: &str, raw_key: String, inherited: Option<Arc<dyn ApiKeyAuth>>) -> Self {
+        let name = inherited
+            .as_ref()
+            .map(|auth| auth.name().to_owned())
+            .unwrap_or_else(|| "API key".to_owned());
+        Self {
+            name,
+            provider_id: provider_id.to_owned(),
+            raw_key,
+            inherited,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiKeyAuth for ConfigApiKeyAuth {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// This auth HAS a `check` (upstream `composeApiKeyAuth` always provides
+    /// one, provider-composer.ts:322-340): `Ok(None)` means "checked: not
+    /// configured" and must short-circuit availability instead of falling
+    /// through to `resolve` (which throws on a missing `${VAR}`).
+    fn has_check(&self) -> bool {
+        true
+    }
+
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// `inherited?.login ?? prompt` (provider-composer.ts:316-321).
+    async fn login(
+        &self,
+        interaction: &dyn AuthInteraction,
+    ) -> Result<ApiKeyCredential, ModelsError> {
+        if let Some(inherited) = &self.inherited {
+            if inherited.supports_login() {
+                return inherited.login(interaction).await;
+            }
+        }
+        let key = interaction
+            .prompt(AuthPrompt::secret("Enter API key".to_owned()))
+            .await?;
+        Ok(ApiKeyCredential {
+            key: Some(key),
+            env: None,
+        })
+    }
+
+    /// The `check` closure (provider-composer.ts:322-340): stored credential
+    /// → configured raw key → inherited. A literal raw key has no env-var
+    /// references, so it is always "configured".
+    async fn check(
+        &self,
+        ctx: &dyn AuthContext,
+        credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthCheck>, ModelsError> {
+        if let Some(credential) = credential {
+            if let Some(inherited) = &self.inherited {
+                return inherited.check(ctx, Some(credential)).await;
+            }
+            if credential.key.as_deref().is_some_and(|key| !key.is_empty()) {
+                return Ok(Some(AuthCheck {
+                    source: Some("stored credential".to_owned()),
+                    kind: AuthType::ApiKey,
+                }));
+            }
+            return Ok(None);
+        }
+        if is_command_config_value(&self.raw_key) {
+            return Ok(Some(AuthCheck {
+                source: Some("configured API key".to_owned()),
+                kind: AuthType::ApiKey,
+            }));
+        }
+        for name in get_config_value_env_var_names(&self.raw_key) {
+            if ctx.env(&name).await.is_none() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(AuthCheck {
+            source: Some("configured API key".to_owned()),
+            kind: AuthType::ApiKey,
+        }))
+    }
+
+    /// The `resolve` closure (provider-composer.ts:341-363). Header/authHeader
+    /// wrapping happens at composition time (`wrap_api_key_auth`), matching
+    /// the outer `withConfiguredAuth` application upstream.
+    async fn resolve(
+        &self,
+        ctx: &dyn AuthContext,
+        credential: Option<&ApiKeyCredential>,
+    ) -> Result<Option<AuthResult>, ModelsError> {
+        if let Some(credential) = credential {
+            if let Some(inherited) = &self.inherited {
+                return inherited.resolve(ctx, Some(credential)).await;
+            }
+            if let Some(key) = credential.key.clone().filter(|key| !key.is_empty()) {
+                return Ok(Some(AuthResult {
+                    auth: ModelAuth {
+                        api_key: Some(key),
+                        headers: None,
+                        base_url: None,
+                    },
+                    env: credential.env.clone(),
+                    source: Some("stored credential".to_owned()),
+                }));
+            }
+            return Ok(None);
+        }
+        let env = config_context_env(&[self.raw_key.clone()], ctx).await;
+        let key = resolve_config_value_or_throw(
+            &self.raw_key,
+            &format!("API key for provider \"{}\"", self.provider_id),
+            env.as_ref(),
+        )?;
+        if let Some(inherited) = &self.inherited {
+            return inherited
+                .resolve(
+                    ctx,
+                    Some(&ApiKeyCredential {
+                        key: Some(key),
+                        env: env.clone(),
+                    }),
+                )
+                .await;
+        }
+        Ok(Some(AuthResult {
+            auth: ModelAuth {
+                api_key: Some(key),
+                headers: None,
+                base_url: None,
+            },
+            env,
+            source: Some("configured API key".to_owned()),
+        }))
+    }
 }
 
 /// Base passthrough with auth resolution overridden by configured
@@ -993,11 +1172,12 @@ impl ModelRuntime {
             .unwrap_or(false);
 
         let auth = match &api_key_value {
-            Some(env_var) => ProviderAuth {
+            Some(raw_key) => ProviderAuth {
                 api_key: Some(wrap_api_key_auth(
-                    Arc::new(env_api_key_auth(
-                        format!("{provider_id} API key"),
-                        &[env_var.as_str()],
+                    Arc::new(ConfigApiKeyAuth::new(
+                        provider_id,
+                        raw_key.clone(),
+                        base.and_then(|b| b.auth().api_key.clone()),
                     )),
                     &configured_headers,
                     auth_header,
@@ -1192,9 +1372,14 @@ impl ModelRuntime {
             Some(Credential::ApiKey(api_key_credential)) => Some(api_key_credential.clone()),
             _ => None,
         };
-        // `apiKey.check` — the rpi-ai trait cannot express "method absent"
-        // (the default returns None), so a `None` result falls through to the
-        // resolve chain. For env-var providers the two are equivalent.
+        // `apiKey.check` (models.ts:497-508): when the method EXISTS its
+        // result is returned as-is — `None` means "checked: not configured"
+        // and must NOT fall through to `resolve` (which throws on missing
+        // `${VAR}` config values, provider-composer.ts:349-354). The rpi-ai
+        // trait cannot express "method absent", so `has_check()` marks the
+        // implementations that provide one; for the rest (env-var providers)
+        // a `None` result falls through to the resolve chain, where the two
+        // are equivalent.
         if let Some(check) = api_key
             .check(auth_context.as_ref(), api_key_credential.as_ref())
             .await
@@ -1207,6 +1392,9 @@ impl ModelRuntime {
             })?
         {
             return Ok(Some(check));
+        }
+        if api_key.has_check() {
+            return Ok(None);
         }
 
         let credentials: Arc<dyn CredentialStore> = self.credentials.clone();
@@ -1745,11 +1933,11 @@ impl ModelRuntime {
             .boxed(),
         )
         .await
-        .map_err(|_| {
+        .map_err(|cause| {
             ModelsError::new(
                 ModelsErrorCode::Auth,
                 format!(
-                    "Credential login committed for {err_pid}, but local synchronization failed"
+                    "Credential login committed for {err_pid}, but local synchronization failed: {cause}"
                 ),
             )
         })?;
@@ -2093,9 +2281,25 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
+    use rpi_ai::auth::types::AuthContext as _;
     use rpi_ai::models::{PublishHandle, PublishShared};
 
     use super::*;
+
+    /// A map-backed `AuthContext` (the helpers.rs test shape) for driving
+    /// env-referencing config values deterministically.
+    struct MapAuthContext(std::collections::HashMap<String, String>);
+
+    #[async_trait::async_trait]
+    impl AuthContext for MapAuthContext {
+        async fn env(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+
+        async fn file_exists(&self, _path: &str) -> bool {
+            false
+        }
+    }
 
     /// Build a minimal `RefreshModelsContext` for probing whether a provider
     /// implements `refresh_models`. Never actually awaited.
@@ -2284,6 +2488,103 @@ mod tests {
         assert!(runtime.get_error().is_none());
     }
 
+    /// models.json `apiKey` is a *config value* (provider-composer.ts
+    /// :301-365): a literal key is directly usable — check and resolve both
+    /// succeed with "configured API key", no auth.json credential needed.
+    /// (Regression: the port treated the raw string as an env var NAME,
+    /// making literal keys unresolvable without auth.json.)
+    #[tokio::test]
+    async fn models_json_literal_api_key_is_usable_without_auth_json() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "sk-literal-test-key",
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("custom").expect("custom composed");
+        // The fixture writes no auth.json → no stored credential.
+        let check = runtime
+            .check_provider_auth(&provider)
+            .await
+            .expect("check runs")
+            .expect("literal key is configured without auth.json");
+        assert_eq!(check.source.as_deref(), Some("configured API key"));
+
+        let api_key_auth = provider.auth().api_key.clone().expect("api_key auth");
+        let resolved = api_key_auth
+            .resolve(&DefaultAuthContext, None)
+            .await
+            .expect("resolve runs")
+            .expect("resolves");
+        assert_eq!(
+            resolved.auth.api_key.as_deref(),
+            Some("sk-literal-test-key")
+        );
+        assert_eq!(resolved.source.as_deref(), Some("configured API key"));
+    }
+
+    /// `${VAR}` references stay env-gated (composeApiKeyAuth check,
+    /// provider-composer.ts:329-336): absent env → not configured; set env
+    /// → configured and resolved from the env value. A stored credential
+    /// still wins over the configured raw key.
+    #[tokio::test]
+    async fn models_json_env_ref_api_key_gates_on_env_and_credential_wins() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"custom": {
+                "baseUrl": "https://api.example.com/v1",
+                "api": "openai-completions",
+                "apiKey": "${RPI_TEST_ABSENT_KEY_VAR}",
+                "models": [{"id": "m1"}]
+            }}}"#,
+        )
+        .await;
+        let provider = runtime.get_provider("custom").expect("custom composed");
+        let api_key_auth = provider.auth().api_key.clone().expect("api_key auth");
+
+        let empty = MapAuthContext(std::collections::HashMap::new());
+        assert!(
+            api_key_auth
+                .check(&empty, None)
+                .await
+                .expect("check")
+                .is_none(),
+            "unset env reference is not configured"
+        );
+
+        let mut env = std::collections::HashMap::new();
+        env.insert("RPI_TEST_ABSENT_KEY_VAR".to_owned(), "from-env".to_owned());
+        let present = MapAuthContext(env);
+        let check = api_key_auth
+            .check(&present, None)
+            .await
+            .expect("check")
+            .expect("env reference configured");
+        assert_eq!(check.source.as_deref(), Some("configured API key"));
+        let resolved = api_key_auth
+            .resolve(&present, None)
+            .await
+            .expect("resolve")
+            .expect("resolves");
+        assert_eq!(resolved.auth.api_key.as_deref(), Some("from-env"));
+
+        // Stored credential (auth.json shape) wins over the configured key.
+        let stored = api_key_auth
+            .check(
+                &empty,
+                Some(&ApiKeyCredential {
+                    key: Some("stored-key".to_owned()),
+                    env: None,
+                }),
+            )
+            .await
+            .expect("check")
+            .expect("stored credential configured");
+        assert_eq!(stored.source.as_deref(), Some("stored credential"));
+    }
+
     /// Upstream defaults (`modelFromJson`, provider-composer.ts:154-155):
     /// 128000 / 16384 — never 0 (a 0 window would clamp requests to
     /// `max_tokens: 1`).
@@ -2447,7 +2748,9 @@ mod tests {
 
     /// Provider-level `headers` and `authHeader` wrap auth resolution, so the
     /// stream path (which resolves through the composed provider auth) sends
-    /// them too (`withConfiguredAuth`, provider-composer.ts:250-262).
+    /// them too (`withConfiguredAuth`, provider-composer.ts:250-262). The
+    /// `apiKey` uses the `${VAR}` config-value reference (a bare string is a
+    /// literal key since the composeApiKeyAuth port).
     #[tokio::test]
     async fn provider_headers_and_auth_header_reach_resolved_auth() {
         const ENV_KEY: &str = "RPI_TEST_COMPOSE_HEADERS_KEY";
@@ -2456,7 +2759,7 @@ mod tests {
             r#"{"providers": {"custom": {
                 "baseUrl": "https://api.example.com/v1",
                 "api": "openai-completions",
-                "apiKey": "RPI_TEST_COMPOSE_HEADERS_KEY",
+                "apiKey": "${RPI_TEST_COMPOSE_HEADERS_KEY}",
                 "headers": {"X-Custom": "yes"},
                 "authHeader": true,
                 "models": [{"id": "m1"}]

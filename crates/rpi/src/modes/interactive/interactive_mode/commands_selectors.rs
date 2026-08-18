@@ -2542,10 +2542,12 @@ mod tests {
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         std::fs::write(
             agent_dir.join("models.json"),
+            // `${VAR}` reference: the harness wants the provider unavailable
+            // unless a test exports the var (see test_support.rs).
             r#"{"providers": {"custom": {
                 "baseUrl": "https://api.example.com/v1",
                 "api": "openai-completions",
-                "apiKey": "RPI_TEST_INTERACTIVE_KEY",
+                "apiKey": "${RPI_TEST_INTERACTIVE_KEY}",
                 "models": [{"id": "m1", "contextWindow": 200000}]
             }}}"#,
         )

@@ -313,6 +313,19 @@ pub trait ApiKeyAuth: Send + Sync {
         ))
     }
 
+    /// `check?` presence (upstream: the method is absent vs. present is
+    /// behaviorally distinct — models.ts:497-508 calls `check` and RETURNS its
+    /// result when the method exists; it only falls through to `resolve` when
+    /// the method is ABSENT). The Rust trait cannot express "method absent",
+    /// so this flag marks implementations whose `Ok(None)` means "checked:
+    /// not configured" — callers must not fall through to `resolve()` (which
+    /// may throw where `check` returns None, e.g. a missing `${VAR}` config
+    /// value). Implementations that override [`Self::check`] with real logic
+    /// must return `true`.
+    fn has_check(&self) -> bool {
+        false
+    }
+
     /// `check?` — optional side-effect-free availability check. Use this when
     /// `resolve()` may execute commands or perform other request-time work.
     /// Default `None`: Models checks availability by resolving auth.
