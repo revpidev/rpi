@@ -2112,6 +2112,43 @@ impl InteractiveMode {
             })
             .await;
 
+        // The rest of `bindCurrentSessionExtensions` (interactive-mode.ts
+        // :1817-1892) re-attaches the extension UI context
+        // (`bindExtensions({ uiContext, mode: "tui" })`, :1818-1821) and the
+        // extension shortcuts (:1889) on EVERY session switch. rpi's T15 W4
+        // shape keeps `set_ui` on the host, and each replaced session owns a
+        // fresh host (app.rs `create_runtime`), so both must be re-attached
+        // here — without this the new host has no UI bridge and extension
+        // status-bar entries (e.g. the mcp-adapter's "mcp" key) and widgets
+        // silently no-op after `/new` / `/resume` / `/clone` / `/fork` /
+        // `/import`.
+        {
+            let runner = session.extension_runner();
+            if let Some(host) = runner
+                .as_any()
+                .and_then(|any| {
+                    any.downcast_ref::<crate::core::extension_host_adapter::ExtensionHostAdapter>()
+                })
+                .map(|adapter| adapter.host().clone())
+            {
+                let bridge = lock(&self.ui_state.extension_ui_bridge)
+                    .clone()
+                    .unwrap_or_else(|| {
+                        let bridge =
+                            Arc::new(super::ui_bridge::InteractiveUiBridge::new(&self.ui_state));
+                        *lock(&self.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
+                        bridge
+                    });
+                host.set_ui(Some(bridge), rpi_ext_host::types::ExtensionMode::Tui);
+            }
+        }
+        // `setupExtensionShortcuts(extensionRunner)` (interactive-mode.ts:1889)
+        // — the hook consults the CURRENT session's runner.
+        crate::modes::interactive::extension_shortcuts::install_extension_shortcuts(
+            &self.ui_state,
+            &session,
+        );
+
         self.ui_state.update_available_provider_count();
         self.ui_state.update_editor_border_color();
         self.ui_state.update_terminal_title();
