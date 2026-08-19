@@ -386,6 +386,37 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         })
     });
 
+    // ── 5d. Poll self-healing: a ctx change with NO event still
+    //        re-renders (the 1s fingerprint poll catches what the event
+    //        surface drops — the two silent host-side event bugs). ────
+    set_canned("getThinkingLevel", json!("minimal"));
+    write_settings(json!({"statusLine": {
+        "type": "command",
+        "command": "cat | grep -o '\\\"level\\\":\\\"minimal\\\"'",
+        "placement": "widget",
+    }}));
+    // Deliberately NO send_event: only the poll drives this render.
+    poll_until(
+        "poll catches the thinking change without any event",
+        |records| {
+            calls_of(records, "ui.setWidget").iter().any(|args| {
+                args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                    && args
+                        .pointer("/content/children/0/props/text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("minimal"))
+            })
+        },
+    );
+    write_settings(json!({}));
+    send_event("message_end", json!({"type": "message_end"}));
+    poll_until("widget cleared after 5d", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args.get("content") == Some(&Value::Null)
+        })
+    });
+
     // ── 6. Failing script keeps the last render (no new pushes). ───────
     write_settings(json!({"statusLine": {
         "type": "command",

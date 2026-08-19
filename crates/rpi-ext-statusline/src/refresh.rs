@@ -33,6 +33,15 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 const BRIDGE_RETRY_INTERVAL: Duration = Duration::from_millis(1500);
 const BRIDGE_RETRIES: usize = 15;
 
+/// Poll cadence for the ctx-data fingerprint: the plugin's self-healing
+/// data plane. The host event surface has proven lossy (TE12 found two
+/// silent event drops); the poll re-reads the five ctx facts every second
+/// (µs-scale host calls) and triggers a full refresh whenever ANY of them
+/// changed — "data changed ⇒ re-render", independent of event delivery.
+/// The elapsed clock is deliberately NOT part of the fingerprint: a
+/// ticking duration stays opt-in via `refreshInterval`.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// What wakes the loop.
 #[derive(Debug)]
 pub enum Trigger {
@@ -66,6 +75,8 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
     // process): the instance stays dormant for good — FR-C0 / FR-I.
     let mut bridge_abandoned = false;
     let mut interval_deadline: Option<Instant> = None;
+    let mut poll_deadline = Instant::now() + POLL_INTERVAL;
+    let mut last_fingerprint: Option<String> = None;
 
     loop {
         // Copy the deadline into the future (Option<Instant> is Copy) so
@@ -81,6 +92,8 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
             }
         };
         tokio::pin!(interval_fut);
+        let poll_fut = tokio::time::sleep_until(tokio::time::Instant::from_std(poll_deadline));
+        tokio::pin!(poll_fut);
 
         let step = tokio::select! {
             trigger = rx.recv() => match trigger {
@@ -96,6 +109,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                 continue;
             }
             _ = &mut interval_fut => Trigger::Event("interval"),
+            _ = &mut poll_fut => Trigger::Event("poll"),
         };
 
         match step {
@@ -104,6 +118,24 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     token.cancel();
                 }
                 break;
+            }
+            Trigger::Event("poll") => {
+                poll_deadline = Instant::now() + POLL_INTERVAL;
+                if bridge_abandoned || !bridge_ready {
+                    // The poll never opens the bridge gate: without a UI
+                    // there is nothing to refresh (dormant children stay
+                    // free of host-call traffic).
+                    continue;
+                }
+                if poll_fingerprint_changed(&calls, &mut last_fingerprint) {
+                    if let Some(token) = inflight.take() {
+                        token.cancel();
+                        generation += 1;
+                    }
+                    if let Some(token) = refresh_tick(&calls, &done_tx, &mut generation) {
+                        inflight = Some(token);
+                    }
+                }
             }
             Trigger::Event(reason) => {
                 // INFO level: event delivery is the TE12 diagnostic
@@ -177,6 +209,32 @@ fn current_refresh_interval() -> Option<u64> {
     config::load_settings_snapshot()
         .status_line
         .and_then(|config| config.refresh_interval_secs)
+}
+
+/// One poll pass: when unconfigured, also ride the FR-H restore (the poll
+/// covers the idle no-event case); otherwise fingerprint the five ctx
+/// facts and report whether ANY of them changed since the last poll. The
+/// first poll after (re)configuration counts as a change — a free initial
+/// render for config edits the event surface knows nothing about.
+fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -> bool {
+    let settings = config::load_settings_snapshot();
+    if settings.status_line.is_none() {
+        restore_if_mounted(calls);
+        *last = None;
+        return false;
+    }
+    let ctx = fetch_ctx(calls);
+    let fingerprint = format!(
+        "{:?}|{}|{:?}|{:?}|{:?}",
+        ctx.model.as_ref().map(|model| model.get("id")),
+        ctx.cwd,
+        ctx.thinking_level,
+        ctx.session_name,
+        ctx.context_usage,
+    );
+    let changed = last.as_ref() != Some(&fingerprint);
+    *last = Some(fingerprint);
+    changed
 }
 
 /// One refresh pass: reload config, pull ctx, spawn the script. Returns
