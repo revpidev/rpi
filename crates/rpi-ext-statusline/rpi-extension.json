@@ -1,0 +1,8 @@
+{
+  "name": "rpi-statusline",
+  "version": "0.1.0",
+  "description": "Claude Code-compatible script statusline: run a configured command, feed it session JSON, render its stdout as the footer",
+  "native": "librpi_ext_statusline.so",
+  "capabilities": ["ui", "session"],
+  "rpiAbi": 1
+}
