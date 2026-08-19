@@ -30,6 +30,7 @@ use rpi_tui::tui::Component;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{APP_NAME, PACKAGE_NAME, VERSION};
+use crate::core::extension_registry::ExtensionInstallInfo;
 use crate::core::model_runtime::{
     CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput, DEFAULT_MODEL_REFRESH_TIMEOUT_MS,
 };
@@ -37,7 +38,6 @@ use crate::core::package_manager::{
     ConfiguredPackage, DefaultPackageManager, InstallConfirmCallback, PackageCommandRunner,
     SystemPackageCommandRunner,
 };
-use crate::core::extension_registry::ExtensionInstallInfo;
 use crate::core::self_update::{BinarySelfUpdateRequest, BinarySelfUpdateSeam};
 use crate::core::settings_manager::{SettingsManager, SettingsManagerCreateOptions};
 use crate::core::skills::SourceScope;
@@ -536,7 +536,8 @@ fn build_install_confirm(yes: bool) -> Option<InstallConfirmCallback> {
 /// `handlePackageCommand` for `rpi update` (package-manager-cli.ts:702-735
 /// and the update branch at :818-879). Returns the process exit code.
 /// `args[0]` must be `"update"`.
-pub async fn run_update(args: &[String]) -> i32 {    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+pub async fn run_update(args: &[String]) -> i32 {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
     let agent_dir = crate::config::get_agent_dir();
     run_update_in(args, &cwd, &agent_dir, None, None, None).await
 }
