@@ -17,7 +17,7 @@ This file is a detailed reference loaded from `skills/pi-subagents/SKILL.md`.
   ask wait state at a time.
 - **Keep conversational authority clear.** Advisory subagents should not silently
   become second decision-makers.
-- **Respect the fixed authority policy.** `authorityPolicy` is a small `auto` / `confirm` / `forbid` map for supported operational actions. Worktree discard, destructive cleanup, and spawn-budget grants default to confirmation; stop, steer, and schedule creation remain automatic. Use `worktree.discard` with the durable `handoffPath`; confirm-required actions refuse safely without an interactive UI and retained paths include manual Git recovery commands.
+- **Respect the fixed authority policy.** `authorityPolicy` is a small `auto` / `confirm` / `forbid` map for supported operational actions. Worktree discard, destructive cleanup, and spawn-budget grants default to confirmation; stop and steer remain automatic. Use `worktree.discard` with the durable `handoffPath`; confirm-required actions refuse safely without an interactive UI and retained paths include manual Git recovery commands.
 
 Runtime config can change orchestration behavior. `intercomBridge.resultDelivery: false` disables only external acknowledged grouped-result delivery when native parent notifications own completion; supervisor asks/progress stay active, and enabled transport failures are still reported. `asyncByDefault` and `forceTopLevelAsync` affect whether launches detach; `waitTool` can make direct `subagent_wait()` calls return immediately while headless auto-drain remains active, and its effective value is propagated to child runtimes; `globalConcurrencyLimit` bounds concurrent fanout, while a positive `maxSubagentSpawnsPerSession` optionally caps cumulative launches (`0` or unset is unlimited). Status and doctor report the budget; static work preflights declared capacity; only the settled root interactive parent can use `grant-spawn-budget` after native confirmation, with total grants bounded by the original cap. Compaction does not reset usage or grants; `singleRunOutputBaseDir` and `worktreeBaseDir` route outputs and worktrees; `completionBatch` groups async notifications. `artifactDir` is `project` (default), `session`, or `temp` and chooses where subagent artifacts are stored. Set `asyncWidget: false` to hide the above-editor background-run widget when a companion footer or dashboard owns that space (fleet inspector remains available). Per-run `artifacts: false` disables artifact capture for that launch. Async status and result artifacts include `lifecycleArtifactVersion` and fields such as `workflowGraph`, `steps`, `results`, `totalTokens`, `totalCost`, `turnCount`, `toolCount`, and nested `children`. Child protocol failures expose a structured `protocolError`; `protocol_output_limit` means a child emitted a JSONL line above the 16 MiB live-parser cap. Prefer these artifacts and `status` views over scraping terminal output.
 
@@ -25,7 +25,7 @@ Runtime config can change orchestration behavior. `intercomBridge.resultDelivery
 
 ### Prefer async orchestration
 
-Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and scripted workflows unless you intentionally need a foreground/blocking run. Launch all execution through `workflowScript`; use `return runs.run("main", { agent, task })` for one isolated child and `runs.all([...])` when two or more child lanes, monitors, or dependent steps should move together. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
+Launch every subagent asynchronously by default. Use `async: true` for scouts, researchers, workers, reviewers, validators, oracle checks, one-off delegates, and composed workflows unless you intentionally need a foreground/blocking run. Launch all execution through the structured parameters: `{ agent, task }` for one isolated child, `tasks: [...]` when two or more child lanes should move together in parallel, and `steps: [...]` for a dependent sequence. The parent should keep moving: inspect code while scouts run, prepare validation while a worker implements, do a local diff pass while reviewers review, and synthesize or verify while a fix worker applies accepted feedback. Async is the default orchestration posture; foreground runs are the explicit opt-out.
 
 ### Use subagent_wait() to block until async runs finish
 
@@ -75,11 +75,13 @@ Use `/name` so intercom targeting stays stable.
 
 ### Recon → Plan → Implement
 
-```js
-subagent({ workflowScript: `
-  const context = await runs.run("recon", { agent: "scout", task: "Inspect the codebase and identify the implementation seam" });
-  return (await runs.run("implement", { agent: "worker", task: "Implement from: " + context.output })).output;
-` })
+```jsonc
+subagent({
+  steps: [
+    { agent: "scout", task: "Inspect the codebase and identify the implementation seam", as: "recon" },
+    { agent: "worker", task: "Implement from: {outputs.recon}" }
+  ]
+})
 ```
 
 ### Fable mode for complex work
@@ -118,9 +120,9 @@ clarify → validation contract → scout → async worker → parallel async fr
 
 The validation contract defines acceptance before code is written: expected behavior, acceptance checks, commands or user flows to exercise, and evidence the worker should return. Keep it lightweight for small tasks, but make it explicit enough that reviewers and validators are checking the intended outcome rather than the worker’s own assumptions.
 
-For one host-run verification command, `gate: "npm test"` on the child is shorthand for verified acceptance with that command; it cannot be combined with `acceptance` and is rejected on retained resume items. Use the structured `acceptance` field when the run should carry an explicit acceptance contract. If omitted, subagents infer an effective policy from role, mode, and risk. Evidence levels end at `verified`: use `level: "checked"` for ordinary writer evidence and `level: "verified"` when the runtime should run explicit validation commands. Independent review is orthogonal; use `review: { required: true, agent: "reviewer" }` and orchestrate the reviewer separately. `review-required` means evidence passed but review is pending, while `reviewed` means a real independent result found no blockers. For reviewer/read-only calls, omit `acceptance`. Never explicitly request `level: "reviewed"`; that value remains recognized only so preflight can return an actionable correction. To disable gates, use `{ level: "none", reason: "..." }`; the bare string `"none"` is rejected, and `false` is accepted only as a deprecated shorthand. Child-reported command success is evidence, not runtime verification.
+For one host-run verification command, `gate: "npm test"` on the child runs that command host-side after the child finishes; a failing gate fails the run. It is the runtime's verified-acceptance shorthand — child-reported command success alone is evidence, not runtime verification. Richer acceptance expectations belong in the task text as the validation contract the worker must answer; for reviewer/read-only calls, omit `gate`.
 
-The first `worker` implements the approved plan. The parent continues with independent inspection or validation prep while it runs, not parallel edits to the same worktree. When the async worker completes, treat its handoff as the transition into review, not as final completion, unless the user explicitly asked for worker-only work, review-only output, or to stop after implementation. Parallel reviewers inspect the resulting diff from fresh context. Validators check behavior with the best available evidence: commands, tests, browser/CLI interaction, screenshots, logs, or manual reproduction notes. The final `worker` applies synthesized review fixes in forked context, then the parent looks over the final diff before completing. The parent may launch these steps as an initial async `workflowScript` when the workflow is already clear, or as follow-up workflowScript runs after each async completion. Initial workflows should pass `async: true` so the main chat is unblocked. Do not stop after parallel review unless the user explicitly asked for review-only output or the review surfaced a decision that needs approval first.
+The first `worker` implements the approved plan. The parent continues with independent inspection or validation prep while it runs, not parallel edits to the same worktree. When the async worker completes, treat its handoff as the transition into review, not as final completion, unless the user explicitly asked for worker-only work, review-only output, or to stop after implementation. Parallel reviewers inspect the resulting diff from fresh context. Validators check behavior with the best available evidence: commands, tests, browser/CLI interaction, screenshots, logs, or manual reproduction notes. The final `worker` applies synthesized review fixes in forked context, then the parent looks over the final diff before completing. The parent may launch these steps as an initial async `steps` composition when the workflow is already clear, or as follow-up calls after each async completion. Compositions run async by default so the main chat stays unblocked. Do not stop after parallel review unless the user explicitly asked for review-only output or the review surfaced a decision that needs approval first.
 
 For complex work, risky changes, broad refactors, or many changed lines, increase review and validation fanout rather than trusting one reviewer. Use distinct angles such as correctness/regressions, tests/validation, simplicity/maintainability, security/privacy, performance, docs/API contracts, and user-flow behavior. When reviewers find non-trivial issues or the fix worker touches many lines, run another focused review round before final validation.
 
@@ -142,45 +144,36 @@ Keep orchestration authority in the parent session. Child subagents should not l
 
 Example implementation handoff after clarification and optional planning:
 
-```typescript
+```jsonc
 subagent({
-  workflowScript: `return runs.run("implementation", {
-    agent: "worker",
-    task: "Implement the approved feature.\n\nClarified requirements:\n- ...\n\nPlan: see ~/Documents/docs/...-plan.md\n\nValidation contract:\n- ...\n\nReturn a handoff with changed files, what was implemented, what was left undone, commands run with exit codes, validation evidence, surprises/new risks, and decisions needing parent approval.",
-    acceptance: {
-      level: "checked",
-      evidence: ["changed-files", "tests-added", "commands-run", "residual-risks", "no-staged-files"]
-    }
-  })`,
+  agent: "worker",
+  task: "Implement the approved feature.\n\nClarified requirements:\n- ...\n\nPlan: see ~/Documents/docs/...-plan.md\n\nValidation contract:\n- ...\n\nReturn a handoff with changed files, what was implemented, what was left undone, commands run with exit codes, validation evidence, surprises/new risks, and decisions needing parent approval.",
   async: true
 })
 ```
 
 Example review pass after implementation:
 
-```typescript
+```jsonc
 subagent({
-  workflowScript: `
-    const results = await runs.all([
-      { key: "correctness", agent: "reviewer", task: "Review the current diff for correctness and regressions. Inspect changed files directly; do not rely on the worker's reasoning.", output: false },
-      { key: "tests", agent: "reviewer", task: "Review the current diff for tests and validation quality against the validation contract. Inspect changed files directly.", output: false },
-      { key: "simplicity", agent: "reviewer", task: "Review the current diff for simplicity and maintainability. Inspect changed files directly.", output: false }
-    ]);
-    return results.map(result => result.output);
-  `,
+  tasks: [
+    { key: "correctness", agent: "reviewer", task: "Review the current diff for correctness and regressions. Inspect changed files directly; do not rely on the worker's reasoning.", output: false },
+    { key: "tests", agent: "reviewer", task: "Review the current diff for tests and validation quality against the validation contract. Inspect changed files directly.", output: false },
+    { key: "simplicity", agent: "reviewer", task: "Review the current diff for simplicity and maintainability. Inspect changed files directly.", output: false }
+  ],
   context: "fresh",
   async: true
 })
 ```
 
+The composed result aggregates each child's output in key order and carries per-run `details` (`key`, `runId`, exit code, usage); no result-transform step is needed.
+
 Example fix worker after parallel reviews:
 
-```typescript
+```jsonc
 subagent({
-  workflowScript: `return runs.run("fix", {
-    agent: "worker",
-    task: "Apply the synthesized reviewer feedback below. Only apply fixes worth doing now; preserve user-approved scope; ask before unapproved product or architecture changes. Run focused validation and summarize what changed.\n\nReviewer synthesis:\n..."
-  })`,
+  agent: "worker",
+  task: "Apply the synthesized reviewer feedback below. Only apply fixes worth doing now; preserve user-approved scope; ask before unapproved product or architecture changes. Run focused validation and summarize what changed.\n\nReviewer synthesis:\n...",
   async: true
 })
 ```
@@ -189,19 +182,19 @@ subagent({
 
 Do not treat review as the final step for implementation work. Run reviewers and validators, synthesize their findings against user scope and the validation contract, then launch one `worker` for accepted fixes when implementation is authorized.
 
-When an async implementation worker completes, treat the worker handoff as an intermediate state. The next parent action is review fanout, then synthesis, then a fix worker if reviewers found fixes worth doing now. This can be planned as an initial async `workflowScript` when the whole workflow is known, or continued as follow-up workflowScript runs when the parent only launched the first worker initially. Initial workflows should pass `async: true` so the main chat is unblocked.
+When an async implementation worker completes, treat the worker handoff as an intermediate state. The next parent action is review fanout, then synthesis, then a fix worker if reviewers found fixes worth doing now. This can be planned as an initial async `steps` composition when the whole workflow is known, or continued as follow-up calls when the parent only launched the first worker initially. Compositions run async by default so the main chat stays unblocked.
 
 For explicit review-loop requests, repeat worker → fresh-reviewer → synthesized-fix-worker cycles until reviewers find no blockers or fixes worth doing now, remaining feedback is optional or intentionally deferred, an unapproved product/scope/architecture decision needs the user, or the max review-round cap is reached. Default to 3 review rounds unless the user sets a different cap. For complex work, many changed lines, or any fix pass that materially changes the diff, run another focused review round before the parent’s final look; otherwise stop instead of chasing optional polish.
 
 ### Parallel non-conflicting analysis
 
-```js
-subagent({ workflowScript: `
-  return await runs.all([
+```jsonc
+subagent({
+  tasks: [
     { key: "frontend", agent: "scout", task: "Inspect the frontend" },
     { key: "backend", agent: "scout", task: "Inspect the backend" }
-  ]);
-` })
+  ]
+})
 ```
 
 Use distinct keys, prompts, and output paths. Do not launch parallel writers into the same checkout.
@@ -211,7 +204,7 @@ Use distinct keys, prompts, and output paths. Do not launch parallel writers int
 **"Unknown agent"**
 ```typescript
 subagent({ action: "list" })
-// Check available agents and chains, then confirm scope/precedence.
+// Check available agents, then confirm scope/precedence.
 ```
 
 **Setup, discovery, or intercom confusion**

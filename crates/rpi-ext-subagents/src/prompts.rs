@@ -1,20 +1,26 @@
 //! Bundled prompt templates and the `/prompt-workflow` adapter (FR-P1-07).
 //!
 //! Port of pi-subagents `src/slash/prompt-workflows.ts` @ v0.48.0 (56f97234):
-//! the five packaged templates (`prompts/*.md`, byte-exact from the pinned
-//! submodule via `include_str!`) register as prompt-template commands; user
-//! templates in `.rpi/prompts/` + `~/.rpi/agent/prompts/` with
+//! the five packaged templates (`prompts/*.md` from the pinned submodule via
+//! `include_str!`) register as prompt-template commands; user templates in
+//! `.rpi/prompts/` + `~/.rpi/agent/prompts/` with
 //! `subagent:`/`model:`/`skill:`/`cwd:`/`fork:`/`fresh:`/`chain:` frontmatter
 //! adapt to structured delegation calls (ADR-0018 W12: `chain:` maps to
-//! `steps`, not workflowScript). The bundled `pi-subagents` orchestration
+//! `steps`, not workflowScript). Template and skill bodies are localized for
+//! the structured entry points per ADR-0021 (no `workflowScript` teaching;
+//! parity exemption recorded there). The bundled `pi-subagents` orchestration
 //! skill ships to the user skill dir at install (parent sessions only —
-//! children never resolve it, `SUBAGENT_ORCHESTRATION_SKILL`).
+//! children never resolve it, `SUBAGENT_ORCHESTRATION_SKILL`); a layout
+//! version marker re-ships rewritten bodies over the pre-ADR-0021 byte-exact
+//! install.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-/// `PROMPT_TEMPLATES` — bundled prompt names and bodies (byte-exact).
+/// `PROMPT_TEMPLATES` — bundled prompt names and bodies (`review-loop.md` is
+/// localized for the structured entry points per ADR-0021; the rest are
+/// byte-exact from the pinned submodule).
 pub const BUNDLED_PROMPTS: [(&str, &str); 5] = [
     (
         "parallel-review",
@@ -60,26 +66,44 @@ pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 4] = [
     ),
 ];
 
+/// Layout version of the shipped orchestration skill (ADR-0021). v1 was the
+/// byte-exact upstream copy with no version marker; v2 is the localized
+/// rewrite (no `workflowScript` teaching). Bump this whenever the bundled
+/// bodies change so existing installs are upgraded in place.
+const ORCHESTRATION_SKILL_LAYOUT_VERSION: u32 = 2;
+
 /// Install the orchestration skill into `<agentDir>/skills/pi-subagents/`
 /// (upstream ships it with the package; rpi has no package skill path, so the
-/// plugin materializes it idempotently — existing files are never
-/// overwritten). Called at parent-mode install only.
+/// plugin materializes it). Idempotent per layout version: the marker file
+/// `.rpi-layout-version` gates re-shipping — missing or older marker rewrites
+/// the bodies (this covers the pre-marker v1 byte-exact install; user
+/// customization should live in a renamed copy of the skill), equal or newer
+/// marker leaves the directory untouched. Called at parent-mode install only.
 pub fn install_orchestration_skill() {
-    let skill_dir = crate::paths::get_agent_dir()
-        .join("skills")
-        .join("pi-subagents");
+    install_orchestration_skill_at(&crate::paths::get_agent_dir());
+}
+
+/// Directory-parameterized core for tests: the agent-dir env var is
+/// process-global, so concurrent integration tests must not race through it.
+pub fn install_orchestration_skill_at(agent_dir: &Path) {
+    let skill_dir = agent_dir.join("skills").join("pi-subagents");
     let references = skill_dir.join("references");
+    let version_path = skill_dir.join(".rpi-layout-version");
+    let installed = std::fs::read_to_string(&version_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
+    if matches!(installed, Some(v) if v >= ORCHESTRATION_SKILL_LAYOUT_VERSION) {
+        return;
+    }
     let _ = std::fs::create_dir_all(&references);
-    let skill_md = skill_dir.join("SKILL.md");
-    if !skill_md.exists() {
-        let _ = std::fs::write(&skill_md, ORCHESTRATION_SKILL_SKILL_MD);
-    }
+    let _ = std::fs::write(skill_dir.join("SKILL.md"), ORCHESTRATION_SKILL_SKILL_MD);
     for (name, body) in ORCHESTRATION_SKILL_REFERENCES {
-        let path = references.join(name);
-        if !path.exists() {
-            let _ = std::fs::write(&path, body);
-        }
+        let _ = std::fs::write(references.join(name), body);
     }
+    let _ = std::fs::write(
+        &version_path,
+        ORCHESTRATION_SKILL_LAYOUT_VERSION.to_string(),
+    );
 }
 
 /// `getPromptDirectories` (prompt-workflows.ts:23-32) — project then user

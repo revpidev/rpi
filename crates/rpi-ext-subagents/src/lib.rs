@@ -1016,6 +1016,10 @@ fn wait_update_details() -> Value {
 /// test seam (kept ungated so integration tests share the process state).
 #[doc(hidden)]
 pub mod test_support {
+    /// Exposed for integration tests of the skill-layout upgrade path
+    /// (ADR-0021).
+    pub use crate::prompts::install_orchestration_skill_at;
+
     /// Thin wrapper over the session spawn-budget ledger.
     pub struct SpawnBudgetLedgerProbe {
         ledger: crate::runner::background::SpawnBudgetLedger,
