@@ -143,7 +143,16 @@ fn is_session_file_stem(stem: &str) -> bool {
 /// Newest shape-valid `*.jsonl` in `dir` by mtime (subagents
 /// `findLatestSessionFile` paths.rs:250-273 plus the TE-D34 stem filter);
 /// `None` when the directory has none.
-pub fn find_latest_session_file(dir: &Path) -> Option<PathBuf> {
+///
+/// `since` is an mtime floor: files last modified before it are ignored.
+/// This closes the new-session latch race (TE12 follow-up): the first
+/// refresh tick can fire after `session_start` but before the new session
+/// file exists on disk, and without the floor the mtime-newest file is the
+/// PREVIOUS session's — which the sticky latch would then keep for the
+/// whole session, showing the old session's totals. With the floor the
+/// latch stays `None` until this session's file appears (retried on every
+/// tick while `None`).
+pub fn find_latest_session_file(dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
@@ -165,6 +174,9 @@ pub fn find_latest_session_file(dir: &Path) -> Option<PathBuf> {
         let Ok(modified) = meta.modified() else {
             continue;
         };
+        if modified < since {
+            continue;
+        }
         if best
             .as_ref()
             .is_none_or(|(best_time, _)| modified > *best_time)
@@ -236,10 +248,49 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&newest, b"{}").expect("write");
         assert_eq!(
-            find_latest_session_file(&dir),
+            find_latest_session_file(&dir, std::time::SystemTime::UNIX_EPOCH),
             Some(newest.clone()),
             "newest shape-valid file wins; fork artifacts skipped"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_latest_session_file_mtime_floor_excludes_previous_session() {
+        // The new-session latch race (TE12 follow-up): at the first refresh
+        // tick only the PREVIOUS session's file exists; the mtime floor
+        // must keep it out, leaving the latch empty until this session's
+        // file appears.
+        let dir =
+            std::env::temp_dir().join(format!("rpi-statusline-paths-floor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let previous =
+            dir.join("2026-08-19T10-00-00-000_11111111-2222-3333-4444-555555555555.jsonl");
+        let current =
+            dir.join("2026-08-19T11-00-00-000_018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e.jsonl");
+        std::fs::write(&previous, b"{}").expect("write");
+        // Backdate the previous session file by an hour.
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .append(true)
+            .open(&previous)
+            .expect("open")
+            .set_modified(old_time)
+            .expect("backdate mtime");
+        let session_start = std::time::SystemTime::now();
+        // Only the stale file exists → the floor excludes it.
+        assert_eq!(
+            find_latest_session_file(&dir, session_start),
+            None,
+            "previous-session file must be excluded by the mtime floor"
+        );
+        // This session's file appears → latched. The caller passes the
+        // grace-adjusted floor (state.rs LATCH_MTIME_GRACE): file mtime
+        // precision can trail `now()` by microseconds, and the host
+        // creates the file slightly BEFORE emitting session_start.
+        let floored = session_start - std::time::Duration::from_secs(2);
+        std::fs::write(&current, b"{}").expect("write");
+        assert_eq!(find_latest_session_file(&dir, floored), Some(current));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

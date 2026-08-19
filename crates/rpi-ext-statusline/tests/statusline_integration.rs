@@ -313,10 +313,12 @@ fn statusline_lifecycle_over_the_carrier_seam() {
             args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
                 && args.get("placement").and_then(Value::as_str) == Some("belowEditor")
                 && args.pointer("/content/type").and_then(Value::as_str) == Some("column")
-                && args.pointer("/content/children/0/props/text")
+                && args
+                    .pointer("/content/children/0/props/text")
                     .and_then(Value::as_str)
                     .is_some_and(|text| text.contains("widget-line-1"))
-                && args.pointer("/content/children/1/props/text")
+                && args
+                    .pointer("/content/children/1/props/text")
                     .and_then(Value::as_str)
                     .is_some_and(|text| text.contains("widget-line-2"))
         })
@@ -325,8 +327,10 @@ fn statusline_lifecycle_over_the_carrier_seam() {
     assert!(
         calls_of(&now, "ui.setStatus")
             .iter()
-            .any(|args| args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
-                && args.get("text") == Some(&Value::Null)),
+            .any(
+                |args| args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                    && args.get("text") == Some(&Value::Null)
+            ),
         "widget switch clears the old status entry"
     );
     // No footer takeover in widget mode (no new setFooter calls at all —
