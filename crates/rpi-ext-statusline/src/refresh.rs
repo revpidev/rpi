@@ -343,7 +343,11 @@ fn restore_if_mounted(calls: &AsyncHostCalls) {
             host_ok(calls, "ui.setFooter", json!({ "component": null }));
         }
         Some(Placement::Widget) => {
-            host_ok(calls, "ui.setWidget", json!({ "key": STATUS_KEY, "content": null }));
+            host_ok(
+                calls,
+                "ui.setWidget",
+                json!({ "key": STATUS_KEY, "content": null }),
+            );
         }
         Some(Placement::Status) => {
             host_ok(

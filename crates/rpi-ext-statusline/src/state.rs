@@ -9,7 +9,7 @@
 //! filtering is needed — TE12 verification §1).
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -73,6 +73,10 @@ pub struct EngineState {
     totals: Totals,
     last_usage: Option<Totals>,
     session_started_at: Instant,
+    /// Wall-clock session start — the mtime floor for the transcript latch
+    /// (see [`Self::ensure_transcript`]). `Instant` cannot be compared
+    /// against file mtimes, hence the second clock.
+    session_started_wall: SystemTime,
     /// Sticky transcript latch: `(cwd at latch time, resolved file)`.
     transcript: Option<(PathBuf, PathBuf)>,
     session_id: Option<String>,
@@ -82,12 +86,18 @@ pub struct EngineState {
     pub mounted: Option<Placement>,
 }
 
+/// Mtime tolerance below the session-start wall clock: the host creates
+/// the session file shortly BEFORE emitting `session_start`, so the new
+/// file's mtime can precede the event's arrival by a moment.
+const LATCH_MTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Default for EngineState {
     fn default() -> Self {
         Self {
             totals: Totals::default(),
             last_usage: None,
             session_started_at: Instant::now(),
+            session_started_wall: SystemTime::now(),
             transcript: None,
             session_id: None,
             mounted: None,
@@ -122,6 +132,7 @@ impl EngineState {
                 self.totals = Totals::default();
                 self.last_usage = None;
                 self.session_started_at = Instant::now();
+                self.session_started_wall = SystemTime::now();
                 self.transcript = None;
             }
         }
@@ -129,8 +140,10 @@ impl EngineState {
 
     /// Ensure a valid transcript latch: (re)resolve when absent, when the
     /// cwd moved, or when the latched file disappeared (TE-D34 sticky
-    /// latch). Never fails — an unresolvable directory just leaves the
-    /// latch empty (stdin JSON omits `transcript_path`).
+    /// latch). Never fails — an unresolvable directory (or one whose files
+    /// all predate this session — the new-session latch race) just leaves
+    /// the latch empty, retried on the next tick; stdin JSON omits
+    /// `transcript_path` until then.
     pub fn ensure_transcript(&mut self, cwd: &Path, settings_session_dir: Option<&str>) {
         let needs_reresolve = match &self.transcript {
             None => true,
@@ -140,7 +153,11 @@ impl EngineState {
             return;
         }
         let dir = resolve_session_dir(cwd, settings_session_dir);
-        self.transcript = find_latest_session_file(&dir).map(|path| (cwd.to_owned(), path));
+        let since = self
+            .session_started_wall
+            .checked_sub(LATCH_MTIME_GRACE)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        self.transcript = find_latest_session_file(&dir, since).map(|path| (cwd.to_owned(), path));
         self.session_id = self
             .transcript
             .as_ref()
@@ -225,6 +242,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Serializes the two tests that mutate the process-global
+    /// `RPI_CODING_AGENT_SESSION_DIR` (parallel set/remove_var races).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64, cost: f64) -> Value {
         json!({
             "input": input, "output": output,
@@ -274,6 +295,7 @@ mod tests {
 
         let cwd = Path::new("/definitely/not/here");
         // Point the resolution at the fixture via the env override.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
         let mut state = EngineState::default();
         state.ensure_transcript(cwd, None);
@@ -290,6 +312,48 @@ mod tests {
         std::fs::remove_file(&file).expect("remove");
         state.ensure_transcript(cwd, None);
         assert_eq!(state.transcript_path(), None);
+        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_session_does_not_latch_previous_sessions_file() {
+        // TE12 follow-up regression: at a new session's first tick only the
+        // previous session's file exists — the latch must stay empty
+        // (stdin omits transcript_path, the script shows zero totals)
+        // rather than locking onto the stale file for the whole session.
+        let dir =
+            std::env::temp_dir().join(format!("rpi-statusline-state-race-{}", std::process::id()));
+        let session_dir = dir.join("sessions").join("--x--");
+        std::fs::create_dir_all(&session_dir).expect("mkdir");
+        let stale =
+            session_dir.join("2026-08-19T10-00-00-000_11111111-2222-3333-4444-555555555555.jsonl");
+        std::fs::write(&stale, b"{}").expect("write");
+        let old_time = SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .append(true)
+            .open(&stale)
+            .expect("open")
+            .set_modified(old_time)
+            .expect("backdate mtime");
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", &session_dir);
+        let mut state = EngineState::default();
+        state.ensure_transcript(Path::new("/cwd"), None);
+        assert_eq!(
+            state.transcript_path(),
+            None,
+            "stale previous-session file must not be latched"
+        );
+        assert_eq!(state.session_id(), None);
+
+        // This session's file lands on disk → the next tick latches it.
+        let current =
+            session_dir.join("2026-08-19T11-00-00-000_018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e.jsonl");
+        std::fs::write(&current, b"{}").expect("write");
+        state.ensure_transcript(Path::new("/cwd"), None);
+        assert_eq!(state.transcript_path(), Some(current.as_path()));
         std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
         std::fs::remove_dir_all(&dir).ok();
     }
