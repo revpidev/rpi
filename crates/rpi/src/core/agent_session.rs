@@ -1885,8 +1885,11 @@ impl AgentSession {
     // Model management
     // ==================================================================
 
-    async fn emit_model_select(&self, next: &Model, source: &str) {
-        let previous = self.model();
+    /// Emit `model_select` when the model actually changed. `previous`
+    /// MUST be captured BEFORE the switch (`self.model()` reads the live
+    /// state, so reading it here would always equal `next` and the event
+    /// would never fire — the bug this signature fixes).
+    async fn emit_model_select(&self, previous: Option<Model>, next: &Model, source: &str) {
         if models_are_equal(previous.as_ref(), Some(next)) {
             return;
         }
@@ -1911,6 +1914,7 @@ impl AgentSession {
         }
 
         let thinking_level = self.thinking_level_for_model_switch(None);
+        let previous_model = self.model();
         self.inner.agent.set_model(model.clone());
         self.sync_compaction_model();
         self.sync_session_env();
@@ -1924,7 +1928,7 @@ impl AgentSession {
             .set_default_model_and_provider(&model.provider, &model.id);
 
         self.set_thinking_level(thinking_level);
-        self.emit_model_select(&model, "set").await;
+        self.emit_model_select(previous_model, &model, "set").await;
         Ok(())
     }
 
@@ -1996,6 +2000,7 @@ impl AgentSession {
         };
         let next = authenticated[next_index].clone();
         let thinking_level = self.thinking_level_for_model_switch(next.thinking_level);
+        let previous_model = self.model();
 
         self.inner.agent.set_model(next.model.clone());
         self.sync_compaction_model();
@@ -2009,7 +2014,8 @@ impl AgentSession {
             .settings_manager_mut()
             .set_default_model_and_provider(&next.model.provider, &next.model.id);
         self.set_thinking_level(thinking_level);
-        self.emit_model_select(&next.model, "cycle").await;
+        self.emit_model_select(previous_model, &next.model, "cycle")
+            .await;
 
         Ok(Some(ModelCycleResult {
             model: next.model,
@@ -2044,6 +2050,7 @@ impl AgentSession {
         };
         let next_model = available[next_index].clone();
         let thinking_level = self.thinking_level_for_model_switch(None);
+        let previous_model = self.model();
 
         self.inner.agent.set_model(next_model.clone());
         self.sync_compaction_model();
@@ -2057,7 +2064,8 @@ impl AgentSession {
             .settings_manager_mut()
             .set_default_model_and_provider(&next_model.provider, &next_model.id);
         self.set_thinking_level(thinking_level);
-        self.emit_model_select(&next_model, "cycle").await;
+        self.emit_model_select(previous_model, &next_model, "cycle")
+            .await;
 
         Ok(Some(ModelCycleResult {
             model: next_model,
