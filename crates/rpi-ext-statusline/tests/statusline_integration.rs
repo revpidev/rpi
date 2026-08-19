@@ -356,6 +356,36 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         })
     });
 
+    // ── 5c. A model switch re-renders with no usage change (regression:
+    //        the removed dirty-key short-circuit once ate these). ───────
+    set_canned(
+        "ctx.model",
+        json!({"id": "test-model-2", "name": "Second Model", "contextWindow": 128_000}),
+    );
+    write_settings(json!({"statusLine": {
+        "type": "command",
+        "command": "cat | grep -o test-model-2",
+        "placement": "widget",
+    }}));
+    send_event("model_select", json!({"type": "model_select"}));
+    poll_until("model switch re-renders via the new ctx.model", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args
+                    .pointer("/content/children/0/props/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("test-model-2"))
+        })
+    });
+    write_settings(json!({}));
+    send_event("message_end", json!({"type": "message_end"}));
+    poll_until("widget cleared after 5c", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args.get("content") == Some(&Value::Null)
+        })
+    });
+
     // ── 6. Failing script keeps the last render (no new pushes). ───────
     write_settings(json!({"statusLine": {
         "type": "command",

@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::{Placement, StatusLineConfig};
+use crate::config::Placement;
 use crate::paths::{find_latest_session_file, resolve_session_dir, session_id_from_path};
 
 /// Cumulative usage/cost counters (the footer's `usage_totals` shape).
@@ -184,57 +184,6 @@ impl EngineState {
     pub fn session_id(&self) -> Option<&str> {
         self.session_id.as_deref()
     }
-}
-
-/// Dirty key (fleet.rs:381 precedent): when this string is unchanged the
-/// refresh tick skips spawning the script. Includes the elapsed-seconds
-/// coarse clock so a duration display advances on subsequent events even
-/// with identical usage.
-pub fn snapshot_dirty_key(snapshot: &Snapshot, config: &StatusLineConfig) -> String {
-    #[derive(Serialize)]
-    struct Key<'a> {
-        command: &'a str,
-        padding: usize,
-        placement: &'a str,
-        cwd: &'a str,
-        model_id: Option<&'a str>,
-        context_tokens: Option<&'a Value>,
-        context_percent: Option<&'a Value>,
-        effort: Option<&'a str>,
-        session_name: Option<&'a str>,
-        totals: Totals,
-        last_usage: Option<Totals>,
-        elapsed_secs: u128,
-    }
-    let key = Key {
-        command: &config.command,
-        padding: config.padding,
-        placement: match config.placement {
-            Placement::Replace => "replace",
-            Placement::Widget => "widget",
-            Placement::Status => "status",
-        },
-        cwd: &snapshot.cwd,
-        model_id: snapshot
-            .model
-            .as_ref()
-            .and_then(|m| m.get("id"))
-            .and_then(Value::as_str),
-        context_tokens: snapshot
-            .context_usage
-            .as_ref()
-            .and_then(|c| c.get("tokens")),
-        context_percent: snapshot
-            .context_usage
-            .as_ref()
-            .and_then(|c| c.get("percent")),
-        effort: snapshot.thinking_level.as_deref(),
-        session_name: snapshot.session_name.as_deref(),
-        totals: snapshot.totals,
-        last_usage: snapshot.last_usage,
-        elapsed_secs: snapshot.session_elapsed_ms / 1000,
-    };
-    serde_json::to_string(&key).unwrap_or_default()
 }
 
 #[cfg(test)]
