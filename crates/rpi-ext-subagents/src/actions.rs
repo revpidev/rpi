@@ -506,7 +506,7 @@ pub fn handle_management_action_with(
         }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config)),
         other => ToolOutcome::error(format!(
-            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, grant-spawn-budget, doctor."
+            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, doctor."
         )),
     }
 }

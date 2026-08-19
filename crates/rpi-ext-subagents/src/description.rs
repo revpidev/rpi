@@ -5,7 +5,9 @@
 //! (project config dir then agent dir, 50 KiB cap, `{{placeholder}}`
 //! substitution, unknown placeholders kept), mandatory deduplicated safety
 //! section. The full/compact EXECUTION texts are rewritten for the structured
-//! P0 entry point per ADR-0016 — the byte-parity exemption is recorded there.
+//! entry points per ADR-0016 (single run) and ADR-0018 (tasks/steps
+//! composition with interpolation) — the byte-parity exemption is recorded
+//! there.
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +20,7 @@ const CUSTOM_TOOL_DESCRIPTION_MAX_BYTES: u64 = 50 * 1024;
 pub const SUBAGENT_SAFETY_GUIDANCE: &str = "SAFETY-CRITICAL SUBAGENT GUIDANCE:
 • Use { action: \"list\" } before execution and only run executable/non-disabled agents.
 • Keep execution and management separate: omit action for delegation execution; use action only for management/control.
-• P0 delegation runs in the foreground and blocks until the child finishes; pass a timeoutMs when a bounded run is needed.
+• Compositions (tasks/steps) run async by default; single runs follow asyncByDefault. Pass async:false only for a foreground blocking run, and pass a timeoutMs when a bounded run is needed.
 • Ordinary child subagents are not orchestrators. Only explicitly configured fanout children may use the child-safe subagent tool, still bounded by depth/session limits.
 • Keep one writer for the same cwd/worktree. Use fresh-context read-only reviewers for independent review, then have the parent synthesize and apply fixes.
 • Runs write artifacts (input/output/transcript/meta) next to the session or under .rpi/subagents/artifacts; include output paths and residual risks when reporting results.";
@@ -27,13 +29,16 @@ pub const FULL_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate a task to a focused c
 
 EXECUTION:
 • Before executing, use { action: \"list\" } and run only executable/non-disabled configured agents.
-• SINGLE RUN: { agent: \"scout\", task: \"...\" }. Pass the complete task text; the child has its own system prompt, tool allowlist and fresh session. The call blocks until the child finishes and returns its final output plus details (runId, agent, exitCode, usage).
+• SINGLE RUN: { agent: \"scout\", task: \"...\" }. Pass the complete task text; the child has its own system prompt, tool allowlist and fresh session. Returns the final output plus details (runId, agent, exitCode, usage); async runs return a receipt immediately and deliver the result as a session message.
+• PARALLEL WAVE: tasks: [{ key: \"correctness\", agent: \"reviewer\", task: \"...\" }, ...]. Children run concurrently bounded by concurrency (default 4); failures are isolated and the result aggregates every child's output in key order with per-child details.
+• CHAIN: steps: [{ agent: \"scout\", task: \"...\", as: \"scan\" }, { agent: \"worker\", task: \"Implement from {outputs.scan}\" }]. Children run sequentially; task templates may interpolate {task} (original), {previous} (prior step output), {outputs.<name>} (a step bound with as) and {chain_dir}. A failed step stops the chain and completed steps are returned.
+• Top-level async, concurrency, worktree, model, thinking, timeoutMs and budget fields are defaults children inherit unless they override them. async defaults to true for tasks/steps and to asyncByDefault for single runs.
 • context is \"fresh\" (default; isolated session) or \"fork\" (branch of the current parent session; requires a persisted parent). timeoutMs (or maxRuntimeMs) bounds the run; foreground runs default to 30 minutes. output names an output file for the child; artifacts:true/false toggles the artifact trail; cwd relocates the child.
 • Example: { agent: \"worker\", task: \"Implement X and run the tests\", context: \"fresh\", timeoutMs: 600000 }
 • model overrides the agent's model for this run; agentScope (user|project|both) scopes discovery.
 
 MANAGEMENT / CONTROL (use action; omit execution fields):
-• list, get, status, doctor (P0). Use { action: \"list\" } to enumerate agents; { action: \"get\", agent: \"...\" } for full definition detail; { action: \"doctor\" } for configuration self-diagnostics.
+• list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, doctor. Use { action: \"list\" } to enumerate agents; { action: \"get\", agent: \"...\" } for full definition detail; { action: \"status\" } for active runs; { action: \"doctor\" } for configuration self-diagnostics.
 
 ";
 
@@ -41,14 +46,15 @@ pub const COMPACT_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate a task to a focuse
 
 EXECUTE:
 • Call { action: \"list\" } first and use only executable/non-disabled agents.
-• SINGLE RUN { agent:\"scout\", task:\"...\" }. Complete task text; child has its own prompt/tools/session. Blocks until done and returns the final output with runId/exitCode/usage details.
-• context fresh|fork; timeoutMs bounds the run (default 30 minutes); output names an output file; artifacts toggles the trail; cwd relocates the child; model overrides per run.
+• SINGLE RUN { agent:\"scout\", task:\"...\" }. Complete task text; child has its own prompt/tools/session. Returns the final output with runId/exitCode/usage details.
+• PARALLEL tasks:[{key, agent, task, ...}] — concurrent children (concurrency cap, default 4), isolated failures, results aggregated in key order.
+• CHAIN steps:[{agent, task, as?}] — sequential children; task templates interpolate {task}, {previous}, {outputs.<name>} (bound with as), {chain_dir}; a failed step stops the chain.
+• context fresh|fork; async default true for compositions, asyncByDefault for single runs; timeoutMs bounds the run (foreground default 30 minutes); output names an output file; artifacts toggles the trail; cwd relocates the child; model overrides per run; top-level fields act as child defaults.
 
 MANAGE / CONTROL:
-• Use action for list/get/status/doctor. get takes agent; doctor reports binary/config/discovery/directory diagnostics.
+• Use action for list/get/status/interrupt/stop/steer/resume/refine/grant-spawn-budget/doctor. get takes agent; status lists active runs; doctor reports binary/config/discovery/directory diagnostics.
 
 ASYNC / SAFETY:
-• Foreground only in this version; async/background runs arrive with P1.
 • Ordinary children are not orchestrators. Keep one writer per cwd/worktree and use fresh read-only reviewers for independent checks.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +221,13 @@ mod tests {
         let config = ExtensionConfig::new();
         let description = build_subagent_tool_description(&config, Path::new("/repo"));
         assert!(description.contains("SINGLE RUN"));
+        assert!(description.contains("PARALLEL WAVE"));
+        assert!(description.contains("CHAIN"));
+        assert!(description.contains("{outputs.<name>}"));
         assert!(description.contains("action: \"list\""));
+        // ADR-0018 decision 5: the composition entry points are documented;
+        // the stale "async arrives with P1" wording is gone.
+        assert!(!description.contains("arrive with P1"));
         assert_eq!(
             description
                 .matches("SAFETY-CRITICAL SUBAGENT GUIDANCE")

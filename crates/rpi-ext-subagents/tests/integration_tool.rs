@@ -188,3 +188,59 @@ fn tool_surface_integration() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ADR-0021: the orchestration skill ships localized bodies (no workflowScript
+// teaching). The layout marker must upgrade a pre-marker v1 byte-exact install
+// in place, and must leave a same-marker directory (user-customized) alone.
+// Uses the directory-parameterized installer: the agent-dir env var is
+// process-global, so routing through it would race concurrent tests.
+#[test]
+fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
+    let dir = sandbox();
+    let agent_dir = dir.join("agent");
+    let skill_dir = agent_dir.join("skills").join("pi-subagents");
+    std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+    // v1 install shape: upstream body mentioning workflowScript, no marker.
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: pi-subagents\n---\n\nUse `workflowScript` for all execution.\n",
+    )
+    .unwrap();
+
+    rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
+
+    let upgraded = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+    assert!(!upgraded.contains("workflowScript"), "{upgraded}");
+    assert!(upgraded.contains("tasks"), "{upgraded}");
+    for name in [
+        "constraints-and-recipes.md",
+        "execution-controls.md",
+        "management-authoring-rpc.md",
+        "prompting-and-roles.md",
+    ] {
+        let body = std::fs::read_to_string(skill_dir.join("references").join(name)).unwrap();
+        assert!(
+            !body.contains("workflowScript"),
+            "{name} still teaches workflowScript"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(skill_dir.join(".rpi-layout-version")).unwrap(),
+        "2"
+    );
+
+    // User customization at the current layout version must survive a
+    // reinstall.
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: pi-subagents\n---\n\nCustomized locally.\n",
+    )
+    .unwrap();
+    rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
+    assert_eq!(
+        std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
+        "---\nname: pi-subagents\n---\n\nCustomized locally.\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
