@@ -1,0 +1,23 @@
+[package]
+name = "rpi-ext-statusline"
+description = "Claude Code-compatible script statusline (L0 native plugin, TE12): run a configured command, feed it session JSON on stdin, render its stdout as the footer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# rlib: all logic lives in the library for unit/integration tests; cdylib is
+# the distributed artifact loaded by rpi-ext-host's native loader
+# (mcp-adapter Cargo.toml precedent).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+# Plugin-owned tokio runtime (mcp-adapter runtime.rs precedent) + script
+# child-process execution (subagents runner/foreground.rs precedent).
+tokio.workspace = true
+tracing.workspace = true

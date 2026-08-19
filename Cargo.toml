@@ -10,6 +10,7 @@ members = [
     "crates/rpi-ext-mcp-adapter",
     "crates/rpi-ext-subagents",
     "crates/rpi-ext-smart-fetch",
+    "crates/rpi-ext-statusline",
     "crates/rpi-test-native-plugin",
     "crates/rpi-test-support",
 ]
@@ -27,6 +28,7 @@ rpi-tui = { path = "crates/rpi-tui" }
 rpi-ext-host = { path = "crates/rpi-ext-host" }
 rpi-ext-mcp-adapter = { path = "crates/rpi-ext-mcp-adapter" }
 rpi-ext-smart-fetch = { path = "crates/rpi-ext-smart-fetch" }
+rpi-ext-statusline = { path = "crates/rpi-ext-statusline" }
 rpi-test-support = { path = "crates/rpi-test-support" }
 
 # External baseline (coding-standards appendix A).
