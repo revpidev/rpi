@@ -17,7 +17,7 @@ use crate::config::{self, Placement};
 use crate::payload::build_stdin_json;
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
-use crate::state::{snapshot_dirty_key, EngineState, Snapshot};
+use crate::state::{EngineState, Snapshot};
 use crate::{host_ok, AsyncHostCalls, ENGINE};
 
 /// `ui.setStatus` key (the `status` placement channel). Distinct from the
@@ -61,7 +61,6 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
         tokio::sync::mpsc::unbounded_channel();
     let mut inflight: Option<CancelToken> = None;
     let mut generation: usize = 0;
-    let mut dirty_key: Option<String> = None;
     let mut bridge_ready = false;
     // Set when the bridge never appeared (a UI-less subagents child
     // process): the instance stays dormant for good — FR-C0 / FR-I.
@@ -90,7 +89,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
             },
             done = done_rx.recv() => {
                 let Some(done) = done else { break };
-                match handle_script_done(&calls, generation, done, &mut dirty_key) {
+                match handle_script_done(&calls, generation, done) {
                     DoneOutcome::Stale => { /* cancelled run: ignore */ }
                     DoneOutcome::Handled => { inflight = None; }
                 }
@@ -134,8 +133,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     token.cancel();
                     generation += 1;
                 }
-                if let Some(token) = refresh_tick(&calls, &done_tx, &mut generation, &mut dirty_key)
-                {
+                if let Some(token) = refresh_tick(&calls, &done_tx, &mut generation) {
                     inflight = Some(token);
                 }
                 let interval = current_refresh_interval();
@@ -178,18 +176,24 @@ fn current_refresh_interval() -> Option<u64> {
         .and_then(|config| config.refresh_interval_secs)
 }
 
-/// One refresh pass: reload config, pull ctx, skip when nothing changed,
-/// otherwise spawn the script. Returns the new in-flight cancel token.
+/// One refresh pass: reload config, pull ctx, spawn the script. Returns
+/// the new in-flight cancel token.
+///
+/// Every tick runs the script unconditionally: the seven trigger events
+/// are all low-frequency user-visible operations (message/tool completion,
+/// model/thinking switches, session lifecycle) already coalesced by the
+/// 300ms debounce, so a snapshot-comparison short-circuit only creates
+/// "changed but not refreshed" bugs — the git branch, for one, lives in
+/// none of the host-visible fields (TE12 follow-up: switching branches in
+/// a bash tool never re-rendered because the dirty key was unchanged).
 fn refresh_tick(
     calls: &AsyncHostCalls,
     done_tx: &UnboundedSender<ScriptDone>,
     generation: &mut usize,
-    dirty_key: &mut Option<String>,
 ) -> Option<CancelToken> {
     let settings = config::load_settings_snapshot();
     let Some(config) = settings.status_line else {
         restore_if_mounted(calls);
-        *dirty_key = None;
         return None;
     };
 
@@ -202,11 +206,6 @@ fn refresh_tick(
 
     let ctx = fetch_ctx(calls);
     let snapshot = snapshot_from_engine(&ctx, settings.session_dir.as_deref());
-    let key = snapshot_dirty_key(&snapshot, &config);
-    if dirty_key.as_ref() == Some(&key) {
-        return None;
-    }
-    *dirty_key = Some(key);
 
     *generation += 1;
     let cancel = CancelToken::new();
@@ -278,12 +277,7 @@ enum DoneOutcome {
 /// FR-F/FR-G: on success re-read the config (it may have changed while the
 /// script ran) and push through the configured channel; on failure keep
 /// the previous render and warn.
-fn handle_script_done(
-    calls: &AsyncHostCalls,
-    generation: usize,
-    done: ScriptDone,
-    dirty_key: &mut Option<String>,
-) -> DoneOutcome {
+fn handle_script_done(calls: &AsyncHostCalls, generation: usize, done: ScriptDone) -> DoneOutcome {
     let (run_generation, result) = done;
     if run_generation != generation {
         return DoneOutcome::Stale;
@@ -298,7 +292,6 @@ fn handle_script_done(
     let settings = config::load_settings_snapshot();
     let Some(config) = settings.status_line else {
         restore_if_mounted(calls);
-        *dirty_key = None;
         return DoneOutcome::Handled;
     };
     match config.placement {
