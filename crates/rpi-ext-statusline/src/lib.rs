@@ -148,6 +148,7 @@ fn handle_dispatch(message: &Value) -> Value {
         return Value::Null;
     }
     let event = message.get("event").and_then(Value::as_str).unwrap_or("");
+    tracing::info!(event, "statusline dispatch");
     let payload = message.get("payload").cloned().unwrap_or(Value::Null);
     let trigger = match event {
         "message_end" => {

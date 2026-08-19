@@ -106,7 +106,10 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                 break;
             }
             Trigger::Event(reason) => {
-                tracing::trace!(reason, "statusline refresh trigger");
+                // INFO level: event delivery is the TE12 diagnostic
+                // surface (which triggers arrived, which were dropped by
+                // the dormant gate / bridge wait).
+                tracing::info!(reason, "statusline refresh trigger");
                 if bridge_abandoned {
                     continue;
                 }
