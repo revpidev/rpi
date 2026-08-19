@@ -48,7 +48,6 @@ use rpi_ai::auth::config_value::{
     get_config_value_env_var_names, is_command_config_value, resolve_config_value_or_throw,
 };
 use rpi_ai::auth::file_store::FileCredentialStore;
-use rpi_ai::auth::helpers::env_api_key_auth;
 use rpi_ai::auth::interaction::{AuthInteraction, AuthPrompt};
 use rpi_ai::auth::resolve::{
     resolve_provider_auth, AuthResolutionOverrides, ModelsError, ModelsErrorCode,
@@ -2281,7 +2280,7 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
-    use rpi_ai::auth::types::AuthContext as _;
+    use rpi_ai::auth::helpers::env_api_key_auth;
     use rpi_ai::models::{PublishHandle, PublishShared};
 
     use super::*;
