@@ -159,7 +159,9 @@ pub fn parse_registry_source(source: &str) -> Option<RegistrySource> {
 fn is_github_owner(owner: &str) -> bool {
     !owner.is_empty()
         && owner.len() <= 39
-        && owner.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && !owner.starts_with('-')
         && !owner.ends_with('-')
 }
@@ -472,7 +474,13 @@ pub fn github_download_url(owner: &str, repo: &str, tag: &str, file: &str) -> St
 /// Official-site mirror asset URL (design §6:
 /// `<site_base>/extensions/download/<owner>/<repo>/<tag>/<file>`). The
 /// site base is the registry base, mirroring the install.sh semantics.
-pub fn mirror_download_url(registry_base: &str, owner: &str, repo: &str, tag: &str, file: &str) -> String {
+pub fn mirror_download_url(
+    registry_base: &str,
+    owner: &str,
+    repo: &str,
+    tag: &str,
+    file: &str,
+) -> String {
     format!(
         "{}/extensions/download/{owner}/{repo}/{tag}/{file}",
         registry_base.trim_end_matches('/')
@@ -514,10 +522,7 @@ impl RegistryTransport for ReqwestRegistryTransport {
                     .map_err(|error| error.to_string())?;
                 let response = client
                     .get(&url)
-                    .header(
-                        reqwest::header::USER_AGENT,
-                        rpi_user_agent(config::VERSION),
-                    )
+                    .header(reqwest::header::USER_AGENT, rpi_user_agent(config::VERSION))
                     .send()
                     .await
                     .map_err(|error| format!("request failed: {error}"))?;
@@ -572,8 +577,8 @@ pub struct GithubReleaseInfo {
 
 /// Parse a Releases API response (`tag_name` + asset `name`s).
 pub fn parse_github_release_json(body: &[u8]) -> Result<GithubReleaseInfo, String> {
-    let value: Value =
-        serde_json::from_slice(body).map_err(|error| format!("invalid release response: {error}"))?;
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|error| format!("invalid release response: {error}"))?;
     let tag = value
         .get("tag_name")
         .and_then(Value::as_str)
@@ -584,7 +589,12 @@ pub fn parse_github_release_json(body: &[u8]) -> Result<GithubReleaseInfo, Strin
         .map(|assets| {
             assets
                 .iter()
-                .filter_map(|asset| asset.get("name").and_then(Value::as_str).map(str::to_string))
+                .filter_map(|asset| {
+                    asset
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -746,8 +756,7 @@ pub fn extract_rpix(archive: &[u8], dest: &Path) -> Result<Vec<PathBuf>, String>
         .entries()
         .map_err(|error| format!("could not read the .rpix archive: {error}"))?;
     for entry in entries {
-        let mut entry =
-            entry.map_err(|error| format!("corrupt .rpix archive: {error}"))?;
+        let mut entry = entry.map_err(|error| format!("corrupt .rpix archive: {error}"))?;
         let path = entry
             .path()
             .map_err(|error| format!("corrupt .rpix archive path: {error}"))?
@@ -834,10 +843,7 @@ pub fn verify_sha256sums(dir: &Path, files: &[PathBuf]) -> Result<(), String> {
             continue;
         }
         if !listed.contains(file) {
-            return Err(format!(
-                "{} is not covered by SHA256SUMS",
-                file.display()
-            ));
+            return Err(format!("{} is not covered by SHA256SUMS", file.display()));
         }
     }
     Ok(())
@@ -922,10 +928,7 @@ pub fn extract_and_verify_rpix(
         Ok(manifest)
     })();
     match result {
-        Ok(manifest) => Ok(ExtractedRpix {
-            temp_dir,
-            manifest,
-        }),
+        Ok(manifest) => Ok(ExtractedRpix { temp_dir, manifest }),
         Err(error) => {
             let _ = std::fs::remove_dir_all(&temp_dir);
             Err(error)
@@ -1178,12 +1181,16 @@ mod tests {
         );
         // Range excludes 0.2.x.
         assert_eq!(
-            select_registry_version(&index, Some("~0.1.0")).unwrap().version,
+            select_registry_version(&index, Some("~0.1.0"))
+                .unwrap()
+                .version,
             "0.1.0"
         );
         // The yanked 0.2.0 is skipped even when it would be the max match.
         assert_eq!(
-            select_registry_version(&index, Some("^0.2")).unwrap().version,
+            select_registry_version(&index, Some("^0.2"))
+                .unwrap()
+                .version,
             "0.2.1"
         );
         // Nothing matches.
@@ -1213,9 +1220,8 @@ mod tests {
             select_artifact(entry, ExtensionKind::Native, Some("aarch64-apple-darwin")).unwrap();
         assert_eq!(artifact.file, "subagents-0.2.1-aarch64-apple-darwin.rpix");
         // Platform not published → error lists the published platforms.
-        let error =
-            select_artifact(entry, ExtensionKind::Native, Some("x86_64-pc-windows-msvc"))
-                .unwrap_err();
+        let error = select_artifact(entry, ExtensionKind::Native, Some("x86_64-pc-windows-msvc"))
+            .unwrap_err();
         assert!(error.contains("not published for platform"), "{error}");
         assert!(error.contains("x86_64-unknown-linux-musl"), "{error}");
         // Wasm picks the target-less artifact.
@@ -1234,8 +1240,12 @@ mod tests {
                 unavailable: false,
             }],
         };
-        let artifact =
-            select_artifact(&wasm_entry, ExtensionKind::Wasm, Some("aarch64-apple-darwin")).unwrap();
+        let artifact = select_artifact(
+            &wasm_entry,
+            ExtensionKind::Wasm,
+            Some("aarch64-apple-darwin"),
+        )
+        .unwrap();
         assert_eq!(artifact.file, "smart-1.0.0.rpix");
         // Unknown build target cannot select a native artifact.
         assert!(select_artifact(entry, ExtensionKind::Native, None).is_err());
@@ -1258,9 +1268,12 @@ mod tests {
                 unavailable: true,
             }],
         };
-        let error =
-            select_artifact(&entry, ExtensionKind::Native, Some("x86_64-unknown-linux-musl"))
-                .unwrap_err();
+        let error = select_artifact(
+            &entry,
+            ExtensionKind::Native,
+            Some("x86_64-unknown-linux-musl"),
+        )
+        .unwrap_err();
         assert!(error.contains("unavailable"), "{error}");
     }
 
@@ -1288,9 +1301,11 @@ mod tests {
             "subagents-0.2.0-aarch64-apple-darwin.rpix".to_string(),
             "subagents-0.2.0-x86_64-unknown-linux-musl.rpix.sha256".to_string(),
         ];
-        let selected =
-            select_github_asset(&assets, Some("x86_64-unknown-linux-musl")).unwrap();
-        assert_eq!(selected.file, "subagents-0.2.0-x86_64-unknown-linux-musl.rpix");
+        let selected = select_github_asset(&assets, Some("x86_64-unknown-linux-musl")).unwrap();
+        assert_eq!(
+            selected.file,
+            "subagents-0.2.0-x86_64-unknown-linux-musl.rpix"
+        );
         assert_eq!(selected.name, "subagents");
         assert_eq!(selected.version, "0.2.0");
         assert_eq!(selected.kind, ExtensionKind::Native);
@@ -1308,10 +1323,7 @@ mod tests {
         let error = select_github_asset(&["README.md".to_string()], Some("x")).unwrap_err();
         assert!(error.contains("no .rpix asset"), "{error}");
         // Two different extensions in one release: ambiguous.
-        let assets = vec![
-            "one-1.0.0.rpix".to_string(),
-            "two-1.0.0.rpix".to_string(),
-        ];
+        let assets = vec!["one-1.0.0.rpix".to_string(), "two-1.0.0.rpix".to_string()];
         let error = select_github_asset(&assets, None).unwrap_err();
         assert!(error.contains("several extensions"), "{error}");
     }
@@ -1431,7 +1443,9 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_cksum();
-            builder.append_data(&mut header, path, &content[..]).unwrap();
+            builder
+                .append_data(&mut header, path, &content[..])
+                .unwrap();
         }
         let tampered = builder.into_inner().unwrap().finish().unwrap();
         let error = materialize_rpix(&tampered, &root, "subagents", "0.2.0").unwrap_err();
@@ -1455,7 +1469,9 @@ mod tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_cksum();
-            builder.append_data(&mut header, path, &content[..]).unwrap();
+            builder
+                .append_data(&mut header, path, &content[..])
+                .unwrap();
         }
         let archive = builder.into_inner().unwrap().finish().unwrap();
         let error = materialize_rpix(&archive, dir.path(), "subagents", "0.2.0").unwrap_err();
@@ -1496,8 +1512,7 @@ mod tests {
         tar_bytes.push(b'x');
         tar_bytes.resize(512 + 512, 0);
         tar_bytes.resize(512 + 512 + 1024, 0);
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         use std::io::Write;
         encoder.write_all(&tar_bytes).unwrap();
         let archive = encoder.finish().unwrap();
@@ -1511,8 +1526,7 @@ mod tests {
         let dir = TestDir::new();
         let root = dir.path().join("extensions");
         let archive = build_rpix("subagents", "0.2.0", &[("libsubagents.so", b"x")]);
-        let extracted =
-            extract_and_verify_rpix(&archive, &root, "subagents", "0.2.0").unwrap();
+        let extracted = extract_and_verify_rpix(&archive, &root, "subagents", "0.2.0").unwrap();
         let dest = activate_rpix(
             extracted,
             &root,

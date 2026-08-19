@@ -2176,8 +2176,7 @@ impl DefaultPackageManager {
                 entry.version, source.name
             ));
         }
-        let artifact =
-            extension_registry::select_artifact(entry, kind, config::build_target())?;
+        let artifact = extension_registry::select_artifact(entry, kind, config::build_target())?;
         let (owner, repo) = index.repository.split_once('/').ok_or_else(|| {
             format!(
                 "Invalid registry index: repository \"{}\" is not <owner>/<repo>",
@@ -2195,8 +2194,19 @@ impl DefaultPackageManager {
                 integrity: IntegrityLevel::RegistryIndex,
             },
             download_urls: vec![
-                extension_registry::github_download_url(owner, repo, &artifact.release, &artifact.file),
-                extension_registry::mirror_download_url(base, owner, repo, &artifact.release, &artifact.file),
+                extension_registry::github_download_url(
+                    owner,
+                    repo,
+                    &artifact.release,
+                    &artifact.file,
+                ),
+                extension_registry::mirror_download_url(
+                    base,
+                    owner,
+                    repo,
+                    &artifact.release,
+                    &artifact.file,
+                ),
             ],
             sidecar_urls: Vec::new(),
             index_sha256: Some(artifact.sha256.clone()),
@@ -2210,8 +2220,11 @@ impl DefaultPackageManager {
         &self,
         source: &GithubReleaseSource,
     ) -> Result<(ResolvedArtifactInstall, String), String> {
-        let api_url =
-            extension_registry::github_release_api_url(&source.owner, &source.repo, source.tag.as_deref());
+        let api_url = extension_registry::github_release_api_url(
+            &source.owner,
+            &source.repo,
+            source.tag.as_deref(),
+        );
         let body = self
             .registry_transport
             .get(&api_url, extension_registry::REGISTRY_REQUEST_TIMEOUT)
@@ -2415,12 +2428,13 @@ impl DefaultPackageManager {
                 resolved.download_urls[0]
             )
         })?;
-        let expected = parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar)).ok_or_else(|| {
-            format!(
-                "The sha256 sidecar for {} is malformed; aborting the install",
-                resolved.info.name
-            )
-        })?;
+        let expected =
+            parse_sha256_sidecar(&String::from_utf8_lossy(&sidecar)).ok_or_else(|| {
+                format!(
+                    "The sha256 sidecar for {} is malformed; aborting the install",
+                    resolved.info.name
+                )
+            })?;
         let actual = sha256_hex(&bytes);
         if actual != expected {
             return Err(format!(
@@ -2472,7 +2486,12 @@ impl DefaultPackageManager {
             extracted.cleanup();
             return Err(error);
         }
-        extension_registry::activate_rpix(extracted, &root, &resolved.info.name, Some(source_string))?;
+        extension_registry::activate_rpix(
+            extracted,
+            &root,
+            &resolved.info.name,
+            Some(source_string),
+        )?;
         Ok(())
     }
 
@@ -2830,12 +2849,11 @@ impl DefaultPackageManager {
                 // Rpi-specific (extension-distribution §7.2): registry and
                 // `github:` sources re-resolve by range/tag and run install
                 // steps 5–7.
-                ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => {
-                    registry_candidates.push(ConfiguredUpdateSource {
+                ParsedSource::Registry(_) | ParsedSource::GithubRelease(_) => registry_candidates
+                    .push(ConfiguredUpdateSource {
                         source: entry.source.clone(),
                         scope: entry.scope,
-                    })
-                }
+                    }),
                 _ => {}
             }
         }
@@ -6933,10 +6951,7 @@ mod registry_tests {
         }
 
         fn insert(&self, url: &str, body: Vec<u8>) {
-            self.responses
-                .lock()
-                .unwrap()
-                .insert(url.to_string(), body);
+            self.responses.lock().unwrap().insert(url.to_string(), body);
         }
 
         fn remove(&self, url: &str) {
@@ -6987,10 +7002,7 @@ mod registry_tests {
         manager
     }
 
-    fn manager_ok(
-        dirs: &TestDirs,
-        transport: Arc<MapTransport>,
-    ) -> DefaultPackageManager {
+    fn manager_ok(dirs: &TestDirs, transport: Arc<MapTransport>) -> DefaultPackageManager {
         registry_manager(dirs, transport, Some(Box::new(|_| true)), false, true)
     }
 
@@ -7020,7 +7032,9 @@ mod registry_tests {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_cksum();
-            builder.append_data(&mut header, path, &content[..]).unwrap();
+            builder
+                .append_data(&mut header, path, &content[..])
+                .unwrap();
         }
         builder.into_inner().unwrap().finish().unwrap()
     }
@@ -7096,12 +7110,8 @@ mod registry_tests {
             &extension_registry::registry_index_url(REGISTRY_BASE, name),
             index.into_bytes(),
         );
-        let download = extension_registry::github_download_url(
-            "acme",
-            name,
-            &format!("v{version}"),
-            &file,
-        );
+        let download =
+            extension_registry::github_download_url("acme", name, &format!("v{version}"), &file);
         transport.insert(&download, archive.clone());
         (archive, download)
     }
@@ -7128,7 +7138,10 @@ mod registry_tests {
         // Local paths keep their meaning: `.`/`/` shapes, and an existing
         // bare directory (`src` exists in the crate root, the cargo test
         // cwd).
-        assert!(matches!(parse_source("./subagents"), ParsedSource::Local(_)));
+        assert!(matches!(
+            parse_source("./subagents"),
+            ParsedSource::Local(_)
+        ));
         assert!(matches!(parse_source("foo/bar"), ParsedSource::Local(_)));
         assert!(matches!(parse_source("src"), ParsedSource::Local(_)));
         // A bare name with an invalid range tail stays local.
@@ -7149,7 +7162,10 @@ mod registry_tests {
         };
         assert_eq!(github.tag.as_deref(), Some("v1.2.3"));
         // Malformed github: falls back to local (install errors naturally).
-        assert!(matches!(parse_source("github:acme"), ParsedSource::Local(_)));
+        assert!(matches!(
+            parse_source("github:acme"),
+            ParsedSource::Local(_)
+        ));
 
         // Existing channels are untouched.
         assert!(matches!(parse_source("npm:foo"), ParsedSource::Npm(_)));
@@ -7212,7 +7228,9 @@ mod registry_tests {
             false,
             true,
         );
-        manager.install_and_persist("subagents@^0.2", false).unwrap();
+        manager
+            .install_and_persist("subagents@^0.2", false)
+            .unwrap();
 
         // Materialized into the global discovery root (design §3.3).
         let dir = dirs.agent_dir.join("extensions/subagents");
@@ -7264,8 +7282,7 @@ mod registry_tests {
     fn test_install_registry_checksum_mismatch_aborts_without_mirror() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
-        let (archive, download) =
-            serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let (archive, download) = serve_registry_extension(&transport, "subagents", "0.2.0", true);
         // Corrupt the index-pinned sha256.
         let index = native_index_json("subagents", "acme/subagents", "0.2.0", &"0".repeat(64));
         transport.insert(
@@ -7281,7 +7298,13 @@ mod registry_tests {
             download.rsplit('/').next().unwrap(),
         );
         transport.insert(&mirror, archive);
-        let mut manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), false, true);
+        let mut manager = registry_manager(
+            &dirs,
+            transport.clone(),
+            Some(Box::new(|_| true)),
+            false,
+            true,
+        );
         let error = manager.install_and_persist("subagents", false).unwrap_err();
         assert!(error.contains("Integrity check failed"), "{error}");
         let calls = transport.calls();
@@ -7294,8 +7317,7 @@ mod registry_tests {
     fn test_install_registry_falls_back_to_mirror() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
-        let (archive, download) =
-            serve_registry_extension(&transport, "subagents", "0.2.0", true);
+        let (archive, download) = serve_registry_extension(&transport, "subagents", "0.2.0", true);
         // GitHub-direct 404s; the mirror serves the artifact.
         transport.remove(&download);
         let mirror = extension_registry::mirror_download_url(
@@ -7323,7 +7345,13 @@ mod registry_tests {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         serve_registry_extension(&transport, "subagents", "0.2.0", true);
-        let mut manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), true, true);
+        let mut manager = registry_manager(
+            &dirs,
+            transport.clone(),
+            Some(Box::new(|_| true)),
+            true,
+            true,
+        );
         let error = manager.install_and_persist("subagents", false).unwrap_err();
         assert!(error.contains("offline mode"), "{error}");
         let manager = manager_ok(&dirs, transport);
@@ -7336,7 +7364,8 @@ mod registry_tests {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         serve_registry_extension(&transport, "subagents", "0.2.0", true);
-        let mut manager = registry_manager(&dirs, transport, Some(Box::new(|_| true)), false, false);
+        let mut manager =
+            registry_manager(&dirs, transport, Some(Box::new(|_| true)), false, false);
         let error = manager.install_and_persist("subagents", true).unwrap_err();
         assert!(error.contains("not trusted"), "{error}");
 
@@ -7358,7 +7387,9 @@ mod registry_tests {
         let transport = MapTransport::new();
         serve_registry_extension(&transport, "subagents", "0.2.0", true);
         let mut manager = manager_ok(&dirs, transport);
-        manager.install_and_persist("subagents@^0.2", false).unwrap();
+        manager
+            .install_and_persist("subagents@^0.2", false)
+            .unwrap();
         let removed = manager.remove_and_persist("subagents", false).unwrap();
         assert!(removed);
         assert!(!dirs.agent_dir.join("extensions/subagents").exists());
@@ -7388,7 +7419,11 @@ mod registry_tests {
         // Up to date: the second update does not download again.
         let calls_before = transport.calls().len();
         manager.update(Some("subagents")).unwrap();
-        assert_eq!(transport.calls().len(), calls_before + 1, "index re-fetch only");
+        assert_eq!(
+            transport.calls().len(),
+            calls_before + 1,
+            "index re-fetch only"
+        );
     }
 
     // ---- github: channel (design §7.1) ----
@@ -7436,13 +7471,7 @@ mod registry_tests {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         serve_github_release(
-            &transport,
-            "acme",
-            "tools",
-            "v1.0.0",
-            "tools",
-            "1.0.0",
-            false,
+            &transport, "acme", "tools", "v1.0.0", "tools", "1.0.0", false,
         );
         let mut manager = manager_ok(&dirs, transport);
         manager
@@ -7459,7 +7488,9 @@ mod registry_tests {
             Some(dir.clone())
         );
         // remove works without any network (the marker identifies the dir).
-        let removed = manager.remove_and_persist("github:acme/tools", false).unwrap();
+        let removed = manager
+            .remove_and_persist("github:acme/tools", false)
+            .unwrap();
         assert!(removed);
         assert!(!dir.exists());
         assert!(!settings_packages(&dirs).contains("github:acme"));
@@ -7470,13 +7501,7 @@ mod registry_tests {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
         let (_download, sidecar) = serve_github_release(
-            &transport,
-            "acme",
-            "tools",
-            "v1.0.0",
-            "tools",
-            "1.0.0",
-            false,
+            &transport, "acme", "tools", "v1.0.0", "tools", "1.0.0", false,
         );
         transport.remove(&sidecar);
         let mut manager = manager_ok(&dirs, transport);
@@ -7491,7 +7516,9 @@ mod registry_tests {
     fn test_update_github_release_to_latest() {
         let dirs = TestDirs::new();
         let transport = MapTransport::new();
-        serve_github_release(&transport, "acme", "tools", "v1.0.0", "tools", "1.0.0", false);
+        serve_github_release(
+            &transport, "acme", "tools", "v1.0.0", "tools", "1.0.0", false,
+        );
         // The source has no tag: resolution goes through releases/latest.
         let release = serde_json::json!({
             "tag_name": "v1.0.0",
@@ -7502,10 +7529,14 @@ mod registry_tests {
             release.to_string().into_bytes(),
         );
         let mut manager = manager_ok(&dirs, transport.clone());
-        manager.install_and_persist("github:acme/tools", false).unwrap();
+        manager
+            .install_and_persist("github:acme/tools", false)
+            .unwrap();
 
         // A new latest release (1.1.0) is picked up by update.
-        serve_github_release(&transport, "acme", "tools", "v1.1.0", "tools", "1.1.0", false);
+        serve_github_release(
+            &transport, "acme", "tools", "v1.1.0", "tools", "1.1.0", false,
+        );
         let release = serde_json::json!({
             "tag_name": "v1.1.0",
             "assets": [{"name": "tools-1.1.0.rpix"}, {"name": "tools-1.1.0.rpix.sha256"}]
@@ -7516,8 +7547,10 @@ mod registry_tests {
         );
         manager.update(Some("github:acme/tools")).unwrap();
         assert_eq!(
-            extension_registry::installed_extension_version(&dirs.agent_dir.join("extensions/tools"))
-                .as_deref(),
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/tools")
+            )
+            .as_deref(),
             Some("1.1.0")
         );
         // The marker survives the atomic replacement.
@@ -7536,7 +7569,13 @@ mod registry_tests {
         let mut manager = manager_ok(&dirs, transport.clone());
         manager.install_and_persist("subagents", false).unwrap();
         // Offline update: no registry access at all (early return).
-        let manager = registry_manager(&dirs, transport.clone(), Some(Box::new(|_| true)), true, true);
+        let manager = registry_manager(
+            &dirs,
+            transport.clone(),
+            Some(Box::new(|_| true)),
+            true,
+            true,
+        );
         manager.update(None).unwrap();
         assert!(transport.calls().len() < 4, "no new fetches");
     }
