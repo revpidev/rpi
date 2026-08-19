@@ -2110,11 +2110,33 @@ impl AgentSession {
                 SessionEvent::ThinkingLevelChanged { level: effective },
             ));
             // `void this._extensionRunner.emit(...)` (agent-session.ts:1693).
+            // The spawn must survive callers WITHOUT a runtime context:
+            // TUI key callbacks (cycle_thinking_level, the thinking
+            // selector) run on the off-runtime driver thread, where
+            // `Handle::try_current()` fails — dropping the spawn silently
+            // lost the event for every subscriber. Drive it on a dedicated
+            // current-thread runtime in that case (the spawn_async
+            // fallback precedent, commands_selectors.rs:261-275).
             let runner = self.runner();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    runner.emit("thinking_level_select").await;
-                });
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        runner.emit("thinking_level_select").await;
+                    });
+                }
+                Err(_) => {
+                    std::thread::spawn(move || {
+                        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        else {
+                            return;
+                        };
+                        runtime.block_on(async move {
+                            runner.emit("thinking_level_select").await;
+                        });
+                    });
+                }
             }
         }
     }
