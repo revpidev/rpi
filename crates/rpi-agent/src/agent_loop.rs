@@ -825,13 +825,17 @@ async fn stream_assistant_response(
 
     let mut response = stream_function(config.model.clone(), llm_context, options);
 
-    let mut partial_message: Option<AssistantMessage> = None;
+    // Whether `StreamEvent::Start` has been seen — only then are delta
+    // updates forwarded. (Upstream tracks the last partial message here;
+    // only the "started" predicate is read, so a flag avoids re-cloning the
+    // whole accumulating message on every delta.)
+    let mut stream_started = false;
     let mut added_partial = false;
 
     while let Some(event) = response.next().await {
         match event {
             StreamEvent::Start { partial } => {
-                partial_message = Some(partial.clone());
+                stream_started = true;
                 context
                     .messages
                     .push(AgentMessage::Assistant(partial.clone()));
@@ -848,10 +852,9 @@ async fn stream_assistant_response(
                 return finalize_streamed_message(context, error, added_partial, emit).await;
             }
             other => {
-                if partial_message.is_some() {
+                if stream_started {
                     if let Some(partial) = stream_event_partial(&other) {
                         let partial = partial.clone();
-                        partial_message = Some(partial.clone());
                         replace_context_tail(context, partial.clone());
                         emit(AgentEvent::MessageUpdate {
                             message: AgentMessage::Assistant(partial),
