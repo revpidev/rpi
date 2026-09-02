@@ -677,6 +677,14 @@ pub trait ContextActions: Send + Sync {
     fn get_append_system_prompt_source_paths(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// `ctx.sessionFile()` (rpi additive, ADR-0022): authoritative
+    /// `{path, id}` of the current session — `path: null` for in-memory
+    /// sessions. `None` when unbound (the caller falls back to its own
+    /// derivation).
+    fn get_session_file(&self) -> Option<crate::types::SessionFileInfo> {
+        None
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -1259,6 +1267,15 @@ impl ExtensionContext {
             .context_actions()?
             .map(|actions| actions.get_append_system_prompt_source_paths())
             .unwrap_or_default())
+    }
+
+    /// `ctx.sessionFile()` (rpi additive, ADR-0022) — authoritative
+    /// `{path, id}` of the current session; `path: null` for in-memory
+    /// sessions. Default `None` when unbound.
+    pub fn session_file(&self) -> Result<Option<crate::types::SessionFileInfo>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .and_then(|actions| actions.get_session_file()))
     }
 }
 

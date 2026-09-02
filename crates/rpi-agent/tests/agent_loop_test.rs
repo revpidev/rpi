@@ -674,7 +674,11 @@ async fn partial_update_reaches_stream_before_execute_returns() {
     };
     let (stream_fn, _state) = mock_stream_fn(vec![
         assistant_message(
-            vec![tool_call("tool-1", "streaming_tool", json!({ "value": "x" }))],
+            vec![tool_call(
+                "tool-1",
+                "streaming_tool",
+                json!({ "value": "x" }),
+            )],
             StopReason::ToolUse,
         ),
         text_assistant("done"),

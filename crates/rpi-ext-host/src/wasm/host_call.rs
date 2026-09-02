@@ -93,7 +93,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.modelRegistry.hasConfiguredAuth"
         | "ctx.modelRegistry.getApiKeyAndHeaders"
         | "ctx.setRuntimeApiKey"
-        | "ctx.removeRuntimeApiKey" => Requires(Capability::Session),
+        | "ctx.removeRuntimeApiKey"
+        | "ctx.sessionFile" => Requires(Capability::Session),
         _ => UnknownMethod,
     }
 }
@@ -776,6 +777,21 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(serde_json::to_value(usage).unwrap_or(Value::Null))
         }
+        "ctx.sessionFile" => {
+            // rpi additive (ADR-0022): `{path: string|null, id: string}`;
+            // unbound hosts answer the all-null shape rather than an error
+            // so guests can feature-detect.
+            let info = state
+                .api
+                .context()
+                .session_file()
+                .map_err(|e| (error_kind(&e), e.to_string()))?
+                .unwrap_or(ext::SessionFileInfo {
+                    path: None,
+                    id: String::new(),
+                });
+            Ok(serde_json::to_value(info).unwrap_or(Value::Null))
+        }
         "ctx.getSystemPrompt" => Ok(json!(state
             .api
             .context()
@@ -1110,6 +1126,11 @@ mod tests {
         ));
         assert!(matches!(
             required_capability("ctx.setRuntimeApiKey"),
+            Requires(Capability::Session)
+        ));
+        // ADR-0022 addition is Session-gated (same family as ctx.*).
+        assert!(matches!(
+            required_capability("ctx.sessionFile"),
             Requires(Capability::Session)
         ));
     }

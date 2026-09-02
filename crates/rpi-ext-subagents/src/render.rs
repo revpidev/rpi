@@ -708,7 +708,6 @@ mod tests {
     // ===== FR-B: terminal families =====
 
     #[test]
-    #[test]
     fn async_receipt_renders_detached_not_running() {
         // The 2026-08-16 live-session defect: the receipt is the call's
         // FINAL render, so a spinner here reads "still running" forever.
@@ -761,6 +760,7 @@ mod tests {
         assert!(lines[0].0.contains("scout · running"), "{lines:?}");
     }
 
+    #[test]
     fn terminal_success_card() {
         let details = json!({
             "mode": "single",

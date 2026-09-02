@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::config::{self, Placement};
-use crate::payload::build_stdin_json;
+use crate::config::{self, Placement, DEFAULT_LIVE_REFRESH_MS};
+use crate::payload::{build_stdin_json, HOOK_EVENT_STATUS};
 use crate::render::{footer_tree, status_text};
 use crate::runner::{self, CancelToken, ScriptError};
 use crate::state::{EngineState, Snapshot};
@@ -47,6 +47,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 pub enum Trigger {
     /// A subscribed session event (or the synthetic "interval").
     Event(&'static str),
+    /// Live bookkeeping advanced (`message_start` / `message_update`
+    /// dispatch — measurement only, FR-E); arms the live ticker, never
+    /// the debounce must-run path.
+    Live,
+    /// The live ticker fired (streaming re-run throttle, FR-E).
+    LiveTick,
     /// `session_shutdown` — cancel in-flight work and stop.
     Shutdown,
 }
@@ -62,6 +68,9 @@ struct CtxData {
     context_usage: Option<Value>,
     thinking_level: Option<String>,
     session_name: Option<String>,
+    /// `ctx.sessionFile` answer `{path, id}` (FR-I); `None` = call
+    /// failed / unbound → the directory heuristic stays in charge.
+    session_file: Option<Value>,
 }
 
 /// Run the refresh loop until `Trigger::Shutdown` (or every senders drop).
@@ -77,6 +86,10 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
     let mut interval_deadline: Option<Instant> = None;
     let mut poll_deadline = Instant::now() + POLL_INTERVAL;
     let mut last_fingerprint: Option<String> = None;
+    // Live ticker (FR-E): armed by `Trigger::Live` while an assistant
+    // message streams; fires at most once per `liveTokens.refreshMs`.
+    let mut live_deadline: Option<Instant> = None;
+    let mut last_live_fingerprint: Option<String> = None;
 
     loop {
         // Copy the deadline into the future (Option<Instant> is Copy) so
@@ -94,6 +107,16 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
         tokio::pin!(interval_fut);
         let poll_fut = tokio::time::sleep_until(tokio::time::Instant::from_std(poll_deadline));
         tokio::pin!(poll_fut);
+        let live_deadline_value = live_deadline;
+        let live_fut = async move {
+            match live_deadline_value {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(live_fut);
 
         let step = tokio::select! {
             trigger = rx.recv() => match trigger {
@@ -110,6 +133,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
             }
             _ = &mut interval_fut => Trigger::Event("interval"),
             _ = &mut poll_fut => Trigger::Event("poll"),
+            _ = &mut live_fut => Trigger::LiveTick,
         };
 
         match step {
@@ -119,8 +143,72 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                 }
                 break;
             }
+            Trigger::Live => {
+                // Arm the streaming ticker (idempotent): the first live
+                // bookkeeping of a stream starts the refreshMs cadence.
+                if live_deadline.is_none() {
+                    live_deadline = Some(Instant::now() + live_refresh_interval());
+                }
+            }
+            Trigger::LiveTick => {
+                let streaming =
+                    with_engine(|engine| engine.live.as_ref().is_some_and(|l| l.is_streaming()));
+                if !streaming {
+                    live_deadline = None;
+                    last_live_fingerprint = None;
+                    continue;
+                }
+                // FR-E: refreshMs is re-read every tick — config edits
+                // apply immediately.
+                live_deadline = Some(Instant::now() + live_refresh_interval());
+                if bridge_abandoned {
+                    continue;
+                }
+                if !bridge_ready {
+                    // A stream may start before any regular event armed
+                    // the bridge; acquire it here (same discipline as the
+                    // event path — dormant instances stay dormant).
+                    bridge_ready = wait_for_bridge(&calls).await;
+                    if !bridge_ready {
+                        bridge_abandoned = true;
+                        continue;
+                    }
+                }
+                // Dirty check (FR-E): re-run only when a measurement moved.
+                // While streaming `elapsed_ms` always moves (a stalled
+                // stream still re-runs so the script can zero the rate).
+                let now = Instant::now();
+                let fingerprint = with_engine(|engine| {
+                    engine.live.as_ref().map(|live| live.peek_fingerprint(now))
+                });
+                let Some(fingerprint) = fingerprint else {
+                    continue;
+                };
+                if last_live_fingerprint.as_ref() == Some(&fingerprint) {
+                    continue;
+                }
+                last_live_fingerprint = Some(fingerprint);
+                if let Some(token) = inflight.take() {
+                    token.cancel();
+                    generation += 1;
+                }
+                if let Some(token) =
+                    refresh_tick(&calls, &done_tx, &mut generation, "message_update")
+                {
+                    inflight = Some(token);
+                }
+            }
             Trigger::Event("poll") => {
                 poll_deadline = Instant::now() + POLL_INTERVAL;
+                // While an assistant message streams, the liveTicker owns
+                // the re-run cadence (A4: spawn ≤ 1/refreshMs) — the poll
+                // must not interleave a second spawn stream. Its
+                // self-heal job resumes once the stream settles.
+                if with_engine(|engine| {
+                    engine.live.as_ref().is_some_and(|live| live.is_streaming())
+                }) {
+                    continue;
+                }
                 if bridge_abandoned || !bridge_ready {
                     // The poll never opens the bridge gate: without a UI
                     // there is nothing to refresh (dormant children stay
@@ -132,7 +220,9 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                         token.cancel();
                         generation += 1;
                     }
-                    if let Some(token) = refresh_tick(&calls, &done_tx, &mut generation) {
+                    if let Some(token) =
+                        refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS)
+                    {
                         inflight = Some(token);
                     }
                 }
@@ -154,12 +244,15 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                 }
                 // CC debounce: wait out the burst, then coalesce.
                 tokio::time::sleep(DEBOUNCE).await;
-                let shutdown = drain_triggers(&mut rx);
+                let (shutdown, saw_live) = drain_triggers(&mut rx);
                 if shutdown {
                     if let Some(token) = inflight.take() {
                         token.cancel();
                     }
                     break;
+                }
+                if saw_live && live_deadline.is_none() {
+                    live_deadline = Some(Instant::now() + live_refresh_interval());
                 }
                 // A newer update cancels the in-flight script (CC
                 // semantics). Bump the generation so its late result is
@@ -168,7 +261,9 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     token.cancel();
                     generation += 1;
                 }
-                if let Some(token) = refresh_tick(&calls, &done_tx, &mut generation) {
+                if let Some(token) =
+                    refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS)
+                {
                     inflight = Some(token);
                 }
                 let interval = current_refresh_interval();
@@ -178,14 +273,18 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
     }
 }
 
-/// Coalesce the debounce window: drain queued triggers; report if a
-/// shutdown arrived (which wins over every other trigger).
-fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> bool {
+/// Coalesce the debounce window: drain queued triggers; report whether a
+/// shutdown arrived (which wins over every other trigger) and whether any
+/// live bookkeeping was drained (re-arm the ticker so a quiet stream's
+/// cadence is not lost to the drain).
+fn drain_triggers(rx: &mut UnboundedReceiver<Trigger>) -> (bool, bool) {
+    let mut saw_live = false;
     loop {
         match rx.try_recv() {
-            Ok(Trigger::Shutdown) => return true,
+            Ok(Trigger::Shutdown) => return (true, saw_live),
+            Ok(Trigger::Live) => saw_live = true,
             Ok(_) => {}
-            Err(_) => return false,
+            Err(_) => return (false, saw_live),
         }
     }
 }
@@ -203,6 +302,16 @@ async fn wait_for_bridge(calls: &AsyncHostCalls) -> bool {
     false
 }
 
+/// The configured `liveTokens.refreshMs` right now (re-read per tick;
+/// §1.5 — applies immediately).
+fn live_refresh_interval() -> Duration {
+    let ms = config::load_settings_snapshot()
+        .status_line
+        .map(|config| config.live_tokens.refresh_ms)
+        .unwrap_or(DEFAULT_LIVE_REFRESH_MS);
+    Duration::from_millis(ms)
+}
+
 /// The configured `refreshInterval` right now (re-read from settings so a
 /// config edit applies on the next tick).
 fn current_refresh_interval() -> Option<u64> {
@@ -216,6 +325,12 @@ fn current_refresh_interval() -> Option<u64> {
 /// facts and report whether ANY of them changed since the last poll. The
 /// first poll after (re)configuration counts as a change — a free initial
 /// render for config edits the event surface knows nothing about.
+///
+/// The live measurements join the fingerprint only once FROZEN
+/// (`message_end` seen): while streaming, the liveTicker owns the re-run
+/// cadence and the poll must not interleave a second spawn stream
+/// (A4: spawn rate ≤ 1/refreshMs). Frozen values self-heal a dropped
+/// `message_end` event through the poll instead.
 fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -> bool {
     let settings = config::load_settings_snapshot();
     if settings.status_line.is_none() {
@@ -224,13 +339,21 @@ fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -
         return false;
     }
     let ctx = fetch_ctx(calls);
+    let live_fingerprint = with_engine(|engine| {
+        engine
+            .live
+            .as_ref()
+            .filter(|live| !live.is_streaming())
+            .map(|live| live.peek_fingerprint(Instant::now()))
+    });
     let fingerprint = format!(
-        "{:?}|{}|{:?}|{:?}|{:?}",
+        "{:?}|{}|{:?}|{:?}|{:?}|{:?}",
         ctx.model.as_ref().map(|model| model.get("id")),
         ctx.cwd,
         ctx.thinking_level,
         ctx.session_name,
         ctx.context_usage,
+        live_fingerprint,
     );
     let changed = last.as_ref() != Some(&fingerprint);
     *last = Some(fingerprint);
@@ -251,6 +374,7 @@ fn refresh_tick(
     calls: &AsyncHostCalls,
     done_tx: &UnboundedSender<ScriptDone>,
     generation: &mut usize,
+    hook_event_name: &str,
 ) -> Option<CancelToken> {
     let settings = config::load_settings_snapshot();
     let Some(config) = settings.status_line else {
@@ -266,7 +390,7 @@ fn refresh_tick(
     }
 
     let ctx = fetch_ctx(calls);
-    let snapshot = snapshot_from_engine(&ctx, settings.session_dir.as_deref());
+    let snapshot = snapshot_from_engine(&ctx, settings.session_dir.as_deref(), hook_event_name);
 
     *generation += 1;
     let cancel = CancelToken::new();
@@ -285,11 +409,42 @@ fn refresh_tick(
 }
 
 /// Assemble the payload snapshot: ctx facts plus the engine's
-/// accumulated state (latching the transcript path on the way through).
-fn snapshot_from_engine(ctx: &CtxData, settings_session_dir: Option<&str>) -> Snapshot {
+/// accumulated state. The live delta window advances HERE — the
+/// payload-assembly instant IS the measurement base (FR-B) — and the
+/// authoritative session identity (FR-I) wins over the transcript latch,
+/// which only runs as the fallback when `ctx.sessionFile` is unavailable.
+fn snapshot_from_engine(
+    ctx: &CtxData,
+    settings_session_dir: Option<&str>,
+    hook_event_name: &str,
+) -> Snapshot {
     with_engine(|engine| {
-        let cwd_path = Path::new(&ctx.cwd);
-        engine.ensure_transcript(cwd_path, settings_session_dir);
+        if let Some(info) = &ctx.session_file {
+            let path = info.get("path").and_then(Value::as_str).map(str::to_owned);
+            if let Some(id) = info.get("id").and_then(Value::as_str) {
+                if !id.is_empty() {
+                    engine.set_authoritative_session(path, id.to_owned());
+                }
+            }
+        }
+        let (transcript_path, session_id) = match engine.authoritative_session() {
+            Some((path, id)) => (path.clone(), Some(id.clone())),
+            None => {
+                let cwd_path = Path::new(&ctx.cwd);
+                engine.ensure_transcript(cwd_path, settings_session_dir);
+                (
+                    engine
+                        .transcript_path()
+                        .map(|path| path.display().to_string()),
+                    engine.session_id().map(str::to_owned),
+                )
+            }
+        };
+        let live_output = engine
+            .live
+            .as_mut()
+            .filter(|live| live.ever_measured())
+            .map(|live| live.snapshot(std::time::Instant::now()));
         Snapshot {
             cwd: ctx.cwd.clone(),
             model: ctx.model.clone(),
@@ -299,15 +454,15 @@ fn snapshot_from_engine(ctx: &CtxData, settings_session_dir: Option<&str>) -> Sn
             totals: engine.totals(),
             last_usage: engine.last_usage(),
             session_elapsed_ms: engine.session_elapsed_ms(),
-            transcript_path: engine
-                .transcript_path()
-                .map(|path| path.display().to_string()),
-            session_id: engine.session_id().map(str::to_owned),
+            transcript_path,
+            session_id,
+            live_output,
+            hook_event_name: hook_event_name.to_owned(),
         }
     })
 }
 
-/// Pull the session facts over host calls (five reads; each failure falls
+/// Pull the session facts over host calls (six reads; each failure falls
 /// back independently).
 fn fetch_ctx(calls: &AsyncHostCalls) -> CtxData {
     CtxData {
@@ -325,6 +480,12 @@ fn fetch_ctx(calls: &AsyncHostCalls) -> CtxData {
             .and_then(|value| value.as_str().map(str::to_owned)),
         session_name: host_ok(calls, "getSessionName", json!({}))
             .and_then(|value| value.as_str().map(str::to_owned)),
+        session_file: host_ok(calls, "ctx.sessionFile", json!({})).filter(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        }),
     }
 }
 
@@ -433,10 +594,13 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Trigger::Event("message_end")).ok();
         tx.send(Trigger::Event("model_select")).ok();
-        assert!(!drain_triggers(&mut rx));
+        assert_eq!(drain_triggers(&mut rx), (false, false));
         tx.send(Trigger::Event("message_end")).ok();
+        tx.send(Trigger::Live).ok();
         tx.send(Trigger::Shutdown).ok();
         tx.send(Trigger::Event("turn_end")).ok();
-        assert!(drain_triggers(&mut rx));
+        assert_eq!(drain_triggers(&mut rx), (true, true));
+        tx.send(Trigger::Live).ok();
+        assert_eq!(drain_triggers(&mut rx), (false, true));
     }
 }

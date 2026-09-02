@@ -702,7 +702,7 @@ impl ApiKeyAuth for ConfigApiKeyAuth {
             }
             return Ok(None);
         }
-        let env = config_context_env(&[self.raw_key.clone()], ctx).await;
+        let env = config_context_env(std::slice::from_ref(&self.raw_key), ctx).await;
         let key = resolve_config_value_or_throw(
             &self.raw_key,
             &format!("API key for provider \"{}\"", self.provider_id),

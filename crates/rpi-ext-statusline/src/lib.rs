@@ -13,8 +13,9 @@
 //! thread only does in-memory state updates plus a channel send (µs
 //! scale — the TE-D6 dispatch-blocking discipline); the refresh loop,
 //! host calls and script child processes live on the plugin's private
-//! tokio runtime. Zero ABI additions: every host call used here
-//! (`on`, `ctx.*`, `ui.setFooter`, `ui.setStatus`) already exists.
+//! tokio runtime. Host-call surface: `on`, `ctx.*` (including the
+//! additive `ctx.sessionFile`, ADR-0022), `ui.setFooter`, `ui.setStatus`,
+//! `ui.setWidget`.
 
 pub mod config;
 pub mod paths;
@@ -37,8 +38,8 @@ use crate::runtime::PluginRuntime;
 use crate::state::EngineState;
 
 /// Events subscribed at install (TE12 事件映射表; everything else is
-/// deliberately not subscribed — `message_update` & friends are high
-/// frequency with no new payload).
+/// deliberately not subscribed — other high-frequency events carry no
+/// data this plugin consumes).
 const SUBSCRIBED_EVENTS: &[&str] = &[
     "message_end",
     "session_start",
@@ -49,6 +50,13 @@ const SUBSCRIBED_EVENTS: &[&str] = &[
     "tool_execution_end",
     "session_shutdown",
 ];
+
+/// Live-token subscriptions (03-realtime-token-count §1.4/§1.5): only
+/// armed at install when `statusLine.liveTokens` is configured — the
+/// subscription set is the zero-cost off switch (unsubscribed users pay
+/// no per-delta host payload serialization). Both dispatch as
+/// bookkeeping-only `Trigger::Live` (never the 300ms-debounce path).
+const LIVE_EVENTS: &[&str] = &["message_start", "message_update"];
 
 /// Host-call handle + plugin-owned runtime, established once by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
@@ -130,9 +138,23 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             return response;
         }
     }
+    // §1.5 启用时机注记: the live subscription set is fixed at load — a
+    // runtime `liveTokens` key edit changes nothing until restart.
+    let live_tokens_enabled = config::live_tokens_configured_in_global_settings();
+    if live_tokens_enabled {
+        for event in LIVE_EVENTS {
+            let response = host_call_static(&channel, "on", json!({"event": event}));
+            if response.get("error").is_some() {
+                return response;
+            }
+        }
+    }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let _ = TRIGGERS.set(tx);
     let _ = ENGINE.set(Mutex::new(EngineState::default()));
+    if live_tokens_enabled {
+        with_engine(|engine| engine.arm_live_measure());
+    }
     runtime.spawn(refresh::refresh_loop(channel, rx));
     let _ = STATE.set(PluginState {
         calls,
@@ -153,8 +175,34 @@ fn handle_dispatch(message: &Value) -> Value {
     let trigger = match event {
         "message_end" => {
             let message = payload.get("message").cloned().unwrap_or(Value::Null);
-            with_engine(|engine| engine.accumulate_usage(&message));
+            with_engine(|engine| {
+                engine.accumulate_usage(&message);
+                // FR-C/FR-D: exact output tokens + streaming=false.
+                if let Some(live) = engine.live.as_mut() {
+                    live.on_message_end(&message);
+                }
+            });
             Trigger::Event("message_end")
+        }
+        "message_start" => {
+            // Bookkeeping only (FR-D); never the debounce must-run path.
+            with_engine(|engine| {
+                if let Some(live) = engine.live.as_mut() {
+                    live.on_message_start(payload.pointer("/message/role").and_then(Value::as_str));
+                }
+            });
+            Trigger::Live
+        }
+        "message_update" => {
+            // FR-A: O(1) per delta — read {type, delta}, accumulate chars.
+            with_engine(|engine| {
+                if let Some(live) = engine.live.as_mut() {
+                    live.on_message_update(
+                        payload.get("assistantMessageEvent").unwrap_or(&Value::Null),
+                    );
+                }
+            });
+            Trigger::Live
         }
         "session_start" => {
             let reason = payload.get("reason").and_then(Value::as_str);
@@ -241,5 +289,9 @@ mod tests {
         events.dedup();
         assert_eq!(events.len(), count, "no duplicate subscriptions");
         assert_eq!(count, 8, "the TE12 event table");
+        let mut live = LIVE_EVENTS.to_vec();
+        live.sort_unstable();
+        live.dedup();
+        assert_eq!(live.len(), 2, "message_start + message_update only");
     }
 }

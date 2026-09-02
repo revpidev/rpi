@@ -597,6 +597,17 @@ pub struct MessageUpdateEvent {
     pub assistant_message_event: Value,
 }
 
+/// `ctx.sessionFile()` result (rpi additive host-call, ADR-0022): the
+/// authoritative identity of the CURRENT session — `path` is `None` for
+/// in-memory sessions. Replaces directory-heuristic transcript
+/// derivation in consumers (rpi-statusline FR-I / TE-D34 §1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionFileInfo {
+    pub path: Option<String>,
+    pub id: String,
+}
+
 /// `MessageEndEventResult` (types.ts:1086-1089). The replacement must keep
 /// the original role (enforced in runner.rs, runner.ts:837-844).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
