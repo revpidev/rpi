@@ -1330,6 +1330,9 @@ async fn run(
             // 027a58479 (R2.7.4): `(options?.fetch ?? globalThis.fetch)` — the
             // custom fetch channel applies to this SSE HTTP request only; the
             // WebSocket transport above is unaffected (types.ts fetch doc).
+            // `timeout_ms: None` — the Codex SSE path applies its own
+            // absolute-deadline semantics around this send below (upstream
+            // `AbortSignal.timeout`), so no shared headers budget here.
             let send = send_provider_request(
                 client
                     .post(&url)
@@ -1337,6 +1340,7 @@ async fn run(
                     .body(sse_body.clone()),
                 options.stream.fetch.as_ref(),
                 signal.as_ref(),
+                None,
             );
             let send_future = async {
                 send.await.map_err(|error| match error {

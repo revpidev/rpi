@@ -377,7 +377,11 @@ pub async fn create_agent_session(
                     )
                 };
                 // SDKs treat timeout=0 as 0ms; use max int32 to effectively
-                // disable (sdk.ts:305-308).
+                // disable (sdk.ts:305-308). The value feeds idle-timeout
+                // budgets upstream (undici headersTimeout/bodyTimeout): the
+                // connect phase, the headers wait, and inter-chunk body gaps
+                // — never the stream's total duration (see
+                // rpi-ai/src/api/stream_timeouts.rs).
                 let effective_timeout_ms = if http_idle_timeout_ms == 0 {
                     2_147_483_647
                 } else {

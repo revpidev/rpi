@@ -762,8 +762,11 @@ async fn run(
     );
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder = reqwest::Client::builder();
+    // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
+    // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
+        client_builder =
+            client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
     }
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
@@ -775,7 +778,10 @@ async fn run(
             let request = client.post(&url).headers(header_map.clone()).json(&body);
             let signal = options.stream.signal.clone();
             async move {
-                let send = request.send();
+                let send = crate::api::stream_timeouts::send_with_headers_timeout(
+                    request.send(),
+                    options.stream.timeout_ms,
+                );
                 let result = match &signal {
                     Some(token) => tokio::select! {
                         outcome = send => outcome,
@@ -790,7 +796,7 @@ async fn run(
                     None => send.await,
                 };
                 match result {
-                    Ok(response) => {
+                    crate::api::stream_timeouts::SendOutcome::Ok(response) => {
                         let status = response.status();
                         if status.is_success() {
                             Ok(response)
@@ -828,11 +834,20 @@ async fn run(
                             })
                         }
                     }
-                    Err(error) => Err(ProviderErrorInfo {
-                        status: error.status().map(|status| status.as_u16()),
-                        headers: None,
-                        message: error.to_string(),
-                    }),
+                    crate::api::stream_timeouts::SendOutcome::Transport(error) => {
+                        Err(ProviderErrorInfo {
+                            status: error.status().map(|status| status.as_u16()),
+                            headers: None,
+                            message: error.to_string(),
+                        })
+                    }
+                    crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
+                        Err(ProviderErrorInfo {
+                            status: None,
+                            headers: None,
+                            message,
+                        })
+                    }
                 }
             }
         },
@@ -860,7 +875,10 @@ async fn run(
 
     let mut processor = StreamProcessor::new(output, model);
     let mut decoder = SseDecoder::new();
-    let mut byte_stream = response.bytes_stream();
+    // Inter-chunk idle timeout (upstream bodyTimeout; see
+    // api::stream_timeouts).
+    let mut byte_stream =
+        crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
     while let Some(chunk) = byte_stream.next().await {
         if options
             .stream

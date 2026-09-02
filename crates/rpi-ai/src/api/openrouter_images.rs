@@ -139,8 +139,12 @@ async fn generate_images_inner(
             let fetch = options.and_then(|options| options.fetch.clone());
             async move {
                 // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
-                // keeps the reqwest default path unchanged.
-                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
+                // keeps the reqwest default path unchanged. Image generation
+                // is a non-streaming one-shot POST, so the total client
+                // timeout set above stays the right semantics; no extra
+                // headers budget is needed.
+                let result =
+                    send_provider_request(request, fetch.as_ref(), signal.as_ref(), None).await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
