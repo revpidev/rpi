@@ -37,7 +37,6 @@ mod session_fork;
 mod tool;
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
@@ -48,7 +47,7 @@ pub use runtime::PluginRuntime;
 
 use crate::runner::foreground::StreamFrameSink;
 
-/// Host-call handle + plugin-owned runtime, established once by
+/// Host-call handle + plugin-owned runtime, established by
 /// `rpi_extension_init`. The cookie is stored as `usize` to keep the state
 /// `Send + Sync` (mcp-adapter precedent).
 struct PluginState {
@@ -65,7 +64,47 @@ enum PluginMode {
     ChildFanout,
 }
 
-static STATE: OnceLock<PluginState> = OnceLock::new();
+/// Active plugin state — LAST-WINS (M4, TE-D16 follow-up). A session
+/// switch (`/new`, `/resume`, `/fork`, `/clone`, `/import`) makes the host
+/// build a fresh `NativeExtensionHost` and re-run `rpi_extension_init` on
+/// this same cdylib (statics are process-global). The plugin must follow
+/// the NEWEST host channel: its `SessionContextActions` are bound to the
+/// live session, so `ctx.sessionFile` answers authoritatively; the first
+/// host's weak session refs are dead and would answer empty shapes. The
+/// pre-M4 `OnceLock` pinning silently kept the first channel forever,
+/// degrading every post-switch lookup to the directory heuristic.
+static STATE: std::sync::Mutex<Option<std::sync::Arc<PluginState>>> = std::sync::Mutex::new(None);
+
+/// States replaced by a newer host. Retired, NOT dropped: the old plugin
+/// runtime may still stream background child processes started under the
+/// previous session (background runs outlive session switches by design),
+/// so tearing the runtime down on re-init would orphan them. The first
+/// host stays alive through the loader's Arc cycle; host calls through the
+/// old channel are harmless no-ops.
+static RETIRED_STATES: std::sync::Mutex<Vec<std::sync::Arc<PluginState>>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn lock_state() -> std::sync::MutexGuard<'static, Option<std::sync::Arc<PluginState>>> {
+    STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The state the dispatcher should use (newest host). `None` only before
+/// the first successful `rpi_extension_init`.
+fn current_state() -> Option<std::sync::Arc<PluginState>> {
+    lock_state().clone()
+}
+
+/// Install a freshly built state, last-wins (M4). The replaced state — if
+/// any — moves to [`RETIRED_STATES`] to keep its runtime alive.
+fn adopt_state(state: PluginState) {
+    let previous = lock_state().replace(std::sync::Arc::new(state));
+    if let Some(previous) = previous {
+        RETIRED_STATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(previous);
+    }
+}
 
 /// Clonable host-call channel for background tasks (FR-P1-04): the runner
 /// task outlives the dispatch call that started it and needs `sendMessage` /
@@ -672,13 +711,16 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         runtime: plugin_runtime,
         mode,
     };
-    match STATE.set(state) {
-        Ok(()) => json!({ "ok": true }),
-        // Idempotent init: a second load of the same cdylib (ambient +
-        // explicit `--extension`) must not fail — the first instance serves
-        // both (host loader dedupes canonical paths; this is the safety net).
-        Err(_) => json!({ "ok": true }),
-    }
+    // M4: adopt last-wins. The two historical second-load scenarios both
+    // rebind correctly now:
+    // - ambient + explicit `--extension` of the same file in ONE host: the
+    //   loader dedupes canonical paths, so this arm is the safety net and
+    //   the replacement is the same channel anyway;
+    // - a session switch rebuilt the host: the new channel is the live one
+    //   (its session actions bind the current session — this is the fix
+    //   that keeps `ctx.sessionFile` authoritative across `/new` //resume).
+    adopt_state(state);
+    json!({ "ok": true })
 }
 
 /// Steer inbox poll loop (registerSteeringInbox L333 + writeSteerAck):
@@ -754,7 +796,7 @@ async fn steer_inbox_loop(calls: RpiHostCalls, cookie: usize, inbox: PathBuf) {
 
 /// Host-dispatched calls (`rpi_dispatch`): toolExecute / command / event.
 fn dispatch_message(message: &Value) -> Value {
-    let Some(state) = STATE.get() else {
+    let Some(state) = current_state() else {
         return Value::Null;
     };
     match message.get("kind").and_then(Value::as_str) {
@@ -784,7 +826,7 @@ fn dispatch_message(message: &Value) -> Value {
                     .get("toolCallId")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty());
-                return execute_subagent_wait(&params, state, tool_call_id);
+                return execute_subagent_wait(&params, &state, tool_call_id);
             }
             if tool_name == "contact_supervisor" {
                 if let Some(context) = crate::p1::supervisor::ChildSupervisorContext::from_env() {
@@ -1518,5 +1560,77 @@ mod parent_session_tests {
             };
             assert!(ctx.parent_session(&settings).is_none());
         });
+    }
+
+    /// M4 (TE-D16 follow-up): a second `rpi_extension_init` — what a
+    /// session switch (`/new` //resume`//fork`…) triggers by rebuilding the
+    /// extension host — must REBIND the plugin's host channel last-wins.
+    /// The pre-M4 `OnceLock` pinned the first channel forever; its session
+    /// actions pointed at the disposed session, so `ctx.sessionFile`
+    /// answered the empty shape and every post-switch lookup degraded to
+    /// the directory heuristic (the exact condition TE-D16 closed over).
+    #[test]
+    fn second_init_rebinds_state_to_the_new_host_channel() {
+        let cookie_a = unique_cookie();
+        let cookie_b = unique_cookie();
+        {
+            let mut answers = scripted().lock().unwrap_or_else(|e| e.into_inner());
+            answers.insert(
+                cookie_a,
+                json!({ "ok": { "id": "SESSION-A", "path": "/tmp/session-a.jsonl" } }),
+            );
+            answers.insert(
+                cookie_b,
+                json!({ "ok": { "id": "SESSION-B", "path": "/tmp/session-b.jsonl" } }),
+            );
+        }
+        let build = |cookie: usize| PluginState {
+            calls: RpiHostCalls {
+                call: scripted_host_call,
+            },
+            cookie,
+            runtime: PluginRuntime::new().expect("plugin runtime"),
+            mode: PluginMode::Parent,
+        };
+
+        // First host installs; a session switch installs again with the
+        // NEW host's cookie.
+        adopt_state(build(cookie_a));
+        adopt_state(build(cookie_b));
+
+        // The dispatcher's channel is the newest host's: the authoritative
+        // parent session resolves through cookie B, not the pinned A.
+        let state = current_state().expect("state present after two inits");
+        assert_eq!(state.cookie, cookie_b, "last-wins rebind");
+        let ctx = HostCallsContext {
+            calls: &state.calls,
+            cookie: state.cookie,
+        };
+        let session = ctx
+            .parent_session(&config::SettingsPair::default())
+            .expect("authoritative session via the new channel");
+        assert_eq!(session.id, "SESSION-B");
+        assert_eq!(session.file, Some(PathBuf::from("/tmp/session-b.jsonl")));
+
+        // The replaced first state stays retired (runtime alive), not
+        // dropped.
+        assert_eq!(
+            RETIRED_STATES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            1,
+            "replaced state retired, not dropped"
+        );
+
+        // Restore the pristine in-binary state for the other tests.
+        *lock_state() = None;
+        RETIRED_STATES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let mut answers = scripted().lock().unwrap_or_else(|e| e.into_inner());
+        answers.remove(&cookie_a);
+        answers.remove(&cookie_b);
     }
 }

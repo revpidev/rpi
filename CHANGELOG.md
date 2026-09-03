@@ -10,7 +10,7 @@
 ### 修复
 
 - **流式请求总超时误杀活跃流**（V13-08，先行）：总 deadline 误映射 → 三段式超时（connect/headers/body 块间静默 idle，每 chunk 重置）；9 个 SSE adapter 全覆盖，codex / openrouter_images 两处有意例外。
-- **write 大文件流式渲染 O(n²)**（V13-09，先行）：分层缓存（稳定前缀窗口跳重算 + 可见内容指纹跳重建 + repair_json 惰性化 + 拷贝瘦身 3→1）；400 行流式 2250ms → 245ms（9.2×）。
+- **write 大文件流式渲染 O(n²)**（V13-09，先行）：分层缓存（稳定前缀窗口跳重算 + 可见内容指纹跳重建 + repair_json 惰性化 + 拷贝瘦身 3→2，勘误 v0.1.3 首发：state 拷贝已除，context 尾更新为上游 parity 必需、事件载荷需独占所有权，各留 1 次）；400 行流式 2250ms → 245ms（9.2×）。
 - **扩展 UI 换装撕帧**（V13-05，并发正确性）：widget 单锁原子化（跨容器 add-then-remove）+ selector 单锁 clear+add+set_focus——不再有缺失帧 / 裸 editor 帧。
 - **流式渲染热路径**（V13-06）：MessageUpdate 队列连续段折叠保尾（同帧 K 条 delta → 1 次 update_content）+ update_content 引用化消除调用侧深拷贝。
 - **subagents 子进程事件落盘治理**（V13-01）：events.jsonl / transcript 持久单句柄（50MiB 上限静默丢弃）+ status.json 100ms 写入门控（终态/state 变化同步落盘）。

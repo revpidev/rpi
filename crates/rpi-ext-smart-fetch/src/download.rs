@@ -782,3 +782,85 @@ fn progress_gate_resets_after_push() {
         64 * 1024 + PROGRESS_MIN_DELTA_BYTES
     ));
 }
+
+/// V13-04 §4 (M7 follow-up): the promised multi-chunk integration anchor —
+/// the plan's "10MB × 16KiB chunk (625 chunks)" scenario, driven through
+/// the REAL streaming download path (`ResponseBody::Stream` →
+/// `stream_response_to_file_with_progress`) with a synthetic wreq response
+/// (mock seam: `Response::from(http::Response<Body::wrap_stream>)`, no
+/// network, deterministic chunking). The byte threshold dominates on an
+/// in-memory stream (µs-scale elapsed): pushes land every ≥64KiB, i.e.
+/// chunk 1, 5, 9, … → 157 frames, versus one per chunk (625) without the
+/// gate — deleting the `progress_gate_due` wiring now fails this test.
+#[tokio::test]
+async fn m7_multichunk_download_body_progress_frames_are_gated() {
+    use crate::pipeline::FetchExecutionHooks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const CHUNKS: usize = 625;
+    const CHUNK_LEN: usize = 16 * 1024;
+    let total = (CHUNKS * CHUNK_LEN) as u64; // 10,240,000 bytes (~10MB)
+
+    let frames = Arc::new(AtomicUsize::new(0));
+    let first_progress = Arc::new(std::sync::Mutex::new(None));
+    let last_progress = Arc::new(std::sync::Mutex::new(None));
+    let hooks = FetchExecutionHooks {
+        on_progress_change: Some({
+            let frames = Arc::clone(&frames);
+            let first = Arc::clone(&first_progress);
+            let last = Arc::clone(&last_progress);
+            Arc::new(move |update| {
+                if update.phase != "body_progress" {
+                    return;
+                }
+                frames.fetch_add(1, Ordering::SeqCst);
+                let mut first = first.lock().unwrap();
+                if first.is_none() {
+                    *first = Some(update.progress);
+                }
+                *last.lock().unwrap() = Some(update.progress);
+            })
+        }),
+        ..Default::default()
+    };
+
+    let chunks = futures::stream::iter(
+        (0..CHUNKS).map(|_| Ok::<Vec<u8>, std::io::Error>(vec![b'x'; CHUNK_LEN])),
+    );
+    let http_response = http::Response::builder()
+        .status(200)
+        .body(wreq::Body::wrap_stream(chunks))
+        .expect("build http response");
+    let body = ResponseBody::Stream(Box::new(wreq::Response::from(http_response)));
+
+    let dir = std::env::temp_dir().join(format!("rpi-sf-m7-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("blob.bin");
+    let downloaded = stream_response_to_file_with_progress(body, &path, &hooks, Some(total))
+        .await
+        .expect("streams to disk");
+    assert_eq!(downloaded, total);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), total);
+
+    // Byte-bound math: pushes at chunks 1, 5, 9, … 1+4k ≤ 625 → 157 frames.
+    // A mid-test wall-clock stall ≥100ms can only ADD frames (time branch),
+    // hence the lower bound is exact and the upper bound carries a small
+    // stall allowance; both stay far below the ungated 625.
+    let count = frames.load(Ordering::SeqCst);
+    assert!(
+        (157..=165).contains(&count),
+        "gated body_progress frames: {count} (ungated would be {CHUNKS})"
+    );
+    // Progress maps 0.51 + fraction × 0.44: first frame ≈ 0.5107, last
+    // ≈ 0.95 (full body).
+    let first = first_progress.lock().unwrap().expect("first frame");
+    let last = last_progress.lock().unwrap().expect("last frame");
+    assert!(
+        (first - 0.51).abs() < 0.01,
+        "first frame near 0.51: {first}"
+    );
+    assert!((last - 0.95).abs() < 1e-6, "last frame at 0.95: {last}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

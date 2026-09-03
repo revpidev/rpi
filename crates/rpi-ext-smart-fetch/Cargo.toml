@@ -51,6 +51,10 @@ mime_guess = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# V13-04 §4 integration anchor (M7): build a synthetic multi-chunk
+# `wreq::Response` (mock seam: `Response::from(http::Response<Body>)`)
+# without a network.
+http.workspace = true
 # `test-util` gates `#[tokio::test(start_paused = true)]` for the
 # deterministic spinner-timing tests (FR-P2-D).
 tokio = { workspace = true, features = ["test-util"] }
