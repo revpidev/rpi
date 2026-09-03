@@ -1,20 +1,28 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.3] - 2026-09-03
 
 ### 新增
 
-- **statusline 实时 token 计数**（rpi-statusline 03-realtime-token-count）：`statusLine.liveTokens` 键（bool/object，`refreshMs` 300..5000 默认 1s，订阅集加载时评估）开启流式期间 1Hz 级脚本重跑；stdin 新增 `rpi.live_output` 纯测量块（三路字符累计/增量窗口/elapsed/精确 output token，字符→token 换算与速率计算留在用户脚本，默认 ceil(chars/4) 口径）。未配置时行为与事件集与 TE12 完全一致。
-- **代理事件载荷转发 parity 补齐**：`agent_end`/`turn_start`/`turn_end`/`message_start`/`message_update`/`tool_execution_*` 八事件按上游形状携带载荷（`message_update` 含 `assistantMessageEvent`，`turn_*` 含 `turnIndex`）；`has_handlers` 短路保证无订阅会话零开销。
-- **`ctx.sessionFile` host-call**（ADR-0022，additive，capability `session`）：当前会话权威身份 `{path, id}`（内存会话 `path: null`）。
+- **statusline 实时 token 计数**（V13-10，先行 PR）：`statusLine.liveTokens` 键开启流式期间 1Hz 级脚本重跑；stdin 新增 `rpi.live_output` 纯测量块；随行宿主八事件载荷转发 parity 补齐 + `ctx.sessionFile` additive host-call（ADR-0022），双开同 cwd 串数据治本（TE-D34 §1）。
+- **subagents 父会话权威定位**（V13-02）：`parent_session` 优先 `ctx.sessionFile`，目录启发式降级为兜底并加固（mtime 下界 + stem 形状过滤），四消费点改用权威 session id（关闭 TE-D16）。
 
 ### 修复
 
-- **同 cwd 双开实例 statusline 串数据**（TE-D34 §1）：`transcript_path`/`session_id` 改用 `ctx.sessionFile` 权威值，目录启发式（mtime 最新 + sticky latch）降级为兑底——兄弟实例 mtime-更新的会话文件不再竞态胜出。
+- **流式请求总超时误杀活跃流**（V13-08，先行）：总 deadline 误映射 → 三段式超时（connect/headers/body 块间静默 idle，每 chunk 重置）；9 个 SSE adapter 全覆盖，codex / openrouter_images 两处有意例外。
+- **write 大文件流式渲染 O(n²)**（V13-09，先行）：分层缓存（稳定前缀窗口跳重算 + 可见内容指纹跳重建 + repair_json 惰性化 + 拷贝瘦身 3→1）；400 行流式 2250ms → 245ms（9.2×）。
+- **扩展 UI 换装撕帧**（V13-05，并发正确性）：widget 单锁原子化（跨容器 add-then-remove）+ selector 单锁 clear+add+set_focus——不再有缺失帧 / 裸 editor 帧。
+- **流式渲染热路径**（V13-06）：MessageUpdate 队列连续段折叠保尾（同帧 K 条 delta → 1 次 update_content）+ update_content 引用化消除调用侧深拷贝。
+- **subagents 子进程事件落盘治理**（V13-01）：events.jsonl / transcript 持久单句柄（50MiB 上限静默丢弃）+ status.json 100ms 写入门控（终态/state 变化同步落盘）。
+- **子进程 update 帧节流**（V13-03）：事件路径帧签名门控（同活动跳推 + 1s 心跳 + 首帧/终态必推）+ subagent_wait 轮询脏检查——50 相同事件 toolUpdate 从 50 帧压到 3 帧。
+- **smart-fetch 进度节流**（V13-04）：body_progress 100ms/64KiB 门控 + batch 快照 1% 签名短路；终态帧与帧形状零变化。
 
 ### 内部
 
-- G1 门禁随批修复 main 既有问题：subagents render.rs 重复/缺失 `#[test]`、background.rs 测试守卫跨 await 的 clippy 1.97 新 lint（allow + 注释）、model_runtime `cloned_ref_to_slice_refs`、两文件 rustfmt 清账（纯格式化）。
+- **低档杂项清理**（V13-07）：mcp-adapter `!command` 秘钥解析改 spawn_blocking；无 UI 期重试免推 status bar；`getAllTools` 惰性查询；statusline 变化 tick 复用 fetch_ctx（12→6 host call）；TUI 每帧尺寸读取 4→1 次 ioctl。
+- 偏离登记汇总：TE-D16 关闭、TE-D35/36/37、D-088/089/090/091。
+- M0 收口：两支先行 PR（`fix/stream-idle-timeout-write-perf` / `feat/statusline-live-token-count`）合入 main + 门禁清账（clippy 1.97 lint）。
+- workspace 版本 bump 0.1.3 + Cargo.lock 同步；全量门禁 5367 用例零失败。
 
 ## [0.1.2] - 2026-08-19
 
