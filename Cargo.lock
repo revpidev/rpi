@@ -3145,6 +3145,7 @@ dependencies = [
  "deunicode",
  "dom_smoothie",
  "futures",
+ "http",
  "mime_guess",
  "regex",
  "rpi-agent",
