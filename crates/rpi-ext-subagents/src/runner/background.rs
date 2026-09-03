@@ -1426,6 +1426,9 @@ pub async fn wait_for_runs(
                 .to_string(),
         );
     }
+    // V13-03 FR-B: signature of the last on_update frame pushed by the
+    // poll loop (None = never pushed → first round always pushes).
+    let mut last_signature: Option<String> = None;
     loop {
         // User abort (extension-ABI abort-channel gap): the wait tool is a
         // synchronous dispatch the runtime cannot cancel, so it polls the
@@ -1463,6 +1466,16 @@ pub async fn wait_for_runs(
             .filter(|s| is_terminal(s["state"].as_str().unwrap_or("")))
             .collect();
         if !terminal.is_empty() && (!all || terminal.len() == snapshots.len()) {
+            // FR-B R3: the frame right before returning must be pushed (the
+            // terminal state otherwise never reaches on_update — the result
+            // text itself rides the tool result, not this channel).
+            if let Some(on_update) = on_update {
+                on_update(&async_wait_update(
+                    &snapshots,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                ));
+            }
             return Ok(json!({
                 "waited": terminal.len(),
                 "all": all,
@@ -1477,13 +1490,38 @@ pub async fn wait_for_runs(
                 .filter(|s| !is_terminal(s["state"].as_str().unwrap_or("")))
                 .cloned()
                 .collect();
-            on_update(&async_wait_update(
-                &still_active,
-                0,
-                started.elapsed().as_millis() as u64,
-            ));
+            // FR-B R1/R2 (V13-03): round dirty-check — a frame signature
+            // of the snapshots the frame renders + the elapsed SECONDS (pure
+            // sub-second drift is not a change). An unchanged steady wait
+            // pushes nothing (audit #9: the 250ms poll had no dirty check).
+            let elapsed_secs = started.elapsed().as_secs();
+            let signature = serde_json::to_string(
+                &json!({ "runs": still_active, "elapsed_secs": elapsed_secs }),
+            )
+            .unwrap_or_default();
+            if last_signature.as_deref() != Some(signature.as_str()) {
+                on_update(&async_wait_update(
+                    &still_active,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                ));
+                last_signature = Some(signature);
+            }
         }
         if std::time::Instant::now() >= deadline {
+            // FR-B R3: final frame before the timeout return.
+            if let Some(on_update) = on_update {
+                let still_active: Vec<Value> = snapshots
+                    .iter()
+                    .filter(|s| !is_terminal(s["state"].as_str().unwrap_or("")))
+                    .cloned()
+                    .collect();
+                on_update(&async_wait_update(
+                    &still_active,
+                    0,
+                    started.elapsed().as_millis() as u64,
+                ));
+            }
             return Ok(json!({
                 "waited": 0,
                 "all": all,
@@ -2183,5 +2221,103 @@ pub(crate) mod tests {
         );
         let _ = std::fs::remove_dir_all(&handle.run_dir);
         remove_status_gate(&handle.run_id);
+    }
+
+    // ---- V13-03 FR-B: wait-poll dirty check (audit #9) ------------------
+
+    fn wait_test_handle(tag: &str, state: &str) -> Arc<AsyncRunHandle> {
+        let run_id = format!("wait-{tag}-{}", crate::artifacts::now_millis());
+        Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(json!({
+                "mode": "single",
+                "state": state,
+                "steps": [{"agent": "worker", "status": "running"}],
+            }))),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: std::env::temp_dir().join("rpi-sub-wait-test"),
+            started_ms: crate::artifacts::now_millis(),
+        })
+    }
+
+    #[tokio::test]
+    async fn wait_poll_dirty_check_suppresses_unchanged_frames() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let handled = {
+            let _guard = REGISTRY_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let handle = wait_test_handle("steady", STATE_RUNNING);
+            register_run(handle.clone());
+            handle
+        };
+
+        let pushes = AtomicUsize::new(0);
+        let on_update = |_text: &str| {
+            pushes.fetch_add(1, Ordering::Relaxed);
+        };
+        let handle = handled;
+        let result = wait_for_runs(None, true, 1100, Some(&on_update), None)
+            .await
+            .unwrap();
+        assert_eq!(result["timedOut"], json!(true), "{result}");
+        let pushes_seen = pushes.load(Ordering::Relaxed);
+        // Steady state: 1100ms of 250ms polls → new code ≈ 3 pushes (first,
+        // the 1s elapsed heartbeat, the timeout final frame); the pre-V13-03
+        // loop pushed every round (5). Bound it well below per-round.
+        assert!(
+            pushes_seen <= 4,
+            "unchanged steady wait must not push per poll round: {pushes_seen}"
+        );
+        assert!(pushes_seen >= 1, "first frame still pushes: {pushes_seen}");
+
+        unregister_run(&handle.run_id);
+    }
+
+    #[tokio::test]
+    async fn wait_poll_pushes_on_terminal_change_next_round() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let handled = {
+            let _guard = REGISTRY_TEST_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let handle = wait_test_handle("flip", STATE_RUNNING);
+            register_run(handle.clone());
+            handle
+        };
+
+        // A state change lands 300ms into the wait → the next poll (≤250ms
+        // later) must push and return (FR-B: state change → next round
+        // push; first + terminal frames always push).
+        let handle = handled;
+        let flip = handle.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            update_status(&flip, |status| {
+                status["state"] = json!(STATE_COMPLETE);
+            });
+        });
+        let pushes = AtomicUsize::new(0);
+        let on_update = |_text: &str| {
+            pushes.fetch_add(1, Ordering::Relaxed);
+        };
+        let result = wait_for_runs(None, false, 3000, Some(&on_update), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            result["runs"][0]["state"],
+            json!(STATE_COMPLETE),
+            "{result}"
+        );
+        let pushes_seen = pushes.load(Ordering::Relaxed);
+        assert!(
+            pushes_seen >= 2,
+            "initial + state-change/terminal frames must push: {pushes_seen}"
+        );
+        assert!(pushes_seen <= 4, "bounded frames: {pushes_seen}");
+
+        unregister_run(&handle.run_id);
     }
 }

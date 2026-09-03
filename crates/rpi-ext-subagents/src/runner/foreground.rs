@@ -505,6 +505,9 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         };
         let mut buffer = vec![0u8; 64 * 1024];
         let mut terminal = false;
+        // V13-03 FR-A: last PUSHED event-path frame signature + time (the
+        // 1s activity ticker runs separately and stays unchanged).
+        let mut last_pushed: Option<(String, std::time::Instant)> = None;
 
         // Protocol-limit path (execution.ts:1047-1062): record the error and
         // run the SIGTERM → 3s → SIGKILL ladder.
@@ -594,14 +597,31 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                 stdout_terminal.store(terminal, Ordering::SeqCst);
                 // Per-event streaming face (execution.ts:914/929/972/1005
                 // fireUpdate): one frame per progress-bearing event.
-                if let Some(fields) = status_fields {
+                if let Some(ref fields) = status_fields {
                     if let Some(status) = &step_status {
-                        status(child_index, &fields);
+                        status(child_index, fields);
                     }
                 }
                 if let Some((text, details)) = frame {
                     if let Some(sink) = &frame_sink {
-                        sink(&text, &details);
+                        // V13-03 FR-A event-path signature gate: same
+                        // activity signature as the last PUSHED frame is
+                        // skipped, except for the 1s heartbeat fallback
+                        // (R3) and the must-push frames (R4: first frame,
+                        // terminal/drain frame).
+                        let signature = frame_signature(status_fields.as_ref(), &text);
+                        let must_push = last_pushed.is_none()
+                            || terminal
+                            || last_pushed
+                                .as_ref()
+                                .is_some_and(|(prev, _)| *prev != signature);
+                        let heartbeat = last_pushed.as_ref().is_some_and(|(_, at)| {
+                            at.elapsed() >= Duration::from_millis(ACTIVITY_TICK_MS)
+                        });
+                        if must_push || heartbeat {
+                            sink(&text, &details);
+                            last_pushed = Some((signature, std::time::Instant::now()));
+                        }
                     }
                 }
             },
@@ -811,6 +831,34 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 /// and tool failures inside the child never advance the chain. Artifacts of
 /// the last attempt win (same paths per child), with `attemptedModels`
 /// carrying the full chain for meta.json.
+/// V13-03 FR-A R1: event-path frame signature — the activity projection
+/// fields (currentTool/currentToolArgs/currentToolStartedAt/currentPath/
+/// turnCount/toolCount) plus the frame's content text. Deliberately
+/// excludes any monotonic time-varying field (elapsed/duration), so
+/// consecutive frames describing the same activity compare equal; the 1s
+/// heartbeat (R3) and terminal frames (R4) push regardless.
+/// `currentToolStartedAt` is tool identity — constant while the tool runs,
+/// a real change when it switches.
+fn frame_signature(fields: Option<&Value>, text: &str) -> String {
+    let mut key = serde_json::Map::new();
+    if let Some(fields) = fields {
+        for name in [
+            "currentTool",
+            "currentToolArgs",
+            "currentToolStartedAt",
+            "currentPath",
+            "turnCount",
+            "toolCount",
+        ] {
+            if let Some(value) = fields.get(name) {
+                key.insert(name.to_string(), value.clone());
+            }
+        }
+    }
+    key.insert("text".to_string(), json!(text));
+    serde_json::to_string(&serde_json::Value::Object(key)).unwrap_or_default()
+}
+
 pub async fn run_foreground_with_fallback(
     input: &ForegroundRunInput,
     candidates: &[String],
@@ -1063,5 +1111,63 @@ fn signal_name(signal: i32) -> String {
         9 => "SIGKILL".to_string(),
         15 => "SIGTERM".to_string(),
         other => format!("signal {other}"),
+    }
+}
+
+/// V13-03 FR-A: frame-signature tests — identical activity compares equal,
+/// changed activity differs, monotonic time/duration fields never enter the
+/// signature (regression guard: a signature field that changes on every
+/// frame would defeat the throttler).
+#[cfg(test)]
+mod frame_signature_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fields_of() -> Value {
+        json!({
+            "currentTool": "read",
+            "currentToolArgs": "{\"path\":\"/tmp/a.rs\"}",
+            "currentToolStartedAt": 1_700_000_000_000u64,
+            "currentPath": "/tmp/a.rs",
+            "turnCount": 3,
+            "toolCount": 7,
+        })
+    }
+
+    #[test]
+    fn identical_activity_yields_equal_signature() {
+        let a = frame_signature(Some(&fields_of()), "same output");
+        let b = frame_signature(Some(&fields_of()), "same output");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn changed_tool_yields_different_signature() {
+        let mut changed = fields_of();
+        changed["currentTool"] = json!("bash");
+        assert_ne!(
+            frame_signature(Some(&fields_of()), "output"),
+            frame_signature(Some(&changed), "output"),
+            "a real activity change must produce a new signature"
+        );
+        assert_ne!(
+            frame_signature(Some(&fields_of()), "output"),
+            frame_signature(Some(&fields_of()), "changed output"),
+            "frame content text is part of the signature"
+        );
+    }
+
+    #[test]
+    fn absent_fields_still_signature_stable() {
+        let fields = json!({ "turnCount": 2, "toolCount": 4 });
+        assert_eq!(
+            frame_signature(Some(&fields), "x"),
+            frame_signature(Some(&fields), "x")
+        );
+        assert_eq!(
+            frame_signature(None, "x"),
+            frame_signature(None, "x"),
+            "no status fields yet (first events) still compares equal"
+        );
     }
 }

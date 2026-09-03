@@ -112,6 +112,22 @@ fn main() {
             );
             emit(&mut out, r#"{"type":"agent_settled"}"#);
         }
+        // V13-03 FR-A: high-frequency IDENTICAL tool-result events (same
+        // activity signature) followed by a single terminal message — the
+        // event path must not push one toolUpdate per event.
+        "thrash" => {
+            for _ in 0..50 {
+                emit(
+                    &mut out,
+                    r#"{"type":"tool_result_end","message":{"role":"toolResult","content":[{"type":"text","text":"same payload"}]}}"#,
+                );
+            }
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"thrash done"}],"usage":{"input":10,"output":5,"cost":{"total":0.01}},"model":"faux/fixed-1","stopReason":"stop"}}"#,
+            );
+            emit(&mut out, r#"{"type":"agent_settled"}"#);
+        }
         "willretry" => {
             emit(&mut out, r#"{"type":"agent_end","willRetry":true}"#);
             emit(

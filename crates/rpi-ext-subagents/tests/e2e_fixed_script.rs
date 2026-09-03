@@ -575,6 +575,28 @@ fn e2e_fixed_child_full_pipeline() {
         "second fork still from instance B, not fork artifact:\n{branch2_text}"
     );
 
+    // ---- Scenario 3c (V13-03 FR-A): identical-event frame throttling -----
+    // The fixed child re-emits 50 byte-identical tool-result events before
+    // the terminal message. The event path must coalesce them (one push for
+    // the first + the drain/terminal frame), NOT one toolUpdate per event
+    // (audit #3: per-event sync FFI).
+    let thrash_dump = sandbox.dump("thrash");
+    std::env::set_var("RPI_E2E_DUMP_DIR", &thrash_dump);
+    std::env::set_var("RPI_E2E_MODE", "thrash");
+    let _ = take_tool_updates(); // baseline: drain frames from earlier scenarios
+    let result = execute(json!({
+        "agent": "scout",
+        "task": "thrash",
+        "timeoutMs": 30000,
+    }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let pushed = take_tool_updates().len();
+    assert!(
+        pushed <= 4,
+        "50 identical events must not push one toolUpdate per event: {pushed}"
+    );
+    assert!(pushed >= 1, "initial/drain frame still pushed: {pushed}");
+
     // ---- Scenario 4: depth block ---------------------------------------
     std::env::set_var("RPI_SUBAGENT_DEPTH", "2");
     let result = execute(json!({ "agent": "scout", "task": "go deeper", "timeoutMs": 5000 }));
