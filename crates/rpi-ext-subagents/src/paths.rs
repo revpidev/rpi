@@ -245,9 +245,21 @@ pub fn resolve_parent_session_dir(cwd: &Path, settings_session_dir: Option<&str>
         .join(encode_cwd_dir_name(&cwd.to_string_lossy()))
 }
 
-/// `findLatestSessionFile` (utils.ts:268-282): newest `*.jsonl` in `dir` by
-/// mtime; `None` when the directory has none.
-pub fn find_latest_session_file(dir: &Path) -> Option<PathBuf> {
+/// `findLatestSessionFile` (utils.ts:268-282) + TE-D16 hardening (V13-02):
+/// newest shape-valid `*.jsonl` in `dir` by mtime, floored at `since`
+/// (files older than the floor never compete); `None` when the directory
+/// has none.
+///
+/// This is now the **fallback** path only — `parent_session` (lib.rs)
+/// prefers the authoritative `ctx.sessionFile` (ADR-0022) and reaches here
+/// when the host call is unavailable. The `since` mtime floor closes the
+/// new-session race (the current session's file may not exist on disk yet;
+/// without the floor the mtime-newest file is the PREVIOUS session's) and
+/// `is_session_file_stem` prevents subagents' own fresh `fork*` artifacts
+/// from winning the "newest" race — the same hardening statusline applied
+/// (rpi-ext-statusline `paths.rs find_latest_session_file`); the two crates
+/// mirror the host layout independently, no shared code.
+pub fn find_latest_session_file(dir: &Path, since: std::time::SystemTime) -> Option<PathBuf> {
     let entries = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
@@ -255,13 +267,25 @@ pub fn find_latest_session_file(dir: &Path) -> Option<PathBuf> {
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(meta) = entry.metadata() else { continue };
+        if !path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_session_file_stem)
+        {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
         let Ok(modified) = meta.modified() else {
             continue;
         };
+        if modified < since {
+            continue;
+        }
         if best
             .as_ref()
             .is_none_or(|(best_time, _)| modified > *best_time)
@@ -270,6 +294,41 @@ pub fn find_latest_session_file(dir: &Path) -> Option<PathBuf> {
         }
     }
     best.map(|(_, path)| path)
+}
+
+/// Whether a file stem matches the session-file shape `<ISO ts>_<uuidv7>`
+/// (host `session_manager.rs:1045-1067`), filtering out subagents' own
+/// fork artifacts (`fork.jsonl`, `fork-N.jsonl`) and stray files — the
+/// TE-D16 stem filter (V13-02 FR-B R2). Same predicate as
+/// rpi-ext-statusline `paths.rs is_session_file_stem` (mirrored layout,
+/// no shared code).
+fn is_session_file_stem(stem: &str) -> bool {
+    if stem.starts_with("fork") {
+        return false;
+    }
+    let Some((_, tail)) = stem.rsplit_once('_') else {
+        return false;
+    };
+    // uuidv7: 36 chars, 8-4-4-4-12 hex groups.
+    tail.len() == 36 && tail.matches('-').count() == 4 && {
+        let groups: Vec<&str> = tail.split('-').collect();
+        groups.len() == 5
+            && [8usize, 4, 4, 4, 12]
+                .iter()
+                .zip(&groups)
+                .all(|(want, group)| {
+                    group.len() == *want && group.chars().all(|c| c.is_ascii_hexdigit())
+                })
+    }
+}
+
+/// Session id = the uuidv7 tail of the session-file stem (host
+/// `session_manager.rs:314` `create_session_id = uuidv7()`); used by the
+/// fallback path when the authoritative `ctx.sessionFile` is unavailable.
+pub fn session_id_from_path(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let (_, tail) = stem.rsplit_once('_')?;
+    is_session_file_stem(stem).then(|| tail.to_string())
 }
 
 #[cfg(test)]
@@ -307,5 +366,97 @@ mod tests {
         let home = home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         let p = normalize_path("~/a/./b/../c");
         assert_eq!(p, home.join("a/c"));
+    }
+
+    // ---- V13-02: stem shape + mtime floor (fallback hardening) ---------
+
+    #[test]
+    fn session_file_stem_shape_matrix() {
+        let good = "2026-08-19T10-00-00-000_018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        assert!(is_session_file_stem(good));
+        // Fork artifacts (subagents' own) and stray names are rejected — the
+        // audit surface 2 (a fresh fork file must not win the newest race).
+        assert!(!is_session_file_stem("fork"));
+        assert!(!is_session_file_stem("fork-2"));
+        assert!(!is_session_file_stem("notes"));
+        assert!(!is_session_file_stem("2026-08-19_not-a-uuid"));
+        // Wrong uuid group lengths / no separator.
+        assert!(!is_session_file_stem(
+            "2026-08-19_018f6a1e4c3b7abc8d2e9f0a1b2c3d4effff"
+        ));
+        assert!(!is_session_file_stem(
+            "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e"
+        ));
+    }
+
+    #[test]
+    fn session_id_extraction_from_path() {
+        let path = Path::new(
+            "/tmp/sessions/--x--/2026-08-19T10-00-00-000_018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e.jsonl",
+        );
+        assert_eq!(
+            session_id_from_path(path).as_deref(),
+            Some("018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e")
+        );
+        assert_eq!(session_id_from_path(Path::new("/tmp/fork.jsonl")), None);
+    }
+
+    /// Writes a session file with a backdated mtime (same trick statusline
+    /// paths.rs tests use) and returns its path.
+    fn write_session_file(dir: &Path, stem: &str, mtime_age_secs: u64) -> PathBuf {
+        let path = dir.join(format!("{stem}.jsonl"));
+        std::fs::write(&path, "{\"type\":\"session\"}\n").unwrap();
+        let age = std::time::SystemTime::now() - std::time::Duration::from_secs(mtime_age_secs);
+        let file = std::fs::File::open(&path).unwrap();
+        file.set_modified(age).unwrap();
+        path
+    }
+
+    #[test]
+    fn find_latest_session_file_applies_mtime_floor() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Floor = 1h ago: the 2h-old previous-session file is below it, the
+        // 1s-old fresh file is above it.
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+
+        let uuid = "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        let old = write_session_file(&dir, &format!("2026-08-19T00-00-00-000_{uuid}"), 7200);
+        // The previous session's file (older than the floor) never wins.
+        assert_eq!(find_latest_session_file(&dir, since), None);
+        // A file inside the grace window is accepted.
+        let fresh = write_session_file(&dir, &format!("2026-08-19T01-00-00-000_{uuid}"), 1);
+        assert_eq!(
+            find_latest_session_file(&dir, since).as_deref(),
+            Some(fresh.as_path())
+        );
+        // The older file is unreachable while the fresh one exists.
+        assert_eq!(
+            find_latest_session_file(&dir, since).as_deref(),
+            Some(fresh.as_path())
+        );
+        assert_ne!(old, fresh);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_latest_session_file_excludes_fork_and_stray_stems() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-paths2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let since = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let uuid = "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        let session = write_session_file(&dir, &format!("2026-08-19T01-00-00-000_{uuid}"), 1);
+        // Fresh fork artifacts / stray names must never win (audit #2 surface).
+        let fork = write_session_file(&dir, "fork-2", 0);
+        let stray = write_session_file(&dir, "notes", 0);
+        assert_eq!(
+            find_latest_session_file(&dir, since).as_deref(),
+            Some(session.as_path())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(fork, stray);
     }
 }

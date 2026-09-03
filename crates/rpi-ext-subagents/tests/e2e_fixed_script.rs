@@ -14,6 +14,10 @@ use serde_json::{json, Value};
 struct FakeHost {
     cwd: PathBuf,
     model: Value,
+    /// Authoritative `ctx.sessionFile` answer (V13-02): `Some` = served as
+    /// `{"path", "id"}`, `None` = host call error (fallback path). Scenario
+    /// 3 and the FR-D dual-instance scenario set it before forking.
+    session_file: std::sync::Mutex<Option<Value>>,
 }
 
 /// TE09: host-call observation sinks — `toolUpdate` partial frames and
@@ -70,6 +74,15 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
             json!({ "ok": true })
         }
         "ctx.cwd" => json!({ "ok": host.cwd.to_string_lossy() }),
+        "ctx.sessionFile" => match host
+            .session_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(info) => json!({ "ok": info }),
+            None => json!({ "error": { "message": "no authoritative session" } }),
+        },
         "ctx.model" => json!({ "ok": host.model }),
         "toolUpdate" => {
             TOOL_UPDATES
@@ -204,13 +217,14 @@ fn e2e_fixed_child_full_pipeline() {
     let sandbox = Sandbox::new();
     let host = Arc::new(FakeHost {
         cwd: sandbox.project.clone(),
-        model: json!({"provider": "faux", "id": "faux-1"}),
+        model: json!({ "provider": "faux", "id": "faux-1" }),
+        session_file: std::sync::Mutex::new(None),
     });
     let response = rpi_ext_subagents::install_for_test(
         RpiHostCalls {
             call: fake_host_call,
         },
-        Arc::into_raw(host) as PluginCookie,
+        Arc::into_raw(host.clone()) as PluginCookie,
     );
     assert_eq!(response.get("ok"), Some(&Value::Bool(true)), "{response}");
 
@@ -394,12 +408,19 @@ fn e2e_fixed_child_full_pipeline() {
         ),
     )
     .unwrap();
-    // Point the plugin at the sessions dir via project settings.
+    // Point the plugin at the sessions dir via project settings, and serve
+    // the authoritative `ctx.sessionFile` (V13-02): scenario 3 exercises the
+    // FR-A main path — fork from the authoritative parent, not the dir
+    // heuristic (the fabricated stem below is not host-shape anyway).
     std::fs::write(
         sandbox.project.join(".rpi/settings.json"),
         json!({ "sessionDir": sessions.to_string_lossy() }).to_string(),
     )
     .unwrap();
+    *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({
+        "path": parent_session.to_string_lossy(),
+        "id": "abc12345",
+    }));
 
     let dump = sandbox.dump("fork");
     std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
@@ -439,6 +460,119 @@ fn e2e_fixed_child_full_pipeline() {
     assert!(
         argv.contains("Task: You are a delegated subagent running from a fork"),
         "fork preamble wraps the task:\n{argv}"
+    );
+
+    // ---- Scenario 3b (V13-02 FR-D): dual-instance authoritative parent -----
+    // Two rpi instances share one session dir (double-open same cwd):
+    // instance A's file is mtime-NEWEST and carries its own marker, while the
+    // authoritative ctx.sessionFile names instance B. The fork must branch
+    // from B (the authoritative value), not from A's mtime-leading file;
+    // and once the fork artifact lands fresh, a second fork must STILL use B
+    // (never lock onto fork.jsonl — audit hit surface 2).
+    let dual_dir = sandbox.root.join("dual");
+    std::fs::create_dir_all(&dual_dir).unwrap();
+    let make_stem = |ts: &str, id: &str| format!("{ts}_{id}");
+    // A: mtime-newest, B: older but authoritative.
+    let file_a = dual_dir.join(format!(
+        "{}.jsonl",
+        make_stem(
+            "2026-08-19T23-00-00-000",
+            "11111111-1111-7111-8111-111111111111"
+        )
+    ));
+    let file_b = dual_dir.join(format!(
+        "{}.jsonl",
+        make_stem(
+            "2026-08-19T10-00-00-000",
+            "22222222-2222-7222-8222-222222222222"
+        )
+    ));
+    let write_session = |path: &std::path::Path, marker: &str, cwd: &str| {
+        std::fs::write(
+            path,
+            format!(
+                concat!(
+                    r#"{{"type":"session","version":3,"id":"{}","timestamp":"2026-08-19T00:00:00.000Z","cwd":"{}"}}"# , "\n",
+                    r#"{{"type":"message","id":"id000001","timestamp":"2026-08-19T00:00:01.000Z","message":{{"role":"user","content":[{{"type":"text","text":"{}"}}]}}}}"# , "\n"
+                ),
+                path.file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .rsplit_once('_')
+                    .map(|(_, tail)| tail)
+                    .unwrap_or("?"),
+                cwd,
+                marker
+            ),
+        )
+        .unwrap();
+        // Pin A's mtime strictly newest at write time (CI sandboxes round
+        // mtime to whole seconds, so sleeps do not separate writes).
+        if path == file_a.as_path() {
+            let file = std::fs::File::open(path).unwrap();
+            file.set_modified(std::time::SystemTime::now()).unwrap();
+        }
+    };
+    write_session(&file_b, "marker-B", &real_project.to_string_lossy());
+    write_session(&file_a, "marker-A", &real_project.to_string_lossy());
+    // B gets a clearly older mtime (60s back), keeping A the newest.
+    let fb = std::fs::File::open(&file_b).unwrap();
+    fb.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+        .unwrap();
+    // Authoritative = instance B while A holds the newest mtime.
+    assert!(
+        file_a
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .zip(file_b.metadata().and_then(|m| m.modified()).ok())
+            .is_some_and(|(a, b)| a > b),
+        "precondition: A must be mtime-newer than B"
+    );
+    *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = Some(json!({
+        "path": file_b.to_string_lossy(),
+        "id": "22222222-2222-7222-8222-222222222222",
+    }));
+    std::fs::write(
+        sandbox.project.join(".rpi/settings.json"),
+        json!({ "sessionDir": dual_dir.to_string_lossy() }).to_string(),
+    )
+    .unwrap();
+    let dual_dump = sandbox.dump("dual");
+    std::env::set_var("RPI_E2E_DUMP_DIR", &dual_dump);
+    let dual_runs = dual_dir.join("runs");
+    let result = execute(json!({
+        "agent": "delegate",
+        "task": "dual fork",
+        "context": "fork",
+        "timeoutMs": 30000,
+        "artifacts": false,
+        "sessionDir": dual_runs.to_string_lossy(),
+    }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let branch1 = find_latest_jsonl(&dual_runs).expect("fork branch #1");
+    let branch1_text = std::fs::read_to_string(&branch1).unwrap();
+    assert!(
+        branch1_text.contains("marker-B"),
+        "fork must branch from the authoritative instance B, not mtime-newest A:\n{branch1_text}"
+    );
+    assert!(!branch1_text.contains("marker-A"), "{branch1_text}");
+    // The fresh branch file (fork-N.jsonl, mtime newest) must not hijack the
+    // NEXT fork — the authoritative value still rules (audit hit surface 2).
+    let result = execute(json!({
+        "agent": "delegate",
+        "task": "dual fork again",
+        "context": "fork",
+        "timeoutMs": 30000,
+        "artifacts": false,
+        "sessionDir": dual_runs.to_string_lossy(),
+    }));
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let branch2 = find_latest_jsonl(&dual_runs).expect("fork branch #2");
+    let branch2_text = std::fs::read_to_string(&branch2).unwrap();
+    assert!(
+        branch2_text.contains("marker-B"),
+        "second fork still from instance B, not fork artifact:\n{branch2_text}"
     );
 
     // ---- Scenario 4: depth block ---------------------------------------

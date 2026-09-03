@@ -736,12 +736,7 @@ fn dispatch_async(
         }
     };
 
-    let session_id = ctx.parent_session_file.as_ref().map(|p| {
-        p.file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
-    });
+    let session_id = ctx.parent_session_id.clone();
     let planned = match &body {
         crate::runner::background::AsyncBody::Single { .. } => 1,
         crate::runner::background::AsyncBody::Tasks { entries, .. } => entries.len() as u64,

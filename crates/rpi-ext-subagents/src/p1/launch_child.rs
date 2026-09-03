@@ -20,7 +20,7 @@ use crate::config::{ExtensionConfig, SettingsPair};
 use crate::launch::model::{self, AvailableModel};
 use crate::runner::budget;
 use crate::runner::foreground::{self, ForegroundRunInput, ForegroundRunResult};
-use crate::{session_fork, PluginRuntime};
+use crate::{session_fork, ParentSession, PluginRuntime};
 
 /// Per-child output override (`normalizeOutputOverride` chain step
 /// semantics): a path, disabled, or inherit the agent default.
@@ -170,7 +170,13 @@ pub struct RunCtx {
     pub settings: SettingsPair,
     pub config: ExtensionConfig,
     pub base_cwd: PathBuf,
+    /// Authoritative parent session identity (V13-02, ADR-0022); `file` is
+    /// `None` only for a not-yet-persisted in-memory parent.
+    pub parent_session: Option<ParentSession>,
     pub parent_session_file: Option<PathBuf>,
+    /// Parent session id (authoritative `ctx.sessionFile.id`, fallback =
+    /// uuidv7 tail of the fallback file stem).
+    pub parent_session_id: Option<String>,
     pub parent_model: Option<String>,
     pub registry: Vec<AvailableModel>,
     /// One id per delegation call; parallel/chain children share it so the
@@ -207,7 +213,11 @@ impl RunCtx {
         config: ExtensionConfig,
     ) -> Self {
         let settings = crate::config::read_settings_pair(&host.cwd());
-        let parent_session_file = host.parent_session_file(&settings);
+        let parent_session = host.parent_session(&settings);
+        let parent_session_file = parent_session
+            .as_ref()
+            .and_then(|session| session.file.clone());
+        let parent_session_id = parent_session.as_ref().map(|session| session.id.clone());
         let effective_cwd = object
             .get("cwd")
             .and_then(Value::as_str)
@@ -269,7 +279,9 @@ impl RunCtx {
             settings,
             config,
             base_cwd: effective_cwd,
+            parent_session,
             parent_session_file,
+            parent_session_id,
             parent_model: host.parent_model(),
             registry: host.scoped_models(),
             run_id,
@@ -342,6 +354,17 @@ pub async fn run_child_async(
     let (session_file, thinking_override) = if let Some(resume_file) = &spec.session_file {
         (Some(resume_file.clone()), None)
     } else if context == ContextMode::Fork {
+        // FR-A R2 (V13-02): `ctx.sessionFile` identified an in-memory parent
+        // (id present, path null) — the parent has not persisted enough
+        // history to fork from yet. Fail fast with the upstream-mirrored
+        // message (substring asserted by e2e_fixed_script.rs scenario 2)
+        // plus the in-memory hint; the plain no-session case keeps the exact
+        // message from create_fork_session.
+        if let Some(parent) = &ctx.parent_session {
+            if parent.file.is_none() {
+                return Err("Failed to create forked subagent session: Forked subagent context requires a persisted parent session (parent session is in-memory and not yet persisted to disk).".into());
+            }
+        }
         let branch_file = if spec.child_index == 0 {
             ctx.session_root.join("fork.jsonl")
         } else {
@@ -596,12 +619,7 @@ pub async fn run_child_async(
         artifacts_dir: ctx.artifacts_dir.clone(),
         include_jsonl: ctx.config.include_jsonl(),
         include_transcript: true,
-        parent_session_id: ctx.parent_session_file.as_ref().map(|p| {
-            p.file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string()
-        }),
+        parent_session_id: ctx.parent_session_id.clone(),
         self_extension,
         fanout_authorized,
         resolved_skill_names: (!resolved_skills.is_empty()).then(|| {

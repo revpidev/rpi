@@ -433,12 +433,13 @@ pub fn handle_management_action_with(
                         .to_string(),
                 );
             }
-            // The session id is derived from the host's current session
-            // (TE-D16) — never trusted from the call parameters, so a grant
-            // cannot target another session's ledger.
+            // The session id is derived from the host's authoritative parent
+            // session (V13-02, `ctx.sessionFile`; TE-D16-derived id before
+            // the accessor) — never trusted from the call parameters, so a
+            // grant cannot target another session's ledger.
             let Some(session_id) = host
-                .parent_session_file(settings)
-                .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                .parent_session(settings)
+                .map(|session| session.id)
                 .filter(|s| !s.is_empty())
             else {
                 return ToolOutcome::error(

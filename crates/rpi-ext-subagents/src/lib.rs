@@ -94,12 +94,39 @@ pub fn host_call_static(channel: &AsyncHostCalls, method: &str, args: Value) -> 
     serde_json::from_slice(&response[..]).unwrap_or(Value::Null)
 }
 
-/// Host bridge the tool layer uses (cwd, parent model, parent session file,
+/// Authoritative parent session identity (V13-02, ADR-0022 `ctx.sessionFile`).
+/// `id` is always present; `file` is `None` only for a not-yet-persisted
+/// in-memory session — fork refuses to branch from those (FR-A R2, upstream
+/// fork-context.ts:160 «Forked subagent context requires a persisted parent
+/// session»).
+#[derive(Debug, Clone)]
+pub struct ParentSession {
+    pub file: Option<PathBuf>,
+    pub id: String,
+}
+
+/// mtime floor grace for the parent-session fallback heuristic (V13-02
+/// FR-B R3): the host may create the session file shortly before the plugin
+/// loads, so the floor is process-start (approx) minus this grace. Same
+/// value as statusline `LATCH_MTIME_GRACE` (state.rs:263).
+const LATCH_FALLBACK_MTIME_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Approximate plugin-process start in wall-clock terms (captured on first
+/// use ~= load time); base for the fallback mtime floor. The fallback only
+/// ever runs when the authoritative `ctx.sessionFile` is unavailable.
+fn process_start_wall_clock() -> std::time::SystemTime {
+    static START: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::SystemTime::now)
+}
+
+/// Host bridge the tool layer uses (cwd, parent model, parent session,
 /// and — from TE05 — the scoped model registry for fuzzy resolution).
 pub trait HostContext {
     fn cwd(&self) -> PathBuf;
     fn parent_model(&self) -> Option<String>;
-    fn parent_session_file(&self, settings: &config::SettingsPair) -> Option<PathBuf>;
+    /// Authoritative parent session identity (V13-02): prefers `ctx.sessionFile`,
+    /// directory-heuristic fallback when the host call is unavailable.
+    fn parent_session(&self, settings: &config::SettingsPair) -> Option<ParentSession>;
     /// `ctx.hasUI`: authority-gated actions (grant-spawn-budget) are limited
     /// to the root interactive parent session (upstream
     /// subagent-executor.ts:5241-5260). Defaults to `false` — test fakes
@@ -171,6 +198,29 @@ struct HostCallsContext<'a> {
     cookie: usize,
 }
 
+impl HostCallsContext<'_> {
+    /// Directory-heuristic fallback (upstream `findLatestSessionFile`,
+    /// utils.ts:268-282) — used only when `ctx.sessionFile` is unavailable:
+    /// newest shape-valid `.jsonl` at `resolve_parent_session_dir`, floored
+    /// at process-start − 2s (same `LATCH_MTIME_GRACE` value as statusline
+    /// state.rs:263; the plugin loads after the host starts the session) and
+    /// filtered to the `<ISO ts>_<uuidv7>` stem shape (excludes `fork*`
+    /// artifacts — FR-B).
+    fn parent_session_fallback(&self, settings: &config::SettingsPair) -> Option<ParentSession> {
+        let cwd = self.cwd();
+        let dir = paths::resolve_parent_session_dir(&cwd, settings.session_dir.as_deref());
+        let since = process_start_wall_clock()
+            .checked_sub(LATCH_FALLBACK_MTIME_GRACE)
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let file = paths::find_latest_session_file(&dir, since)?;
+        let id = paths::session_id_from_path(&file).unwrap_or_default();
+        Some(ParentSession {
+            file: Some(file),
+            id,
+        })
+    }
+}
+
 impl HostContext for HostCallsContext<'_> {
     fn cwd(&self) -> PathBuf {
         if let Some(cwd) = host_call_ok(self.calls, self.cookie, "ctx.cwd", json!({})) {
@@ -196,14 +246,51 @@ impl HostContext for HostCallsContext<'_> {
             .unwrap_or(false)
     }
 
-    /// No ABI accessor for the session file (TE04 must not change
-    /// rpi-ext-host), so derive it from the deterministic session-dir layout
-    /// plus the newest `.jsonl` — upstream's own `findLatestSessionFile`
-    /// heuristic (deviation TE-D16).
-    fn parent_session_file(&self, settings: &config::SettingsPair) -> Option<PathBuf> {
-        let cwd = self.cwd();
-        let dir = paths::resolve_parent_session_dir(&cwd, settings.session_dir.as_deref());
-        paths::find_latest_session_file(&dir)
+    /// Authoritative parent session identity (V13-02, closes TE-D16):
+    /// prefers `ctx.sessionFile` (`{path, id}`, ADR-0022) — upstream
+    /// `ctx.sessionManager.getSessionFile()` (subagent-executor.ts:491,
+    /// fork-context.ts:157); the directory heuristic (`findLatestSessionFile`,
+    /// utils.ts:268-282) is only the fallback when the host call is
+    /// unavailable. No sticky latch (unlike statusline refresh.rs): every
+    /// launch re-reads the authoritative value so a session switch is
+    /// followed — a latch would pin the old session after /resume.
+    fn parent_session(&self, settings: &config::SettingsPair) -> Option<ParentSession> {
+        const CTX_SESSION_FILE: &str = "ctx.sessionFile";
+        match host_call_ok(self.calls, self.cookie, CTX_SESSION_FILE, json!({})) {
+            Some(value) => {
+                let id = value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                match id {
+                    Some(id) => {
+                        // path == null ⇒ in-memory session not yet on disk;
+                        // `file: None` triggers the fork fail-fast (FR-A R2).
+                        let file = value
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .filter(|path| !path.is_empty())
+                            .map(PathBuf::from);
+                        Some(ParentSession {
+                            file,
+                            id: id.to_owned(),
+                        })
+                    }
+                    None => {
+                        tracing::warn!(
+                            "{CTX_SESSION_FILE} returned no session id; falling back to directory heuristic"
+                        );
+                        self.parent_session_fallback(settings)
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(
+                    "{CTX_SESSION_FILE} unavailable; falling back to directory heuristic"
+                );
+                self.parent_session_fallback(settings)
+            }
+        }
     }
 
     fn async_calls(&self) -> Option<AsyncHostCalls> {
@@ -715,17 +802,18 @@ fn dispatch_message(message: &Value) -> Value {
                 let orchestrator_session_id =
                     std::env::var(launch::args::SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV)
                         .unwrap_or_default();
-                // The parent's own session id comes from its newest session
-                // file (TE-D16 derivation), falling back to the env.
+                // The parent's own session id comes from its authoritative
+                // session (V13-02 `ctx.sessionFile`, ADR-0022), falling back
+                // to the env.
                 let session_id = if orchestrator_session_id.is_empty() {
                     HostCallsContext {
                         calls: &state.calls,
                         cookie: state.cookie,
                     }
-                    .parent_session_file(&config::read_settings_pair(
+                    .parent_session(&config::read_settings_pair(
                         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                     ))
-                    .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+                    .map(|session| session.id)
                     .unwrap_or_default()
                 } else {
                     orchestrator_session_id
@@ -1278,5 +1366,157 @@ pub mod child_stream_replay {
         pub fn messages_public(&self) -> &[serde_json::Value] {
             &self.messages
         }
+    }
+}
+
+/// V13-02: `parent_session` authoritative `ctx.sessionFile` decision matrix
+/// (lib.rs FR-A / FR-B). A scripted host channel answers `ctx.sessionFile`
+/// per cookie (each test uses a unique cookie so parallel threads don't
+/// collide); every other method answers benignly.
+#[cfg(test)]
+mod parent_session_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static SCRIPTED_ANSWERS: OnceLock<std::sync::Mutex<HashMap<usize, Value>>> = OnceLock::new();
+
+    fn scripted() -> &'static std::sync::Mutex<HashMap<usize, Value>> {
+        SCRIPTED_ANSWERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+    }
+
+    extern "C" fn scripted_host_call(cookie: PluginCookie, request: RVec<u8>) -> RVec<u8> {
+        let parsed: Value = serde_json::from_slice(&request[..]).unwrap_or(Value::Null);
+        let method = parsed.get("call").and_then(Value::as_str).unwrap_or("");
+        let response = match method {
+            "ctx.sessionFile" => scripted()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(cookie as usize))
+                .cloned()
+                .unwrap_or_else(|| json!({ "error": { "message": "not scripted" } })),
+            "ctx.cwd" => json!({ "ok": "/tmp" }),
+            _ => json!({ "ok": Value::Null }),
+        };
+        RVec::from(serde_json::to_vec(&response).unwrap_or_default())
+    }
+
+    fn unique_cookie() -> usize {
+        55000
+            + (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as usize
+                % 1_000_000)
+    }
+
+    fn with_answer(answer: Value, f: impl FnOnce(&HostCallsContext<'_>)) {
+        let cookie = unique_cookie();
+        scripted()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cookie, answer);
+        let calls = RpiHostCalls {
+            call: scripted_host_call,
+        };
+        let ctx = HostCallsContext {
+            calls: &calls,
+            cookie,
+        };
+        f(&ctx);
+        scripted()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&cookie);
+    }
+
+    #[test]
+    fn authoritative_session_file_wins_over_newer_dir_file() {
+        // A shape-valid, mtime-newer session file sits in the dir — the
+        // authoritative ctx.sessionFile must win anyway (FR-D: double-open
+        // same cwd, the other instance's file is the mtime-newest).
+        let dir = std::env::temp_dir().join(format!("rpi-sub-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uuid = "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        let newer = dir.join(format!("2026-08-19T12-00-00-000_{uuid}.jsonl"));
+        std::fs::write(&newer, "{}").unwrap();
+        with_answer(
+            json!({ "ok": { "id": "auth-id", "path": "/sessions/auth.jsonl" } }),
+            |ctx| {
+                let settings = config::SettingsPair {
+                    session_dir: Some(dir.to_string_lossy().to_string()),
+                    ..Default::default()
+                };
+                let session = ctx.parent_session(&settings).expect("resolves");
+                assert_eq!(session.id, "auth-id");
+                assert_eq!(session.file, Some(PathBuf::from("/sessions/auth.jsonl")));
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_file_error_falls_back_to_directory_heuristic() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-fb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uuid = "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        let file = dir.join(format!("2026-08-19T10-00-00-000_{uuid}.jsonl"));
+        std::fs::write(&file, "{}").unwrap();
+        with_answer(json!({ "error": { "message": "unknownMethod" } }), |ctx| {
+            let settings = config::SettingsPair {
+                session_dir: Some(dir.to_string_lossy().to_string()),
+                ..Default::default()
+            };
+            let session = ctx.parent_session(&settings).expect("fallback resolves");
+            assert_eq!(session.file.as_deref(), Some(file.as_path()));
+            assert_eq!(session.id, uuid);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_file_empty_id_falls_back_with_warn() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-fb2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let uuid = "018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e";
+        let file = dir.join(format!("2026-08-19T10-00-00-000_{uuid}.jsonl"));
+        std::fs::write(&file, "{}").unwrap();
+        with_answer(json!({ "ok": { "id": "", "path": null } }), |ctx| {
+            let settings = config::SettingsPair {
+                session_dir: Some(dir.to_string_lossy().to_string()),
+                ..Default::default()
+            };
+            let session = ctx.parent_session(&settings).expect("fallback resolves");
+            assert_eq!(session.file.as_deref(), Some(file.as_path()));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_memory_session_yields_file_none_with_id() {
+        // FR-A R2: ctx.sessionFile answers an id but `path: null` — an
+        // in-memory session. `file: None` is what triggers the fork
+        // fail-fast downstream.
+        with_answer(json!({ "ok": { "id": "mem-id", "path": null } }), |ctx| {
+            let session = ctx
+                .parent_session(&config::SettingsPair::default())
+                .expect("resolves");
+            assert_eq!(session.id, "mem-id");
+            assert_eq!(session.file, None);
+        });
+    }
+
+    #[test]
+    fn no_session_at_all_yields_none() {
+        with_answer(json!({ "error": { "message": "unknownMethod" } }), |ctx| {
+            let settings = config::SettingsPair {
+                session_dir: Some("/nonexistent-rpi-session-dir".to_string()),
+                ..Default::default()
+            };
+            assert!(ctx.parent_session(&settings).is_none());
+        });
     }
 }
