@@ -13,8 +13,10 @@ sequence.
    triggers `.github/workflows/build.yml`, which builds all six targets and
    publishes the assets to the GitHub Release. The release notes are
    attached automatically from `changes/v<version>.md` (the changelog
-   single source of truth) — make sure that file is final before tagging;
-   a tag re-push refreshes both the assets and the notes.
+   single source of truth), reflowed by `scripts/unwrap-release-notes.py`
+   because GitHub renders release bodies with hard line breaks while the
+   source files are ~70-column wrapped — make sure that file is final
+   before tagging; a tag re-push refreshes both the assets and the notes.
 3. **Wait for all six target assets + their `.sha256` sidecars** (12 files) to
    appear on the Release page, and verify before proceeding:
 
