@@ -27,6 +27,31 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 3000;
 pub const MIN_TIMEOUT_MS: u64 = 500;
 pub const MAX_TIMEOUT_MS: u64 = 60_000;
 
+/// `statusLine.liveTokens` bounds (rpi extension,
+/// 03-realtime-token-count §1.5): streaming re-run throttle.
+pub const DEFAULT_LIVE_REFRESH_MS: u64 = 1000;
+pub const MIN_LIVE_REFRESH_MS: u64 = 300;
+pub const MAX_LIVE_REFRESH_MS: u64 = 5000;
+
+/// Parsed `statusLine.liveTokens` (bool | object). `enabled` is evaluated
+/// ONCE at plugin load (it fixes the subscription set — adding the key at
+/// runtime does not subscribe; restart required), while `refresh_ms` is
+/// re-read on every tick and applies immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveTokens {
+    pub enabled: bool,
+    pub refresh_ms: u64,
+}
+
+impl Default for LiveTokens {
+    fn default() -> Self {
+        LiveTokens {
+            enabled: false,
+            refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+        }
+    }
+}
+
 /// `padding` bound (defensive; CC documents no bound).
 pub const MAX_PADDING: usize = 16;
 
@@ -74,6 +99,10 @@ pub struct StatusLineConfig {
     pub placement: Placement,
     /// Script execution timeout (rpi `timeoutMs` extension).
     pub timeout_ms: u64,
+    /// `statusLine.liveTokens` (rpi extension; 03-realtime-token-count
+    /// §1.5). `enabled` here reflects the CURRENT settings read — only
+    /// the load-time evaluation fixes the subscription set.
+    pub live_tokens: LiveTokens,
 }
 
 /// One read of the global settings.json serving both consumers (the
@@ -136,13 +165,44 @@ fn parse_status_line(value: &Value) -> Option<StatusLineConfig> {
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TIMEOUT_MS)
         .clamp(MIN_TIMEOUT_MS, MAX_TIMEOUT_MS);
+    let live_tokens = parse_live_tokens(object.get("liveTokens"));
     Some(StatusLineConfig {
         command: command.to_owned(),
         padding,
         refresh_interval_secs,
         placement,
         timeout_ms,
+        live_tokens,
     })
+}
+
+/// §1.5: `true` = on with defaults; an object may override `refreshMs`
+/// (clamped 300..5000, out-of-range/invalid falls back to the default);
+/// `false` / missing / wrong type = off.
+fn parse_live_tokens(value: Option<&Value>) -> LiveTokens {
+    let mut live = LiveTokens {
+        enabled: true,
+        ..LiveTokens::default()
+    };
+    match value {
+        Some(Value::Bool(true)) => {}
+        Some(Value::Object(object)) => {
+            if let Some(refresh) = object.get("refreshMs").and_then(Value::as_u64) {
+                live.refresh_ms = refresh.clamp(MIN_LIVE_REFRESH_MS, MAX_LIVE_REFRESH_MS);
+            }
+        }
+        _ => return LiveTokens::default(),
+    }
+    live
+}
+
+/// Load-time subscription evaluation (§1.5 启用时机注记): whether the
+/// `liveTokens` key is configured in the CURRENT global settings. Called
+/// once at install; runtime key edits do not change the subscription set.
+pub fn live_tokens_configured_in_global_settings() -> bool {
+    load_settings_snapshot()
+        .status_line
+        .is_some_and(|config| config.live_tokens.enabled)
 }
 
 #[cfg(test)]
@@ -166,6 +226,7 @@ mod tests {
         assert_eq!(config.refresh_interval_secs, None);
         assert_eq!(config.placement, Placement::Replace);
         assert_eq!(config.timeout_ms, DEFAULT_TIMEOUT_MS);
+        assert_eq!(config.live_tokens, LiveTokens::default());
     }
 
     #[test]
@@ -198,6 +259,54 @@ mod tests {
                 .unwrap()
                 .placement,
             Placement::Widget
+        );
+    }
+
+    #[test]
+    fn live_tokens_parses_bool_object_and_clamps() {
+        // Missing / false / wrong type → off with default refresh.
+        for off in [None, Some(json!(false)), Some(json!("yes")), Some(json!(1))] {
+            let value = off.clone();
+            let config = parse(json!({"type": "command", "command": "x"})).unwrap();
+            assert!(!config.live_tokens.enabled);
+            assert_eq!(parse_live_tokens(value.as_ref()), LiveTokens::default());
+        }
+        // `true` → on, default refreshMs.
+        assert_eq!(
+            parse_live_tokens(Some(&json!(true))),
+            LiveTokens {
+                enabled: true,
+                refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+            }
+        );
+        // Object with refreshMs inside bounds.
+        assert_eq!(
+            parse_live_tokens(Some(&json!({"refreshMs": 500}))),
+            LiveTokens {
+                enabled: true,
+                refresh_ms: 500,
+            }
+        );
+        // Out-of-range clamps to 300..5000; invalid falls back to default.
+        assert_eq!(
+            parse_live_tokens(Some(&json!({"refreshMs": 1}))).refresh_ms,
+            300
+        );
+        assert_eq!(
+            parse_live_tokens(Some(&json!({"refreshMs": 999_999}))).refresh_ms,
+            5000
+        );
+        assert_eq!(
+            parse_live_tokens(Some(&json!({"refreshMs": "soon"}))).refresh_ms,
+            DEFAULT_LIVE_REFRESH_MS
+        );
+        // Empty object → on with defaults.
+        assert_eq!(
+            parse_live_tokens(Some(&json!({}))),
+            LiveTokens {
+                enabled: true,
+                refresh_ms: DEFAULT_LIVE_REFRESH_MS,
+            }
         );
     }
 
@@ -243,6 +352,7 @@ mod tests {
                 refresh_interval_secs: None,
                 placement: Placement::Replace,
                 timeout_ms: DEFAULT_TIMEOUT_MS,
+                live_tokens: LiveTokens::default(),
             })
         );
         assert_eq!(snapshot.session_dir.as_deref(), Some("/data/sessions"));

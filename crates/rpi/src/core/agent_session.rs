@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rpi_agent::compaction::branch_summarization::{
@@ -43,6 +43,7 @@ use rpi_ai::types::{
 use rpi_ai::utils::overflow::is_context_overflow;
 use rpi_ai::utils::retry::{is_retryable_assistant_error, RetryPolicy};
 use rpi_ai::utils::text::content_text_user;
+use rpi_ext_host::types as ext;
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -394,6 +395,12 @@ struct AgentSessionInner {
     pending_next_turn_messages: Mutex<Vec<AgentMessage>>,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
 
+    /// `_turnIndex` (agent-session.ts:344): reset to 0 on `agent_start`,
+    /// incremented after each `turn_end` extension emit. Carried by the
+    /// `turn_start` / `turn_end` extension event payloads (HR-B,
+    /// rpi-statusline 03-realtime-token-count §1.3).
+    turn_index: AtomicU32,
+
     retry_attempt: Mutex<u32>,
     retry_abort: Mutex<Option<CancellationToken>>,
 
@@ -517,6 +524,7 @@ impl AgentSession {
             follow_up_messages: Mutex::new(Vec::new()),
             pending_next_turn_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
+            turn_index: AtomicU32::new(0),
             retry_attempt: Mutex::new(0),
             retry_abort: Mutex::new(None),
             bash_tokens: Mutex::new(Vec::new()),
@@ -766,18 +774,89 @@ impl AgentSession {
             })
     }
 
-    /// `_emitExtensionEvent` (agent-session.ts:712-793) — no-op seam calls,
-    /// same call sites as upstream. Returns the (possibly
-    /// extension-replaced) `message_end` message for the persistence path.
+    /// `_emitExtensionEvent` (agent-session.ts:712-793) — same call
+    /// sites as upstream. Agent-event payloads are forwarded verbatim in
+    /// the upstream shapes (`agent_end` carries `messages`,
+    /// `message_update` carries `message` + `assistantMessageEvent`, …;
+    /// HR-A, rpi-statusline 03-realtime-token-count §1.3) using the
+    /// event payload model family in `rpi-ext-host` `types.rs`. Returns
+    /// the (possibly extension-replaced) `message_end` message for the
+    /// persistence path.
+    ///
+    /// `has_handlers` short-circuits BEFORE any payload is built or
+    /// serialized (HR-C): a session with no extension subscribed pays
+    /// nothing on the streaming hot path.
     async fn emit_extension_event(&self, event: &AgentEvent) -> Option<AgentMessage> {
         let runner = self.runner();
         match event {
-            AgentEvent::AgentStart => runner.emit("agent_start").await,
-            AgentEvent::AgentEnd { .. } => runner.emit("agent_end").await,
-            AgentEvent::TurnStart => runner.emit("turn_start").await,
-            AgentEvent::TurnEnd { .. } => runner.emit("turn_end").await,
-            AgentEvent::MessageStart { .. } => runner.emit("message_start").await,
-            AgentEvent::MessageUpdate { .. } => runner.emit("message_update").await,
+            AgentEvent::AgentStart => {
+                // agent-session.ts:727: `_turnIndex = 0` (HR-B).
+                self.inner.turn_index.store(0, Ordering::SeqCst);
+                runner.emit("agent_start").await
+            }
+            AgentEvent::AgentEnd { messages } => {
+                if runner.has_handlers("agent_end") {
+                    let payload = serde_json::to_value(ext::AgentEndEvent {
+                        messages: messages.clone(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("agent_end", payload).await;
+                }
+            }
+            AgentEvent::TurnStart => {
+                if runner.has_handlers("turn_start") {
+                    let payload = serde_json::to_value(ext::TurnStartEvent {
+                        turn_index: self.inner.turn_index.load(Ordering::SeqCst),
+                        timestamp: rpi_ai::models::now_millis(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("turn_start", payload).await;
+                }
+            }
+            AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } => {
+                let turn_index = self.inner.turn_index.load(Ordering::SeqCst);
+                if runner.has_handlers("turn_end") {
+                    let payload = serde_json::to_value(ext::TurnEndEvent {
+                        turn_index,
+                        message: message.clone(),
+                        tool_results: tool_results.clone(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("turn_end", payload).await;
+                }
+                // agent-session.ts:748: `_turnIndex++` after the emit (HR-B).
+                self.inner
+                    .turn_index
+                    .store(turn_index + 1, Ordering::SeqCst);
+            }
+            AgentEvent::MessageStart { message } => {
+                if runner.has_handlers("message_start") {
+                    let payload = serde_json::to_value(ext::MessageEvent {
+                        message: message.clone(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("message_start", payload).await;
+                }
+            }
+            AgentEvent::MessageUpdate {
+                message,
+                assistant_message_event,
+            } => {
+                if runner.has_handlers("message_update") {
+                    let payload = serde_json::to_value(ext::MessageUpdateEvent {
+                        message: message.clone(),
+                        assistant_message_event: serde_json::to_value(
+                            assistant_message_event.as_ref(),
+                        )
+                        .unwrap_or(serde_json::Value::Null),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("message_update", payload).await;
+                }
+            }
             AgentEvent::MessageEnd { message } => {
                 if let Some(replacement) = runner.emit_message_end(message).await {
                     // Extension-replaced messages re-enter state before
@@ -790,9 +869,55 @@ impl AgentSession {
                     return Some(replacement);
                 }
             }
-            AgentEvent::ToolExecutionStart { .. } => runner.emit("tool_execution_start").await,
-            AgentEvent::ToolExecutionUpdate { .. } => runner.emit("tool_execution_update").await,
-            AgentEvent::ToolExecutionEnd { .. } => runner.emit("tool_execution_end").await,
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                args,
+            } => {
+                if runner.has_handlers("tool_execution_start") {
+                    let payload = serde_json::to_value(ext::ToolExecutionStartEvent {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args.clone(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("tool_execution_start", payload).await;
+                }
+            }
+            AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                args,
+                partial_result,
+            } => {
+                if runner.has_handlers("tool_execution_update") {
+                    let payload = serde_json::to_value(ext::ToolExecutionUpdateEvent {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        args: args.clone(),
+                        partial_result: partial_result.clone(),
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("tool_execution_update", payload).await;
+                }
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name,
+                result,
+                is_error,
+            } => {
+                if runner.has_handlers("tool_execution_end") {
+                    let payload = serde_json::to_value(ext::ToolExecutionEndEvent {
+                        tool_call_id: tool_call_id.clone(),
+                        tool_name: tool_name.clone(),
+                        result: result.clone(),
+                        is_error: *is_error,
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                    runner.emit_event("tool_execution_end", payload).await;
+                }
+            }
         }
         None
     }

@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### 新增
+
+- **statusline 实时 token 计数**（rpi-statusline 03-realtime-token-count）：`statusLine.liveTokens` 键（bool/object，`refreshMs` 300..5000 默认 1s，订阅集加载时评估）开启流式期间 1Hz 级脚本重跑；stdin 新增 `rpi.live_output` 纯测量块（三路字符累计/增量窗口/elapsed/精确 output token，字符→token 换算与速率计算留在用户脚本，默认 ceil(chars/4) 口径）。未配置时行为与事件集与 TE12 完全一致。
+- **代理事件载荷转发 parity 补齐**：`agent_end`/`turn_start`/`turn_end`/`message_start`/`message_update`/`tool_execution_*` 八事件按上游形状携带载荷（`message_update` 含 `assistantMessageEvent`，`turn_*` 含 `turnIndex`）；`has_handlers` 短路保证无订阅会话零开销。
+- **`ctx.sessionFile` host-call**（ADR-0022，additive，capability `session`）：当前会话权威身份 `{path, id}`（内存会话 `path: null`）。
+
+### 修复
+
+- **同 cwd 双开实例 statusline 串数据**（TE-D34 §1）：`transcript_path`/`session_id` 改用 `ctx.sessionFile` 权威值，目录启发式（mtime 最新 + sticky latch）降级为兑底——兄弟实例 mtime-更新的会话文件不再竞态胜出。
+
+### 内部
+
+- G1 门禁随批修复 main 既有问题：subagents render.rs 重复/缺失 `#[test]`、background.rs 测试守卫跨 await 的 clippy 1.97 新 lint（allow + 注释）、model_runtime `cloned_ref_to_slice_refs`、两文件 rustfmt 清账（纯格式化）。
+
 ## [0.1.2] - 2026-08-19
 
 ### 新增

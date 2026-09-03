@@ -520,9 +520,15 @@ mod tests {
         let degenerate_text = degenerate["props"]["text"].as_str().unwrap();
         // width 120: url column 98 (URL padded), bar 16 cells; width 80:
         // url column 60 (URL padded), bar 14 cells.
-        assert!(wide_text.len() > narrow_text.len(), "wide={wide_text:?} narrow={narrow_text:?}");
+        assert!(
+            wide_text.len() > narrow_text.len(),
+            "wide={wide_text:?} narrow={narrow_text:?}"
+        );
         assert!(wide_text.matches('░').count() > narrow_text.matches('░').count());
-        assert_eq!(degenerate_text, narrow_text, "sub-20 width falls back to 80");
+        assert_eq!(
+            degenerate_text, narrow_text,
+            "sub-20 width falls back to 80"
+        );
     }
 
     #[test]

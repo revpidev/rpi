@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::state::{Snapshot, Totals};
+use crate::state::{LiveSnapshot, Snapshot, Totals};
 
 /// CC fixed threshold for `exceeds_200k_tokens` ("a fixed threshold
 /// regardless of actual context window size").
@@ -21,11 +21,21 @@ const EXCEEDS_THRESHOLD: u64 = 200_000;
 /// `rpi.transcript_format` marker for the v0.1 session JSONL shape.
 pub const TRANSCRIPT_FORMAT: &str = "rpi-v3";
 
+/// CC `hook_event_name` for regular (non-live) runs.
+pub const HOOK_EVENT_STATUS: &str = "Status";
+
 /// Build the JSON piped to the script's stdin. Insertion-ordered
 /// (serde_json preserve_order) so the payload is byte-stable for tests.
 pub fn build_stdin_json(snapshot: &Snapshot) -> Value {
     let mut root = Map::new();
-    root.insert("hook_event_name".into(), json!("Status"));
+    root.insert(
+        "hook_event_name".into(),
+        json!(if snapshot.hook_event_name.is_empty() {
+            HOOK_EVENT_STATUS
+        } else {
+            &snapshot.hook_event_name
+        }),
+    );
     root.insert("cwd".into(), json!(snapshot.cwd));
     if let Some(id) = &snapshot.session_id {
         root.insert("session_id".into(), json!(id));
@@ -81,16 +91,32 @@ pub fn build_stdin_json(snapshot: &Snapshot) -> Value {
         root.insert("thinking".into(), json!({"enabled": level != "off"}));
     }
 
-    // rpi extension block (FR-L, TE-D34 mitigation).
-    root.insert(
-        "rpi".into(),
-        json!({
-            "session_totals": totals_object(&snapshot.totals),
-            "transcript_format": TRANSCRIPT_FORMAT,
-        }),
-    );
+    // rpi extension block (FR-L, TE-D34 mitigation; live_output per
+    // 03-realtime-token-count §1.6 — measurement values only, python
+    // computes tokens/rates).
+    let mut rpi = Map::new();
+    rpi.insert("session_totals".into(), totals_object(&snapshot.totals));
+    rpi.insert("transcript_format".into(), json!(TRANSCRIPT_FORMAT));
+    if let Some(live) = &snapshot.live_output {
+        rpi.insert("live_output".into(), live_output_object(live));
+    }
+    root.insert("rpi".into(), Value::Object(rpi));
 
     Value::Object(root)
+}
+
+/// §1.6 `rpi.live_output`: all snake_case measurement values.
+fn live_output_object(live: &LiveSnapshot) -> Value {
+    json!({
+        "streaming": live.streaming,
+        "text_chars": live.text_chars,
+        "thinking_chars": live.thinking_chars,
+        "toolcall_chars": live.toolcall_chars,
+        "delta_chars": live.delta_chars,
+        "delta_ms": live.delta_ms,
+        "elapsed_ms": live.elapsed_ms,
+        "output_tokens_exact": live.output_tokens_exact,
+    })
 }
 
 /// `context_window` object: `context_window_size` always present (0 when
@@ -191,6 +217,8 @@ mod tests {
                 "/home/leven/.rpi/agent/sessions/--x--/2026-08-19T10-00-00-000_018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e.jsonl".into(),
             ),
             session_id: Some("018f6a1e-4c3b-7abc-8d2e-9f0a1b2c3d4e".into()),
+            live_output: None,
+            hook_event_name: "Status".into(),
         }
     }
 
@@ -294,5 +322,60 @@ mod tests {
         assert!(payload["context_window"]
             .get("total_input_tokens")
             .is_none());
+    }
+
+    #[test]
+    fn live_output_block_shape_and_omission() {
+        // §1.6: all snake_case measurement values, explicitly-null exact.
+        let mut snapshot = full_snapshot();
+        snapshot.live_output = Some(crate::state::LiveSnapshot {
+            streaming: true,
+            text_chars: 300,
+            thinking_chars: 160,
+            toolcall_chars: 52,
+            delta_chars: 128,
+            delta_ms: 1042,
+            elapsed_ms: 51_200,
+            output_tokens_exact: None,
+        });
+        let payload = build_stdin_json(&snapshot);
+        assert_eq!(payload["rpi"]["live_output"]["streaming"], true);
+        assert_eq!(payload["rpi"]["live_output"]["text_chars"], 300);
+        assert_eq!(payload["rpi"]["live_output"]["thinking_chars"], 160);
+        assert_eq!(payload["rpi"]["live_output"]["toolcall_chars"], 52);
+        assert_eq!(payload["rpi"]["live_output"]["delta_chars"], 128);
+        assert_eq!(payload["rpi"]["live_output"]["delta_ms"], 1042);
+        assert_eq!(payload["rpi"]["live_output"]["elapsed_ms"], 51_200);
+        assert_eq!(
+            payload["rpi"]["live_output"]["output_tokens_exact"],
+            Value::Null
+        );
+        // Exact present when the provider reported n > 0.
+        snapshot.live_output.as_mut().unwrap().output_tokens_exact = Some(812);
+        assert_eq!(
+            build_stdin_json(&snapshot)["rpi"]["live_output"]["output_tokens_exact"],
+            812
+        );
+        // Never streamed / liveTokens unconfigured → block omitted.
+        snapshot.live_output = None;
+        assert!(build_stdin_json(&snapshot)["rpi"]
+            .get("live_output")
+            .is_none());
+    }
+
+    #[test]
+    fn hook_event_name_status_by_default_and_real_event_for_live_ticks() {
+        // FR-F: regular runs keep the CC "Status" (A4: non-streaming path
+        // unchanged); live-tick runs carry the real event name.
+        let mut snapshot = full_snapshot();
+        assert_eq!(build_stdin_json(&snapshot)["hook_event_name"], "Status");
+        snapshot.hook_event_name = "message_update".into();
+        assert_eq!(
+            build_stdin_json(&snapshot)["hook_event_name"],
+            "message_update"
+        );
+        // Empty string falls back to Status (snapshot default).
+        snapshot.hook_event_name = String::new();
+        assert_eq!(build_stdin_json(&snapshot)["hook_event_name"], "Status");
     }
 }

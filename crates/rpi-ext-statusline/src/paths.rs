@@ -1,13 +1,18 @@
 //! Path derivation: agent dir, session-dir layout, newest session file.
 //!
-//! The ABI has no accessor for the current session file or session id
-//! (TE12 "rpi 地基" verification), so — like subagents TE-D16 — this module
-//! derives them from the host's deterministic layout
+//! FALLBACK ONLY since `ctx.sessionFile` (ADR-0022 / FR-I,
+//! 03-realtime-token-count §1.3 HR-E): the authoritative accessor in
+//! `refresh.rs::fetch_ctx` wins, and this directory heuristic runs solely
+//! when that host call fails. The sticky latch plus the mtime floor in
+//! `state.rs` demote with it (TE-D34 §1 closed for the dual-instance
+//! same-cwd case: an mtime-newer sibling file can no longer win).
+//!
+//! Derivation mirrors the host's deterministic layout
 //! (`rpi/src/core/session_manager.rs:1045-1073`):
 //! `<agentDir>/sessions/--<encoded cwd>--/<ISO ts>_<uuidv7>.jsonl`.
-//! Known precision limit (TE-D34): a fresh subagents child writing into the
-//! same cwd directory can win the mtime race; mitigated by the sticky latch
-//! in `state.rs` plus the stem-shape filter below.
+//! Known precision limit (TE-D34): a fresh subagents child writing into
+//! the same cwd directory can win the mtime race; mitigated by the sticky
+//! latch in `state.rs` plus the stem-shape filter below.
 
 use std::path::{Component, Path, PathBuf};
 

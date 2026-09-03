@@ -1571,6 +1571,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_for_unknown_run_errors() {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
@@ -1581,6 +1585,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn aborted_wait_returns_promptly_with_runs_kept_alive() {
         // The wait tool is a synchronous dispatch the runtime cannot cancel;
         // the abort probe is the cooperative substitute. An aborted wait must
@@ -1608,6 +1616,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_returns_when_run_reaches_terminal_state() {
         // Regression: finish used to unregister the handle right after the
         // terminal transition, so the run vanished from the wait's snapshot
@@ -1643,6 +1655,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_all_requires_every_initial_run_terminal() {
         let _guard = REGISTRY_TEST_MUTEX
             .lock()
@@ -1727,6 +1743,10 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_without_active_runs_errors_instead_of_spinning() {
         // subagent-wait.ts:548-551: no active runs (a TERMINAL run left in
         // the registry does not count — :552 snapshots the active set only)

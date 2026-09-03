@@ -90,6 +90,21 @@ impl ContextActions for SessionContextActions {
             })
     }
 
+    /// `ctx.sessionFile()` (rpi additive, ADR-0022): the bound
+    /// `SessionManager` is the authoritative source — `path: None` for
+    /// in-memory sessions (FR-I, rpi-statusline 03-realtime-token-count
+    /// §1.3 HR-E: kills the same-cwd dual-instance transcript mixup,
+    /// TE-D34 §1).
+    fn get_session_file(&self) -> Option<rpi_ext_host::types::SessionFileInfo> {
+        let session = self.session()?;
+        Some(rpi_ext_host::types::SessionFileInfo {
+            path: session
+                .session_file()
+                .map(|path| path.display().to_string()),
+            id: session.session_id().to_owned(),
+        })
+    }
+
     /// `compact` — fire-and-forget with the callback pair
     /// (agent-session.ts:2423-2433).
     fn compact(&self, options: CompactOptions) {

@@ -10,7 +10,10 @@
 //! parity_events_test precedent):
 //! - the whole `message_update` / `tool_execution_update` event classes are
 //!   excluded: the upstream faux slices deltas with `Math.random`, so delta
-//!   boundaries and output chunking are not part of the contract.
+//!   boundaries and output chunking are not part of the contract. This is a
+//!   SESSION-wire convention only — the EXTENSION event surface forwards
+//!   the full upstream payloads (since 2026-08-20, HR-A) and anchors them
+//!   1:1 in `extension_host_agent_event_payload_test.rs` instead.
 //! - the `usage` / `details` keys are stripped: usage is estimated from the
 //!   full context (including the upstream builder's system prompt) and
 //!   details is a tool-internal description shape — neither belongs to the
