@@ -5515,6 +5515,93 @@ mod tests {
         assert!(!rendered.contains("alpha"), "{rendered}");
     }
 
+    /// V13-06 §3.4/§4 (M6 follow-up): the promised synthetic-stream
+    /// integration anchor. 500 accumulating text deltas go through the
+    /// REAL queue/drain pipeline in two modes:
+    /// - FOLDED (streaming fast path): all deltas land in one drain — the
+    ///   queue fold collapses the run to ONE `update_content` rebuild, so
+    ///   intermediate rebuilds are capped by the drain cadence (frame-rate
+    ///   cap, D-091), not by the delta count;
+    /// - UNFOLDED (pre-V13-06 processing shape): drain after every push —
+    ///   one rebuild per delta (~500).
+    /// Both modes' FINAL rendered frame must be line-identical: folding
+    /// changes how many intermediate frames are built, never the last one.
+    #[tokio::test]
+    async fn m6_synthetic_500_delta_stream_fold_count_and_final_frame_parity() {
+        use crate::modes::interactive::components::assistant_message::rebuild_counter;
+
+        const DELTAS: usize = 500;
+        let delta_message = |i: usize| {
+            assistant_message(
+                vec![text_content(&format!("delta-{i:03}"))],
+                StopReason::Pending,
+            )
+        };
+
+        // -- FOLDED: one drain after the whole run -------------------------
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        for i in 0..DELTAS {
+            ui.push(UiCommand::MessageUpdate(delta_message(i)));
+        }
+        rebuild_counter::reset();
+        ui.drain_events();
+        let folded_rebuilds = rebuild_counter::get();
+        let folded_frame = {
+            let streaming = lock(&ui.streaming);
+            let frame = lock(&streaming.as_ref().unwrap().handle)
+                .render(100)
+                .to_vec();
+            frame
+        };
+        assert_eq!(
+            folded_rebuilds, 2,
+            "one drain = MessageStart rebuild + exactly ONE folded-update rebuild"
+        );
+        mode.shutdown().await;
+
+        // -- UNFOLDED: drain after every push (the pre-fold shape) ---------
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        ui.drain_events();
+        rebuild_counter::reset();
+        for i in 0..DELTAS {
+            ui.push(UiCommand::MessageUpdate(delta_message(i)));
+            ui.drain_events();
+        }
+        let unfolded_rebuilds = rebuild_counter::get();
+        let unfolded_frame = {
+            let streaming = lock(&ui.streaming);
+            let frame = lock(&streaming.as_ref().unwrap().handle)
+                .render(100)
+                .to_vec();
+            frame
+        };
+        assert_eq!(
+            unfolded_rebuilds, DELTAS,
+            "drain-per-delta rebuilds once per delta (the fold's whole point)"
+        );
+        mode.shutdown().await;
+
+        // Final-frame parity: identical last message → identical lines.
+        assert_eq!(
+            folded_frame, unfolded_frame,
+            "folding must never change the final frame"
+        );
+        assert!(
+            folded_frame.iter().any(|l| l.contains("delta-499")),
+            "final frame shows the last delta: {folded_frame:?}"
+        );
+    }
+
     #[tokio::test]
     async fn v1306_drain_folds_segment_by_other_commands() {
         // FR-A R1: a different command kind breaks the run — each segment

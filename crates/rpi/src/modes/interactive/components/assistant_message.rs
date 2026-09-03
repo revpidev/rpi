@@ -75,6 +75,22 @@ thread_local! {
     static REBUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Test-only introspection for the V13-06 §3.4 integration anchor
+/// (M6 follow-up): the synthetic 500-delta folding test in
+/// `interactive_mode.rs` drives the REAL queue/drain pipeline and asserts
+/// rebuild counts — the counter must be reachable from that module.
+#[cfg(test)]
+pub(crate) mod rebuild_counter {
+    /// Reset the current thread's rebuild counter.
+    pub(crate) fn reset() {
+        super::REBUILD_COUNT.with(|count| count.set(0));
+    }
+    /// Current thread's rebuild count since the last [`reset`].
+    pub(crate) fn get() -> usize {
+        super::REBUILD_COUNT.with(|count| count.get())
+    }
+}
+
 impl AssistantMessageComponent {
     pub fn new(
         message: Option<AssistantMessage>,
