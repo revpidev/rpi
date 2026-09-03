@@ -1724,6 +1724,17 @@ pub async fn run_tool_call(
     }
 }
 
+/// V13-07 S3: lazy native-tool resolver for the mcp not-found branch.
+/// `getAllTools` (a full tool-name clone+filter across the host) used to run
+/// on EVERY mcp dispatch; it now only fires when a tool name failed to
+/// resolve to a server tool.
+pub type NativeToolsResolver = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// An empty resolver (no native tools) for callers without a host channel.
+pub fn no_native_tools() -> NativeToolsResolver {
+    Arc::new(Vec::new)
+}
+
 /// `executeCall` (proxy-modes.ts:768-1253), P0 cut: no approval gate, no UI
 /// sessions; guard-disabled content path. Session recovery (FR-P1-08) and
 /// auto-auth (FR-P1-04) are wired in (TE-D09/TE-D11).
@@ -1732,7 +1743,7 @@ pub async fn execute_call(
     tool_name: &str,
     args: Option<serde_json::Map<String, Value>>,
     server_override: Option<&str>,
-    native_tools: &[String],
+    native_tools: NativeToolsResolver,
 ) -> Value {
     let prefix_mode = state.config.global_tool_prefix();
     // proxy-modes.ts:783-799 — identity keys sit between `error` and
@@ -2004,7 +2015,8 @@ pub async fn execute_call(
     }
 
     let (Some(server_name), Some(tool_meta)) = (server_name.clone(), tool_meta.clone()) else {
-        if server_override.is_none() && native_tools.iter().any(|t| t == tool_name && t != "mcp") {
+        if server_override.is_none() && native_tools().iter().any(|t| t == tool_name && t != "mcp")
+        {
             return text_result(
                 format!(
                     "\"{tool_name}\" is a native Pi tool. Call {tool_name} directly instead of using mcp({{ tool: \"{tool_name}\" }})."
@@ -2669,6 +2681,20 @@ impl ProxyDispatcher {
 
     /// The proxy tool's execute body (index.ts:720-839).
     pub async fn execute(self: &Arc<Self>, params: &Value, native_tools: &[String]) -> Value {
+        let owned = native_tools.to_vec();
+        let resolver: NativeToolsResolver = Arc::new(move || owned.clone());
+        self.execute_with_resolver(params, resolver).await
+    }
+
+    /// V13-07 S3: `execute` with the native-tool list resolved LAZILY — the
+    /// list is only fetched (one `getAllTools` host call) when a name fails
+    /// to resolve to a server tool, so the common dispatch path pays zero
+    /// host calls for it.
+    pub async fn execute_with_resolver(
+        self: &Arc<Self>,
+        params: &Value,
+        native_tools: NativeToolsResolver,
+    ) -> Value {
         // args parsing (index.ts:735-756) — upstream throws; the ABI has no
         // throw channel, so the same message rides a normal result (TE-D04).
         let mut parsed_args: Option<serde_json::Map<String, Value>> = None;

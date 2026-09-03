@@ -392,6 +392,41 @@ async fn proxy_end_to_end_five_modes() {
         assert_eq!(result["content"][0]["text"], json!("pong"));
         assert_eq!(result["details"]["mode"], json!("call"));
 
+        // V13-07 S3: getAllTools resolution is LAZY — a known server tool
+        // dispatch must not touch the native-tool resolver; an
+        // unknown-tool not-found branch invokes it exactly once.
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_resolver = count.clone();
+        let resolver: rpi_ext_mcp_adapter::proxy::NativeToolsResolver = Arc::new(move || {
+            count_for_resolver.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            vec!["bash".to_string()]
+        });
+        let lazy = dispatcher
+            .execute_with_resolver(
+                &json!({ "tool": "fixture_echo", "args": { "query": "lazy" } }),
+                resolver.clone(),
+            )
+            .await;
+        assert_eq!(lazy["content"][0]["text"], json!("lazy"), "{lazy}");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "known-tool dispatch must pay zero getAllTools host calls"
+        );
+        let missing = dispatcher
+            .execute_with_resolver(&json!({ "tool": "no_such_tool_xyz" }), resolver.clone())
+            .await;
+        assert_eq!(
+            missing["details"]["error"],
+            json!("tool_not_found"),
+            "{missing}"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "not-found must invoke the resolver exactly once"
+        );
+
         let result = dispatcher
             .execute(&json!({ "tool": "fixture_fail" }), &[])
             .await;
