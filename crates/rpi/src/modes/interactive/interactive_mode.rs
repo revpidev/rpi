@@ -2211,9 +2211,17 @@ impl InteractiveUi {
         // V13-05 (FR-B): replace previous selector / install the new one in
         // a SINGLE container critical section (swap_editor_region) — never a
         // transient bare-editor or missing-selector frame, and set_focus
-        // fires once (no focus jitter).
-        *lock(&self.active_selector) = Some(entry.clone());
-        self.swap_editor_region(entry.clone(), entry);
+        // fires once (no focus jitter). M3: the `active_selector`
+        // bookkeeping is held ACROSS the swap so a concurrent
+        // `hide_selector_if_current` (a superseded dialog's late timeout
+        // wake) cannot interleave its editor-restore swap between the
+        // bookkeeping and the container swap — lock order is always
+        // active_selector → editor_container, never the reverse.
+        {
+            let mut active = lock(&self.active_selector);
+            *active = Some(entry.clone());
+            self.swap_editor_region(entry.clone(), entry);
+        }
         // Clear the settings selector weak ref (selector changed / reinstated).
         *lock(&self.settings_selector_weak) = None;
     }
@@ -2222,11 +2230,42 @@ impl InteractiveUi {
     /// editor into the container (upstream `editorContainer.clear();
     /// editorContainer.addChild(editor)`).
     pub(crate) fn hide_selector(&self) {
-        if lock(&self.active_selector).take().is_some() {
-            // Single critical section: clear → add editor → focus editor
-            // (already atomic; kept via the shared primitive V13-05 FR-B).
-            self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
+        // M3: same critical-section discipline as `show_selector` — the
+        // take and the editor-restore swap happen under one
+        // `active_selector` guard, so they cannot interleave with a
+        // concurrent show/hide.
+        {
+            let mut active = lock(&self.active_selector);
+            if active.take().is_some() {
+                // Single critical section: clear → add editor → focus editor
+                // (already atomic; kept via the shared primitive V13-05 FR-B).
+                self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
+            }
         }
+        // Clear the settings selector weak ref (selector is no longer mounted).
+        *lock(&self.settings_selector_weak) = None;
+    }
+
+    /// Guarded close for extension dialogs (M3, upstream's
+    /// `activeSelectorToken` guard, interactive-mode.ts:4355-4361): restore
+    /// the editor only when `entry` is STILL the mounted selector. A
+    /// dialog's `done()`/timeout can wake arbitrarily late (the tokio
+    /// timeout fires on a worker thread); by then another selector may
+    /// legitimately own the editor region (a built-in selector, or another
+    /// extension's dialog) — an unguarded hide would close the replacement.
+    /// Identity is `Arc` pointer equality; a superseded call is a no-op.
+    pub(crate) fn hide_selector_if_current(&self, entry: &SharedComponent) {
+        let mut active = lock(&self.active_selector);
+        let is_current = active
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, entry));
+        if !is_current {
+            // Superseded — the replacement owns the editor region now.
+            return;
+        }
+        *active = None;
+        self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
+        drop(active);
         // Clear the settings selector weak ref (selector is no longer mounted).
         *lock(&self.settings_selector_weak) = None;
     }
@@ -2236,18 +2275,22 @@ impl InteractiveUi {
     /// add → set_focus under the same `editor_container` lock, so no render
     /// deadline can capture the bare editor (old two-critical-section shape
     /// had a hole between them and called set_focus twice → transient focus
-    /// jitter). `set_focus` goes through `run_or_queue` (try_lock), which
-    /// never blocks on the renderer inner lock, so calling it while holding
-    /// the container lock is deadlock-free: the driver thread holds the
-    /// inner lock during render and only ever takes each container lock
-    /// briefly.
+    /// jitter). `set_focus` MUST go through `set_focus_nonblocking` here:
+    /// the plain `set_focus` uncontended branch drains pending ops with a
+    /// BLOCKING inner-lock acquisition, which under this container lock
+    /// would open an ABBA deadlock against the render path (the driver
+    /// holds `inner` and takes container locks through
+    /// `SharedChild::render`). The nonblocking variant only try-locks
+    /// (applying the focus change immediately) or queues the op for the
+    /// event loop's next drain — either way this thread never waits on
+    /// `inner` while holding the container lock.
     fn swap_editor_region(&self, entry: SharedComponent, focus: SharedComponent) {
         {
             let mut container = lock(&self.editor_container);
             container.clear();
             container.children.push(Box::new(SharedEntry(entry)));
+            self.ui.set_focus_nonblocking(Some(focus));
         }
-        self.ui.set_focus(Some(focus));
         self.ui.request_render(false);
     }
 
@@ -7725,6 +7768,167 @@ mod tests {
         renderer.join().expect("renderer thread");
         let checks = checker.join().expect("checker thread");
         assert!(checks > 30, "checker sampled {checks} snapshots");
+        mode.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // M1 (V13-05 FR-A R3 follow-up): cross-container address bookkeeping
+    // under concurrent writers.
+    // ---------------------------------------------------------------------
+
+    /// Two writers swap two widget keys concurrently with alternating
+    /// placements, so most writes take the cross-container add-then-remove
+    /// arm while BOTH writers target the same containers. Each new child's
+    /// address must be captured inside the add critical section (M1): the
+    /// pre-fix code re-locked the container to read `children.last()`,
+    /// which could observe the OTHER writer's child — the address book
+    /// would hold a wrong address, later swaps would remove the wrong
+    /// widget, and the containers would accumulate leaked children.
+    /// Asserts: exactly one child per key across the two containers and
+    /// only the last-written content for each key (a follow-up
+    /// same-placement swap per key proves the recorded addresses still
+    /// point at the right children).
+    #[tokio::test]
+    async fn m1_concurrent_cross_container_swaps_keep_widget_addresses_exact() {
+        use rpi_ext_host::api::{ExtensionWidgetOptions, UiBridge, WidgetContent, WidgetPlacement};
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        let ui = &mode.ui_state;
+
+        // Seed both keys in known placements (a below, b above).
+        bridge.set_widget(
+            "a",
+            Some(WidgetContent::Lines(vec!["A-seed".to_owned()])),
+            Some(ExtensionWidgetOptions {
+                placement: Some(WidgetPlacement::BelowEditor),
+            }),
+        );
+        bridge.set_widget(
+            "b",
+            Some(WidgetContent::Lines(vec!["B-seed".to_owned()])),
+            None,
+        );
+
+        let iterations = 160u64;
+        let writer =
+            |key: &'static str, prefix: &'static str, phase: u64| -> std::thread::JoinHandle<u64> {
+                let bridge = Arc::clone(&bridge);
+                std::thread::spawn(move || {
+                    let mut i: u64 = 0;
+                    while i < iterations {
+                        let below = (i + phase).is_multiple_of(2);
+                        let options = below.then_some(ExtensionWidgetOptions {
+                            placement: Some(WidgetPlacement::BelowEditor),
+                        });
+                        bridge.set_widget(
+                            key,
+                            Some(WidgetContent::Lines(vec![format!("{prefix}{i}")])),
+                            options,
+                        );
+                        i += 1;
+                        std::thread::sleep(std::time::Duration::from_micros(250));
+                    }
+                    i
+                })
+            };
+        // Opposite phases: when writer A adds below, writer B adds above,
+        // and they swap every iteration — the two writers keep crossing
+        // paths in the same containers.
+        let wa = writer("a", "A", 0);
+        let wb = writer("b", "B", 1);
+        let (ia, ib) = (wa.join().expect("writer a"), wb.join().expect("writer b"));
+
+        // One more same-placement swap per key: removal by the recorded
+        // address must take out exactly the key's own widget.
+        bridge.set_widget(
+            "a",
+            Some(WidgetContent::Lines(vec!["A-final".to_owned()])),
+            None,
+        );
+        bridge.set_widget(
+            "b",
+            Some(WidgetContent::Lines(vec!["B-final".to_owned()])),
+            Some(ExtensionWidgetOptions {
+                placement: Some(WidgetPlacement::BelowEditor),
+            }),
+        );
+
+        let total = lock(&ui.widgets_above).children.len() + lock(&ui.widgets_below).children.len();
+        assert_eq!(total, 2, "exactly one child per key (no leaked widgets)");
+        let mut rendered: Vec<String> = Vec::new();
+        for container in [&ui.widgets_above, &ui.widgets_below] {
+            let guard = lock(container);
+            for child in &guard.children {
+                rendered.extend(child.render(80));
+            }
+        }
+        let all = rendered.concat();
+        assert!(all.contains("A-final") && all.contains("B-final"));
+        assert!(!all.contains("A-seed") && !all.contains("B-seed"));
+        // Every intermediate write (except each writer's last placement
+        // phase) must have been superseded — the last cross-container write
+        // for a key is at index iterations-1; check a few early markers.
+        for marker in ["A0", "A1", "B0", "B1"] {
+            assert!(
+                !all.contains(marker),
+                "stale widget {marker} leaked: {all:?}"
+            );
+        }
+        assert!(ia == iterations && ib == iterations);
+        mode.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // M3 (V13-05 FR-B R3): a superseded dialog's late close must not hide
+    // the replacement selector.
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn m3_late_dialog_close_leaves_replacement_selector_mounted() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        let marker = |text: &'static str| {
+            shared_component_from_boxed(Box::new(rpi_tui::components::text::Text::new(
+                text, 0, 0, None,
+            )))
+        };
+        let a = marker("DIALOG-A");
+        let b = marker("DIALOG-B");
+        let render_editor_container = || {
+            lock(&ui.editor_container)
+                .children
+                .iter()
+                .flat_map(|c| c.render(80))
+                .collect::<String>()
+        };
+
+        ui.show_selector(a.clone());
+        assert!(render_editor_container().contains("DIALOG-A"));
+        // B replaces A (another extension dialog / built-in selector).
+        ui.show_selector(b.clone());
+        assert!(render_editor_container().contains("DIALOG-B"));
+        assert!(lock(&ui.active_selector).is_some());
+
+        // A's late timeout wake (it mounted BEFORE B): must be a no-op —
+        // the pre-M3 unconditional hide closed the replacement.
+        ui.hide_selector_if_current(&a);
+        assert!(
+            lock(&ui.active_selector).is_some(),
+            "replacement selector stays mounted"
+        );
+        assert!(
+            render_editor_container().contains("DIALOG-B"),
+            "B still owns the editor region"
+        );
+
+        // B's own close still restores the editor.
+        ui.hide_selector_if_current(&b);
+        assert!(lock(&ui.active_selector).is_none());
+        assert!(!render_editor_container().contains("DIALOG-B"));
         mode.shutdown().await;
     }
 

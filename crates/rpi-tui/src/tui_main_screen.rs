@@ -477,6 +477,31 @@ impl TuiMainScreen {
         self.run_or_queue(move |inner| inner.set_focus(component));
     }
 
+    /// `setFocus` variant that NEVER blocks on the inner lock's drain path
+    /// (V13-05 FR-B R1, M2): `run_or_queue` executes the op under a
+    /// try_lock, but its uncontended branch then calls
+    /// `drain_pending_ops`, which acquires `inner` with a BLOCKING lock.
+    /// Calling that while a caller-held component-container lock is held
+    /// opens an ABBA window (the render path holds `inner` and takes
+    /// container locks through `SharedChild::render`), so this variant
+    /// simply skips the drain: on contention the op stays queued and is
+    /// drained by the event loop's many existing drain sites (tick /
+    /// render_now / after input), exactly like `run_or_queue`'s contended
+    /// branch. Used by `swap_editor_region`, which must issue the focus
+    /// change INSIDE the editor-container critical section so no render
+    /// deadline can observe the swapped container with the previous
+    /// focus.
+    pub fn set_focus_nonblocking(&self, component: Option<SharedComponent>) {
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                inner.set_focus(component);
+            }
+            Err(_) => {
+                lock_shared(&self.pending).push(Box::new(move |inner| inner.set_focus(component)))
+            }
+        }
+    }
+
     // --- overlay API ------------------------------------------------------
 
     /// Upstream `showOverlay` (tui.ts:495). Returns a handle to control the
@@ -3587,6 +3612,50 @@ mod tests {
             "FIRST should be visible after hiding SECOND"
         );
         tui.stop(TuiStopOptions::default());
+    }
+
+    // -------------------------------------------------------------------------
+    // V13-05 FR-B R1 (M2): set_focus under a component-container lock must
+    // never block on the inner lock's drain path.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn set_focus_nonblocking_returns_while_inner_lock_is_held() {
+        let terminal = VirtualTerminal::new(80, 24);
+        let tui = new_tui(&terminal);
+        let (editor, editor_h) = focusable_overlay(&["EDITOR"]);
+
+        // Simulate the render path: `inner` is held by the driver (do_render
+        // holds it across component rendering, where it takes container
+        // locks). The nonblocking focus path must complete while `inner` is
+        // held — it try-locks and queues instead of blocking on the drain
+        // (`run_or_queue`'s uncontended branch drains with a blocking
+        // `lock_inner`, which under a container lock is the ABBA the
+        // swap_editor_region comment warns about). A recv timeout converts
+        // a regression into a failure instead of a hung suite; dropping the
+        // guard first lets a regressed worker finish so the process can
+        // exit cleanly.
+        let inner = tui.inner.lock().unwrap();
+        let tui_c = tui.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tui_c.set_focus_nonblocking(Some(editor));
+            let _ = tx.send(());
+        });
+        if rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
+            drop(inner);
+            panic!("set_focus_nonblocking blocked while the inner lock was held");
+        }
+        // The op is queued (inner held): not applied yet.
+        assert!(
+            !editor_h.focused(),
+            "queued focus op must not be applied yet"
+        );
+        drop(inner);
+
+        // The event loop's drain sites (tick) apply the queued focus op.
+        tui.tick(std::time::Instant::now());
+        assert!(editor_h.focused(), "drained focus op applied");
     }
 
     // -------------------------------------------------------------------------

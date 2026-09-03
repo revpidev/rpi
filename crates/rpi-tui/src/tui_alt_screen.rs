@@ -769,6 +769,21 @@ impl TuiAltScreen {
         self.run_or_queue(move |inner| inner.set_focus(component));
     }
 
+    /// Never-blocking `setFocus` variant for callers that hold a
+    /// component-container lock (see `TuiMainScreen::set_focus_nonblocking`
+    /// for the ABBA rationale; same shape here for the fullscreen
+    /// renderer).
+    pub fn set_focus_nonblocking(&self, component: Option<SharedComponent>) {
+        match self.inner.try_lock() {
+            Ok(mut inner) => {
+                inner.set_focus(component);
+            }
+            Err(_) => {
+                lock_shared(&self.pending).push(Box::new(move |inner| inner.set_focus(component)))
+            }
+        }
+    }
+
     /// Upstream `getFocusedComponent` (tui.ts:414-416). `None` on lock
     /// contention.
     pub fn get_focused_component(&self) -> Option<SharedComponent> {

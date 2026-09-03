@@ -194,6 +194,17 @@ impl TuiHandle {
         }
     }
 
+    /// Never-blocking `setFocus` variant — safe to call while holding a
+    /// component-container lock (V13-05 FR-B R1): dispatches to the active
+    /// renderer's nonblocking focus path, which never drains pending ops
+    /// under the inner lock.
+    pub fn set_focus_nonblocking(&self, component: Option<SharedComponent>) {
+        match self.renderer_clone() {
+            RendererClone::Main(tui) => tui.set_focus_nonblocking(component),
+            RendererClone::Alt(tui) => tui.set_focus_nonblocking(component),
+        }
+    }
+
     /// Upstream `getFocusedComponent` (tui.ts:414-416 @ 4181f66).
     pub fn get_focused_component(&self) -> Option<SharedComponent> {
         match self.renderer_clone() {

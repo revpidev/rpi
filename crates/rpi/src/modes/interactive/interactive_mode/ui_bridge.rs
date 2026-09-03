@@ -119,7 +119,7 @@ impl InteractiveUiBridge {
         rx: oneshot::Receiver<Option<String>>,
     ) -> Option<String> {
         let ui = self.ui()?;
-        ui.show_selector(entry);
+        ui.show_selector(entry.clone());
         let result = match opts.and_then(|o| o.timeout) {
             Some(ms) if ms > 0 => {
                 match tokio::time::timeout(std::time::Duration::from_millis(ms), rx).await {
@@ -129,8 +129,13 @@ impl InteractiveUiBridge {
             }
             _ => rx.await.ok().flatten(),
         };
+        // M3: guarded close — a late `done()`/timeout wake must only close
+        // the dialog it mounted (upstream `activeSelectorToken` guard,
+        // interactive-mode.ts:4355-4361). By the time we wake, another
+        // selector (built-in, or another extension's dialog) may own the
+        // editor region; an unconditional hide would close the replacement.
         if let Some(ui) = self.ui() {
-            ui.hide_selector();
+            ui.hide_selector_if_current(&entry);
         }
         result
     }
@@ -229,17 +234,26 @@ impl InteractiveUiBridge {
             // old one. A duplicate frame is imperceptible; add-then-remove
             // guarantees there is never a MISSING frame (remove-then-add
             // would show one).
-            (Some((old_below, address)), false) => {
+            (Some((old_below, old_address)), false) => {
                 debug_assert_ne!(old_below, below);
                 let new_container = if below {
                     &ui.widgets_below
                 } else {
                     &ui.widgets_above
                 };
-                {
+                // M1: the new child's address is read INSIDE the add's
+                // critical section. A separate re-lock of the container
+                // could observe another writer's child (a concurrent
+                // `set_widget` for a different key, or `retheme_widgets`
+                // on the driver thread) — recording THEIR address in the
+                // book would make a later swap remove the wrong widget and
+                // leak ours. The same-container and first-mount arms above
+                // already read the address under the add's guard.
+                let address = {
                     let mut container = lock(new_container);
                     container.add_child(built);
-                }
+                    super::child_address(&**container.children.last().expect("just pushed"))
+                };
                 let old_container = if old_below {
                     &ui.widgets_below
                 } else {
@@ -248,12 +262,8 @@ impl InteractiveUiBridge {
                 {
                     let mut container = lock(old_container);
                     // retain() is a no-op when the address is already gone.
-                    super::remove_child_by_address(&mut container, address);
+                    super::remove_child_by_address(&mut container, old_address);
                 }
-                let address = {
-                    let container = lock(new_container);
-                    super::child_address(&**container.children.last().expect("just pushed"))
-                };
                 (below, address)
             }
             // No previous entry — plain first mount.
