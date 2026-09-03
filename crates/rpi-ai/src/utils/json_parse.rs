@@ -33,17 +33,46 @@ fn escape_control_character(c: char) -> String {
 
 /// Byte-for-byte port of `repairJson`: escapes raw control characters inside
 /// string literals and doubles backslashes before invalid escape characters.
+///
+/// The heavy caller (`parse_streaming_json_value`) runs this on every
+/// streaming tool-args delta; the original always allocated a full output
+/// copy even when the input was already clean (the common case while a
+/// write/edit `content` string streams in). [`repair_json_if_needed`]
+/// allocates only when a repair is actually required.
 pub fn repair_json(json: &str) -> String {
+    repair_json_if_needed(json).unwrap_or_else(|| json.to_owned())
+}
+
+/// Lazy [`repair_json`]: `None` when no repair is needed, `Some(repaired)`
+/// otherwise. Output is byte-identical to [`repair_json`]. Until the first
+/// repair the input is returned untouched (no allocation); from the first
+/// repair onward every character flows into the materialized output.
+fn repair_json_if_needed(json: &str) -> Option<String> {
     let chars: Vec<char> = json.chars().collect();
-    let mut repaired = String::new();
+    let mut out: Option<String> = None;
     let mut in_string = false;
     let mut index = 0;
+
+    /// Emits a repaired slice at `index`, materializing `out` with the
+    /// untouched prefix `chars[..index]` on the first repair.
+    fn repair(out: &mut Option<String>, chars: &[char], index: usize, replacement: &str) {
+        if out.is_none() {
+            let mut materialized = String::with_capacity(chars.len());
+            materialized.extend(chars[..index].iter());
+            *out = Some(materialized);
+        }
+        out.as_mut()
+            .expect("materialized above")
+            .push_str(replacement);
+    }
 
     while index < chars.len() {
         let char = chars[index];
 
         if !in_string {
-            repaired.push(char);
+            if let Some(out) = out.as_mut() {
+                out.push(char);
+            }
             if char == '"' {
                 in_string = true;
             }
@@ -52,8 +81,10 @@ pub fn repair_json(json: &str) -> String {
         }
 
         if char == '"' {
-            repaired.push(char);
             in_string = false;
+            if let Some(out) = out.as_mut() {
+                out.push(char);
+            }
             index += 1;
             continue;
         }
@@ -62,7 +93,7 @@ pub fn repair_json(json: &str) -> String {
             let next_char = chars.get(index + 1).copied();
             match next_char {
                 None => {
-                    repaired.push_str("\\\\");
+                    repair(&mut out, &chars, index, "\\\\");
                     index += 1;
                     continue;
                 }
@@ -71,8 +102,11 @@ pub fn repair_json(json: &str) -> String {
                     if unicode_digits.len() == 4
                         && unicode_digits.chars().all(|c| c.is_ascii_hexdigit())
                     {
-                        repaired.push_str("\\u");
-                        repaired.push_str(&unicode_digits);
+                        // Valid `\uXXXX` passes through untouched.
+                        if let Some(out) = out.as_mut() {
+                            out.push_str("\\u");
+                            out.push_str(&unicode_digits);
+                        }
                         index += 6;
                         continue;
                     }
@@ -83,26 +117,30 @@ pub fn repair_json(json: &str) -> String {
 
             let next_char = next_char.unwrap(); // invariant: None returned above
             if VALID_JSON_ESCAPES.contains(&next_char) {
-                repaired.push('\\');
-                repaired.push(next_char);
+                // Valid escape passes through untouched.
+                if let Some(out) = out.as_mut() {
+                    out.push('\\');
+                    out.push(next_char);
+                }
                 index += 2;
                 continue;
             }
 
-            repaired.push_str("\\\\");
+            repair(&mut out, &chars, index, "\\\\");
             index += 1;
             continue;
         }
 
         if is_control_character(char) {
-            repaired.push_str(&escape_control_character(char));
-        } else {
-            repaired.push(char);
+            let escaped = escape_control_character(char);
+            repair(&mut out, &chars, index, &escaped);
+        } else if let Some(out) = out.as_mut() {
+            out.push(char);
         }
         index += 1;
     }
 
-    repaired
+    out
 }
 
 /// Removes unpaired `\uXXXX` surrogate escapes (a high surrogate `\uD800`–
@@ -217,14 +255,14 @@ fn json_parse_lenient(text: &str) -> Result<Value, serde_json::Error> {
 pub fn parse_json_with_repair(json: &str) -> Result<Value, serde_json::Error> {
     match json_parse_lenient(json) {
         Ok(value) => Ok(value),
-        Err(first) => {
-            let repaired = repair_json(json);
-            if repaired != json {
-                json_parse_lenient(&repaired)
-            } else {
-                Err(first)
-            }
-        }
+        Err(first) => match repair_json_if_needed(json) {
+            // A materialized repair differs from the input by construction;
+            // its parse result stands. No repair needed (streaming-truncated
+            // but otherwise clean JSON) keeps the first error without an
+            // alloc-and-compare round trip.
+            Some(repaired) => json_parse_lenient(&repaired),
+            None => Err(first),
+        },
     }
 }
 
@@ -482,6 +520,117 @@ mod tests {
 
     fn parse(text: &str) -> Value {
         parse_streaming_json_value(Some(text))
+    }
+
+    /// The lazy repair must be byte-identical to the eager original on both
+    /// clean inputs (no allocation, `None`) and dirty inputs.
+    #[test]
+    fn test_lazy_repair_matches_eager_output() {
+        let clean = r#"{"path":"src/main.rs","content":"fn main() {}\n"}"#;
+        assert_eq!(
+            repair_json_if_needed(clean),
+            None,
+            "clean input needs no repair"
+        );
+        assert_eq!(repair_json(clean), clean.to_owned());
+
+        let dirty_inputs = [
+            // Raw control characters inside strings.
+            "{\"a\":\"line1\nline2\t\"}",
+            "{\"a\":\"x\u{0c}y\"}",
+            // Control char before any repair (prefix must be preserved).
+            "{\"key\":\"value\",\"other\":\"z\rz\"}",
+            // Invalid escape doubled; valid escapes untouched.
+            "{\"a\":\"c:\\x\"}",
+            "{\"a\":\"c:\\n\\t\"}",
+            // Trailing lone backslash.
+            "{\"a\":\"c:\\\"",
+            // Valid \uXXXX kept; invalid hex after \u doubled.
+            "{\"a\":\"\\u00e9\"}",
+            "{\"a\":\"\\uZZZZ\"}",
+            // Escapes outside strings are untouched.
+            "{\"a\":\"b\"}",
+        ];
+        for dirty in dirty_inputs {
+            let eager = eager_repair_reference(dirty);
+            match repair_json_if_needed(dirty) {
+                None => assert_eq!(
+                    eager,
+                    dirty.to_owned(),
+                    "no lazy repair ⇒ eager output must equal the input for {dirty:?}"
+                ),
+                Some(lazy) => assert_eq!(
+                    lazy, eager,
+                    "lazy repair must match the eager original for {dirty:?}"
+                ),
+            }
+            assert_eq!(repair_json(dirty), eager);
+        }
+    }
+
+    /// The pre-lazy eager implementation, kept as the behavioral reference
+    /// (always builds the full output).
+    fn eager_repair_reference(json: &str) -> String {
+        let chars: Vec<char> = json.chars().collect();
+        let mut repaired = String::new();
+        let mut in_string = false;
+        let mut index = 0;
+        while index < chars.len() {
+            let char = chars[index];
+            if !in_string {
+                repaired.push(char);
+                if char == '"' {
+                    in_string = true;
+                }
+                index += 1;
+                continue;
+            }
+            if char == '"' {
+                repaired.push(char);
+                in_string = false;
+                index += 1;
+                continue;
+            }
+            if char == '\\' {
+                let next_char = chars.get(index + 1).copied();
+                match next_char {
+                    None => {
+                        repaired.push_str("\\\\");
+                        index += 1;
+                        continue;
+                    }
+                    Some('u') => {
+                        let unicode_digits: String = chars.iter().skip(index + 2).take(4).collect();
+                        if unicode_digits.len() == 4
+                            && unicode_digits.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            repaired.push_str("\\u");
+                            repaired.push_str(&unicode_digits);
+                            index += 6;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+                let next_char = next_char.unwrap();
+                if VALID_JSON_ESCAPES.contains(&next_char) {
+                    repaired.push('\\');
+                    repaired.push(next_char);
+                    index += 2;
+                    continue;
+                }
+                repaired.push_str("\\\\");
+                index += 1;
+                continue;
+            }
+            if is_control_character(char) {
+                repaired.push_str(&escape_control_character(char));
+            } else {
+                repaired.push(char);
+            }
+            index += 1;
+        }
+        repaired
     }
 
     #[test]

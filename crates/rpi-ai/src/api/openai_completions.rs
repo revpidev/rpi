@@ -2330,8 +2330,11 @@ async fn run(
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder = reqwest::Client::builder();
+    // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
+    // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
+        client_builder =
+            client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
     }
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
@@ -2343,7 +2346,13 @@ async fn run(
             async move {
                 // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
                 // keeps the reqwest default path unchanged.
-                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
+                let result = send_provider_request(
+                    request,
+                    fetch.as_ref(),
+                    signal.as_ref(),
+                    options.stream.timeout_ms,
+                )
+                .await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -2421,7 +2430,10 @@ async fn run(
         compat.supports_finish_reason,
     );
     let mut decoder = SseDecoder::new();
-    let mut byte_stream = response.bytes_stream();
+    // Inter-chunk idle timeout (upstream bodyTimeout; see
+    // api::stream_timeouts).
+    let mut byte_stream =
+        crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
     let mut saw_done = false;
     while let Some(chunk) = byte_stream.next().await {
         if options

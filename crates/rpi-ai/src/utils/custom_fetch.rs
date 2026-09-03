@@ -31,6 +31,9 @@ use crate::utils::provider_retry::ProviderErrorInfo;
 pub enum SendFailure {
     /// The abort signal fired before the response arrived.
     Aborted,
+    /// The headers-wait budget elapsed before response headers arrived
+    /// (upstream undici `headersTimeout`; see `api::stream_timeouts`).
+    HeadersTimedOut(String),
     /// The reqwest transport failed (default path).
     Reqwest(reqwest::Error),
     /// The custom fetch failed, or its response could not be bridged.
@@ -48,6 +51,11 @@ impl SendFailure {
                 headers: None,
                 message: "Request was aborted".to_owned(),
             },
+            SendFailure::HeadersTimedOut(message) => ProviderErrorInfo {
+                status: None,
+                headers: None,
+                message,
+            },
             SendFailure::Reqwest(error) => ProviderErrorInfo {
                 status: error.status().map(|status| status.as_u16()),
                 headers: None,
@@ -62,6 +70,7 @@ impl SendFailure {
     pub fn message(&self) -> String {
         match self {
             SendFailure::Aborted => "Request was aborted".to_owned(),
+            SendFailure::HeadersTimedOut(message) => message.clone(),
             SendFailure::Reqwest(error) => error.to_string(),
             SendFailure::Custom(info) => info.message.clone(),
         }
@@ -70,21 +79,42 @@ impl SendFailure {
 
 /// Sends one attempt of a provider request, honoring the per-request custom
 /// fetch channel (R2.7.4). With `fetch: None` this is exactly the previous
-/// inline behavior: `request.send()` raced against the abort signal.
+/// inline behavior: `request.send()` raced against the abort signal — plus
+/// the headers-wait budget: when `timeout_ms` is set, the wait from request
+/// start to response headers is bounded (upstream undici `headersTimeout`;
+/// the TS SDKs' `timeout` option is likewise cleared once headers arrive, so
+/// it never covers the streamed body). A `timeout_ms` of `0` disables the
+/// budget.
 pub async fn send_provider_request(
     request: reqwest::RequestBuilder,
     fetch: Option<&FetchFn>,
     signal: Option<&CancellationToken>,
+    timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, SendFailure> {
     match fetch {
         None => {
-            let send = request.send();
+            let send = async {
+                match crate::api::stream_timeouts::send_with_headers_timeout(
+                    request.send(),
+                    timeout_ms,
+                )
+                .await
+                {
+                    crate::api::stream_timeouts::SendOutcome::Ok(response) => Ok(response),
+                    crate::api::stream_timeouts::SendOutcome::Transport(error) => {
+                        Err(SendFailure::Reqwest(error))
+                    }
+                    crate::api::stream_timeouts::SendOutcome::HeadersTimeout(message) => {
+                        Err(SendFailure::HeadersTimedOut(message))
+                    }
+                }
+            };
             match signal {
                 Some(token) => tokio::select! {
-                    outcome = send => outcome.map_err(SendFailure::Reqwest),
+                    outcome = send => outcome,
                     () = token.cancelled() => Err(SendFailure::Aborted),
                 },
-                None => send.await.map_err(SendFailure::Reqwest),
+                None => send.await,
             }
         }
         Some(fetch) => {
@@ -203,10 +233,45 @@ mod tests {
         let request = client
             .post("http://127.0.0.1:1/v1/x")
             .json(&serde_json::json!({}));
-        let result = send_provider_request(request, None, None).await;
+        let result = send_provider_request(request, None, None, None).await;
         match result {
             Err(SendFailure::Reqwest(error)) => assert!(error.is_connect()),
             other => panic!("expected reqwest connect error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_headers_timeout_elapses_before_response() {
+        // A server that accepts the connection but never answers: the wait
+        // for response headers must be bounded by the headers budget and
+        // surface HeadersTimedOut with a retry-classifiable message.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            // Accept and hold the socket open without responding.
+            while let Ok((socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let mut socket = socket;
+                // Drain the request so the client write side completes.
+                use tokio::io::AsyncReadExt;
+                let _ = socket.read(&mut buf).await;
+                std::future::pending::<()>().await;
+            }
+        });
+        let client = reqwest::Client::new();
+        let request = client
+            .post(format!("http://{addr}/v1/x"))
+            .json(&serde_json::json!({}));
+        let result = send_provider_request(request, None, None, Some(50)).await;
+        match result {
+            Err(SendFailure::HeadersTimedOut(message)) => {
+                assert!(message.contains("timed out"), "message: {message}");
+                let info = SendFailure::HeadersTimedOut(message).into_provider_error_info();
+                assert_eq!(info.status, None, "transport errors are retryable");
+            }
+            other => panic!("expected headers timeout, got {other:?}"),
         }
     }
 
@@ -219,7 +284,7 @@ mod tests {
             .post("http://upstream.test/v1/chat?api-version=1")
             .header("authorization", "Bearer k")
             .json(&serde_json::json!({"a": 1}));
-        let response = send_provider_request(request, Some(&fetch), None)
+        let response = send_provider_request(request, Some(&fetch), None, None)
             .await
             .expect("custom fetch response");
         assert_eq!(response.status().as_u16(), 401);
@@ -254,7 +319,7 @@ mod tests {
         token.cancel();
         let client = reqwest::Client::new();
         let request = client.post("http://upstream.test/v1/x");
-        let result = send_provider_request(request, Some(&fetch), Some(&token)).await;
+        let result = send_provider_request(request, Some(&fetch), Some(&token), None).await;
         assert!(matches!(result, Err(SendFailure::Aborted)));
         let info = match result {
             Err(failure) => failure.into_provider_error_info(),

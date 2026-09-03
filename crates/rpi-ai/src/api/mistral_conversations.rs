@@ -1212,13 +1212,17 @@ async fn run(
     );
     let header_map = provider_headers_to_header_map(&headers)?;
     let mut client_builder = reqwest::Client::builder();
-    // Upstream: `AbortSignal.timeout(options?.timeoutMs ?? 60_000)`; the
-    // reqwest timeout likewise covers the whole body stream.
+    // Upstream: `AbortSignal.timeout(options?.timeoutMs ?? 60_000)` — a
+    // total deadline that aborts even actively streaming bodies. rpi keeps
+    // the same budget but applies idle-timeout semantics instead (connect +
+    // headers wait + inter-chunk idle; see api::stream_timeouts), so long
+    // inferences that keep streaming are not killed by their total
+    // duration — an intentional improvement over the upstream quirk.
     let timeout_ms = options
         .stream
         .timeout_ms
         .unwrap_or(DEFAULT_MISTRAL_TIMEOUT_MS);
-    client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
+    client_builder = client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
     let client = client_builder.build().map_err(|error| error.to_string())?;
 
     let response = retry_provider_request(
@@ -1232,7 +1236,13 @@ async fn run(
             async move {
                 // 027a58479 (R2.7.4): per-request custom fetch channel; `None`
                 // keeps the reqwest default path unchanged.
-                let result = send_provider_request(request, fetch.as_ref(), signal.as_ref()).await;
+                let result = send_provider_request(
+                    request,
+                    fetch.as_ref(),
+                    signal.as_ref(),
+                    Some(timeout_ms),
+                )
+                .await;
                 match result {
                     Ok(response) => {
                         let status = response.status();
@@ -1272,6 +1282,11 @@ async fn run(
                                     &error.to_string(),
                                 )
                             },
+                        },
+                        SendFailure::HeadersTimedOut(_) => ProviderErrorInfo {
+                            status: None,
+                            headers: None,
+                            message: MISTRAL_TIMEOUT_MESSAGE.to_owned(),
                         },
                         other => other.into_provider_error_info(),
                     }),
@@ -1325,7 +1340,9 @@ async fn run(
 
     let mut processor = StreamProcessor::new(output, model);
     let mut decoder = SseDecoder::new();
-    let mut byte_stream = response.bytes_stream();
+    // Inter-chunk idle timeout (see api::stream_timeouts).
+    let mut byte_stream =
+        crate::api::stream_timeouts::wrap(response.bytes_stream(), Some(timeout_ms));
     loop {
         // Upstream checks the abort signal around every `reader.read()`;
         // `select!` lets the cancellation fire while waiting for a chunk.
@@ -1337,11 +1354,16 @@ async fn run(
             None => byte_stream.next().await,
         };
         let Some(chunk) = next else { break };
-        let bytes = chunk.map_err(|error| {
-            if error.is_timeout() {
+        let bytes = chunk.map_err(|error| match error {
+            crate::api::stream_timeouts::IdleStreamError::IdleTimeout { .. } => {
                 MISTRAL_TIMEOUT_MESSAGE.to_owned()
-            } else {
-                error.to_string()
+            }
+            crate::api::stream_timeouts::IdleStreamError::Transport(error) => {
+                if error.is_timeout() {
+                    MISTRAL_TIMEOUT_MESSAGE.to_owned()
+                } else {
+                    error.to_string()
+                }
             }
         })?;
         for sse in decoder.feed(&bytes) {

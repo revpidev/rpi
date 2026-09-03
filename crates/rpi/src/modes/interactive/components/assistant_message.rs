@@ -34,6 +34,9 @@ pub struct AssistantMessageComponent {
     hidden_thinking_label: String,
     output_pad: usize,
     last_message: Option<AssistantMessage>,
+    /// Fingerprint of everything the `updateContent` rebuild depends on;
+    /// `None` until the first rebuild. Equal fingerprints skip the rebuild.
+    last_signature: Option<VisibleSignature>,
     has_tool_calls: bool,
     theme: Arc<Theme>,
     /// Extension-registered Markdown transformers (assistant-message.ts:20).
@@ -41,6 +44,35 @@ pub struct AssistantMessageComponent {
     /// `isStreaming` (assistant-message.ts:23): set by `updateContent`'s
     /// argument and captured into the transform context.
     is_streaming: bool,
+}
+
+/// Cheap fingerprint of the rebuild inputs: streaming flag, thinking-block
+/// settings, pad, stop reason / error text, tool-call presence, and a
+/// (length, hash) pair per visible text/thinking block. Everything the
+/// rebuilt children and the render-time OSC133 markers depend on.
+type VisibleSignature = (
+    bool,
+    bool,
+    String,
+    usize,
+    StopReason,
+    Option<String>,
+    bool,
+    Vec<(u64, u64)>,
+);
+
+/// (len, hash) fingerprint of a visible block's content.
+fn block_fingerprint(text: &str) -> (u64, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    (text.len() as u64, hasher.finish())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts container rebuilds inside `update_content` (perf tests).
+    static REBUILD_COUNT: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
 impl AssistantMessageComponent {
@@ -60,6 +92,7 @@ impl AssistantMessageComponent {
             hidden_thinking_label: hidden_thinking_label.into(),
             output_pad,
             last_message: None,
+            last_signature: None,
             has_tool_calls: false,
             theme,
             markdown_transformers,
@@ -99,9 +132,47 @@ impl AssistantMessageComponent {
     /// upstream `isStreaming` argument (`updateContent(message, isStreaming =
     /// this.isStreaming)` — the setters and `invalidate` keep the stored
     /// value).
+    ///
+    /// Perf deviation: upstream rebuilds the content container on every
+    /// call. During tool-call streaming this runs once per delta; when the
+    /// visible fingerprint is unchanged (a write/edit streaming its args —
+    /// no text/thinking/stop changes), the rebuild is skipped and only the
+    /// stored message is refreshed.
     pub fn update_content(&mut self, message: AssistantMessage, is_streaming: bool) {
         self.is_streaming = is_streaming;
-        self.last_message = Some(message.clone());
+
+        let signature = (
+            is_streaming,
+            self.hide_thinking_block,
+            self.hidden_thinking_label.clone(),
+            self.output_pad,
+            message.stop_reason,
+            message.error_message.clone(),
+            message
+                .content
+                .iter()
+                .any(|c| matches!(c, AssistantContent::ToolCall(_))),
+            message
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(text) => Some(block_fingerprint(&text.text)),
+                    AssistantContent::Thinking(thinking) => {
+                        Some(block_fingerprint(&thinking.thinking))
+                    }
+                    AssistantContent::ToolCall(_) => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        if self.last_signature.as_ref() == Some(&signature) {
+            self.last_message = Some(message);
+            return;
+        }
+        self.last_signature = Some(signature);
+        self.last_message = Some(message);
+        let message = self.last_message.as_ref().expect("stored above");
+        #[cfg(test)]
+        REBUILD_COUNT.with(|count| count.set(count.get() + 1));
 
         // Clear content container
         self.content_container.clear();
@@ -368,6 +439,100 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Perf regression (300+ line streaming writes): `MessageUpdate` fires
+    /// once per tool-args delta; updates that only change tool-call blocks
+    /// (no text/thinking/stop/error changes) must skip the container
+    /// rebuild entirely.
+    #[test]
+    fn tool_call_only_updates_skip_the_rebuild() {
+        let mut component = AssistantMessageComponent::new(
+            None,
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        let tool_call = |args_len: usize| {
+            AssistantContent::ToolCall(rpi_ai::types::ToolCall {
+                id: "t1".into(),
+                name: "write".into(),
+                arguments: serde_json::Map::from_iter([(
+                    "content".to_owned(),
+                    serde_json::Value::String("x".repeat(args_len)),
+                )]),
+                thought_signature: None,
+                namespace: None,
+            })
+        };
+
+        REBUILD_COUNT.with(|count| count.set(0));
+        // Visible text first — rebuilds.
+        component.update_content(
+            message(vec![text("Writing the file:"), tool_call(10)]),
+            true,
+        );
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 1);
+
+        // 300 tool-args-only deltas: no further rebuilds.
+        for len in 11..=310 {
+            component.update_content(
+                message(vec![text("Writing the file:"), tool_call(len)]),
+                true,
+            );
+        }
+        assert_eq!(
+            REBUILD_COUNT.with(|c| c.get()),
+            1,
+            "tool-call-only deltas must not rebuild the container"
+        );
+
+        // The rendered text survives the skipped rebuilds.
+        let lines = component.render(60);
+        assert!(lines.iter().any(|l| l.contains("Writing the file:")));
+
+        // isStreaming transition (message_end) rebuilds exactly once more.
+        component.update_content(
+            message(vec![text("Writing the file:"), tool_call(310)]),
+            false,
+        );
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 2);
+
+        // A text delta rebuilds.
+        component.update_content(
+            message(vec![text("Writing the file: done"), tool_call(310)]),
+            false,
+        );
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3);
+    }
+
+    /// `set_output_pad` and the thinking setters must not be swallowed by
+    /// the signature skip: they change the rebuild inputs and must rebuild.
+    #[test]
+    fn setters_bypass_the_signature_skip() {
+        let mut component = AssistantMessageComponent::new(
+            Some(message(vec![text("hello")])),
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        REBUILD_COUNT.with(|count| count.set(0));
+        component.set_output_pad(2);
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 1, "pad change rebuilds");
+        component.set_hide_thinking_block(true);
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 2, "hide toggle rebuilds");
+        component.set_hidden_thinking_label("Thoughts");
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3, "label change rebuilds");
+        // A same-value setter is a no-op (the fingerprint is unchanged and
+        // the rendering would be identical anyway).
+        component.set_output_pad(2);
+        assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3);
     }
 
     #[test]

@@ -809,8 +809,11 @@ async fn run(
     }
 
     let mut client_builder = reqwest::Client::builder();
+    // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
+    // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {
-        client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
+        client_builder =
+            client_builder.connect_timeout(std::time::Duration::from_millis(timeout_ms));
     }
     let client = client_builder
         .build()
@@ -822,9 +825,14 @@ async fn run(
     let signal = options.stream.signal.clone();
     // 027a58479 (R2.7.4): per-request custom fetch channel; `None` keeps the
     // reqwest default path unchanged.
-    let response = send_provider_request(request, options.stream.fetch.as_ref(), signal.as_ref())
-        .await
-        .map_err(|error| StreamFailure::plain(error.message()))?;
+    let response = send_provider_request(
+        request,
+        options.stream.fetch.as_ref(),
+        signal.as_ref(),
+        options.stream.timeout_ms,
+    )
+    .await
+    .map_err(|error| StreamFailure::plain(error.message()))?;
 
     // Upstream invokes `onResponse` before the `response.ok` check.
     if let Some(on_response) = &options.stream.on_response {
@@ -852,7 +860,10 @@ async fn run(
 
     let mut converter = EventConverter::new(model);
     let mut reader = PiMessagesEventReader::default();
-    let mut byte_stream = response.bytes_stream();
+    // Inter-chunk idle timeout (upstream bodyTimeout; see
+    // api::stream_timeouts).
+    let mut byte_stream =
+        crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
 
     while let Some(chunk) = byte_stream.next().await {
         if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
