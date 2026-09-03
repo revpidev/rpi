@@ -899,6 +899,12 @@ fn e2e_fixed_child_full_pipeline() {
         let dump = sandbox.dump("streaming");
         std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
         std::env::set_var("RPI_E2E_MODE", "tools");
+        // The wait tool's on_update pushes are fire-and-forget tokio tasks
+        // (2026-08-16 wait-hang fix): earlier wait scenarios' trailing frames
+        // can land a tick late and would steal frames[0]. Settle them out of
+        // the streaming window before the baseline drain so frames[0] is
+        // genuinely this dispatch's own initial frame.
+        std::thread::sleep(std::time::Duration::from_millis(120));
         take_tool_updates();
         let result = execute(json!({
             "agent": "scout",
