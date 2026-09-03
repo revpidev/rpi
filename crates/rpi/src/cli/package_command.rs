@@ -664,6 +664,14 @@ pub async fn run_update_in(
                     println!("{message}");
                 }
             }
+            // Rpi-specific: a multi-extension batch continues past a
+            // failing source (per-extension errors surface here, not
+            // only as the run's final error line).
+            if event.kind == crate::core::package_manager::ProgressKind::Error {
+                if let Some(message) = &event.message {
+                    eprintln!("Error: {message}");
+                }
+            }
         })));
         manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
         if let Err(message) = manager.update(update_source.as_deref()) {
@@ -1028,6 +1036,10 @@ pub fn format_package_list(packages: &[ConfiguredPackage]) -> String {
         let mut out = String::new();
         if pkg.filtered {
             out.push_str(&format!("  {} (filtered)\n", pkg.source));
+        } else if pkg.untracked {
+            // Rpi-specific (loader parity): installed without a settings
+            // entry; `rpi install <source>` tracks it.
+            out.push_str(&format!("  {} (untracked)\n", pkg.source));
         } else {
             out.push_str(&format!("  {}\n", pkg.source));
         }
@@ -1577,6 +1589,7 @@ mod package_command_tests {
                 source: "npm:left-pad".to_string(),
                 scope: SourceScope::User,
                 filtered: false,
+                untracked: false,
                 installed_path: Some(PathBuf::from(
                     "/home/u/.rpi/agent/npm/node_modules/left-pad",
                 )),
@@ -1585,12 +1598,14 @@ mod package_command_tests {
                 source: "npm:filtered-pkg".to_string(),
                 scope: SourceScope::User,
                 filtered: true,
+                untracked: false,
                 installed_path: None,
             },
             ConfiguredPackage {
                 source: "git:github.com/user/repo".to_string(),
                 scope: SourceScope::Project,
                 filtered: false,
+                untracked: false,
                 installed_path: None,
             },
         ];

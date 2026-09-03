@@ -9,6 +9,7 @@
 
 ### 修复
 
+- **`rpi update --extensions` 漏更新未跟踪插件**（v0.1.3 追补）：update/list 只认 settings `packages` 条目而加载器加载安装根目录全部 manifest 目录——未跟踪安装（早期版本/手工复制）被静默跳过，多插件场景即“只升级一个”；update 与加载器发现对齐（identity 去重并入、不回写 settings，`rpi update <name>` 可命中），`rpi list` 标注 `(untracked)`；registry 批量单个失败不再短路其余，未收录（404）的未跟踪安装降级为跳过提示。
 - **流式请求总超时误杀活跃流**（V13-08，先行）：总 deadline 误映射 → 三段式超时（connect/headers/body 块间静默 idle，每 chunk 重置）；9 个 SSE adapter 全覆盖，codex / openrouter_images 两处有意例外。
 - **write 大文件流式渲染 O(n²)**（V13-09，先行）：分层缓存（稳定前缀窗口跳重算 + 可见内容指纹跳重建 + repair_json 惰性化 + 拷贝瘦身 3→2，勘误 v0.1.3 首发：state 拷贝已除，context 尾更新为上游 parity 必需、事件载荷需独占所有权，各留 1 次）；400 行流式 2250ms → 245ms（9.2×）。
 - **扩展 UI 换装撕帧**（V13-05，并发正确性）：widget 单锁原子化（跨容器 add-then-remove）+ selector 单锁 clear+add+set_focus——不再有缺失帧 / 裸 editor 帧。
