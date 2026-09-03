@@ -131,10 +131,26 @@ pub struct StdioChild {
 impl StdioChild {
     /// Spawn the child and start the stdout reader / stderr capture tasks.
     /// Returns the transport-ready child plus the incoming-message receiver.
+    /// Resolves `!command` secrets synchronously (V13-07 S1: the async
+    /// connection path uses [`Self::spawn_with_env`] so the resolution runs
+    /// on the blocking pool instead).
     pub fn spawn(
         definition: &ServerEntry,
         default_cwd: Option<&str>,
         incoming: mpsc::UnboundedSender<Value>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        Self::spawn_with_env(definition, default_cwd, incoming, resolve_env(definition)?)
+    }
+
+    /// `spawn` with the environment already resolved (V13-07 S1): the caller
+    /// resolves the blocking `!command` secrets on the blocking pool and
+    /// hands the finished env over, so this builder never blocks a tokio
+    /// worker.
+    pub fn spawn_with_env(
+        definition: &ServerEntry,
+        default_cwd: Option<&str>,
+        incoming: mpsc::UnboundedSender<Value>,
+        env: Vec<(String, String)>,
     ) -> Result<Arc<Self>, ProtocolError> {
         let command = definition
             .get_str("command")
@@ -172,7 +188,7 @@ impl StdioChild {
             // default single-process kill (grandchildren are not reaped).
             cmd.process_group(0);
         }
-        cmd.env_clear().envs(resolve_env(definition)?);
+        cmd.env_clear().envs(env);
         if let Some(cwd) = &cwd {
             cmd.current_dir(cwd);
         }
@@ -330,13 +346,37 @@ impl McpTransport for StdioTransport {
 
 /// Spawn a stdio transport for `definition` (the `command` branch of
 /// `createConnection`, server-manager.ts:359-390).
-pub fn connect_stdio(
+///
+/// V13-07 S1: `!command` secret resolution can block up to
+/// `COMMAND_SECRET_TIMEOUT` per secret — it runs on the blocking pool here
+/// so a hung secret never occupies a tokio worker, while the child spawn and
+/// its reader tasks stay on the runtime.
+pub async fn connect_stdio(
     definition: &ServerEntry,
     default_cwd: Option<&str>,
 ) -> Result<(StdioTransport, mpsc::UnboundedReceiver<Value>), ProtocolError> {
     let (tx, rx) = mpsc::unbounded_channel();
-    let child = StdioChild::spawn(definition, default_cwd, tx)?;
+    let definition_owned = definition.clone();
+    let default_cwd = default_cwd.map(str::to_owned);
+    let env = tokio::task::spawn_blocking(move || resolve_env(&definition_owned))
+        .await
+        .map_err(|join| {
+            ProtocolError::Transport(format!("stdio env resolution task failed: {join}"))
+        })??;
+    let child = StdioChild::spawn_with_env(definition, default_cwd.as_deref(), tx, env)?;
     Ok((StdioTransport { child }, rx))
+}
+
+/// V13-07 S1 unit seam: the blocking-pool `!command` secret resolution used
+/// by [`connect_stdio`] (spawn_blocking wrapper over [`resolve_env`]); kept
+/// async so a hung secret is provably off the runtime worker.
+pub async fn resolve_env_async(
+    definition: &ServerEntry,
+) -> Result<Vec<(String, String)>, ProtocolError> {
+    let definition = definition.clone();
+    tokio::task::spawn_blocking(move || resolve_env(&definition))
+        .await
+        .map_err(|join| ProtocolError::Transport(format!("env resolution task failed: {join}")))?
 }
 
 #[cfg(test)]

@@ -306,7 +306,9 @@ impl McpServerManager {
         let request_timeout = self.request_timeout(definition);
 
         if definition.get_str("command").is_some() {
-            let (transport, incoming) = connect_stdio(definition, self.default_cwd.as_deref())?;
+            // V13-07 S1: `!command` secret resolution runs on the blocking pool.
+            let (transport, incoming) =
+                connect_stdio(definition, self.default_cwd.as_deref()).await?;
             let stderr_tail = transport.child().stderr_tail.clone();
             let client = McpClient::new(Arc::new(transport), incoming);
             let mode =
