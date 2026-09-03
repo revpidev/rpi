@@ -193,7 +193,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     generation += 1;
                 }
                 if let Some(token) =
-                    refresh_tick(&calls, &done_tx, &mut generation, "message_update")
+                    refresh_tick(&calls, &done_tx, &mut generation, "message_update", None)
                 {
                     inflight = Some(token);
                 }
@@ -215,14 +215,18 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     // free of host-call traffic).
                     continue;
                 }
-                if poll_fingerprint_changed(&calls, &mut last_fingerprint) {
+                if let Some(ctx) = poll_fingerprint_changed(&calls, &mut last_fingerprint) {
                     if let Some(token) = inflight.take() {
                         token.cancel();
                         generation += 1;
                     }
-                    if let Some(token) =
-                        refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS)
-                    {
+                    if let Some(token) = refresh_tick(
+                        &calls,
+                        &done_tx,
+                        &mut generation,
+                        HOOK_EVENT_STATUS,
+                        Some(ctx),
+                    ) {
                         inflight = Some(token);
                     }
                 }
@@ -262,7 +266,7 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
                     generation += 1;
                 }
                 if let Some(token) =
-                    refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS)
+                    refresh_tick(&calls, &done_tx, &mut generation, HOOK_EVENT_STATUS, None)
                 {
                     inflight = Some(token);
                 }
@@ -331,12 +335,12 @@ fn current_refresh_interval() -> Option<u64> {
 /// cadence and the poll must not interleave a second spawn stream
 /// (A4: spawn rate ≤ 1/refreshMs). Frozen values self-heal a dropped
 /// `message_end` event through the poll instead.
-fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -> bool {
+fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -> Option<CtxData> {
     let settings = config::load_settings_snapshot();
     if settings.status_line.is_none() {
         restore_if_mounted(calls);
         *last = None;
-        return false;
+        return None;
     }
     let ctx = fetch_ctx(calls);
     let live_fingerprint = with_engine(|engine| {
@@ -357,7 +361,8 @@ fn poll_fingerprint_changed(calls: &AsyncHostCalls, last: &mut Option<String>) -
     );
     let changed = last.as_ref() != Some(&fingerprint);
     *last = Some(fingerprint);
-    changed
+    // On change, the already-fetched ctx rides into refresh_tick (S4).
+    changed.then_some(ctx)
 }
 
 /// One refresh pass: reload config, pull ctx, spawn the script. Returns
@@ -375,6 +380,7 @@ fn refresh_tick(
     done_tx: &UnboundedSender<ScriptDone>,
     generation: &mut usize,
     hook_event_name: &str,
+    ctx_override: Option<CtxData>,
 ) -> Option<CancelToken> {
     let settings = config::load_settings_snapshot();
     let Some(config) = settings.status_line else {
@@ -389,7 +395,10 @@ fn refresh_tick(
         restore_if_mounted(calls);
     }
 
-    let ctx = fetch_ctx(calls);
+    // V13-07 S4: reuse the ctx a data-changing poll tick already fetched
+    // (that tick's 6 host calls ride into the refresh instead of a second
+    // fetch); other triggers self-fetch.
+    let ctx = ctx_override.unwrap_or_else(|| fetch_ctx(calls));
     let snapshot = snapshot_from_engine(&ctx, settings.session_dir.as_deref(), hook_event_name);
 
     *generation += 1;

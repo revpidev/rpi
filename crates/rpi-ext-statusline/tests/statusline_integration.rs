@@ -417,6 +417,73 @@ fn statusline_lifecycle_over_the_carrier_seam() {
         })
     });
 
+    // ── 5e. V13-07 S4: a data-changing poll tick fetches ctx ONCE — the
+    //        fingerprint poll's 6 host calls ride into the refresh (the
+    //        pre-fix path paid a second fetch_ctx inside refresh_tick: 12
+    //        ctx-calls per change tick). Measure the ctx.* traffic between
+    //        a settled render and the render that reflects the change; the
+    //        window holds ~2 fingerprint polls (6 calls each in the new
+    //        code) plus the shared refresh, so ≤15 proves no double fetch.
+    let ctx_family = |records: &[(String, Value)]| {
+        records
+            .iter()
+            .filter(|(method, _)| {
+                matches!(
+                    method.as_str(),
+                    "ctx.cwd"
+                        | "ctx.model"
+                        | "ctx.getContextUsage"
+                        | "getThinkingLevel"
+                        | "getSessionName"
+                        | "ctx.sessionFile"
+                )
+            })
+            .count()
+    };
+    write_settings(json!({"statusLine": {
+        "type": "command",
+        "command": "cat",
+        "placement": "widget",
+    }}));
+    set_canned("getThinkingLevel", json!("high"));
+    send_event("message_end", json!({"type": "message_end"}));
+    // Wait for a settled render for the current level (closes the window).
+    let settled = poll_until("settled v1 render anchors the S4 window", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args
+                    .pointer("/content/children/0/props/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("\"level\":\"high\""))
+        })
+    });
+    let anchor = ctx_family(&settled);
+
+    // Flip the ctx thinking level (a value no earlier section produced, so
+    // no stale render can satisfy the poll) → the NEXT poll change tick
+    // renders it.
+    set_canned("getThinkingLevel", json!("deep"));
+    let changed = poll_until("poll change tick renders via a single fetch", |records| {
+        calls_of(records, "ui.setWidget").iter().any(|args| {
+            args.get("key").and_then(Value::as_str) == Some("rpi-statusline")
+                && args
+                    .pointer("/content/children/0/props/text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.contains("\"level\":\"deep\""))
+        })
+    });
+    let ctx_calls_between = ctx_family(&changed) - anchor;
+    assert!(
+        ctx_calls_between <= 15,
+        "change tick must not double-fetch ctx (old code ≈18, shared poll ≈12): {ctx_calls_between}"
+    );
+    assert!(
+        ctx_calls_between >= 6,
+        "at least one fingerprint poll: {ctx_calls_between}"
+    );
+    write_settings(json!({}));
+    send_event("message_end", json!({"type": "message_end"}));
+
     // ── 6. Failing script keeps the last render (no new pushes). ───────
     write_settings(json!({"statusLine": {
         "type": "command",
