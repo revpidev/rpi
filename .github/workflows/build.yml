@@ -269,3 +269,8 @@ jobs:
           # Tag re-push (release rebuild) must replace existing assets
           # instead of failing on "asset already exists".
           overwrite_files: true
+          # Release notes come from the changelog single source of truth
+          # (changes/README.md): changes/v<version>.md, staged on main with
+          # the version bump. A re-push also refreshes the notes (errata to
+          # an already-published changelog land on the Release page too).
+          body_file: changes/v${{ steps.version.outputs.version }}.md

@@ -11,7 +11,10 @@ sequence.
    `Cargo.toml` — and merge to `main`.
 2. **Tag the release**: `git tag v<version>` and push the tag. The tag
    triggers `.github/workflows/build.yml`, which builds all six targets and
-   publishes the assets to the GitHub Release.
+   publishes the assets to the GitHub Release. The release notes are
+   attached automatically from `changes/v<version>.md` (the changelog
+   single source of truth) — make sure that file is final before tagging;
+   a tag re-push refreshes both the assets and the notes.
 3. **Wait for all six target assets + their `.sha256` sidecars** (12 files) to
    appear on the Release page, and verify before proceeding:
 
