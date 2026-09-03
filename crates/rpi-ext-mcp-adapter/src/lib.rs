@@ -470,18 +470,34 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     // (on_ready / metadata updates / connect sync) keep it current.
     plugin.runtime.spawn(async move {
         for _ in 0..15 {
-            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            tokio::time::sleep(bridge_retry_interval()).await;
             let Some(state) = STATE.get() else { return };
+            // V13-07 S2: only push the status bar once the host reports a
+            // UI — before that every update_status_bar hits the null bridge
+            // and is silently dropped, so the call is pure waste (up to 15
+            // wasted pushes per install without it).
             let has_ui = host_call_ok(&state.calls, state.cookie, "ctx.hasUI", json!({}))
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
-            update_status_bar(state);
-            if has_ui {
-                return;
+            if !has_ui {
+                continue;
             }
+            update_status_bar(state);
+            return;
         }
     });
     json!({"ok": true })
+}
+
+/// V13-07 S2: the bridge-ready retry interval, 1500ms in production. Test
+/// binaries override it (integration tests compile without cfg(test), so the
+/// knob stays unconditional — production never touches it).
+pub static BRIDGE_RETRY_MS_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1500);
+
+fn bridge_retry_interval() -> std::time::Duration {
+    let ms = BRIDGE_RETRY_MS_TEST.load(std::sync::atomic::Ordering::Relaxed);
+    std::time::Duration::from_millis(ms.max(1))
 }
 
 #[allow(clippy::missing_safety_doc)]
@@ -523,21 +539,35 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 return pack(&result);
             }
             let params = message.get("params").cloned().unwrap_or(Value::Null);
-            // Native tool detection for the call not-found branch
-            // (proxy-modes.ts:925-933, `getPiTools`).
-            let native_tools = host_call_ok(&state.calls, state.cookie, "getAllTools", json!({}))
-                .and_then(|ok| ok.as_array().cloned())
-                .map(|tools| {
-                    tools
-                        .iter()
-                        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            // V13-07 S3: native tool detection for the call not-found branch
+            // (proxy-modes.ts:925-933, `getPiTools`) is LAZY — the
+            // getAllTools host call runs only when a tool name fails to
+            // resolve to a server tool; the common mcp dispatch pays zero
+            // host calls for it.
+            let call = state.calls.call; // extern fn — Copy
+            let cookie = state.cookie;
+            let native_tools: crate::proxy::NativeToolsResolver = Arc::new(move || {
+                // The host trampoline is a plain fn-pointer: re-wrap it in a
+                // short-lived RpiHostCalls to reuse host_call_ok.
+                let calls = RpiHostCalls { call };
+                host_call_ok(&calls, cookie, "getAllTools", json!({}))
+                    .and_then(|ok| ok.as_array().cloned())
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .filter_map(|t| {
+                                t.get("name").and_then(Value::as_str).map(str::to_string)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            });
             let dispatcher = state.dispatcher.clone();
-            let result = state
-                .runtime
-                .block_on(async move { dispatcher.execute(&params, &native_tools).await });
+            let result = state.runtime.block_on(async move {
+                dispatcher
+                    .execute_with_resolver(&params, native_tools)
+                    .await
+            });
             pack(&result)
         }
         // Render protocol (host_call.rs:245-289): the host dispatches a
