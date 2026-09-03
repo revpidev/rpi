@@ -3,10 +3,10 @@
 //!
 //! The original bug: `StreamOptions::timeout_ms` (upstream undici
 //! `headersTimeout`/`bodyTimeout`, i.e. **idle** budgets) was mapped to
-//! `reqwest::ClientBuilder::timeout` — a **total** deadline covering connect
-//! + headers + the entire streamed body. Any inference streaming longer than
-//! the budget (default 5 min) was killed mid-stream even while actively
-//! receiving chunks.
+//! `reqwest::ClientBuilder::timeout` — a **total** deadline covering every
+//! phase (connect, headers, and the entire streamed body). Any inference
+//! streaming longer than the budget (default 5 min) was killed mid-stream
+//! even while actively receiving chunks.
 //!
 //! These tests drive the full `anthropic_messages` adapter (reqwest default
 //! transport) against a loopback SSE server and pin the corrected semantics:
@@ -25,7 +25,7 @@ use rpi_ai::types::{
     Context, Model, ProviderRequestOptions, SimpleStreamOptions, StreamEvent, StreamOptions,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// One scripted server action: sleep `delay_ms`, then write `payload`
 /// (`None` = keep the connection open forever, i.e. stall).

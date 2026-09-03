@@ -72,7 +72,7 @@ fn block_fingerprint(text: &str) -> (u64, u64) {
 #[cfg(test)]
 thread_local! {
     /// Counts container rebuilds inside `update_content` (perf tests).
-    static REBUILD_COUNT: std::cell::Cell<usize> = std::cell::Cell::new(0);
+    static REBUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl AssistantMessageComponent {

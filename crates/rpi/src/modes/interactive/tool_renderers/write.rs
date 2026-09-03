@@ -84,14 +84,14 @@ fn highlight_single_line(line: &str, lang: &str, theme: &Theme) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(test)]
+thread_local! {
+    static PREFIX_REFRESH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `refreshWriteHighlightPrefix` (write.ts:70-79): re-highlight the first
 /// [`WRITE_PARTIAL_FULL_HIGHLIGHT_LINES`] lines as one block so multi-line
 /// constructs that streaming per-line highlighting misses are corrected.
-#[cfg(test)]
-thread_local! {
-    static PREFIX_REFRESH_COUNT: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
-
 fn refresh_write_highlight_prefix(cache: &mut WriteHighlightCache, theme: &Theme) {
     #[cfg(test)]
     PREFIX_REFRESH_COUNT.with(|count| count.set(count.get() + 1));
@@ -253,11 +253,7 @@ fn format_write_call(
                 Some(cache) => {
                     let total = trailing_trimmed_len(&cache.highlighted_lines);
                     let max = preview_max_lines(expanded, total);
-                    let body = cache.highlighted_lines[..max]
-                        .iter()
-                        .map(|line| line.clone())
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let body = cache.highlighted_lines[..max].to_vec().join("\n");
                     (total, max, body)
                 }
                 None => {

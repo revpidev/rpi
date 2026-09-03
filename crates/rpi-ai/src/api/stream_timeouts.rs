@@ -125,7 +125,7 @@ pub struct IdleTimeoutStream<S> {
 /// Wraps `stream` with an idle timeout derived from `timeout_ms`.
 pub fn wrap<S>(stream: S, timeout_ms: Option<u64>) -> IdleTimeoutStream<S> {
     let idle_ms = timeout_ms.filter(|ms| *ms != 0);
-    let deadline = idle_ms.map(|ms| tokio::time::Duration::from_millis(ms));
+    let deadline = idle_ms.map(tokio::time::Duration::from_millis);
     let sleep = Box::pin(match deadline {
         Some(duration) => tokio::time::sleep(duration),
         None => tokio::time::sleep(tokio::time::Duration::MAX),
@@ -192,7 +192,7 @@ mod tests {
             stream.next().await,
             Some(Err(IdleStreamError::Transport(error))) if error == "boom"
         ));
-        assert!(matches!(stream.next().await, None));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
