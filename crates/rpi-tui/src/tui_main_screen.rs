@@ -1218,16 +1218,26 @@ impl TuiMainScreenInner {
         if self.stopped {
             return;
         }
-        let width = i32::from(self.terminal().columns());
-        let height = i32::from(self.terminal().rows());
+        // V13-07 S5: read the terminal size ONCE per frame (upstream reads a
+        // cached property, tui-main-screen.ts:182-183; each `columns()`/
+        // `rows()` here is an ioctl — the old code called them four times,
+        // re-acquiring the non-reentrant terminal mutex each time) and
+        // reuse the locals for width/height and the lock-free size cache.
+        // Resize detection still uses this per-frame read — this only
+        // removes the duplicate syscalls, not the check. Both reads happen
+        // under a SINGLE guard: two `terminal()` temporaries in one tuple
+        // would self-deadlock (the first MutexGuard is still alive when the
+        // second acquisition locks the same mutex).
+        let (cols, rows) = {
+            let terminal = self.terminal();
+            (terminal.columns(), terminal.rows())
+        };
+        let width = i32::from(cols);
+        let height = i32::from(rows);
         // Refresh the lock-free size cache (read by components, e.g. the
         // Editor's `terminal_rows`, which cannot take the inner lock).
-        self.size_cache
-            .rows
-            .store(self.terminal().rows(), Ordering::Relaxed);
-        self.size_cache
-            .columns
-            .store(self.terminal().columns(), Ordering::Relaxed);
+        self.size_cache.rows.store(rows, Ordering::Relaxed);
+        self.size_cache.columns.store(cols, Ordering::Relaxed);
         let width_changed = self.previous_width != 0 && self.previous_width != width;
         let height_changed = self.previous_height != 0 && self.previous_height != height;
         let previous_buffer_length = if self.previous_height > 0 {
@@ -6320,6 +6330,120 @@ mod tests {
         let viewport = terminal.get_viewport();
         assert_eq!(viewport[0], "x".repeat(30), "truncated to the new width");
         assert_eq!(viewport[1], "end", "no wrapped tail pushing content down");
+        tui.stop(TuiStopOptions::default());
+    }
+
+    // ---------------------------------------------------------------------
+    // V13-07 S5: do_render reads the terminal size ONCE per frame
+    // ---------------------------------------------------------------------
+
+    /// Counting terminal wrapper: delegates to a VirtualTerminal but counts
+    /// `columns()`/`rows()` calls (each is an ioctl in production; upstream
+    /// reads a cached property).
+    struct CountingTerminal {
+        inner: VirtualTerminal,
+        columns_calls: Arc<AtomicU64>,
+        rows_calls: Arc<AtomicU64>,
+    }
+
+    impl Terminal for CountingTerminal {
+        fn start(&mut self, on_input: InputHandler, on_resize: ResizeHandler) {
+            self.inner.start(on_input, on_resize)
+        }
+        fn stop(&mut self) {
+            self.inner.stop()
+        }
+        fn drain_input(
+            &mut self,
+            max_ms: Option<u64>,
+            idle_ms: Option<u64>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.inner.drain_input(max_ms, idle_ms)
+        }
+        fn write(&mut self, data: &str) {
+            self.inner.write(data)
+        }
+        fn columns(&self) -> u16 {
+            self.columns_calls.fetch_add(1, Ordering::Relaxed);
+            Terminal::columns(&self.inner)
+        }
+        fn rows(&self) -> u16 {
+            self.rows_calls.fetch_add(1, Ordering::Relaxed);
+            Terminal::rows(&self.inner)
+        }
+        fn kitty_protocol_active(&self) -> bool {
+            self.inner.kitty_protocol_active()
+        }
+        fn move_by(&mut self, lines: i32) {
+            self.inner.move_by(lines)
+        }
+        fn hide_cursor(&mut self) {
+            self.inner.hide_cursor()
+        }
+        fn show_cursor(&mut self) {
+            self.inner.show_cursor()
+        }
+        fn clear_line(&mut self) {
+            self.inner.clear_line()
+        }
+        fn clear_from_cursor(&mut self) {
+            self.inner.clear_from_cursor()
+        }
+        fn clear_screen(&mut self) {
+            self.inner.clear_screen()
+        }
+        fn set_title(&mut self, title: &str) {
+            self.inner.set_title(title)
+        }
+        fn set_progress(&mut self, active: bool) {
+            self.inner.set_progress(active)
+        }
+    }
+
+    #[test]
+    fn v1307_do_render_reads_terminal_size_once() {
+        let _lock = state_lock();
+        let vt = VirtualTerminal::new(80, 24);
+        let columns_calls = Arc::new(AtomicU64::new(0));
+        let rows_calls = Arc::new(AtomicU64::new(0));
+        let counting = CountingTerminal {
+            inner: vt.clone(),
+            columns_calls: Arc::clone(&columns_calls),
+            rows_calls: Arc::clone(&rows_calls),
+        };
+        let tui = TuiMainScreen::with_options(Box::new(counting), None, Some(temp_log_dir()));
+        // Construction seeds the size cache (reading the size once) — reset
+        // the counters so the render itself is measured in isolation.
+        columns_calls.store(0, Ordering::Relaxed);
+        rows_calls.store(0, Ordering::Relaxed);
+        // No start(): without the render-scheduler timer armed, each
+        // render_now triggers exactly one do_render synchronously.
+        tui.render_now(false);
+
+        // First rendered frame: exactly ONE columns()/rows() read each (the
+        // pre-V13-07 do_render called them two times per property per frame
+        // — width/height plus the size-cache stores — i.e. 4 terminal-mutex
+        // acquisitions).
+        assert_eq!(
+            columns_calls.load(Ordering::Relaxed),
+            1,
+            "one columns() read per frame (was 2)"
+        );
+        assert_eq!(
+            rows_calls.load(Ordering::Relaxed),
+            1,
+            "one rows() read per frame"
+        );
+
+        // A second synchronous render keeps the per-frame cost at one read.
+        tui.render_now(false);
+        assert_eq!(
+            columns_calls.load(Ordering::Relaxed),
+            2,
+            "exactly one columns() read on the second frame too"
+        );
+        assert_eq!(rows_calls.load(Ordering::Relaxed), 2);
+
         tui.stop(TuiStopOptions::default());
     }
 }
