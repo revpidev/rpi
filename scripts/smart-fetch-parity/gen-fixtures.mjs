@@ -889,6 +889,15 @@ for (const scenario of batchProgressScenarios) {
 }
 writeFileSync(join(OUT_DIR, "batch-progress.json"), JSON.stringify(batchProgressOut, null, 2) + "\n");
 
+// NOTE (V13-04 FR-B): the committed batch-progress.json is DELIBERATELY
+// post-processed — rpi's BatchProgressState snapshot dirty-check merges
+// consecutive identical full-table states (upstream tool.ts pushes a frame
+// per update; rpi throttles the identical middle frames across the FFI
+// boundary, TE-D37). When regenerating here, re-apply the merge: for each
+// scenario remove snapshots entries identical (by stable JSON) to the
+// previous one. The terminal frames stay byte-exact (parity fixture test
+// asserts the post-merge sequence).
+
 console.log(
   `wrote: format.json (${Object.entries(formatOut).reduce((n, [, v]) => n + v.length, 0)} cases), ` +
     `tool.json, settings.json, pipeline.json (${pipelineOut.length} scenarios), ` +

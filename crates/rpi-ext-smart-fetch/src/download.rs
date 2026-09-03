@@ -301,6 +301,21 @@ fn create_exclusive(file_path: &Path) -> std::io::Result<std::fs::File> {
     options.open(file_path)
 }
 
+/// V13-04 FR-A R1: whether a `body_progress` frame is due — ≥100ms since
+/// the last PUSHED progress, or ≥64KiB of new bytes (either threshold
+/// satisfies: a fast wire with big chunks stays within rate, a slow wire
+/// with tiny chunks never starves). `None` (first event) always due (R2).
+/// Pure so the throttle matrix is unit-testable without a transport.
+fn progress_gate_due(last_push: Option<(std::time::Instant, u64)>, downloaded: u64) -> bool {
+    match last_push {
+        None => true,
+        Some((at, last_bytes)) => {
+            at.elapsed() >= crate::constants::PROGRESS_MIN_INTERVAL_MS
+                || downloaded >= last_bytes + crate::constants::PROGRESS_MIN_DELTA_BYTES
+        }
+    }
+}
+
 /// `streamResponseToFile` (extract.ts:228-344): stream the body to
 /// `file_path` with exclusive creation and 0600, counting bytes; on failure
 /// remove the partial file (unless the failure is the EEXIST retry signal)
@@ -327,13 +342,25 @@ pub async fn stream_response_to_file_with_progress(
     hooks: &FetchExecutionHooks,
     content_length: Option<u64>,
 ) -> Result<u64, (ResponseBody, DownloadFailure)> {
-    // mapRequestEventToProgress `body_progress` (extract.ts:875-895).
-    let body_progress = |downloaded: u64| {
+    // mapRequestToEventProgress `body_progress` (extract.ts:875-895) with the
+    // V13-04 FR-A gate: a frame is pushed only when ≥100ms elapsed since the
+    // last PUSHED progress OR ≥64KiB of new bytes arrived — otherwise the
+    // fast-wire case (big chunks) and slow-wire case (tiny chunks) both stay
+    // within rate (the spinner clock keeps the UI alive in between; FR-C R1).
+    // Per-fetch local state (closure-captured), no locking; terminal progress
+    // points (body_complete/file_done/raw_done/error) live in pipeline.rs and
+    // bypass this gate (FR-A R2).
+    let mut last_push: Option<(std::time::Instant, u64)> = None;
+    let mut body_progress = |downloaded: u64| {
         let Some(content_length) = content_length.filter(|len| *len > 0) else {
             return;
         };
+        if !progress_gate_due(last_push, downloaded) {
+            return;
+        }
         let fraction = (downloaded as f64 / content_length as f64).clamp(0.0, 1.0);
         hooks.emit_progress("loading", 0.51 + fraction * 0.44, "body_progress");
+        last_push = Some((std::time::Instant::now(), downloaded));
     };
 
     if let Some(parent) = file_path.parent() {
@@ -695,4 +722,63 @@ mod tests {
             resolve_download_target("https://example.com/", "", "unknown/unknown", "fixed-uuid");
         assert_eq!(target.file_name, "fixed-uuid.dat");
     }
+}
+
+// ---- V13-04 FR-A: body_progress throttle matrix --------------------
+
+#[test]
+fn progress_gate_first_event_always_due() {
+    assert!(progress_gate_due(None, 0));
+    assert!(progress_gate_due(None, 1));
+}
+
+#[test]
+fn progress_gate_byte_threshold_matrix() {
+    use crate::constants::PROGRESS_MIN_DELTA_BYTES;
+    let now = std::time::Instant::now();
+    // Sub-threshold byte growth with no time elapsed → not due.
+    assert!(!progress_gate_due(Some((now, 0)), 1024));
+    assert!(!progress_gate_due(Some((now, 15_000)), 15_000 + 1024));
+    // ≥64KiB of new bytes → due regardless of the time.
+    assert!(progress_gate_due(Some((now, 0)), PROGRESS_MIN_DELTA_BYTES));
+    assert!(progress_gate_due(Some((now, 0)), 1024 * 1024));
+    assert!(progress_gate_due(
+        Some((now, 15_000)),
+        15_000 + PROGRESS_MIN_DELTA_BYTES
+    ));
+}
+
+#[test]
+fn progress_gate_time_threshold_matrix() {
+    use crate::constants::PROGRESS_MIN_INTERVAL_MS;
+    let now = std::time::Instant::now();
+    // <100ms and sub-threshold bytes → not due.
+    assert!(!progress_gate_due(Some((now, 0)), 8 * 1024));
+    // 50ms ago, tiny delta → still not due (FR-A R1 slow-wire never
+    // starves because the byte threshold eventually trips).
+    let half = now - PROGRESS_MIN_INTERVAL_MS / 2;
+    assert!(!progress_gate_due(Some((half, 0)), 8 * 1024));
+    // ≥100ms since the last push → due even for a tiny delta.
+    let past = now - PROGRESS_MIN_INTERVAL_MS - std::time::Duration::from_millis(5);
+    assert!(progress_gate_due(Some((past, 0)), 1));
+    // Exactly at the boundary with a small delta → due.
+    let at = now - PROGRESS_MIN_INTERVAL_MS;
+    assert!(progress_gate_due(Some((at, 0)), 128));
+}
+
+#[test]
+fn progress_gate_resets_after_push() {
+    use crate::constants::PROGRESS_MIN_DELTA_BYTES;
+    let now = std::time::Instant::now();
+    // After a push the window restarts from the pushed byte count: a
+    // 1KiB step right after is NOT due; another 64KiB above it is.
+    let pushed_at = now - std::time::Duration::from_millis(10);
+    assert!(!progress_gate_due(
+        Some((pushed_at, 64 * 1024)),
+        64 * 1024 + 1024
+    ));
+    assert!(progress_gate_due(
+        Some((pushed_at, 64 * 1024)),
+        64 * 1024 + PROGRESS_MIN_DELTA_BYTES
+    ));
 }

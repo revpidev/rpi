@@ -588,22 +588,6 @@
             {
               "index": 0,
               "url": "https://ex.com/data.bin",
-              "status": "loading",
-              "progress": 0.95,
-              "statusStartedAt": 0
-            }
-          ],
-          "total": 1,
-          "completed": 0,
-          "succeeded": 0,
-          "failed": 0,
-          "batchConcurrency": 1
-        },
-        {
-          "items": [
-            {
-              "index": 0,
-              "url": "https://ex.com/data.bin",
               "status": "done",
               "progress": 1,
               "statusStartedAt": 0
@@ -733,29 +717,6 @@
           "completed": 0,
           "succeeded": 0,
           "failed": 0,
-          "batchConcurrency": 1
-        },
-        {
-          "items": [
-            {
-              "index": 0,
-              "url": "https://no-such-host.example.com/x",
-              "status": "error",
-              "progress": 1,
-              "statusStartedAt": 0
-            },
-            {
-              "index": 1,
-              "url": "https://ex.com/ok",
-              "status": "queued",
-              "progress": 0,
-              "statusStartedAt": 0
-            }
-          ],
-          "total": 2,
-          "completed": 1,
-          "succeeded": 0,
-          "failed": 1,
           "batchConcurrency": 1
         },
         {
@@ -1036,22 +997,6 @@
               "url": "https://ex.com/article",
               "status": "loading",
               "progress": 0.95,
-              "statusStartedAt": 0
-            }
-          ],
-          "total": 1,
-          "completed": 0,
-          "succeeded": 0,
-          "failed": 0,
-          "batchConcurrency": 1
-        },
-        {
-          "items": [
-            {
-              "index": 0,
-              "url": "https://ex.com/article",
-              "status": "processing",
-              "progress": 0.96,
               "statusStartedAt": 0
             }
           ],

@@ -62,3 +62,28 @@ pub const META_REFRESH_SCAN_WINDOW: usize = 4096;
 /// "smart-fetch-pi")` (settings.ts:176); rpi derives the name from the product
 /// identifier per ADR-0001 — declared [VARIANT] in requirements §3.
 pub const DEFAULT_TEMP_DIR_NAME: &str = "smart-fetch-rpi";
+
+// ---------------------------------------------------------------------------
+// V13-04 progress throttling (audit #4: every-chunk progress push across an
+// FFI boundary). Upstream emits per event with a process-internal callback
+// (extract.ts:1218 / tool.ts:246), so it needs no throttle; rpi's
+// `UpdateSink::push` pays serialization + synchronous FFI + host dispatch
+// per frame — see deviation TE-D37.
+// ---------------------------------------------------------------------------
+
+/// Minimum interval between PUSHED progress frames (FR-A R1) — 100ms, the
+/// same order as the spinner clock (index.ts `SPINNER_INTERVAL`).
+#[allow(dead_code)]
+pub const PROGRESS_MIN_INTERVAL_MS: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Minimum NEW bytes between PUSHED progress frames (FR-A R1): a fast wire
+/// with big chunks must not exceed the time gate alone, a slow wire with
+/// tiny chunks must not starve.
+#[allow(dead_code)]
+pub const PROGRESS_MIN_DELTA_BYTES: u64 = 64 * 1024;
+
+/// Batch snapshot dirty-check granularity (FR-B R4): progress rounded to 1%
+/// — tiny fractional jitter is not a visible change (the rendered bars are
+/// percentage-scaled).
+#[allow(dead_code)]
+pub const PROGRESS_GRANULARITY: f64 = 0.01;

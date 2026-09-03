@@ -358,6 +358,26 @@ fn build_progress_snapshot(
     }
 }
 
+/// V13-04 FR-B R1/R2: the light signature of the table as the next snapshot
+/// would render it — per item `(index, status, progress rounded to 1%,
+/// error)`. Only signature changes emit a full-snapshot frame; the frame
+/// SHAPE stays untouched (FR-D), the rounding just keeps fractional
+/// progress jitter from producing distinguishable frames (FR-B R4).
+fn snapshot_signature(table: &[BatchFetchItemProgress]) -> String {
+    let key: Vec<serde_json::Value> = table
+        .iter()
+        .map(|item| {
+            serde_json::json!({
+                "index": item.index,
+                "status": item.status,
+                "progress": (item.progress * 100.0).round(),
+                "error": item.error,
+            })
+        })
+        .collect();
+    serde_json::to_string(&key).unwrap_or_default()
+}
+
 /// The shared progress table + snapshot sink (`progressItems` +
 /// `emitProgress`/`updateProgress`, tool.ts:237-265). The emit callback runs
 /// OUTSIDE the table lock (coding-standards §6.5 — the execute-layer sink
@@ -369,6 +389,10 @@ pub struct BatchProgressState {
     table: Arc<Mutex<Vec<BatchFetchItemProgress>>>,
     batch_concurrency: Arc<u64>,
     sink: Option<BatchProgressSink>,
+    /// V13-04 FR-B: signature of the last PUSHED snapshot (index/status /
+    /// 1%-rounded progress/error per item) — `update` skips the sink when
+    /// nothing the frame renders changed.
+    last_signature: Arc<Mutex<Option<String>>>,
 }
 
 impl BatchProgressState {
@@ -381,6 +405,7 @@ impl BatchProgressState {
             table: Arc::new(Mutex::new(items)),
             batch_concurrency: Arc::new(batch_concurrency),
             sink,
+            last_signature: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -402,9 +427,13 @@ impl BatchProgressState {
 
     /// `updateProgress` (tool.ts:246-265): status change, progress from the
     /// table unless overridden (clamped), `statusStartedAt` kept when the
-    /// status is unchanged, error only set (never cleared).
+    /// status is unchanged, error only set (never cleared). V13-04 FR-B: the
+    /// snapshot frame is skipped when nothing the rendered bars show changed
+    /// (status / progress at 1% granularity / error) — terminal `done`/`error`
+    /// transitions always change the signature, so terminal frames still push
+    /// (R3); the frame SHAPE is untouched when a push happens (FR-D).
     fn update(&self, index: usize, status: &str, error: Option<String>, progress: Option<f64>) {
-        {
+        let changed = {
             let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
             let Some(item) = table.get_mut(index) else {
                 return;
@@ -421,8 +450,23 @@ impl BatchProgressState {
             if let Some(error) = error {
                 item.error = Some(error);
             }
+            // Dirty check (signature comparison inside the table lock; the
+            // sink call below stays outside it — FR-B R2).
+            let signature = snapshot_signature(&table);
+            let mut last = self
+                .last_signature
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if last.as_deref() == Some(signature.as_str()) {
+                false
+            } else {
+                *last = Some(signature);
+                true
+            }
+        };
+        if changed {
+            self.emit();
         }
-        self.emit();
     }
 
     /// `buildProgressSnapshot` over the live table (the execute layer reads
@@ -923,4 +967,86 @@ mod tests {
         assert!(text.contains("## [2/2] https://example.com/bad"));
         assert!(text.contains("> Error: Invalid URL: bad"));
     }
+}
+
+// ---- V13-04 FR-B: snapshot dirty check ------------------------------
+
+#[test]
+fn batch_snapshot_dirty_check_skips_unchanged_frames() {
+    // Consecutive updates that leave the rendered table identical are
+    // merged (FR-B): 8 items × 3 same-progress events would be 24
+    // per-update frames upstream; the dirty check collapses them.
+    let items: Vec<_> = (0..8)
+        .map(|i| BatchFetchItemProgress {
+            index: i,
+            url: format!("https://ex.com/{i}"),
+            status: "queued".to_string(),
+            progress: 0.0,
+            status_started_at: Some(0),
+            error: None,
+        })
+        .collect();
+    let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let e2 = Arc::clone(&emitted);
+    let sink: BatchProgressSink = Arc::new(move |snapshot| {
+        e2.lock().unwrap().push(snapshot.clone());
+    });
+    let state = BatchProgressState::new(items, 8, Some(sink));
+    state.emit_initial(); // 1 frame: all queued
+
+    // Each item: running (same progress 0.5) ×3 identical updates.
+    for i in 0..8 {
+        for _ in 0..3 {
+            state.update(i, "loading", None, Some(0.5));
+        }
+    }
+    // Each item: done — 8 terminal transitions.
+    for i in 0..8 {
+        state.update(i, "done", None, Some(1.0));
+    }
+    let frames = emitted.lock().unwrap().len();
+    // initial (1) + 8 loading-transition frames + 8 done-transition
+    // frames (+ possible rounding merge) — NOT 24 per-update frames.
+    assert!(
+        frames <= 1 + 8 + 8,
+        "consecutive identical updates must not each emit a frame: {frames}"
+    );
+    assert!(
+        frames >= 1 + 8 + 8 - 1,
+        "terminal frames still emitted: {frames}"
+    );
+}
+
+#[test]
+fn batch_snapshot_error_change_fires_and_rounds_progress() {
+    let item = BatchFetchItemProgress {
+        index: 0,
+        url: "https://ex.com/a".to_string(),
+        status: "queued".to_string(),
+        progress: 0.0,
+        status_started_at: Some(0),
+        error: None,
+    };
+    let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let e2 = Arc::clone(&emitted);
+    let sink: BatchProgressSink = Arc::new(move |snapshot| {
+        e2.lock()
+            .unwrap()
+            .push(serde_json::to_string(&snapshot.to_json()).unwrap());
+    });
+    let state = BatchProgressState::new(vec![item], 1, Some(sink));
+
+    // 0.5123 vs 0.5149 both round to 51% → second is not a visible
+    // change (FR-B R4), so it must not emit.
+    state.update(0, "loading", None, Some(0.5123));
+    let after_first = emitted.lock().unwrap().len();
+    state.update(0, "loading", None, Some(0.5149));
+    let after_second = emitted.lock().unwrap().len();
+    assert_eq!(after_first, after_second, "sub-1% progress jitter skipped");
+    // A >1% step IS visible.
+    state.update(0, "loading", None, Some(0.62));
+    assert_eq!(emitted.lock().unwrap().len(), after_second + 1);
+    // error set → new signature → push.
+    state.update(0, "error", Some("boom".to_string()), Some(1.0));
+    assert_eq!(emitted.lock().unwrap().len(), after_second + 2);
 }
