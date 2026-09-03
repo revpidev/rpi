@@ -621,12 +621,16 @@ pub enum MissingSourceAction {
     Error,
 }
 
-/// `ConfiguredPackage` (package-manager.ts:94-99).
+/// `ConfiguredPackage` (package-manager.ts:94-99), plus the rpi-specific
+/// `untracked` flag: installed extensions discovered in the install roots
+/// without a settings entry are listed so users can see why `rpi remove`
+/// does not manage them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredPackage {
     pub source: String,
     pub scope: SourceScope,
     pub filtered: bool,
+    pub untracked: bool,
     pub installed_path: Option<PathBuf>,
 }
 
@@ -647,11 +651,15 @@ pub enum PackageUpdateKind {
     Git,
 }
 
-/// `ConfiguredUpdateSource` (package-manager.ts, `update` locals).
+/// `ConfiguredUpdateSource` (package-manager.ts, `update` locals), plus
+/// the rpi-specific `tracked` flag: `false` for extensions discovered in
+/// the install roots without a settings `packages` entry (they update
+/// best-effort; see [`DefaultPackageManager::update`]).
 #[derive(Debug, Clone)]
 struct ConfiguredUpdateSource {
     source: String,
     scope: SourceScope,
+    tracked: bool,
 }
 
 /// `NpmUpdateTarget` (package-manager.ts, `updateConfiguredSources` locals).
@@ -2579,11 +2587,37 @@ impl DefaultPackageManager {
 
     /// Registry/`github:` update (design §7.2: re-resolve by range and run
     /// install steps 5–7). A source already at the resolved version is
-    /// skipped.
-    fn update_registry_entry(&self, source: &str, scope: SourceScope) -> Result<(), String> {
+    /// skipped. `untracked` marks a source discovered in the install
+    /// roots without a settings entry: a registry that never listed it
+    /// downgrades to a skip note instead of a hard error (design §7.3 —
+    /// loading is local; an unmanaged directory must not break `rpi
+    /// update --extensions`).
+    fn update_registry_entry(
+        &self,
+        source: &str,
+        scope: SourceScope,
+        untracked: bool,
+    ) -> Result<(), String> {
         match parse_source(source) {
             ParsedSource::Registry(registry) => {
-                let resolved = self.resolve_registry_install(&registry)?;
+                let resolved = match self.resolve_registry_install(&registry) {
+                    Ok(resolved) => resolved,
+                    Err(error) if untracked && Self::is_registry_not_found(&error) => {
+                        self.emit_progress(&ProgressEvent {
+                            kind: ProgressKind::Start,
+                            action: ProgressAction::Update,
+                            source: source.to_string(),
+                            message: Some(format!(
+                                "Skipping {source}: not in the registry (untracked install; \
+                                 re-install with \"{APP_NAME} install {source}\" or remove the \
+                                 directory to manage it)",
+                                APP_NAME = config::APP_NAME,
+                            )),
+                        });
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                };
                 let installed = self
                     .get_registry_install_root(scope)
                     .ok()
@@ -2634,6 +2668,15 @@ impl DefaultPackageManager {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Whether a registry resolution error means "the registry has no
+    /// such extension" (HTTP 404), as opposed to transport/artifact
+    /// failures. Binds to the message [`Self::resolve_registry_install`]
+    /// builds; `test_is_registry_not_found_binds_to_resolve_error`
+    /// guards the coupling.
+    fn is_registry_not_found(error: &str) -> bool {
+        error.starts_with("No extension named")
     }
 
     /// `installParsedSource` (package-manager.ts:1347-1356).
@@ -2758,6 +2801,7 @@ impl DefaultPackageManager {
             let source = Self::package_source_string(&pkg).to_string();
             configured.push(ConfiguredPackage {
                 filtered: matches!(pkg, PackageSource::Filtered(_)),
+                untracked: false,
                 installed_path: self.get_installed_path(&source, SourceScope::User),
                 source,
                 scope: SourceScope::User,
@@ -2768,9 +2812,29 @@ impl DefaultPackageManager {
             let source = Self::package_source_string(&pkg).to_string();
             configured.push(ConfiguredPackage {
                 filtered: matches!(pkg, PackageSource::Filtered(_)),
+                untracked: false,
                 installed_path: self.get_installed_path(&source, SourceScope::Project),
                 source,
                 scope: SourceScope::Project,
+            });
+        }
+        // Rpi-specific (loader parity, design §3.3): installed extensions
+        // without a settings entry still load at runtime — list them with
+        // an `untracked` marker instead of hiding them.
+        for discovered in self.discover_installed_extension_sources() {
+            let identity = self.get_package_identity(&discovered.source, Some(discovered.scope));
+            if configured.iter().any(|entry| {
+                self.get_package_identity(&entry.source, Some(entry.scope)) == identity
+            }) {
+                continue;
+            }
+            let (source, scope) = (discovered.source, discovered.scope);
+            configured.push(ConfiguredPackage {
+                source: source.clone(),
+                scope,
+                filtered: false,
+                untracked: true,
+                installed_path: self.get_installed_path(&source, scope),
             });
         }
         configured
@@ -2782,6 +2846,14 @@ impl DefaultPackageManager {
 
     /// `update` (package-manager.ts:1048-1078): update every configured
     /// package, or only the one whose identity matches `source`.
+    ///
+    /// Rpi-specific (extension-distribution design §3.3, loader parity):
+    /// the extension loader discovers *every* manifest-carrying directory
+    /// under the registry install roots, regardless of settings. A full
+    /// update (`rpi update --extensions`) therefore also re-resolves
+    /// installed-but-untracked extensions (older installs, hand-copied
+    /// dev builds, orphaned `github:` directories); a single-source
+    /// update matches them by identity too.
     pub fn update(&self, source: Option<&str>) -> Result<(), String> {
         let global_settings = self.settings_manager.get_global_settings();
         let project_settings = self.settings_manager.get_project_settings();
@@ -2804,8 +2876,28 @@ impl DefaultPackageManager {
                 update_sources.push(ConfiguredUpdateSource {
                     source: source_str.to_string(),
                     scope,
+                    tracked: true,
                 });
             }
+        }
+
+        // Untracked installs join the batch (deduped by identity against
+        // the settings-derived entries so a package is updated once).
+        for discovered in self.discover_installed_extension_sources() {
+            let discovered_identity =
+                self.get_package_identity(&discovered.source, Some(discovered.scope));
+            if update_sources.iter().any(|entry| {
+                self.get_package_identity(&entry.source, Some(entry.scope)) == discovered_identity
+            }) {
+                continue;
+            }
+            if let Some(identity) = &identity {
+                if &discovered_identity != identity {
+                    continue;
+                }
+            }
+            matched = true;
+            update_sources.push(discovered);
         }
 
         if let Some(source) = source {
@@ -2817,6 +2909,62 @@ impl DefaultPackageManager {
         }
 
         self.update_configured_sources(&update_sources)
+    }
+
+    /// Installed-but-untracked extension sources (rpi-specific; design
+    /// §3.3 loader parity): one entry per manifest-carrying `<name>/`
+    /// directory under the registry install roots that no settings
+    /// `packages` entry covers. `.tmp-<pid>` / `.old-<pid>` staging
+    /// directories are skipped; the source is the
+    /// [`extension_registry::GITHUB_INSTALL_MARKER_FILE`] content when
+    /// present, else the manifest (fallback: directory) name as a bare
+    /// registry source. Only registry / `github:` identities are
+    /// returned — they are the only kinds update can re-resolve (design
+    /// §7.2). The project root is scanned only for a trusted project.
+    fn discover_installed_extension_sources(&self) -> Vec<ConfiguredUpdateSource> {
+        let mut discovered = Vec::new();
+        for scope in [SourceScope::User, SourceScope::Project] {
+            if scope == SourceScope::Project && !self.settings_manager.is_project_trusted() {
+                continue;
+            }
+            let Ok(root) = self.get_registry_install_root(scope) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if !dir.join("rpi-extension.json").is_file() {
+                    continue;
+                }
+                let Some(dir_name) = dir.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if dir_name.contains(".tmp-") || dir_name.contains(".old-") {
+                    continue;
+                }
+                let source = match std::fs::read_to_string(
+                    dir.join(extension_registry::GITHUB_INSTALL_MARKER_FILE),
+                ) {
+                    Ok(marker) if !marker.trim().is_empty() => marker.trim().to_string(),
+                    _ => extension_registry::installed_extension_name(&dir)
+                        .unwrap_or_else(|| dir_name.to_string()),
+                };
+                if !matches!(
+                    parse_source(&source),
+                    ParsedSource::Registry(_) | ParsedSource::GithubRelease(_)
+                ) {
+                    continue;
+                }
+                discovered.push(ConfiguredUpdateSource {
+                    source,
+                    scope,
+                    tracked: false,
+                });
+            }
+        }
+        discovered
     }
 
     /// `updateConfiguredSources` (package-manager.ts:1080-1137): npm
@@ -2853,6 +3001,7 @@ impl DefaultPackageManager {
                     .push(ConfiguredUpdateSource {
                         source: entry.source.clone(),
                         scope: entry.scope,
+                        tracked: entry.tracked,
                     }),
                 _ => {}
             }
@@ -2922,12 +3071,27 @@ impl DefaultPackageManager {
             }
             if !registry_candidates.is_empty() {
                 // Registry updates run sequentially: each one may need the
-                // interactive L0 confirmation prompt.
+                // interactive L0 confirmation prompt. Unlike the npm/git
+                // pools (upstream Promise.all semantics), one failing
+                // extension must not block the rest — a multi-extension
+                // batch still moves every healthy source forward, and the
+                // first error in source order fails the run afterwards
+                // (rpi-specific, extension-distribution design §7.3).
                 handles.push(scope.spawn(|| {
+                    let mut first_error: Option<String> = None;
                     for entry in &registry_candidates {
-                        self.update_registry_entry(&entry.source, entry.scope)?;
+                        if let Err(error) =
+                            self.update_registry_entry(&entry.source, entry.scope, !entry.tracked)
+                        {
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
                     }
-                    Ok(())
+                    match first_error {
+                        Some(error) => Err(error),
+                        None => Ok(()),
+                    }
                 }));
             }
             let mut first_error: Option<String> = None;
@@ -7424,6 +7588,268 @@ mod registry_tests {
             calls_before + 1,
             "index re-fetch only"
         );
+    }
+
+    #[test]
+    fn test_update_all_registry_extensions_each_updated() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-b", "0.1.0", false);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        manager.install_and_persist("ext-b", false).unwrap();
+        let packages = settings_packages(&dirs);
+        assert!(
+            packages.contains("\"ext-a\""),
+            "ext-a persisted: {packages}"
+        );
+        assert!(
+            packages.contains("\"ext-b\""),
+            "ext-b persisted: {packages}"
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.1.0")
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-b")
+            )
+            .as_deref(),
+            Some("0.1.0")
+        );
+
+        // Both extensions publish 0.2.0: `update --extensions` (source =
+        // None) must move BOTH installs forward.
+        serve_registry_extension(&transport, "ext-a", "0.2.0", true);
+        serve_registry_extension(&transport, "ext-b", "0.2.0", false);
+        manager.update(None).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.2.0"),
+            "ext-a must be updated too"
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-b")
+            )
+            .as_deref(),
+            Some("0.2.0"),
+            "ext-b must be updated too"
+        );
+    }
+
+    /// Hand-materialize an installed extension directory without going
+    /// through `rpi install` (the hand-copied / legacy install shape:
+    /// manifest present, no settings entry).
+    fn place_untracked_extension(dirs: &TestDirs, name: &str, version: &str) {
+        let dir = dirs.agent_dir.join("extensions").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("rpi-extension.json"),
+            format!(
+                "{{\"name\":\"{name}\",\"version\":\"{version}\",\"wasm\":\"dist/{name}.wasm\",\"capabilities\":[],\"rpiAbi\":1}}"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_update_discovers_untracked_installed_extensions() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-b", "0.2.0", false);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        // ext-b sits in the discovery root (0.1.0) but has no settings
+        // entry — the loader would still load it.
+        place_untracked_extension(&dirs, "ext-b", "0.1.0");
+        assert!(!settings_packages(&dirs).contains("ext-b"));
+
+        // `update --extensions` must move BOTH the tracked ext-a and the
+        // untracked ext-b forward.
+        serve_registry_extension(&transport, "ext-a", "0.2.0", true);
+        manager.update(None).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-b")
+            )
+            .as_deref(),
+            Some("0.2.0"),
+            "untracked ext-b must be discovered and updated"
+        );
+        // Discovery never writes settings.
+        assert!(!settings_packages(&dirs).contains("ext-b"));
+    }
+
+    #[test]
+    fn test_update_source_matches_untracked_install() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-b", "0.2.0", false);
+        let manager = manager_ok(&dirs, transport.clone());
+        place_untracked_extension(&dirs, "ext-b", "0.1.0");
+
+        manager.update(Some("ext-b")).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-b")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn test_update_untracked_not_in_registry_is_skipped() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        // A local-only extension the registry never listed.
+        place_untracked_extension(&dirs, "local-only", "0.1.0");
+
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        manager.set_progress_callback(Some(Box::new(move |event| {
+            if event.kind == ProgressKind::Start {
+                if let Some(message) = &event.message {
+                    sink.lock().unwrap().push(message.clone());
+                }
+            }
+        })));
+
+        serve_registry_extension(&transport, "ext-a", "0.2.0", true);
+        manager.update(None).unwrap();
+        // ext-a moved forward; local-only is skipped with a note, not an
+        // error, and its directory is untouched.
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/local-only")
+            )
+            .as_deref(),
+            Some("0.1.0")
+        );
+        assert!(
+            notes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.starts_with("Skipping local-only:")),
+            "skip note emitted: {:?}",
+            notes.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_update_tracked_404_errors_but_updates_the_rest() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        serve_registry_extension(&transport, "ext-b", "0.1.0", false);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        manager.install_and_persist("ext-b", false).unwrap();
+
+        // ext-a publishes 0.2.0; ext-b's index disappears entirely.
+        serve_registry_extension(&transport, "ext-a", "0.2.0", true);
+        transport.remove(&extension_registry::registry_index_url(
+            REGISTRY_BASE,
+            "ext-b",
+        ));
+
+        // The tracked ext-b failure fails the run (exit-code parity), but
+        // ext-a still updates instead of being blocked by ext-b.
+        let error = manager.update(None).unwrap_err();
+        assert!(error.contains("No extension named \"ext-b\""), "{error}");
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-a")
+            )
+            .as_deref(),
+            Some("0.2.0"),
+            "a failing tracked extension must not block the others"
+        );
+    }
+
+    #[test]
+    fn test_update_skips_staging_and_backup_dirs() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist("ext-a", false).unwrap();
+        // Activation leftovers must not be picked up as installs.
+        place_untracked_extension(&dirs, "ext-a.tmp-1234", "0.1.0");
+        place_untracked_extension(&dirs, "ext-a.old-1234", "0.1.0");
+        let discovered = manager.discover_installed_extension_sources();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].source, "ext-a");
+    }
+
+    #[test]
+    fn test_list_configured_packages_marks_untracked() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        serve_registry_extension(&transport, "ext-a", "0.1.0", true);
+        let mut manager = manager_ok(&dirs, transport);
+        manager.install_and_persist("ext-a", false).unwrap();
+        place_untracked_extension(&dirs, "ext-b", "0.1.0");
+
+        let listed = manager.list_configured_packages();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].source, "ext-a");
+        assert!(!listed[0].untracked);
+        assert_eq!(listed[1].source, "ext-b");
+        assert!(listed[1].untracked);
+        assert_eq!(
+            listed[1].installed_path,
+            Some(dirs.agent_dir.join("extensions/ext-b"))
+        );
+    }
+
+    /// The untracked-install skip in [`DefaultPackageManager::update_registry_entry`]
+    /// matches errors by message; bind the prefix to what
+    /// `resolve_registry_install` actually builds so drift fails here.
+    #[test]
+    fn test_is_registry_not_found_binds_to_resolve_error() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let manager = manager_ok(&dirs, transport);
+        let ParsedSource::Registry(registry) = parse_source("never-published") else {
+            panic!("bare name must parse as a registry source");
+        };
+        let error = manager.resolve_registry_install(&registry).unwrap_err();
+        assert!(
+            DefaultPackageManager::is_registry_not_found(&error),
+            "resolve error must be classified not-found: {error}"
+        );
+        assert!(!DefaultPackageManager::is_registry_not_found(
+            "request failed: HTTP 500"
+        ));
     }
 
     // ---- github: channel (design §7.1) ----

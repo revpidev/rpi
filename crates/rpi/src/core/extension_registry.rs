@@ -880,6 +880,14 @@ pub fn installed_extension_version(dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The `name` recorded in an installed extension directory's manifest
+/// (untracked-install discovery); `None` when absent or unreadable.
+pub fn installed_extension_name(dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(dir.join("rpi-extension.json")).ok()?;
+    let raw: Value = serde_json::from_str(&content).ok()?;
+    raw.get("name").and_then(Value::as_str).map(str::to_string)
+}
+
 /// A verified, still-temporary extraction awaiting activation.
 #[derive(Debug)]
 pub struct ExtractedRpix {
