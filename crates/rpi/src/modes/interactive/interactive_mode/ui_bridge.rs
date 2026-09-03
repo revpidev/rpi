@@ -138,6 +138,17 @@ impl InteractiveUiBridge {
     /// Build the component for a widget content against the CURRENT theme
     /// and mount it into its placement container, replacing any existing
     /// entry under the same key.
+    ///
+    /// V13-05 (FR-A): the swap is atomic per container — the component tree
+    /// is built BEFORE touching any container lock, and the remove-old /
+    /// add-new pair happens inside one critical section, so no render
+    /// deadline can capture a frame with the widget missing. Cross-container
+    /// placement changes go **add-then-remove** (the widget appears in the
+    /// new container before it leaves the old one): a duplicate for one
+    /// frame is imperceptible, a missing frame is not. `remove_child_by_
+    /// address` is a retain-filter, a no-op for an already-vacated address.
+    /// Lock order: `widgets` (address book) take → container lock(s) →
+    /// `widgets` write; the two are never held simultaneously.
     fn mount_widget(
         &self,
         ui: &Arc<InteractiveUi>,
@@ -145,20 +156,10 @@ impl InteractiveUiBridge {
         content: Option<&WidgetContent>,
         options: Option<&ExtensionWidgetOptions>,
     ) {
-        // Remove any existing entry first.
-        if let Some((below, address)) = lock(&self.widgets).remove(key) {
-            let container = if below {
-                &ui.widgets_below
-            } else {
-                &ui.widgets_above
-            };
-            super::remove_child_by_address(&mut lock(container), address);
-        }
-        let Some(content) = content else {
-            ui.render_handle.request_render();
-            return;
-        };
-        let component: Box<dyn Component> = match content {
+        // FR-A R1: build the component (theme baking) before any container
+        // lock — the build is millisecond-grade and must not extend a
+        // critical section.
+        let built = content.map(|content| match content {
             WidgetContent::Lines(lines) => {
                 let mut column = rpi_tui::components::r#box::Box::new(0, 0, None);
                 for line in lines {
@@ -174,21 +175,104 @@ impl InteractiveUiBridge {
             WidgetContent::Component(tree) => {
                 component_from_tree(tree, &Arc::clone(&lock(&ui.theme)))
             }
-        };
+        });
         let below = matches!(
             options.and_then(|o| o.placement),
             Some(WidgetPlacement::BelowEditor)
         );
-        let container = if below {
-            &ui.widgets_below
-        } else {
-            &ui.widgets_above
+
+        // Take the previous address-book entry: container operations below
+        // run against this taken entry (R4: address book update happens
+        // around the container swap, never while a container lock is held).
+        let previous = lock(&self.widgets).remove(key);
+
+        let Some(built) = built else {
+            // Removal (`set_widget(key, None)`): drop the old entry from its
+            // container in one critical section.
+            if let Some((old_below, address)) = previous {
+                let container = if old_below {
+                    &ui.widgets_below
+                } else {
+                    &ui.widgets_above
+                };
+                let mut container = lock(container);
+                super::remove_child_by_address(&mut container, address);
+            }
+            ui.render_handle.request_render();
+            return;
         };
-        let mut container = lock(container);
-        container.add_child(component);
-        let address = super::child_address(&**container.children.last().expect("just pushed"));
-        drop(container);
-        lock(&self.widgets).insert(key.to_owned(), (below, address));
+
+        let same_placement = previous
+            .as_ref()
+            .map(|(old_below, _)| *old_below == below)
+            .unwrap_or(false);
+        let new_address = match (previous, same_placement) {
+            // Same-container path — STRICT atomicity (FR-A R2): remove old +
+            // add new inside ONE container lock scope, so no render deadline
+            // can capture a frame with the widget missing; request_render
+            // fires once after the swap.
+            (Some((_old_below, address)), true) => {
+                let container = if below {
+                    &ui.widgets_below
+                } else {
+                    &ui.widgets_above
+                };
+                let mut container = lock(container);
+                super::remove_child_by_address(&mut container, address);
+                container.add_child(built);
+                let address =
+                    super::child_address(&**container.children.last().expect("just pushed"));
+                (below, address)
+            }
+            // Cross-container placement change — ADD-THEN-REMOVE (FR-A R3):
+            // the widget lands in the new container before it leaves the
+            // old one. A duplicate frame is imperceptible; add-then-remove
+            // guarantees there is never a MISSING frame (remove-then-add
+            // would show one).
+            (Some((old_below, address)), false) => {
+                debug_assert_ne!(old_below, below);
+                let new_container = if below {
+                    &ui.widgets_below
+                } else {
+                    &ui.widgets_above
+                };
+                {
+                    let mut container = lock(new_container);
+                    container.add_child(built);
+                }
+                let old_container = if old_below {
+                    &ui.widgets_below
+                } else {
+                    &ui.widgets_above
+                };
+                {
+                    let mut container = lock(old_container);
+                    // retain() is a no-op when the address is already gone.
+                    super::remove_child_by_address(&mut container, address);
+                }
+                let address = {
+                    let container = lock(new_container);
+                    super::child_address(&**container.children.last().expect("just pushed"))
+                };
+                (below, address)
+            }
+            // No previous entry — plain first mount.
+            (None, _) => {
+                let container = if below {
+                    &ui.widgets_below
+                } else {
+                    &ui.widgets_above
+                };
+                let mut container = lock(container);
+                container.add_child(built);
+                let address =
+                    super::child_address(&**container.children.last().expect("just pushed"));
+                (below, address)
+            }
+        };
+        // R4: address book update after the container swap; the two are
+        // never held simultaneously.
+        lock(&self.widgets).insert(key.to_owned(), new_address);
         ui.render_handle.request_render();
     }
 

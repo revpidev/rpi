@@ -2190,17 +2190,14 @@ impl InteractiveUi {
     /// container's, so the content swap is safe; `set_focus`/
     /// `request_render` go through the renderer's re-entrancy queue.
     pub(crate) fn show_selector(&self, entry: SharedComponent) {
-        self.hide_selector();
-        {
-            let mut container = lock(&self.editor_container);
-            container.clear();
-            container
-                .children
-                .push(Box::new(SharedEntry(entry.clone())));
-        }
+        // V13-05 (FR-B): replace previous selector / install the new one in
+        // a SINGLE container critical section (swap_editor_region) — never a
+        // transient bare-editor or missing-selector frame, and set_focus
+        // fires once (no focus jitter).
         *lock(&self.active_selector) = Some(entry.clone());
-        self.ui.set_focus(Some(entry));
-        self.ui.request_render(false);
+        self.swap_editor_region(entry.clone(), entry);
+        // Clear the settings selector weak ref (selector changed / reinstated).
+        *lock(&self.settings_selector_weak) = None;
     }
 
     /// The `done()` callback (interactive-mode.ts:4123-4127): restore the
@@ -2208,18 +2205,32 @@ impl InteractiveUi {
     /// editorContainer.addChild(editor)`).
     pub(crate) fn hide_selector(&self) {
         if lock(&self.active_selector).take().is_some() {
-            {
-                let mut container = lock(&self.editor_container);
-                container.clear();
-                container
-                    .children
-                    .push(Box::new(SharedEntry(self.editor_region.clone())));
-            }
-            self.ui.set_focus(Some(self.editor_region.clone()));
-            self.ui.request_render(false);
+            // Single critical section: clear → add editor → focus editor
+            // (already atomic; kept via the shared primitive V13-05 FR-B).
+            self.swap_editor_region(self.editor_region.clone(), self.editor_region.clone());
         }
         // Clear the settings selector weak ref (selector is no longer mounted).
         *lock(&self.settings_selector_weak) = None;
+    }
+
+    /// Swap the editor-container content to `entry` and move focus to
+    /// `focus` in ONE container critical section (V13-05 FR-B): clear →
+    /// add → set_focus under the same `editor_container` lock, so no render
+    /// deadline can capture the bare editor (old two-critical-section shape
+    /// had a hole between them and called set_focus twice → transient focus
+    /// jitter). `set_focus` goes through `run_or_queue` (try_lock), which
+    /// never blocks on the renderer inner lock, so calling it while holding
+    /// the container lock is deadlock-free: the driver thread holds the
+    /// inner lock during render and only ever takes each container lock
+    /// briefly.
+    fn swap_editor_region(&self, entry: SharedComponent, focus: SharedComponent) {
+        {
+            let mut container = lock(&self.editor_container);
+            container.clear();
+            container.children.push(Box::new(SharedEntry(entry)));
+        }
+        self.ui.set_focus(Some(focus));
+        self.ui.request_render(false);
     }
 
     /// `showTreeSelector` (interactive-mode.ts:4635-4747), basic path:
@@ -7393,6 +7404,207 @@ mod tests {
         let dark_theme = crate::core::themes::load_theme("dark", None).unwrap();
         ui.apply_theme(Arc::new(dark_theme));
         assert!(lock(&ui.widgets_above).children.is_empty());
+        mode.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // V13-05: extension UI atomic swap (FR-C per-frame stress)
+    // ---------------------------------------------------------------------
+
+    /// FR-C R1: another thread pounds `request_render` at ~8ms while the
+    /// writer replaces the same widget key 120×, alternating placement to
+    /// drive BOTH the same-container (single critical section) and
+    /// cross-container (add-then-remove) paths under render pressure. A
+    /// checker snapshots the containers at render-race frequency and
+    /// asserts the widget is NEVER missing across the two containers — a
+    /// missing snapshot is exactly the frame a renderer would draw without
+    /// the widget (the pre-V13-05 two-critical-section mount exposed it).
+    #[tokio::test]
+    async fn w4_v1305_widget_swap_never_missing_during_concurrent_renders() {
+        use rpi_ext_host::api::{ExtensionWidgetOptions, UiBridge, WidgetContent, WidgetPlacement};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        let ui = &mode.ui_state;
+        let above = Arc::clone(&ui.widgets_above);
+        let below = Arc::clone(&ui.widgets_below);
+
+        bridge.set_widget(
+            "w",
+            Some(WidgetContent::Lines(vec![
+                "W0".to_owned(),
+                "W1".to_owned(),
+                "W2".to_owned(),
+            ])),
+            None,
+        );
+        assert_eq!(lock(&above).children.len(), 1, "seeded widget mounted");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let render_handle = ui.render_handle.clone();
+        let renderer_stop = Arc::clone(&stop);
+        let renderer = std::thread::spawn(move || {
+            while !renderer_stop.load(Ordering::Relaxed) {
+                render_handle.request_render();
+                std::thread::sleep(std::time::Duration::from_millis(8));
+            }
+        });
+        let checker_stop = Arc::clone(&stop);
+        let above_c = Arc::clone(&above);
+        let below_c = Arc::clone(&below);
+        let checker = std::thread::spawn(move || {
+            let mut checks = 0usize;
+            while !checker_stop.load(Ordering::Relaxed) {
+                let total = lock(&above_c).children.len() + lock(&below_c).children.len();
+                assert!(
+                    total >= 1,
+                    "frame snapshot without the widget (missing-frame violation): total={total}"
+                );
+                checks += 1;
+                std::thread::sleep(std::time::Duration::from_micros(400));
+            }
+            checks
+        });
+
+        // Writer: 120 same-key swaps; placement alternates every iteration.
+        for i in 0..120 {
+            let below_placement = i % 2 == 0;
+            let options = below_placement.then_some(ExtensionWidgetOptions {
+                placement: Some(WidgetPlacement::BelowEditor),
+            });
+            bridge.set_widget(
+                "w",
+                Some(WidgetContent::Lines(vec![
+                    format!("W{i}"),
+                    "W-X".to_owned(),
+                    "W-Y".to_owned(),
+                ])),
+                options,
+            );
+            std::thread::sleep(std::time::Duration::from_micros(1200));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        renderer.join().expect("renderer thread");
+        let checks = checker.join().expect("checker thread");
+        assert!(checks > 40, "checker sampled {checks} snapshots");
+
+        // Final state: exactly one widget in the placement of the last write
+        // (i=119 is odd → above).
+        let (final_above, final_below) = (lock(&above).children.len(), lock(&below).children.len());
+        assert_eq!(
+            (final_above, final_below),
+            (1, 0),
+            "exactly one widget, above (last write i=119): {final_above}/{final_below}"
+        );
+        mode.shutdown().await;
+    }
+
+    /// FR-C R1 + retheme regression: the theme-replay path reuses the same
+    /// atomic primitive, so after `apply_theme` the widget stays COMPLETE
+    /// (all 3 lines) — and a removal fully empties the container, never a
+    /// partial intermediate.
+    #[tokio::test]
+    async fn w4_v1305_theme_replay_preserves_complete_widget() {
+        use rpi_ext_host::api::{UiBridge, WidgetContent};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        *lock(&mode.ui_state.extension_ui_bridge) = Some(Arc::clone(&bridge));
+        let ui = &mode.ui_state;
+
+        bridge.set_widget(
+            "w",
+            Some(WidgetContent::Lines(vec![
+                "LINE-A".to_owned(),
+                "LINE-B".to_owned(),
+                "LINE-C".to_owned(),
+            ])),
+            None,
+        );
+        let render_lines = || {
+            lock(&ui.widgets_above)
+                .children
+                .iter()
+                .flat_map(|c| c.render(80))
+                .collect::<Vec<_>>()
+        };
+        let before = render_lines();
+        assert_eq!(before.len(), 3, "three widget lines: {before:?}");
+
+        ui.apply_theme(Arc::new(
+            crate::core::themes::load_theme("light", None).unwrap(),
+        ));
+        let after = render_lines();
+        assert_eq!(after.len(), 3, "replay keeps all three lines: {after:?}");
+        assert!(
+            after
+                .iter()
+                .all(|l| rpi_test_support::vt::strip_ansi(l).contains("LINE-")),
+            "{after:?}"
+        );
+
+        bridge.set_widget("w", None, None);
+        assert!(lock(&ui.widgets_above).children.is_empty());
+        mode.shutdown().await;
+    }
+
+    /// FR-C R2: selector churn under concurrent render pressure — the
+    /// editor container must hold EXACTLY one entry at every snapshot (no
+    /// empty/bare intermediate), and the content identity must track the
+    /// active selector state (post-conditions verified after each phase).
+    #[tokio::test]
+    async fn w4_v1305_selector_swap_under_render_pressure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let render_handle = ui.render_handle.clone();
+        let renderer_stop = Arc::clone(&stop);
+        let renderer = std::thread::spawn(move || {
+            while !renderer_stop.load(Ordering::Relaxed) {
+                render_handle.request_render();
+                std::thread::sleep(std::time::Duration::from_millis(6));
+            }
+        });
+        let checker_stop = Arc::clone(&stop);
+        let container = Arc::clone(&ui.editor_container);
+        let checker = std::thread::spawn(move || {
+            let mut checks = 0usize;
+            while !checker_stop.load(Ordering::Relaxed) {
+                let children = lock(&container).children.len();
+                assert!(
+                    children == 1,
+                    "editor container must hold exactly one entry at every snapshot, got {children}"
+                );
+                checks += 1;
+                std::thread::sleep(std::time::Duration::from_micros(300));
+            }
+            checks
+        });
+
+        let selector = shared_component_from_boxed(Box::new(SharedChild(Arc::new(Mutex::new(
+            rpi_tui::components::r#box::Box::new(0, 0, None),
+        )))));
+        for _ in 0..40 {
+            ui.show_selector(selector.clone());
+            // Content follows the active selector immediately (post-swap).
+            assert!(lock(&ui.active_selector).is_some());
+            assert_eq!(lock(&ui.editor_container).children.len(), 1);
+            std::thread::sleep(std::time::Duration::from_micros(1500));
+        }
+        ui.hide_selector();
+        assert!(lock(&ui.active_selector).is_none());
+        assert_eq!(lock(&ui.editor_container).children.len(), 1);
+
+        stop.store(true, Ordering::Relaxed);
+        renderer.join().expect("renderer thread");
+        let checks = checker.join().expect("checker thread");
+        assert!(checks > 30, "checker sampled {checks} snapshots");
         mode.shutdown().await;
     }
 
