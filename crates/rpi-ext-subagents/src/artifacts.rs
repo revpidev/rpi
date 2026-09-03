@@ -165,9 +165,19 @@ pub fn write_metadata(file_path: &Path, metadata: &Value) -> std::io::Result<()>
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering;
+        WRITE_METADATA_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
     result
 }
 
+/// Test-only counter of `write_metadata` calls (V13-01 FR-C quantitative
+/// acceptance: status write coalescing assertion).
+#[cfg(test)]
+pub(crate) static WRITE_METADATA_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 fn nanos_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -186,6 +196,88 @@ pub fn append_jsonl(file_path: &Path, line: &str) {
         .open(file_path)
     {
         let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Cumulative ceiling for the persistent JSONL writers — same value as
+/// upstream `DEFAULT_MAX_JSONL_BYTES` (jsonl-writer.ts:14).
+pub const DEFAULT_MAX_JSONL_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Persistent append-only JSONL writer (V13-01 FR-A/FR-B): the port of
+/// upstream `JsonlWriter` (jsonl-writer.ts:28-89) — ONE open append handle
+/// per child run instead of the previous per-line open/close+mkdir, with a
+/// 50MiB cumulative ceiling (DEFAULT_MAX_JSONL_BYTES) past which subsequent
+/// lines are silently dropped.
+///
+/// Semantics mirror upstream `writeLine` (jsonl-writer.ts:58-77): blank
+/// lines are skipped; write failures are best-effort silent (disk-full etc.)
+/// and later lines keep trying (R4). The reader-side backpressure (upstream
+/// pause/resume on the child stream) is intentionally NOT ported: rpi's
+/// line loop is itself the consumer and BoundedLineReader already caps the
+/// line size — see deviation TE-D35.
+///
+/// Construction is the only place `create_dir_all` runs; the writer is pure
+/// synchronous IO (same execution environment as the previous
+/// `append_jsonl` per-line calls — no new Send constraints).
+pub struct JsonlWriter {
+    /// `None` = not created / unavailable / ceiling retired.
+    file: Option<std::fs::File>,
+    bytes_written: u64,
+    max_bytes: u64,
+}
+
+/// Test-only counter of `JsonlWriter::create` calls (V13-01 FR-A
+/// quantitative acceptance: open count == 1 per run).
+#[cfg(test)]
+pub(crate) static JSONL_CREATE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl JsonlWriter {
+    /// Create the writer: parent `create_dir_all` + open-append exactly once.
+    pub fn create(path: &Path, max_bytes: u64) -> Self {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering;
+            JSONL_CREATE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        let file = std::fs::create_dir_all(path.parent().unwrap_or(Path::new(".")))
+            .ok()
+            .and_then(|_| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        Self {
+            file,
+            bytes_written: 0,
+            max_bytes,
+        }
+    }
+
+    /// Append one JSONL line (upstream `writeLine`): blank skip, ceiling
+    /// drop, best-effort failures.
+    pub fn write_line(&mut self, line: &str) {
+        let Some(file) = &mut self.file else {
+            return; // unavailable or ceiling-retired
+        };
+        if line.trim().is_empty() {
+            return;
+        }
+        use std::io::Write;
+        let bytes = line.len() as u64 + 1; // + trailing newline
+        if self.max_bytes > 0 && self.bytes_written + bytes > self.max_bytes {
+            // Ceiling reached: retire the handle and silently drop the line
+            // (upstream drops subsequent lines without erroring).
+            self.file = None;
+            return;
+        }
+        if writeln!(file, "{line}").is_ok() {
+            self.bytes_written += bytes;
+        }
+        // A failed write leaves the handle in place; later lines retry
+        // (best-effort, FR-A R4).
     }
 }
 
@@ -385,5 +477,98 @@ mod tests {
             format_iso8601(1_755_168_000_123),
             "2025-08-14T10:40:00.123Z"
         );
+    }
+
+    // ---- V13-01: JsonlWriter persistent writer (FR-A) ----------------
+
+    /// JSONL_CREATE_COUNT is process-global; all JsonlWriter tests in this
+    /// module serialize so their counter deltas are exclusive.
+    static JSONL_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn jsonl_writer_appends_and_counts_open_once() {
+        let _guard = JSONL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("rpi-sub-jsonl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        let before = JSONL_CREATE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        {
+            let mut writer = JsonlWriter::create(&path, DEFAULT_MAX_JSONL_BYTES);
+            for i in 0..200 {
+                writer.write_line(&format!(r#"{{"type":"event","i":{i}}}"#));
+            }
+        }
+        let after = JSONL_CREATE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after - before, 1, "one create (one open) for the whole run");
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 200, "all lines persisted");
+        assert!(content.contains(r#""i":199"#));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_writer_skips_blank_lines_and_survives_empty_input() {
+        let _guard = JSONL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("rpi-sub-jsonl2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        let mut writer = JsonlWriter::create(&path, DEFAULT_MAX_JSONL_BYTES);
+        writer.write_line("");
+        writer.write_line("   ");
+        writer.write_line(r#"{"type":"a"}"#);
+        writer.write_line("\t");
+        drop(writer);
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "only the non-blank line persisted"
+        );
+        assert!(content.contains("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_writer_silently_drops_beyond_ceiling() {
+        let _guard = JSONL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("rpi-sub-jsonl3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("events.jsonl");
+        // 64-byte ceiling → a handful of lines fit, the rest are dropped
+        // silently (upstream jsonl-writer.ts:58-77 parity).
+        let mut writer = JsonlWriter::create(&path, 64);
+        for _ in 0..100 {
+            writer.write_line(r#"{"type":"payload","body":"xxxx"}"#);
+        }
+        drop(writer);
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines = content.lines().count();
+        assert!(
+            (1..100).contains(&lines),
+            "line count under the ceiling, not all 100: {lines}"
+        );
+        assert!(
+            lines <= 3,
+            "64-byte ceiling leaves fewer than 4 full lines: {lines}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonl_writer_unwritable_dir_is_best_effort_silent() {
+        let _guard = JSONL_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("rpi-sub-jsonl4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A path whose parent is a FILE cannot be created → create() yields
+        // a handle-less writer; write_line must be a silent no-op.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a dir").unwrap();
+        let path = blocker.join("events.jsonl");
+        let mut writer = JsonlWriter::create(&path, DEFAULT_MAX_JSONL_BYTES);
+        writer.write_line(r#"{"type":"a"}"#);
+        drop(writer);
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

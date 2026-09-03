@@ -393,15 +393,31 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
 
     let state = Arc::new(Mutex::new(ChildRunState::default()));
     let raw_tail = Arc::new(Mutex::new(BoundedByteTail::new(MAX_CHILD_STDERR_BYTES)));
-    let jsonl_path = artifact_paths
+    // V13-01 (FR-A/FR-B): one persistent write handle per child run instead
+    // of per-line open/close — events.jsonl from stdout, the transcript
+    // shared between the stdout and stderr readers (the two tasks share via
+    // the Mutex; each line is a synchronous write, same environment as the
+    // old per-line append). Writers drop (closing the handles) when the
+    // reader tasks end (stdout EOF / run teardown) — FR-A R5.
+    let jsonl_writer: Option<Arc<Mutex<artifacts::JsonlWriter>>> = artifact_paths
         .as_ref()
         .filter(|_| input.include_jsonl)
-        .map(|p| p.jsonl_path.clone());
-    let transcript_path = artifact_paths
+        .map(|p| {
+            Arc::new(Mutex::new(artifacts::JsonlWriter::create(
+                &p.jsonl_path,
+                artifacts::DEFAULT_MAX_JSONL_BYTES,
+            )))
+        });
+    let transcript_writer: Option<Arc<Mutex<artifacts::JsonlWriter>>> = artifact_paths
         .as_ref()
         .filter(|_| input.include_transcript)
-        .map(|p| p.transcript_path.clone());
-    let stderr_transcript_path = transcript_path.clone();
+        .map(|p| {
+            Arc::new(Mutex::new(artifacts::JsonlWriter::create(
+                &p.transcript_path,
+                artifacts::DEFAULT_MAX_JSONL_BYTES,
+            )))
+        });
+    let stderr_transcript_writer = transcript_writer.clone();
 
     // Shared run flags.
     let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -508,11 +524,19 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
             "stdout",
             MAX_CHILD_PENDING_LINE_BYTES,
             |line: &str| {
-                if let Some(jsonl) = &jsonl_path {
-                    artifacts::append_jsonl(jsonl, line);
+                // V13-01: persistent writers (one handle per run) — no more
+                // per-line open/close.
+                if let Some(jsonl) = &jsonl_writer {
+                    jsonl
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .write_line(line);
                 }
-                if let Some(transcript) = &transcript_path {
-                    artifacts::append_jsonl(transcript, &format!("stdout: {line}"));
+                if let Some(transcript) = &transcript_writer {
+                    transcript
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .write_line(&format!("stdout: {line}"));
                 }
                 let trimmed = line.trim();
                 let parsed: Option<Value> = serde_json::from_str(trimmed).ok();
@@ -624,7 +648,7 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(&buffer[..read]);
-                    if let Some(transcript) = &stderr_transcript_path {
+                    if let Some(transcript) = &stderr_transcript_writer {
                         line_bytes.extend_from_slice(&buffer[..read]);
                         while let Some(pos) = line_bytes.iter().position(|b| *b == b'\n') {
                             let line: Vec<u8> = line_bytes.drain(..=pos).collect();
@@ -632,7 +656,10 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
                                 let text =
                                     String::from_utf8_lossy(&line[..line.len().saturating_sub(1)])
                                         .to_string();
-                                artifacts::append_jsonl(transcript, &format!("stderr: {text}"));
+                                transcript
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .write_line(&format!("stderr: {text}"));
                                 transcript_bytes += line.len();
                             }
                         }

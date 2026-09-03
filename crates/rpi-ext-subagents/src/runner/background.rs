@@ -110,6 +110,61 @@ fn unregister_run(run_id: &str) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(run_id);
+    // Drop the per-run status-write gate with the run (V13-01 FR-C).
+    remove_status_gate(run_id);
+}
+
+// -------------------------------------------------------------------------
+// Status write coalescing (V13-01 FR-C)
+// -------------------------------------------------------------------------
+//
+// Port of upstream `writeStatusPayload(false)` + the 100ms FileCoalescer
+// (subagent-runner.ts:2286-2294, file-coalescer.ts): hot-path updates
+// (step status / activity fields that do NOT change `state`) coalesce at
+// 100ms; terminal transitions and ANY `state`-field change flush
+// synchronously (upstream `writeStatusPayload(immediate=true)`), so the
+// status.json on disk is always the last memory state once a run finishes
+// (FR-C R5). The gate is event-driven rather than a setTimeout timer —
+// final-equivalence holds via the immediate exits (deviation TE-D35).
+
+/// Coalescing window — same value as upstream FileCoalescer `100ms`.
+const STATUS_WRITE_GATE_MS: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Per-run gate: `last_write` of the previous successful disk write
+/// (`None` = never — the first update always writes) plus a `dirty` flag
+/// for the coalesced-later semantics.
+#[derive(Debug, Clone, Default)]
+struct StatusWriteGate {
+    last_write: Option<std::time::Instant>,
+    dirty: bool,
+}
+
+/// Side table keyed by run_id (keeps `AsyncRunHandle` field-free, so no
+/// struct-construction churn anywhere); pruned in `unregister_run`.
+static STATUS_GATES: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, StatusWriteGate>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Run `f` against the run's gate (creating it lazily) under one map lock.
+fn with_status_gate(run_id: &str, f: impl FnOnce(&mut StatusWriteGate)) {
+    let mut map = STATUS_GATES.lock().unwrap_or_else(|e| e.into_inner());
+    f(map.entry(run_id.to_string()).or_default());
+}
+
+fn remove_status_gate(run_id: &str) {
+    STATUS_GATES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(run_id);
+}
+
+/// The non-active terminal states (upstream status.model.raw.states
+/// terminal set): complete/failed/stopped/paused/rejected.
+fn is_terminal_state(state: &str) -> bool {
+    matches!(
+        state,
+        STATE_COMPLETE | STATE_FAILED | STATE_STOPPED | STATE_PAUSED | STATE_REJECTED
+    )
 }
 
 /// Terminal runs stay registered (the registry doc contract: "live and
@@ -198,9 +253,45 @@ pub fn status_snapshot(handle: &AsyncRunHandle) -> Value {
 
 fn update_status(handle: &AsyncRunHandle, mutate: impl FnOnce(&mut Value)) {
     let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+    let state_before = status.get("state").cloned();
     mutate(&mut status);
+    // R4: `updatedAt` refreshes on EVERY in-memory update — coalescing only
+    // affects the disk write frequency, not the document's freshness.
     status["updatedAt"] = json!(iso8601(now_millis()));
-    let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
+    let state_after = status.get("state").cloned();
+    // FR-C R2: terminal transitions and any `state`-field change flush
+    // synchronously (`writeStatusPayload(immediate=true)`); everything else
+    // coalesces at STATUS_WRITE_GATE_MS (FR-C R1).
+    let immediate = state_after != state_before
+        || state_after
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(is_terminal_state);
+    if immediate {
+        let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
+        with_status_gate(&handle.run_id, |gate| {
+            gate.last_write = Some(std::time::Instant::now());
+            gate.dirty = false;
+        });
+        return;
+    }
+    // Lock order: status write lock is held while taking the gate lock
+    // (R3: never the reverse) — the gate is a thin map lookup under the
+    // coalescing condition.
+    with_status_gate(&handle.run_id, |gate| {
+        let due = gate
+            .last_write
+            .is_none_or(|last| last.elapsed() >= STATUS_WRITE_GATE_MS);
+        if due {
+            let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
+            gate.last_write = Some(std::time::Instant::now());
+            gate.dirty = false;
+        } else {
+            // Deferred flush; the next due update coalesces this one, and
+            // the terminal/teardown immediate exits cover the tail (R5).
+            gate.dirty = true;
+        }
+    });
 }
 
 fn append_event(run_dir: &Path, event: &str, data: Value) {
@@ -1978,5 +2069,119 @@ pub(crate) mod tests {
             .join("no-such-run-id-xyz")
             .join("children.jsonl")
             .exists());
+    }
+
+    // ---- V13-01 FR-C: status write coalescing + terminal flush ---------
+
+    /// Builds an isolated handle whose status.json lives in a fresh temp
+    /// dir — deterministic, parallel-safe disk observations.
+    fn gate_test_handle(tag: &str) -> Arc<AsyncRunHandle> {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-gate-{tag}-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Arc::new(AsyncRunHandle {
+            run_id: format!("gate-{tag}-{}", crate::artifacts::now_millis()),
+            status: Arc::new(RwLock::new(json!({
+                "state": STATE_RUNNING,
+                "steps": [{"agent": "worker", "status": "pending"}],
+            }))),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: dir,
+            started_ms: crate::artifacts::now_millis(),
+        })
+    }
+
+    fn disk_status(handle: &AsyncRunHandle) -> String {
+        std::fs::read_to_string(handle.run_dir.join("status.json")).unwrap_or_default()
+    }
+
+    #[test]
+    fn status_writes_coalesce_at_gate_and_terminal_flushes() {
+        use std::io::Read;
+        let handle = gate_test_handle("coalesce");
+
+        // First write lands (gate never flushed → always due).
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+        });
+        let mut snapshot = std::fs::File::open(handle.run_dir.join("status.json")).unwrap();
+        let mut first = String::new();
+        snapshot.read_to_string(&mut first).unwrap();
+        assert!(first.contains("running"));
+
+        // 50 hot-path updates (no state change) inside the 100ms window:
+        // none may reach the disk — the file bytes stay byte-identical
+        // (pre-V13-01 every update rewrote it, changing updatedAt each time).
+        for i in 0..50 {
+            update_status(&handle, |status| {
+                status["steps"][0]["status"] = json!(format!("step-{i}"));
+            });
+        }
+        let now_file = disk_status(&handle);
+        assert_eq!(
+            now_file, first,
+            "50 gated updates must not rewrite status.json inside the window"
+        );
+        assert!(
+            handle.status.read().unwrap_or_else(|e| e.into_inner())["steps"][0]["status"]
+                == json!("step-49"),
+            "memory holds the latest value (coalescing never loses data)"
+        );
+
+        // A `state`-field transition flushes synchronously (FR-C R2/R5):
+        // the whole current memory doc — including all 50 coalesced updates
+        // and the final step value — lands on disk immediately.
+        update_status(&handle, |status| {
+            status["state"] = json!(STATE_COMPLETE);
+        });
+        let terminal = disk_status(&handle);
+        assert!(terminal.contains("\"complete\""), "{terminal}");
+        assert!(
+            terminal.contains("step-49"),
+            "final memory value persisted by the immediate terminal flush: {terminal}"
+        );
+
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    #[test]
+    fn status_gate_due_elapses_and_writes() {
+        let handle = gate_test_handle("due");
+        // Force the gate to "never written": the next non-immediate update
+        // must write immediately (first-write guarantee).
+        with_status_gate(&handle.run_id, |gate| {
+            gate.last_write = None;
+            gate.dirty = false;
+        });
+        update_status(&handle, |status| {
+            status["steps"][0]["status"] = json!("running");
+        });
+        assert!(
+            disk_status(&handle).contains("\"running\""),
+            "due gate writes"
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    #[test]
+    fn status_gate_state_field_change_flushes_immediately() {
+        let handle = gate_test_handle("statechange");
+        // running → queued is a state-field change (non-terminal): must
+        // still flush synchronously (FR-C R2).
+        update_status(&handle, |status| {
+            status["state"] = json!(STATE_QUEUED);
+        });
+        assert!(
+            disk_status(&handle).contains("\"queued\""),
+            "state-field change flushes synchronously even inside the window"
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
     }
 }
