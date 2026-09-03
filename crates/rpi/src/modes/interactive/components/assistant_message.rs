@@ -99,7 +99,7 @@ impl AssistantMessageComponent {
             is_streaming: false,
         };
         if let Some(message) = message {
-            component.update_content(message, false);
+            component.update_content(&message, false);
         }
         component
     }
@@ -108,7 +108,7 @@ impl AssistantMessageComponent {
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
         self.hide_thinking_block = hide;
         if let Some(message) = self.last_message.clone() {
-            self.update_content(message, self.is_streaming);
+            self.update_content(&message, self.is_streaming);
         }
     }
 
@@ -116,7 +116,7 @@ impl AssistantMessageComponent {
     pub fn set_hidden_thinking_label(&mut self, label: impl Into<String>) {
         self.hidden_thinking_label = label.into();
         if let Some(message) = self.last_message.clone() {
-            self.update_content(message, self.is_streaming);
+            self.update_content(&message, self.is_streaming);
         }
     }
 
@@ -124,7 +124,7 @@ impl AssistantMessageComponent {
     pub fn set_output_pad(&mut self, padding: usize) {
         self.output_pad = padding;
         if let Some(message) = self.last_message.clone() {
-            self.update_content(message, self.is_streaming);
+            self.update_content(&message, self.is_streaming);
         }
     }
 
@@ -138,7 +138,7 @@ impl AssistantMessageComponent {
     /// visible fingerprint is unchanged (a write/edit streaming its args —
     /// no text/thinking/stop changes), the rebuild is skipped and only the
     /// stored message is refreshed.
-    pub fn update_content(&mut self, message: AssistantMessage, is_streaming: bool) {
+    pub fn update_content(&mut self, message: &AssistantMessage, is_streaming: bool) {
         self.is_streaming = is_streaming;
 
         let signature = (
@@ -164,12 +164,14 @@ impl AssistantMessageComponent {
                 })
                 .collect::<Vec<_>>(),
         );
+        // FR-B R1 (V13-06): the message is borrowed — exactly one clone here
+        // stores `last_message`; callers no longer clone before calling.
         if self.last_signature.as_ref() == Some(&signature) {
-            self.last_message = Some(message);
+            self.last_message = Some(message.clone());
             return;
         }
         self.last_signature = Some(signature);
-        self.last_message = Some(message);
+        self.last_message = Some(message.clone());
         let message = self.last_message.as_ref().expect("stored above");
         #[cfg(test)]
         REBUILD_COUNT.with(|count| count.set(count.get() + 1));
@@ -372,7 +374,7 @@ impl Component for AssistantMessageComponent {
     fn invalidate(&mut self) {
         self.content_container.invalidate();
         if let Some(message) = self.last_message.clone() {
-            self.update_content(message, self.is_streaming);
+            self.update_content(&message, self.is_streaming);
         }
     }
 }
@@ -472,7 +474,7 @@ mod tests {
         REBUILD_COUNT.with(|count| count.set(0));
         // Visible text first — rebuilds.
         component.update_content(
-            message(vec![text("Writing the file:"), tool_call(10)]),
+            &message(vec![text("Writing the file:"), tool_call(10)]),
             true,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 1);
@@ -480,7 +482,7 @@ mod tests {
         // 300 tool-args-only deltas: no further rebuilds.
         for len in 11..=310 {
             component.update_content(
-                message(vec![text("Writing the file:"), tool_call(len)]),
+                &message(vec![text("Writing the file:"), tool_call(len)]),
                 true,
             );
         }
@@ -496,14 +498,14 @@ mod tests {
 
         // isStreaming transition (message_end) rebuilds exactly once more.
         component.update_content(
-            message(vec![text("Writing the file:"), tool_call(310)]),
+            &message(vec![text("Writing the file:"), tool_call(310)]),
             false,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 2);
 
         // A text delta rebuilds.
         component.update_content(
-            message(vec![text("Writing the file: done"), tool_call(310)]),
+            &message(vec![text("Writing the file: done"), tool_call(310)]),
             false,
         );
         assert_eq!(REBUILD_COUNT.with(|c| c.get()), 3);
@@ -558,7 +560,7 @@ mod tests {
 
         // Tool calls disable the OSC markers (rendered separately).
         component.update_content(
-            message(vec![
+            &message(vec![
                 text("hi"),
                 AssistantContent::ToolCall(Default::default()),
             ]),
@@ -767,7 +769,7 @@ mod tests {
                 md
             })],
         );
-        component.update_content(message(vec![thinking("deep")]), true);
+        component.update_content(&message(vec![thinking("deep")]), true);
         let _ = component.render(50);
         let calls = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert_eq!(calls.len(), 1);

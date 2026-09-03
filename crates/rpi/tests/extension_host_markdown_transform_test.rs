@@ -127,7 +127,7 @@ async fn markdown_transformers_chain_through_runner_into_assistant_rendering() {
         1,
         runner.get_markdown_transformers(),
     );
-    streaming_component.update_content(assistant_message("stream"), true);
+    streaming_component.update_content(&assistant_message("stream"), true);
     let stripped = strip_ansi(&streaming_component.render(80).join("\n"));
     assert!(stripped.contains("[b][a]stream"), "stripped: {stripped}");
 

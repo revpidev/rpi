@@ -1515,9 +1515,27 @@ impl InteractiveUi {
 
     /// Apply all queued commands. Runs on the driver thread between `pump`
     /// calls (or directly in tests); never from inside a component callback.
+    ///
+    /// V13-06 FR-A: consecutive `MessageUpdate` commands are folded — only
+    /// the LAST of a same-kind run survives (the final message in a drain is
+    /// the latest accumulated state; rendering the intermediates is wasted
+    /// work since only the last rebuild is ever drawn at the 16ms frame
+    /// tick). Any other command kind breaks the run (segmented folding —
+    /// event ordering is untouched), and `MessageStart`/`MessageEnd`/
+    /// `AgentEnd` are never swallowed: the update immediately before
+    /// `MessageEnd` is still processed first (ordering preserved).
     pub(crate) fn drain_events(&self) {
         let commands: Vec<UiCommand> = lock(&self.event_queue).drain(..).collect();
+        let mut folded: Vec<UiCommand> = Vec::with_capacity(commands.len());
         for command in commands {
+            if matches!(command, UiCommand::MessageUpdate(_))
+                && matches!(folded.last(), Some(UiCommand::MessageUpdate(_)))
+            {
+                folded.pop();
+            }
+            folded.push(command);
+        }
+        for command in folded {
             self.handle_command(command);
         }
     }
@@ -1619,7 +1637,7 @@ impl InteractiveUi {
                             );
                         // streaming component: `updateContent(message, true)`
                         // (interactive-mode.ts:3140).
-                        component.update_content(assistant.clone(), true);
+                        component.update_content(assistant, true);
                         let handle = Arc::new(Mutex::new(component));
                         let entry_address =
                             self.add_chat_child(Box::new(SharedChild(handle.clone())));
@@ -1638,7 +1656,7 @@ impl InteractiveUi {
                     if let Some(track) = lock(&self.streaming).as_ref() {
                         // interactive-mode.ts:3148: streaming updates pass
                         // isStreaming = true.
-                        lock(&track.handle).update_content(assistant.clone(), true);
+                        lock(&track.handle).update_content(assistant, true);
                         for content in &assistant.content {
                             if let AssistantContent::ToolCall(tool_call) = content {
                                 let mut pending_tools = lock(&self.pending_tools);
@@ -1698,7 +1716,7 @@ impl InteractiveUi {
                         }
                         // interactive-mode.ts:3193: message_end updates with
                         // isStreaming = false.
-                        component.update_content(assistant, false);
+                        component.update_content(&assistant, false);
                         drop(component);
 
                         if stop_is_error {
@@ -5413,6 +5431,108 @@ mod tests {
         lock(&tool).set_expanded(true);
         let rendered = lock(&tool).render(60).join("\n");
         assert!(rendered.contains("a.txt"), "args updated: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn v1306_drain_folds_consecutive_message_updates_to_last() {
+        // FR-A: K consecutive MessageUpdates in one drain fold to the LAST —
+        // only it is processed (renders the final accumulated message; the
+        // intermediates' tool components never get created, proof they were
+        // folded rather than merely skipped by a fingerprint).
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let mk = |text: &str, tool_id: &str| {
+            assistant_message(
+                vec![text_content(text), tool_call_content(tool_id, "read")],
+                StopReason::Pending,
+            )
+        };
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        // Three updates in the SAME drain: only the last survives.
+        ui.push(UiCommand::MessageUpdate(mk("alpha", "call_a")));
+        ui.push(UiCommand::MessageUpdate(mk("beta", "call_b")));
+        ui.push(UiCommand::MessageUpdate(mk("gamma", "call_c")));
+        ui.drain_events();
+
+        // Streaming + ONLY the last update's tool component (fold dropped
+        // `call_a`/`call_b` entirely — a per-update pipeline would have 3).
+        assert_eq!(chat_children(ui), 2, "folded to the final update");
+        assert!(lock(&ui.pending_tools).contains_key("call_c"));
+        assert!(!lock(&ui.pending_tools).contains_key("call_a"));
+        assert!(!lock(&ui.pending_tools).contains_key("call_b"));
+        // The rendered streaming text is the LAST update's.
+        let streamed = lock(&ui.streaming);
+        let rendered = lock(&streamed.as_ref().unwrap().handle)
+            .render(100)
+            .join("\n");
+        assert!(rendered.contains("gamma"), "{rendered}");
+        assert!(!rendered.contains("alpha"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn v1306_drain_folds_segment_by_other_commands() {
+        // FR-A R1: a different command kind breaks the run — each segment
+        // folds independently and all event kinds stay processed in order.
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let mk = |tool_id: &str| {
+            assistant_message(
+                vec![text_content("seg"), tool_call_content(tool_id, "read")],
+                StopReason::Pending,
+            )
+        };
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageUpdate(mk("call_1")));
+        ui.push(UiCommand::MessageUpdate(mk("call_1"))); // second same-id (fold within segment)
+        ui.push(UiCommand::TurnStart); // no-op command breaks the run
+        ui.push(UiCommand::MessageUpdate(mk("call_2")));
+        ui.push(UiCommand::MessageUpdate(mk("call_2"))); // fold within second segment
+        ui.drain_events();
+
+        // Both segments' last updates were processed → BOTH tool components
+        // exist (a fold-all implementation would lose call_1).
+        assert!(lock(&ui.pending_tools).contains_key("call_1"));
+        assert!(lock(&ui.pending_tools).contains_key("call_2"));
+        assert_eq!(chat_children(ui), 3, "streaming + call_1 + call_2");
+    }
+
+    #[tokio::test]
+    async fn v1306_drain_keeps_update_before_message_end_and_empty_single_noop() {
+        // FR-A R2/R4: MessageEnd is never folded with the update before it;
+        // the last update is processed first, then the end. Empty / single
+        // drains are no-ops.
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("start")],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageUpdate(assistant_message(
+            vec![text_content("final text")],
+            StopReason::Pending,
+        )));
+        ui.push(UiCommand::MessageEnd(assistant_message(
+            vec![text_content("final text")],
+            StopReason::Stop,
+        )));
+        ui.drain_events();
+        // MessageEnd consumed the streaming track (taken) → folding must not
+        // have eaten either command.
+        assert!(lock(&ui.streaming).is_none(), "MessageEnd still processed");
+        // The component in chat now holds the final content.
+        let lines = chat_children(ui);
+        assert!(lines >= 1, "chat has the streamed message");
+
+        // Empty and single drains don't regress.
+        ui.drain_events();
+        ui.push(UiCommand::AgentStart);
+        ui.drain_events();
     }
 
     #[tokio::test]
