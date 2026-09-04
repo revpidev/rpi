@@ -286,4 +286,4 @@ jobs:
           # the version bump, reflowed by the step above. A re-push also
           # refreshes the notes (errata to an already-published changelog
           # land on the Release page too).
-          body_file: release-notes.md
+          body_path: release-notes.md

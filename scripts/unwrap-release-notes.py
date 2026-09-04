@@ -104,6 +104,15 @@ def main() -> int:
     if len(sys.argv) != 2:
         print(__doc__, file=sys.stderr)
         return 2
+    # Windows runners default redirected stdout to the cp1252 locale codec
+    # (UnicodeEncodeError on CJK notes) and translate \n to \r\n; force
+    # UTF-8 with LF so the emitted release notes are byte-identical on
+    # every target. reconfigure is 3.7+; stdout without it (e.g. a
+    # StringIO under test) already behaves.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    except AttributeError:
+        pass
     with open(sys.argv[1], encoding="utf-8") as handle:
         print(unwrap(handle.read()), end="")
     return 0
