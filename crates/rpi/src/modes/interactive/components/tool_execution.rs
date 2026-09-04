@@ -515,18 +515,32 @@ impl ToolExecutionComponent {
                     // composition (tool-execution.ts:66-68).
                     self.content_box.set_bg_fn(Some(bg_fn));
                     self.content_box.clear();
+                    // The result component is BUILT before the call component
+                    // (V13-11, rpi#18): a renderer's `renderResult` may
+                    // backfill shared state that its own `renderCall` reads
+                    // — upstream `edit.ts:416-424` rebuilds the call
+                    // component in place after backfilling, which in the
+                    // rebuild-per-update port (T17) maps to building the
+                    // call component after the result side effect has
+                    // landed. Adding order stays call → result; all other
+                    // renderers are stateless across the two hooks, so the
+                    // swap is unobservable for them.
+                    let result_component = self.render_result_component();
                     self.content_box.add_child(self.render_call_component());
-                    if let Some(component) = self.render_result_component() {
+                    if let Some(component) = result_component {
                         self.content_box.add_child(component);
                     }
                 }
                 RenderShell::Self_ => {
                     // selfRenderContainer is used when the tool renders its
-                    // own framing (tool-execution.ts:66-68).
+                    // own framing (tool-execution.ts:66-68). Same
+                    // result-before-call BUILD order as the Default shell
+                    // (see the note above, V13-11).
                     self.self_render_container.clear();
+                    let result_component = self.render_result_component();
                     self.self_render_container
                         .add_child(self.render_call_component());
-                    if let Some(component) = self.render_result_component() {
+                    if let Some(component) = result_component {
                         self.self_render_container.add_child(component);
                     }
                 }
@@ -984,5 +998,160 @@ mod tests {
         // tool with no definition at all → the default box.
         assert_eq!(with_shell(None).get_render_shell(), RenderShell::Self_);
         assert_eq!(make_component().get_render_shell(), RenderShell::Default);
+    }
+
+    /// Temp dir for the V13-11 edit-preview tests (the preview reads the
+    /// file from disk, so each test needs its own state).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "rpi-tool-exec-v13-11-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock before epoch")
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempDir(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The header line ("edit <path>") with its background asserted — the
+    /// edit TuiBox pads by one cell, so the header is not lines[0].
+    fn assert_header_bg(lines: &[String], theme: &Theme, bg: &str) {
+        let header = lines
+            .iter()
+            .find(|l| strip_ansi(l).contains("edit src.txt"))
+            .unwrap_or_else(|| panic!("header line not found in {lines:?}"));
+        assert!(
+            header.starts_with(theme.get_bg_ansi(bg)),
+            "expected {bg} header, got: {header:?}"
+        );
+    }
+
+    fn make_edit_component(
+        tmp: &TempDir,
+        old_text: &str,
+        new_text: &str,
+    ) -> (ToolExecutionComponent, Arc<Theme>) {
+        let theme = theme();
+        let component = ToolExecutionComponent::new(
+            "edit",
+            "call_1",
+            serde_json::json!({
+                "path": "src.txt",
+                "edits": [{"oldText": old_text, "newText": new_text}]
+            }),
+            ToolExecutionOptions::default(),
+            None,
+            Arc::clone(&theme),
+            RenderHandle::new(|| {}),
+            tmp.path().to_string_lossy().into_owned(),
+        );
+        (component, theme)
+    }
+
+    fn successful_edit_result() -> ToolResultState {
+        ToolResultState {
+            content: vec![],
+            is_error: false,
+            details: Some(serde_json::json!({
+                "diff": "-1 Hello, world!\n+1 Hello, testing!",
+                "firstChangedLine": 1,
+            })),
+        }
+    }
+
+    /// V13-11 (rpi#18), race reproduction: the file on disk is the POST-edit
+    /// content — the agent thread wrote it before the UI drained `MessageEnd`,
+    /// so `set_args_complete` computes the preview against the edited file
+    /// and `oldText` no longer matches → not-found error preview. The
+    /// successful result then arrives; ONE `update_result` pass must show the
+    /// backfilled diff instead of the stale error (building the call
+    /// component before the result side effect froze the error on screen
+    /// forever — the port missed upstream's in-place rebuild, edit.ts:416-424).
+    #[test]
+    fn edit_result_backfill_corrects_racy_error_preview() {
+        let tmp = TempDir::new("race");
+        // Simulate the race: "world" was already replaced by "testing".
+        std::fs::write(tmp.path().join("src.txt"), "Hello, testing!").unwrap();
+        let (mut component, theme) = make_edit_component(&tmp, "world", "testing");
+
+        // argsComplete computes the preview synchronously: "world" is
+        // absent from the post-edit file → error preview (issue #18 shows
+        // "Could not find edits[0] …").
+        component.set_args_complete();
+        let lines = component.render(80);
+        let stripped = strip_ansi(&lines.join("\n"));
+        assert!(
+            stripped.contains("Could not find"),
+            "race not reproduced — no error preview: {stripped}"
+        );
+        assert_header_bg(&lines, &theme, "toolErrorBg");
+
+        // The edit did land on disk; the successful result carries the diff.
+        component.update_result(successful_edit_result(), false);
+        let lines = component.render(80);
+        let stripped = strip_ansi(&lines.join("\n"));
+        assert!(
+            stripped.contains("-1 Hello, world!"),
+            "backfilled diff missing: {stripped}"
+        );
+        assert!(
+            stripped.contains("+1 Hello, testing!"),
+            "backfilled diff missing: {stripped}"
+        );
+        assert!(
+            !stripped.contains("Could not find"),
+            "stale error preview survived the result (rpi#18): {stripped}"
+        );
+        assert_header_bg(&lines, &theme, "toolSuccessBg");
+    }
+
+    /// V13-11 (rpi#18), true not-found variant: the preview error is real
+    /// (the oldText never existed), and a successful result with a diff
+    /// still overwrites it in the same `update_display` pass — upstream's
+    /// `setEditPreview` backfill is unconditional on success
+    /// (edit.ts:400-411).
+    #[test]
+    fn edit_result_backfill_corrects_true_not_found_preview() {
+        let tmp = TempDir::new("not-found");
+        std::fs::write(tmp.path().join("src.txt"), "Hello, world!").unwrap();
+        let (mut component, theme) = make_edit_component(&tmp, "missing", "testing");
+
+        component.set_args_complete();
+        let lines = component.render(80);
+        let stripped = strip_ansi(&lines.join("\n"));
+        assert!(
+            stripped.contains("Could not find"),
+            "expected a true not-found preview: {stripped}"
+        );
+        assert_header_bg(&lines, &theme, "toolErrorBg");
+
+        component.update_result(successful_edit_result(), false);
+        let lines = component.render(80);
+        let stripped = strip_ansi(&lines.join("\n"));
+        assert!(
+            stripped.contains("-1 Hello, world!") && stripped.contains("+1 Hello, testing!"),
+            "backfilled diff missing: {stripped}"
+        );
+        assert!(
+            !stripped.contains("Could not find"),
+            "stale error preview survived the result: {stripped}"
+        );
+        assert_header_bg(&lines, &theme, "toolSuccessBg");
     }
 }

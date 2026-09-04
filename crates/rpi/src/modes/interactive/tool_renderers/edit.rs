@@ -15,8 +15,14 @@
 //! - Upstream keeps the call component in `EditRenderState.callComponent`
 //!   and reuses it through `context.lastComponent` (edit.ts:166-178,
 //!   tool-execution.ts:117-124); here the state holds only the preview
-//!   fields and the visual component is rebuilt from them on every update
-//!   (same pattern as the bash renderer, T17).
+//!   fields and the visual component is rebuilt from them on every
+//!   `ToolExecutionComponent::update_display` (same pattern as the bash
+//!   renderer, T17). Because the rebuild is event-driven (update_display is
+//!   called by the args/result/… setters, not every frame), a `renderResult`
+//!   backfill only reaches the call component when the call component is
+//!   BUILT after the result side effect — `update_display` builds the
+//!   result component before the call component for exactly this reason
+//!   (V13-11, mirroring upstream's in-place rebuild, edit.ts:416-424).
 //! - `renderResult` always returns the result [`Container`] — empty when
 //!   `formatEditResult` yields nothing — because `None` would fall through
 //!   to the generic fallback and print the success text (upstream write/edit
@@ -430,9 +436,12 @@ impl ToolDefinition for EditToolRenderer {
         }
 
         // Upstream rebuilds the call component when the preview/settledError
-        // changed (edit.ts:416-424); here the call component is rebuilt from
-        // state on every update (T17), so the result frame already shows the
-        // backfilled preview.
+        // changed (edit.ts:416-424). Here the backfill takes effect through
+        // `update_display`'s result-before-call build order (V13-11): this
+        // `renderResult` runs while building the RESULT component, and the
+        // call component is built afterwards from the backfilled state —
+        // building it first (as before V13-11) froze the pre-result preview
+        // on screen forever (rpi#18).
 
         let output = format_edit_result(
             &context.args,
