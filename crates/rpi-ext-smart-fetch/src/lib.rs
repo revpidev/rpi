@@ -27,7 +27,7 @@ pub mod runtime;
 pub mod settings;
 pub mod types;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
@@ -45,12 +45,31 @@ use crate::types::{FetchOutcome, WebFetchParams};
 /// frames themselves are a render-side concern (render.rs `SPINNER_FRAMES`).
 const SPINNER_INTERVAL_MS: u64 = 100;
 
+/// Host-call channel to the CURRENT extension host (mcp-adapter lib.rs
+/// precedent). `RawLibrary::load_at` dlopen-memoizes per path, so a session
+/// switch re-runs `install` on the same statics — the channel must follow
+/// the newest host or calls go through the replaced host's freed cookie.
+#[derive(Clone, Copy)]
+struct HostChannel {
+    call: extern "C" fn(PluginCookie, RVec<u8>) -> RVec<u8>,
+    cookie: usize,
+}
+
 /// Plugin state established once by `rpi_extension_init`.
 struct PluginState {
     runtime: PluginRuntime,
-    /// Host handle for the per-execute `ctx.cwd` lookup (FR-P1-5). `None` in
-    /// test installs that never registered through a real host.
-    host: Option<(RpiHostCalls, usize)>,
+    /// Rebindable host channel for the per-execute `ctx.cwd` lookup
+    /// (FR-P1-5) and streaming `toolUpdate` pushes. `None` in test
+    /// installs that never registered through a real host.
+    host: RwLock<Option<HostChannel>>,
+}
+
+impl PluginState {
+    /// The current host channel (read at call time so executes never act
+    /// on a stale, dropped host).
+    fn channel(&self) -> Option<HostChannel> {
+        *self.host.read().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
@@ -193,9 +212,6 @@ fn batch_tool_parameters_schema() -> Value {
 
 fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     let cookie = cookie as usize;
-    let Some(plugin_runtime) = PluginRuntime::new() else {
-        return json!({"error": {"kind": "init", "message": "failed to start plugin tokio runtime"}});
-    };
     let register = |args: Value| -> Result<(), Value> {
         let request = serde_json::to_vec(&json!({"call": "registerTool", "args": args, "seq": 0}))
             .unwrap_or_default();
@@ -235,14 +251,36 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         return json!({"error": {"kind": "init", "message": error.to_string()}});
     }
 
+    let Some(plugin_runtime) = PluginRuntime::new() else {
+        return json!({"error": {"kind": "init", "message": "failed to start plugin tokio runtime"}});
+    };
     match STATE.set(PluginState {
         runtime: plugin_runtime,
-        host: Some((calls, cookie)),
+        host: RwLock::new(Some(HostChannel {
+            call: calls.call,
+            cookie,
+        })),
     }) {
-        Ok(()) => json!({"ok": true}),
-        // Idempotent init (ambient + explicit load): first instance serves.
-        Err(_) => json!({"ok": true}),
+        Ok(()) => {}
+        // Rebind (mcp-adapter / subagents session-switch discipline): a
+        // second install on a fresh `NativeExtensionHost` (session
+        // replacement via `/resume` `/new` `/fork` `/clone` `/import`
+        // re-loads this same dlopen-memoized cdylib) adopts the NEW host
+        // channel — the replaced host is dropped once the outgoing session
+        // goes away, and its cookie dangles, so every later `ctx.cwd`
+        // lookup and streaming `toolUpdate` push must go through the
+        // newest binding. The tool registrations above already ran
+        // against this host.
+        Err(_) => {
+            if let Some(state) = STATE.get() {
+                *state.host.write().unwrap_or_else(|e| e.into_inner()) = Some(HostChannel {
+                    call: calls.call,
+                    cookie,
+                });
+            }
+        }
     }
+    json!({"ok": true})
 }
 
 /// The per-execute runtime state (index.ts:496-499 / 684-687): settings are
@@ -250,12 +288,11 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
 /// and folded into tool defaults.
 fn resolve_runtime(state: &PluginState) -> (ResolvedSettings, FetchToolDefaults) {
     let cwd = state
-        .host
-        .as_ref()
-        .and_then(|(calls, cookie)| {
+        .channel()
+        .and_then(|channel| {
             let request = serde_json::to_vec(&json!({"call": "ctx.cwd", "args": {}, "seq": 0}))
                 .unwrap_or_default();
-            let response = (calls.call)(*cookie as PluginCookie, RVec::from(request));
+            let response = (channel.call)(channel.cookie as PluginCookie, RVec::from(request));
             let response: Value = serde_json::from_slice(&response[..]).unwrap_or(Value::Null);
             response
                 .get("ok")
@@ -492,13 +529,11 @@ fn execute_web_fetch(params: &Value, state: &PluginState, tool_call_id: Option<&
     let opts = batch::build_fetch_options_from_params(&parsed_params, &defaults);
 
     // FR-P2-B/D: the streaming layer exists only under a real dispatch id.
-    let sink = tool_call_id.and_then(|id| {
-        state.host.as_ref().map(|(calls, cookie)| {
-            Arc::new(UpdateSink {
-                call: calls.call,
-                cookie: *cookie,
-                tool_call_id: id.to_string(),
-            })
+    let sink = tool_call_id.zip(state.channel()).map(|(id, channel)| {
+        Arc::new(UpdateSink {
+            call: channel.call,
+            cookie: channel.cookie,
+            tool_call_id: id.to_string(),
         })
     });
     let latest = Arc::new(Mutex::new(WebFetchRenderDetails::initial(
@@ -693,13 +728,11 @@ fn execute_batch_web_fetch(
     let verbose = parsed.verbose.unwrap_or(resolved.verbose_by_default);
 
     // FR-P2-B/D: same streaming gate as web_fetch — a real dispatch id.
-    let sink = tool_call_id.and_then(|id| {
-        state.host.as_ref().map(|(calls, cookie)| {
-            Arc::new(UpdateSink {
-                call: calls.call,
-                cookie: *cookie,
-                tool_call_id: id.to_string(),
-            })
+    let sink = tool_call_id.zip(state.channel()).map(|(id, channel)| {
+        Arc::new(UpdateSink {
+            call: channel.call,
+            cookie: channel.cookie,
+            tool_call_id: id.to_string(),
         })
     });
     let latest: Arc<Mutex<Option<crate::batch::BatchFetchProgressSnapshot>>> =

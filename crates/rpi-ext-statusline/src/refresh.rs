@@ -74,7 +74,14 @@ struct CtxData {
 }
 
 /// Run the refresh loop until `Trigger::Shutdown` (or every senders drop).
-pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigger>) {
+/// `shared` is the rebindable host channel (lib.rs `CHANNEL`): read at the
+/// top of every iteration so a session-switch rebind takes effect on the
+/// next trigger/tick — never pushing through a replaced host's freed
+/// cookie.
+pub async fn refresh_loop(
+    shared: std::sync::Arc<std::sync::RwLock<AsyncHostCalls>>,
+    mut rx: UnboundedReceiver<Trigger>,
+) {
     let (done_tx, mut done_rx): (UnboundedSender<ScriptDone>, UnboundedReceiver<ScriptDone>) =
         tokio::sync::mpsc::unbounded_channel();
     let mut inflight: Option<CancelToken> = None;
@@ -92,6 +99,8 @@ pub async fn refresh_loop(calls: AsyncHostCalls, mut rx: UnboundedReceiver<Trigg
     let mut last_live_fingerprint: Option<String> = None;
 
     loop {
+        // The current host channel (rebind-aware; see the fn doc).
+        let calls = *shared.read().unwrap_or_else(|error| error.into_inner());
         // Copy the deadline into the future (Option<Instant> is Copy) so
         // the loop body may reassign `interval_deadline` while the pinned
         // future is still alive.

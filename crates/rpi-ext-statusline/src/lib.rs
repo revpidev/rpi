@@ -26,7 +26,7 @@ pub mod runner;
 pub mod runtime;
 pub mod state;
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
@@ -64,12 +64,19 @@ const LIVE_EVENTS: &[&str] = &["message_start", "message_update"];
 /// dropping the runtime would park the refresh loop.
 #[allow(dead_code)]
 struct PluginState {
-    calls: RpiHostCalls,
-    cookie: usize,
     runtime: PluginRuntime,
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
+
+/// The refresh loop's host channel, REBINDABLE across hosts (mcp-adapter /
+/// subagents session-switch discipline): a session replacement (`/resume`
+/// `/new` `/fork` `/clone` `/import`) re-loads this same dlopen-memoized
+/// cdylib on a fresh `NativeExtensionHost`, and the replaced host is
+/// dropped once the outgoing session goes away — the loop must push
+/// through the newest channel or every footer write after `/resume`
+/// dangles on the freed cookie.
+static CHANNEL: OnceLock<Arc<RwLock<AsyncHostCalls>>> = OnceLock::new();
 
 /// Shared engine state: dispatch thread writes (usage accumulation,
 /// session lifecycle), refresh loop reads (snapshot) / writes (mounted
@@ -77,8 +84,10 @@ static STATE: OnceLock<PluginState> = OnceLock::new();
 pub(crate) static ENGINE: OnceLock<Mutex<EngineState>> = OnceLock::new();
 
 /// Trigger channel sender stashed at install so the sync dispatch path can
-/// wake the async refresh loop.
-static TRIGGERS: OnceLock<tokio::sync::mpsc::UnboundedSender<Trigger>> = OnceLock::new();
+/// wake the async refresh loop. Mutex-wrapped: a rebind replaces the sender
+/// together with the restarted loop (the previous loop broke on
+/// `session_shutdown`).
+static TRIGGERS: OnceLock<Mutex<tokio::sync::mpsc::UnboundedSender<Trigger>>> = OnceLock::new();
 
 /// Clonable host-call channel for background tasks (subagents lib.rs:70-95
 /// precedent, verbatim): the refresh loop outlives the install dispatch
@@ -112,22 +121,13 @@ pub(crate) fn host_ok(channel: &AsyncHostCalls, method: &str, args: Value) -> Op
     Some(response.get("ok").cloned().unwrap_or(Value::Null))
 }
 
-/// Install: start the runtime, subscribe to the session events, spawn the
-/// refresh loop. Idempotent (a second init reports success without
-/// re-arming).
+/// Install: subscribe to the session events, spawn the refresh loop. A
+/// second init (session replacement re-loading the same dlopen-memoized
+/// cdylib on a fresh host) RE-BINDS: re-subscribes the events (the fresh
+/// host registry is empty — without this every statusline event dies
+/// after `/resume`), adopts the new channel and restarts the refresh loop
+/// (the outgoing host's `session_shutdown` broke the previous one).
 fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
-    if STATE.get().is_some() {
-        return json!({"ok": true});
-    }
-    let runtime = match PluginRuntime::start() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            return json!({"error": {
-                "kind": "internal",
-                "message": format!("statusline runtime start failed: {error}"),
-            }})
-        }
-    };
     let channel = AsyncHostCalls {
         call: calls.call,
         cookie: cookie as usize,
@@ -149,18 +149,50 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             }
         }
     }
+
+    // Rebind: newest host wins (see CHANNEL). The loop restart shares the
+    // engine state — the new session's `session_start` event resets the
+    // per-session fields.
+    if let Some(state) = STATE.get() {
+        *CHANNEL
+            .get()
+            .expect("channel cell installed with the first state")
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = channel;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *TRIGGERS
+            .get()
+            .expect("trigger cell installed with the first state")
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = tx;
+        state.runtime.spawn(refresh::refresh_loop(
+            Arc::clone(CHANNEL.get().expect("channel cell")),
+            rx,
+        ));
+        return json!({"ok": true});
+    }
+
+    let runtime = match PluginRuntime::start() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return json!({"error": {
+                "kind": "internal",
+                "message": format!("statusline runtime start failed: {error}"),
+            }})
+        }
+    };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let _ = TRIGGERS.set(tx);
+    let _ = TRIGGERS.set(Mutex::new(tx));
     let _ = ENGINE.set(Mutex::new(EngineState::default()));
+    let _ = CHANNEL.set(Arc::new(RwLock::new(channel)));
     if live_tokens_enabled {
         with_engine(|engine| engine.arm_live_measure());
     }
-    runtime.spawn(refresh::refresh_loop(channel, rx));
-    let _ = STATE.set(PluginState {
-        calls,
-        cookie: cookie as usize,
-        runtime,
-    });
+    runtime.spawn(refresh::refresh_loop(
+        Arc::clone(CHANNEL.get().expect("channel cell just set")),
+        rx,
+    ));
+    let _ = STATE.set(PluginState { runtime });
     json!({"ok": true})
 }
 
@@ -217,8 +249,11 @@ fn handle_dispatch(message: &Value) -> Value {
         "tool_execution_end" => Trigger::Event("tool_execution_end"),
         _ => return Value::Null,
     };
-    if let Some(tx) = TRIGGERS.get() {
-        let _ = tx.send(trigger);
+    if let Some(cell) = TRIGGERS.get() {
+        let _ = cell
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .send(trigger);
     }
     Value::Null
 }
