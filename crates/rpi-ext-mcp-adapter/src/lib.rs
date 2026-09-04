@@ -37,7 +37,7 @@ pub mod status;
 pub mod tsshape;
 pub mod utils;
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable::prefix_type::PrefixTypeTrait;
 use abi_stable::std_types::RVec;
@@ -47,18 +47,47 @@ use serde_json::{json, Value};
 use crate::direct::ToolSurface as _;
 use crate::proxy::ProxyDispatcher;
 
-/// Host-call handle + plugin-owned tokio runtime, established once by
-/// `rpi_extension_init` and torn down on `session_shutdown` (design §2.3).
-///
-/// The cookie is stored as `usize` so `PluginState` stays `Send + Sync`
-/// without an unsafe impl; it is an opaque host pointer that only ever
-/// travels back into the host's trampoline unchanged.
-struct PluginState {
-    calls: RpiHostCalls,
+/// Host-call channel to the CURRENT extension host. `RawLibrary::load_at`
+/// dlopen-memoizes per path, so a second host in the same process re-runs
+/// `install` on the SAME plugin statics — the channel (fn-pointer +
+/// cookie) must follow the newest host while the tokio runtime and the
+/// dispatcher stay process-lifetime (see `install`).
+#[derive(Clone, Copy)]
+struct HostChannel {
+    call: extern "C" fn(PluginCookie, RVec<u8>) -> RVec<u8>,
     cookie: usize,
+}
+
+impl HostChannel {
+    /// Re-wrap the trampoline fn-pointer into the ABI handle.
+    fn calls(&self) -> RpiHostCalls {
+        RpiHostCalls { call: self.call }
+    }
+}
+
+/// Host-call handle + plugin-owned tokio runtime, established once by
+/// `rpi_extension_init`. The cookie is stored as `usize` so `PluginState`
+/// stays `Send + Sync` without an unsafe impl; it is an opaque host pointer
+/// that only ever travels back into the host's trampoline unchanged.
+struct PluginState {
+    host: RwLock<HostChannel>,
     runtime: runtime::PluginRuntime,
     dispatcher: Arc<ProxyDispatcher>,
     direct: Arc<Mutex<DirectSurface>>,
+}
+
+impl PluginState {
+    /// The current host channel (read at call time so background tasks and
+    /// dispatcher hooks never act on a stale, dropped host).
+    fn channel(&self) -> HostChannel {
+        *self.host.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Adopt a freshly loaded host (session replacement: `/resume` `/new`
+    /// `/fork` `/clone` `/import` build a fresh `NativeExtensionHost`).
+    fn rebind(&self, channel: HostChannel) {
+        *self.host.write().unwrap_or_else(|e| e.into_inner()) = channel;
+    }
 }
 
 /// directTools surface state (index.ts install-scope variables):
@@ -121,6 +150,7 @@ impl crate::direct::ToolSurface for HostSurface<'_> {
 /// current config + cache, sync the surface, then apply the proxy-tool
 /// truth table.
 fn sync_tool_surface(state: &PluginState) {
+    let channel = state.channel();
     let runtime_config = state
         .dispatcher
         .try_runtime()
@@ -159,8 +189,8 @@ fn sync_tool_surface(state: &PluginState) {
 
     let report = {
         let mut surface = HostSurface {
-            calls: &state.calls,
-            cookie: state.cookie,
+            calls: &channel.calls(),
+            cookie: channel.cookie,
         };
         registry.sync(&specs, &mut surface)
     };
@@ -175,8 +205,8 @@ fn sync_tool_surface(state: &PluginState) {
     if should_register && !proxy_registered {
         let description = direct::build_proxy_description(&config, cache.as_ref(), &specs);
         let mut surface = HostSurface {
-            calls: &state.calls,
-            cookie: state.cookie,
+            calls: &channel.calls(),
+            cookie: channel.cookie,
         };
         surface.register_tool(json!({
             "definition": {
@@ -196,8 +226,8 @@ fn sync_tool_surface(state: &PluginState) {
         proxy_registered = true;
     } else if !should_register && proxy_registered {
         let mut surface = HostSurface {
-            calls: &state.calls,
-            cookie: state.cookie,
+            calls: &channel.calls(),
+            cookie: channel.cookie,
         };
         if surface.unregister_tool("mcp") {
             proxy_registered = false;
@@ -237,9 +267,10 @@ fn update_status_bar(state: &PluginState) {
 
 /// Publish (or clear, on `None`) the "mcp" footer status entry.
 fn set_status(state: &PluginState, text: Option<String>) {
+    let channel = state.channel();
     host_call(
-        &state.calls,
-        state.cookie,
+        &channel.calls(),
+        channel.cookie,
         "ui.setStatus",
         json!({ "key": "mcp", "text": text }),
     );
@@ -279,7 +310,8 @@ fn host_call_ok(calls: &RpiHostCalls, cookie: usize, method: &str, args: Value) 
 /// The session cwd via the host (`ctx.cwd`), falling back to the process
 /// cwd (identical for the native in-process plugin in practice).
 fn session_cwd(state: &PluginState) -> std::path::PathBuf {
-    if let Some(cwd) = host_call_ok(&state.calls, state.cookie, "ctx.cwd", json!({})) {
+    let channel = state.channel();
+    if let Some(cwd) = host_call_ok(&channel.calls(), channel.cookie, "ctx.cwd", json!({})) {
         if let Some(cwd) = cwd.as_str() {
             if !cwd.is_empty() {
                 return std::path::PathBuf::from(cwd);
@@ -290,6 +322,91 @@ fn session_cwd(state: &PluginState) -> std::path::PathBuf {
 }
 
 fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
+    let channel = HostChannel {
+        call: calls.call,
+        cookie: cookie as usize,
+    };
+
+    // Registrations (index.ts:283-441): flag + events — against THIS host,
+    // for the first install and for a rebind alike (a fresh host starts
+    // with an empty registry, so flags and event handlers must be
+    // re-registered on it).
+    let register = |method: &str, args: Value| -> Result<(), Value> {
+        let response = host_call(&channel.calls(), channel.cookie, method, args);
+        if response.get("error").is_some() {
+            return Err(response);
+        }
+        Ok(())
+    };
+
+    if let Err(err) = register(
+        "registerFlag",
+        json!({
+            "name": "mcp-config",
+            "description": "Path to MCP config file",
+            "type": "string",
+        }),
+    ) {
+        return json!({"error": err});
+    }
+    for event in ["session_start", "session_shutdown", "tool_result"] {
+        if let Err(err) = register("on", json!({"event": event})) {
+            return json!({"error": err});
+        }
+    }
+
+    // Rebind path: session replacement (`/resume` `/new` `/fork` `/clone`
+    // `/import`) builds a fresh `NativeExtensionHost` that re-loads this
+    // same dlopen-memoized library and re-runs `install`. Upstream re-runs
+    // the TS module per host; the native port keeps the process-lifetime
+    // tokio runtime + dispatcher and RE-BINDS instead: adopt the new host
+    // channel, reset the per-host tool surface (the fresh host registry is
+    // empty — the old registry's "already registered" marks would suppress
+    // re-registration), re-discover config from the (possibly new) session
+    // cwd, and re-push the tool surface + status bar (the outgoing host's
+    // `session_shutdown` already cleared the "mcp" footer entry; without
+    // this rebind the load used to fail with "plugin already initialized"
+    // and MCP tools, flags, events and the 🔌 status line all silently
+    // vanished after /resume).
+    if let Some(plugin) = STATE.get() {
+        plugin.rebind(channel);
+        {
+            let mut surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
+            let env_override = surface.env_override.clone();
+            let early_config = surface.early_config.clone();
+            *surface = DirectSurface {
+                registry: direct::DirectToolRegistry::default(),
+                frozen: false,
+                env_override,
+                early_config,
+                proxy_registered: false,
+            };
+        }
+        // Config discovery from the new session's cwd (ctx.cwd through the
+        // NEW binding).
+        let cwd = session_cwd(plugin);
+        {
+            let mut surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
+            surface.early_config = config::load_mcp_config(None, &cwd);
+        }
+        sync_tool_surface(plugin);
+        update_status_bar(plugin);
+        // Load-time prewarm mirrors the first install (start_init is
+        // idempotent; a following session_start no-ops or re-arms it).
+        let prewarm = {
+            let surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
+            ProxyDispatcher::has_startup_server(&surface.early_config)
+        };
+        if prewarm {
+            let dispatcher = plugin.dispatcher.clone();
+            plugin.runtime.spawn(async move {
+                dispatcher.start_init(cwd, None);
+            });
+        }
+        spawn_bridge_retry();
+        return json!({"ok": true});
+    }
+
     let plugin_runtime = match runtime::PluginRuntime::start() {
         Ok(rt) => rt,
         Err(err) => {
@@ -313,8 +430,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         }
     });
     let state = PluginState {
-        calls,
-        cookie: cookie as usize,
+        host: RwLock::new(channel),
         runtime: plugin_runtime,
         dispatcher,
         direct: Arc::new(Mutex::new(DirectSurface {
@@ -325,35 +441,6 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             proxy_registered: false,
         })),
     };
-
-    // Registrations (index.ts:283-441): flag, events, proxy tool.
-    let cookie_usize = state.cookie;
-    let calls = RpiHostCalls {
-        call: state.calls.call,
-    };
-    let register = |method: &str, args: Value| -> Result<(), Value> {
-        let response = host_call(&calls, cookie_usize, method, args);
-        if response.get("error").is_some() {
-            return Err(response);
-        }
-        Ok(())
-    };
-
-    if let Err(err) = register(
-        "registerFlag",
-        json!({
-            "name": "mcp-config",
-            "description": "Path to MCP config file",
-            "type": "string",
-        }),
-    ) {
-        return json!({"error": err});
-    }
-    for event in ["session_start", "session_shutdown", "tool_result"] {
-        if let Err(err) = register("on", json!({"event": event})) {
-            return json!({"error": err});
-        }
-    }
 
     // Config discovery runs from the session cwd (`ctx.cwd` host call;
     // process cwd as fallback). The tool surface (direct tools + proxy tool
@@ -461,13 +548,23 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         });
     }
     // Bridge-ready retry push (2026-08-16 status-bar-loss fix): install()
-    // runs before the TUI binds its UI bridge, so the early
-    // `update_status_bar` lands on the null bridge and is silently dropped;
-    // with lazy servers `on_ready` only fires after the first real use, so
-    // nothing re-pushes and the footer never shows the MCP entry. Retry the
-    // push every 1.5 s until the host reports a UI (15 tries ≈ 22 s covers
-    // startup plus theme reloads); after that the regular refresh hooks
-    // (on_ready / metadata updates / connect sync) keep it current.
+    // (and every rebind) may run before the TUI binds its UI bridge, so an
+    // early `update_status_bar` lands on the null bridge and is silently
+    // dropped; with lazy servers `on_ready` only fires after the first real
+    // use, so nothing re-pushes and the footer never shows the MCP entry.
+    // Retry the push every 1.5 s until the host reports a UI (15 tries ≈
+    // 22 s covers startup plus theme reloads); after that the regular
+    // refresh hooks (on_ready / metadata updates / connect sync) keep it
+    // current.
+    spawn_bridge_retry();
+    json!({"ok": true })
+}
+
+/// Arm the bridge-ready status-bar retry loop (see the install-site comment).
+/// Idempotent and multi-armed safe: concurrent loops only re-push the same
+/// idempotent footer text.
+fn spawn_bridge_retry() {
+    let Some(plugin) = STATE.get() else { return };
     plugin.runtime.spawn(async move {
         for _ in 0..15 {
             tokio::time::sleep(bridge_retry_interval()).await;
@@ -476,7 +573,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             // UI — before that every update_status_bar hits the null bridge
             // and is silently dropped, so the call is pure waste (up to 15
             // wasted pushes per install without it).
-            let has_ui = host_call_ok(&state.calls, state.cookie, "ctx.hasUI", json!({}))
+            let channel = state.channel();
+            let has_ui = host_call_ok(&channel.calls(), channel.cookie, "ctx.hasUI", json!({}))
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
             if !has_ui {
@@ -486,7 +584,6 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             return;
         }
     });
-    json!({"ok": true })
 }
 
 /// V13-07 S2: the bridge-ready retry interval, 1500ms in production. Test
@@ -544,13 +641,12 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
             // getAllTools host call runs only when a tool name fails to
             // resolve to a server tool; the common mcp dispatch pays zero
             // host calls for it.
-            let call = state.calls.call; // extern fn — Copy
-            let cookie = state.cookie;
+            let channel = state.channel(); // fn-pointer + cookie — Copy
             let native_tools: crate::proxy::NativeToolsResolver = Arc::new(move || {
                 // The host trampoline is a plain fn-pointer: re-wrap it in a
                 // short-lived RpiHostCalls to reuse host_call_ok.
-                let calls = RpiHostCalls { call };
-                host_call_ok(&calls, cookie, "getAllTools", json!({}))
+                let calls = RpiHostCalls { call: channel.call };
+                host_call_ok(&calls, channel.cookie, "getAllTools", json!({}))
                     .and_then(|ok| ok.as_array().cloned())
                     .map(|tools| {
                         tools
@@ -637,9 +733,10 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 state
                     .runtime
                     .block_on(state.dispatcher.clone().shutdown_owned());
+                let channel = state.channel();
                 host_call(
-                    &state.calls,
-                    state.cookie,
+                    &channel.calls(),
+                    channel.cookie,
                     "ui.setStatus",
                     json!({ "key": "mcp", "text": null }),
                 );
@@ -674,9 +771,10 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
 /// a path, not a credential, but flag reads stay quiet anyway). The host
 /// reply uses the `{"ok": value}` envelope, so unwrap via `host_call_ok`.
 fn current_config_path(state: &PluginState) -> Option<String> {
+    let channel = state.channel();
     host_call_ok(
-        &state.calls,
-        state.cookie,
+        &channel.calls(),
+        channel.cookie,
         "getFlag",
         json!({"name": "mcp-config"}),
     )

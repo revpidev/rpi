@@ -9,6 +9,8 @@
 
 ### 修复
 
+- **statusline / smart-fetch 同族：`/resume` 后事件死亡或宿主通道悬垂**（v0.1.3 追补，同根因）：statusline install 早退 → 新宿主零事件订阅（footer 冻结）+ 旧通道 poll 定时器烧悬垂 cookie + 旧循环已退出无人重启；smart-fetch `STATE.host` 冻结在宿主 1 → ctx.cwd/toolUpdate 走旧 cookie（悬垂或 cwd 回退）。修复同 mcp-adapter 纪律：事件订阅无条件化 + CHANNEL/host 可重绑 + rebind 重启 refresh_loop；双插件各补 rebind_second_host 回归（已验证还原修复后变红）。
+- **`/resume` 后「🔌 MCP」状态行消失且 MCP 扩展整体缺失**（v0.1.3 追补）：会话替换重载同路径 cdylib，dlopen 记忆化使插件 `STATE: OnceLock` 跨宿主存活，第二次 `install` 报 `plugin already initialized` 整体失败——状态行已清空无人重推，且 mcp 工具/flag/事件在新会话静默缺失。修复：宿主通道（fn 指针 + cookie）改 `RwLock` 可重绑——rebind 保留进程级 runtime + dispatcher，新宿主上重注册 flag/事件、重置 direct 工具面、按新 cwd 重发现配置、重推工具面与状态行并重臂 bridge-retry（新宿主 UI 桥后接，直推会被 null bridge 丢弃）；调用点全部改为调用时读当前通道，旧宿主 rebind 后零推送。双端回归：rebind_second_host（完整 /resume 生命周期）+ native_same_path_reload（同路径二宿主重载）。
 - **edit 工具误报 `Could not find edits[N]` 但编辑实际成功**（V13-11 追补，rpi#18）：预览竞态（UI 排空滞后于 agent 写盘）叠加 `update_display` 先建 call 组件后回填，红色错误永久残留；改为 result 组件先构建（对齐上游 renderResult 就地重建语义），伤害降为一闪而过。
 - **`rpi update --extensions` 漏更新未跟踪插件**（v0.1.3 追补）：update/list 只认 settings `packages` 条目而加载器加载安装根目录全部 manifest 目录——未跟踪安装（早期版本/手工复制）被静默跳过，多插件场景即“只升级一个”；update 与加载器发现对齐（identity 去重并入、不回写 settings，`rpi update <name>` 可命中），`rpi list` 标注 `(untracked)`；registry 批量单个失败不再短路其余，未收录（404）的未跟踪安装降级为跳过提示。
 - **流式请求总超时误杀活跃流**（V13-08，先行）：总 deadline 误映射 → 三段式超时（connect/headers/body 块间静默 idle，每 chunk 重置）；9 个 SSE adapter 全覆盖，codex / openrouter_images 两处有意例外。
