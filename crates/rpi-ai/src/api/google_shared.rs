@@ -19,7 +19,9 @@
 
 use serde_json::{json, Value};
 
-use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
+use crate::api::constrained_sampling::{
+    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+};
 use crate::types::{
     AssistantContent, Context, InputModality, Message, Model, StopReason, StreamOptions, Tool,
     ToolResultContent, UserContent, UserContentBlock,
@@ -474,29 +476,38 @@ fn sanitize_for_open_api(schema: &Value) -> Value {
 /// uses `parametersJsonSchema` (full JSON Schema); `use_parameters` selects
 /// the legacy OpenAPI 3.03 `parameters` field with meta keys stripped (Cloud
 /// Code Assist with Claude models). `None` for an empty tool list.
-pub fn convert_tools(tools: &[Tool], use_parameters: bool) -> Option<Value> {
+pub fn convert_tools(
+    tools: &[Tool],
+    use_parameters: bool,
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, String> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let declarations: Vec<Value> = tools
         .iter()
         .map(|tool| {
-            if use_parameters {
+            // google-shared.ts:327-338 (7915cdac6): strict tools send the
+            // converted subset into both wire fields.
+            let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+            let parameters = get_json_schema_tool_parameters(tool, strict)?;
+            let declaration = if use_parameters {
                 json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "parameters": sanitize_for_open_api(&tool.parameters),
+                    "parameters": sanitize_for_open_api(&parameters),
                 })
             } else {
                 json!({
                     "name": tool.name,
                     "description": tool.description,
-                    "parametersJsonSchema": tool.parameters,
+                    "parametersJsonSchema": parameters,
                 })
-            }
+            };
+            Ok(declaration)
         })
-        .collect();
-    Some(json!([{ "functionDeclarations": declarations }]))
+        .collect::<Result<_, String>>()?;
+    Ok(Some(json!([{ "functionDeclarations": declarations }])))
 }
 
 /// `supportsGoogleStrictToolSampling`: Gemini 3+ enforces required function

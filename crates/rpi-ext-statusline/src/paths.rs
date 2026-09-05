@@ -193,7 +193,7 @@ pub fn find_latest_session_file(dir: &Path, since: std::time::SystemTime) -> Opt
 }
 
 /// Session id = the uuidv7 tail of the session-file stem
-/// (`session_manager.rs:314` `create_session_id = uuidv7()`).
+/// (`session_manager.rs:314` `create_session_id = uuidv7_now()`).
 pub fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let (_, tail) = stem.rsplit_once('_')?;

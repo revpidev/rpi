@@ -32,7 +32,7 @@ use rpi_agent::harness::types::{
 use rpi_agent::harness::utils::shell_output::{
     execute_shell_with_capture, sanitize_binary_output, ShellCaptureOptions,
 };
-use rpi_ai::utils::uuid::uuidv7;
+use rpi_ai::utils::uuid::uuidv7_now;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
@@ -51,7 +51,7 @@ impl TestDir {
         let dir = base.join(format!(
             "rpi-nodejs-env-test-{}-{}",
             std::process::id(),
-            uuidv7()
+            uuidv7_now()
         ));
         std::fs::create_dir_all(&dir).unwrap();
         TestDir(dir)

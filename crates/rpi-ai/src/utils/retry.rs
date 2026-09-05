@@ -393,6 +393,15 @@ mod tests {
         .await;
         assert_eq!(response.stop_reason, StopReason::Aborted);
         assert_eq!(response.error_message, None);
+        // 86bac52f9 (retry.ts:203-207): the aborted message is the destructure
+        // `{ errorMessage: _, ...rest }` — serde must omit the key entirely,
+        // not serialize a JSON null.
+        let serialized = serde_json::to_value(&response).expect("serialize");
+        assert!(
+            serialized.get("errorMessage").is_none(),
+            "errorMessage must be absent from the wire shape: {serialized}"
+        );
+        assert_eq!(serialized["stopReason"], "aborted");
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@
 //!   for all main-path files; the alignment only applies to harness files,
 //!   matching the T16 interop contract).
 //! - Randomness: `randomUUID()` → `rpi_ai::utils::uuid::random_uuid`,
-//!   `uuidv7()` → `rpi_ai::utils::uuid::uuidv7` (no `rand`/`uuid` crate in the
+//!   `uuidv7_now()` → `rpi_ai::utils::uuid::uuidv7_now` (no `rand`/`uuid` crate in the
 //!   dependency baseline; non-security PRNG, see uuid.rs header).
 //! - Labels are stored as a single `targetId → (label, timestamp)` map instead
 //!   of upstream's two parallel maps (invariant by construction).
@@ -57,7 +57,7 @@ use rpi_agent::session::{
 // module (stale-usage timestamp guards, agent-session.ts:1974/2030).
 pub use rpi_agent::session::{parse_iso8601_ms, session_entry_to_context_messages};
 use rpi_ai::types::Usage;
-use rpi_ai::utils::uuid::{random_uuid, uuidv7};
+use rpi_ai::utils::uuid::{random_uuid, uuidv7_now};
 use serde_json::Value;
 
 use crate::config::{get_default_session_dir, get_default_session_dir_path};
@@ -327,7 +327,7 @@ impl StoredEntry {
 
 /// `createSessionId` — uuidv7 (session-manager.ts:208-210).
 fn create_session_id() -> String {
-    uuidv7()
+    uuidv7_now()
 }
 
 /// `assertValidSessionId` (session-manager.ts:212-218). Error message is

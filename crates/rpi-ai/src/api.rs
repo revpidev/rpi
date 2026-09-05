@@ -11,6 +11,7 @@ pub mod google_adc;
 pub mod google_generative_ai;
 pub mod google_shared;
 pub mod google_vertex;
+pub mod http_client;
 pub mod lazy;
 pub mod mistral_conversations;
 pub mod openai_codex_responses;

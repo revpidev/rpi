@@ -323,7 +323,7 @@ fn is_session_file_stem(stem: &str) -> bool {
 }
 
 /// Session id = the uuidv7 tail of the session-file stem (host
-/// `session_manager.rs:314` `create_session_id = uuidv7()`); used by the
+/// `session_manager.rs:314` `create_session_id = uuidv7_now()`); used by the
 /// fallback path when the authoritative `ctx.sessionFile` is unavailable.
 pub fn session_id_from_path(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rpi_ai::utils::uuid::uuidv7;
+use rpi_ai::utils::uuid::uuidv7_now;
 
 use crate::harness::session::session_facade::Session as SessionFacade;
 use crate::harness::types::{
@@ -84,7 +84,7 @@ pub(crate) fn now_iso8601() -> String {
 
 /// `createSessionId` (repo-utils.ts:12-14).
 pub(crate) fn create_session_id() -> String {
-    uuidv7()
+    uuidv7_now()
 }
 
 /// `createTimestamp` (repo-utils.ts:16-18).
@@ -114,13 +114,13 @@ pub(crate) fn get_file_system_result_or_throw<T>(
 /// ids must come from the random tail; falls back to a full uuidv7 after 100 collisions.
 pub(crate) fn generate_entry_id(by_id: &HashMap<String, SessionEntry>) -> String {
     for _ in 0..100 {
-        let id = uuidv7();
+        let id = uuidv7_now();
         let short = &id[id.len().saturating_sub(8)..];
         if !by_id.contains_key(short) {
             return short.to_owned();
         }
     }
-    uuidv7()
+    uuidv7_now()
 }
 
 /// `updateLabelCache` (jsonl-storage.ts:25-33) — label entries maintain a

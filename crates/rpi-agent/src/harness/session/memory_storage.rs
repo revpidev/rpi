@@ -5,7 +5,7 @@
 //! - The `TMetadata` generic parameter (memory-storage.ts:43) collapses to
 //!   [`SessionMetadata`]: upstream only ever instantiates the default
 //!   `InMemorySessionStorage<SessionMetadata>`, and the default metadata object
-//!   (`{ id: uuidv7(), createdAt: new Date().toISOString() }`, memory-storage.ts:61)
+//!   (`{ id: uuidv7_now(), createdAt: new Date().toISOString() }`, memory-storage.ts:61)
 //!   cannot be built generically in Rust.
 //! - The constructor validates the replayed leaf like upstream (memory-storage.ts:58-60)
 //!   and returns `Result<Self, SessionError>` instead of throwing.
@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use rpi_ai::utils::uuid::uuidv7;
+use rpi_ai::utils::uuid::uuidv7_now;
 use tokio::sync::Mutex;
 
 use crate::harness::types::{
@@ -77,7 +77,7 @@ impl InMemorySessionStorage {
             }
         }
         let metadata = options.metadata.unwrap_or(SessionMetadata {
-            id: uuidv7(),
+            id: uuidv7_now(),
             created_at: now_iso8601(),
         });
         Ok(Self {

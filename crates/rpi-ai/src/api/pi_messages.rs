@@ -809,7 +809,9 @@ async fn run(
         }
     }
 
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), url.as_str())
+            .map_err(StreamFailure::plain)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {

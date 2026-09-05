@@ -930,7 +930,9 @@ fn test_convert_tools_strips_meta_keys_with_use_parameters() {
         "properties": {"command": {"type": "string"}},
         "required": ["command"],
     }))];
-    let result = convert_tools(&tools, true).expect("converted");
+    let result = convert_tools(&tools, true, true)
+        .expect("converted")
+        .expect("tools");
     let decl = &result[0]["functionDeclarations"][0];
     assert_eq!(
         decl["parameters"],
@@ -955,7 +957,9 @@ fn test_convert_tools_strips_nested_meta_keys_recursively() {
             },
         },
     }))];
-    let result = convert_tools(&tools, true).expect("converted");
+    let result = convert_tools(&tools, true, true)
+        .expect("converted")
+        .expect("tools");
     assert_eq!(
         result[0]["functionDeclarations"][0]["parameters"],
         json!({
@@ -974,7 +978,9 @@ fn test_convert_tools_preserves_ref_while_stripping_meta_keys() {
             "refProp": {"$ref": "#/$defs/someDef", "type": "string"},
         },
     }))];
-    let result = convert_tools(&tools, true).expect("converted");
+    let result = convert_tools(&tools, true, true)
+        .expect("converted")
+        .expect("tools");
     assert_eq!(
         result[0]["functionDeclarations"][0]["parameters"],
         json!({
@@ -995,7 +1001,7 @@ fn test_convert_tools_does_not_mutate_original_parameters() {
         "required": ["command"],
     });
     let tools = vec![make_tool(original.clone())];
-    let _ = convert_tools(&tools, true);
+    let _ = convert_tools(&tools, true, true);
     assert_eq!(tools[0].parameters, original);
 }
 
@@ -1007,7 +1013,9 @@ fn test_convert_tools_preserves_schema_in_parameters_json_schema() {
         "properties": {"command": {"type": "string"}},
         "required": ["command"],
     }))];
-    let result = convert_tools(&tools, false).expect("converted");
+    let result = convert_tools(&tools, false, true)
+        .expect("converted")
+        .expect("tools");
     assert_eq!(
         result[0]["functionDeclarations"][0]["parametersJsonSchema"],
         json!({
@@ -1026,7 +1034,9 @@ fn test_convert_tools_handles_tools_without_schema_meta() {
         "properties": {"path": {"type": "string"}},
         "required": ["path"],
     }))];
-    let result = convert_tools(&tools, true).expect("converted");
+    let result = convert_tools(&tools, true, true)
+        .expect("converted")
+        .expect("tools");
     assert_eq!(
         result[0]["functionDeclarations"][0]["parameters"],
         json!({
@@ -1039,8 +1049,8 @@ fn test_convert_tools_handles_tools_without_schema_meta() {
 
 #[test]
 fn test_convert_tools_empty_list_is_none() {
-    assert!(convert_tools(&[], false).is_none());
-    assert!(convert_tools(&[], true).is_none());
+    assert!(convert_tools(&[], false, true).expect("ok").is_none());
+    assert!(convert_tools(&[], true, true).expect("ok").is_none());
 }
 
 #[test]

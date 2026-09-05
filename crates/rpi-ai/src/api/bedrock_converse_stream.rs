@@ -66,7 +66,9 @@ use serde_json::{json, Map, Value};
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::bedrock::event_stream::{EventStreamDecoder, EventStreamMessage};
 use crate::api::bedrock::sigv4::{self, extended_encode_uri_component, SigV4Credentials};
-use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
+use crate::api::constrained_sampling::{
+    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+};
 use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
     clamp_reasoning,
@@ -806,11 +808,12 @@ pub fn convert_tool_config(
     let mut bedrock_tools = Vec::new();
     for tool in tools {
         let strict = resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+        let parameters = get_json_schema_tool_parameters(tool, strict)?;
         // Wire member order follows the SDK schema (name, inputSchema,
         // description, strict), not the upstream object-literal order.
         let mut tool_spec = Map::new();
         tool_spec.insert("name".to_owned(), json!(tool.name));
-        tool_spec.insert("inputSchema".to_owned(), json!({"json": tool.parameters}));
+        tool_spec.insert("inputSchema".to_owned(), json!({"json": parameters}));
         tool_spec.insert("description".to_owned(), json!(tool.description));
         if strict == Some(true) {
             tool_spec.insert("strict".to_owned(), json!(true));
@@ -1763,7 +1766,8 @@ async fn run(
     }
     let header_map = provider_headers_to_header_map(&header_map)?;
 
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {

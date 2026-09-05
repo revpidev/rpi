@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Map, Value};
 
 use crate::api::constrained_sampling::{
-    append_grammar_tool_input_json_delta, get_grammar_tool_input,
+    append_grammar_tool_input_json_delta, get_grammar_tool_input, get_json_schema_tool_parameters,
     resolve_grammar_constrained_sampling, resolve_json_schema_strict_sampling,
     GrammarToolInputJsonBuffer,
 };
@@ -573,19 +573,21 @@ pub fn convert_responses_tools(
 
             let constrained_strict =
                 resolve_json_schema_strict_sampling(tool, supports_strict_mode)?;
+            let strict = constrained_strict.unwrap_or(default_strict);
             let mut function_tool = json!({
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
                 // TypeBox already generates JSON Schema upstream; `parameters`
-                // is a schema value here.
-                "parameters": tool.parameters,
+                // is a schema value here — strict tools send the converted
+                // subset (openai-responses-shared.ts:380-388, 7915cdac6).
+                "parameters": get_json_schema_tool_parameters(tool, Some(strict))?,
             });
             if options.defer_loading {
                 function_tool["defer_loading"] = json!(true);
             }
             if supports_strict_mode {
-                function_tool["strict"] = json!(constrained_strict.unwrap_or(default_strict));
+                function_tool["strict"] = json!(strict);
             }
             Ok(function_tool)
         })

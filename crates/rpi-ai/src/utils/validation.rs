@@ -322,8 +322,79 @@ pub fn validate_tool_call(tools: &[Tool], tool_call: &ToolCall) -> Result<Value,
 
 /// `validateToolArguments`: validates (and coerces) tool-call arguments
 /// against the tool's JSON schema. Returns the validated arguments.
+/// `getSubSchemaValidator(propertySchema)?.Check(null)` — does the property
+/// schema accept `null`? A schema that fails to compile keeps the key
+/// (upstream `undefined?.Check(null) === false` → false).
+fn schema_accepts_null(schema: &Value) -> bool {
+    jsonschema::draft7::new(schema)
+        .map(|validator| validator.is_valid(&Value::Null))
+        .unwrap_or(true)
+}
+
+/// `normalizeOptionalNulls` (validation.ts:240-268, `7915cdac6`): drop
+/// `null` values for optional, non-nullable, non-`$ref` properties
+/// (recursively through arrays and nested objects) before coercion —
+/// providers reject explicit nulls on optional fields.
+fn normalize_optional_nulls(value: &mut Value, schema: &Value) {
+    let Some(schema_object) = schema.as_object() else {
+        return;
+    };
+    if let Value::Array(items) = value {
+        match schema_object.get("items") {
+            Some(Value::Array(item_schemas)) => {
+                for (item, item_schema) in items.iter_mut().zip(item_schemas.iter()) {
+                    normalize_optional_nulls(item, item_schema);
+                }
+            }
+            Some(single) => {
+                for item in items.iter_mut() {
+                    normalize_optional_nulls(item, single);
+                }
+            }
+            None => {}
+        }
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(properties) = schema_object.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let required: std::collections::HashSet<&str> = schema_object
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    for (key, property_schema) in properties {
+        if !object.contains_key(key) {
+            continue;
+        }
+        let is_null = object.get(key) == Some(&Value::Null);
+        let ref_exempt = property_schema.get("$ref").is_some_and(Value::is_string);
+        if is_null
+            && !required.contains(key.as_str())
+            && !ref_exempt
+            && !schema_accepts_null(property_schema)
+        {
+            object.remove(key);
+        } else {
+            let Some(child) = object.get_mut(key) else {
+                continue;
+            };
+            normalize_optional_nulls(child, property_schema);
+        }
+    }
+}
+
 pub fn validate_tool_arguments(tool: &Tool, tool_call: &ToolCall) -> Result<Value, String> {
     let mut args = Value::Object(tool_call.arguments.clone());
+    normalize_optional_nulls(&mut args, &tool.parameters);
     let validator = get_validator(&tool.parameters)?;
 
     let coerced = coerce_with_json_schema(args.clone(), &tool.parameters);
@@ -387,6 +458,80 @@ mod tests {
         }
     }
 
+    /// "treats null as omission for optional non-nullable properties"
+    /// (validation.test.ts:101-124, `7915cdac6`): optional non-nullable
+    /// nulls drop (recursively); nullable-union nulls survive.
+    #[test]
+    fn test_normalize_optional_nulls_drops_non_nullable_optionals() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "number"},
+                "nullable": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "metadata": {
+                    "type": "object",
+                    "properties": {"enabled": {"type": "boolean"}},
+                    "required": []
+                }
+            },
+            "required": ["path"]
+        }));
+        let out = validate_tool_arguments(
+            &tool,
+            &call(json!({
+                "path": "file.txt",
+                "offset": null,
+                "nullable": null,
+                "metadata": {"enabled": null}
+            })),
+        )
+        .expect("valid");
+        assert_eq!(
+            out,
+            json!({"path": "file.txt", "nullable": null, "metadata": {}})
+        );
+    }
+
+    /// "preserves optional nulls whose referenced schema is nullable"
+    /// (validation.test.ts:126-143): `$ref` properties are exempt from the
+    /// null cleanup.
+    #[test]
+    fn test_normalize_optional_nulls_exempts_refs() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+            "$defs": {"value": {"anyOf": [{"type": "number"}, {"type": "null"}]}}
+        }));
+        let out = validate_tool_arguments(&tool, &call(json!({"value": null}))).expect("valid");
+        assert_eq!(out, json!({"value": null}));
+    }
+
+    /// Array items recurse through both tuple and single `items` schemas.
+    #[test]
+    fn test_normalize_optional_nulls_recurses_arrays() {
+        let tool = tool(json!({
+            "type": "object",
+            "properties": {
+                "tags": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"label": {"type": "string"}},
+                        "required": []
+                    }
+                }
+            },
+            "required": []
+        }));
+        let out = validate_tool_arguments(
+            &tool,
+            &call(json!({"tags": [{"label": null}, {"label": "keep"}]})),
+        )
+        .expect("valid");
+        assert_eq!(out, json!({"tags": [{}, {"label": "keep"}]}));
+    }
+
     #[test]
     fn test_validate_tool_call_not_found() {
         let err = validate_tool_call(&[], &call(json!({}))).unwrap_err();
@@ -395,9 +540,14 @@ mod tests {
 
     #[test]
     fn test_coercion_null_to_number() {
+        // `required` mirrors the upstream coercion harness
+        // (createToolCallWithPlainSchema): required properties skip the
+        // optional-null cleanup and reach coercion (7915cdac6 changed
+        // optional nulls to deletion — see the normalize tests).
         let tool = tool(json!({
             "type": "object",
-            "properties": {"n": {"type": "number"}, "i": {"type": "integer"}}
+            "properties": {"n": {"type": "number"}, "i": {"type": "integer"}},
+            "required": ["n", "i"]
         }));
         let out =
             validate_tool_arguments(&tool, &call(json!({"n": null, "i": null}))).expect("valid");
@@ -441,7 +591,8 @@ mod tests {
             "properties": {
                 "s": {"type": "string"},
                 "x": {"type": "null"}
-            }
+            },
+            "required": ["s", "x"]
         }));
         let out =
             validate_tool_arguments(&tool, &call(json!({"s": 12, "x": false}))).expect("valid");
@@ -503,7 +654,8 @@ mod tests {
     fn test_coercion_type_array_first_convertible() {
         let tool = tool(json!({
             "type": "object",
-            "properties": {"v": {"type": ["integer", "string"]}}
+            "properties": {"v": {"type": ["integer", "string"]}},
+            "required": ["v"]
         }));
         // Already matches a union member: left unchanged.
         let out = validate_tool_arguments(&tool, &call(json!({"v": "keep"}))).expect("valid");

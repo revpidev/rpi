@@ -91,7 +91,8 @@ use crate::types::{
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
@@ -321,7 +322,11 @@ fn build_params(
     }
     let tools: &[Tool] = context.tools.as_deref().unwrap_or(&[]);
     if !tools.is_empty() {
-        if let Some(converted) = convert_tools(tools, false) {
+        if let Some(converted) = convert_tools(
+            tools,
+            false,
+            supports_google_strict_tool_sampling(&model.id),
+        )? {
             config.insert("tools".to_owned(), converted);
         }
         let function_calling_mode = resolve_google_function_calling_mode(
@@ -544,7 +549,12 @@ fn build_request_headers(
 ) -> crate::types::ProviderHeaders {
     let mut base = crate::types::ProviderHeaders::new();
     base.insert(auth_header.0.to_owned(), Some(auth_header.1));
-    merge_headers_chain(&[Some(base), model_headers(model), options_headers.cloned()])
+    merge_headers_chain(&[
+        pi_user_agent_headers(),
+        Some(base),
+        model_headers(model),
+        options_headers.cloned(),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +968,8 @@ async fn run(
 
     let headers = build_request_headers(model, auth_header, options.stream.headers.as_ref());
     let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {

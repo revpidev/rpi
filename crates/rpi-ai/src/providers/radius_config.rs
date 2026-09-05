@@ -161,8 +161,11 @@ pub async fn load_radius_gateway_config(
     api_key: Option<&str>,
     signal: Option<&CancellationToken>,
 ) -> Result<RadiusGatewayConfig, ModelsError> {
-    let mut request = reqwest::Client::new()
-        .get(format!("{gateway}/v1/config"))
+    let config_url = format!("{gateway}/v1/config");
+    let mut request = crate::api::http_client::adapter_client_builder(None, &config_url)
+        .and_then(|builder| builder.build().map_err(|error| error.to_string()))
+        .map_err(|error| ModelsError::new(ModelsErrorCode::ModelSource, error))?
+        .get(&config_url)
         .header(reqwest::header::ACCEPT, "application/json");
     if let Some(api_key) = api_key {
         request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {api_key}"));

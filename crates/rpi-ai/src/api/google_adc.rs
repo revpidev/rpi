@@ -290,7 +290,7 @@ async fn fetch_access_token(
     credentials: &AdcCredentials,
     endpoints: &AdcEndpoints,
 ) -> Result<String, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::api::http_client::adapter_client_builder(None, &endpoints.token_url)?
         .build()
         .map_err(|error| error.to_string())?;
     match credentials {
@@ -338,10 +338,11 @@ async fn fetch_access_token(
 /// the `Metadata-Flavor: Google` header. The request doubles as the GCE
 /// availability probe (3s timeout, like `gcp-metadata.isAvailable`).
 async fn fetch_metadata_access_token(endpoints: &AdcEndpoints) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(METADATA_TIMEOUT)
-        .build()
-        .map_err(|error| error.to_string())?;
+    let client =
+        crate::api::http_client::adapter_client_builder(None, &endpoints.metadata_token_url)?
+            .timeout(METADATA_TIMEOUT)
+            .build()
+            .map_err(|error| error.to_string())?;
     let response = client
         .get(&endpoints.metadata_token_url)
         .header("Metadata-Flavor", "Google")

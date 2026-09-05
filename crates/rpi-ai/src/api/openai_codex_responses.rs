@@ -289,35 +289,9 @@ fn extract_account_id(token: &str) -> Result<String, CodexError> {
     Ok(account_id.to_owned())
 }
 
-/// `pi (${os.platform()} ${os.release()}; ${os.arch()})`.
-fn user_agent() -> String {
-    format!(
-        "pi ({} {}; {})",
-        std::env::consts::OS,
-        os_release(),
-        std::env::consts::ARCH
-    )
-}
-
-#[cfg(unix)]
-fn os_release() -> String {
-    // SAFETY: `utsname` is a plain C struct; zeroed is a valid initial state
-    // and `uname` writes NUL-terminated arrays on success.
-    unsafe {
-        let mut uts: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut uts) == 0 {
-            return std::ffi::CStr::from_ptr(uts.release.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-        }
-        String::new()
-    }
-}
-
-#[cfg(not(unix))]
-fn os_release() -> String {
-    String::new()
-}
+/// `pi (<platform> <release>; <arch>)` — shared consolidation of the
+/// pre-existing local implementation (pi-user-agent.ts:18).
+use crate::utils::pi_user_agent::get_pi_user_agent;
 
 /// Case-insensitive header record (JS `Headers` lowercases all names).
 type HeaderRecord = BTreeMap<String, String>;
@@ -346,7 +320,7 @@ fn build_base_codex_headers(
     headers.insert("chatgpt-account-id".to_owned(), account_id.to_owned());
     // Literal "pi" (upstream openai-codex-responses.ts:1593); do not rename.
     headers.insert("originator".to_owned(), "pi".to_owned());
-    headers.insert("user-agent".to_owned(), user_agent());
+    headers.insert("user-agent".to_owned(), get_pi_user_agent());
     headers
 }
 
@@ -1203,7 +1177,9 @@ async fn run(
             body = next_body;
         }
     }
-    let websocket_request_id = codex_session_id.clone().unwrap_or_else(uuidv7);
+    let websocket_request_id = codex_session_id
+        .clone()
+        .unwrap_or_else(|| uuidv7(None).expect("uuidv7 sequence exhausted"));
     let sse_headers = build_sse_headers(
         model,
         options.stream.headers.as_ref(),
@@ -1314,7 +1290,10 @@ async fn run(
 
     // Fetch with retry logic for rate limits and transient errors.
     let max_retries = options.stream.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-    let client = reqwest::Client::new();
+    let client = crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)
+        .map_err(CodexError::Other)?
+        .build()
+        .map_err(|error| CodexError::Other(error.to_string()))?;
     let mut response: Option<reqwest::Response> = None;
     let mut deadline: Option<tokio::time::Instant> = None;
 

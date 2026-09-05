@@ -74,7 +74,8 @@ use crate::utils::custom_fetch::{send_provider_request, SendFailure};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
@@ -268,6 +269,7 @@ fn build_request_headers(
     .into();
 
     let mut headers = merge_headers_chain(&[
+        pi_user_agent_headers(),
         Some(base),
         model_headers(model),
         options.stream.headers.clone(),
@@ -1233,7 +1235,8 @@ async fn run(
         model.base_url.trim_end_matches('/')
     );
     let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Upstream: `AbortSignal.timeout(options?.timeoutMs ?? 60_000)` — a
     // total deadline that aborts even actively streaming bodies. rpi keeps
     // the same budget but applies idle-timeout semantics instead (connect +

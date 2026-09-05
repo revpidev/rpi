@@ -67,7 +67,8 @@ use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
@@ -294,7 +295,12 @@ pub fn build_client_headers(
         ("api-key".to_owned(), Some(api_key.to_owned())),
     ]
     .into();
-    merge_headers_chain(&[Some(base), model_headers(model), options_headers.cloned()])
+    merge_headers_chain(&[
+        pi_user_agent_headers(),
+        Some(base),
+        model_headers(model),
+        options_headers.cloned(),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +488,8 @@ async fn run(
 
     let url = format!("{}/responses", config.base_url);
     let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {

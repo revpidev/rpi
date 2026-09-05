@@ -126,7 +126,10 @@ async fn generate_images_inner(
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let header_map = build_client_headers(model, &api_key, options)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder = crate::api::http_client::adapter_client_builder(
+        options.and_then(|options| options.env.as_ref()),
+        &url,
+    )?;
     if let Some(timeout_ms) = options.and_then(|options| options.timeout_ms) {
         client_builder = client_builder.timeout(std::time::Duration::from_millis(timeout_ms));
     }

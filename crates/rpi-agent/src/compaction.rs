@@ -32,7 +32,7 @@ use rpi_ai::types::{
 };
 use rpi_ai::utils::retry::{retry_assistant_call, RetryCallbacks, RetryPolicy};
 use rpi_ai::utils::text::content_text_assistant;
-use rpi_ai::utils::uuid::uuidv7;
+use rpi_ai::utils::uuid::uuidv7_now;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -670,7 +670,7 @@ pub async fn complete_summarization(
 ) -> AssistantMessage {
     let request_options = StreamOptions {
         cache_retention: Some(CacheRetention::None),
-        session_id: Some(uuidv7()),
+        session_id: Some(uuidv7_now()),
         ..options.clone()
     };
     let produce = || async {

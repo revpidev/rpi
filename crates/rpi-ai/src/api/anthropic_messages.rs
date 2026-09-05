@@ -33,7 +33,9 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
+use crate::api::constrained_sampling::{
+    get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
+};
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
 use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
@@ -52,7 +54,8 @@ use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::provider_env::get_provider_env_value;
@@ -176,7 +179,7 @@ fn get_beta_features(
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Stealth mode: mimic Claude Code's version in the OAuth user agent.
-pub const CLAUDE_CODE_VERSION: &str = "2.1.75";
+pub const CLAUDE_CODE_VERSION: &str = "2.1.251";
 
 /// Claude Code 2.x tool names (canonical casing).
 /// Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -502,6 +505,7 @@ fn build_request_headers(
             );
         }
         let headers = merge_headers_chain(&[
+            pi_user_agent_headers(),
             Some(base),
             model_headers(model),
             dynamic_headers,
@@ -526,6 +530,7 @@ fn build_request_headers(
                 Some(format!("Bearer {api_key}")),
             );
             let headers = merge_headers_chain(&[
+                pi_user_agent_headers(),
                 Some(base),
                 model_headers(model),
                 options.stream.headers.clone(),
@@ -545,6 +550,7 @@ fn build_request_headers(
         .filter(|_| compat.send_session_affinity_headers)
         .map(|session_id| [("x-session-affinity".to_owned(), Some(session_id.to_owned()))].into());
     let headers = merge_headers_chain(&[
+        pi_user_agent_headers(),
         Some(base),
         session_affinity_headers,
         model_headers(model),
@@ -923,14 +929,16 @@ fn convert_tools(
         .enumerate()
         .map(|(index, tool)| {
             let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
-            let schema = &tool.parameters;
+            // `getJsonSchemaToolParameters` (7915cdac6): the strict-converted
+            // parameters feed both the direct schema and the legacy view.
+            let schema = get_json_schema_tool_parameters(tool, strict)?;
             let legacy_input_schema = json!({
                 "type": "object",
                 "properties": schema.get("properties").cloned().unwrap_or_else(|| json!({})),
                 "required": schema.get("required").cloned().unwrap_or_else(|| json!([])),
             });
             let input_schema = if strict == Some(true) {
-                // { ...tool.parameters, ...legacyInputSchema } — legacy wins.
+                // { ...parameters, ...legacyInputSchema } — legacy wins.
                 let mut base = schema.as_object().cloned().unwrap_or_default();
                 if let Value::Object(legacy) = &legacy_input_schema {
                     for (key, value) in legacy {
@@ -1827,7 +1835,8 @@ async fn run(
 
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
     let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts): connect_timeout bounds the connection, the
     // headers wait is bounded in send_provider_request, and the body stream
@@ -2397,7 +2406,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             headers.get("user-agent").and_then(|v| v.as_deref()),
-            Some("claude-cli/2.1.75")
+            Some("claude-cli/2.1.251")
         );
         assert_eq!(headers.get("x-app").and_then(|v| v.as_deref()), Some("cli"));
         let beta = headers

@@ -39,7 +39,7 @@ use tokio_util::sync::CancellationToken;
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::constrained_sampling::{
     append_grammar_tool_input_json_delta, create_grammar_tool_input_properties,
-    get_grammar_tool_input, resolve_grammar_constrained_sampling,
+    get_grammar_tool_input, get_json_schema_tool_parameters, resolve_grammar_constrained_sampling,
     resolve_json_schema_strict_sampling, GrammarToolInputJsonBuffer,
 };
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
@@ -61,7 +61,8 @@ use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
+    provider_headers_to_header_map,
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
@@ -481,6 +482,7 @@ pub fn build_client_headers(
         });
 
     merge_headers_chain(&[
+        pi_user_agent_headers(),
         Some(base),
         model_headers(model),
         copilot_headers,
@@ -948,8 +950,11 @@ pub fn convert_tools(
             function.insert("name".to_owned(), json!(tool.name));
             function.insert("description".to_owned(), json!(tool.description));
             // TypeBox already generates JSON Schema upstream; `parameters` is a
-            // schema value here.
-            function.insert("parameters".to_owned(), tool.parameters.clone());
+            // schema value here — strict tools send the converted subset.
+            function.insert(
+                "parameters".to_owned(),
+                get_json_schema_tool_parameters(tool, strict)?,
+            );
             if compat.supports_strict_mode {
                 function.insert("strict".to_owned(), json!(strict.unwrap_or(false)));
             }
@@ -2574,7 +2579,8 @@ async fn run(
 
     let url = format!("{}/chat/completions", model.base_url.trim_end_matches('/'));
     let header_map = provider_headers_to_header_map(&headers)?;
-    let mut client_builder = reqwest::Client::builder();
+    let mut client_builder =
+        crate::api::http_client::adapter_client_builder(options.stream.env.as_ref(), &url)?;
     // Idle-timeout semantics (upstream undici headersTimeout/bodyTimeout;
     // see api::stream_timeouts) — never a total-request deadline.
     if let Some(timeout_ms) = options.stream.timeout_ms {
@@ -3177,7 +3183,8 @@ pub(crate) mod tests {
         );
 
         // SDK semantics: user headers land after auth headers and win
-        // case-insensitively.
+        // case-insensitively. `87af49dec`: the default pi User-Agent rides as
+        // the first merge source and survives when nothing overrides it.
         let options_headers: ProviderHeaders =
             [("Authorization".to_owned(), Some("Bearer user".to_owned()))].into();
         let headers = build_client_headers(
@@ -3188,10 +3195,33 @@ pub(crate) mod tests {
             None,
             &compat,
         );
-        assert_eq!(headers.len(), 2);
+        assert_eq!(headers.len(), 3, "accept + authorization + user-agent");
         assert_eq!(
             headers.get("Authorization").and_then(|v| v.as_deref()),
             Some("Bearer user")
+        );
+        assert_eq!(
+            headers.get("User-Agent").and_then(|v| v.as_deref()),
+            Some(crate::utils::pi_user_agent::get_pi_user_agent().as_str())
+        );
+
+        // A `User-Agent` in the request headers overrides the default.
+        let options_headers: ProviderHeaders = [
+            ("Authorization".to_owned(), Some("Bearer user".to_owned())),
+            ("User-Agent".to_owned(), Some("custom-agent/1".to_owned())),
+        ]
+        .into();
+        let headers = build_client_headers(
+            &model,
+            &ctx,
+            "sk-key",
+            Some(&options_headers),
+            None,
+            &compat,
+        );
+        assert_eq!(
+            headers.get("User-Agent").and_then(|v| v.as_deref()),
+            Some("custom-agent/1")
         );
     }
 
