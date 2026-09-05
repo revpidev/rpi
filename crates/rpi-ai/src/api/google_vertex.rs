@@ -77,16 +77,16 @@ use crate::api::google_generative_ai::{
 };
 use crate::api::google_shared::{
     convert_messages, convert_tools, is_thinking_part, map_stop_reason,
-    resolve_google_function_calling_mode, retain_thought_signature, retry_google_request,
-    supports_google_strict_tool_sampling, GoogleThinkingLevel,
+    resolve_google_function_calling_mode, resolve_google_thinking_level, retain_thought_signature,
+    retry_google_request, supports_google_strict_tool_sampling, GoogleThinkingLevel,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
-    AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, Model,
-    ModelThinkingLevel, ProviderEnv, ProviderResponse, SimpleStreamOptions, StopReason,
-    StreamEvent, StreamOptions, ThinkingBudgets, ThinkingLevel, Tool, ToolCall, Usage,
+    AssistantContent, AssistantMessage, Context, DoneReason, ErrorReason, Model, ProviderEnv,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingBudgets,
+    ThinkingLevel, Tool, ToolCall, Usage,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
@@ -1197,16 +1197,10 @@ pub fn stream_simple(
     };
 
     let clamped = clamp_thinking_level(model, reasoning.to_model_level());
-    // `clampedReasoning === "off" ? "high" : clampedReasoning`.
-    let effort = match clamped {
-        ModelThinkingLevel::Off => ThinkingLevel::High,
-        ModelThinkingLevel::Minimal => ThinkingLevel::Minimal,
-        ModelThinkingLevel::Low => ThinkingLevel::Low,
-        ModelThinkingLevel::Medium => ThinkingLevel::Medium,
-        ModelThinkingLevel::High => ThinkingLevel::High,
-        ModelThinkingLevel::Xhigh => ThinkingLevel::Xhigh,
-        ModelThinkingLevel::Max => ThinkingLevel::Max,
-    };
+    // `resolveGoogleThinkingLevel(model, clampedReasoning)`
+    // (af2c35223/#8135): off → high; thinkingLevelMap entries win; xhigh/max
+    // without a mapping are an error (was: silently clamped to high).
+    let effort = resolve_google_thinking_level(model, clamped)?;
 
     if is_gemini_3_pro_model(model) || is_gemini_3_flash_model(model) {
         return Ok(stream(

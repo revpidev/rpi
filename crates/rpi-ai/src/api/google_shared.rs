@@ -53,6 +53,49 @@ impl GoogleThinkingLevel {
     }
 }
 
+/// `resolveGoogleThinkingLevel` (google-shared.ts:31-48 @ 9841914,
+/// af2c35223/#8135): resolve a supported pi level or a model-specific
+/// Google mapping to a standard level. `off` resolves to `high`; a
+/// `thinkingLevelMap` string entry wins (lowercased); the result must be
+/// one of minimal/low/medium/high — anything else (including xhigh/max
+/// without a mapping) is an error.
+pub fn resolve_google_thinking_level(
+    model: &crate::types::Model,
+    level: crate::types::ModelThinkingLevel,
+) -> Result<crate::types::ThinkingLevel, String> {
+    use crate::types::{ModelThinkingLevel, ThinkingLevel};
+    if level == ModelThinkingLevel::Off {
+        return Ok(ThinkingLevel::High);
+    }
+    let mapped = model
+        .thinking_level_map
+        .as_ref()
+        .and_then(|map| map.get(&level));
+    let resolved = match mapped {
+        Some(Some(mapped)) => mapped.to_lowercase(),
+        _ => level.as_str().to_owned(),
+    };
+    match resolved.as_str() {
+        "minimal" => Ok(ThinkingLevel::Minimal),
+        "low" => Ok(ThinkingLevel::Low),
+        "medium" => Ok(ThinkingLevel::Medium),
+        "high" => Ok(ThinkingLevel::High),
+        _ => Err(format!(
+            "Unsupported Google thinking level mapping for {}/{}: {} -> {}",
+            model.provider,
+            model.id,
+            level.as_str(),
+            match mapped {
+                Some(Some(mapped)) => mapped.clone(),
+                // Upstream `String(mapped)`: a null entry prints "null", a
+                // missing one "undefined".
+                Some(None) => "null".to_owned(),
+                None => "undefined".to_owned(),
+            }
+        )),
+    }
+}
+
 /// `isThinkingPart`: only `thought === true` marks thinking content.
 ///
 /// Protocol note (Gemini / Vertex AI thought signatures): `thoughtSignature`
@@ -566,6 +609,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn map_model(map: serde_json::Value) -> crate::types::Model {
+        let mut value = serde_json::json!({
+            "id": "gemini-3-pro", "name": "Gemini 3 Pro",
+            "api": "google-generative-ai", "provider": "google",
+            "baseUrl": "https://generativelanguage.googleapis.com",
+            "reasoning": true, "input": ["text"],
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 1000000, "maxTokens": 60000
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(map.as_object().cloned().unwrap_or_default());
+        serde_json::from_value(value).expect("model")
+    }
+
+    /// `resolveGoogleThinkingLevel` (af2c35223/#8135): `off` resolves to
+    /// `high`; `thinkingLevelMap` string entries win (lowercased); results
+    /// must be one of minimal/low/medium/high — anything else is an error
+    /// with the `provider/model: level -> mapped` shape.
+    #[test]
+    fn resolve_google_thinking_level_off_map_and_errors() {
+        use crate::types::{ModelThinkingLevel as M, ThinkingLevel as T};
+
+        let plain = map_model(serde_json::json!({}));
+        // off → high (af2c35223 tightened this from "silently high" to the
+        // same explicit rule).
+        assert_eq!(resolve_google_thinking_level(&plain, M::Off), Ok(T::High));
+        // Direct levels pass through.
+        assert_eq!(
+            resolve_google_thinking_level(&plain, M::Medium),
+            Ok(T::Medium)
+        );
+        // xhigh/max without a mapping are now errors (was: latent clamp).
+        assert_eq!(
+            resolve_google_thinking_level(&plain, M::Xhigh),
+            Err("Unsupported Google thinking level mapping for google/gemini-3-pro: xhigh -> undefined".to_owned())
+        );
+
+        // Mapped entries win and are lowercased.
+        let mapped = map_model(serde_json::json!({
+            "thinkingLevelMap": {"high": "HIGH", "low": "Minimal", "xhigh": "high"}
+        }));
+        assert_eq!(resolve_google_thinking_level(&mapped, M::High), Ok(T::High));
+        assert_eq!(
+            resolve_google_thinking_level(&mapped, M::Low),
+            Ok(T::Minimal)
+        );
+        assert_eq!(
+            resolve_google_thinking_level(&mapped, M::Xhigh),
+            Ok(T::High)
+        );
+
+        // An invalid mapping string is an error naming the mapping.
+        let invalid = map_model(serde_json::json!({
+            "thinkingLevelMap": {"medium": "ultra"}
+        }));
+        assert_eq!(
+            resolve_google_thinking_level(&invalid, M::Medium),
+            Err("Unsupported Google thinking level mapping for google/gemini-3-pro: medium -> ultra".to_owned())
+        );
+    }
 
     /// `gemini-live-*` must parse as Gemini versions: the `gemini-live-`
     /// prefix is tried before `gemini-` (upstream

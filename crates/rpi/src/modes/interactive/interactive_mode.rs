@@ -1715,11 +1715,13 @@ impl InteractiveUi {
                         }
                         let fallback_error_message = assistant.error_message.clone();
                         let stop_is_error = self.streaming_stop_reason_is_error(&assistant);
+                        // `maybeShowAssistantDiagnostics` (:3310) and
                         // `maybeShowCacheMissNotice` (interactive-mode.ts:2994)
-                        // runs in the non-error branch; called before
+                        // run in the non-error branch; called before
                         // `update_content` so the message value can be shared
                         // without cloning the (potentially large) content.
                         if !stop_is_error {
+                            self.maybe_show_assistant_diagnostics(&assistant);
                             self.maybe_show_cache_miss_notice(&assistant);
                         }
                         // interactive-mode.ts:3193: message_end updates with
@@ -2759,6 +2761,76 @@ impl InteractiveUi {
         // (interactive-mode.ts:3457-3471 — 20k-token / $0.10 thresholds,
         // warning label, chat spacer + text) behind the
         // get_show_cache_miss_notices gate.
+    }
+
+    /// `maybeShowAssistantDiagnostics` (interactive-mode.ts:3816-3839 @
+    /// 9841914, 4e69b0c28): render `anthropic_input_transformations`
+    /// diagnostics as transcript warnings behind the same
+    /// `showCacheMissNotices` gate — only `thinking_dropped` entries with a
+    /// renderable reason produce output.
+    pub(crate) fn maybe_show_assistant_diagnostics(
+        &self,
+        message: &rpi_ai::types::AssistantMessage,
+    ) {
+        if !self
+            .session()
+            .settings_manager(|settings| settings.get_show_cache_miss_notices())
+        {
+            return;
+        }
+        for diagnostic in message.diagnostics.as_deref().unwrap_or(&[]) {
+            if diagnostic.kind != "anthropic_input_transformations" {
+                continue;
+            }
+            let Some(transformations) = diagnostic
+                .details
+                .as_ref()
+                .and_then(|details| details.get("transformations"))
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            let dropped: Vec<String> = transformations
+                .iter()
+                .filter_map(|transformation| {
+                    if transformation
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        != Some("thinking_dropped")
+                    {
+                        return None;
+                    }
+                    let reason = transformation
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown reason");
+                    let location = transformation
+                        .get("path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|path| format!(" at {path}"))
+                        .unwrap_or_default();
+                    Some(format!("{reason}{location}"))
+                })
+                .collect();
+            if dropped.is_empty() {
+                continue;
+            }
+            let noun = if dropped.len() == 1 {
+                "thinking block".to_owned()
+            } else {
+                format!("{} thinking blocks", dropped.len())
+            };
+            self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
+            self.add_chat_child(Box::new(Text::new(
+                lock(&self.theme).fg(
+                    "warning",
+                    &format!("Anthropic dropped {noun}: {}", dropped.join("; ")),
+                ),
+                1,
+                0,
+                None,
+            )));
+        }
     }
 
     /// `addCompactionCostNotice` (interactive-mode.ts:3750-3762 @
@@ -6996,6 +7068,85 @@ mod tests {
     // ---------------------------------------------------------------------
     // Cache-miss notice hook (`maybeShowCacheMissNotice`, interactive-mode.ts:3449-3455)
     // ---------------------------------------------------------------------
+
+    /// `maybeShowAssistantDiagnostics` (interactive-mode.ts:3816-3839 @
+    /// 9841914, 4e69b0c28 — V14-05 FR-K): `anthropic_input_transformations`
+    /// diagnostics render as a warning notice behind the
+    /// `showCacheMissNotices` gate; the gate off (or no thinking_dropped
+    /// entries) renders nothing.
+    #[tokio::test]
+    async fn assistant_diagnostics_render_behind_cache_miss_notice_gate() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.session()
+            .settings_manager(|settings| settings.set_show_cache_miss_notices(true));
+
+        let mut message = assistant_message_raw(vec![text_content("answer")], StopReason::Stop);
+        message.diagnostics = Some(vec![rpi_ai::types::AssistantMessageDiagnostic {
+            kind: "anthropic_input_transformations".to_owned(),
+            timestamp: 1,
+            error: None,
+            details: Some(
+                serde_json::json!({
+                    "transformations": [
+                        {"type": "thinking_dropped", "reason": "prefix mismatch", "path": "/content/0"},
+                        {"type": "thinking_dropped", "reason": "stale signature"},
+                        {"type": "unrelated"}
+                    ]
+                })
+                .as_object()
+                .cloned()
+                .expect("details object"),
+            ),
+        }]);
+
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("answer")],
+            StopReason::Stop,
+        )));
+        ui.push(UiCommand::MessageEnd(AgentMessage::Assistant(message)));
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            rendered.contains("Anthropic dropped 2 thinking blocks"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("prefix mismatch at /content/0; stale signature"),
+            "rendered: {rendered}"
+        );
+
+        // Gate off → nothing renders.
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        let mut message = assistant_message_raw(vec![text_content("answer")], StopReason::Stop);
+        message.diagnostics = Some(vec![rpi_ai::types::AssistantMessageDiagnostic {
+            kind: "anthropic_input_transformations".to_owned(),
+            timestamp: 1,
+            error: None,
+            details: Some(
+                serde_json::json!({
+                    "transformations": [
+                        {"type": "thinking_dropped", "reason": "prefix mismatch"}
+                    ]
+                })
+                .as_object()
+                .cloned()
+                .expect("details object"),
+            ),
+        }]);
+        ui.push(UiCommand::MessageStart(assistant_message(
+            vec![text_content("answer")],
+            StopReason::Stop,
+        )));
+        ui.push(UiCommand::MessageEnd(AgentMessage::Assistant(message)));
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(100).join("\n");
+        assert!(
+            !rendered.contains("Anthropic dropped"),
+            "gate off must not render: {rendered}"
+        );
+    }
 
     #[tokio::test]
     async fn cache_miss_hook_runs_on_message_end_without_rendering() {

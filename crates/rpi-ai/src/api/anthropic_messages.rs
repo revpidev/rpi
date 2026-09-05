@@ -1,11 +1,18 @@
 //! Port of `packages/ai/src/api/anthropic-messages.ts` @ pi 0.82.1 (2efa728);
 //! stream-termination semantics (rawStopReason, `sensitive` error text)
-//! updated to 4181f66 (926eb15c1, 5a2539a7b).
+//! updated to 4181f66 (926eb15c1, 5a2539a7b); mid-conversation effort /
+//! thinking-binding / server-side fallback / input-transformations
+//! updated to 9841914 (4e69b0c28, eb1f87fa9 — V14-05).
 //!
 //! Anthropic Messages API adapter: request construction (system prompt,
 //! cache control, thinking modes, tools, deferred tool references), Claude
 //! Code identity for OAuth tokens, SSE stream decoding into
 //! [`StreamEvent`]s, and `stream_simple` reasoning mapping.
+//!
+//! Transport note (V14-05 FR-E): upstream computes `getBetaFeatures` into
+//! the SDK's `betas` body parameter, which the SDK moves into the
+//! `anthropic-beta` request header; rpi hand-writes HTTP and emits that
+//! header directly — the equivalent wire form (empty set → no header).
 //!
 //! Intentional differences (upstream deviations):
 //! - HTTP is a direct reqwest call, not the `@anthropic-ai/sdk`; the SDK's
@@ -61,6 +68,111 @@ use crate::utils::transform_messages::transform_messages;
 
 const FINE_GRAINED_TOOL_STREAMING_BETA: &str = "fine-grained-tool-streaming-2025-05-14";
 const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
+const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
+const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
+const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// `shouldUseServerSideFallbackBeta` (:184-186, eb1f87fa9).
+fn should_use_server_side_fallback_beta(model: &Model) -> bool {
+    model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.allowed_fallback_models.as_ref())
+        .is_some_and(|fallbacks| !fallbacks.is_empty())
+}
+
+/// `getBetaFeatures` (:978-1018 @ 9841914, 4e69b0c28): the single beta-set
+/// computation. Order: OAuth pair → fine-grained tool streaming →
+/// interleaved thinking (now gated on `model.reasoning &&
+/// thinking_enabled == Some(true)`) → server-side fallback → the two
+/// mid-convo/binding betas; deduplicated preserving first occurrence.
+///
+/// An explicit `anthropic-beta` entry in `model.headers` or
+/// `options.headers` (case-insensitive; options wins if both carry it)
+/// **replaces** the computed set — a `null` value clears it to empty, a
+/// string is split on commas, trimmed, emptied entries dropped and
+/// deduplicated (:985-1000). rpi's `Model.headers` values are plain
+/// strings (no null), so the clear rule is reachable only through
+/// `options.headers` (`ProviderHeaders` values are `Option<String>`),
+/// matching the type shapes on both sides.
+///
+/// Transport note: upstream sends this list as the SDK `betas` body
+/// parameter, which the SDK moves into the `anthropic-beta` request
+/// header; rpi hand-writes HTTP and emits the header directly — the
+/// equivalent wire form (empty set → no header).
+fn get_beta_features(
+    model: &Model,
+    context: &Context,
+    is_oauth_token: bool,
+    options: &AnthropicOptions,
+) -> Vec<String> {
+    // :985-1000 — explicit `anthropic-beta` overrides the computed set.
+    let mut configured: Option<Option<String>> = None;
+    if let Some(headers) = &model.headers {
+        for (name, value) in headers {
+            if name.to_lowercase() == "anthropic-beta" {
+                configured = Some(Some(value.clone()));
+            }
+        }
+    }
+    if let Some(headers) = options.stream.headers.as_ref() {
+        for (name, value) in headers {
+            if name.to_lowercase() == "anthropic-beta" {
+                configured = Some(value.clone());
+            }
+        }
+    }
+    if let Some(configured) = configured {
+        return match configured {
+            // `null` clears the whole set (:989).
+            None => Vec::new(),
+            Some(features) => {
+                let mut seen: HashSet<&str> = HashSet::new();
+                features
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|feature| !feature.is_empty() && seen.insert(feature))
+                    .map(str::to_owned)
+                    .collect()
+            }
+        };
+    }
+
+    let mut features: Vec<String> = Vec::new();
+    if is_oauth_token {
+        features.push("claude-code-20250219".to_owned());
+        features.push("oauth-2025-04-20".to_owned());
+    }
+    if should_use_fine_grained_tool_streaming_beta(model, context) {
+        features.push(FINE_GRAINED_TOOL_STREAMING_BETA.to_owned());
+    }
+    if model.reasoning
+        && options.thinking_enabled == Some(true)
+        && options.interleaved_thinking.unwrap_or(true)
+        && model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.force_adaptive_thinking)
+            != Some(true)
+    {
+        features.push(INTERLEAVED_THINKING_BETA.to_owned());
+    }
+    if should_use_server_side_fallback_beta(model) {
+        features.push(SERVER_SIDE_FALLBACK_BETA.to_owned());
+    }
+    if model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_mid_convo_effort)
+        == Some(true)
+    {
+        features.push(MID_CONVERSATION_OUTPUT_CONFIG_BETA.to_owned());
+        features.push(THINKING_BINDING_CONTROLS_BETA.to_owned());
+    }
+    // :1017 — `[...new Set(features)]` (already unique by construction;
+    // kept for parity with the upstream dedup step).
+    features
+}
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Stealth mode: mimic Claude Code's version in the OAuth user agent.
@@ -344,28 +456,19 @@ fn is_oauth_token(api_key: &str) -> bool {
 /// OAuth token.
 fn build_request_headers(
     model: &Model,
+    context: &Context,
     api_key: Option<&str>,
-    interleaved_thinking: bool,
-    use_fine_grained_tool_streaming_beta: bool,
-    options_headers: Option<&ProviderHeaders>,
+    options: &AnthropicOptions,
     dynamic_headers: Option<HashMap<String, String>>,
     session_id: Option<&str>,
 ) -> (ProviderHeaders, bool) {
     let compat = get_anthropic_compat(model);
-    // Adaptive-thinking models have interleaved thinking built in.
-    let needs_interleaved_beta = interleaved_thinking
-        && model
-            .compat
-            .as_ref()
-            .and_then(|c| c.force_adaptive_thinking)
-            != Some(true);
-    let mut beta_features: Vec<&str> = Vec::new();
-    if use_fine_grained_tool_streaming_beta {
-        beta_features.push(FINE_GRAINED_TOOL_STREAMING_BETA);
-    }
-    if needs_interleaved_beta {
-        beta_features.push(INTERLEAVED_THINKING_BETA);
-    }
+    // The beta set comes from the single `getBetaFeatures` computation
+    // (4e69b0c28) — OAuth/Claude-Code identity headers still gate on the
+    // token shape.
+    let is_oauth = api_key.is_some_and(is_oauth_token);
+    let beta_features = get_beta_features(model, context, is_oauth, options);
+    let beta_header = (!beta_features.is_empty()).then(|| beta_features.join(","));
 
     let dynamic_headers: Option<ProviderHeaders> = dynamic_headers.map(|headers| {
         headers
@@ -389,8 +492,8 @@ fn build_request_headers(
 
     // Copilot: Bearer auth, selective betas.
     if model.provider == "github-copilot" {
-        if !beta_features.is_empty() {
-            base.insert("anthropic-beta".to_owned(), Some(beta_features.join(",")));
+        if let Some(betas) = &beta_header {
+            base.insert("anthropic-beta".to_owned(), Some(betas.clone()));
         }
         if let Some(api_key) = api_key {
             base.insert(
@@ -402,17 +505,17 @@ fn build_request_headers(
             Some(base),
             model_headers(model),
             dynamic_headers,
-            options_headers.cloned(),
+            options.stream.headers.clone(),
         ]);
         return (headers, false);
     }
 
     // OAuth: Bearer auth, Claude Code identity headers.
     if let Some(api_key) = api_key {
-        if is_oauth_token(api_key) {
-            let mut betas = vec!["claude-code-20250219", "oauth-2025-04-20"];
-            betas.extend(beta_features);
-            base.insert("anthropic-beta".to_owned(), Some(betas.join(",")));
+        if is_oauth {
+            if let Some(betas) = &beta_header {
+                base.insert("anthropic-beta".to_owned(), Some(betas.clone()));
+            }
             base.insert(
                 "user-agent".to_owned(),
                 Some(format!("claude-cli/{CLAUDE_CODE_VERSION}")),
@@ -422,15 +525,18 @@ fn build_request_headers(
                 "authorization".to_owned(),
                 Some(format!("Bearer {api_key}")),
             );
-            let headers =
-                merge_headers_chain(&[Some(base), model_headers(model), options_headers.cloned()]);
+            let headers = merge_headers_chain(&[
+                Some(base),
+                model_headers(model),
+                options.stream.headers.clone(),
+            ]);
             return (headers, true);
         }
     }
 
     // API key or header-owned auth.
-    if !beta_features.is_empty() {
-        base.insert("anthropic-beta".to_owned(), Some(beta_features.join(",")));
+    if let Some(betas) = &beta_header {
+        base.insert("anthropic-beta".to_owned(), Some(betas.clone()));
     }
     if let Some(api_key) = api_key {
         base.insert("x-api-key".to_owned(), Some(api_key.to_owned()));
@@ -442,7 +548,7 @@ fn build_request_headers(
         Some(base),
         session_affinity_headers,
         model_headers(model),
-        options_headers.cloned(),
+        options.stream.headers.clone(),
     ]);
     (headers, false)
 }
@@ -555,6 +661,45 @@ fn convert_tool_result(
 }
 
 /// `convertMessages`.
+/// `ConvertedAnthropicMessages` (:1325-1328): the converted wire messages
+/// plus, for managed-effort models, the recorded historical effort level per
+/// assistant message index (4e69b0c28).
+struct ConvertedAnthropicMessages {
+    messages: Vec<Value>,
+    assistant_levels: HashMap<usize, String>,
+}
+
+/// `isAnthropicEffort` (:1400-1402).
+fn is_anthropic_effort(value: Option<&str>) -> bool {
+    matches!(value, Some("low" | "medium" | "high" | "xhigh" | "max"))
+}
+
+/// `insertThinkingLevelMessages` (:1404-1417): before every historical
+/// assistant message whose effort was recorded, insert an effort-only
+/// system message; always append the current turn's marker last.
+fn insert_thinking_level_messages(
+    converted: ConvertedAnthropicMessages,
+    active_effort: &str,
+) -> Vec<Value> {
+    let mut messages: Vec<Value> = Vec::new();
+    for (index, message) in converted.messages.into_iter().enumerate() {
+        if let Some(historical_effort) = converted.assistant_levels.get(&index) {
+            messages.push(json!({
+                "role": "system",
+                "content": [],
+                "output_config": {"effort": historical_effort},
+            }));
+        }
+        messages.push(message);
+    }
+    messages.push(json!({
+        "role": "system",
+        "content": [],
+        "output_config": {"effort": active_effort},
+    }));
+    messages
+}
+
 fn convert_messages(
     transformed_messages: &[Message],
     is_oauth_token: bool,
@@ -562,8 +707,10 @@ fn convert_messages(
     allow_empty_signature: bool,
     deferred_tool_names: &HashSet<String>,
     normalize_tool_name: &dyn Fn(&str) -> String,
-) -> Vec<Value> {
+    managed_provider: Option<&str>,
+) -> ConvertedAnthropicMessages {
     let mut params: Vec<Value> = Vec::new();
+    let mut assistant_levels: HashMap<usize, String> = HashMap::new();
     let mut loaded_tool_names: HashSet<String> = HashSet::new();
 
     let mut i = 0;
@@ -674,7 +821,21 @@ fn convert_messages(
                     i += 1;
                     continue;
                 }
+                let message_index = params.len();
                 params.push(json!({"role": "assistant", "content": blocks}));
+                // :1339-1346 — only same-provider anthropic-messages
+                // assistants with a valid recorded effort replay a marker
+                // (4e69b0c28).
+                if let Some(managed_provider) = managed_provider {
+                    if assistant.api == crate::types::ApiKind::from("anthropic-messages")
+                        && assistant.provider == managed_provider
+                        && is_anthropic_effort(assistant.provider_thinking_level.as_deref())
+                    {
+                        if let Some(level) = &assistant.provider_thinking_level {
+                            assistant_levels.insert(message_index, level.clone());
+                        }
+                    }
+                }
             }
             Message::ToolResult(_) => {
                 // Collect all consecutive toolResult messages (z.ai Anthropic
@@ -734,7 +895,10 @@ fn convert_messages(
         }
     }
 
-    params
+    ConvertedAnthropicMessages {
+        messages: params,
+        assistant_levels,
+    }
 }
 
 fn should_use_fine_grained_tool_streaming_beta(model: &Model, context: &Context) -> bool {
@@ -858,16 +1022,30 @@ fn build_params(
         .map(|tool| normalize_tool_name(&tool.name))
         .collect();
 
+    // Managed-effort models (4e69b0c28): replay effort markers around the
+    // history and pin the request-level controls below (:1053-1060).
+    let managed = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.supports_mid_convo_effort)
+        == Some(true);
+    let converted = convert_messages(
+        &transformed_messages,
+        is_oauth_token,
+        cache_control.as_ref(),
+        compat.allow_empty_signature,
+        &deferred_tool_names,
+        &normalize_tool_name,
+        managed.then_some(model.provider.as_str()),
+    );
+    let messages = if managed {
+        insert_thinking_level_messages(converted, options.effort.as_deref().unwrap_or("high"))
+    } else {
+        converted.messages
+    };
     let mut params = json!({
         "model": model.id,
-        "messages": convert_messages(
-            &transformed_messages,
-            is_oauth_token,
-            cache_control.as_ref(),
-            compat.allow_empty_signature,
-            &deferred_tool_names,
-            &normalize_tool_name,
-        ),
+        "messages": messages,
         "max_tokens": options.stream.max_tokens.unwrap_or(model.max_tokens),
         "stream": true,
     });
@@ -893,9 +1071,9 @@ fn build_params(
     }
 
     // Temperature is incompatible with extended thinking and unsupported on
-    // Claude Opus 4.7+.
+    // Claude Opus 4.7+ / managed-effort models (:1090-1097).
     if let Some(temperature) = options.stream.temperature {
-        if options.thinking_enabled != Some(true) && compat.supports_temperature {
+        if options.thinking_enabled != Some(true) && !managed && compat.supports_temperature {
             params["temperature"] = json!(temperature);
         }
     }
@@ -925,7 +1103,21 @@ fn build_params(
     }
 
     // Configure thinking mode: adaptive, budget-based, or explicitly disabled.
-    if model.reasoning {
+    // Managed effort models always use adaptive thinking so prefix mismatches
+    // can be dropped instead of surfacing as persistent 400 responses
+    // (:1123-1131, 4e69b0c28).
+    if managed {
+        let display = options
+            .thinking_display
+            .unwrap_or(AnthropicThinkingDisplay::Summarized)
+            .as_str();
+        params["thinking"] = json!({
+            "type": "adaptive",
+            "display": display,
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        });
+        params["output_config"] = json!({"effort": "high"});
+    } else if model.reasoning {
         if options.thinking_enabled == Some(true) {
             // Default to "summarized" so Opus 4.7 and Mythos Preview behave
             // like older Claude 4 models (whose API default is also
@@ -981,6 +1173,23 @@ fn build_params(
             AnthropicToolChoice::None => json!({"type": "none"}),
             AnthropicToolChoice::Tool { name } => json!({"type": "tool", "name": name}),
         };
+    }
+
+    // Server-side refusal fallback (eb1f87fa9, :1168-1172): only when the
+    // compat lists permitted targets — Anthropic rejects `fallbacks` for
+    // models with none.
+    let allowed_fallback_models = model
+        .compat
+        .as_ref()
+        .and_then(|compat| compat.allowed_fallback_models.as_ref());
+    if allowed_fallback_models.is_some_and(|fallbacks| !fallbacks.is_empty()) {
+        params["fallbacks"] = Value::Array(
+            allowed_fallback_models
+                .expect("non-empty checked")
+                .iter()
+                .map(|fallback| json!({"model": fallback.model}))
+                .collect(),
+        );
     }
 
     Ok(params)
@@ -1048,10 +1257,18 @@ struct BlockState {
 struct StreamProcessor<'a> {
     output: &'a mut AssistantMessage,
     model: &'a Model,
+    /// `usageModel` (:599-605): the model used for cost calculation — the
+    /// requested model, or the fallback model (with its compat-listed cost)
+    /// when the server reports a different one (eb1f87fa9).
+    usage_model: Model,
     is_oauth_token: bool,
     tools: Option<&'a [Tool]>,
     saw_message_start: bool,
     saw_message_end: bool,
+    /// `inputTransformations` (:537, :592-593, :745-746): the latest
+    /// `input_transformations` array from `message_start`/`message_delta`
+    /// (assignment semantics — the last one wins; 4e69b0c28).
+    input_transformations: Option<Value>,
     block_states: Vec<BlockState>,
 }
 
@@ -1064,11 +1281,13 @@ impl<'a> StreamProcessor<'a> {
     ) -> Self {
         Self {
             output,
+            usage_model: model.clone(),
             model,
             is_oauth_token,
             tools,
             saw_message_start: false,
             saw_message_end: false,
+            input_transformations: None,
             block_states: Vec::new(),
         }
     }
@@ -1079,7 +1298,9 @@ impl<'a> StreamProcessor<'a> {
             + self.output.usage.output
             + self.output.usage.cache_read
             + self.output.usage.cache_write;
-        calculate_cost(self.model, &mut self.output.usage);
+        // Fallback responses bill at the fallback model's cost
+        // (`usageModel`, eb1f87fa9).
+        calculate_cost(&self.usage_model, &mut self.output.usage);
     }
 
     /// `iterateAnthropicEvents` per-event body: filter, parse, flag, dispatch.
@@ -1122,6 +1343,46 @@ impl<'a> StreamProcessor<'a> {
                 if let Some(id) = message.get("id").and_then(Value::as_str) {
                     self.output.response_id = Some(id.to_owned());
                 }
+                // :592-593 — server-reported input transformations (latest
+                // assignment wins; message_delta may replace them later).
+                if let Some(transformations) = message.get("input_transformations") {
+                    if transformations.is_array() {
+                        self.input_transformations = Some(transformations.clone());
+                    }
+                }
+                // :598 — the server may have served a fallback model; the
+                // returned id is authoritative for the final message.
+                if let Some(served) = message.get("model").and_then(Value::as_str) {
+                    self.output.model = served.to_owned();
+                }
+                // :599-605 — cost follows the served model when it matches a
+                // permitted fallback target (same provider + exact model).
+                let fallback_cost = if self.output.model == self.model.id {
+                    None
+                } else {
+                    self.model
+                        .compat
+                        .as_ref()
+                        .and_then(|compat| compat.allowed_fallback_models.as_ref())
+                        .and_then(|fallbacks| {
+                            fallbacks
+                                .iter()
+                                .find(|fallback| {
+                                    fallback.provider == self.model.provider
+                                        && fallback.model == self.output.model
+                                })
+                                .map(|fallback| fallback.cost.clone())
+                        })
+                };
+                self.usage_model = match fallback_cost {
+                    Some(cost) => {
+                        let mut served_model = self.model.clone();
+                        served_model.id = self.output.model.clone();
+                        served_model.cost = cost;
+                        served_model
+                    }
+                    None => self.model.clone(),
+                };
                 // Capture initial token usage from message_start; this ensures
                 // input token counts even if the stream is aborted early.
                 let usage = &message["usage"];
@@ -1140,6 +1401,17 @@ impl<'a> StreamProcessor<'a> {
                 let event_index = json_u64(&event["index"]).unwrap_or(0) as usize;
                 let block = &event["content_block"];
                 match block.get("type").and_then(Value::as_str) {
+                    // :618-623 — a `fallback` marker block is skipped when it
+                    // opens the output; anything later is an unsupported
+                    // mid-output model switch (eb1f87fa9).
+                    Some("fallback") => {
+                        if !self.output.content.is_empty() {
+                            return Err(
+                                "Anthropic performed an unsupported mid-output model fallback"
+                                    .to_owned(),
+                            );
+                        }
+                    }
                     Some("text") => {
                         // 59ad3dead: the initial `text` of a content_block_start
                         // is part of the content, not a delta preamble — keep it.
@@ -1362,6 +1634,12 @@ impl<'a> StreamProcessor<'a> {
             }
             Some("message_delta") => {
                 let delta = &event["delta"];
+                // :745-746 — replaces any message_start-collected array.
+                if let Some(transformations) = event.get("input_transformations") {
+                    if transformations.is_array() {
+                        self.input_transformations = Some(transformations.clone());
+                    }
+                }
                 if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
                     if !reason.is_empty() {
                         // 926eb15c1: preserve the raw provider reason before
@@ -1416,22 +1694,56 @@ impl<'a> StreamProcessor<'a> {
         if signal.is_some_and(|signal| signal.is_cancelled()) {
             return Err("Request was aborted".to_owned());
         }
-        match self.output.stop_reason {
+        let reason = match self.output.stop_reason {
             // `Deferred` shares the `Pending` arm: no rpi provider produces it
             // (lifecycle is [DEFER], R2.2.1), so it is unreachable here and
             // treated as "stream ended without a usable stop reason".
             StopReason::Pending | StopReason::Deferred => {
-                Err("Anthropic stream ended without a stop reason".to_owned())
+                return Err("Anthropic stream ended without a stop reason".to_owned())
             }
-            StopReason::Aborted | StopReason::Error => Err(self
-                .output
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "An unknown error occurred".to_owned())),
-            StopReason::Stop => Ok(DoneReason::Stop),
-            StopReason::Length => Ok(DoneReason::Length),
-            StopReason::ToolUse => Ok(DoneReason::ToolUse),
+            StopReason::Aborted | StopReason::Error => {
+                return Err(self
+                    .output
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| "An unknown error occurred".to_owned()))
+            }
+            StopReason::Stop => DoneReason::Stop,
+            StopReason::Length => DoneReason::Length,
+            StopReason::ToolUse => DoneReason::ToolUse,
+        };
+        // :790-803 (4e69b0c28): surface collected input transformations as a
+        // diagnostic on the successful final message — `undefined` fields
+        // are dropped from the JSON just like upstream's `?? undefined`.
+        if let Some(transformations) = &self.input_transformations {
+            if let Some(entries) = transformations.as_array() {
+                if !entries.is_empty() {
+                    let mapped: Vec<Value> = entries
+                        .iter()
+                        .map(|entry| {
+                            let mut object = serde_json::Map::new();
+                            for key in ["type", "path", "reason"] {
+                                if let Some(value) = entry.get(key).and_then(Value::as_str) {
+                                    object.insert(key.to_owned(), json!(value));
+                                }
+                            }
+                            Value::Object(object)
+                        })
+                        .collect();
+                    let mut details = serde_json::Map::new();
+                    details.insert("transformations".to_owned(), Value::Array(mapped));
+                    self.output.diagnostics.get_or_insert_with(Vec::new).push(
+                        crate::types::AssistantMessageDiagnostic {
+                            kind: "anthropic_input_transformations".to_owned(),
+                            timestamp: now_ms(),
+                            error: None,
+                            details: Some(details),
+                        },
+                    );
+                }
+            }
         }
+        Ok(reason)
     }
 }
 
@@ -1496,17 +1808,19 @@ async fn run(
 
     let (headers, is_oauth_token) = build_request_headers(
         model,
+        context,
         api_key,
-        options.interleaved_thinking.unwrap_or(true),
-        should_use_fine_grained_tool_streaming_beta(model, context),
-        options.stream.headers.as_ref(),
+        options,
         dynamic_headers,
         cache_session_id,
     );
 
     let mut params = build_params(model, context, is_oauth_token, options)?;
     if let Some(on_payload) = &options.stream.on_payload {
-        if let Some(next_params) = on_payload(params.clone(), model).await {
+        if let Some(mut next_params) = on_payload(params.clone(), model).await {
+            // :571-572 — the SDK transport always streams; a caller-supplied
+            // payload cannot turn that off.
+            next_params["stream"] = json!(true);
             params = next_params;
         }
     }
@@ -1629,6 +1943,18 @@ pub fn stream(
     tokio::spawn(async move {
         let signal = options.stream.signal.clone();
         let mut output = initial_output(&model);
+        // :513-520 (4e69b0c28): managed models record the turn's effort at
+        // stream start (`options.effort ?? "high"`); other models leave the
+        // field absent — never an empty string.
+        if model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.supports_mid_convo_effort)
+            == Some(true)
+        {
+            output.provider_thinking_level =
+                Some(options.effort.clone().unwrap_or_else(|| "high".to_owned()));
+        }
         match run(&model, &context, &options, &mut output, &task_stream).await {
             Ok(reason) => {
                 task_stream.push(StreamEvent::Done {
@@ -1819,7 +2145,7 @@ pub(crate) mod tests {
         serde_json::from_value(value).expect("model")
     }
 
-    fn assistant_message(
+    pub(crate) fn assistant_message(
         content: Vec<AssistantContent>,
         provider: &str,
         model_id: &str,
@@ -1844,7 +2170,7 @@ pub(crate) mod tests {
         })
     }
 
-    fn user_text(text: &str) -> Message {
+    pub(crate) fn user_text(text: &str) -> Message {
         serde_json::from_value(json!({
             "role": "user", "content": text, "timestamp": 0
         }))
@@ -1873,7 +2199,7 @@ pub(crate) mod tests {
         .expect("toolResult")
     }
 
-    fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Context {
+    pub(crate) fn context(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> Context {
         Context {
             system_prompt: None,
             messages,
@@ -2000,12 +2326,26 @@ pub(crate) mod tests {
         let model = make_model(json!({}));
         let options_headers: ProviderHeaders =
             [("X-Custom".to_owned(), Some("1".to_owned()))].into();
+        let options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    headers: Some(options_headers),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
         let (headers, is_oauth) = build_request_headers(
             &model,
+            &Context {
+                system_prompt: None,
+                messages: vec![],
+                tools: None,
+            },
             Some("sk-ant-api03-key"),
-            true,
-            false,
-            Some(&options_headers),
+            &options,
             None,
             Some("session-1"),
         );
@@ -2033,13 +2373,20 @@ pub(crate) mod tests {
 
     #[test]
     fn test_build_request_headers_oauth() {
-        let model = make_model(json!({}));
+        let model = make_model(json!({"compat": {"supportsEagerToolInputStreaming": false}}));
+        let options = AnthropicOptions {
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
         let (headers, is_oauth) = build_request_headers(
             &model,
+            &Context {
+                system_prompt: None,
+                messages: vec![],
+                tools: Some(vec![tool("search")]),
+            },
             Some("sk-ant-oat01-token"),
-            true,
-            true,
-            None,
+            &options,
             None,
             None,
         );
@@ -2065,8 +2412,14 @@ pub(crate) mod tests {
     #[test]
     fn test_build_request_headers_adaptive_skips_interleaved_beta() {
         let model = make_model(json!({"compat": {"forceAdaptiveThinking": true}}));
-        let (headers, _) =
-            build_request_headers(&model, Some("sk-key"), true, false, None, None, None);
+        let (headers, _) = build_request_headers(
+            &model,
+            &Context::default(),
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            None,
+        );
         assert!(!headers.contains_key("anthropic-beta"));
     }
 
@@ -2075,10 +2428,9 @@ pub(crate) mod tests {
         let model = make_model(json!({"compat": {"sendSessionAffinityHeaders": true}}));
         let (headers, _) = build_request_headers(
             &model,
+            &Context::default(),
             Some("sk-key"),
-            false,
-            false,
-            None,
+            &AnthropicOptions::default(),
             None,
             Some("sess-9"),
         );
@@ -2107,9 +2459,16 @@ pub(crate) mod tests {
             user_text("again"),
         ];
         let cc = json!({"type": "ephemeral"});
-        let params = convert_messages(&messages, false, Some(&cc), false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            Some(&cc),
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], json!({"role": "user", "content": "hello"}));
         assert_eq!(
@@ -2130,9 +2489,16 @@ pub(crate) mod tests {
             assistant_message(vec![], "anthropic", "claude-sonnet-4-5"),
             user_text("real"),
         ];
-        let params = convert_messages(&messages, false, None, false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         assert_eq!(params.len(), 1);
         assert_eq!(params[0]["content"], json!("real"));
     }
@@ -2156,9 +2522,16 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let params = convert_messages(&messages, false, None, false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
             blocks[0],
@@ -2173,9 +2546,16 @@ pub(crate) mod tests {
         assert_eq!(blocks.len(), 2);
 
         // allowEmptySignature keeps the block as thinking with "".
-        let params = convert_messages(&messages, false, None, true, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            true,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         let blocks = params[0]["content"].as_array().expect("blocks");
         assert_eq!(
             blocks[1],
@@ -2194,9 +2574,16 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let params = convert_messages(&messages, false, None, false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         assert_eq!(
             params[0]["content"][0],
             json!({"type": "redacted_thinking", "data": "opaque"})
@@ -2210,9 +2597,16 @@ pub(crate) mod tests {
             tool_result("call_2", "two", None),
             user_text("next"),
         ];
-        let params = convert_messages(&messages, false, None, false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         assert_eq!(params.len(), 2);
         let content = params[0]["content"].as_array().expect("content");
         assert_eq!(
@@ -2228,7 +2622,16 @@ pub(crate) mod tests {
     fn test_convert_messages_tool_references() {
         let deferred: HashSet<String> = ["search".to_owned()].into();
         let messages = vec![tool_result("call_1", "result body", Some(vec!["search"]))];
-        let params = convert_messages(&messages, false, None, false, &deferred, &|n| n.to_owned());
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &deferred,
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         let content = params[0]["content"].as_array().expect("content");
         // Reference replaces the tool result content; the original content is
         // displaced into a sibling block.
@@ -2256,18 +2659,27 @@ pub(crate) mod tests {
             "anthropic",
             "claude-sonnet-4-5",
         )];
-        let params = convert_messages(
+        let converted = convert_messages(
             &messages,
             true,
             None,
             false,
             &HashSet::new(),
             &to_claude_code_name,
+            None,
         );
+        let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("Bash"));
-        let params = convert_messages(&messages, false, None, false, &HashSet::new(), &|n| {
-            n.to_owned()
-        });
+        let converted = convert_messages(
+            &messages,
+            false,
+            None,
+            false,
+            &HashSet::new(),
+            &|n| n.to_owned(),
+            None,
+        );
+        let params = converted.messages;
         assert_eq!(params[0]["content"][0]["name"], json!("bash"));
     }
 
@@ -2361,6 +2773,47 @@ pub(crate) mod tests {
         assert_eq!(system[1]["text"], json!("You are rpi."));
         // OAuth canonicalizes tool names.
         assert_eq!(params["tools"][0]["name"], json!("Bash"));
+    }
+
+    /// FR-G R2 (eb1f87fa9): `fallbacks` is sent only when the compat lists
+    /// permitted targets, as `[{model}]` entries.
+    #[test]
+    fn test_build_params_fallbacks_only_with_allowed_models() {
+        let model = make_model(json!({
+            "compat": {"allowedFallbackModels": [
+                {"provider": "anthropic", "model": "claude-haiku-9", "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0}},
+                {"provider": "anthropic", "model": "claude-sonnet-4-5-mini", "cost": {"input": 0.5, "output": 1.0, "cacheRead": 0.0, "cacheWrite": 0.0}}
+            ]}
+        }));
+        let ctx = context(vec![user_text("hi")], None);
+        let params =
+            build_params(&model, &ctx, false, &AnthropicOptions::default()).expect("params");
+        assert_eq!(
+            params["fallbacks"],
+            json!([{"model": "claude-haiku-9"}, {"model": "claude-sonnet-4-5-mini"}])
+        );
+
+        // Absent or empty → the field is omitted entirely.
+        let empty = make_model(json!({"compat": {"allowedFallbackModels": []}}));
+        let params =
+            build_params(&empty, &ctx, false, &AnthropicOptions::default()).expect("params");
+        assert!(params.get("fallbacks").is_none());
+        let plain = make_model(json!({}));
+        let params =
+            build_params(&plain, &ctx, false, &AnthropicOptions::default()).expect("params");
+        assert!(params.get("fallbacks").is_none());
+    }
+
+    /// FR-C R2 (4e69b0c28): managed models never send `temperature`, even
+    /// with thinking off and a temperature requested.
+    #[test]
+    fn test_build_params_managed_never_sends_temperature() {
+        let model = make_model(json!({"compat": {"supportsMidConvoEffort": true}}));
+        let ctx = context(vec![user_text("hi")], None);
+        let mut options = AnthropicOptions::default();
+        options.stream.temperature = Some(0.5);
+        let params = build_params(&model, &ctx, false, &options).expect("params");
+        assert!(params.get("temperature").is_none());
     }
 
     #[test]
@@ -2755,6 +3208,142 @@ pub(crate) mod tests {
         (collected, reason, output)
     }
 
+    /// FR-G R3 (eb1f87fa9): `message_start` may report a fallback model; the
+    /// returned id overrides `output.model` and cost follows the fallback
+    /// target's compat-listed pricing.
+    #[test]
+    fn message_start_fallback_model_overrides_output_and_bills_fallback_cost() {
+        let model = make_model(json!({
+            "compat": {
+                "allowedFallbackModels": [
+                    {"provider": "anthropic", "model": "claude-haiku-9", "cost": {
+                        "input": 2_000_000.0, "output": 4_000_000.0,
+                        "cacheRead": 0.0, "cacheWrite": 0.0
+                    }}
+                ]
+            }
+        }));
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"model\":\"claude-haiku-9\",\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":50}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.model, "claude-haiku-9");
+        // 100 × 2,000,000/1e6 = 200; 50 × 4,000,000/1e6 = 200 — the
+        // requested model's rates (3/15) would have given 0.3/0.75.
+        assert_eq!(output.usage.cost.input, 200.0);
+        assert_eq!(output.usage.cost.output, 200.0);
+    }
+
+    /// FR-G R3: an unknown served model keeps the requested model's rates.
+    #[test]
+    fn message_start_unknown_model_keeps_requested_rates() {
+        let model = make_model(json!({}));
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_f\",\"model\":\"claude-unknown-9\",\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1000000,\"output_tokens\":0}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.model, "claude-unknown-9");
+        // Requested model rates: 3.0/M input.
+        assert_eq!(output.usage.cost.input, 3.0);
+    }
+
+    /// FR-G R4 (:618-623): a `fallback` marker block opening the output is
+    /// skipped; arriving mid-output is an error.
+    #[test]
+    fn fallback_block_first_skipped_mid_output_errors() {
+        let model = make_model(json!({}));
+        // First block: the fallback marker is skipped silently.
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"fallback\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.content.len(), 1);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextStart { .. })));
+
+        // Mid-output: hard error with the upstream message.
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"first\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"fallback\"}}\n\n",
+        );
+        let (_events, reason, _output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(
+            reason,
+            Err("Anthropic performed an unsupported mid-output model fallback".to_owned())
+        );
+    }
+
+    /// FR-F (4e69b0c28): `input_transformations` from `message_start` and
+    /// `message_delta` surface as an `anthropic_input_transformations`
+    /// diagnostic; `message_delta` replaces the earlier array; absent arrays
+    /// leave no diagnostic.
+    #[test]
+    fn input_transformations_become_diagnostics() {
+        let model = make_model(json!({}));
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0},\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"/content/0\"}]}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1},\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"/content/0\"},{\"reason\":\"prefix_mismatch\"}]}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        let diagnostics = output.diagnostics.as_deref().expect("diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, "anthropic_input_transformations");
+        let details = diagnostics[0].details.as_ref().expect("details");
+        assert_eq!(
+            details.get("transformations"),
+            Some(&json!([
+                {"type": "thinking_dropped", "path": "/content/0"},
+                {"reason": "prefix_mismatch"},
+            ])),
+            "the message_delta array replaces the message_start one; absent              keys (like `type` on the second entry) are dropped"
+        );
+
+        // No transformations anywhere → no diagnostics.
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert!(output.diagnostics.is_none());
+    }
+
     const RECORDED_STREAM: &str = concat!(
         "event: message_start\n",
         "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cache_read_input_tokens\":5,\"cache_creation_input_tokens\":2,\"cache_creation\":{\"ephemeral_1h_input_tokens\":1}}}}\n",
@@ -3028,6 +3617,362 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
+mod mid_convo_effort_tests {
+    //! Port of `packages/ai/test/anthropic-mid-conversation-effort.test.ts`
+    //! @ 9841914 (4e69b0c28) — intents transplanted, wire params asserted
+    //! field-by-field via the on_payload capture seam (upstream captures the
+    //! SDK payload and throws; rpi captures and lets the unreachable
+    //! `http://127.0.0.1:9` endpoint fail the request — the error message
+    //! still carries the stream-start-initialized output).
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::tests::{assistant_message, context, make_model, user_text};
+    use super::*;
+
+    fn managed_model(provider: &str) -> Model {
+        make_model(json!({
+            "id": "claude-fable-5-1",
+            "name": "Claude Fable 5.1",
+            "provider": provider,
+            "baseUrl": "http://127.0.0.1:9",
+            "compat": {
+                "forceAdaptiveThinking": true,
+                "supportsMidConvoEffort": true
+            },
+            "thinkingLevelMap": {
+                "off": null, "minimal": "low", "low": "low",
+                "medium": "medium", "high": "high", "max": "max"
+            }
+        }))
+    }
+
+    fn assistant_with_level(model: &Model, level: Option<&str>) -> Message {
+        let mut message = assistant_message(
+            vec![
+                AssistantContent::Thinking(crate::types::ThinkingContent {
+                    thinking: "reasoning".to_owned(),
+                    thinking_signature: Some("signature".to_owned()),
+                    redacted: None,
+                }),
+                AssistantContent::Text(crate::types::TextContent {
+                    text: "answer".to_owned(),
+                    text_signature: None,
+                }),
+            ],
+            &model.provider,
+            &model.id,
+        );
+        if let Message::Assistant(message) = &mut message {
+            if let Some(level) = level {
+                message.provider_thinking_level = Some(level.to_owned());
+            }
+        }
+        message
+    }
+
+    async fn capture(
+        model: &Model,
+        context: &Context,
+        effort: Option<&str>,
+    ) -> (Value, AssistantMessage) {
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let slot = payload.clone();
+        let options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    on_payload: Some(Arc::new(move |value, _model| {
+                        let slot = slot.clone();
+                        Box::pin(async move {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                            None
+                        })
+                    })),
+                    ..Default::default()
+                },
+                cache_retention: Some(CacheRetention::None),
+                ..Default::default()
+            },
+            thinking_enabled: Some(true),
+            effort: effort.map(str::to_owned),
+            ..Default::default()
+        };
+        let event_stream = stream(model, context, options);
+        let message = event_stream
+            .result()
+            .await
+            .expect("error message from unreachable endpoint");
+        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        (captured, message)
+    }
+
+    fn effort_markers(payload: &Value) -> Vec<&Value> {
+        payload["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|message| message["role"] == json!("system"))
+            .collect()
+    }
+
+    /// "reconstructs an exact historical marker prefix and appends the
+    /// current marker".
+    #[tokio::test]
+    async fn reconstructs_exact_historical_marker_prefix_and_appends_current() {
+        let model = managed_model("anthropic");
+        let (first, first_message) =
+            capture(&model, &context(vec![user_text("one")], None), Some("low")).await;
+        assert_eq!(
+            first["messages"],
+            json!([
+                {"role": "user", "content": "one"},
+                {"role": "system", "content": [], "output_config": {"effort": "low"}},
+            ])
+        );
+        let (second, _second_message) = capture(
+            &model,
+            &context(
+                vec![
+                    user_text("one"),
+                    assistant_with_level(&model, Some("low")),
+                    user_text("two"),
+                ],
+                None,
+            ),
+            Some("high"),
+        )
+        .await;
+        let first_messages = first["messages"].as_array().expect("messages").clone();
+        let second_messages = second["messages"].as_array().expect("messages").clone();
+        assert_eq!(
+            &second_messages[..first_messages.len()],
+            &first_messages[..],
+            "the historical prefix must be reconstructed exactly"
+        );
+        assert_eq!(
+            second_messages.last(),
+            Some(&json!({
+                "role": "system", "content": [], "output_config": {"effort": "high"}
+            }))
+        );
+        // Request-level controls are pinned regardless of the turn's effort.
+        assert_eq!(first["output_config"], json!({"effort": "high"}));
+        assert_eq!(second["output_config"], json!({"effort": "high"}));
+        assert_eq!(
+            second["thinking"],
+            json!({
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+            })
+        );
+        assert_eq!(
+            first_message.provider_thinking_level.as_deref(),
+            Some("low")
+        );
+    }
+
+    /// "preserves native effort %s" over all five levels.
+    #[tokio::test]
+    async fn preserves_native_effort_all_levels() {
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let model = managed_model("anthropic");
+            let (payload, message) =
+                capture(&model, &context(vec![user_text("one")], None), Some(effort)).await;
+            assert_eq!(
+                effort_markers(&payload),
+                vec![&json!({
+                    "role": "system", "content": [], "output_config": {"effort": effort}
+                })],
+                "effort {effort}"
+            );
+            assert_eq!(message.provider_thinking_level.as_deref(), Some(effort));
+        }
+    }
+
+    /// "defaults omitted effort to high and still enables drop_block".
+    #[tokio::test]
+    async fn defaults_omitted_effort_to_high_with_drop_block() {
+        let (payload, message) = capture(
+            &managed_model("anthropic"),
+            &context(vec![user_text("one")], None),
+            None,
+        )
+        .await;
+        assert_eq!(
+            payload["messages"].as_array().expect("messages").last(),
+            Some(&json!({
+                "role": "system", "content": [], "output_config": {"effort": "high"}
+            }))
+        );
+        assert_eq!(
+            payload["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            json!("drop_block")
+        );
+        assert_eq!(message.provider_thinking_level.as_deref(), Some("high"));
+    }
+
+    /// "does not invent markers for legacy or other-provider assistants".
+    #[tokio::test]
+    async fn no_markers_for_legacy_or_other_provider_assistants() {
+        let model = managed_model("anthropic");
+        let mut other_provider_model = managed_model("other-provider");
+        other_provider_model.provider = "other-provider".to_owned();
+        let legacy = assistant_with_level(&model, None);
+        let other_provider = assistant_with_level(&other_provider_model, Some("low"));
+        // FR-H R3: an old openrouter session recorded Claude messages under
+        // `openai-completions`; such assistants carry no anthropic-messages
+        // api marker even with a level set.
+        let mut legacy_api = assistant_with_level(&model, Some("low"));
+        if let Message::Assistant(message) = &mut legacy_api {
+            message.api = crate::types::ApiKind::from("openai-completions");
+        }
+        let (payload, _) = capture(
+            &model,
+            &context(
+                vec![
+                    user_text("one"),
+                    legacy,
+                    user_text("two"),
+                    other_provider,
+                    user_text("three"),
+                    legacy_api,
+                ],
+                None,
+            ),
+            Some("medium"),
+        )
+        .await;
+        assert_eq!(
+            effort_markers(&payload),
+            vec![&json!({
+                "role": "system", "content": [], "output_config": {"effort": "medium"}
+            })]
+        );
+    }
+
+    /// "leaves unsupported models on top-level effort" — no markers, no
+    /// block_binding, output_config carries the requested effort, and the
+    /// message records no provider level.
+    #[tokio::test]
+    async fn unsupported_models_stay_on_top_level_effort() {
+        let model = make_model(json!({
+            "id": "claude-fable-5-1",
+            "baseUrl": "http://127.0.0.1:9",
+            "compat": {"forceAdaptiveThinking": true}
+        }));
+        let (payload, message) =
+            capture(&model, &context(vec![user_text("one")], None), Some("low")).await;
+        assert_eq!(
+            payload["messages"],
+            json!([{"role": "user", "content": "one"}])
+        );
+        assert_eq!(payload["output_config"], json!({"effort": "low"}));
+        assert_eq!(
+            payload["thinking"],
+            json!({"type": "adaptive", "display": "summarized"})
+        );
+        assert_eq!(message.provider_thinking_level, None);
+    }
+
+    /// "sends the effort and binding beta headers" — asserted at the two
+    /// layers rpi has (the beta-set computation and the emitted header).
+    #[test]
+    fn sends_effort_and_binding_beta_headers() {
+        let model = managed_model("anthropic");
+        let options = AnthropicOptions {
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
+        let betas = get_beta_features(&model, &Context::default(), false, &options);
+        assert!(betas.contains(&"mid-conversation-output-config-2026-07-01".to_owned()));
+        assert!(betas.contains(&"thinking-binding-controls-2026-08-01".to_owned()));
+        let (headers, _) = build_request_headers(
+            &model,
+            &Context::default(),
+            Some("test-key"),
+            &options,
+            None,
+            None,
+        );
+        let beta = headers
+            .get("anthropic-beta")
+            .and_then(|value| value.as_deref())
+            .expect("anthropic-beta header");
+        assert!(beta.contains("mid-conversation-output-config-2026-07-01"));
+        assert!(beta.contains("thinking-binding-controls-2026-08-01"));
+    }
+
+    /// Header override rules (:985-1000): an explicit `anthropic-beta`
+    /// replaces the computed set; `null` clears it; comma lists are
+    /// trimmed/deduplicated; options win over model headers.
+    #[test]
+    fn beta_header_overrides_replace_computed_set() {
+        let model = managed_model("anthropic");
+        let options = AnthropicOptions {
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
+        let base = Context::default();
+
+        // String override wins and is normalized.
+        let mut with_model_headers = managed_model("anthropic");
+        with_model_headers.headers = Some(
+            [("Anthropic-Beta".to_owned(), " a ,,b ".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            get_beta_features(&with_model_headers, &base, false, &options),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+
+        // null clears (options headers are the only null-capable channel).
+        let null_options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    headers: Some([("anthropic-beta".to_owned(), None)].into_iter().collect()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
+        assert!(get_beta_features(&model, &base, false, &null_options).is_empty());
+
+        // options beat model headers; dedup keeps first occurrence.
+        let mut model_headers = managed_model("anthropic");
+        model_headers.headers = Some(
+            [("anthropic-beta".to_owned(), "x".to_owned())]
+                .into_iter()
+                .collect(),
+        );
+        let override_options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    headers: Some(
+                        [("anthropic-beta".to_owned(), Some(" b , b ,a ".to_owned()))]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            get_beta_features(&model_headers, &base, false, &override_options),
+            vec!["b".to_owned(), "a".to_owned()]
+        );
+    }
+}
+
+#[cfg(test)]
 mod header_semantics_tests {
     use serde_json::json;
 
@@ -3044,10 +3989,18 @@ mod header_semantics_tests {
             [("X-API-Key".to_owned(), Some("user-key".to_owned()))].into();
         let (headers, _) = build_request_headers(
             &model,
+            &Context::default(),
             Some("sk-key"),
-            false,
-            false,
-            Some(&options_headers),
+            &AnthropicOptions {
+                stream: crate::types::StreamOptions {
+                    request: crate::types::ProviderRequestOptions {
+                        headers: Some(options_headers),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             None,
             None,
         );
@@ -3064,10 +4017,18 @@ mod header_semantics_tests {
         let options_headers: ProviderHeaders = [("x-api-key".to_owned(), None)].into();
         let (headers, _) = build_request_headers(
             &model,
+            &Context::default(),
             Some("sk-key"),
-            false,
-            false,
-            Some(&options_headers),
+            &AnthropicOptions {
+                stream: crate::types::StreamOptions {
+                    request: crate::types::ProviderRequestOptions {
+                        headers: Some(options_headers),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             None,
             None,
         );

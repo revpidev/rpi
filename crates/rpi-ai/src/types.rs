@@ -1598,10 +1598,31 @@ pub struct ModelCompat {
     /// Whether the provider supports Anthropic strict tool schemas.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_strict_tools: Option<bool>,
+    /// Whether the exact model transport supports effort-only system messages
+    /// and thinking binding controls (types.ts:716, 4e69b0c28). Default:
+    /// false; catalog gating rules are V14-09 scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_mid_convo_effort: Option<bool>,
+    /// Models Anthropic accepts in `fallbacks` for server-side refusal
+    /// fallback, with local pricing metadata for returned fallback
+    /// responses (types.ts:718-723, eb1f87fa9). When absent or empty the
+    /// `fallbacks` request field must be omitted — Anthropic rejects it for
+    /// models with no permitted fallback targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_fallback_models: Option<Vec<AnthropicAllowedFallbackModel>>,
     /// Whether the provider supports deferred tools loaded by
     /// `tool_reference` blocks in tool results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_tool_references: Option<bool>,
+}
+
+/// `AnthropicAllowedFallbackModel` (types.ts:307-311): one server-side
+/// refusal-fallback target with its local pricing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnthropicAllowedFallbackModel {
+    pub provider: String,
+    pub model: String,
+    pub cost: ModelCost,
 }
 
 // ---------------------------------------------------------------------------
@@ -1858,6 +1879,36 @@ mod tests {
         );
         let back: StreamEvent = serde_json::from_str(&to_json(&ev)).expect("roundtrip");
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn provider_thinking_level_round_trip_and_backward_compatibility() {
+        // V14-05 FR-A R1 (4e69b0c28): camelCase, absent when None; old
+        // records without the field deserialize to None (JSONL backward
+        // compatibility).
+        let mut message = partial();
+        let wire = serde_json::to_value(&message).expect("serialize");
+        assert!(
+            !wire
+                .as_object()
+                .expect("object")
+                .contains_key("providerThinkingLevel"),
+            "None must be omitted"
+        );
+
+        message.provider_thinking_level = Some("xhigh".to_owned());
+        let wire = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(wire["providerThinkingLevel"], json!("xhigh"));
+
+        let legacy = json!({
+            "role": "assistant", "content": [], "api": "anthropic-messages",
+            "provider": "anthropic", "model": "m",
+            "usage": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                      "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}},
+            "stopReason": "stop", "timestamp": 1
+        });
+        let parsed: AssistantMessage = serde_json::from_value(legacy).expect("deserialize");
+        assert_eq!(parsed.provider_thinking_level, None);
     }
 
     #[test]

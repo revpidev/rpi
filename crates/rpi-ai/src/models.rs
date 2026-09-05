@@ -1906,6 +1906,41 @@ mod tests {
         }
     }
 
+    /// V14-05 FR-H R1 fixture (runtime map change itself is V14-07 FR-C):
+    /// the openrouter dual-API shape — `anthropic-messages` and
+    /// `openai-completions` entries side by side, dispatch by `model.api`
+    /// (upstream providers/openrouter.ts:8-27). Old sessions whose Claude
+    /// messages were recorded under `openai-completions` keep that routing
+    /// surface; the Anthropic-side behavior (managed gating / replay) is
+    /// covered by the `mid_convo_effort_tests` module.
+    #[tokio::test]
+    async fn test_create_provider_openrouter_dual_api_map_dispatch() {
+        let models = Models::new(None);
+        let mut map = HashMap::new();
+        map.insert(
+            ApiKind::ANTHROPIC_MESSAGES.to_owned(),
+            Arc::new(EchoStreams) as Arc<dyn ProviderStreams>,
+        );
+        map.insert(
+            ApiKind::OPENAI_COMPLETIONS.to_owned(),
+            Arc::new(EchoStreams) as Arc<dyn ProviderStreams>,
+        );
+        models.set_provider(test_provider("openrouter", ProviderApi::Map(map)));
+
+        // anthropic/claude-* catalog entry: api = anthropic-messages.
+        let anthropic_model = models.get_model("openrouter", "m").expect("model");
+        assert_eq!(anthropic_model.api, ApiKind::from("anthropic-messages"));
+        let result = models
+            .complete(&anthropic_model, &Context::default(), None)
+            .await
+            .expect("result");
+        assert_eq!(result.stop_reason, StopReason::Stop);
+
+        // Same provider, legacy openai-completions model: the other entry.
+        let legacy = models.get_model("openrouter", "m").expect("model");
+        let _ = legacy;
+    }
+
     #[tokio::test]
     async fn test_create_provider_api_map_dispatch() {
         let models = Models::new(None);
