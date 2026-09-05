@@ -4851,6 +4851,27 @@ mod build_and_stream_tests {
         );
         assert_eq!(params["reasoning"], json!({"effort": "high"}));
 
+        // openrouter `thinkingLevelMap.off` three states (`off !== null` guard,
+        // openai-completions.ts:931): mandatory models carry `off: null` —
+        // the reasoning field is omitted entirely so no `effort: "none"`
+        // leaks (#8454); an explicit string maps through; absent defaults to
+        // "none" (asserted above).
+        let mandatory = make_model(json!({
+            "provider": "openrouter",
+            "thinkingLevelMap": {"off": null, "high": "high"}
+        }));
+        let params = params_for(&mandatory, &ctx, &no_effort, CacheRetention::Short);
+        assert!(
+            params.get("reasoning").is_none(),
+            "off: null must omit the reasoning field: {params}"
+        );
+        let mapped_off = make_model(json!({
+            "provider": "openrouter",
+            "thinkingLevelMap": {"off": "none"}
+        }));
+        let params = params_for(&mapped_off, &ctx, &no_effort, CacheRetention::Short);
+        assert_eq!(params["reasoning"], json!({"effort": "none"}));
+
         // ant-ling: only a mapped (non-null) effort is sent.
         let ant_ling = make_model(json!({
             "provider": "ant-ling", "thinkingLevelMap": {"high": "HIGH"}

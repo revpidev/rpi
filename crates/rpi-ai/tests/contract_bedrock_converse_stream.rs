@@ -1486,6 +1486,226 @@ async fn test_convert_messages_assistant_blank_and_thinking() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Redacted reasoning roundtrip (`d57e531f5` / #8314), tool-document
+// sanitization (`98145a6c0`), onResponse raw headers (`10acee604` / #8234)
+// ---------------------------------------------------------------------------
+
+/// A thinking block fed two encrypted-reasoning deltas (base64
+/// "prefix"/"suffix" split across chunks) plus a late signature delta that
+/// the redacted guard must ignore.
+fn redacted_stream_body(with_block_stop: bool) -> Vec<u8> {
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    for payload in [
+        r#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"redactedContent":"cHJlZml4"}}}"#,
+        r#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"redactedContent":"c3VmZml4"}}}"#,
+        r#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"signature":"must-be-ignored"}}}"#,
+    ] {
+        body.extend_from_slice(&event_frame("contentBlockDelta", payload));
+    }
+    if with_block_stop {
+        body.extend_from_slice(&event_frame(
+            "contentBlockStop",
+            r#"{"contentBlockIndex":0}"#,
+        ));
+    }
+    body.extend_from_slice(&event_frame("messageStop", r#"{"stopReason":"end_turn"}"#));
+    body
+}
+
+#[tokio::test]
+async fn test_redacted_reasoning_stream_buffers_placeholder_and_signature() {
+    let model = claude_model("http://unused");
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        sigv4_options(test_env()),
+        (
+            200,
+            "application/vnd.amazon.eventstream",
+            redacted_stream_body(true),
+        ),
+    )
+    .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    // Placeholder delta emitted exactly once, on the first redacted chunk.
+    let deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, vec!["[Reasoning redacted]"]);
+    let StreamEvent::Done { message, .. } = events.last().expect("done") else {
+        panic!("expected done event");
+    };
+    let rpi_ai::types::AssistantContent::Thinking(thinking) = &message.content[0] else {
+        panic!("expected thinking block, got {:?}", message.content[0]);
+    };
+    assert_eq!(thinking.thinking, "[Reasoning redacted]");
+    assert_eq!(thinking.redacted, Some(true));
+    // Buffered chunks concatenate in arrival order; the trailing signature
+    // delta was dropped by the mutual-exclusion guard.
+    assert_eq!(
+        thinking.thinking_signature.as_deref(),
+        Some("cHJlZml4c3VmZml4")
+    );
+}
+
+/// A stream can settle without stopping each block — the terminal path
+/// flushes the scratch buffer too (upstream finalizeStreamingBlock :325).
+#[tokio::test]
+async fn test_redacted_reasoning_flushes_without_content_block_stop() {
+    let model = claude_model("http://unused");
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        sigv4_options(test_env()),
+        (
+            200,
+            "application/vnd.amazon.eventstream",
+            redacted_stream_body(false),
+        ),
+    )
+    .await;
+    let StreamEvent::Done { message, .. } = events.last().expect("done event") else {
+        panic!("expected done event");
+    };
+    let rpi_ai::types::AssistantContent::Thinking(thinking) = &message.content[0] else {
+        panic!("expected thinking block");
+    };
+    assert_eq!(thinking.redacted, Some(true));
+    assert_eq!(
+        thinking.thinking_signature.as_deref(),
+        Some("cHJlZml4c3VmZml4")
+    );
+}
+
+#[tokio::test]
+async fn test_convert_messages_replays_redacted_reasoning_as_redacted_content() {
+    let model = claude_model("http://unused");
+    let thinking_block = |signature: Option<&str>| {
+        rpi_ai::types::AssistantContent::Thinking(rpi_ai::types::ThinkingContent {
+            thinking: "[Reasoning redacted]".to_owned(),
+            thinking_signature: signature.map(str::to_owned),
+            redacted: Some(true),
+        })
+    };
+    let assistant = Message::Assistant(AssistantMessage {
+        role: rpi_ai::types::AssistantRole::Assistant,
+        content: vec![
+            thinking_block(Some("cHJlZml4c3VmZml4")),
+            // Not base64: dropped instead of failing the request.
+            thinking_block(Some("<<not-base64>>")),
+        ],
+        api: ApiKind::from(ApiKind::BEDROCK_CONVERSE_STREAM),
+        provider: "amazon-bedrock".to_owned(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: Default::default(),
+        stop_reason: StopReason::Stop,
+        error_message: None,
+        timestamp: 0,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
+    });
+    let (payload, _) =
+        capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
+    assert_eq!(
+        payload["messages"][0]["content"],
+        json!([{"reasoningContent": {"redactedContent": "cHJlZml4c3VmZml4"}}])
+    );
+}
+
+#[tokio::test]
+async fn test_convert_messages_sanitizes_empty_tool_argument_keys() {
+    let model = claude_model("http://unused");
+    let assistant = Message::Assistant(AssistantMessage {
+        role: rpi_ai::types::AssistantRole::Assistant,
+        content: vec![rpi_ai::types::AssistantContent::ToolCall(
+            rpi_ai::types::ToolCall {
+                id: "call-1".to_owned(),
+                name: "bash".to_owned(),
+                arguments: [
+                    ("".to_owned(), json!("dropped")),
+                    ("keep".to_owned(), json!({"": 1, "a": [{"": null, "b": 2}]})),
+                ]
+                .into_iter()
+                .collect(),
+                thought_signature: None,
+                namespace: None,
+            },
+        )],
+        api: ApiKind::from(ApiKind::BEDROCK_CONVERSE_STREAM),
+        provider: "amazon-bedrock".to_owned(),
+        model: model.id.clone(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: Default::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        timestamp: 0,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
+    });
+    let (payload, _) =
+        capture_payload(&model, &context(vec![assistant]), sigv4_options(test_env())).await;
+    assert_eq!(
+        payload["messages"][0]["content"][0]["toolUse"]["input"],
+        json!({"keep": {"a": [{"b": 2}]}})
+    );
+}
+
+#[tokio::test]
+async fn test_on_response_receives_raw_response_headers() {
+    let model = claude_model("http://unused");
+    let mut options = sigv4_options(test_env());
+    let captured = Arc::new(Mutex::new(None));
+    let slot = captured.clone();
+    options.stream.on_response = Some(Arc::new(move |response, _model| {
+        let slot = slot.clone();
+        Box::pin(async move {
+            *slot.lock().expect("slot") = Some(response);
+        })
+    }));
+    let (base_url, _rx) = serve_with_headers(
+        200,
+        "application/vnd.amazon.eventstream",
+        vec![
+            ("x-amzn-requestid", "req-123".to_owned()),
+            ("x-custom-gateway", "gw-1".to_owned()),
+        ],
+        minimal_stream_body(),
+    )
+    .await;
+    let mut model = model;
+    model.base_url = base_url;
+    let events: Vec<StreamEvent> = stream(&model, &context(vec![user_text("hi")]), options.clone())
+        .collect()
+        .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let response = captured.lock().expect("slot").clone().expect("on_response");
+    assert_eq!(response.status, 200);
+    // Raw headers, not just the modeled request id: gateway headers survive
+    // (10acee604 / #8234).
+    assert_eq!(
+        response.headers.get("x-custom-gateway").map(String::as_str),
+        Some("gw-1")
+    );
+    assert_eq!(
+        response.headers.get("x-amzn-requestid").map(String::as_str),
+        Some("req-123")
+    );
+}
+
 #[tokio::test]
 async fn test_convert_messages_groups_tool_results_and_cache_points() {
     let model = claude_model("http://unused");

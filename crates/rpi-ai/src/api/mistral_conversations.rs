@@ -176,6 +176,8 @@ impl MistralToolCallIdNormalizer {
 /// `deriveMistralToolCallId`: ids that are already 9 alphanumeric chars pass
 /// through; everything else is replaced by a 9-char alphanumeric prefix of
 /// `shortHash(seed)`.
+/// `deriveMistralToolCallId` — fallback id for chunks with no usable
+/// `id` (`toolcall:{index ?? 0}`, attempt 0).
 fn derive_mistral_tool_call_id(id: &str, attempt: u32) -> String {
     // JS `id.replace(/[^a-zA-Z0-9]/g, "")`.
     let normalized: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
@@ -784,6 +786,19 @@ enum DeltaContent {
     Chunks(Vec<Value>),
 }
 
+/// Tool-call aggregation key — upstream `const key = toolCall.index ?? callId`
+/// (mistral-conversations.ts:696, `6c87d9a02` / #8387). Chunks carrying an
+/// `index` are keyed by it (Mistral omits the id on continuation chunks, so
+/// keying on the id would split one call into several blocks); only chunks
+/// with no `index` fall back to the call id. A first chunk keyed by `CallId`
+/// followed by an indexed chunk opens a *separate* entry — faithful to the
+/// upstream map, not "improved" into a merge.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ToolKey {
+    Index(u32),
+    CallId(String),
+}
+
 /// `ToolCall` (streaming subset). `function.name` / `function.arguments` are
 /// required, matching the SDK's zod schema.
 #[derive(Debug, serde::Deserialize)]
@@ -827,7 +842,7 @@ struct StreamProcessor<'a> {
     model: &'a Model,
     current_block: Option<CurrentBlock>,
     /// Tool-call content index, keyed by `{callId}:{index}`.
-    tool_blocks_by_key: HashMap<String, usize>,
+    tool_blocks_by_key: HashMap<ToolKey, usize>,
     /// Tool-block content indices in creation order (JS `Map` iteration).
     tool_block_order: Vec<usize>,
     /// `partialArgs` scratch buffer per tool-block content index.
@@ -1067,16 +1082,23 @@ impl<'a> StreamProcessor<'a> {
         tool_call: &WireToolCall,
         events: &AssistantMessageEventStream,
     ) {
-        let index = tool_call.index.unwrap_or(0);
+        // `toolCall.index ?? 0` for the fallback id derivation.
+        let fallback_index = tool_call.index.unwrap_or(0);
         let call_id = match tool_call
             .id
             .as_deref()
             .filter(|id| !id.is_empty() && *id != "null")
         {
             Some(id) => id.to_owned(),
-            None => derive_mistral_tool_call_id(&format!("toolcall:{index}"), 0),
+            None => derive_mistral_tool_call_id(&format!("toolcall:{fallback_index}"), 0),
         };
-        let key = format!("{call_id}:{index}");
+        // `const key = toolCall.index ?? callId` (6c87d9a02 / #8387): indexed
+        // chunks aggregate by index — Mistral omits the id on continuation
+        // chunks, so an id-scoped key would split one call into many blocks.
+        let key = match tool_call.index {
+            Some(index) => ToolKey::Index(index),
+            None => ToolKey::CallId(call_id.clone()),
+        };
 
         let content_index = match self.tool_blocks_by_key.get(&key) {
             Some(existing) => *existing,

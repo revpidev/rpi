@@ -222,7 +222,10 @@ async fn test_openrouter_factory_config_and_auth() {
         "openrouter",
         "OpenRouter",
         Some("https://openrouter.ai/api/v1"),
-        &[ApiKind::OPENAI_COMPLETIONS],
+        // `650e7a612` (#8454): dual-api dispatch — anthropic-messages entries
+        // arrive with the V14-09 catalog regen; current catalog entries are
+        // all openai-completions.
+        &[ApiKind::ANTHROPIC_MESSAGES, ApiKind::OPENAI_COMPLETIONS],
     );
 
     let auth = provider.auth();

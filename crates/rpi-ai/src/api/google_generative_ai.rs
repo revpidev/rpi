@@ -654,11 +654,15 @@ impl<'a> StreamProcessor<'a> {
             // 23cb385b6: preserve the raw provider reason before mapping.
             self.output.raw_stop_reason = Some(finish_reason.to_owned());
             self.output.stop_reason = map_stop_reason(finish_reason)?;
-            if self
-                .output
-                .content
-                .iter()
-                .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+            // 5093641a5 (#8059): only a clean `STOP` finish upgrades to
+            // toolUse — a tool call riding a length/error stop keeps the
+            // mapped reason instead of being misreported as toolUse.
+            if self.output.stop_reason == StopReason::Stop
+                && self
+                    .output
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, AssistantContent::ToolCall(_)))
             {
                 self.output.stop_reason = StopReason::ToolUse;
             }

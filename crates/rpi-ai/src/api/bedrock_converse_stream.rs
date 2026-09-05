@@ -97,6 +97,11 @@ use crate::utils::transform_messages::transform_messages;
 /// `EMPTY_TEXT_PLACEHOLDER` (bedrock-converse-stream.ts:104).
 pub const EMPTY_TEXT_PLACEHOLDER: &str = "<empty>";
 
+/// `REDACTED_THINKING_PLACEHOLDER` — matches the placeholder the Anthropic
+/// API path uses for redacted thinking (bedrock-converse-stream.ts:106,
+/// `d57e531f5` / #8314).
+const REDACTED_THINKING_PLACEHOLDER: &str = "[Reasoning redacted]";
+
 /// `BEDROCK_DATA_RETENTION_DOCS_URL`.
 const BEDROCK_DATA_RETENTION_DOCS_URL: &str =
     "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html";
@@ -526,6 +531,36 @@ fn create_non_blank_text_block(text: &str) -> Option<Value> {
     }
 }
 
+/// `sanitizeBedrockDocument` (`98145a6c0`, :900-908): recursively drop
+/// empty-string keys — AWS rejects them — preserving arrays, nested values
+/// and key order.
+fn sanitize_bedrock_document(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_bedrock_document).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !key.is_empty())
+                .map(|(key, nested)| (key.clone(), sanitize_bedrock_document(nested)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// `decodeRedactedContent` (:1304-1311): the persisted signature carries the
+/// encrypted reasoning as base64. A hand-edited or externally produced
+/// session can hold a signature that is not base64; drop that block instead
+/// of failing the whole request. Returns the canonical base64 re-encoding
+/// (the wire shape for `redactedContent`).
+fn decode_redacted_content(signature: Option<&str>) -> Option<String> {
+    use base64::Engine as _;
+    let signature = signature?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(signature)
+        .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 /// `createRequiredTextBlock`: blank text becomes the `<empty>` placeholder.
 fn create_required_text_block(text: &str) -> Value {
     create_non_blank_text_block(text).unwrap_or_else(|| json!({"text": EMPTY_TEXT_PLACEHOLDER}))
@@ -639,11 +674,35 @@ pub fn convert_messages(
                                 "toolUse": {
                                     "toolUseId": call.id,
                                     "name": call.name,
-                                    "input": Value::Object(call.arguments.clone()),
+                                    // `sanitizeBedrockDocument` (`98145a6c0`): AWS
+                                    // rejects document values with empty-string
+                                    // keys; strip them recursively, preserving
+                                    // every other nested value.
+                                    "input": sanitize_bedrock_document(&Value::Object(
+                                        call.arguments.clone(),
+                                    )),
                                 },
                             }));
                         }
                         AssistantContent::Thinking(thinking) => {
+                            // Encrypted reasoning is opaque: replay the stored
+                            // payload as the `redactedContent` member instead of
+                            // lowering it to reasoning text (`d57e531f5` /
+                            // #8314, bedrock-converse-stream.ts:988-996).
+                            if thinking.redacted.unwrap_or(false) {
+                                if let Some(redacted_content) =
+                                    decode_redacted_content(thinking.thinking_signature.as_deref())
+                                {
+                                    if !redacted_content.is_empty() {
+                                        content_blocks.push(json!({
+                                            "reasoningContent": {
+                                                "redactedContent": redacted_content,
+                                            },
+                                        }));
+                                    }
+                                }
+                                continue;
+                            }
                             let thinking_text = sanitize_surrogates(&thinking.thinking);
                             if thinking_text.trim().is_empty() {
                                 continue;
@@ -1136,6 +1195,10 @@ struct StreamProcessor<'a> {
     blocks_by_bedrock_index: HashMap<u64, usize>,
     /// Tool-call partial JSON by content index.
     partial_json: HashMap<usize, String>,
+    /// Scratch buffer for encrypted reasoning deltas (base64-decoded
+    /// bytes), joined into `thinkingSignature` on flush — never persisted
+    /// (`redactedChunks`, bedrock-converse-stream.ts:108, `d57e531f5`).
+    redacted_chunks: HashMap<usize, Vec<u8>>,
     /// Mid-stream failure metadata sink (70bbe47a9): unmodeled error frames
     /// contribute their `:error-code` to the `bedrock_response_failure`
     /// diagnostic.
@@ -1153,6 +1216,7 @@ impl<'a> StreamProcessor<'a> {
             model,
             blocks_by_bedrock_index: HashMap::new(),
             partial_json: HashMap::new(),
+            redacted_chunks: HashMap::new(),
             failure,
         }
     }
@@ -1420,9 +1484,53 @@ impl<'a> StreamProcessor<'a> {
                 .filter(|signature| !signature.is_empty())
             {
                 if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
-                    let current = thinking.thinking_signature.get_or_insert_with(String::new);
-                    current.push_str(signature);
+                    // `thinkingSignature` holds either an Anthropic signature
+                    // or an opaque redacted payload, never both: mixing them
+                    // would corrupt whichever arrived first
+                    // (bedrock-converse-stream.ts:637, `d57e531f5`).
+                    if thinking.redacted != Some(true) {
+                        let current = thinking.thinking_signature.get_or_insert_with(String::new);
+                        current.push_str(signature);
+                    }
                 }
+            }
+            // Encrypted reasoning from non-Anthropic models on Bedrock (e.g.
+            // OpenAI GPT-5.6, `d57e531f5` / #8314). The payload is opaque, so
+            // keep it verbatim (base64 on the wire → bytes here) the way the
+            // Anthropic path stores redacted thinking, and replay it as
+            // `redactedContent` on the next turn.
+            if let Some(redacted) = reasoning
+                .get("redactedContent")
+                .and_then(Value::as_str)
+                .filter(|redacted| !redacted.is_empty())
+            {
+                use base64::Engine as _;
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(redacted) else {
+                    return;
+                };
+                let first =
+                    if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
+                        let first = thinking.redacted != Some(true);
+                        if first {
+                            thinking.redacted = Some(true);
+                            thinking.thinking_signature = Some(String::new());
+                            thinking.thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
+                        }
+                        first
+                    } else {
+                        false
+                    };
+                if first {
+                    events.push(StreamEvent::ThinkingDelta {
+                        content_index: index,
+                        delta: REDACTED_THINKING_PLACEHOLDER.to_owned(),
+                        partial: self.output.clone(),
+                    });
+                }
+                self.redacted_chunks
+                    .entry(index)
+                    .or_default()
+                    .extend_from_slice(&bytes);
             }
         }
     }
@@ -1436,6 +1544,11 @@ impl<'a> StreamProcessor<'a> {
         let Some(index) = self.blocks_by_bedrock_index.remove(&bedrock_index) else {
             return;
         };
+        // `contentBlockStop` flushes the redacted scratch buffer before the
+        // terminal event (bedrock-converse-stream.ts:716).
+        if matches!(self.output.content[index], AssistantContent::Thinking(_)) {
+            self.flush_redacted_content(index);
+        }
         match &mut self.output.content[index] {
             AssistantContent::Text(text) => {
                 events.push(StreamEvent::TextEnd {
@@ -1460,6 +1573,32 @@ impl<'a> StreamProcessor<'a> {
                     partial: self.output.clone(),
                 });
             }
+        }
+    }
+
+    /// `flushRedactedContent` (bedrock-converse-stream.ts:668, `d57e531f5`):
+    /// encode the buffered encrypted reasoning into `thinkingSignature`
+    /// (base64 of the concatenated bytes) and drop the scratch buffer, which
+    /// must never reach a persisted message.
+    fn flush_redacted_content(&mut self, index: usize) {
+        let Some(bytes) = self.redacted_chunks.remove(&index) else {
+            return;
+        };
+        use base64::Engine as _;
+        if let AssistantContent::Thinking(thinking) = &mut self.output.content[index] {
+            thinking.thinking_signature =
+                Some(base64::engine::general_purpose::STANDARD.encode(bytes));
+        }
+    }
+
+    /// Terminal flush — upstream `finalizeStreamingBlock` runs from the done
+    /// and error paths as well as `contentBlockStop`, because a stream can
+    /// settle without stopping each block (bedrock-converse-stream.ts:325,
+    /// :330).
+    fn flush_all_redacted(&mut self) {
+        let indices: Vec<usize> = self.redacted_chunks.keys().copied().collect();
+        for index in indices {
+            self.flush_redacted_content(index);
         }
     }
 
@@ -1746,15 +1885,20 @@ async fn run(
     }
 
     if let Some(on_response) = &options.stream.on_response {
-        // Upstream only surfaces the request id from `$metadata`.
-        let mut headers = HashMap::new();
-        if let Some(request_id) = response
+        // `addResponseHeadersMiddleware` (10acee604 / #8234): Bedrock's
+        // modeled `$metadata` only preserves selected fields, so forward the
+        // raw response headers — custom gateway headers reach `onResponse`
+        // too (toProviderResponse spreads every header, :484).
+        let headers: HashMap<String, String> = response
             .headers()
-            .get("x-amzn-requestid")
-            .and_then(|value| value.to_str().ok())
-        {
-            headers.insert("x-amzn-requestid".to_owned(), request_id.to_owned());
-        }
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
+            })
+            .collect();
         on_response(
             ProviderResponse {
                 status: response.status().as_u16(),
@@ -1771,23 +1915,50 @@ async fn run(
     // api::stream_timeouts).
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
-    while let Some(chunk) = byte_stream.next().await {
+    let mut outcome: Result<(), String> = Ok(());
+    'stream: while let Some(chunk) = byte_stream.next().await {
         if options
             .stream
             .signal
             .as_ref()
             .is_some_and(|signal| signal.is_cancelled())
         {
-            return Err("Request was aborted".to_owned());
+            outcome = Err("Request was aborted".to_owned());
+            break 'stream;
         }
-        let bytes = chunk.map_err(|error| error.to_string())?;
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                outcome = Err(error.to_string());
+                break 'stream;
+            }
+        };
         decoder.feed(&bytes);
         while let Some(message) = decoder.next_message() {
-            let message = message?;
-            processor.handle_message(&message, events)?;
+            match message {
+                Ok(message) => {
+                    if let Err(error) = processor.handle_message(&message, events) {
+                        outcome = Err(error);
+                        break 'stream;
+                    }
+                }
+                Err(error) => {
+                    outcome = Err(error);
+                    break 'stream;
+                }
+            }
         }
     }
-    decoder.finish()?;
+    if outcome.is_ok() {
+        if let Err(error) = decoder.finish() {
+            outcome = Err(error);
+        }
+    }
+    // Terminal flush — a stream can settle without stopping every block, so
+    // both the done and error paths finalize the scratch buffers first
+    // (upstream finalizeStreamingBlock at :325/:330).
+    processor.flush_all_redacted();
+    outcome?;
 
     finalize(options, processor.output)
 }

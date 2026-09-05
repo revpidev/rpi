@@ -970,7 +970,7 @@ async fn mistral_http_transport_parses_native_thinking_text_tool_calls_and_cache
         "\r\n",
         "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"tool_calls\":[{\"id\":\"abc123456\",\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"query\\\":\"}}]}}]}\r\n",
         "\r\n",
-        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{\"tool_calls\":[{\"id\":\"abc123456\",\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"\\\"pi\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\r\n",
+        "data: {\"id\":\"response-1\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"\",\"arguments\":\"\\\"pi\\\"}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":4,\"total_tokens\":14,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\r\n",
         "\r\n",
         "data: [DONE]\r\n",
         "\r\n",
@@ -1051,6 +1051,52 @@ async fn mistral_http_transport_parses_sse_and_utf_8_sequences_split_across_tran
         rpi_ai::types::AssistantContent::Text(text) => assert_eq!(text.text, "héllo 🌍"),
         other => panic!("expected text block, got {other:?}"),
     }
+}
+
+/// Tool-key edge case pinned to the upstream map semantics (6c87d9a02 /
+/// #8387): the key is `index ?? callId`, so a chunk keyed by `CallId` (id
+/// present, index absent) and a later indexed chunk land in **separate**
+/// blocks — the upstream map does not merge them, and neither do we.
+#[tokio::test]
+async fn mistral_id_keyed_chunk_then_indexed_chunk_open_separate_blocks() {
+    const SPLIT_SSE: &str = concat!(
+        "data: {\"id\":\"response-split\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"tool_calls\":[{\"id\":\"idonly\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\r\n",
+        "\r\n",
+        "data: {\"id\":\"response-split\",\"model\":\"mistral-large-latest\",\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\r\n",
+        "\r\n",
+        "data: [DONE]\r\n",
+        "\r\n",
+    );
+    let (base_url, mut captured) = serve(vec![(200, SPLIT_SSE)]).await;
+    let m = model("mistral-large-latest", &base_url, json!({}));
+    let events = collect(MistralConversations.stream(
+        &m,
+        &context(vec![user_text("hello")]),
+        Some(options()),
+    ))
+    .await;
+
+    captured.recv().await.expect("request captured");
+    let starts = events
+        .iter()
+        .filter(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+        .count();
+    assert_eq!(starts, 2, "separate blocks, not merged: {events:?}");
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    let tool_calls: Vec<&rpi_ai::types::ToolCall> = message
+        .content
+        .iter()
+        .map(|block| match block {
+            rpi_ai::types::AssistantContent::ToolCall(call) => call,
+            other => panic!("expected tool call block, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].id, "idonly");
+    // Continuation chunk without an id derives `toolcall:{index ?? 0}`.
+    assert_ne!(tool_calls[1].id, "idonly");
 }
 
 /// mistral-http-transport.test.ts: "honors case-insensitive header overrides

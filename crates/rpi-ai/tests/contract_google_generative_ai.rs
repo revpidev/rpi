@@ -514,6 +514,38 @@ async fn test_google_tool_call_stream() {
     assert_eq!(call.thought_signature.as_deref(), Some("QUJDREVGRw=="));
 }
 
+/// 5093641a5 (#8059): a tool call riding a non-`STOP` finish reason does
+/// **not** upgrade the stop reason to toolUse — only a clean stop does.
+#[tokio::test]
+async fn test_google_tool_call_with_length_finish_keeps_length() {
+    const LENGTH_TOOL_CALL_SSE: &str = concat!(
+        "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"name\":\"bash\",\"args\":{\"command\":\"ls\"}}}]},\"finishReason\":\"MAX_TOKENS\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":5,\"totalTokenCount\":15}}\n",
+        "\n",
+    );
+    let (base_url, _captured) = serve(vec![(200, LENGTH_TOOL_CALL_SSE)]).await;
+    let m = model(&base_url);
+    let mut ctx = context(vec![user_text("hi")]);
+    ctx.tools = Some(vec![make_tool(json!({
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    }))]);
+    let events = collect(GoogleGenerativeAi.stream(&m, &ctx, Some(options()))).await;
+
+    let Some(StreamEvent::Done { reason, message }) = events.last() else {
+        panic!("expected done event, got {events:?}");
+    };
+    // The mapped MAX_TOKENS (length) survives; the tool call alone no longer
+    // forces toolUse.
+    assert_eq!(*reason, rpi_ai::types::DoneReason::Length);
+    assert_eq!(message.stop_reason, StopReason::Length);
+    assert_eq!(message.raw_stop_reason.as_deref(), Some("MAX_TOKENS"));
+    assert!(message
+        .content
+        .iter()
+        .any(|block| matches!(block, rpi_ai::types::AssistantContent::ToolCall(_))));
+}
+
 #[tokio::test]
 async fn test_google_tool_choice_any_sets_validated_mode_off() {
     let (base_url, mut captured) = serve(vec![(200, GOOGLE_TOOL_CALL_SSE)]).await;
