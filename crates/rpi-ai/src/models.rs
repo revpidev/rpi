@@ -1582,6 +1582,7 @@ impl Models {
                 thinking_budgets: options
                     .as_ref()
                     .and_then(|o| o.simple.thinking_budgets.clone()),
+                tool_choice: options.as_ref().and_then(|o| o.simple.tool_choice),
             });
             provider
                 .stream_simple(&request_model, &context, simple_options)

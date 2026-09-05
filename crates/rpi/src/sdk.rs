@@ -432,6 +432,8 @@ pub async fn create_agent_session(
                         .and_then(rpi_ai::types::ThinkingLevel::from_model_level),
                     thinking_budgets,
                     stream: stream_options,
+
+                    tool_choice: None,
                 };
                 let stream_options_with_headers = rpi_ai::models::ModelsSimpleStreamOptions {
                     simple,

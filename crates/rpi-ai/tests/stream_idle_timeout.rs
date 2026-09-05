@@ -177,6 +177,7 @@ fn options(timeout_ms: u64) -> SimpleStreamOptions {
         },
         reasoning: None,
         thinking_budgets: None,
+        tool_choice: None,
     }
 }
 
@@ -295,6 +296,7 @@ async fn no_timeout_option_disables_enforcement() {
                 },
                 reasoning: None,
                 thinking_budgets: None,
+                tool_choice: None,
             }),
         )
         .expect("stream_simple"),

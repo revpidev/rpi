@@ -2588,6 +2588,10 @@ mod tests {
         assert_eq!(output.usage.cache_read, 5);
         assert_eq!(output.usage.cache_write, 0);
         assert_eq!(output.usage.total_tokens, 42);
+        // V14-06 FR-I (:591): a length stop maps to no error message and the
+        // plain assignment clears any earlier value — upstream `delete
+        // output.errorMessage`.
+        assert_eq!(output.error_message, None);
     }
 
     /// "finalizes content-filtered incomplete responses as non-retryable

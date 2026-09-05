@@ -212,6 +212,10 @@ pub enum ChatTemplateKwargVarKind {
     ThinkingEnabled,
     #[serde(rename = "thinking.effort")]
     ThinkingEffort,
+    /// b23741269 (#8275): the clamped thinking budget (same value the
+    /// top-level budget field would carry).
+    #[serde(rename = "thinking.budget")]
+    ThinkingBudget,
 }
 
 /// Token budgets for each thinking level (token-based providers only).
@@ -502,6 +506,19 @@ pub struct SimpleStreamOptions {
     pub reasoning: Option<ThinkingLevel>,
     /// Custom token budgets for thinking levels (token-based providers only).
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Provider-neutral tool selection for simple requests
+    /// (e5dde9a76/#8607, types.ts:316): `"auto" | "none"`. When omitted,
+    /// adapters use provider-specific behavior.
+    pub tool_choice: Option<SimpleToolChoice>,
+}
+
+/// `SimpleStreamOptions.toolChoice` literal union.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SimpleToolChoice {
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "none")]
+    None,
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,6 +1482,28 @@ pub enum DeferredToolsMode {
     Kimi,
 }
 
+/// `OpenAICompletionsCompat.thinkingTokenBudgetField` (b23741269/#8275):
+/// the top-level request field carrying the thinking budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkingTokenBudgetField {
+    #[serde(rename = "thinking_token_budget")]
+    ThinkingTokenBudget,
+    #[serde(rename = "thinking_budget")]
+    ThinkingBudget,
+    #[serde(rename = "thinking_budget_tokens")]
+    ThinkingBudgetTokens,
+}
+
+impl ThinkingTokenBudgetField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ThinkingTokenBudget => "thinking_token_budget",
+            Self::ThinkingBudget => "thinking_budget",
+            Self::ThinkingBudgetTokens => "thinking_budget_tokens",
+        }
+    }
+}
+
 /// Merged compat settings for OpenAI-completions / OpenAI-responses /
 /// Anthropic-messages / Bedrock APIs (see file header note for why this is one
 /// flat struct). All fields optional; absent fields are omitted on the wire,
@@ -1535,6 +1574,21 @@ pub struct ModelCompat {
     /// consume the whole response and emit no answer. Default: false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_thinking_token_budget: Option<bool>,
+    /// b23741269 (#8275): the top-level request field carrying the thinking
+    /// budget — `thinking_token_budget` (vLLM) / `thinking_budget`
+    /// (Qwen-SGLang) / `thinking_budget_tokens` (llama.cpp).
+    /// `supports_thinking_token_budget` is the `thinking_token_budget`
+    /// alias (field wins when both are set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_token_budget_field: Option<ThinkingTokenBudgetField>,
+    /// 256f63024 (#9004): vLLM scheduler priority, sent as the top-level
+    /// `priority` request field when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vllm_priority: Option<f64>,
+    /// b8b873b98 (#8941): whether the Responses `max_output_tokens` field is
+    /// accepted. Default: true; some Codex-protocol gateways reject it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_max_output_tokens: Option<bool>,
     /// Whether the provider supports OpenAI custom tools with Lark/regex
     /// grammar formats. Also in OpenAIResponsesCompat.
     #[serde(rename = "supportsOpenAIGrammarTools")]

@@ -106,6 +106,9 @@ pub struct AzureOpenAIResponsesOptions {
     pub stream: StreamOptions,
     pub reasoning_effort: Option<ModelThinkingLevel>,
     pub reasoning_summary: Option<String>,
+    /// 9117326b4 (#8607): forwarded verbatim as the Responses
+    /// `tool_choice` request field.
+    pub tool_choice: Option<Value>,
     pub azure_api_version: Option<String>,
     pub azure_resource_name: Option<String>,
     pub azure_base_url: Option<String>,
@@ -359,6 +362,11 @@ pub fn build_params(
                 ..ConvertResponsesToolsOptions::default()
             },
         )?);
+    }
+
+    // 9117326b4 (#8607): forwarded verbatim.
+    if let Some(tool_choice) = &options.tool_choice {
+        params["tool_choice"] = tool_choice.clone();
     }
 
     if model.reasoning {
@@ -701,6 +709,14 @@ pub fn stream_simple(
         AzureOpenAIResponsesOptions {
             stream: base,
             reasoning_effort,
+            // 9117326b4 (#8607): the simple `"auto" | "none"` choice forwards
+            // verbatim (Responses accepts both as plain strings).
+            tool_choice: options.as_ref().and_then(|o| o.tool_choice).map(|choice| {
+                serde_json::json!(match choice {
+                    crate::types::SimpleToolChoice::Auto => "auto",
+                    crate::types::SimpleToolChoice::None => "none",
+                })
+            }),
             ..AzureOpenAIResponsesOptions::default()
         },
     ))
@@ -783,6 +799,29 @@ mod tests {
     }
 
     // -- parseDeploymentNameMap -------------------------------------------------
+
+    /// 9117326b4 (#8607): the options-level `tool_choice` forwards verbatim
+    /// as the Responses `tool_choice` request field.
+    #[test]
+    fn test_tool_choice_forwarded_verbatim() {
+        let model = model(json!({}));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+        let options = AzureOpenAIResponsesOptions {
+            tool_choice: Some(
+                json!({"type": "allowed_tools", "tools": [{"type": "function", "name": "search"}]}),
+            ),
+            ..Default::default()
+        };
+        let params = params_for(&model, &ctx, &options);
+        assert_eq!(
+            params["tool_choice"],
+            json!({"type": "allowed_tools", "tools": [{"type": "function", "name": "search"}]})
+        );
+
+        // Absent → no field.
+        let params = params_for(&model, &ctx, &AzureOpenAIResponsesOptions::default());
+        assert!(params.get("tool_choice").is_none());
+    }
 
     #[test]
     fn test_parse_deployment_name_map() {

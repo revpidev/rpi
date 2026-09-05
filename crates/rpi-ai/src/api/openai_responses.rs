@@ -124,6 +124,9 @@ pub struct ResolvedOpenAIResponsesCompat {
     pub supports_additional_tools: bool,
     pub supports_tool_search: bool,
     pub supports_explicit_prompt_cache_mode: bool,
+    /// b8b873b98 (#8941): whether `max_output_tokens` is accepted. Default:
+    /// true; some Codex-protocol gateways reject the field.
+    pub supports_max_output_tokens: bool,
 }
 
 /// `getCompat` (openai-responses).
@@ -154,17 +157,43 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAIResponsesCompat {
         supports_explicit_prompt_cache_mode: compat
             .and_then(|compat| compat.supports_explicit_prompt_cache_mode)
             .unwrap_or(false),
+        supports_max_output_tokens: compat
+            .and_then(|compat| compat.supports_max_output_tokens)
+            .unwrap_or(true),
     }
 }
 
-/// `getPromptCacheRetention`: long retention opts into the 24h window when
-/// the provider supports it.
+/// `getPromptCacheRetention` (17de82d7b): long retention opts into the 24h
+/// window when the provider supports it — except explicit-cache-mode models,
+/// which use [`get_prompt_cache_options`] instead.
 fn get_prompt_cache_retention(
     compat: &ResolvedOpenAIResponsesCompat,
     cache_retention: CacheRetention,
 ) -> Option<&'static str> {
-    (cache_retention == CacheRetention::Long && compat.supports_long_cache_retention)
+    (cache_retention == CacheRetention::Long
+        && compat.supports_long_cache_retention
+        && !compat.supports_explicit_prompt_cache_mode)
         .then_some("24h")
+}
+
+/// `getPromptCacheOptions` (openai-responses.ts:91-100, 17de82d7b): GPT-6
+/// Astra explicit prompt-cache control — `none` disables the implicit cache
+/// (`{ mode: "explicit" }`), `long` opts into the 30-minute window when
+/// supported.
+fn get_prompt_cache_options(
+    compat: &ResolvedOpenAIResponsesCompat,
+    cache_retention: CacheRetention,
+) -> Option<Value> {
+    if !compat.supports_explicit_prompt_cache_mode {
+        return None;
+    }
+    if cache_retention == CacheRetention::None {
+        return Some(json!({ "mode": "explicit" }));
+    }
+    if cache_retention == CacheRetention::Long && compat.supports_long_cache_retention {
+        return Some(json!({ "ttl": "30m" }));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -278,8 +307,6 @@ pub fn build_params(
 
     let cache_retention =
         resolve_cache_retention(options.stream.cache_retention, options.stream.env.as_ref());
-    let disable_implicit_prompt_cache =
-        cache_retention == CacheRetention::None && compat.supports_explicit_prompt_cache_mode;
 
     let mut params = json!({
         "model": model.id,
@@ -294,12 +321,17 @@ pub fn build_params(
     if let Some(retention) = get_prompt_cache_retention(compat, cache_retention) {
         params["prompt_cache_retention"] = json!(retention);
     }
-    if disable_implicit_prompt_cache {
-        params["prompt_cache_options"] = json!({ "mode": "explicit" });
+    if let Some(cache_options) = get_prompt_cache_options(compat, cache_retention) {
+        params["prompt_cache_options"] = cache_options;
     }
     params["store"] = json!(false);
 
-    if let Some(max_tokens) = options.stream.max_tokens {
+    // b8b873b98 (#8941): some Codex-protocol gateways reject the field.
+    if let Some(max_tokens) = options
+        .stream
+        .max_tokens
+        .filter(|_| compat.supports_max_output_tokens)
+    {
         params["max_output_tokens"] = json!(max_tokens.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS));
     }
     if let Some(temperature) = options.stream.temperature {
@@ -774,6 +806,68 @@ mod tests {
             .keys()
             .cloned()
             .collect()
+    }
+
+    // -- V14-06: supportsMaxOutputTokens (#8941) + prompt_cache_options
+    // (17de82d7b) ---------------------------------------------------------
+
+    /// b8b873b98 (#8941): `supportsMaxOutputTokens: false` omits the
+    /// `max_output_tokens` field entirely (some Codex-protocol gateways
+    /// reject it); default still sends it with the 16-token floor.
+    #[test]
+    fn test_max_output_tokens_compat_gate() {
+        let gated = model(json!({"compat": {"supportsMaxOutputTokens": false}}));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+        let mut options = OpenAIResponsesOptions::default();
+        options.stream.max_tokens = Some(8);
+        let params = params_for(&gated, &ctx, &options);
+        assert!(
+            params.get("max_output_tokens").is_none(),
+            "compat gate must omit the field: {params}"
+        );
+
+        let plain = model(json!({}));
+        let params = params_for(&plain, &ctx, &options);
+        assert_eq!(params["max_output_tokens"], json!(16), "floor applied");
+    }
+
+    /// 17de82d7b: explicit-cache-mode models get `prompt_cache_options`
+    /// (`none` → `{ mode: "explicit" }`, `long` → `{ ttl: "30m" }`) and no
+    /// longer send `prompt_cache_retention`.
+    #[test]
+    fn test_prompt_cache_options_astra() {
+        let astra = model(json!({
+            "compat": {"supportsExplicitPromptCacheMode": true, "supportsLongCacheRetention": true}
+        }));
+        let ctx = common::context(vec![common::user_text("hi")], None);
+
+        // none → explicit mode; no retention, no cache key.
+        let mut options = OpenAIResponsesOptions::default();
+        options.stream.cache_retention = Some(CacheRetention::None);
+        let params = params_for(&astra, &ctx, &options);
+        assert_eq!(params["prompt_cache_options"], json!({"mode": "explicit"}));
+        assert!(params.get("prompt_cache_retention").is_none());
+        assert!(params.get("prompt_cache_key").is_none());
+
+        // long → 30m TTL window; retention stays off for explicit models.
+        let mut options = OpenAIResponsesOptions::default();
+        options.stream.cache_retention = Some(CacheRetention::Long);
+        let params = params_for(&astra, &ctx, &options);
+        assert_eq!(params["prompt_cache_options"], json!({"ttl": "30m"}));
+        assert!(params.get("prompt_cache_retention").is_none());
+
+        // short → neither option nor retention.
+        let params = params_for(&astra, &ctx, &OpenAIResponsesOptions::default());
+        assert!(params.get("prompt_cache_options").is_none());
+        assert!(params.get("prompt_cache_retention").is_none());
+
+        // Non-explicit long-retention models keep the 24h field.
+        let legacy = model(json!({"compat": {"supportsLongCacheRetention": true}}));
+        let mut options = OpenAIResponsesOptions::default();
+        options.stream.cache_retention = Some(CacheRetention::Long);
+        let params = params_for(&legacy, &ctx, &options);
+        assert_eq!(params["prompt_cache_retention"], json!("24h"));
+        assert!(params.get("prompt_cache_options").is_none());
     }
 
     // -- compat ---------------------------------------------------------------

@@ -1832,6 +1832,7 @@ async fn test_stream_simple_budget_path_payload() {
         },
         reasoning: Some(ThinkingLevel::High),
         thinking_budgets: None,
+        tool_choice: None,
     };
     let (base_url, mut rx) = serve(
         200,
@@ -1882,6 +1883,7 @@ async fn test_stream_simple_budget_path_payload() {
         },
         reasoning: Some(ThinkingLevel::Xhigh),
         thinking_budgets: None,
+        tool_choice: None,
     };
     let (base_url, mut rx) = serve(
         200,

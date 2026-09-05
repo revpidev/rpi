@@ -2531,6 +2531,8 @@ mod tests {
             },
             reasoning,
             thinking_budgets: None,
+
+            tool_choice: None,
         };
         simple.stream.on_payload = Some(std::sync::Arc::new(move |payload, _model| {
             let captured = captured_clone.clone();

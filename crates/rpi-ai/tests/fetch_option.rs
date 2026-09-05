@@ -101,6 +101,7 @@ fn simple_options(fetch: FetchFn, api_key: &str) -> SimpleStreamOptions {
         },
         reasoning: None,
         thinking_budgets: None,
+        tool_choice: None,
     }
 }
 

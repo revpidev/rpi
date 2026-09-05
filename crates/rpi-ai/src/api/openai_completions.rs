@@ -177,6 +177,10 @@ pub fn get_tools_by_name(tools: Option<&[Tool]>, names: &[String]) -> Vec<Tool> 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedOpenAICompletionsCompat {
     pub supports_store: bool,
+    /// b23741269 (#8275): resolved budget field name (`field > bool alias`).
+    pub thinking_token_budget_field: Option<crate::types::ThinkingTokenBudgetField>,
+    /// 256f63024 (#9004): vLLM scheduler priority (top-level `priority`).
+    pub vllm_priority: Option<f64>,
     pub supports_developer_role: bool,
     pub supports_reasoning_effort: bool,
     pub supports_usage_in_streaming: bool,
@@ -240,7 +244,7 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         || base_url.contains("api.x.ai")
         || is_together
         || base_url.contains("chutes.ai")
-        || base_url.contains("deepseek.com")
+        || base_url.to_lowercase().contains("deepseek.com")
         || is_zai
         || is_moonshot
         || provider == "opencode"
@@ -252,7 +256,7 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
     // c185d4123: DeepSeek endpoints take `max_tokens`, not
     // `max_completion_tokens` (declared before `use_max_tokens`, upstream
     // declaration order).
-    let is_deepseek = provider == "deepseek" || base_url.contains("deepseek.com");
+    let is_deepseek = provider == "deepseek" || base_url.to_lowercase().contains("deepseek.com");
     // 2fe21b407 (#7174) + c185d4123: Z.AI and DeepSeek join the `max_tokens`
     // list (both ignore `max_completion_tokens`).
     let use_max_tokens = base_url.contains("chutes.ai")
@@ -314,6 +318,8 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         chat_template_args: Default::default(),
         zai_tool_stream: false,
         supports_thinking_token_budget: false,
+        thinking_token_budget_field: None,
+        vllm_priority: None,
         supports_strict_mode: !is_moonshot
             && !is_together
             && !is_cloudflare_ai_gateway
@@ -388,6 +394,8 @@ pub fn get_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         supports_thinking_token_budget: compat
             .supports_thinking_token_budget
             .unwrap_or(detected.supports_thinking_token_budget),
+        thinking_token_budget_field: compat.thinking_token_budget_field,
+        vllm_priority: compat.vllm_priority,
         supports_strict_mode: compat
             .supports_strict_mode
             .unwrap_or(detected.supports_strict_mode),
@@ -648,6 +656,39 @@ pub fn convert_messages(
                     })
                     .collect();
 
+                // b7bb00b93 (#7994): replay reasoning details verbatim and
+                // in order — the signed thinking-signature array wins; the
+                // pre-b7bb00b93 storage (encrypted details on tool-call
+                // `thought_signature`s) is the fallback for old sessions.
+                let all_thinking_blocks: Vec<&ThinkingContent> = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantContent::Thinking(thinking) => Some(thinking),
+                        _ => None,
+                    })
+                    .collect();
+                let tool_call_blocks: Vec<&ToolCall> = assistant
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        AssistantContent::ToolCall(call) => Some(call),
+                        _ => None,
+                    })
+                    .collect();
+                let signed_reasoning_details = all_thinking_blocks.iter().find_map(|block| {
+                    parse_openai_reasoning_details(block.thinking_signature.as_deref())
+                });
+                let legacy_reasoning_details: Vec<Value> = tool_call_blocks
+                    .iter()
+                    .filter_map(|call| {
+                        parse_legacy_encrypted_reasoning_detail(call.thought_signature.as_deref())
+                    })
+                    .collect();
+                let preserved_reasoning_details = signed_reasoning_details.or_else(|| {
+                    (!legacy_reasoning_details.is_empty()).then_some(legacy_reasoning_details)
+                });
+
                 if !thinking_blocks.is_empty() {
                     if compat.requires_thinking_as_text {
                         // Convert thinking blocks to plain text (no tags to avoid
@@ -670,21 +711,25 @@ pub fn convert_messages(
                         }
 
                         // Use the signature from the first thinking block if
-                        // available (for llama.cpp server + gpt-oss).
-                        let mut signature = thinking_blocks[0].thinking_signature.clone();
-                        if model.provider == "opencode-go"
-                            && signature.as_deref() == Some("reasoning")
-                        {
-                            signature = Some("reasoning_content".to_owned());
-                        }
-                        if let Some(signature) = signature.filter(|s| !s.is_empty()) {
-                            // Raw thinking text (not sanitized), joined with "\n".
-                            let joined = thinking_blocks
-                                .iter()
-                                .map(|block| block.thinking.as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            assistant_msg.insert(signature, json!(joined));
+                        // available (for llama.cpp server + gpt-oss) — but
+                        // never when the signature holds preserved reasoning
+                        // details (:1310).
+                        if preserved_reasoning_details.is_none() {
+                            let mut signature = thinking_blocks[0].thinking_signature.clone();
+                            if model.provider == "opencode-go"
+                                && signature.as_deref() == Some("reasoning")
+                            {
+                                signature = Some("reasoning_content".to_owned());
+                            }
+                            if let Some(signature) = signature.filter(|s| !s.is_empty()) {
+                                // Raw thinking text (not sanitized), joined with "\n".
+                                let joined = thinking_blocks
+                                    .iter()
+                                    .map(|block| block.thinking.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                assistant_msg.insert(signature, json!(joined));
+                            }
                         }
                     }
                 } else if !assistant_text.is_empty() {
@@ -728,21 +773,15 @@ pub fn convert_messages(
                             }));
                         }
                     }
-                    let reasoning_details: Vec<Value> = tool_calls
-                        .iter()
-                        .filter_map(|tool_call| tool_call.thought_signature.as_ref())
-                        .map(|signature| {
-                            serde_json::from_str::<Value>(signature).unwrap_or(Value::Null)
-                        })
-                        .filter(is_js_truthy)
-                        .collect();
                     assistant_msg.insert("tool_calls".to_owned(), Value::Array(converted));
-                    if !reasoning_details.is_empty() {
-                        assistant_msg.insert(
-                            "reasoning_details".to_owned(),
-                            Value::Array(reasoning_details),
-                        );
-                    }
+                }
+                // `assistantMsg.reasoning_details = preservedReasoningDetails`
+                // (:1353-1354) — verbatim, in order.
+                if let Some(reasoning_details) = preserved_reasoning_details {
+                    assistant_msg.insert(
+                        "reasoning_details".to_owned(),
+                        Value::Array(reasoning_details),
+                    );
                 }
 
                 if compat.requires_reasoning_content_on_assistant_messages
@@ -925,6 +964,69 @@ pub fn convert_tools(
 
 /// `buildChatTemplateValues` (upstream `openai-completions.ts:892`): resolves
 /// each configured kwarg/arg; `None` when no entry survives resolution.
+/// `resolveThinkingTokenBudgetField` (b23741269/#8275): explicit field
+/// wins; the legacy bool compat is the `thinking_token_budget` alias.
+fn thinking_token_budget_field(
+    compat: &ResolvedOpenAICompletionsCompat,
+) -> Option<crate::types::ThinkingTokenBudgetField> {
+    use crate::types::ThinkingTokenBudgetField;
+    compat.thinking_token_budget_field.or({
+        compat
+            .supports_thinking_token_budget
+            .then_some(ThinkingTokenBudgetField::ThinkingTokenBudget)
+    })
+}
+
+/// `resolveClampedThinkingBudget` (openai-completions.ts:1004-1017):
+/// `thinkingBudgetForLevel` clamped to leave `MIN_ANSWER_TOKENS` of answer
+/// room under the response ceiling; `None` when off / not reasoning /
+/// clamped to zero.
+fn resolve_clamped_thinking_budget(
+    model: &Model,
+    options: &OpenAICompletionsOptions,
+    params: &Value,
+    _field: Option<crate::types::ThinkingTokenBudgetField>,
+) -> Option<u64> {
+    let effort = options.reasoning_effort?;
+    if !model.reasoning {
+        return None;
+    }
+    // `clampReasoning`: xhigh/max use the high budget.
+    let level = match effort {
+        ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max => ModelThinkingLevel::High,
+        other => other,
+    };
+    let defaults = ThinkingBudgets {
+        minimal: Some(1024),
+        low: Some(2048),
+        medium: Some(8192),
+        high: Some(16384),
+    };
+    let budget_for = |budgets: &ThinkingBudgets| match level {
+        ModelThinkingLevel::Minimal => budgets.minimal,
+        ModelThinkingLevel::Low => budgets.low,
+        ModelThinkingLevel::Medium => budgets.medium,
+        ModelThinkingLevel::High => budgets.high,
+        // Off is not a valid upstream `reasoningEffort`; xhigh/max were
+        // clamped above.
+        _ => None,
+    };
+    let level_budget = options
+        .thinking_budgets
+        .as_ref()
+        .and_then(budget_for)
+        .or_else(|| budget_for(&defaults))?;
+    let ceiling = params
+        .get("max_tokens")
+        .or_else(|| params.get("max_completion_tokens"))
+        .and_then(json_u64)
+        .unwrap_or(u64::from(model.max_tokens));
+    // Always leave room for the answer, otherwise the budget recreates the
+    // bug it prevents (`clampThinkingBudgetToAnswerRoom`).
+    let budget = u64::from(level_budget).min(ceiling.saturating_sub(u64::from(MIN_ANSWER_TOKENS)));
+    (budget > 0).then_some(budget)
+}
+
 /// Parameterized over the source map so both `chat_template_kwargs` and
 /// `chat_template_args` share one implementation (Baseten uses the latter,
 /// `openai-completions.ts:784` @ `c1019d920`).
@@ -932,10 +1034,13 @@ fn build_chat_template_values(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
     values: &std::collections::BTreeMap<String, ChatTemplateKwargValue>,
+    thinking_budget: Option<u64>,
 ) -> Option<Value> {
     let mut kwargs = Map::new();
     for (key, value) in values {
-        if let Some(resolved) = resolve_chat_template_kwarg_value(model, reasoning_effort, value) {
+        if let Some(resolved) =
+            resolve_chat_template_kwarg_value(model, reasoning_effort, value, thinking_budget)
+        {
             kwargs.insert(key.clone(), resolved);
         }
     }
@@ -951,8 +1056,14 @@ fn build_chat_template_kwargs(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
     compat: &ResolvedOpenAICompletionsCompat,
+    thinking_budget: Option<u64>,
 ) -> Option<Value> {
-    build_chat_template_values(model, reasoning_effort, &compat.chat_template_kwargs)
+    build_chat_template_values(
+        model,
+        reasoning_effort,
+        &compat.chat_template_kwargs,
+        thinking_budget,
+    )
 }
 
 /// `chat_template_args` resolution (baseten thinkingFormat).
@@ -960,8 +1071,14 @@ fn build_chat_template_args(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
     compat: &ResolvedOpenAICompletionsCompat,
+    thinking_budget: Option<u64>,
 ) -> Option<Value> {
-    build_chat_template_values(model, reasoning_effort, &compat.chat_template_args)
+    build_chat_template_values(
+        model,
+        reasoning_effort,
+        &compat.chat_template_args,
+        thinking_budget,
+    )
 }
 
 /// `resolveChatTemplateKwargValue`: scalars pass through; `$var` refs resolve
@@ -970,6 +1087,7 @@ fn resolve_chat_template_kwarg_value(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
     value: &ChatTemplateKwargValue,
+    thinking_budget: Option<u64>,
 ) -> Option<Value> {
     let scalar = match value {
         ChatTemplateKwargValue::Scalar(value) => return Some(value.clone()),
@@ -981,6 +1099,11 @@ fn resolve_chat_template_kwarg_value(
     }
     if scalar.var == ChatTemplateKwargVarKind::ThinkingEnabled {
         return Some(json!(reasoning_effort.is_some()));
+    }
+    // b23741269 (#8275): the clamped thinking budget — the same value the
+    // top-level budget field carries.
+    if scalar.var == ChatTemplateKwargVarKind::ThinkingBudget {
+        return thinking_budget.map(|budget| json!(budget));
     }
 
     // thinking.effort: mapped value for the effort (or `off` when no effort).
@@ -1229,56 +1352,38 @@ pub fn build_params(
         params.insert("tool_choice".to_owned(), tool_choice.clone());
     }
 
-    apply_thinking_params(&mut params, model, options.reasoning_effort, compat);
-
-    // d07889da0 (#7638): vLLM caps reasoning with a top-level
-    // `thinking_token_budget`. Independent of thinkingFormat: the same server
-    // can serve zai, qwen or chat-template models. Reasoning and the answer
-    // share max_tokens here, so an uncapped reasoning phase can consume the
-    // whole response and leave no answer and no tool call.
-    if compat.supports_thinking_token_budget && model.reasoning {
-        if let Some(effort) = options.reasoning_effort {
-            // `clampReasoning`: xhigh/max use the high budget.
-            let level = match effort {
-                ModelThinkingLevel::Xhigh | ModelThinkingLevel::Max => ModelThinkingLevel::High,
-                other => other,
-            };
-            let defaults = ThinkingBudgets {
-                minimal: Some(1024),
-                low: Some(2048),
-                medium: Some(8192),
-                high: Some(16384),
-            };
-            let budget_for = |budgets: &ThinkingBudgets| match level {
-                ModelThinkingLevel::Minimal => budgets.minimal,
-                ModelThinkingLevel::Low => budgets.low,
-                ModelThinkingLevel::Medium => budgets.medium,
-                ModelThinkingLevel::High => budgets.high,
-                // Off is not a valid upstream `reasoningEffort`; xhigh/max
-                // were clamped above.
-                _ => None,
-            };
-            let level_budget = options
-                .thinking_budgets
-                .as_ref()
-                .and_then(budget_for)
-                .or_else(|| budget_for(&defaults));
-            if let Some(level_budget) = level_budget {
-                let ceiling = params
-                    .get("max_tokens")
-                    .or_else(|| params.get("max_completion_tokens"))
-                    .and_then(json_u64)
-                    .unwrap_or(u64::from(model.max_tokens));
-                // Always leave room for the answer, otherwise the budget
-                // recreates the bug it prevents.
-                let budget = u64::from(level_budget)
-                    .min(ceiling.saturating_sub(u64::from(MIN_ANSWER_TOKENS)));
-                if budget > 0 {
-                    params.insert("thinking_token_budget".to_owned(), json!(budget));
-                }
-            }
-        }
+    // 256f63024 (#9004): vLLM scheduler priority.
+    if let Some(priority) = compat.vllm_priority {
+        params.insert("priority".to_owned(), json!(priority));
     }
+
+    // d07889da0 (#7638) + b23741269 (#8275): cap reasoning with a top-level
+    // budget field (`thinking_token_budget` / `thinking_budget` /
+    // `thinking_budget_tokens`; the bool compat is the first one's alias).
+    // Independent of thinkingFormat: the same server can serve zai, qwen or
+    // chat-template models. Reasoning and the answer share max_tokens here,
+    // so an uncapped reasoning phase can consume the whole response and
+    // leave no answer and no tool call. The same clamped value feeds the
+    // `{ "$var": "thinking.budget" }` chat-template kwarg.
+    let clamped_thinking_budget = resolve_clamped_thinking_budget(
+        model,
+        options,
+        &Value::Object(params.clone()),
+        thinking_token_budget_field(compat),
+    );
+    if let (Some(field), Some(budget)) =
+        (thinking_token_budget_field(compat), clamped_thinking_budget)
+    {
+        params.insert(field.as_str().to_owned(), json!(budget));
+    }
+
+    apply_thinking_params(
+        &mut params,
+        model,
+        options.reasoning_effort,
+        compat,
+        clamped_thinking_budget,
+    );
 
     // OpenRouter provider routing preferences (read from model.compat
     // directly, like upstream — not from the resolved compat).
@@ -1329,6 +1434,7 @@ fn apply_thinking_params(
     model: &Model,
     reasoning_effort: Option<ModelThinkingLevel>,
     compat: &ResolvedOpenAICompletionsCompat,
+    thinking_budget: Option<u64>,
 ) {
     if compat.thinking_format == ThinkingFormat::Zai && model.reasoning {
         params.insert(
@@ -1371,14 +1477,18 @@ fn apply_thinking_params(
             }),
         );
     } else if compat.thinking_format == ThinkingFormat::ChatTemplate && model.reasoning {
-        if let Some(kwargs) = build_chat_template_kwargs(model, reasoning_effort, compat) {
+        if let Some(kwargs) =
+            build_chat_template_kwargs(model, reasoning_effort, compat, thinking_budget)
+        {
             params.insert("chat_template_kwargs".to_owned(), kwargs);
         }
     } else if compat.thinking_format == ThinkingFormat::Baseten && model.reasoning {
         // Port of `openai-completions.ts:779-796` @ c1019d920 / 4181f66.
         // Baseten sends `chat_template_args` (resolved from compat) plus
         // `reasoning_effort` when the model supports it.
-        if let Some(args) = build_chat_template_args(model, reasoning_effort, compat) {
+        if let Some(args) =
+            build_chat_template_args(model, reasoning_effort, compat, thinking_budget)
+        {
             params.insert("chat_template_args".to_owned(), args);
         }
         if compat.supports_reasoning_effort {
@@ -1513,6 +1623,8 @@ pub fn parse_chunk_usage(raw_usage: &Value, model: &Model) -> Usage {
     let prompt_tokens = json_u64(&raw_usage["prompt_tokens"]).unwrap_or(0);
     let cache_read_tokens = json_u64(&raw_usage["prompt_tokens_details"]["cached_tokens"])
         .or_else(|| json_u64(&raw_usage["prompt_cache_hit_tokens"]))
+        // d3ab2af96 (#8119): Kimi reports cache hits at the top level.
+        .or_else(|| json_u64(&raw_usage["cached_tokens"]))
         .unwrap_or(0);
     let cache_write_tokens =
         json_u64(&raw_usage["prompt_tokens_details"]["cache_write_tokens"]).unwrap_or(0);
@@ -1616,26 +1728,155 @@ fn append_custom_tool_call_input(
     Ok(delta)
 }
 
-/// `isEncryptedReasoningDetail` plus the `JSON.stringify` serialization
-/// (serde_json `preserve_order` keeps the original key order).
-fn encrypted_reasoning_detail(detail: &Value) -> Option<(String, String)> {
-    let object = detail.as_object()?;
-    if object.get("type").and_then(Value::as_str) != Some("reasoning.encrypted") {
+/// `isReasoningDetailObject` + `hasValidCommonReasoningDetailFields` +
+/// `isOpenAIReasoningDetail` (openai-completions.ts:110-158): the three
+/// retained `reasoning_details` shapes — `reasoning.text` (string `text`,
+/// optional string `signature`), `reasoning.summary` (string `summary`),
+/// `reasoning.encrypted` (string `data`); `id`/`format`/`index` optional
+/// common fields.
+fn is_openai_reasoning_detail(detail: &Value) -> bool {
+    let Some(object) = detail.as_object() else {
+        return false;
+    };
+    // `hasValidCommonReasoningDetailFields`: id/format strings when present,
+    // index a number when present.
+    for (field, is_string) in [("id", true), ("format", true), ("index", false)] {
+        match object.get(field) {
+            None | Some(Value::Null) => {}
+            Some(value) => {
+                if is_string {
+                    if !value.is_string() {
+                        return false;
+                    }
+                } else if !value.is_number() {
+                    return false;
+                }
+            }
+        }
+    }
+    match object.get("type").and_then(Value::as_str) {
+        Some("reasoning.summary") => object.get("summary").is_some_and(Value::is_string),
+        Some("reasoning.encrypted") => object.get("data").is_some_and(Value::is_string),
+        Some("reasoning.text") => {
+            object.get("text").is_some_and(Value::is_string)
+                && object
+                    .get("signature")
+                    .is_none_or(|signature| signature.is_null() || signature.is_string())
+        }
+        _ => false,
+    }
+}
+
+/// `fillMissingCommonReasoningDetailFields` (:255-262): `??=` for id/index,
+/// `||=` for format — set only when the target's value is missing/null
+/// (resp. falsy).
+fn fill_missing_common_reasoning_detail_fields(target: &mut Value, source: &Value) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    for field in ["id", "index"] {
+        let missing = target.get(field).is_none_or(|value| value.is_null());
+        if missing && source.get(field).is_some_and(|value| !value.is_null()) {
+            target.insert(
+                field.to_owned(),
+                source.get(field).cloned().unwrap_or(Value::Null),
+            );
+        }
+    }
+    let falsy = target
+        .get("format")
+        .is_none_or(|value| value.is_null() || value == &Value::String(String::new()));
+    if falsy {
+        if let Some(format) = source.get("format").filter(|value| value.is_string()) {
+            target.insert("format".to_owned(), format.clone());
+        }
+    }
+}
+
+/// `appendOpenAIReasoningDetail` (:264-279): consecutive text/summary deltas
+/// merge into one logical entry (`text`/`summary` concatenated, signature
+/// `||=`); encrypted entries stay opaque and discrete. OpenRouter streams
+/// `reasoning_details` as deltas (b7bb00b93, #7994 / c5ad7c1b0, #8605).
+fn append_openai_reasoning_detail(details: &mut Vec<Value>, detail: &Value) {
+    let detail_type = detail.get("type").and_then(Value::as_str).unwrap_or("");
+    let merge_field = match detail_type {
+        "reasoning.text" => "text",
+        "reasoning.summary" => "summary",
+        _ => "",
+    };
+    if !merge_field.is_empty() {
+        if let Some(last) = details.last_mut() {
+            let last_type = last.get("type").and_then(Value::as_str).unwrap_or("");
+            if last_type == detail_type {
+                if let (Some(last_object), Some(detail_object)) =
+                    (last.as_object_mut(), detail.as_object())
+                {
+                    let chunk = detail_object
+                        .get(merge_field)
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let joined = format!(
+                        "{}{chunk}",
+                        last_object
+                            .get(merge_field)
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    );
+                    last_object.insert(merge_field.to_owned(), json!(joined));
+                    if detail_type == "reasoning.text" {
+                        // `lastDetail.signature ||= detail.signature`.
+                        let falsy = last_object.get("signature").is_none_or(|value| {
+                            value.is_null() || value == &Value::String(String::new())
+                        });
+                        if falsy {
+                            if let Some(signature) = detail_object
+                                .get("signature")
+                                .filter(|value| value.is_string())
+                            {
+                                last_object.insert("signature".to_owned(), signature.clone());
+                            }
+                        }
+                    }
+                }
+                fill_missing_common_reasoning_detail_fields(last, detail);
+                return;
+            }
+        }
+    }
+    details.push(detail.clone());
+}
+
+/// `parseOpenAIReasoningDetails` (:227-235): a thinking signature holding a
+/// non-empty array of valid details.
+fn parse_openai_reasoning_details(signature: Option<&str>) -> Option<Vec<Value>> {
+    let signature = signature?;
+    let parsed: Value = serde_json::from_str(signature).ok()?;
+    parsed
+        .as_array()
+        .filter(|details| !details.is_empty() && details.iter().all(is_openai_reasoning_detail))
+        .cloned()
+}
+
+/// `parseLegacyEncryptedReasoningDetail` (:237-253): the pre-b7bb00b93
+/// storage — an encrypted detail (with non-empty string `id` and non-empty
+/// `data`) stashed on a tool call's `thought_signature`.
+fn parse_legacy_encrypted_reasoning_detail(signature: Option<&str>) -> Option<Value> {
+    let signature = signature?;
+    let parsed: Value = serde_json::from_str(signature).ok()?;
+    if !is_openai_reasoning_detail(&parsed) {
         return None;
     }
-    let id = object
+    let id_is_nonempty_string = parsed
         .get("id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())?;
-    if object
+        .is_some_and(|id| id.as_str().is_some_and(|id| !id.is_empty()));
+    let data_is_nonempty = parsed
         .get("data")
         .and_then(Value::as_str)
-        .is_none_or(|data| data.is_empty())
-    {
-        return None;
-    }
-    let serialized = serde_json::to_string(detail).unwrap_or_default();
-    Some((id.to_owned(), serialized))
+        .is_some_and(|data| !data.is_empty());
+    (parsed.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
+        && id_is_nonempty_string
+        && data_is_nonempty)
+        .then_some(parsed)
 }
 
 /// Consumes OpenAI chat completion chunks and drives the [`StreamEvent`]
@@ -1653,7 +1894,11 @@ struct CompletionsProcessor<'a> {
     tool_call_by_index: HashMap<usize, usize>,
     tool_call_by_id: HashMap<String, usize>,
     scratch: HashMap<usize, ToolScratch>,
-    pending_reasoning_details: HashMap<String, String>,
+    /// `streamedReasoningDetails` (:339): replay metadata buffered in memory
+    /// during streaming and serialized into each thinking block's signature
+    /// once at finalize (b7bb00b93/#8671) — never a user-visible stream
+    /// delta.
+    streamed_reasoning_details: Option<Vec<Value>>,
 }
 
 impl<'a> CompletionsProcessor<'a> {
@@ -1674,7 +1919,7 @@ impl<'a> CompletionsProcessor<'a> {
             tool_call_by_index: HashMap::new(),
             tool_call_by_id: HashMap::new(),
             scratch: HashMap::new(),
-            pending_reasoning_details: HashMap::new(),
+            streamed_reasoning_details: None,
         }
     }
 
@@ -1738,30 +1983,6 @@ impl<'a> CompletionsProcessor<'a> {
             partial: self.output.clone(),
         });
         index
-    }
-
-    fn apply_pending_reasoning_detail(&mut self, content_index: usize) {
-        let Some(AssistantContent::ToolCall(block)) = self.output.content.get(content_index) else {
-            return;
-        };
-        if block.id.is_empty() {
-            return;
-        }
-        let Some(pending) = self
-            .pending_reasoning_details
-            .get(&block.id)
-            .filter(|detail| !detail.is_empty())
-            .cloned()
-        else {
-            return;
-        };
-        if let Some(AssistantContent::ToolCall(block)) = self.output.content.get_mut(content_index)
-        {
-            block.thought_signature = Some(pending);
-        }
-        if let Some(AssistantContent::ToolCall(block)) = self.output.content.get(content_index) {
-            self.pending_reasoning_details.remove(&block.id);
-        }
     }
 
     /// `ensureToolCallBlock`: find-or-create the streaming tool call block for
@@ -1913,7 +2134,6 @@ impl<'a> CompletionsProcessor<'a> {
             }
         }
 
-        self.apply_pending_reasoning_detail(index);
         index
     }
 
@@ -2116,19 +2336,20 @@ impl<'a> CompletionsProcessor<'a> {
             }
         }
 
+        // b7bb00b93 (#7994): reasoning details are replay metadata, not
+        // user-visible stream deltas — buffer them and serialize once at
+        // block finalize. Consecutive text/summary deltas merge into logical
+        // entries; encrypted entries remain opaque and discrete.
         if let Some(reasoning_details) = delta.get("reasoning_details").and_then(Value::as_array) {
             for detail in reasoning_details {
-                if let Some((id, serialized)) = encrypted_reasoning_detail(detail) {
-                    if let Some(index) = self.tool_call_by_id.get(&id).copied() {
-                        if let Some(AssistantContent::ToolCall(block)) =
-                            self.output.content.get_mut(index)
-                        {
-                            block.thought_signature = Some(serialized);
-                        }
-                    } else {
-                        self.pending_reasoning_details.insert(id, serialized);
-                    }
+                if !is_openai_reasoning_detail(detail) {
+                    continue;
                 }
+                self.ensure_thinking_block("", events);
+                append_openai_reasoning_detail(
+                    self.streamed_reasoning_details.get_or_insert_with(Vec::new),
+                    detail,
+                );
             }
         }
 
@@ -2149,9 +2370,19 @@ impl<'a> CompletionsProcessor<'a> {
         }
 
         let mut close_delta: Option<String> = None;
+        let streamed_signature = self
+            .streamed_reasoning_details
+            .as_ref()
+            .map(|details| details.iter().map(|d| d.to_string()).collect::<Vec<_>>())
+            .map(|parts| format!("[{}]", parts.join(",")));
         let end = match self.output.content.get_mut(content_index) {
             Some(AssistantContent::Text(block)) => Some(BlockEnd::Text(block.text.clone())),
             Some(AssistantContent::Thinking(block)) => {
+                // #8671: serialize the buffered details exactly once, at
+                // block finalize.
+                if let Some(serialized) = &streamed_signature {
+                    block.thinking_signature = Some(serialized.clone());
+                }
                 Some(BlockEnd::Thinking(block.thinking.clone()))
             }
             Some(AssistantContent::ToolCall(block)) => {
@@ -2193,6 +2424,20 @@ impl<'a> CompletionsProcessor<'a> {
             None => {}
         }
         Ok(())
+    }
+
+    /// The upstream `catch` arm (:699-701): apply buffered reasoning
+    /// details to every thinking block on a failed stream.
+    fn apply_streamed_reasoning_details_to_thinking_blocks(&mut self) {
+        let Some(details) = &self.streamed_reasoning_details else {
+            return;
+        };
+        let serialized = serde_json::to_string(details).unwrap_or_default();
+        for block in &mut self.output.content {
+            if let AssistantContent::Thinking(block) = block {
+                block.thinking_signature = Some(serialized.clone());
+            }
+        }
     }
 
     /// Post-stream tail: finish all blocks, then the upstream final checks.
@@ -2435,32 +2680,57 @@ async fn run(
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
     let mut saw_done = false;
-    while let Some(chunk) = byte_stream.next().await {
+    // The upstream `catch` (:699-701) serializes buffered reasoning details
+    // into every thinking block even when the stream fails — the partial
+    // message must still round-trip. Collected here so the `?`-style early
+    // returns keep that guarantee.
+    let mut result: Result<(), String> = Ok(());
+    'body: while let Some(chunk) = byte_stream.next().await {
         if options
             .stream
             .signal
             .as_ref()
             .is_some_and(|signal| signal.is_cancelled())
         {
-            return Err("Request was aborted".to_owned());
-        }
-        let bytes = chunk.map_err(|error| error.to_string())?;
-        for sse in decoder.feed(&bytes) {
-            if processor.handle_sse(&sse, events)? == SseOutcome::Done {
-                saw_done = true;
-                break;
-            }
-        }
-        if saw_done {
+            result = Err("Request was aborted".to_owned());
             break;
         }
-    }
-    if !saw_done {
-        for sse in decoder.finish() {
-            if processor.handle_sse(&sse, events)? == SseOutcome::Done {
+        let bytes = match chunk.map_err(|error| error.to_string()) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                result = Err(error);
                 break;
             }
+        };
+        for sse in decoder.feed(&bytes) {
+            match processor.handle_sse(&sse, events) {
+                Ok(SseOutcome::Done) => {
+                    saw_done = true;
+                    break 'body;
+                }
+                Ok(SseOutcome::Chunk) => {}
+                Err(error) => {
+                    result = Err(error);
+                    break 'body;
+                }
+            }
         }
+    }
+    if result.is_ok() && !saw_done {
+        for sse in decoder.finish() {
+            match processor.handle_sse(&sse, events) {
+                Ok(SseOutcome::Done) => break,
+                Ok(SseOutcome::Chunk) => {}
+                Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+    }
+    if let Err(error) = result {
+        processor.apply_streamed_reasoning_details_to_thinking_blocks();
+        return Err(error);
     }
     processor.finish(options.stream.signal.as_ref(), events)
 }
@@ -2539,7 +2809,12 @@ pub fn stream_simple(
         OpenAICompletionsOptions {
             stream: base,
             reasoning_effort,
-            tool_choice: None,
+            tool_choice: options.as_ref().and_then(|o| o.tool_choice).map(|choice| {
+                json!(match choice {
+                    crate::types::SimpleToolChoice::Auto => "auto",
+                    crate::types::SimpleToolChoice::None => "none",
+                })
+            }),
             thinking_budgets: options.and_then(|o| o.thinking_budgets),
         },
     ))
@@ -3557,7 +3832,8 @@ mod build_and_stream_tests {
             resolve_chat_template_kwarg_value(
                 &model,
                 None,
-                &ChatTemplateKwargValue::Scalar(json!("x"))
+                &ChatTemplateKwargValue::Scalar(json!("x")),
+                None,
             ),
             Some(json!("x"))
         );
@@ -3568,11 +3844,16 @@ mod build_and_stream_tests {
             omit_when_off: None,
         });
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, None, &enabled),
+            resolve_chat_template_kwarg_value(&model, None, &enabled, None),
             Some(json!(false))
         );
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, Some(ModelThinkingLevel::High), &enabled),
+            resolve_chat_template_kwarg_value(
+                &model,
+                Some(ModelThinkingLevel::High),
+                &enabled,
+                None
+            ),
             Some(json!(true))
         );
 
@@ -3582,16 +3863,21 @@ mod build_and_stream_tests {
             omit_when_off: Some(true),
         });
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, None, &effort),
+            resolve_chat_template_kwarg_value(&model, None, &effort, None),
             None
         );
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, Some(ModelThinkingLevel::High), &effort),
+            resolve_chat_template_kwarg_value(
+                &model,
+                Some(ModelThinkingLevel::High),
+                &effort,
+                None
+            ),
             Some(json!("HIGH"))
         );
         // Unmapped level → the level name itself.
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, Some(ModelThinkingLevel::Low), &effort),
+            resolve_chat_template_kwarg_value(&model, Some(ModelThinkingLevel::Low), &effort, None),
             Some(json!("low"))
         );
 
@@ -3601,7 +3887,7 @@ mod build_and_stream_tests {
             omit_when_off: None,
         });
         assert_eq!(
-            resolve_chat_template_kwarg_value(&model, None, &keep),
+            resolve_chat_template_kwarg_value(&model, None, &keep, None),
             Some(json!("NONE"))
         );
     }
@@ -3610,7 +3896,396 @@ mod build_and_stream_tests {
     fn test_build_chat_template_kwargs_empty_is_none() {
         let model = make_model(json!({}));
         let compat = get_compat(&model);
-        assert_eq!(build_chat_template_kwargs(&model, None, &compat), None);
+        assert_eq!(
+            build_chat_template_kwargs(&model, None, &compat, None),
+            None
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // V14-06: reasoning details retention (#7994/#8671), toolChoice (#8607),
+    // Kimi cached_tokens (#8119), budget field (#8275), vllmPriority (#9004),
+    // DeepSeek case (#7933).
+    // -----------------------------------------------------------------------
+
+    fn v14_06_assistant(content: Vec<AssistantContent>) -> Message {
+        Message::Assistant(AssistantMessage {
+            role: crate::types::AssistantRole::Assistant,
+            content,
+            api: crate::types::ApiKind("openai-completions".into()),
+            // Same model as `make_model` so thinking blocks survive
+            // `transform_messages` (cross-model thinking becomes text).
+            provider: "openai".to_owned(),
+            model: "gpt-4o".to_owned(),
+            response_model: None,
+            response_id: None,
+            provider_thinking_level: None,
+            diagnostics: None,
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1,
+            deferred: None,
+            end_turn: None,
+            raw_stop_reason: None,
+        })
+    }
+
+    fn reasoning_chunk(details: Value) -> String {
+        format!(
+            "data: {{\"id\":\"c\",\"model\":\"m\",\"choices\":[{{\"index\":0,\"delta\":{{\"reasoning_details\":{details}}},\"finish_reason\":null}}]}}\n\n"
+        )
+    }
+
+    fn final_chunk() -> &'static str {
+        "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    }
+
+    /// Streaming merge matrix (b7bb00b93/c5ad7c1b0): consecutive text and
+    /// summary deltas each merge into one logical entry; encrypted entries
+    /// stay discrete; the serialized signature is written exactly once at
+    /// finalize.
+    #[test]
+    fn test_reasoning_details_merge_and_single_serialization() {
+        let model = make_model(json!({}));
+        let stream = format!(
+            "{}{}{}{}{}",
+            reasoning_chunk(json!([{"type": "reasoning.text", "text": "Think "} ])),
+            reasoning_chunk(
+                json!([{"type": "reasoning.text", "text": "hard", "signature": "sig"}])
+            ),
+            reasoning_chunk(json!([{"type": "reasoning.summary", "summary": "S1"}])),
+            reasoning_chunk(json!([{"type": "reasoning.encrypted", "data": "enc-1"}])),
+            final_chunk(),
+        );
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.content.len(), 1, "one thinking block");
+        let AssistantContent::Thinking(block) = &output.content[0] else {
+            panic!("thinking block");
+        };
+        // text deltas merged (second carries the signature → `||=` fills);
+        // summary is its own entry; encrypted discrete.
+        let signature: Value =
+            serde_json::from_str(block.thinking_signature.as_deref().expect("signature"))
+                .expect("json");
+        assert_eq!(
+            signature,
+            json!([
+                {"type": "reasoning.text", "text": "Think hard", "signature": "sig"},
+                {"type": "reasoning.summary", "summary": "S1"},
+                {"type": "reasoning.encrypted", "data": "enc-1"},
+            ])
+        );
+    }
+
+    /// Replay is verbatim + in order (FR-A red line): a history message whose
+    /// thinking signature holds a details array replays it as
+    /// `reasoning_details` on the wire, and the legacy encrypted-on-tool-call
+    /// storage is the fallback; the reasoning-field-as-signature path is
+    /// suppressed when details are preserved.
+    #[test]
+    fn test_reasoning_details_replay_verbatim_in_order() {
+        let model = make_model(json!({}));
+
+        // Signed details win; signature-as-field suppressed.
+        let mut signed = v14_06_assistant(vec![
+            AssistantContent::Thinking(ThinkingContent {
+                thinking: "think".to_owned(),
+                thinking_signature: Some(
+                    r#"[{"type":"reasoning.text","text":"a b"},{"type":"reasoning.encrypted","data":"enc"}]"#
+                        .to_owned(),
+                ),
+                redacted: None,
+            }),
+            AssistantContent::Text(TextContent {
+                text: "answer".to_owned(),
+                text_signature: None,
+            }),
+        ]);
+        let mut ctx = context(vec![signed.clone(), user_text("next")], None);
+        let params = build_params(
+            &model,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        let messages = params["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[0].get("reasoning_details"),
+            Some(&json!([
+                {"type": "reasoning.text", "text": "a b"},
+                {"type": "reasoning.encrypted", "data": "enc"}
+            ])),
+            "verbatim, in order"
+        );
+        // The raw thinking is NOT replayed under a reasoning field.
+        assert!(messages[0].get("reasoning").is_none());
+        assert!(messages[0].get("reasoning_content").is_none());
+
+        // Legacy fallback: encrypted detail on the tool call (old sessions).
+        let Message::Assistant(signed_message) = &mut signed else {
+            unreachable!()
+        };
+        signed_message.content = vec![AssistantContent::ToolCall(ToolCall {
+            id: "call_1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::Map::new(),
+            thought_signature: Some(
+                r#"{"type":"reasoning.encrypted","id":"call_1","data":"enc-old"}"#.to_owned(),
+            ),
+            namespace: None,
+        })];
+        ctx = context(vec![signed, user_text("next")], None);
+        let params = build_params(
+            &model,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        let messages = params["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[0].get("reasoning_details"),
+            Some(&json!([
+                {"type": "reasoning.encrypted", "id": "call_1", "data": "enc-old"}
+            ]))
+        );
+    }
+
+    /// toolChoice (#8607): an explicitly requested choice is sent even with
+    /// no tools in context — and the params carry no `tools` key (upstream
+    /// openai-completions-tool-choice.test.ts:153 intent).
+    #[test]
+    fn test_tool_choice_sent_without_tools() {
+        let model = make_model(json!({}));
+        let ctx = context(vec![user_text("hi")], None);
+        let options = OpenAICompletionsOptions {
+            tool_choice: Some(json!("none")),
+            ..Default::default()
+        };
+        let params = build_params(
+            &model,
+            &ctx,
+            &options,
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert_eq!(params["tool_choice"], json!("none"));
+        assert!(
+            params.get("tools").is_none(),
+            "no tools key without tools: {params}"
+        );
+
+        // tools=[] with tool history: `params.tools = []` is still sent and
+        // the explicit choice stays (upstream :846-849/:855-857).
+        let history = v14_06_assistant(vec![AssistantContent::ToolCall(ToolCall {
+            id: "call_1".to_owned(),
+            name: "bash".to_owned(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+            namespace: None,
+        })]);
+        let ctx = context(
+            vec![
+                history,
+                tool_result("call_1", json!([]), json!({})),
+                user_text("hi"),
+            ],
+            Some(vec![]),
+        );
+        let params = build_params(
+            &model,
+            &ctx,
+            &options,
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert_eq!(params["tools"], json!([]));
+        assert_eq!(params["tool_choice"], json!("none"));
+    }
+
+    /// Kimi usage fallback (#8119): top-level `cached_tokens` is the third
+    /// priority.
+    #[test]
+    fn test_usage_kimi_top_level_cached_tokens() {
+        let model = make_model(json!({}));
+        let stream = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cached_tokens\":40}}\n\ndata: [DONE]\n\n";
+        let (_events, reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.usage.cache_read, 40);
+
+        // Priority: details > prompt_cache_hit_tokens > top level.
+        let stream = "data: {\"id\":\"c\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cached_tokens\":40,\"prompt_cache_hit_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\ndata: [DONE]\n\n";
+        let (_events, _reason, output) = replay(&model, &no_grammar(), stream.as_bytes());
+        assert_eq!(output.usage.cache_read, 3);
+    }
+
+    /// Budget field generalization (#8275): the three field names and the
+    /// bool alias; the 1024 answer-room clamp; `{ "$var": "thinking.budget" }`.
+    #[test]
+    fn test_thinking_token_budget_field_matrix() {
+        for (compat, expected_field) in [
+            (
+                json!({"thinkingTokenBudgetField": "thinking_budget"}),
+                "thinking_budget",
+            ),
+            (
+                json!({"thinkingTokenBudgetField": "thinking_budget_tokens"}),
+                "thinking_budget_tokens",
+            ),
+            (
+                json!({"thinkingTokenBudgetField": "thinking_token_budget"}),
+                "thinking_token_budget",
+            ),
+            (
+                json!({"supportsThinkingTokenBudget": true}),
+                "thinking_token_budget",
+            ),
+        ] {
+            let model = make_model(json!({
+                "reasoning": true, "maxTokens": 20000, "compat": compat
+            }));
+            let ctx = context(vec![user_text("hi")], None);
+            let options = OpenAICompletionsOptions {
+                reasoning_effort: Some(ModelThinkingLevel::High),
+                ..Default::default()
+            };
+            let params = build_params(
+                &model,
+                &ctx,
+                &options,
+                &get_compat(&model),
+                CacheRetention::Short,
+                &no_grammar(),
+            )
+            .expect("params");
+            assert_eq!(
+                params.get(expected_field),
+                Some(&json!(16384)),
+                "field {expected_field} (max_tokens 20000 - 1024 clamp on high 16384)"
+            );
+        }
+
+        // Clamp boundary: ceiling - 1024 <= 0 → no budget field at all.
+        let model = make_model(json!({
+            "reasoning": true, "maxTokens": 1024, "compat": {"supportsThinkingTokenBudget": true}
+        }));
+        let ctx = context(vec![user_text("hi")], None);
+        let options = OpenAICompletionsOptions {
+            reasoning_effort: Some(ModelThinkingLevel::High),
+            ..Default::default()
+        };
+        let params = build_params(
+            &model,
+            &ctx,
+            &options,
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert!(params.get("thinking_token_budget").is_none());
+
+        // `$var: thinking.budget` carries the same clamped value.
+        let model = make_model(json!({
+            "reasoning": true, "maxTokens": 20000,
+            "compat": {
+                "thinkingFormat": "chat-template",
+                "thinkingTokenBudgetField": "thinking_budget",
+                "chatTemplateKwargs": {"budget": {"$var": "thinking.budget"}}
+            }
+        }));
+        let ctx = context(vec![user_text("hi")], None);
+        let options = OpenAICompletionsOptions {
+            reasoning_effort: Some(ModelThinkingLevel::High),
+            ..Default::default()
+        };
+        let params = build_params(
+            &model,
+            &ctx,
+            &options,
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert_eq!(
+            params["chat_template_kwargs"]["budget"],
+            json!(16384),
+            "same clamped budget as the top-level field"
+        );
+        assert_eq!(params["thinking_budget"], json!(16384));
+    }
+
+    /// vllmPriority (#9004): set → top-level `priority`.
+    #[test]
+    fn test_vllm_priority_top_level_param() {
+        let model = make_model(json!({"compat": {"vllmPriority": 7.0}}));
+        let ctx = context(vec![user_text("hi")], None);
+        let params = build_params(
+            &model,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&model),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert_eq!(params["priority"], json!(7.0));
+
+        let plain = make_model(json!({}));
+        let params = build_params(
+            &plain,
+            &ctx,
+            &OpenAICompletionsOptions::default(),
+            &get_compat(&plain),
+            CacheRetention::Short,
+            &no_grammar(),
+        )
+        .expect("params");
+        assert!(params.get("priority").is_none());
+    }
+
+    /// DeepSeek baseUrl detection is case-insensitive (#7933): the
+    /// `max_tokens` (not `max_completion_tokens`) wire field follows the
+    /// lowercase match.
+    #[test]
+    fn test_deepseek_base_url_case_insensitive() {
+        for base_url in [
+            "https://api.DEEPSEEK.com/v1",
+            "https://api.deepseek.COM/v1",
+            "https://DeepSeek.com/v1",
+        ] {
+            let model = make_model(json!({"baseUrl": base_url}));
+            let ctx = context(vec![user_text("hi")], None);
+            let mut options = OpenAICompletionsOptions::default();
+            options.stream.max_tokens = Some(512);
+            let params = build_params(
+                &model,
+                &ctx,
+                &options,
+                &get_compat(&model),
+                CacheRetention::Short,
+                &no_grammar(),
+            )
+            .expect("params");
+            assert_eq!(
+                params.get("max_tokens"),
+                Some(&json!(512)),
+                "deepseek endpoint takes max_tokens: {base_url}"
+            );
+            assert!(params.get("max_completion_tokens").is_none());
+        }
     }
 
     // -- cache control ------------------------------------------------------------
@@ -4502,7 +5177,8 @@ mod build_and_stream_tests {
     }
 
     const RECORDED_STREAM: &str = concat!(
-        // Encrypted reasoning detail arrives before the tool call (pending).
+        // Encrypted reasoning detail arrives first (b7bb00b93: buffered into
+        // the thinking signature, creating the block immediately).
         "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_details\":[{\"type\":\"reasoning.encrypted\",\"id\":\"call_1\",\"data\":\"sig\"}]},\"finish_reason\":null}]}\n",
         "\n",
         "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n",
@@ -4529,20 +5205,23 @@ mod build_and_stream_tests {
         let model = make_model(json!({}));
         let (events, reason, output) = replay(&model, &no_grammar(), RECORDED_STREAM.as_bytes());
         assert_eq!(reason, Ok(DoneReason::ToolUse));
+        // G2 (b7bb00b93): the first chunk's reasoning detail now creates the
+        // thinking block immediately (was: encrypted details waited on their
+        // tool call; text/summary were dropped entirely).
         assert_eq!(
             event_kinds(&events),
             vec![
+                "thinking_start",
                 "text_start",
                 "text_delta",
-                "thinking_start",
                 "thinking_delta",
                 "text_delta",
                 "toolcall_start",
                 "toolcall_delta", // empty arguments chunk still emits a delta
                 "toolcall_delta",
                 "toolcall_delta",
-                "text_end",
                 "thinking_end",
+                "text_end",
                 "toolcall_end",
             ]
         );
@@ -4557,20 +5236,22 @@ mod build_and_stream_tests {
         assert_eq!(output.usage.reasoning, Some(0));
         assert_eq!(output.usage.total_tokens, 15);
 
-        let text = match &output.content[0] {
-            AssistantContent::Text(text) => text,
-            other => panic!("expected text block, got {other:?}"),
-        };
-        assert_eq!(text.text, "Hello world");
-        let thinking = match &output.content[1] {
+        let thinking = match &output.content[0] {
             AssistantContent::Thinking(thinking) => thinking,
             other => panic!("expected thinking block, got {other:?}"),
         };
         assert_eq!(thinking.thinking, "think");
+        // G2 (b7bb00b93/#8671): the buffered details serialize into the
+        // signature once at finalize (was: the reasoning field name).
         assert_eq!(
             thinking.thinking_signature.as_deref(),
-            Some("reasoning_content")
+            Some("[{\"type\":\"reasoning.encrypted\",\"id\":\"call_1\",\"data\":\"sig\"}]")
         );
+        let text = match &output.content[1] {
+            AssistantContent::Text(text) => text,
+            other => panic!("expected text block, got {other:?}"),
+        };
+        assert_eq!(text.text, "Hello world");
         let call = match &output.content[2] {
             AssistantContent::ToolCall(call) => call,
             other => panic!("expected tool call block, got {other:?}"),
@@ -4581,11 +5262,9 @@ mod build_and_stream_tests {
             call.arguments,
             json!({"cmd": "ls"}).as_object().cloned().unwrap()
         );
-        // The pending encrypted reasoning detail landed on the tool call.
-        assert_eq!(
-            call.thought_signature.as_deref(),
-            Some("{\"type\":\"reasoning.encrypted\",\"id\":\"call_1\",\"data\":\"sig\"}")
-        );
+        // G2 (b7bb00b93): tool calls no longer carry streaming reasoning
+        // details — the thinking signature is the only live copy.
+        assert_eq!(call.thought_signature, None);
 
         // The toolcall_end event carries the finalized call.
         let end_call = events.iter().find_map(|event| match event {

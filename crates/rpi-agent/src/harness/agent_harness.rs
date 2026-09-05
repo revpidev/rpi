@@ -400,6 +400,7 @@ fn models_stream_fn(models: &Models) -> StreamFn {
                     reasoning: options.reasoning.and_then(thinking_level_from_model_level),
                     thinking_budgets: None,
                     stream: options,
+                    tool_choice: None,
                 };
                 let stream: BoxStream<'static, StreamEvent> = models
                     .stream_simple(&model, &context, Some(simple.into()))
@@ -1106,6 +1107,7 @@ impl<TContext: Clone + Default + Send + Sync + 'static> AgentHarness<TContext> {
                         },
                         reasoning: options.reasoning.and_then(thinking_level_from_model_level),
                         thinking_budgets: None,
+                        tool_choice: None,
                     };
                     this.models
                         .stream_simple(&model, &context, Some(simple.into()))

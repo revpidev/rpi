@@ -248,6 +248,7 @@ fn simple_options(
         stream: options(),
         reasoning,
         thinking_budgets: budgets,
+        tool_choice: None,
     }
 }
 

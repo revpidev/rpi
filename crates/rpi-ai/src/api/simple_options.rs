@@ -245,6 +245,7 @@ mod tests {
             },
             reasoning: None,
             thinking_budgets: None,
+            tool_choice: None,
         }
     }
 

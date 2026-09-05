@@ -644,6 +644,7 @@ async fn test_thinking_flow_via_stream_simple() {
         stream: api_key_options(),
         reasoning: Some(ThinkingLevel::Medium),
         thinking_budgets: None,
+        tool_choice: None,
     };
     let events = collect(
         stream_simple(&model, &context(vec![user_text("hi")]), Some(options))
@@ -692,6 +693,7 @@ async fn test_thinking_level_models_use_thinking_level_config() {
         stream: api_key_options(),
         reasoning: Some(ThinkingLevel::Low),
         thinking_budgets: None,
+        tool_choice: None,
     };
     let events = collect(
         GoogleVertex

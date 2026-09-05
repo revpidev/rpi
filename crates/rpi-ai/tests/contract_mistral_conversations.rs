@@ -267,6 +267,7 @@ fn simple_options(reasoning: Option<ThinkingLevel>, stream: StreamOptions) -> Si
         stream,
         reasoning,
         thinking_budgets: None,
+        tool_choice: None,
     }
 }
 

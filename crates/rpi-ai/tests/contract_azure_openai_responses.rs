@@ -330,6 +330,7 @@ async fn test_azure_reasoning_replay_preserves_output_item_done_encrypted_conten
                     stream: options(),
                     reasoning: Some(ThinkingLevel::High),
                     thinking_budgets: None,
+                    tool_choice: None,
                 }),
             )
             .expect("stream_simple"),

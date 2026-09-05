@@ -561,6 +561,41 @@ fn event_kinds(events: &[StreamEvent]) -> Vec<&str> {
 /// "zstd-compresses SSE request bodies" + the e2e's cache-affinity header
 /// alignment ("handles SSE requests with aligned cache-affinity identifiers",
 /// mock-ized).
+/// 64eeb82a4 (#9047): a stream whose terminal `response.completed` has no
+/// trailing blank line must still terminate as `done` — the shared
+/// `SseDecoder::finish` (UTF-8 flush + unterminated-line dispatch +
+/// trailing-event flush, sse.rs) is the equivalent of upstream's
+/// Codex-parser EOF handling (openai-codex-responses.ts:779-812); this pins
+/// the scenario so the equivalence cannot regress.
+#[tokio::test]
+async fn test_sse_eof_without_trailing_blank_line_still_completes() {
+    // Same event sequence as `sse_payload`, minus the final "\n\n".
+    let payload = sse_payload("Hello").trim_end_matches('\n').to_owned();
+    assert!(!payload.ends_with("\n\n"), "fixture must be unterminated");
+    let (handshake, request, http) = default_hooks(payload.leak());
+    let backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+    let events = collect(OpenAiCodexResponses.stream(
+        &m,
+        &context(vec![user_text("Say hello")]),
+        Some(sse_options(None)),
+    ))
+    .await;
+
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Done { .. })),
+        "terminal event must complete the stream: {events:?}"
+    );
+    let text = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::TextDelta { delta, .. } => Some(delta.clone()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(text, "Hello");
+}
+
 #[tokio::test]
 async fn test_sse_contract_headers_and_zstd_body() {
     let (handshake, request, http) = default_hooks(sse_payload("Hello").leak());
