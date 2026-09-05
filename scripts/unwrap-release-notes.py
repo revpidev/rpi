@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """changes/v<version>.md -> unwrapped release notes (stdout).
 
-The repo's changelog files are hard-wrapped at ~70 columns (diff-friendly
-editor convention). GitHub renders release-note bodies like issue comments
-— a single newline becomes <br> — so wrapped CJK prose shows mid-sentence
-breaks on the Release page. This script reflows each paragraph / list item
-onto one line for publishing only; the source files stay wrapped.
+Since the 2026-09-05 formatting convention the repo's markdown sources use
+single-line paragraphs, so this pass is normally a no-op. It stays as an
+idempotent normalizer: GitHub renders release-note bodies like issue
+comments — a single newline becomes <br> — so any legacy hard-wrapped text
+(v0.1.x-era files, pasted content) is still reflowed onto one line here.
 
 Rules:
 - Blank lines, headings, code fences and table rows are emitted verbatim

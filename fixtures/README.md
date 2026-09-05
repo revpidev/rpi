@@ -1,25 +1,8 @@
 # Rpi Parity Fixtures
 
-> Landing directory and runbook for the parity/contract test baseline data
-> (golden fixtures).
-> Upstream reference: the committed goldens are recorded against `external/pi`
-> @ `4181f66e6b3ccbef760c2966ecd8b596b926fec6` (0.84.1+) — re-recorded in v0.11
-> T18 (previously `2efa728` / 0.82.1, recorded for v0.1). The current pin
-> always lives in `UPSTREAM.md`; regenerating fixtures that match the
-> committed data requires the submodule checked out at the recording pin.
-> Note: `events.jsonl` holds the **internal** AgentSession event transcript
-> (with cumulative `message`/`partial` on `message_update`); the delta-only
-> wire shape (`toJsonEvent`, json-event.ts @ 4181f66) applies only at the
-> print/json + RPC stdout boundary and is covered by the print/RPC tests, not
-> by these fixtures.
+> Landing directory and runbook for the parity/contract test baseline data (golden fixtures).Upstream reference: the committed goldens are recorded against `external/pi` @ `4181f66e6b3ccbef760c2966ecd8b596b926fec6` (0.84.1+) — re-recorded in v0.11 T18 (previously `2efa728` / 0.82.1, recorded for v0.1). The current pin always lives in `UPSTREAM.md`; regenerating fixtures that match the committed data requires the submodule checked out at the recording pin.Note: `events.jsonl` holds the **internal** AgentSession event transcript (with cumulative `message`/`partial` on `message_update`); the delta-only wire shape (`toJsonEvent`, json-event.ts @ 4181f66) applies only at the print/json + RPC stdout boundary and is covered by the print/RPC tests, not by these fixtures.
 >
-> The **shared normalization and diff implementation** lives in
-> `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity
-> test strips numeric keys (`usage`/`details` etc., see the `STRIPPED_KEYS`
-> list at the top of each test file — currently a local implementation in
-> three test files) before diffing.
-> Fixtures store **raw bytes**; timestamp / uuid / session id / cwd stripping
-> happens at diff time, not at generation time.
+> The **shared normalization and diff implementation** lives in `rpi-test-support` (`normalize.rs` / `diff.rs`). In addition, each parity test strips numeric keys (`usage`/`details` etc., see the `STRIPPED_KEYS` list at the top of each test file — currently a local implementation in three test files) before diffing.Fixtures store **raw bytes**; timestamp / uuid / session id / cwd stripping happens at diff time, not at generation time.
 
 ## 1. Directory layout
 
@@ -35,8 +18,7 @@ fixtures/
 
 ## 2. Runbook (repeatable generation)
 
-Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`,
-so red-line G4 is not touched):
+Prerequisites (one-time; `node_modules/` and `dist/` are both in `.gitignore`, so red-line G4 is not touched):
 
 ```bash
 cd external/pi
@@ -61,16 +43,9 @@ node fixtures/generate-fixtures.mjs            # all scenarios
 node fixtures/generate-fixtures.mjs single-turn # a single scenario
 ```
 
-Generator behavior: each scenario creates an isolated cwd / agentDir in a
-temporary directory (**does not read or write `~/.pi`**), drives
-`createAgentSession` with `fauxProvider()` (fixed `api: "faux"`) plus a fixed
-prompt script, and exports the real session file of the file-backed
-`SessionManager` together with the event sequence captured via
-`session.subscribe`.
+Generator behavior: each scenario creates an isolated cwd / agentDir in a temporary directory (**does not read or write `~/.pi`**), drives `createAgentSession` with `fauxProvider()` (fixed `api: "faux"`) plus a fixed prompt script, and exports the real session file of the file-backed `SessionManager` together with the event sequence captured via `session.subscribe`.
 
-Verify repeatability (spot-check one scenario): regenerate the same scenario
-into a temporary copy; after normalization the diff against the in-repo
-fixtures must be empty:
+Verify repeatability (spot-check one scenario): regenerate the same scenario into a temporary copy; after normalization the diff against the in-repo fixtures must be empty:
 
 ```bash
 cp -r fixtures/generated/single-turn /tmp/single-turn-before
@@ -81,17 +56,9 @@ cargo run -p rpi-test-support --example normalize-diff -- \
 
 (`normalize-diff` example — see §4; exit code 0 = identical after normalization.)
 
-> **`session.jsonl` is a byte-level repeatable anchor; `events.jsonl` is not.**
-> The upstream faux provider splits deltas with `Math.random`
-> (`faux.ts` `splitStringByTokenSize`), so delta boundaries and counts differ
-> between runs. The parity granularity for `events.jsonl` is the **event-type
-> sequence plus terminal message content** (delta boundaries are not part of
-> the contract and never land in the session JSONL); the rpi-side faux uses
-> deterministic chunking (deviation note in the header of
-> `rpi-test-support/src/faux.rs`).
+> **`session.jsonl` is a byte-level repeatable anchor; `events.jsonl` is not.**The upstream faux provider splits deltas with `Math.random` (`faux.ts` `splitStringByTokenSize`), so delta boundaries and counts differ between runs. The parity granularity for `events.jsonl` is the **event-type sequence plus terminal message content** (delta boundaries are not part of the contract and never land in the session JSONL); the rpi-side faux uses deterministic chunking (deviation note in the header of `rpi-test-support/src/faux.rs`).
 
-**Discipline**: fixture changes must be committed in the same commit as the
-behavior change, with the change described in the commit message.
+**Discipline**: fixture changes must be committed in the same commit as the behavior change, with the change described in the commit message.
 
 ## 3. Initial scenarios (delivered by T02)
 
@@ -105,23 +72,11 @@ behavior change, with the change described in the commit message.
 | `compaction-threshold` | 8192 window / 4096 reserve / 512 keep: three Q&A rounds, threshold triggers two compaction rounds (split-turn prefix + UPDATE iteration), third round's prepare is empty and silent | CompactionEntry (firstKeptEntryId/usage/details/fromHook=false), compaction_start/end event order, tokensBefore recomputation, estimatedTokensAfter |
 | `compaction-overflow` | 16384 window: overflow error ("prompt is too long") → recovery compaction → retry succeeds | Overflow recovery path, willRetry=true event order, budget reset after one recovery |
 
-Completion plan (task index): the compaction scenarios shipped with **T08**;
-RPC coverage ships with **T10** — via in-process per-command contract tests
-for all 32 commands (`crates/rpi/tests/rpc_mode_test.rs`, anchored to the
-upstream RPC protocol doc) plus three-mode parity of the scenarios above
-(`crates/rpi/tests/parity_headless_test.rs`). No separate RPC transcript
-fixtures are recorded (the 32-command wire protocol is fully enumerated by
-the contract tests; transcripts would add no coverage).
+Completion plan (task index): the compaction scenarios shipped with **T08**; RPC coverage ships with **T10** — via in-process per-command contract tests for all 32 commands (`crates/rpi/tests/rpc_mode_test.rs`, anchored to the upstream RPC protocol doc) plus three-mode parity of the scenarios above (`crates/rpi/tests/parity_headless_test.rs`). No separate RPC transcript fixtures are recorded (the 32-command wire protocol is fully enumerated by the contract tests; transcripts would add no coverage).
 
 ### 3.1 resources case group (delivered by T09)
 
-`fixtures/generated/resources/`: golden JSON produced by the real upstream
-modules (skills/prompt-templates/theme/keybindings/settings-manager/
-resource-loader, dist builds). The Rust-side parity test is
-`crates/rpi/tests/parity_resources_test.rs` (normalized diff reuses
-rpi-test-support; absolute paths in the golden data were replaced with
-`<path>` at generation time, and the Rust side applies the same replacement
-via `Normalizer::with_path`).
+`fixtures/generated/resources/`: golden JSON produced by the real upstream modules (skills/prompt-templates/theme/keybindings/settings-manager/resource-loader, dist builds). The Rust-side parity test is `crates/rpi/tests/parity_resources_test.rs` (normalized diff reuses rpi-test-support; absolute paths in the golden data were replaced with `<path>` at generation time, and the Rust side applies the same replacement via `Normalizer::with_path`).
 
 Generate (from this repository root):
 
@@ -139,18 +94,9 @@ node fixtures/generate-resources-golden.mjs themes settings  # single group
 | `settings` | 5 embedded deepMerge cases + 8 migration cases | `deepMergeSettings` (single-level shallow merge for nesting / replacement at depth ≥ 2 / arrays and scalars replaced, observed through the `SettingsManager.fromStorage` getter surface) + 4 legacy-format migrations (queueMode/websockets/skills object/retry.maxDelayMs) |
 | `resource-loader-e2e` | `input/` multi-level tree (home `.agents/skills`, global agentDir, `.agents/skills` inside a git repo, cwd `.rpi`, settings-declared paths, CLI paths, invalid theme JSON, outside-repo isolation case) | Full `DefaultResourceLoader` pipeline: rank order (project settings > project auto > user settings > user auto > CLI extras), first-come-first-served name conflicts, git repo root ancestor scan upper bound, context files global→root→leaf order, theme/prompt conflicts and full invalid-theme warning diagnostics |
 
-The e2e tree is prepared by the script and the Rust test repeating the same
-flow (`prepareE2eTree`): copy `input/` to a temp dir, create a `.pi/` twin
-for every `.rpi/` (upstream reads `.pi`, rpi reads `.rpi` — intentional
-naming difference; the golden data uniformly records the `.rpi` spelling),
-and create a `repo/.git` marker directory that git cannot track.
+The e2e tree is prepared by the script and the Rust test repeating the same flow (`prepareE2eTree`): copy `input/` to a temp dir, create a `.pi/` twin for every `.rpi/` (upstream reads `.pi`, rpi reads `.rpi` — intentional naming difference; the golden data uniformly records the `.rpi` spelling), and create a `repo/.git` marker directory that git cannot track.
 
-**Engine-related exclusions** (golden data pins only the stable parts; see
-generation script comments): `invalid-yaml` diagnostic message text (JS yaml
-vs serde_yaml), trailing newline of block scalars in `multiline-description`
-(serde_yaml does not keep `|` trailing newlines at EOF),
-`invalid-color-value-type` (typebox vs handwritten validator wording),
-`invalid-json-document` (JS SyntaxError vs serde_json error text).
+**Engine-related exclusions** (golden data pins only the stable parts; see generation script comments): `invalid-yaml` diagnostic message text (JS yaml vs serde_yaml), trailing newline of block scalars in `multiline-description` (serde_yaml does not keep `|` trailing newlines at EOF), `invalid-color-value-type` (typebox vs handwritten validator wording), `invalid-json-document` (JS SyntaxError vs serde_json error text).
 
 ## 4. Normalization / diff usage
 
@@ -164,36 +110,21 @@ diff_jsonl(expected_fixture, actual_output)?;
 diff_event_sequence(expected_events, actual_events)?;
 ```
 
-CLI form (spot checks, manual parity):
-`cargo run -p rpi-test-support --example normalize-diff -- <expected> <actual>`
-— normalizes each side, diffs, and prints the first difference (line number +
-context).
+CLI form (spot checks, manual parity):`cargo run -p rpi-test-support --example normalize-diff -- <expected> <actual>` — normalizes each side, diffs, and prints the first difference (line number + context).
 
 Normalization rules (`rpi-test-support/src/normalize.rs`):
 
-- `timestamp` keys → type-preserving constants (number → `0`, string →
-  `"<ts>"`)
-- id keys (`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/
-  `sessionId`/`responseId`/`parentSession`) and uuids anywhere → the uniform
-  placeholder `<id:N>` (first-appearance order)
+- `timestamp` keys → type-preserving constants (number → `0`, string → `"<ts>"`)
+- id keys (`id`/`parentId`/`fromId`/`firstKeptEntryId`/`toolCallId`/`sessionId`/`responseId`/`parentSession`) and uuids anywhere → the uniform placeholder `<id:N>` (first-appearance order)
 - ISO-8601 timestamps inside strings → `<ts>`
 - configured cwd / agentDir path prefixes → `<path>`
 - everything else is kept byte-for-byte
 
-In addition, each parity test strips numeric keys per scenario before
-`diff_jsonl` (`STRIPPED_KEYS`: `parity_headless_test.rs` strips
-`usage`/`details`, `parity_compaction_test.rs` strips
-`usage`/`tokensBefore`/`estimatedTokensAfter`, `parity_tools_test.rs` strips
-`usage`/`willRetry`/`details`) — token accounting numbers do not participate
-in parity; this stripping currently lives in three test files (not yet moved
-down into rpi-test-support).
+In addition, each parity test strips numeric keys per scenario before `diff_jsonl` (`STRIPPED_KEYS`: `parity_headless_test.rs` strips `usage`/`details`, `parity_compaction_test.rs` strips `usage`/`tokensBefore`/`estimatedTokensAfter`, `parity_tools_test.rs` strips `usage`/`willRetry`/`details`) — token accounting numbers do not participate in parity; this stripping currently lives in three test files (not yet moved down into rpi-test-support).
 
 ## 5. Itemized parity-level baseline list
 
-Six upstream documents (`external/pi/packages/coding-agent/docs/`) are the
-byte/behavior-level parity baselines. The table below registers
-"document item → parity anchor"; anchor status fills in as tasks progress
-(✅ = anchored, ⏳ = planned task).
+Six upstream documents (`external/pi/packages/coding-agent/docs/`) are the byte/behavior-level parity baselines. The table below registers"document item → parity anchor"; anchor status fills in as tasks progress (✅ = anchored, ⏳ = planned task).
 
 ### 5.1 `session-format.md` (T07 home)
 
