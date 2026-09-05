@@ -144,9 +144,10 @@ pub fn cleanup_share_tmp_file(path: &Path) {
 /// Restrict the share temp file/directory to the current user (T14
 /// review): the exported session HTML can contain private conversation
 /// content; on multi-user machines the default 0644/0755 umask-derived
-/// modes would leave it world-readable in /tmp (upstream parity residual —
-/// upstream's fixed `os.tmpdir()/session.html` has the same exposure).
-/// Best-effort on unix; no-op elsewhere.
+/// modes would leave it world-readable in /tmp. Upstream (9841914,
+/// 6f35de5b5) uses `mkdtempSync("pi-share-")` without mode tightening;
+/// the 0600/0700 hardening is an rpi-only addition kept on purpose
+/// (D-045 addendum). Best-effort on unix; no-op elsewhere.
 pub fn restrict_share_tmp_file_permissions(path: &Path) {
     #[cfg(unix)]
     {

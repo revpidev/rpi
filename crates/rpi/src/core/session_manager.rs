@@ -292,16 +292,30 @@ impl StoredEntry {
         }
     }
 
-    /// `{...entry, parentId}` — returns a record with the parent re-chained
-    /// from the raw object, preserving unknown extension fields
-    /// (createBranchedSession, session-manager.ts:1422-1428).
-    fn with_parent_id(&self, parent_id: Option<String>) -> Result<FileEntryRecord, RpiError> {
+    /// `{...entry, parentId, firstKeptEntryId?}` — branch rewrite preserving
+    /// unknown extension fields: re-chain the parent, and for compaction
+    /// entries remap a label-pointing `firstKeptEntryId` to the first
+    /// retained entry after that label (createBranchedSession,
+    /// session-manager.ts:1422-1448 @ 2631b25c3).
+    fn rewrite_branch_record(
+        &self,
+        parent_id: Option<String>,
+        replacement_by_label_id: &std::collections::HashMap<String, String>,
+    ) -> Result<FileEntryRecord, RpiError> {
         let mut raw = self.raw_value().clone();
         if let Some(obj) = raw.as_object_mut() {
             obj.insert(
                 "parentId".to_owned(),
                 parent_id.map(Value::String).unwrap_or(Value::Null),
             );
+            if let Some(Value::String(current)) = obj.get("firstKeptEntryId").cloned() {
+                if let Some(replacement) = replacement_by_label_id.get(&current) {
+                    obj.insert(
+                        "firstKeptEntryId".to_owned(),
+                        Value::String(replacement.clone()),
+                    );
+                }
+            }
         }
         Ok(FileEntryRecord::from_value(raw))
     }
@@ -544,6 +558,9 @@ pub fn load_entries_from_file(file_path: &Path) -> Vec<Value> {
     let mut entries = Vec::new();
     let mut reader = std::io::BufReader::with_capacity(SESSION_READ_BUFFER_SIZE, file);
     let mut buf: Vec<u8> = Vec::new();
+    // Whether the file ended with a partial (unterminated) line — the
+    // `pending` buffer upstream (session-manager.ts:544-545).
+    let mut trailing_partial = false;
     loop {
         buf.clear();
         match std::io::BufRead::read_until(&mut reader, b'\n', &mut buf) {
@@ -551,6 +568,10 @@ pub fn load_entries_from_file(file_path: &Path) -> Vec<Value> {
             Ok(_) => {
                 if buf.last() == Some(&b'\n') {
                     buf.pop();
+                } else {
+                    // Read-un-fill returned bytes without the delimiter:
+                    // the file's final line lacks `\n`.
+                    trailing_partial = true;
                 }
                 // StringDecoder('utf8') upstream replaces invalid sequences
                 // with U+FFFD; from_utf8_lossy matches.
@@ -572,6 +593,28 @@ pub fn load_entries_from_file(file_path: &Path) -> Vec<Value> {
         && header.get("id").and_then(Value::as_str).is_some();
     if !valid {
         return Vec::new();
+    }
+    // Repair an unterminated final line: append a `\n` so the next
+    // `appendEntry` cannot glue onto the partial tail (0b5ee5d8b, #8345,
+    // session-manager.ts:555 — runs only after the header validates; an
+    // append failure propagates like upstream `appendFileSync`).
+    if trailing_partial {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&resolved);
+        match &mut file {
+            Ok(handle) => {
+                if let Err(error) = handle.write_all(b"\n") {
+                    tracing::warn!(
+                        "failed to terminate partial session line in {}: {error}",
+                        resolved.display()
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                "failed to open session file for line termination {}: {error}",
+                resolved.display()
+            ),
+        }
     }
     entries
 }
@@ -966,10 +1009,51 @@ impl SessionManager {
 
         if let Some(file) = session_file {
             manager.set_session_file_internal(file, preloaded)?;
+        } else if preloaded.as_ref().is_some_and(|values| !values.is_empty()) {
+            // `_loadEntries(preloadedFileEntries, options)` branch of the
+            // upstream constructor (session-manager.ts:884-885): external
+            // entries restore an in-memory session (2b768ba42, #8980).
+            manager.load_preloaded_entries(preloaded.unwrap_or_default(), options)?;
         } else {
             manager.new_session(options.unwrap_or_default())?;
         }
         Ok(manager)
+    }
+
+    /// `_loadEntries` (session-manager.ts:954-966): adopt externally held
+    /// entries. With a session header the entries are taken as-is (older
+    /// versions migrate; the rewrite is a no-op for in-memory sessions);
+    /// without one a fresh header from `options` is prepended.
+    fn load_preloaded_entries(
+        &mut self,
+        mut values: Vec<Value>,
+        options: Option<NewSessionOptions>,
+    ) -> Result<(), RpiError> {
+        let header = values
+            .iter()
+            .find(|v| v.get("type").and_then(Value::as_str) == Some("session"))
+            .and_then(|h| h.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(session_id) = header {
+            self.session_id = session_id;
+            let migrated = migrate_to_current_version(&mut values);
+            self.records = values
+                .into_iter()
+                .map(FileEntryRecord::from_value)
+                .collect();
+            if migrated {
+                // No-op without persistence (rewrite_file checks persist).
+                self.rewrite_file()?;
+            }
+        } else {
+            self.new_session(options.unwrap_or_default())?;
+            let mut records = std::mem::take(&mut self.records);
+            records.extend(values.into_iter().map(FileEntryRecord::from_value));
+            self.records = records;
+        }
+        self.build_index();
+        Ok(())
     }
 
     /// `setSessionFile` — switch to a different session file (resume and
@@ -1703,12 +1787,17 @@ impl SessionManager {
                 return Err(RpiError::Session(format!("Entry {id} not found")));
             }
         }
+        // `const fromId = this.leafId ?? "root"` is captured BEFORE the
+        // leaf reset (session-manager.ts:1405-1406 @ 9841914, d711bd5f0):
+        // `from_id` records the pre-navigation leaf the summary covers,
+        // not the navigation target (`parent_id` keeps that).
+        let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".to_owned());
         self.leaf_id = branch_from_id.map(str::to_owned);
         let entry = FileEntry::BranchSummary(BranchSummaryEntry {
             id: self.next_entry_id(),
             parent_id: branch_from_id.map(str::to_owned),
             timestamp: now_iso8601(),
-            from_id: branch_from_id.unwrap_or("root").to_owned(),
+            from_id,
             summary: summary.to_owned(),
             details,
             usage,
@@ -1735,14 +1824,30 @@ impl SessionManager {
 
         // Filter out label entries; re-chain the retained path so children of
         // removed labels are not orphaned (session-manager.ts:1422-1428).
+        // A compaction's `firstKeptEntryId` pointing at a removed label is
+        // remapped to the first retained entry after that label — otherwise
+        // the fork loses its compaction boundary and `buildSessionContext`
+        // re-admits the compacted messages (2631b25c3, #8989/#8990,
+        // session-manager.ts:1438-1448).
         let mut path_without_labels: Vec<StoredEntry> = Vec::new();
         let mut new_records: Vec<FileEntryRecord> = Vec::new();
+        let mut replacement_by_label_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut pending_label_ids: Vec<String> = Vec::new();
         let mut path_parent_id: Option<String> = None;
         for entry in &path {
             if entry.type_tag() == "label" {
+                pending_label_ids.push(entry.id().to_owned());
                 continue;
             }
-            let record = entry.with_parent_id(path_parent_id.clone())?;
+            let entry_id = entry.id().to_owned();
+            for label_id in pending_label_ids.drain(..) {
+                replacement_by_label_id.insert(label_id, entry_id.clone());
+            }
+            // Parent re-chain + compaction boundary remap in one raw
+            // rewrite (session-manager.ts:1438-1448).
+            let record =
+                entry.rewrite_branch_record(path_parent_id.clone(), &replacement_by_label_id)?;
             path_parent_id = Some(record.entry_id().unwrap_or_default().to_owned());
             let view = StoredEntry::from_record(&record);
             new_records.push(record);
@@ -1952,8 +2057,33 @@ impl SessionManager {
     /// `SessionManager.inMemory` (session-manager.ts:1568-1570) — the
     /// `--no-session` memory session.
     pub fn in_memory(cwd: Option<&Path>, options: NewSessionOptions) -> Result<Self, RpiError> {
+        SessionManager::in_memory_with_entries(cwd, options, None)
+    }
+
+    /// `SessionManager.inMemory(cwd, options, entries?)` (session-manager.ts:1599-1601,
+    /// 2b768ba42 #8980): create an in-memory session restored from entries
+    /// held outside the filesystem. Rust has no optional parameters, so the
+    /// third param lives on this named constructor.
+    ///
+    /// Restore semantics mirror `_loadEntries` (session-manager.ts:954-966):
+    /// entries carrying a session header are adopted as-is (older versions
+    /// trigger migration); header-less entries get a fresh header from
+    /// `options` prepended. Nothing replays through `append_message` — ids,
+    /// timestamps and `first_kept_entry_id`/`from_id` references survive
+    /// untouched.
+    pub fn in_memory_with_entries(
+        cwd: Option<&Path>,
+        options: NewSessionOptions,
+        entries: Option<Vec<rpi_agent::session::FileEntry>>,
+    ) -> Result<Self, RpiError> {
         let cwd = cwd.map(Path::to_path_buf).unwrap_or_else(process_cwd);
-        SessionManager::new(&cwd, Path::new(""), None, false, Some(options), None)
+        let preloaded: Option<Vec<Value>> = entries.map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| serde_json::to_value(entry).unwrap_or(Value::Null))
+                .collect()
+        });
+        SessionManager::new(&cwd, Path::new(""), None, false, Some(options), preloaded)
     }
 
     /// `getEntriesToFork` (harness repo-utils.ts:32-51): `position: "at"`

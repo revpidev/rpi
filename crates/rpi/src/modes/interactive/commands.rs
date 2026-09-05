@@ -369,11 +369,13 @@ impl InteractiveUi {
             GhAuthStatus::Ok => {}
         }
 
-        // `path.join(os.tmpdir(), "session.html")` (interactive-mode.ts:5526).
-        // Divergence (D-045 addendum): the file lives in a per-invocation unique
-        // subdirectory so two concurrent rpi instances cannot overwrite each
-        // other's export (which would publish the wrong session). The
-        // basename stays `session.html` — gh uses it as the gist file name.
+        // Per-invocation unique temp directory (upstream parity:
+        // `mkdtempSync(path.join(os.tmpdir(), "pi-share-"))` @ 9841914,
+        // 6f35de5b5 #8613 — concurrent shares must not overwrite each
+        // other's export). rpi's equivalent unique dir is
+        // `rpi-share-{pid}-{nanos}/` (D-045 addendum: same isolation
+        // guarantees without adding a tempfile dependency; the basename
+        // stays `session.html` — gh uses it as the gist file name).
         let share_dir = std::env::temp_dir().join(format!(
             "rpi-share-{}-{}",
             std::process::id(),

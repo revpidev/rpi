@@ -821,3 +821,376 @@ async fn terminal_turn_over_threshold_skips_prepare_compaction() {
         "no compaction between turn_end and agent_end on a terminal turn: {between:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// V14-02 FR-F: abort chain + isIdle covering compaction/branch summary
+// (bea67d90d, #8920)
+// ---------------------------------------------------------------------------
+
+/// Cancelling the manual-compaction token mid-flight (the channel
+/// `AgentSession::abort` uses) yields `compaction_end { aborted: true }`,
+/// and `wait_for_idle` only returns after the compaction settles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_cancels_in_flight_manual_compaction() {
+    use rpi::core::compaction_runner::CompactionEvent;
+
+    fn user_msg(text: &str) -> AgentMessage {
+        AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole::User,
+            content: rpi_ai::types::UserContent::Text(text.to_owned()),
+            timestamp: 1,
+        })
+    }
+
+    let settings = r#"{"compaction": {"reserveTokens": 100, "keepRecentTokens": 10}}"#;
+    let fixture = session_fixture(vec![], FauxProviderOptions::default(), Some(settings)).await;
+    // Seed enough entries for a manual compaction.
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager
+            .append_message(user_msg(&format!("q {}", "x".repeat(200))))
+            .expect("append");
+        manager
+            .append_message(AgentMessage::Assistant(faux_assistant_message(
+                format!("a {}", "y".repeat(200)),
+                FauxAssistantOptions::default(),
+            )))
+            .expect("append");
+        manager
+            .append_message(user_msg(&format!("q2 {}", "x".repeat(200))))
+            .expect("append");
+    }
+    fixture.provider.set_responses(vec![faux_assistant_message(
+        "SUMMARY",
+        FauxAssistantOptions::default(),
+    )
+    .into()]);
+
+    // Cancel through the exact channel abort() uses, the moment the
+    // compaction starts (deterministic: CompactionStart fires inside
+    // compact() before the summarization stream completes).
+    let session_for_listener = fixture.session.clone();
+    let saw_abortable_state = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = saw_abortable_state.clone();
+    let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
+            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
+                // In flight: not idle (FR-F R3 — compaction included).
+                assert!(
+                    !session_for_listener.is_idle(),
+                    "is_idle must be false during manual compaction"
+                );
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                session_for_listener.abort_compaction();
+            }
+        }
+    }));
+
+    let error = fixture
+        .session
+        .compact(None)
+        .await
+        .expect_err("cancelled compaction errors");
+    assert!(
+        error.to_string().contains("Compaction cancelled"),
+        "error: {error}"
+    );
+    unsubscribe();
+
+    assert!(
+        saw_abortable_state.load(std::sync::atomic::Ordering::SeqCst),
+        "listener observed the in-flight window"
+    );
+    let compaction_ends: Vec<CompactionEvent> = fixture
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|event| match event {
+            rpi::core::agent_session::AgentSessionEvent::Compaction(inner) => {
+                match inner.as_ref() {
+                    end @ CompactionEvent::CompactionEnd { .. } => Some(end.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<CompactionEvent>>();
+    assert_eq!(compaction_ends.len(), 1);
+    match compaction_ends.into_iter().next().expect("one end") {
+        CompactionEvent::CompactionEnd { aborted, .. } => assert!(aborted),
+        other => panic!("expected compaction_end, got {other:?}"),
+    }
+    // The compaction settled: idle again, and wait_for_idle returns.
+    fixture.session.wait_for_idle().await;
+    assert!(fixture.session.is_idle());
+}
+
+/// `AgentSession::abort` walks the full chain (retry → compaction → branch
+/// summary → agent.abort → waitForIdle) and returns on an idle session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_full_chain_returns_on_idle_session() {
+    let fixture = session_fixture(vec![], FauxProviderOptions::default(), None).await;
+    fixture.session.abort().await;
+    assert!(fixture.session.is_idle());
+}
+
+// ---------------------------------------------------------------------------
+// V14-02 FR-E: in-memory fork waits for the active turn to settle
+// (56c6fb33c, #8724/#8937 — upstream regression 8724, ported)
+// ---------------------------------------------------------------------------
+
+/// A tool that blocks until its abort signal fires, resolving with
+/// "tool aborted" (the upstream 8724 blocking tool).
+struct BlockingTool {
+    started: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl rpi_agent::types::AgentTool for BlockingTool {
+    fn name(&self) -> &str {
+        "block"
+    }
+    fn label(&self) -> &str {
+        "Block"
+    }
+    fn description(&self) -> &str {
+        "Wait until aborted"
+    }
+    fn parameters(&self) -> &Value {
+        static PARAMETERS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+        PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object", "properties": {} }))
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: Value,
+        signal: tokio_util::sync::CancellationToken,
+        _on_update: Option<rpi_agent::types::AgentToolUpdateCallback>,
+    ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::AgentError> {
+        self.started.notify_waiters();
+        signal.cancelled().await;
+        Ok(rpi_agent::types::AgentToolResult {
+            content: vec![rpi_ai::types::ToolResultContent::Text(
+                rpi_ai::types::TextContent {
+                    text: "tool aborted".to_owned(),
+                    text_signature: None,
+                },
+            )],
+            details: serde_json::json!({}),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_memory_fork_waits_for_active_tool_turn() {
+    use rpi::core::agent_session_runtime::{
+        AgentSessionRuntime, CreateRuntimeOptions, ForkPosition,
+    };
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let blocking_tool = Arc::new(BlockingTool {
+        started: started.clone(),
+    });
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "rpi-fork-8724-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let cwd = tmp_dir.join("cwd");
+    let agent_dir = tmp_dir.join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+    let next_turn_roles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let roles_capture = next_turn_roles.clone();
+    let next_response = rpi_test_support::faux::FauxResponseStep::Factory(Box::new(
+        move |context: &rpi_ai::types::Context, _options, _state, _model| {
+            let roles = context
+                .messages
+                .iter()
+                .map(|message| {
+                    serde_json::to_value(message)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("role")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<String>>();
+            *roles_capture.lock().unwrap() = roles;
+            faux_assistant_message("next response", FauxAssistantOptions::default())
+        },
+    ));
+    let provider = FauxProvider::new(FauxProviderOptions::default());
+    provider.set_responses(vec![
+        faux_assistant_message("first response", FauxAssistantOptions::default()).into(),
+        faux_assistant_message(
+            faux_tool_call("block", serde_json::Map::new(), None),
+            FauxAssistantOptions {
+                stop_reason: Some(rpi_ai::types::StopReason::ToolUse),
+                ..Default::default()
+            },
+        )
+        .into(),
+        faux_assistant_message("unused after abort", FauxAssistantOptions::default()).into(),
+        next_response,
+    ]);
+    let model = provider.get_model(None).expect("faux model");
+
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
+        rpi::core::model_runtime::CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: rpi::core::model_runtime::ModelsPathInput::Path(
+                agent_dir.join("models.json"),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+
+    let services = rpi::core::agent_session_services::create_agent_session_services(
+        rpi::core::agent_session_services::CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: None,
+            model_runtime: Some(model_runtime.clone()),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        },
+    )
+    .await
+    .expect("services");
+
+    let session_manager = Arc::new(Mutex::new(
+        rpi::core::session_manager::SessionManager::in_memory(
+            Some(&cwd),
+            rpi::core::session_manager::NewSessionOptions::default(),
+        )
+        .expect("in-memory session"),
+    ));
+
+    let model_for_factory = model.clone();
+    let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+        cwd: Some(cwd.clone()),
+        agent_dir: Some(agent_dir.clone()),
+        model_runtime: Some(model_runtime.clone()),
+        model: Some(model),
+        tools: Some(vec!["block".to_owned()]),
+        custom_tools: vec![blocking_tool as Arc<dyn rpi_agent::types::AgentTool>],
+        services: Some(services.clone()),
+        session_manager: Some(session_manager.clone()),
+        ..Default::default()
+    })
+    .await
+    .expect("create session");
+
+    let factory_services = services.clone();
+    let factory_model = model_for_factory;
+    let factory_cwd = cwd.clone();
+    let factory_agent_dir = agent_dir.clone();
+    let factory: rpi::core::agent_session_runtime::CreateAgentSessionRuntimeFactory =
+        Arc::new(move |options: CreateRuntimeOptions| {
+            let services = factory_services.clone();
+            let model = factory_model.clone();
+            let cwd = factory_cwd.clone();
+            let agent_dir = factory_agent_dir.clone();
+            Box::pin(async move {
+                let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+                    cwd: Some(cwd),
+                    agent_dir: Some(agent_dir),
+                    model: Some(model),
+                    tools: Some(vec!["block".to_owned()]),
+                    services: Some(services.clone()),
+                    session_manager: Some(options.session_manager),
+                    ..Default::default()
+                })
+                .await?;
+                let _ = options.session_start_event;
+                Ok(
+                    rpi::core::agent_session_runtime::CreateAgentSessionRuntimeResult {
+                        session: created.session,
+                        services,
+                        diagnostics: Vec::new(),
+                        model_fallback_message: None,
+                    },
+                )
+            })
+        });
+    let mut runtime =
+        AgentSessionRuntime::new(created.session.clone(), services, factory, Vec::new(), None);
+
+    // Turn 1 completes normally.
+    runtime
+        .session()
+        .prompt("first prompt", PromptOptions::default())
+        .await
+        .expect("first prompt");
+    runtime.session().wait_for_idle().await;
+    let first_user_entry_id = runtime
+        .session()
+        .get_user_messages_for_forking()
+        .first()
+        .map(|(id, _)| id.clone())
+        .expect("first user entry");
+
+    // Turn 2 blocks inside the tool; fork DURING the active turn.
+    let session = runtime.session().clone();
+    let outgoing_prompt = tokio::spawn(async move {
+        let _ = session
+            .prompt("start blocking tool", PromptOptions::default())
+            .await;
+    });
+    started.notified().await;
+
+    let fork_result = runtime
+        .fork(&first_user_entry_id, ForkPosition::Before, None)
+        .await
+        .expect("fork");
+    outgoing_prompt.await.expect("prompt settles");
+    runtime.session().wait_for_idle().await;
+
+    // Fork "before" the first user message: the replacement session is
+    // empty — the aborted turn never entered it (upstream 8724 asserts
+    // messages == [] and no message entries).
+    assert!(!fork_result.cancelled);
+    assert_eq!(fork_result.selected_text.as_deref(), Some("first prompt"));
+    assert!(runtime.session().messages().is_empty());
+    let message_entries = runtime
+        .session()
+        .session_manager()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_entries()
+        .iter()
+        .filter(|e| e.type_tag() == "message")
+        .count();
+    assert_eq!(message_entries, 0);
+
+    // The next turn's LLM context starts clean (no aborted-turn leakage):
+    // the capturing factory recorded only the next user message.
+    runtime
+        .session()
+        .prompt("next prompt", PromptOptions::default())
+        .await
+        .expect("next prompt");
+    runtime.session().wait_for_idle().await;
+    let recorded = next_turn_roles.lock().unwrap().clone();
+    assert_eq!(recorded, vec!["user".to_owned()]);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

@@ -3,7 +3,7 @@
     "src/oauth.ts"
   ],
   "modifiedFiles": [],
-  "maxTokens": 2048,
+  "maxTokens": 4096,
   "cacheRetention": "none",
   "usage": {
     "input": 11,

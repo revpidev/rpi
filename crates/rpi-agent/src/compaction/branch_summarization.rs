@@ -81,7 +81,7 @@ pub struct CollectEntriesResult {
 /// holds the resolved values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BranchSummarySettings {
-    /// Tokens reserved for prompt + LLM response.
+    /// Tokens reserved for prompt + LLM response (settings-manager.ts:20).
     pub reserve_tokens: u64,
     /// When true, skips the "Summarize branch?" prompt and defaults to no
     /// summary (consumed by the navigation caller, not by this module).
@@ -109,7 +109,8 @@ pub struct GenerateBranchSummaryOptions<'a> {
     /// If true, `custom_instructions` replaces the default prompt instead of
     /// being appended.
     pub replace_instructions: bool,
-    /// Tokens reserved for prompt + LLM response.
+    /// Tokens reserved when selecting branch history (default 16384)
+    /// (branch-summarization.ts:82 @ e44d75c20).
     pub reserve_tokens: u64,
     pub callbacks: Option<&'a RetryCallbacks>,
 }
@@ -394,7 +395,13 @@ pub async fn generate_branch_summary(
         tools: None,
     };
     let request_options = StreamOptions {
-        max_tokens: Some(2048),
+        // Output cap (e44d75c20, #8845): min(4096, model.maxTokens) with
+        // maxTokens == 0 meaning no limit (upstream Infinity branch).
+        max_tokens: Some(if model.max_tokens > 0 {
+            4096u64.min(u64::from(model.max_tokens)) as u32
+        } else {
+            4096
+        }),
         request: rpi_ai::ProviderRequestOptions {
             signal: args.signal.clone(),
             api_key: args.api_key.clone(),

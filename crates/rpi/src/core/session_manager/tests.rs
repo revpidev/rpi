@@ -2832,3 +2832,268 @@ fn list_all_discovers_sessions_through_symlinked_directories() {
         "symlinked session dir should be discovered"
     );
 }
+
+// ===========================================================================
+// V14-02: session-management repair battery
+// ===========================================================================
+
+/// FR-A (2b768ba42, #8980): `inMemory` restores externally held entries —
+/// header-carrying sets adopt ids/structure verbatim; header-less sets get a
+/// fresh header from the options prepended.
+#[test]
+fn in_memory_with_entries_adopts_header_and_restores_tree() {
+    let mut source = in_memory();
+    let id1 = source.append_message(user_msg("one")).expect("append");
+    let id2 = source.append_message(assistant_msg("two")).expect("append");
+    let source_id = source.get_session_id().to_owned();
+    let mut entries: Vec<rpi_agent::session::FileEntry> =
+        vec![rpi_agent::session::FileEntry::Session(
+            rpi_agent::session::SessionHeader {
+                version: Some(3),
+                id: source_id.clone(),
+                timestamp: "2025-01-01T00:00:00.000Z".to_owned(),
+                cwd: "/tmp".to_owned(),
+                parent_session: None,
+            },
+        )];
+    entries.extend(source.get_entries().iter().filter_map(|stored| {
+        // Re-serialize the raw view through FileEntry to prove external
+        // round-tripping (raw keeps unknown fields; typed keeps the
+        // pinned shape -- both restore the same tree here).
+        serde_json::from_value(stored.raw_value().clone()).ok()
+    }));
+
+    let restored =
+        SessionManager::in_memory_with_entries(None, NewSessionOptions::default(), Some(entries))
+            .expect("restore");
+
+    // Header adopted: same session id, ids/timestamps survive, leaf intact.
+    assert_eq!(restored.get_session_id(), source_id);
+    assert_eq!(restored.get_leaf_id(), Some(id2.as_str()));
+    let entries = restored.get_entries();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].id(), id1);
+    assert_eq!(entries[1].id(), id2);
+    assert_eq!(entries[1].parent_id(), Some(id1.as_str()));
+}
+
+/// FR-A: header-less external entries get a fresh header prepended (the
+/// `else` arm of `_loadEntries`, session-manager.ts:962-964).
+#[test]
+fn in_memory_with_entries_without_header_synthesizes_header() {
+    let mut source = in_memory();
+    let id1 = source.append_message(user_msg("kept")).expect("append");
+    let raw_entries: Vec<Value> = source
+        .get_entries()
+        .iter()
+        .map(|stored| stored.raw_value().clone())
+        .collect();
+    let entries: Vec<rpi_agent::session::FileEntry> = raw_entries
+        .into_iter()
+        .filter(|v| v.get("type").and_then(Value::as_str) != Some("session"))
+        .map(|v| serde_json::from_value(v).expect("FileEntry"))
+        .collect();
+
+    let restored =
+        SessionManager::in_memory_with_entries(None, NewSessionOptions::default(), Some(entries))
+            .expect("restore");
+
+    assert_ne!(restored.get_session_id(), source.get_session_id());
+    let entries = restored.get_entries();
+    // Fresh header + the single entry; the entry id survives.
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id(), id1);
+}
+
+/// FR-A: entries carrying an old version header go through migration.
+#[test]
+fn in_memory_with_entries_migrates_old_header_versions() {
+    // Typed entries carry ids by construction; the version-1 header still
+    // routes through migrate_to_current_version (v1->v2->v3 idempotent on
+    // id-carrying entries, version bumps to 3).
+    let v1_entries: Vec<rpi_agent::session::FileEntry> = vec![
+        rpi_agent::session::FileEntry::Session(rpi_agent::session::SessionHeader {
+            version: Some(1),
+            id: "v1-sess".to_owned(),
+            timestamp: "2025-01-01T00:00:00.000Z".to_owned(),
+            cwd: "/tmp".to_owned(),
+            parent_session: None,
+        }),
+        rpi_agent::session::FileEntry::Message(rpi_agent::session::MessageEntry {
+            id: "m1".to_owned(),
+            parent_id: None,
+            timestamp: "2025-01-01T00:00:01.000Z".to_owned(),
+            message: user_msg("hi"),
+        }),
+    ];
+    let restored = SessionManager::in_memory_with_entries(
+        None,
+        NewSessionOptions::default(),
+        Some(v1_entries),
+    )
+    .expect("restore");
+    assert_eq!(restored.get_session_id(), "v1-sess");
+    // Migration assigned id/parentId (in-memory: no rewrite, but the tree
+    // indexes the migrated shape).
+    assert!(restored.get_leaf_id().is_some());
+}
+
+/// FR-B (2631b25c3, #8989/#8990): forking a path whose compaction boundary
+/// points at a removed label remaps `firstKeptEntryId` to the first retained
+/// entry after that label (upstream regression 8989, ported verbatim:
+/// old → label → kept → compaction(boundary=label) → after).
+#[test]
+fn fork_remaps_compaction_boundary_pointing_at_removed_label() {
+    let mut session = in_memory();
+    let old_id = session.append_message(user_msg("old")).expect("append");
+    // findCutPoint() can move a compaction boundary back to this
+    // context-invisible label.
+    session
+        .append_label_change(&old_id, Some("checkpoint"))
+        .expect("label");
+    let label_id = session.get_leaf_id().expect("label leaf").to_owned();
+    let kept_id = session.append_message(user_msg("kept")).expect("append");
+    let compaction_id = session
+        .append_compaction("summary", &label_id, 100, None, None, None)
+        .expect("compaction (boundary = label)");
+    let leaf_id = session.append_message(user_msg("after")).expect("append");
+
+    session
+        .create_branched_session(&leaf_id)
+        .expect("fork in memory");
+
+    let compaction = session
+        .get_entry(&compaction_id)
+        .and_then(|e| e.known().cloned());
+    match compaction {
+        Some(SessionEntry::Compaction(c)) => {
+            assert_eq!(
+                c.first_kept_entry_id.as_deref(),
+                Some(kept_id.as_str()),
+                "boundary remapped to the first retained entry after the label"
+            );
+        }
+        other => panic!("expected compaction, got {other:?}"),
+    }
+    // The compacted old message must not re-enter the model context
+    // (buildSessionContext after the fork).
+    let roles: Vec<&str> = session
+        .build_session_context()
+        .messages
+        .iter()
+        .map(|m| match m {
+            rpi_agent::AgentMessage::CompactionSummary(_) => "compactionSummary",
+            rpi_agent::AgentMessage::User(_) => "user",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(roles, ["compactionSummary", "user", "user"]);
+}
+
+/// FR-B matrix: a boundary NOT pointing at a label keeps its original value.
+#[test]
+fn fork_keeps_compaction_boundary_when_not_labelled() {
+    let mut session = in_memory();
+    let id1 = session.append_message(user_msg("1")).expect("append");
+    let id2 = session.append_message(assistant_msg("2")).expect("append");
+    session
+        .append_compaction("summary", &id1, 1000, None, None, None)
+        .expect("compaction");
+    session.append_message(user_msg("3")).expect("append");
+
+    let leaf = session.get_leaf_id().expect("leaf").to_owned();
+    session.create_branched_session(&leaf).expect("fork");
+    let entries = session.get_entries();
+    let compaction = entries
+        .iter()
+        .find(|e| e.type_tag() == "compaction")
+        .expect("compaction");
+    match compaction.known() {
+        Some(SessionEntry::Compaction(c)) => {
+            assert_eq!(c.first_kept_entry_id.as_deref(), Some(id1.as_str()));
+        }
+        other => panic!("expected compaction, got {other:?}"),
+    }
+    let _ = id2;
+}
+
+/// FR-G (0b5ee5d8b, #8345): a session file whose last line lacks `\n` loads
+/// fully AND is repaired with a trailing newline.
+#[test]
+fn load_entries_repairs_missing_trailing_newline() {
+    let tmp = TempDir::new();
+    let file = tmp.path().join("partial-tail.jsonl");
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"sess-tail\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+        "{\"type\":\"message\",\"id\":\"m2\",\"parentId\":\"m1\",\"timestamp\":\"2025-01-01T00:00:02.000Z\",\"message\":{\"role\":\"assistant\",\"content\":\"answer\",\"timestamp\":2}}",
+    );
+    std::fs::write(&file, content).expect("write partial-tail file");
+
+    let entries = load_entries_from_file(&file);
+    assert_eq!(entries.len(), 3, "the partial final line still parses");
+
+    // The file got the terminating newline.
+    let repaired = std::fs::read_to_string(&file).expect("read repaired");
+    assert!(repaired.ends_with('\n'), "file must end with newline");
+    assert_eq!(
+        repaired.trim_end_matches('\n').lines().count(),
+        3,
+        "no content lost or duplicated"
+    );
+}
+
+/// FR-G guard: files already ending in `\n` are untouched, and header-less
+/// files are NOT repaired (upstream validates the header before appending).
+#[test]
+fn load_entries_newline_repair_only_for_valid_terminated_missing_files() {
+    let tmp = TempDir::new();
+    // Already terminated: byte-identical after load.
+    let file = tmp.path().join("terminated.jsonl");
+    let content = concat!(
+        "{\"type\":\"session\",\"version\":3,\"id\":\"s\",\"timestamp\":\"2025-01-01T00:00:00.000Z\",\"cwd\":\"/tmp\"}\n",
+        "{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2025-01-01T00:00:01.000Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\",\"timestamp\":1}}\n",
+    );
+    std::fs::write(&file, content).expect("write");
+    let before = std::fs::read(&file).expect("read");
+    let entries = load_entries_from_file(&file);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(std::fs::read(&file).expect("read"), before, "untouched");
+
+    // No valid header: entries rejected, file NOT modified.
+    let file = tmp.path().join("no-header.jsonl");
+    std::fs::write(&file, "{\"type\":\"message\",\"id\":\"m1\"}").expect("write");
+    let before = std::fs::read(&file).expect("read");
+    assert!(load_entries_from_file(&file).is_empty());
+    assert_eq!(std::fs::read(&file).expect("read"), before, "untouched");
+}
+
+/// FR-H (d711bd5f0): branch summary `fromId` records the PRE-navigation
+/// leaf; `parentId` keeps the navigation target.
+#[test]
+fn branch_summary_from_id_is_pre_navigation_leaf() {
+    let mut session = in_memory();
+    let id1 = session.append_message(user_msg("q1")).expect("append");
+    session.append_message(assistant_msg("a1")).expect("append");
+    let id3 = session.append_message(user_msg("q2")).expect("append");
+    session.append_message(assistant_msg("a2")).expect("append");
+    let pre_leaf = session.get_leaf_id().expect("leaf").to_owned();
+
+    let summary_id = session
+        .branch_with_summary(Some(&id3), "abandoned path", None, None, None)
+        .expect("branch with summary");
+
+    let entries = session.get_entries();
+    let summary = entries
+        .iter()
+        .find(|e| e.id() == summary_id)
+        .expect("branch summary entry");
+    match summary.known() {
+        Some(SessionEntry::BranchSummary(b)) => {
+            assert_eq!(b.from_id, pre_leaf, "fromId = pre-navigation leaf");
+            assert_eq!(b.parent_id.as_deref(), Some(id3.as_str()));
+        }
+        other => panic!("expected branch summary, got {other:?}"),
+    }
+    let _ = id1;
+}

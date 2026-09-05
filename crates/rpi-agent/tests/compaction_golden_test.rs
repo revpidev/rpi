@@ -1216,3 +1216,43 @@ async fn prompt_branch_custom_instructions_byte_exact() {
         prompt_text("branch_custom_instructions.txt")
     );
 }
+
+/// V14-02 FR-I (e44d75c20, #8845): branch summary output cap is
+/// `min(4096, model.maxTokens)` — a model above 4096 gets 4096, a model
+/// below gets its own maxTokens, and `maxTokens: 0` means uncapped (4096).
+#[tokio::test]
+async fn branch_summary_output_cap_min_4096_model_max_tokens() {
+    let mut b = EntryBuilder::new();
+    b.user("one");
+    b.assistant(vec![text_block("a1")]);
+    b.user("two");
+    let entries = b.finish();
+
+    let cases: Vec<(u32, u32)> = vec![
+        (16384, 4096), // model above the cap → 4096
+        (1000, 1000),  // model below the cap → its own limit
+        (0, 4096),     // no limit → cap applies
+    ];
+    for (model_max_tokens, expected) in cases {
+        let mut model = test_model();
+        model.max_tokens = model_max_tokens;
+        let capture = capture_stream_fn(&["SUMMARY"]);
+        let args = SummarizationArgs::default();
+        let options = GenerateBranchSummaryOptions {
+            model: &model,
+            stream_fn: &capture.stream_fn,
+            args: &args,
+            custom_instructions: None,
+            replace_instructions: false,
+            reserve_tokens: 16384,
+            callbacks: None,
+        };
+        let _ = generate_branch_summary(&entries, &options).await;
+        let (_, captured_options) = capture.calls.lock().expect("calls")[0].clone();
+        assert_eq!(
+            captured_options.max_tokens,
+            Some(expected),
+            "model.maxTokens = {model_max_tokens}"
+        );
+    }
+}

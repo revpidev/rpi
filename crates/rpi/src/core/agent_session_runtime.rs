@@ -524,12 +524,26 @@ impl AgentSessionRuntime {
             });
         }
 
-        // In-memory session (agent-session-runtime.ts:332-348).
+        // In-memory session (agent-session-runtime.ts:332-348 @ 9841914).
+        // Tear down FIRST so an in-flight turn settles before the fork
+        // rewrites the shared session (56c6fb33c, #8724/#8937): the aborted
+        // turn's tail events and persistence complete against the OLD
+        // session state, then the branch happens.
         let session_manager = self.session.session_manager();
         {
+            let target_file = {
+                let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
+                manager
+                    .get_session_file()
+                    .map(|p| p.to_string_lossy().into_owned())
+            };
+            self.teardown_current(SessionShutdownReason::Fork, target_file)
+                .await;
             let mut manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
             match &target_leaf_id {
                 None => {
+                    // Empty fork: `parentSession` uses the pre-fork capture
+                    // (agent-session-runtime.ts:338-341 @ 56c6fb33c).
                     manager.new_session(NewSessionOptions {
                         id: None,
                         parent_session: previous_session_file
@@ -542,14 +556,6 @@ impl AgentSessionRuntime {
                 }
             }
         }
-        let target_file = {
-            let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
-            manager
-                .get_session_file()
-                .map(|p| p.to_string_lossy().into_owned())
-        };
-        self.teardown_current(SessionShutdownReason::Fork, target_file)
-            .await;
         self.apply(
             (self.create_runtime)(CreateRuntimeOptions {
                 cwd: self.services.cwd.clone(),
@@ -595,11 +601,8 @@ impl AgentSessionRuntime {
             std::fs::create_dir_all(&session_dir)?;
         }
 
-        let destination_path = session_dir.join(
-            resolved_path
-                .file_name()
-                .ok_or_else(|| RpiError::Session("Invalid session file name".to_owned()))?,
-        );
+        let (destination_path, source_already_stored) =
+            probe_import_destination(&session_dir, &resolved_path);
         if self
             .emit_before_switch("resume", Some(&destination_path.to_string_lossy()))
             .await
@@ -608,8 +611,11 @@ impl AgentSessionRuntime {
         }
 
         let previous_session_file = self.session.session_file();
-        if resolved_path != destination_path {
-            std::fs::copy(&resolved_path, &destination_path)?;
+        if !source_already_stored {
+            // `COPYFILE_EXCL` equivalent (agent-session-runtime.ts:386-388):
+            // exclusive create -- a concurrent import landing the same name
+            // fails here instead of overwriting.
+            copy_exclusive(&resolved_path, &destination_path)?;
         }
 
         let session_manager = SessionManager::open(
@@ -675,4 +681,133 @@ pub async fn create_agent_session_runtime(
         result.diagnostics,
         result.model_fallback_message,
     ))
+}
+
+/// Destination probe for `importFromJsonl` (agent-session-runtime.ts:369-379
+/// @ 9841914, 1a773c8e7 #8985): `<name>-1.ext`, `-2`, ... while the target
+/// exists -- never overwrite an existing session. Returns the probed
+/// destination plus whether the source already sits there (copy skipped).
+fn probe_import_destination(
+    session_dir: &std::path::Path,
+    resolved_path: &std::path::Path,
+) -> (PathBuf, bool) {
+    let mut destination_path = session_dir.join(resolved_path.file_name().unwrap_or_default());
+    let source_already_stored = resolve_path(
+        &destination_path.to_string_lossy(),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+    ) == resolved_path;
+    if !source_already_stored {
+        let stem = destination_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extension = destination_path
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let mut suffix = 1;
+        while destination_path.exists() {
+            destination_path =
+                session_dir.join(format!("{stem}-{suffix}{extension}", suffix = suffix));
+            suffix += 1;
+        }
+    }
+    (destination_path, source_already_stored)
+}
+
+/// `copyFileSync(src, dest, COPYFILE_EXCL)` equivalent
+/// (agent-session-runtime.ts:386-388): exclusive create -- fails when the
+/// destination already exists, never truncates an existing session.
+fn copy_exclusive(source: &std::path::Path, destination: &std::path::Path) -> Result<(), RpiError> {
+    use std::io::{Read, Write};
+    let mut source_file = std::fs::File::open(source)?;
+    let mut destination_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buffer = Vec::new();
+    source_file.read_to_end(&mut buffer)?;
+    destination_file.write_all(&buffer)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod v14_02_tests {
+    use super::*;
+
+    /// FR-C (1a773c8e7, #8985): same-name imports probe `-1`, `-2` ... free
+    /// slots instead of overwriting.
+    #[test]
+    fn import_destination_probe_appends_suffixes_for_collisions() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rpi-probe-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("dir");
+        // Imports arrive from outside the session directory.
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let source = outside.join("source.jsonl");
+        std::fs::write(&source, "x").expect("write source");
+
+        // Empty destination dir: no suffix (source passed in already
+        // resolved, like import_from_jsonl).
+        let resolved = resolve_path(&source.to_string_lossy(), &PathBuf::from("/"));
+        let (dest, already) = probe_import_destination(&tmp, &resolved);
+        assert_eq!(dest, tmp.join("source.jsonl"));
+        assert!(!already);
+
+        // One collision: -1.
+        std::fs::write(tmp.join("source.jsonl"), "existing").expect("write");
+        let (dest, already) = probe_import_destination(&tmp, &resolved);
+        assert_eq!(dest, tmp.join("source-1.jsonl"));
+        assert!(!already);
+
+        // Two collisions: -2.
+        std::fs::write(tmp.join("source-1.jsonl"), "existing").expect("write");
+        let (dest, _) = probe_import_destination(&tmp, &resolved);
+        assert_eq!(dest, tmp.join("source-2.jsonl"));
+
+        // Source already stored: identity, copy skipped.
+        let stored = tmp.join("source-1.jsonl");
+        let resolved = resolve_path(&stored.to_string_lossy(), &PathBuf::from("/"));
+        let (dest, already) = probe_import_destination(&tmp, &resolved);
+        assert_eq!(dest, stored);
+        assert!(already);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// FR-C R2: the copy is exclusive-create — an existing destination
+    /// fails instead of being overwritten (COPYFILE_EXCL semantics).
+    #[test]
+    fn copy_exclusive_never_overwrites() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rpi-copy-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).expect("dir");
+        let source = tmp.join("src.jsonl");
+        std::fs::write(&source, "session-content").expect("write source");
+        let dest = tmp.join("dest.jsonl");
+
+        copy_exclusive(&source, &dest).expect("first copy succeeds");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "session-content");
+
+        std::fs::write(&source, "new-content").expect("rewrite source");
+        let error = copy_exclusive(&source, &dest).expect_err("second copy must fail");
+        assert!(matches!(error, RpiError::Io(_)), "{error:?}");
+        // The existing destination was NOT truncated/overwritten.
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "session-content");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -384,6 +384,11 @@ struct AgentSessionInner {
     /// upstream, agent-session.ts:328): cancelled by `abort_compaction` but
     /// never consulted by the prompt rejection.
     auto_compaction_abort: crate::core::compaction_runner::AbortTokenCell,
+    /// `_branchSummaryAbortController` (agent-session.ts:339): set while a
+    /// branch summary generation runs (`navigate_tree` summarize path);
+    /// `abort_branch_summary` cancels it, `is_compacting` consults it
+    /// (#8920 / FR-F R2).
+    branch_summary_abort: crate::core::compaction_runner::AbortTokenCell,
 
     listeners: Mutex<Vec<(u64, AgentSessionEventListener)>>,
     next_listener_id: AtomicU64,
@@ -516,6 +521,7 @@ impl AgentSession {
             compaction: tokio::sync::Mutex::new(compaction),
             compaction_abort,
             auto_compaction_abort,
+            branch_summary_abort: crate::core::compaction_runner::AbortTokenCell::default(),
             listeners: Mutex::new(Vec::new()),
             next_listener_id: AtomicU64::new(0),
             unsubscribe_agent: Mutex::new(None),
@@ -1021,6 +1027,7 @@ impl AgentSession {
     pub fn dispose(&self) {
         self.abort_retry();
         self.abort_compaction();
+        self.abort_branch_summary();
         self.abort_bash();
         self.inner.agent.abort();
         // Unsubscribe before the aborted run's tail events (aborted
@@ -1092,9 +1099,11 @@ impl AgentSession {
         self.inner.is_agent_run_active.load(Ordering::SeqCst)
     }
 
-    /// `get isIdle` (agent-session.ts:881-883).
+    /// `get isIdle` (agent-session.ts:881-883 @ 9841914, bea67d90d/#8920):
+    /// no active agent run AND no compaction/branch-summary in flight —
+    /// `waitForIdle` therefore also covers an in-flight manual compaction.
     pub fn is_idle(&self) -> bool {
-        !self.is_streaming()
+        !self.is_streaming() && !self.is_compacting()
     }
 
     /// `get systemPrompt` (agent-session.ts:886-888).
@@ -1124,8 +1133,12 @@ impl AgentSession {
 
     /// `get isCompacting` (agent-session.ts:944-950) — true while a manual
     /// or auto compaction/summary holds the runner.
+    /// `get isCompacting` (agent-session.ts:989-995 @ 9841914): compaction
+    /// (manual or auto, via the runner mutex) or branch summarization in
+    /// flight.
     pub fn is_compacting(&self) -> bool {
         self.inner.compaction.try_lock().is_err()
+            || lock(&self.inner.branch_summary_abort).is_some()
     }
 
     /// `get messages` (agent-session.ts:953-955).
@@ -2068,9 +2081,12 @@ impl AgentSession {
         lock(&self.inner.follow_up_messages).clone()
     }
 
-    /// `abort` (agent-session.ts:1542-1546).
+    /// `abort` (agent-session.ts:1616-1623 @ 9841914, bea67d90d/#8920):
+    /// retry → compaction → branch summary → agent.abort → waitForIdle.
     pub async fn abort(&self) {
         self.abort_retry();
+        self.abort_compaction();
+        self.abort_branch_summary();
         self.inner.agent.abort();
         self.wait_for_idle().await;
     }
@@ -2475,6 +2491,14 @@ impl AgentSession {
         }
     }
 
+    /// `abortBranchSummary` (agent-session.ts:2107-2108, bea67d90d/#8920):
+    /// cancel an in-flight branch summary generation.
+    pub fn abort_branch_summary(&self) {
+        if let Some(token) = lock(&self.inner.branch_summary_abort).as_ref() {
+            token.cancel();
+        }
+    }
+
     /// `setAutoCompactionEnabled` (agent-session.ts:2220-2222).
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
         lock(&self.inner.resource_loader)
@@ -2763,6 +2787,19 @@ impl AgentSession {
         target_id: &str,
         options: NavigateTreeOptions,
     ) -> Result<NavigateTreeResult, RpiError> {
+        // `_branchSummaryAbortController` lifecycle (agent-session.ts:3162
+        // + finally): set before the summarization phase, cleared on every
+        // exit path — the wrapper guarantees the clear (bea67d90d/#8920).
+        let result = self.navigate_tree_inner(target_id, options).await;
+        *lock(&self.inner.branch_summary_abort) = None;
+        result
+    }
+
+    async fn navigate_tree_inner(
+        &self,
+        target_id: &str,
+        options: NavigateTreeOptions,
+    ) -> Result<NavigateTreeResult, RpiError> {
         let old_leaf_id = lock(&self.inner.session_manager)
             .get_leaf_id()
             .map(str::to_owned);
@@ -2809,6 +2846,10 @@ impl AgentSession {
         let mut label = options.label.clone();
 
         let token = CancellationToken::new();
+        // Register the branch-summary abort cell (agent-session.ts:3162:
+        // `this._branchSummaryAbortController = new AbortController()`);
+        // cleared in every exit path below (upstream `finally`).
+        *lock(&self.inner.branch_summary_abort) = Some(token.clone());
 
         // session_before_tree extension event (no-op seam).
         let mut extension_summary = None;
