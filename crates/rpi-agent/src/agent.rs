@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures::future::BoxFuture;
 use rpi_ai::types::{
@@ -356,8 +356,13 @@ pub struct Agent {
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurnAgentFn>,
-    pub prepare_next_turn: Option<PrepareNextTurnSignalFn>,
-    pub prepare_next_turn_with_context: Option<PrepareNextTurnWithContextFn>,
+    /// `prepareNextTurn` (signal-only) / `prepareNextTurnWithContext` —
+    /// interior-mutable because the session layer installs the next-turn
+    /// refresh chain after building the shared agent (upstream assigns
+    /// `this.agent.prepareNextTurnWithContext` post-construction,
+    /// agent-session.ts:563-580).
+    prepare_next_turn: RwLock<Option<PrepareNextTurnSignalFn>>,
+    prepare_next_turn_with_context: RwLock<Option<PrepareNextTurnWithContextFn>>,
     /// Session identifier forwarded to providers for cache-aware backends.
     pub session_id: Option<String>,
     /// Optional per-level thinking token budgets forwarded to the stream
@@ -406,8 +411,8 @@ impl Agent {
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             should_stop_after_turn: options.should_stop_after_turn,
-            prepare_next_turn: options.prepare_next_turn,
-            prepare_next_turn_with_context: options.prepare_next_turn_with_context,
+            prepare_next_turn: RwLock::new(options.prepare_next_turn),
+            prepare_next_turn_with_context: RwLock::new(options.prepare_next_turn_with_context),
             session_id: options.session_id,
             thinking_budgets: options.thinking_budgets,
             transport: options.transport.unwrap_or(Transport::Auto),
@@ -429,6 +434,35 @@ impl Agent {
         Box::new(move || {
             lock(&listeners).retain(|(listener_id, _)| *listener_id != id);
         })
+    }
+
+    /// Post-construction install of `prepareNextTurnWithContext`
+    /// (`this.agent.prepareNextTurnWithContext = ...`, agent-session.ts:569).
+    /// Replaces any previous chain; pass `None` to clear.
+    pub fn set_prepare_next_turn_with_context(&self, hook: Option<PrepareNextTurnWithContextFn>) {
+        *self
+            .prepare_next_turn_with_context
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    /// Post-construction read of the installed `prepareNextTurnWithContext`
+    /// chain (used when re-wrapping, agent-session.ts:565-568).
+    pub fn prepare_next_turn_with_context(&self) -> Option<PrepareNextTurnWithContextFn> {
+        self.prepare_next_turn_with_context
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Post-construction read of the installed signal-only `prepareNextTurn`
+    /// chain (the `?? this.agent.prepareNextTurn` fallback,
+    /// agent-session.ts:537-540).
+    pub fn prepare_next_turn_signal_only(&self) -> Option<PrepareNextTurnSignalFn> {
+        self.prepare_next_turn
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Current agent state (snapshot copy).
@@ -704,10 +738,18 @@ impl Agent {
             })
         };
 
-        let prepare_next_turn: Option<PrepareNextTurnFn> =
-            if self.prepare_next_turn_with_context.is_some() || self.prepare_next_turn.is_some() {
-                let with_context = self.prepare_next_turn_with_context.clone();
-                let signal_only = self.prepare_next_turn.clone();
+        let prepare_next_turn: Option<PrepareNextTurnFn> = {
+            let with_context = self
+                .prepare_next_turn_with_context
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let signal_only = self
+                .prepare_next_turn
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if with_context.is_some() || signal_only.is_some() {
                 let active_run = self.active_run.clone();
                 Some(Arc::new(move |context: PrepareNextTurnContext| {
                     let with_context = with_context.clone();
@@ -730,7 +772,8 @@ impl Agent {
                 }))
             } else {
                 None
-            };
+            }
+        };
 
         let should_stop_after_turn: Option<ShouldStopAfterTurnFn> =
             if let Some(agent_callback) = self.should_stop_after_turn.clone() {

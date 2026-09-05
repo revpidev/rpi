@@ -332,6 +332,32 @@ impl ExtensionRunner for ExtensionHostAdapter {
         self.host.emit(ext::EVENT_SESSION_COMPACT, payload).await;
     }
 
+    async fn emit_session_compact_failed(
+        &self,
+        reason: &str,
+        error_message: Option<&str>,
+        aborted: bool,
+        will_retry: bool,
+        from_extension: bool,
+    ) {
+        // `errorMessage` is optional on the wire (`SessionCompactFailedEvent`,
+        // extensions/types.ts:617-627): omit the key entirely when absent,
+        // matching the upstream spread of `undefined`.
+        let mut payload = serde_json::json!({
+            "type": ext::EVENT_SESSION_COMPACT_FAILED,
+            "reason": reason,
+            "aborted": aborted,
+            "willRetry": will_retry,
+            "fromExtension": from_extension,
+        });
+        if let Some(message) = error_message {
+            payload["errorMessage"] = serde_json::Value::String(message.to_owned());
+        }
+        self.host
+            .emit(ext::EVENT_SESSION_COMPACT_FAILED, payload)
+            .await;
+    }
+
     async fn emit_event(&self, event_type: &str, payload: Value) {
         self.host.emit(event_type, payload).await;
     }

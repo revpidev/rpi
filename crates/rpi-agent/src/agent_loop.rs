@@ -209,8 +209,13 @@ pub type GetApiKeyFn = Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> 
 pub type ShouldStopAfterTurnFn =
     Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>;
 
-/// `prepareNextTurn` — called after `turn_end`; return replacement
-/// context/model/thinking state to affect the next turn in this run.
+/// `prepareNextTurn` — called after `turn_end` when the loop will
+/// continue, immediately before the next turn starts. Return replacement
+/// context/model/thinking state to affect that turn; return `None` to keep
+/// using the current context/config (types.ts:224-230 @ 9841914).
+///
+/// Terminal turns (stop / abort) never trigger it: the loop checks
+/// `shouldStopAfterTurn` and the queued-message gates first (#6879).
 pub type PrepareNextTurnFn = Arc<
     dyn Fn(PrepareNextTurnContext) -> BoxFuture<'static, Option<AgentLoopTurnUpdate>> + Send + Sync,
 >;
@@ -547,7 +552,10 @@ async fn run_loop(
     emit: &AgentEventSink,
     stream_function: &StreamFn,
 ) {
-    let mut first_turn = true;
+    // `lastCompletedTurn` (agent-loop.ts:167): data for the
+    // `prepare_next_turn` hook, set after each `turn_end`. `None` on the
+    // first iteration — the entry points already emitted `turn_start`.
+    let mut last_completed_turn: Option<(AssistantMessage, Vec<ToolResultMessage>)> = None;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages: Vec<AgentMessage> = match &config.get_steering_messages {
         Some(get_steering) => get_steering().await,
@@ -561,10 +569,44 @@ async fn run_loop(
 
         // Inner loop: process tool calls and steering messages.
         while has_more_tool_calls || !pending_messages.is_empty() {
-            if !first_turn {
+            // Only prepare for a turn the loop will actually start
+            // (agent-loop.ts:178-199 @ 9841914, #6879): reaching this point
+            // means `should_stop_after_turn` did not exit and either tool
+            // results or queued messages keep the loop going. Terminal
+            // turns never trigger prepare, so compaction and other
+            // prepare-time side effects vanish from them.
+            if let Some((message, tool_results)) = last_completed_turn.as_ref() {
+                if let Some(prepare_next_turn) = &config.prepare_next_turn {
+                    let next_turn_context = PrepareNextTurnContext {
+                        message: message.clone(),
+                        tool_results: tool_results.clone(),
+                        context: current_context.clone(),
+                        new_messages: new_messages.clone(),
+                    };
+                    if let Some(update) = prepare_next_turn(next_turn_context).await {
+                        if let Some(next_context) = update.context {
+                            *current_context = next_context;
+                        }
+                        if let Some(model) = update.model {
+                            config.model = model;
+                        }
+                        if let Some(thinking_level) = update.thinking_level {
+                            config.reasoning = thinking_level_from_model_level(thinking_level);
+                        }
+                    }
+                }
+                // Preparation can be long-running (for example, compaction).
+                // Pick up steering queued while it ran. Only poll again if
+                // the earlier poll returned nothing; otherwise
+                // one-at-a-time mode would deliver two messages in this
+                // turn (agent-loop.ts:186-191).
+                if pending_messages.is_empty() {
+                    pending_messages = match &config.get_steering_messages {
+                        Some(get_steering) => get_steering().await,
+                        None => Vec::new(),
+                    };
+                }
                 emit(AgentEvent::TurnStart).await;
-            } else {
-                first_turn = false;
             }
 
             // Process pending messages (inject before next assistant response).
@@ -649,25 +691,11 @@ async fn run_loop(
             })
             .await;
 
-            if let Some(prepare_next_turn) = &config.prepare_next_turn {
-                let next_turn_context = PrepareNextTurnContext {
-                    message: message.clone(),
-                    tool_results: tool_results.clone(),
-                    context: current_context.clone(),
-                    new_messages: new_messages.clone(),
-                };
-                if let Some(update) = prepare_next_turn(next_turn_context).await {
-                    if let Some(next_context) = update.context {
-                        *current_context = next_context;
-                    }
-                    if let Some(model) = update.model {
-                        config.model = model;
-                    }
-                    if let Some(thinking_level) = update.thinking_level {
-                        config.reasoning = thinking_level_from_model_level(thinking_level);
-                    }
-                }
-            }
+            // `lastCompletedTurn = { message, toolResults, ... }`
+            // (agent-loop.ts:249-255): consumed by `prepare_next_turn` at
+            // the top of the next iteration — after the stop checks below,
+            // so aborted/stopped turns never prepare.
+            last_completed_turn = Some((message.clone(), tool_results.clone()));
 
             if let Some(should_stop_after_turn) = &config.should_stop_after_turn {
                 let stop_context = ShouldStopAfterTurnContext {
@@ -1081,6 +1109,12 @@ async fn execute_tool_calls_parallel(
 ) -> ExecutedToolCallBatch {
     // One slot per preflighted tool call, in source order.
     let mut slots: Vec<Option<FinalizedToolCallOutcome>> = Vec::new();
+    // Prepared calls wait for the whole preflight pass before spawning —
+    // upstream defers the closures to `Promise.all(finalizedCalls.map(…))`
+    // (agent-loop.ts:546-549), so a later preflight abort (#8935/#8936)
+    // stops earlier prepared tools via the spawn-entry signal check before
+    // they enter `execute`.
+    let mut deferred: Vec<(usize, PreparedToolCall)> = Vec::new();
     let mut set = tokio::task::JoinSet::new();
 
     for tool_call in tool_calls {
@@ -1116,31 +1150,48 @@ async fn execute_tool_calls_parallel(
             Preparation::Prepared(prepared) => {
                 let index = slots.len();
                 slots.push(None);
-                let task_emit = emit.clone();
-                let task_context = current_context.clone();
-                let task_assistant_message = assistant_message.clone();
-                let task_after_tool_call = config.after_tool_call.clone();
-                let task_signal = signal.clone();
-                set.spawn(async move {
-                    let executed =
-                        execute_prepared_tool_call(&prepared, &task_signal, &task_emit).await;
-                    let finalized = finalize_executed_tool_call(
-                        &task_context,
-                        &task_assistant_message,
-                        &prepared,
-                        executed,
-                        &task_after_tool_call,
-                        &task_signal,
-                    )
-                    .await;
-                    emit_tool_execution_end(&finalized, &task_emit).await;
-                    (index, finalized)
-                });
+                deferred.push((index, prepared));
                 if is_aborted(signal) {
                     break;
                 }
             }
         }
+    }
+
+    // Deferred execution pass — the upstream closure invocation point
+    // (agent-loop.ts:546-549). Each spawned task first re-checks the abort
+    // signal: an abort that landed during a later preflight skips `execute`
+    // entirely and synthesizes the standard aborted error result, walking
+    // the full `tool_execution_end` event path (#8936, agent-loop.ts:521-530).
+    for (index, prepared) in deferred {
+        let task_emit = emit.clone();
+        let task_context = current_context.clone();
+        let task_assistant_message = assistant_message.clone();
+        let task_after_tool_call = config.after_tool_call.clone();
+        let task_signal = signal.clone();
+        set.spawn(async move {
+            if is_aborted(&task_signal) {
+                let finalized = FinalizedToolCallOutcome {
+                    tool_call: prepared.tool_call.clone(),
+                    result: create_error_tool_result("Operation aborted".to_owned()),
+                    is_error: true,
+                };
+                emit_tool_execution_end(&finalized, &task_emit).await;
+                return (index, finalized);
+            }
+            let executed = execute_prepared_tool_call(&prepared, &task_signal, &task_emit).await;
+            let finalized = finalize_executed_tool_call(
+                &task_context,
+                &task_assistant_message,
+                &prepared,
+                executed,
+                &task_after_tool_call,
+                &task_signal,
+            )
+            .await;
+            emit_tool_execution_end(&finalized, &task_emit).await;
+            (index, finalized)
+        });
     }
 
     let mut join_errors: Vec<String> = Vec::new();

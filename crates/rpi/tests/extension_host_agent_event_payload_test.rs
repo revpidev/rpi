@@ -22,7 +22,7 @@ use rpi_ext_host::api::ContextActions;
 use rpi_ext_host::host::NativeExtensionHost;
 use rpi_ext_host::loader::{ExtensionFactory, InlineExtension};
 use rpi_test_support::faux::{
-    faux_assistant_message, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
+    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
     FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
 };
 use serde_json::{json, Value};
@@ -582,4 +582,249 @@ async fn ctx_session_file_round_trip() {
     assert_eq!(info.path, None);
     assert_eq!(info.id, memory_created.session.session_id());
     assert!(!info.id.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// V14-01 FR-H: `session_compact_failed` payload shape (a6b1dbceb, #8241)
+// ---------------------------------------------------------------------------
+
+/// Small-window fixture with compaction settings, mirroring `fixture` but
+/// parameterized (window + settings.json).
+async fn fixture_with_settings(
+    responses: Vec<FauxResponseStep>,
+    host: NativeExtensionHost,
+    context_window: u32,
+    settings: &str,
+) -> Fixture {
+    let tmp = TempDir::new();
+    let cwd = tmp.path().join("cwd");
+    let agent_dir = tmp.path().join("agent");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    std::fs::write(agent_dir.join("settings.json"), settings).expect("write settings");
+
+    let provider = FauxProvider::new(FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(context_window),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    });
+    provider.set_responses(responses);
+    let model = provider.get_model(None).expect("faux model");
+
+    let model_runtime = rpi::core::model_runtime::ModelRuntime::create(
+        rpi::core::model_runtime::CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: rpi::core::model_runtime::ModelsPathInput::Path(
+                agent_dir.join("models.json"),
+            ),
+            ..Default::default()
+        },
+    )
+    .await;
+    model_runtime
+        .register_native_provider(Arc::new(FauxAiProvider::new(provider.clone())))
+        .await
+        .expect("register faux provider");
+
+    let services = rpi::core::agent_session_services::create_agent_session_services(
+        rpi::core::agent_session_services::CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: None,
+            model_runtime: Some(model_runtime.clone()),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        },
+    )
+    .await
+    .expect("services");
+
+    let session_manager = Arc::new(Mutex::new(
+        rpi::core::session_manager::SessionManager::in_memory(
+            Some(&cwd),
+            rpi::core::session_manager::NewSessionOptions::default(),
+        )
+        .expect("in-memory session"),
+    ));
+
+    let host = Arc::new(host);
+    let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+        cwd: Some(cwd),
+        agent_dir: Some(agent_dir),
+        model_runtime: Some(model_runtime),
+        model: Some(model),
+        tools: Some(vec!["updating".to_owned()]),
+        custom_tools: vec![Arc::new(UpdatingTool)],
+        services: Some(services),
+        session_manager: Some(session_manager),
+        extension_host: Some(host),
+        ..Default::default()
+    })
+    .await
+    .expect("create session");
+
+    Fixture {
+        session: created.session,
+        records: Arc::new(Mutex::new(Vec::new())),
+        _tmp: tmp,
+    }
+}
+
+/// A threshold compaction between turns whose summarization fails emits
+/// `session_compact_failed` with the upstream payload shape — camelCase
+/// fields, `errorMessage` present on failure (extensions/types.ts:617-627).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_failed_payload_shape_on_threshold_failure() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let host = NativeExtensionHost::new("/compact-failed-cwd");
+    let errors = host
+        .load_inline(&[recording_ext(records.clone(), &["session_compact_failed"])])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    // A large text block plus the tool call so the post-tool-result
+    // estimate crosses the (small) threshold.
+    let big = format!("EVIDENCE {}", "evidence block. ".repeat(600));
+    let tool_big = faux_assistant_message(
+        vec![
+            faux_text(big),
+            faux_tool_call(
+                "updating",
+                json!({"n": 1}).as_object().cloned().unwrap(),
+                None,
+            ),
+        ],
+        FauxAssistantOptions {
+            stop_reason: Some(rpi_ai::types::StopReason::ToolUse),
+            ..Default::default()
+        },
+    )
+    .into();
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 7000, "keepRecentTokens": 16 }
+    }"#;
+    let fixture = fixture_with_settings(
+        vec![
+            tool_big,
+            faux_assistant_message(
+                "",
+                FauxAssistantOptions {
+                    stop_reason: Some(rpi_ai::types::StopReason::Error),
+                    error_message: Some("summarizer exploded".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .into(),
+            text_step("final answer"),
+        ],
+        host,
+        8192,
+        settings,
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("go", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let failures = records_of(&records, "session_compact_failed");
+    assert!(
+        !failures.is_empty(),
+        "at least one session_compact_failed: {failures:?}"
+    );
+    // Every failure carries the full upstream shape (split-turn retries
+    // each emit their own event).
+    for payload in &failures {
+        assert_eq!(payload["type"], "session_compact_failed");
+        assert_eq!(payload["reason"], "threshold");
+        assert_eq!(payload["aborted"], false);
+        assert_eq!(payload["willRetry"], false);
+        assert_eq!(payload["fromExtension"], false);
+        assert!(payload["errorMessage"].is_string());
+    }
+    let error_message = failures[0]["errorMessage"].as_str().expect("errorMessage");
+    assert!(
+        error_message.starts_with(
+            "Auto-compaction failed: Turn prefix summarization failed: summarizer exploded"
+        ),
+        "errorMessage: {error_message}"
+    );
+}
+
+/// Without a registered handler the failure path is silent (upstream
+/// `hasHandlers` short circuit) — the payload never dispatches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_compact_failed_emits_only_with_handlers() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    // Register a handler for a DIFFERENT event: session_compact_failed has
+    // no handlers on this host.
+    let host = NativeExtensionHost::new("/compact-failed-silent");
+    let errors = host
+        .load_inline(&[recording_ext(records.clone(), &["turn_start"])])
+        .await;
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let big = format!("EVIDENCE {}", "evidence block. ".repeat(600));
+    let tool_big = faux_assistant_message(
+        vec![
+            faux_text(big),
+            faux_tool_call(
+                "updating",
+                json!({"n": 1}).as_object().cloned().unwrap(),
+                None,
+            ),
+        ],
+        FauxAssistantOptions {
+            stop_reason: Some(rpi_ai::types::StopReason::ToolUse),
+            ..Default::default()
+        },
+    )
+    .into();
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 7000, "keepRecentTokens": 16 }
+    }"#;
+    let fixture = fixture_with_settings(
+        vec![
+            tool_big,
+            faux_assistant_message(
+                "",
+                FauxAssistantOptions {
+                    stop_reason: Some(rpi_ai::types::StopReason::Error),
+                    error_message: Some("summarizer exploded".to_owned()),
+                    ..Default::default()
+                },
+            )
+            .into(),
+            text_step("final answer"),
+        ],
+        host,
+        8192,
+        settings,
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("go", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    assert!(
+        records_of(&records, "session_compact_failed").is_empty(),
+        "no dispatch without handlers"
+    );
 }

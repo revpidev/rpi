@@ -1336,6 +1336,362 @@ async fn uses_prepare_next_turn_snapshot_before_continuing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// V14-01 FR-A/FR-B: prepareNextTurn timing (#6879) + parallel preflight
+// abort (#8936) — upstream intents from agent-loop.ts @ 9841914.
+// ---------------------------------------------------------------------------
+
+/// FR-A R2: a terminal turn (`should_stop_after_turn` = true) never invokes
+/// `prepare_next_turn` — compaction and other prepare-time side effects
+/// vanish from stopped turns (56700d42e, #6879).
+#[tokio::test]
+async fn prepare_next_turn_skipped_on_stop_terminal_turn() {
+    let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed.clone());
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    let prepare_calls = Arc::new(AtomicU64::new(0));
+    let mut config = test_config();
+    config.prepare_next_turn = Some({
+        let prepare_calls = prepare_calls.clone();
+        Arc::new(move |_hook_context| {
+            let prepare_calls = prepare_calls.clone();
+            Box::pin(async move {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+        })
+    });
+    config.should_stop_after_turn = Some(Arc::new(|_hook_context| Box::pin(async move { true })));
+
+    let (stream_fn, state) = mock_stream_fn(vec![text_assistant("done")]);
+    let stream = agent_loop(
+        vec![user_message("hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (_events, _messages) = collect(stream).await;
+
+    assert_eq!(call_count(&state), 1);
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+}
+
+/// FR-A R2: an aborted assistant turn never invokes `prepare_next_turn` —
+/// the loop emits turn_end + agent_end and returns before any prepare.
+#[tokio::test]
+async fn prepare_next_turn_skipped_on_aborted_turn() {
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: None,
+    };
+
+    let prepare_calls = Arc::new(AtomicU64::new(0));
+    let mut config = test_config();
+    config.prepare_next_turn = Some({
+        let prepare_calls = prepare_calls.clone();
+        Arc::new(move |_hook_context| {
+            let prepare_calls = prepare_calls.clone();
+            Box::pin(async move {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                None
+            })
+        })
+    });
+
+    let (stream_fn, _state) = mock_stream_fn(
+        vec![text_assistant("aborted mid-flight")]
+            .into_iter()
+            .map(|mut message| {
+                message.stop_reason = StopReason::Aborted;
+                message
+            })
+            .collect::<Vec<_>>(),
+    );
+    let stream = agent_loop(
+        vec![user_message("hello")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+    // turn_end + agent_end, no second turn_start (the prompt message's
+    // start/end pair is the first one).
+    assert_eq!(
+        event_types(&events),
+        [
+            "agent_start",
+            "turn_start",
+            "message_start",
+            "message_end",
+            "message_start",
+            "message_end",
+            "turn_end",
+            "agent_end",
+        ]
+    );
+}
+
+/// FR-A R1/R4: on a continuing turn, `prepare_next_turn` runs exactly once,
+/// after `turn_end` and before `turn_start` (new sequence: turn_end →
+/// prepare → turn_start).
+#[tokio::test]
+async fn prepare_next_turn_runs_between_turn_end_and_turn_start() {
+    let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    // Shared sequence log: prepare hook and LLM calls record their order.
+    let log: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_config();
+    config.prepare_next_turn = Some({
+        let log = log.clone();
+        Arc::new(move |_hook_context| {
+            let log = log.clone();
+            Box::pin(async move {
+                log.lock().unwrap().push("prepare");
+                None
+            })
+        })
+    });
+
+    let (stream_fn, state) = mock_stream_fn(vec![
+        assistant_message(
+            vec![tool_call("tool-1", "echo", json!({ "value": "hello" }))],
+            StopReason::ToolUse,
+        ),
+        text_assistant("done"),
+    ]);
+    // Wrap the scripted stream fn to record the LLM call order in the log.
+    let inner = stream_fn.clone();
+    let logged: StreamFn = {
+        let log = log.clone();
+        Arc::new(move |model, ctx, options| {
+            log.lock().unwrap().push("llm");
+            inner(model, ctx, options)
+        })
+    };
+    let stream = agent_loop(
+        vec![user_message("echo something")],
+        context,
+        config,
+        None,
+        logged,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    assert_eq!(call_count(&state), 2);
+    assert_eq!(*log.lock().unwrap(), vec!["llm", "prepare", "llm"]);
+    // turn_end precedes the next turn_start (prepare sits between them,
+    // observable via the log above).
+    let types = event_types(&events);
+    let first_turn_end = types.iter().position(|t| *t == "turn_end").unwrap();
+    let next_turn_start = types[first_turn_end + 1..]
+        .iter()
+        .position(|t| *t == "turn_start")
+        .map(|offset| first_turn_end + 1 + offset)
+        .unwrap();
+    assert!(next_turn_start > first_turn_end);
+}
+
+/// FR-A R3: steering queued while prepare runs is picked up by the
+/// post-prepare re-poll — but only when the earlier poll returned nothing
+/// (one-at-a-time mode must not deliver two messages in one turn).
+#[tokio::test]
+async fn steering_queued_during_prepare_is_picked_up() {
+    let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let tool = echo_tool(executed);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    // Queue drained by get_steering_messages; the prepare hook enqueues a
+    // steering message while it "runs" (compaction-like long prepare).
+    let steering_queue: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut config = test_config();
+    config.prepare_next_turn = Some({
+        let steering_queue = steering_queue.clone();
+        Arc::new(move |_hook_context| {
+            let steering_queue = steering_queue.clone();
+            Box::pin(async move {
+                steering_queue
+                    .lock()
+                    .unwrap()
+                    .push(user_message("steered while preparing"));
+                None
+            })
+        })
+    });
+    config.get_steering_messages = Some({
+        let steering_queue = steering_queue.clone();
+        Arc::new(move || {
+            let steering_queue = steering_queue.clone();
+            Box::pin(async move { steering_queue.lock().unwrap().drain(..).collect() })
+        })
+    });
+
+    let (stream_fn, state) = mock_stream_fn(vec![
+        assistant_message(
+            vec![tool_call("tool-1", "echo", json!({ "value": "hello" }))],
+            StopReason::ToolUse,
+        ),
+        text_assistant("done"),
+    ]);
+    let stream = agent_loop(
+        vec![user_message("echo something")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    assert_eq!(call_count(&state), 2);
+    // The steering message enqueued during prepare reached the second LLM
+    // call (injected after prepare, before the assistant response).
+    let markers = message_start_markers(&events);
+    assert!(markers.contains(&"steered while preparing".to_owned()));
+    let second_call_messages = recorded_context(&state, 1).messages.clone();
+    assert!(second_call_messages.iter().any(|m| matches!(
+        m,
+        rpi_ai::Message::User(u)
+            if matches!(&u.content, rpi_ai::types::UserContent::Text(t) if t.contains("steered"))
+    )));
+}
+
+/// FR-B (#8936): a parallel batch whose later preflight aborts the run —
+/// prepared tool tasks that have not entered `execute` synthesize
+/// `"Operation aborted"` error results with full `tool_execution_end`
+/// events, and nothing executes (upstream regression 8935).
+#[tokio::test]
+async fn parallel_preflight_abort_skips_prepared_tools() {
+    let executions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let executions_for_tool = executions.clone();
+    let tool = TestTool::new(
+        "external_write",
+        Arc::new(move |params, _on_update| {
+            let executions = executions_for_tool.clone();
+            Box::pin(async move {
+                let value = params
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                executions.lock().unwrap().push(value.clone());
+                ok_result(value)
+            })
+        }),
+    );
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(tool)]),
+    };
+
+    let mut config = test_config();
+    config.tool_execution = ToolExecutionMode::Parallel;
+    config.before_tool_call = Some({
+        Arc::new(|hook_context, signal: CancellationToken| {
+            Box::pin(async move {
+                // Abort the run during the SECOND tool's preflight, like the
+                // upstream 8935 extension hook.
+                let value = hook_context
+                    .args
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if value == "second" {
+                    signal.cancel();
+                }
+                None
+            })
+        })
+    });
+
+    let (stream_fn, _state) = mock_stream_fn(vec![
+        assistant_message(
+            vec![
+                tool_call("tool-1", "external_write", json!({ "value": "first" })),
+                tool_call("tool-2", "external_write", json!({ "value": "second" })),
+            ],
+            StopReason::ToolUse,
+        ),
+        // The aborted run's follow-up turn ends as an aborted assistant
+        // response (the real stream fn surfaces the cancelled signal).
+        {
+            let mut aborted = text_assistant("aborted");
+            aborted.stop_reason = StopReason::Aborted;
+            aborted
+        },
+    ]);
+    let signal = CancellationToken::new();
+    let stream = agent_loop(
+        vec![user_message("run both writes")],
+        context,
+        config,
+        Some(signal),
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    // Neither tool executed: the abort landed between preflight and the
+    // deferred execution pass.
+    assert!(executions.lock().unwrap().is_empty());
+
+    // Both tool calls walked the full event path with error results.
+    let starts = tool_execution_end_ids(&events);
+    assert_eq!(starts.len(), 2);
+    let tool_result_texts: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::MessageEnd {
+                message: AgentMessage::ToolResult(t),
+            } => Some(
+                t.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ToolResultContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(""),
+            ),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        tool_result_texts,
+        vec![
+            "Operation aborted".to_owned(),
+            "Operation aborted".to_owned()
+        ]
+    );
+    let all_error = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionEnd { is_error, .. } => Some(*is_error),
+            _ => None,
+        })
+        .all(|is_error| is_error);
+    assert!(all_error);
+}
+
 #[tokio::test]
 async fn stops_after_turn_when_should_stop_after_turn_returns_true() {
     let executed: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));

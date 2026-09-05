@@ -13,7 +13,7 @@
 //! parent-id walk from the old leaf visits exactly the `old_path` suffix
 //! after the common ancestor.
 
-use rpi_ai::types::{Model, StopReason, StreamOptions, Usage};
+use rpi_ai::types::{AssistantContent, Model, StopReason, StreamOptions, Usage};
 use rpi_ai::utils::retry::RetryCallbacks;
 use rpi_ai::utils::text::content_text_assistant;
 
@@ -21,7 +21,9 @@ use super::utils::{
     compute_file_lists, create_file_ops, extract_file_ops_from_message, format_file_operations,
     serialize_conversation, FileOperations, SUMMARIZATION_SYSTEM_PROMPT,
 };
-use super::{complete_summarization, estimate_tokens, SummarizationArgs};
+use super::{
+    complete_summarization, estimate_tokens, get_summarization_failure, SummarizationArgs,
+};
 use crate::messages::{convert_to_llm, AgentMessage};
 use crate::session::{
     create_branch_summary_message, create_compaction_summary_message, create_custom_message,
@@ -419,14 +421,19 @@ pub async fn generate_branch_summary(
             ..Default::default()
         };
     }
-    if response.stop_reason == StopReason::Error {
+    if let Some(failure) = get_summarization_failure(&response, "Branch summarization") {
         return BranchSummaryResult {
-            error: Some(
-                response
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| "Summarization failed".to_owned()),
-            ),
+            error: Some(failure),
+            ..Default::default()
+        };
+    }
+    if response
+        .content
+        .iter()
+        .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+    {
+        return BranchSummaryResult {
+            error: Some("Branch summarization attempted to call a tool".to_owned()),
             ..Default::default()
         };
     }

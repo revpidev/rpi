@@ -34,6 +34,7 @@ use rpi_agent::messages::{AgentMessage, BashExecutionMessage, CustomMessage, Cus
 use rpi_agent::session::SessionEntry;
 use rpi_agent::types::{AgentEvent, AgentTool, QueueMode, ThinkingLevel};
 use rpi_agent::{Agent, AgentError};
+use rpi_agent::{AgentContext, AgentLoopTurnUpdate, PrepareNextTurnContext};
 use rpi_ai::models::{clamp_thinking_level, get_supported_thinking_levels, models_are_equal};
 use rpi_ai::models_json::OrderedMap;
 use rpi_ai::types::{
@@ -597,7 +598,91 @@ impl AgentSession {
         }
 
         session.build_tool_runtime(config.initial_active_tool_names);
+        // `_installAgentNextTurnRefresh()` (agent-session.ts:397, 563-580):
+        // wrap the (optional) previous prepare chain with the threshold
+        // compaction + state refresh (V14-01 FR-D).
+        session.install_agent_next_turn_refresh();
         session
+    }
+
+    /// `_installAgentNextTurnRefresh` (agent-session.ts:563-580 @ 9841914):
+    /// the loop-facing `prepareNextTurnWithContext` chains, in order:
+    ///
+    /// 1. `_compactBeforeNextAssistantResponse(turn.context)` — pure-estimate
+    ///    threshold compaction before the next assistant request (#8782);
+    /// 2. the previously installed prepare chain (signal-only hooks are
+    ///    adapted like upstream :537-540), receiving the possibly-compacted
+    ///    context;
+    /// 3. refresh the snapshot from live session state — system prompt
+    ///    override ?? base prompt, agent tools/model/thinking level.
+    ///
+    /// The loop only invokes this between turns it will actually run (FR-A),
+    /// so "terminal turns skip compaction" needs no extra gate here.
+    fn install_agent_next_turn_refresh(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        let agent = self.inner.agent.clone();
+        let previous_with_context = agent.prepare_next_turn_with_context();
+        let previous_signal_only = agent.prepare_next_turn_signal_only();
+        agent.set_prepare_next_turn_with_context(Some(Arc::new(
+            move |turn: PrepareNextTurnContext, signal: CancellationToken| {
+                let weak = weak.clone();
+                let previous_with_context = previous_with_context.clone();
+                let previous_signal_only = previous_signal_only.clone();
+                Box::pin(async move {
+                    let inner = weak.upgrade()?;
+                    let session = AgentSession { inner };
+
+                    // 1. Threshold compaction (agent-session.ts:543-553).
+                    let messages = session
+                        .inner
+                        .compaction
+                        .lock()
+                        .await
+                        .compact_before_next_assistant_response(&turn.context.messages)
+                        .await;
+                    let mut context = AgentContext {
+                        messages,
+                        ..turn.context.clone()
+                    };
+
+                    // 2. Previous prepare chain over the compacted context.
+                    let previous_snapshot = if let Some(previous) = previous_with_context.as_ref() {
+                        previous(
+                            PrepareNextTurnContext {
+                                context: context.clone(),
+                                ..turn.clone()
+                            },
+                            signal.clone(),
+                        )
+                        .await
+                    } else if let Some(signal_only) = previous_signal_only.as_ref() {
+                        signal_only(signal.clone()).await
+                    } else {
+                        None
+                    };
+                    if let Some(update) = previous_snapshot {
+                        if let Some(next_context) = update.context {
+                            context = next_context;
+                        }
+                    }
+
+                    // 3. Refresh from live state (agent-session.ts:568-578).
+                    let state = session.inner.agent.state();
+                    let system_prompt = lock(&session.inner.system_prompt_override)
+                        .clone()
+                        .unwrap_or_else(|| lock(&session.inner.base_system_prompt).clone());
+                    Some(AgentLoopTurnUpdate {
+                        context: Some(AgentContext {
+                            system_prompt,
+                            tools: Some(state.tools),
+                            messages: context.messages,
+                        }),
+                        model: Some(state.model),
+                        thinking_level: Some(state.thinking_level),
+                    })
+                })
+            },
+        )));
     }
 
     fn runner(&self) -> Arc<dyn ExtensionRunner> {

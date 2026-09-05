@@ -353,6 +353,20 @@ pub trait ExtensionRunner: Send + Sync {
     ) {
     }
 
+    /// `session_compact_failed` — fire-and-forget when a compaction fails
+    /// or is aborted (agent-session.ts:604-607, before the error is
+    /// rethrown / surfaced). Payload fields mirror
+    /// `SessionCompactFailedEvent` (extensions/types.ts:617-627).
+    async fn emit_session_compact_failed(
+        &self,
+        _reason: &str,
+        _error_message: Option<&str>,
+        _aborted: bool,
+        _will_retry: bool,
+        _from_extension: bool,
+    ) {
+    }
+
     /// Payload-carrying variant of [`ExtensionRunner::emit`] for events
     /// whose handlers observe event fields (`after_provider_response`,
     /// `session_compact`-style emits). Default falls back to the bare

@@ -1540,7 +1540,8 @@ impl SettingsManager {
     }
 
     /// `getShowCacheMissNotices` (settings-manager.ts:850-852) —
-    /// default false.
+    /// default false ("show cache cost and provider recovery notices",
+    /// settings-manager.ts:108).
     pub fn get_show_cache_miss_notices(&self) -> bool {
         self.settings
             .get_bool("showCacheMissNotices")

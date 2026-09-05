@@ -383,16 +383,57 @@ async fn check_compaction_threshold_estimates_from_last_valid_usage() {
     }
 }
 
-/// The estimate path finds no valid usage at all → false (:2022).
+/// No usage data at all → the pure message-size estimate still drives the
+/// threshold check (#8328, 4495469a5; upstream regression
+/// `8328-zero-usage-auto-compaction.test.ts`). G2: the old expectation
+/// ("no usage data at all → categorically ignored", pre-#8328) is
+/// replaced — only the stale-anchor check stays usage-gated.
 #[tokio::test]
-async fn check_compaction_threshold_without_any_usage_data_is_ignored() {
-    let mut fixture = fixture(settings(), Vec::new());
-    // Agent state has only user messages; no assistant usage at all.
-    fixture.agent.set_messages(vec![user("q")]);
+async fn check_compaction_threshold_zero_usage_session_compacts_on_pure_estimate() {
+    // Agent state has only user messages; no assistant usage at all. The
+    // pure estimate (~2k tokens of text) stays under 8192-4096 → no
+    // compaction.
+    let mut under = fixture(settings(), Vec::new());
+    under
+        .agent
+        .set_messages(vec![user(&format!("q {}", "x".repeat(2000)))]);
+    let mut error = assistant("", StopReason::Error, 0, now_ms());
+    error.error_message = Some("boom".to_owned());
+    assert!(!under.runner.check_compaction(&error, true).await);
+    assert!(under.events().is_empty());
+
+    // Same zero-usage shape, but the pure estimate now exceeds the
+    // threshold → threshold compaction fires (upstream: sessions hitting
+    // persistent API errors must still compact).
+    let mut fixture = fixture(settings(), vec![scripted("SUMMARY")]);
+    let mut messages = Vec::new();
+    for i in 0..4 {
+        let message = user(&format!("q{i} {}", "x".repeat(6000)));
+        fixture
+            .runner
+            .session_mut()
+            .append_message(message.clone())
+            .expect("append user");
+        messages.push(message);
+    }
+    fixture.agent.set_messages(messages);
     let mut error = assistant("", StopReason::Error, 0, now_ms());
     error.error_message = Some("boom".to_owned());
     assert!(!fixture.runner.check_compaction(&error, true).await);
-    assert!(fixture.events().is_empty());
+    let events = fixture.events();
+    assert_eq!(
+        event_types(&events),
+        vec!["compaction_start", "compaction_end"]
+    );
+    match &events[0] {
+        CompactionEvent::CompactionStart { reason } => {
+            assert_eq!(
+                *reason,
+                rpi::core::compaction_runner::CompactionReason::Threshold
+            );
+        }
+        other => panic!("expected compaction_start, got {other:?}"),
+    }
 }
 
 /// Usage timestamp guard: an anchor usage from before the compaction is → false
@@ -605,12 +646,13 @@ async fn length_stop_recovery_is_attempted_only_once() {
     fixture.agent.set_messages(messages);
     assert!(!fixture.runner.check_compaction(&second, true).await);
     let errors = compaction_end_errors(&fixture.events());
+    // G2 (V14-01 FR-F R3, c7c763f5c #8130): a truncated-response (length)
+    // recovery failure now gets the short message; only true context
+    // overflow keeps the full guidance. Old expectation was the context
+    // overflow text for both flavors.
     assert_eq!(
         errors,
-        vec![
-            "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
-                .to_owned()
-        ]
+        vec!["Truncated response recovery failed after one compact-and-retry attempt.".to_owned()]
     );
 }
 

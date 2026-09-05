@@ -27,8 +27,8 @@ pub mod utils;
 
 use futures::StreamExt;
 use rpi_ai::types::{
-    AssistantMessage, AssistantRole, CacheRetention, Context, Model, StopReason, StreamEvent,
-    StreamOptions, TextContent, Usage, UserContentBlock, UserMessage, UserRole,
+    AssistantContent, AssistantMessage, AssistantRole, CacheRetention, Context, Model, StopReason,
+    StreamEvent, StreamOptions, TextContent, Usage, UserContentBlock, UserMessage, UserRole,
 };
 use rpi_ai::utils::retry::{retry_assistant_call, RetryCallbacks, RetryPolicy};
 use rpi_ai::utils::text::content_text_assistant;
@@ -686,6 +686,25 @@ pub struct SummaryWithUsage {
     pub usage: Usage,
 }
 
+/// `getSummarizationFailure` (compaction.ts:545-554): returns an error
+/// message when a summarization response cannot safely be persisted. A
+/// length stop contains partial text and must not become a session
+/// checkpoint (#7048).
+pub fn get_summarization_failure(response: &AssistantMessage, label: &str) -> Option<String> {
+    if response.stop_reason == StopReason::Error {
+        return Some(format!(
+            "{label} failed: {}",
+            response.error_message.as_deref().unwrap_or("Unknown error")
+        ));
+    }
+    if response.stop_reason == StopReason::Length {
+        return Some(format!(
+            "{label} failed: generation hit the token cap and the summary is incomplete"
+        ));
+    }
+    None
+}
+
 /// `generateSummaryWithUsage` (compaction.ts:622-686). Budget:
 /// `maxTokens = min(floor(0.8 * reserveTokens), model.maxTokens)`.
 #[allow(clippy::too_many_arguments)]
@@ -749,11 +768,17 @@ pub async fn generate_summary_with_usage(
     )
     .await;
 
-    if response.stop_reason == StopReason::Error {
-        return Err(AgentError::Message(format!(
-            "Summarization failed: {}",
-            response.error_message.as_deref().unwrap_or("Unknown error")
-        )));
+    if let Some(failure) = get_summarization_failure(&response, "Summarization") {
+        return Err(AgentError::Message(failure));
+    }
+    if response
+        .content
+        .iter()
+        .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+    {
+        return Err(AgentError::Message(
+            "Summarization attempted to call a tool".to_owned(),
+        ));
     }
 
     Ok(SummaryWithUsage {
@@ -1061,11 +1086,17 @@ async fn generate_turn_prefix_summary(
     )
     .await;
 
-    if response.stop_reason == StopReason::Error {
-        return Err(AgentError::Message(format!(
-            "Turn prefix summarization failed: {}",
-            response.error_message.as_deref().unwrap_or("Unknown error")
-        )));
+    if let Some(failure) = get_summarization_failure(&response, "Turn prefix summarization") {
+        return Err(AgentError::Message(failure));
+    }
+    if response
+        .content
+        .iter()
+        .any(|block| matches!(block, AssistantContent::ToolCall(_)))
+    {
+        return Err(AgentError::Message(
+            "Turn prefix summarization attempted to call a tool".to_owned(),
+        ));
     }
 
     Ok(SummaryWithUsage {

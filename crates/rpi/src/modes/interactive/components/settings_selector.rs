@@ -1185,7 +1185,8 @@ impl SettingsSelectorComponent {
                 id: "cache-miss-notices".to_string(),
                 label: "Cache miss notices".to_string(),
                 description: Some(
-                    "Show transcript notices for significant prompt-cache misses".to_string(),
+                    "Show transcript notices for cache costs and provider recovery diagnostics"
+                        .to_string(),
                 ),
                 current_value: if options.show_cache_miss_notices { "true" } else { "false" }.to_string(),
                 values: Some(vec!["true".to_string(), "false".to_string()]),

@@ -50,6 +50,7 @@ pub const EVENT_SESSION_BEFORE_SWITCH: &str = "session_before_switch";
 pub const EVENT_SESSION_BEFORE_FORK: &str = "session_before_fork";
 pub const EVENT_SESSION_BEFORE_COMPACT: &str = "session_before_compact";
 pub const EVENT_SESSION_COMPACT: &str = "session_compact";
+pub const EVENT_SESSION_COMPACT_FAILED: &str = "session_compact_failed";
 pub const EVENT_SESSION_SHUTDOWN: &str = "session_shutdown";
 pub const EVENT_SESSION_BEFORE_TREE: &str = "session_before_tree";
 pub const EVENT_SESSION_TREE: &str = "session_tree";
@@ -76,9 +77,10 @@ pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
-/// All 33 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1184-1225).
-pub const ALL_EVENTS: [&str; 33] = [
+/// All 34 event names, in the upstream `ExtensionAPI.on()` overload order
+/// (types.ts:1257-1301). `ui_prompt_start` / `ui_prompt_end` are V14-11
+/// scope and not yet registered here.
+pub const ALL_EVENTS: [&str; 34] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -87,6 +89,7 @@ pub const ALL_EVENTS: [&str; 33] = [
     EVENT_SESSION_BEFORE_FORK,
     EVENT_SESSION_BEFORE_COMPACT,
     EVENT_SESSION_COMPACT,
+    EVENT_SESSION_COMPACT_FAILED,
     EVENT_SESSION_SHUTDOWN,
     EVENT_SESSION_BEFORE_TREE,
     EVENT_SESSION_TREE,

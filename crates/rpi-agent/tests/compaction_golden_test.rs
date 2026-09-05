@@ -615,6 +615,250 @@ async fn prompt_history_update_byte_exact() {
 }
 
 // ---------------------------------------------------------------------------
+// V14-01 FR-F/FR-I: summarization failure contract + request shape
+// (97fa14e39 #7048, 90305d90a, 6b36eb592)
+// ---------------------------------------------------------------------------
+
+/// Capture variant whose scripted responses carry a given stop reason /
+/// error text — the failure matrix driver.
+struct FailureCapture {
+    #[allow(dead_code)]
+    calls: Arc<Mutex<Vec<(Context, StreamOptions)>>>,
+    stream_fn: rpi_agent::StreamFn,
+}
+
+fn failure_capture_stream_fn(message: AssistantMessage) -> FailureCapture {
+    let calls: Arc<Mutex<Vec<(Context, StreamOptions)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stream_fn: rpi_agent::StreamFn = {
+        let calls = calls.clone();
+        Arc::new(
+            move |model: Model, context: Context, options: StreamOptions| {
+                calls.lock().expect("calls").push((context, options));
+                let mut message = message.clone();
+                message.api = model.api.clone();
+                message.provider = model.provider.clone();
+                message.model = model.id.clone();
+                let event = match message.stop_reason {
+                    rpi_ai::types::StopReason::Error => StreamEvent::Error {
+                        reason: rpi_ai::types::ErrorReason::Error,
+                        error: message,
+                    },
+                    _ => StreamEvent::Done {
+                        reason: rpi_ai::types::DoneReason::Length,
+                        message,
+                    },
+                };
+                Box::pin(futures::stream::iter(vec![event])) as BoxStream<'static, StreamEvent>
+            },
+        )
+    };
+    FailureCapture { calls, stream_fn }
+}
+
+fn stop_reason_text(text: &str, stop_reason: rpi_ai::types::StopReason) -> AssistantMessage {
+    AssistantMessage {
+        role: rpi_ai::types::AssistantRole::Assistant,
+        content: vec![rpi_ai::types::AssistantContent::Text(
+            rpi_ai::types::TextContent {
+                text: text.to_owned(),
+                text_signature: None,
+            },
+        )],
+        api: rpi_ai::ApiKind("faux".to_owned()),
+        provider: "faux".to_owned(),
+        model: "faux-1".to_owned(),
+        response_model: None,
+        response_id: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason,
+        error_message: None,
+        timestamp: 1,
+        deferred: None,
+        end_turn: None,
+        raw_stop_reason: None,
+    }
+}
+
+/// FR-F R1/R2: `getSummarizationFailure` message templates are byte-exact
+/// (compaction.ts:545-554 @ 9841914) and a length stop is NOT persisted —
+/// `generate_summary_with_usage` errors out instead of returning partial
+/// text.
+#[tokio::test]
+async fn summarization_length_stop_rejects_with_byte_exact_message() {
+    // Error flavor keeps the `{label} failed: {errorMessage}` template.
+    let capture = failure_capture_stream_fn({
+        let mut message = stop_reason_text("partial", rpi_ai::types::StopReason::Error);
+        message.error_message = Some("provider exploded".to_owned());
+        message
+    });
+    let error = generate_summary_with_usage(
+        &sample_messages(),
+        &test_model(),
+        16384,
+        None,
+        None,
+        &capture.stream_fn,
+        &SummarizationArgs::default(),
+        None,
+    )
+    .await
+    .expect_err("error stop must fail");
+    assert_eq!(error.to_string(), "Summarization failed: provider exploded");
+
+    // Length flavor: partial text must not become a session checkpoint.
+    let capture = failure_capture_stream_fn(stop_reason_text(
+        "partial summary text",
+        rpi_ai::types::StopReason::Length,
+    ));
+    let error = generate_summary_with_usage(
+        &sample_messages(),
+        &test_model(),
+        16384,
+        None,
+        None,
+        &capture.stream_fn,
+        &SummarizationArgs::default(),
+        None,
+    )
+    .await
+    .expect_err("length stop must fail");
+    assert_eq!(
+        error.to_string(),
+        "Summarization failed: generation hit the token cap and the summary is incomplete"
+    );
+
+    // The shared helper exposes the same two templates for other labels.
+    assert_eq!(
+        rpi_agent::compaction::get_summarization_failure(
+            &stop_reason_text("x", rpi_ai::types::StopReason::Length),
+            "Branch summarization",
+        )
+        .as_deref(),
+        Some("Branch summarization failed: generation hit the token cap and the summary is incomplete")
+    );
+    assert_eq!(
+        rpi_agent::compaction::get_summarization_failure(
+            &stop_reason_text("x", rpi_ai::types::StopReason::Error),
+            "Turn prefix summarization",
+        )
+        .as_deref(),
+        Some("Turn prefix summarization failed: Unknown error")
+    );
+    assert_eq!(
+        rpi_agent::compaction::get_summarization_failure(
+            &stop_reason_text("x", rpi_ai::types::StopReason::Stop),
+            "Summarization",
+        ),
+        None
+    );
+}
+
+/// FR-I R3 + 90305d90a: a summarization response containing toolCall blocks
+/// is rejected (summaries must not call tools).
+#[tokio::test]
+async fn summarization_tool_call_response_is_rejected() {
+    let calls: Arc<Mutex<Vec<(Context, StreamOptions)>>> = Arc::new(Mutex::new(Vec::new()));
+    let stream_fn: rpi_agent::StreamFn = {
+        let calls = calls.clone();
+        Arc::new(
+            move |model: Model, context: Context, options: StreamOptions| {
+                calls.lock().expect("calls").push((context, options));
+                let message = AssistantMessage {
+                    role: rpi_ai::types::AssistantRole::Assistant,
+                    content: vec![rpi_ai::types::AssistantContent::ToolCall(
+                        rpi_ai::types::ToolCall {
+                            id: "call-1".to_owned(),
+                            name: "bash".to_owned(),
+                            namespace: None,
+                            arguments: serde_json::Map::new(),
+                            thought_signature: None,
+                        },
+                    )],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_model: None,
+                    response_id: None,
+                    diagnostics: None,
+                    usage: Usage::default(),
+                    stop_reason: rpi_ai::types::StopReason::Stop,
+                    error_message: None,
+                    timestamp: 1,
+                    deferred: None,
+                    end_turn: None,
+                    raw_stop_reason: None,
+                };
+                Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                    reason: rpi_ai::types::DoneReason::Stop,
+                    message,
+                }])) as BoxStream<'static, StreamEvent>
+            },
+        )
+    };
+    let error = generate_summary_with_usage(
+        &sample_messages(),
+        &test_model(),
+        16384,
+        None,
+        None,
+        &stream_fn,
+        &SummarizationArgs::default(),
+        None,
+    )
+    .await
+    .expect_err("toolCall summary must fail");
+    assert_eq!(error.to_string(), "Summarization attempted to call a tool");
+}
+
+/// FR-I R1/R2/R4: summarization requests carry no tools and no toolChoice,
+/// and the abort signal threads through `SummarizationArgs` into the
+/// request options (upstream `createSummaryRequestOptions` injects
+/// `signal: context.abortSignal`; the removed `toolChoice: "none"` of
+/// 6b36eb592 stays removed — "已对齐" check, single-test fixpoint).
+#[tokio::test]
+async fn summarization_request_shape_tools_none_no_tool_choice_signal_threaded() {
+    let token = tokio_util::sync::CancellationToken::new();
+    let args = SummarizationArgs {
+        signal: Some(token.clone()),
+        ..Default::default()
+    };
+    let capture = capture_stream_fn(&["SUMMARY"]);
+    generate_summary_with_usage(
+        &sample_messages(),
+        &test_model(),
+        16384,
+        None,
+        None,
+        &capture.stream_fn,
+        &args,
+        None,
+    )
+    .await
+    .expect("summary");
+
+    let (context, options) = capture.calls.lock().expect("calls")[0].clone();
+    assert!(context.tools.is_none(), "summarization carries no tools");
+    assert!(
+        options.request.signal.is_some(),
+        "abort signal threads into the summarization request"
+    );
+    assert!(
+        options
+            .request
+            .signal
+            .as_ref()
+            .is_some_and(|signal| signal == &token),
+        "the threaded signal is the caller's token"
+    );
+    // `StreamOptions` carries no `toolChoice` field at all (the upstream
+    // `SimpleStreamOptions.toolChoice` channel is provider-neutral and
+    // arrives with V14-06); structurally the summarization request cannot
+    // set one — mirroring upstream post-6b36eb592 where the explicit
+    // `toolChoice: "none"` was removed from `completeSummarization`.
+}
+
+// ---------------------------------------------------------------------------
 // Entry builders (mirror fixtures/generate-compaction-golden.mjs)
 // ---------------------------------------------------------------------------
 

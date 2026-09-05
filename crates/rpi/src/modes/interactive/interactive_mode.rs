@@ -807,6 +807,14 @@ enum EditorInput {
     ForkFrom(String),
 }
 
+/// `CompactionCostNotice.kind` (interactive-mode.ts:207-210 @ 836aee6d3):
+/// which persisted summary usage a cost notice derives from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionCostKind {
+    Compaction,
+    BranchSummary,
+}
+
 /// `sessionEntryToContextMessages` (session-manager.ts:383-405): project one
 /// selected session entry into renderable messages. Plain custom entries are
 /// display/state entries handled separately by the caller.
@@ -1867,12 +1875,29 @@ impl InteractiveUi {
                         self.show_status("Auto-compaction cancelled");
                     }
                 } else if let Some(result) = result {
+                    // The completed compaction is prepended to the model
+                    // context; render the remaining entries and append the
+                    // synthetic summary below at its chronological position
+                    // (836aee6d3, interactive-mode.ts:3362-3377).
+                    let entries = lock(&self.session().session_manager()).build_context_entries();
+                    let rest = match entries.first().and_then(|e| e.known()) {
+                        Some(SessionEntry::Compaction(_)) => entries[1..].to_vec(),
+                        _ => {
+                            tracing::error!(
+                                "Completed compaction is missing from the session context"
+                            );
+                            entries
+                        }
+                    };
                     lock(&self.chat_container).clear();
-                    self.rebuild_chat_from_messages();
+                    self.render_session_entries(&rest, RenderOptions::default());
                     self.add_message_to_chat(
                         create_compaction_summary_message(&result.summary, result.tokens_before),
                         false,
                     );
+                    if let Some(usage) = &result.usage {
+                        self.add_compaction_cost_notice(CompactionCostKind::Compaction, usage);
+                    }
                     Component::invalidate(&mut *lock(&self.footer));
                 } else if let Some(error_message) = error_message {
                     if reason == CompactionReason::Manual {
@@ -2736,6 +2761,43 @@ impl InteractiveUi {
         // get_show_cache_miss_notices gate.
     }
 
+    /// `addCompactionCostNotice` (interactive-mode.ts:3750-3762 @
+    /// 836aee6d3): render billing usage for a compaction or branch summary.
+    /// The notice is derived from persisted summary usage and is not stored
+    /// as a separate session entry.
+    fn add_compaction_cost_notice(&self, kind: CompactionCostKind, usage: &rpi_ai::types::Usage) {
+        if !self
+            .session()
+            .settings_manager(|settings| settings.get_show_cache_miss_notices())
+        {
+            return;
+        }
+
+        let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+        let cost = if usage.cost.total >= 0.01 {
+            format!(" (~${:.2})", usage.cost.total)
+        } else {
+            String::new()
+        };
+        let label = match kind {
+            CompactionCostKind::Compaction => "Compaction",
+            CompactionCostKind::BranchSummary => "Branch summary",
+        };
+        self.add_chat_child(Box::new(rpi_tui::components::spacer::Spacer::new(1)));
+        self.add_chat_child(Box::new(Text::new(
+            lock(&self.theme).fg(
+                "warning",
+                &format!(
+                    "{label}: {} tokens billed{cost}",
+                    crate::modes::interactive::footer::format_tokens(tokens)
+                ),
+            ),
+            1,
+            0,
+            None,
+        )));
+    }
+
     /// `showStatus` (interactive-mode.ts:3194-3212): dim status line with
     /// back-to-back coalescing (a status emitted right after the previous
     /// one updates the previous line instead of appending).
@@ -3172,6 +3234,21 @@ impl InteractiveUi {
                 continue;
             }
             let messages = session_entry_to_context_messages(entry);
+            // Compaction / branch-summary entries with persisted usage get
+            // a cost notice right after their summary message
+            // (interactive-mode.ts:3727-3731 @ 836aee6d3).
+            let summary_cost = match entry {
+                SessionEntry::Compaction(compaction) => compaction
+                    .usage
+                    .as_ref()
+                    .map(|usage| (CompactionCostKind::Compaction, usage.clone())),
+                SessionEntry::BranchSummary(branch_summary) => branch_summary
+                    .usage
+                    .as_ref()
+                    .map(|usage| (CompactionCostKind::BranchSummary, usage.clone())),
+                _ => None,
+            };
+            let has_messages = !messages.is_empty();
             for message in messages {
                 if let AgentMessage::Assistant(assistant) = &message {
                     self.add_message_to_chat(message.clone(), options.populate_history);
@@ -3232,6 +3309,11 @@ impl InteractiveUi {
                     }
                 } else {
                     self.add_message_to_chat(message.clone(), options.populate_history);
+                }
+            }
+            if has_messages {
+                if let Some((kind, usage)) = summary_cost {
+                    self.add_compaction_cost_notice(kind, &usage);
                 }
             }
         }
@@ -5946,6 +6028,124 @@ mod tests {
         ui.drain_events();
         // Spacer + border + heading + changelog + border.
         assert_eq!(chat_children(ui) - before, 5);
+    }
+
+    /// V14-01 FR-G (836aee6d3): compaction / branch-summary usage renders
+    /// as a transcript cost notice behind the `showCacheMissNotices` gate.
+    #[tokio::test]
+    async fn compaction_cost_notices_render_behind_setting_gate() {
+        let usage = serde_json::from_value::<rpi_ai::types::Usage>(serde_json::json!({
+            "input": 10, "output": 20, "cacheRead": 30, "cacheWrite": 40,
+            "totalTokens": 100,
+            "cost": { "input": 0.01, "output": 0.02, "cacheRead": 0.03, "cacheWrite": 0.065, "total": 0.125 }
+        }))
+        .expect("usage");
+
+        // Enabled: both the live compaction_end notice and the persisted
+        // branch-summary entry notice render.
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.session()
+            .settings_manager(|settings| settings.set_show_cache_miss_notices(true));
+        {
+            let manager = session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            let user_id = manager
+                .append_message(user_message("before compaction"))
+                .expect("append user");
+            manager
+                .append_compaction(
+                    "compacted history",
+                    "kept-id",
+                    1234,
+                    None,
+                    None,
+                    Some(usage.clone()),
+                )
+                .expect("append compaction");
+            manager
+                .branch_with_summary(
+                    Some(&user_id),
+                    "branch summary text",
+                    None,
+                    None,
+                    Some(usage.clone()),
+                )
+                .expect("append branch summary");
+        }
+        *lock(&ui.tool_output_expanded) = true;
+        ui.push(UiCommand::CompactionEnd {
+            reason: CompactionReason::Threshold,
+            result: Some(Box::new(rpi_agent::compaction::CompactionResult {
+                summary: "summarized".to_string(),
+                first_kept_entry_id: "x".to_string(),
+                tokens_before: 1234,
+                estimated_tokens_after: None,
+                usage: Some(usage.clone()),
+                details: None,
+            })),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(120).join("\n");
+        // formatTokens(100) = "100"; cost 0.125 → "(~$0.13)".
+        let plain = rpi_test_support::vt::strip_ansi(&rendered);
+        assert!(
+            plain.contains("Compaction: 100 tokens billed"),
+            "live compaction notice missing: {plain}"
+        );
+        assert!(
+            plain.contains("Branch summary: 100 tokens billed"),
+            "persisted branch-summary notice missing: {plain}"
+        );
+        assert!(
+            plain.contains("branch summary text"),
+            "summary body: {plain}"
+        );
+
+        // Disabled: the notice never renders.
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        {
+            let manager = session.session_manager();
+            let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+            manager
+                .append_message(user_message("before compaction"))
+                .expect("append user");
+            manager
+                .append_compaction(
+                    "compacted history",
+                    "kept-id",
+                    1234,
+                    None,
+                    None,
+                    Some(usage.clone()),
+                )
+                .expect("append compaction");
+        }
+        *lock(&ui.tool_output_expanded) = true;
+        ui.push(UiCommand::CompactionEnd {
+            reason: CompactionReason::Threshold,
+            result: Some(Box::new(rpi_agent::compaction::CompactionResult {
+                summary: "summarized".to_string(),
+                first_kept_entry_id: "x".to_string(),
+                tokens_before: 1234,
+                estimated_tokens_after: None,
+                usage: Some(usage),
+                details: None,
+            })),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(120).join("\n");
+        assert!(
+            !rendered.contains("tokens billed"),
+            "notice must not render when the setting is off: {rendered}"
+        );
     }
 
     #[tokio::test]

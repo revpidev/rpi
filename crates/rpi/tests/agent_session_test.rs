@@ -21,8 +21,8 @@ use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelsPathInput};
 use rpi::core::session_manager::{NewSessionOptions, SessionManager};
 use rpi_agent::messages::AgentMessage;
 use rpi_test_support::faux::{
-    faux_assistant_message, FauxAiProvider, FauxAssistantOptions, FauxModelDefinition,
-    FauxProvider, FauxProviderOptions, FauxResponseStep,
+    faux_assistant_message, faux_text, faux_tool_call, FauxAiProvider, FauxAssistantOptions,
+    FauxModelDefinition, FauxProvider, FauxProviderOptions, FauxResponseStep,
 };
 
 // ---------------------------------------------------------------------------
@@ -616,4 +616,208 @@ async fn bash_result_flushes_before_next_prompt() {
         .nth(1)
         .expect("second user message");
     assert!(bash_index < second_user, "roles: {roles:?}");
+}
+
+// ---------------------------------------------------------------------------
+// V14-01 FR-D/FR-A integration: threshold compaction on the
+// prepareNextTurn hook (#8782 + #6879)
+// ---------------------------------------------------------------------------
+
+/// Flattened event stream: agent events keep their `type`, compaction events
+/// are prefixed `compaction:*` for ordering assertions.
+fn flattened_event_types(fixture: &SessionFixture) -> Vec<String> {
+    fixture
+        .events
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|event| match event {
+            AgentSessionEvent::Agent(agent_event) => serde_json::to_value(agent_event)
+                .expect("event serializes")
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            AgentSessionEvent::AgentEnd(_) => Some("agent_end".to_owned()),
+            AgentSessionEvent::Compaction(compaction_event) => {
+                serde_json::to_value(compaction_event)
+                    .expect("event serializes")
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| format!("compaction:{kind}"))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A tool-carrying faux response for the `ls` tool (empty-args call).
+fn ls_tool_step(big_text: &str) -> FauxResponseStep {
+    let mut message = faux_assistant_message(
+        vec![
+            faux_text(big_text),
+            faux_tool_call("ls", serde_json::Map::new(), None),
+        ],
+        FauxAssistantOptions {
+            stop_reason: Some(rpi_ai::types::StopReason::ToolUse),
+            ..Default::default()
+        },
+    );
+    message.usage = serde_json::from_value(serde_json::json!({
+        "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0,
+        "totalTokens": 2,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+    }))
+    .expect("usage");
+    message.into()
+}
+
+/// Threshold compaction fires on the prepare hook between tool results and
+/// the next assistant request: the event sequence is
+/// `tool_execution_end… → compaction_start → compaction_end → turn_start →
+/// message_start(assistant)` (V14-01 §4, agent-session.ts:542-580 @ 9841914).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn threshold_compaction_runs_between_turns_via_prepare_hook() {
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 7000, "keepRecentTokens": 16 }
+    }"#;
+    let provider_options = FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    };
+    let big = format!("EVIDENCE {}", "evidence block. ".repeat(600));
+    let fixture = session_fixture(
+        vec![
+            ls_tool_step(&big),
+            scripted_summary(),
+            faux_assistant_message("final answer", FauxAssistantOptions::default()).into(),
+        ],
+        provider_options,
+        Some(settings),
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("drive one turn", PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    let types = flattened_event_types(&fixture);
+    // The run continued after the tool results (scripted second response),
+    // so the prepare hook compacted between turns.
+    let compaction_start = types
+        .iter()
+        .position(|t| t == "compaction:compaction_start")
+        .expect("compaction_start between turns");
+    let compaction_end = types
+        .iter()
+        .position(|t| t == "compaction:compaction_end")
+        .expect("compaction_end between turns");
+    // The LAST tool_execution_end of the batch precedes compaction_start.
+    let last_tool_end = types
+        .iter()
+        .rposition(|t| t == "tool_execution_end")
+        .expect("tool executed");
+    // The next turn_start (after the first one) follows compaction_end, and
+    // the assistant message_start of that turn follows turn_start.
+    let next_turn_start = types[compaction_end + 1..]
+        .iter()
+        .position(|t| t == "turn_start")
+        .map(|offset| compaction_end + 1 + offset)
+        .expect("turn_start after compaction");
+    let assistant_start = types[next_turn_start + 1..]
+        .iter()
+        .position(|t| t == "message_start")
+        .map(|offset| next_turn_start + 1 + offset)
+        .expect("assistant message_start after turn_start");
+    assert!(last_tool_end < compaction_start);
+    assert!(compaction_start < compaction_end);
+    assert!(compaction_end < next_turn_start);
+    assert!(next_turn_start < assistant_start);
+
+    // The turn-1 assistant response (with the tool call) came before the
+    // compaction; the final answer is in the transcript.
+    assert!(fixture
+        .session
+        .messages()
+        .iter()
+        .any(|m| matches!(m, AgentMessage::Assistant(a) if a
+            .content
+            .iter()
+            .any(|c| matches!(c, rpi_ai::types::AssistantContent::Text(t) if t.text.contains("final answer"))))));
+}
+
+fn scripted_summary() -> FauxResponseStep {
+    let mut message = faux_assistant_message(
+        "History summary: the user drove one turn.",
+        FauxAssistantOptions::default(),
+    );
+    message.usage = serde_json::from_value(serde_json::json!({
+        "input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+        "totalTokens": 15,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 }
+    }))
+    .expect("usage");
+    message.into()
+}
+
+/// Terminal turn over the threshold (no follow-up turn): the loop never
+/// invokes the prepare hook, so NO compaction events appear between the
+/// final `turn_end` and `agent_end` (FR-A R2 / V14-01 §4). The post-run
+/// check runs after `agent_end`, outside this assertion window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_turn_over_threshold_skips_prepare_compaction() {
+    let settings = r#"{
+        "compaction": { "enabled": true, "reserveTokens": 7000, "keepRecentTokens": 16 }
+    }"#;
+    let provider_options = FauxProviderOptions {
+        models: Some(vec![FauxModelDefinition {
+            id: "faux-1".to_owned(),
+            name: None,
+            reasoning: None,
+            input: None,
+            cost: None,
+            context_window: Some(8192),
+            max_tokens: Some(8192),
+        }]),
+        ..Default::default()
+    };
+    let big = format!("FINAL {}", "evidence block. ".repeat(600));
+    let fixture = session_fixture(
+        vec![faux_assistant_message(big.clone(), FauxAssistantOptions::default()).into()],
+        provider_options,
+        Some(settings),
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("terminal question", PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    let types = flattened_event_types(&fixture);
+    let turn_end = types
+        .iter()
+        .position(|t| t == "turn_end")
+        .expect("turn_end");
+    let agent_end = types
+        .iter()
+        .position(|t| t == "agent_end")
+        .expect("agent_end");
+    let between = &types[turn_end + 1..agent_end];
+    assert!(
+        !between.iter().any(|t| t.starts_with("compaction:")),
+        "no compaction between turn_end and agent_end on a terminal turn: {between:?}"
+    );
 }

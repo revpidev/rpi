@@ -46,6 +46,23 @@ pub enum ToolExecutionMode {
     Parallel,
 }
 
+/// `AgentTool.replay` (`"never" | "safe"`) — recovery policy for an
+/// effect whose durable intent exists but whose outcome is unknown
+/// (packages/agent/src/types.ts:401-402).
+///
+/// Type-surface only: the durable harness reads it during recovery; the
+/// classic agent loop never consumes this field (rpi keeps the same split,
+/// the `harness/` module is out of scope for v0.1.4 per ADR-0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayPolicy {
+    /// Never replay the effect; surface the unknown outcome instead.
+    #[serde(rename = "never")]
+    Never,
+    /// Replay is safe (idempotent effects only).
+    #[serde(rename = "safe")]
+    Safe,
+}
+
 /// `QueueMode = "all" | "one-at-a-time"` — how many queued user messages are
 /// injected when the agent loop reaches a queue drain point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +131,13 @@ pub trait AgentTool: Send + Sync {
     }
     /// Per-tool execution mode override; `None` applies the default mode.
     fn execution_mode(&self) -> Option<ToolExecutionMode> {
+        None
+    }
+    /// Recovery policy for an effect whose durable intent exists but whose
+    /// outcome is unknown (upstream `AgentTool.replay`, types.ts:401-402).
+    /// Declared for SDK/extension tool definitions only — the classic agent
+    /// loop never reads it (durable-harness recovery policy).
+    fn replay(&self) -> Option<ReplayPolicy> {
         None
     }
     /// Optional compatibility shim for raw tool-call arguments before schema

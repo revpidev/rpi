@@ -275,6 +275,35 @@ impl CompactionRunner {
         }
     }
 
+    /// `_emitSessionCompactFailed` (agent-session.ts:604-607): emit only
+    /// when handlers are registered for `session_compact_failed` — zero
+    /// overhead without extensions, like the upstream `hasHandlers` short
+    /// circuit.
+    async fn emit_session_compact_failed(
+        &self,
+        reason: CompactionReason,
+        error_message: Option<String>,
+        aborted: bool,
+        will_retry: bool,
+        from_extension: bool,
+    ) {
+        let Some(runner) = self.extension_runner() else {
+            return;
+        };
+        if !runner.has_handlers("session_compact_failed") {
+            return;
+        }
+        runner
+            .emit_session_compact_failed(
+                reason.as_str(),
+                error_message.as_deref(),
+                aborted,
+                will_retry,
+                from_extension,
+            )
+            .await;
+    }
+
     fn emit(&self, event: CompactionEvent) {
         (self.emit)(event);
     }
@@ -339,7 +368,10 @@ impl CompactionRunner {
             reason: CompactionReason::Manual,
         });
 
-        let outcome = self.compact_inner(custom_instructions, &token).await;
+        let mut from_extension = false;
+        let outcome = self
+            .compact_inner(custom_instructions, &token, &mut from_extension)
+            .await;
 
         // Upstream: aborted = message === "Compaction cancelled" ||
         // error.name === "AbortError" (agent-session.ts:1911). Sources here:
@@ -367,8 +399,18 @@ impl CompactionRunner {
             result,
             aborted,
             will_retry: false,
-            error_message,
+            error_message: error_message.clone(),
         });
+        // `session_compact_failed` fires before the error rethrow
+        // (agent-session.ts:2081-2088 @ a6b1dbceb).
+        self.emit_session_compact_failed(
+            CompactionReason::Manual,
+            error_message,
+            aborted,
+            false,
+            from_extension,
+        )
+        .await;
         outcome
     }
 
@@ -412,6 +454,7 @@ impl CompactionRunner {
         &mut self,
         custom_instructions: Option<&str>,
         token: &CancellationToken,
+        from_extension: &mut bool,
     ) -> Result<CompactionResult, RpiError> {
         // `if (!this.model) throw new Error(formatNoModelSelectedMessage())`
         // (agent-session.ts:1790-1792).
@@ -437,7 +480,7 @@ impl CompactionRunner {
                 false,
             )
             .await?;
-        let from_extension = extension_compaction.is_some();
+        *from_extension = extension_compaction.is_some();
 
         let result = match extension_compaction {
             Some(compaction) => compaction,
@@ -468,7 +511,7 @@ impl CompactionRunner {
             return Err(RpiError::Session("Compaction cancelled".into()));
         }
 
-        self.finish_compaction(result, from_extension, CompactionReason::Manual, false)
+        self.finish_compaction(result, *from_extension, CompactionReason::Manual, false)
             .await
     }
 
@@ -590,10 +633,10 @@ impl CompactionRunner {
             .as_ref()
             .map(|m| u64::from(m.max_tokens))
             .unwrap_or(0);
+        let context_overflow =
+            same_model && is_context_overflow(assistant_message, Some(context_window));
         let recoverable_length = same_model && is_recoverable_length(assistant_message, max_tokens);
-        if same_model
-            && (is_context_overflow(assistant_message, Some(context_window)) || recoverable_length)
-        {
+        if context_overflow || recoverable_length {
             let will_retry = assistant_message.stop_reason != StopReason::Stop;
 
             if !will_retry {
@@ -603,16 +646,32 @@ impl CompactionRunner {
             }
 
             if self.overflow_recovery_attempted {
+                // Overflow recovery failure has two flavors (#8130,
+                // agent-session.ts:2172-2175 @ c7c763f5c): true context
+                // overflow keeps the full guidance; a truncated (length)
+                // response that still failed to recover after compaction
+                // gets the short form.
+                let error_message = if context_overflow {
+                    "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.".to_owned()
+                } else {
+                    "Truncated response recovery failed after one compact-and-retry attempt."
+                        .to_owned()
+                };
                 self.emit(CompactionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
                     result: None,
                     aborted: false,
                     will_retry: false,
-                    error_message: Some(
-                        "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
-                            .to_owned(),
-                    ),
+                    error_message: Some(error_message.clone()),
                 });
+                self.emit_session_compact_failed(
+                    CompactionReason::Overflow,
+                    Some(error_message),
+                    false,
+                    false,
+                    false,
+                )
+                .await;
                 return false;
             }
 
@@ -630,23 +689,32 @@ impl CompactionRunner {
                 .await;
         }
 
-        // Case 2: threshold (agent-session.ts:2013-2041). For error messages
+        // Case 2: threshold (agent-session.ts:2216-2243). For error messages
         // or all-zero usage, estimate from the last valid response.
+        // This ensures sessions that hit persistent API errors (e.g. 529) or
+        // malformed zero-usage responses can still compact and do not reset
+        // context accounting (#8328).
         let direct_context_tokens = calculate_context_tokens(&assistant_message.usage);
         let context_tokens =
             if assistant_message.stop_reason == StopReason::Error || direct_context_tokens == 0 {
                 let messages = self.agent.state().messages;
                 let estimate = estimate_context_tokens(&messages);
-                let Some(last_usage_index) = estimate.last_usage_index else {
-                    return false; // No usage data at all.
-                };
-                // Verify the usage source is post-compaction (stale usage guard,
-                // agent-session.ts:2023-2033).
-                if let (Some(ts), rpi_agent::AgentMessage::Assistant(usage_msg)) =
-                    (compaction_ts, &messages[last_usage_index])
-                {
-                    if usage_msg.timestamp <= ts {
-                        return false;
+                // Without provider usage, estimate.tokens is the pure
+                // message-size estimate. Only usage-backed estimates need
+                // the stale pre-compaction check (4495469a5: sessions whose
+                // providers report no streaming usage still compact on the
+                // pure estimate instead of giving up).
+                if let Some(last_usage_index) = estimate.last_usage_index {
+                    // Verify the usage source is post-compaction. Kept
+                    // pre-compaction messages have stale usage reflecting
+                    // the old (larger) context and would falsely trigger
+                    // compaction right after one just finished.
+                    if let (Some(ts), rpi_agent::AgentMessage::Assistant(usage_msg)) =
+                        (compaction_ts, &messages[last_usage_index])
+                    {
+                        if usage_msg.timestamp <= ts {
+                            return false;
+                        }
                     }
                 }
                 estimate.tokens
@@ -661,11 +729,44 @@ impl CompactionRunner {
         false
     }
 
+    /// `_compactBeforeNextAssistantResponse` (agent-session.ts:542-558 @
+    /// 9841914): pure message-size estimate against the threshold. When over
+    /// the limit, run a threshold auto-compaction and return the
+    /// post-compaction agent state as the replacement context messages;
+    /// otherwise return the input unchanged. The "run already terminated"
+    /// gate is the agent-loop `prepare_next_turn` timing itself (FR-A) — no
+    /// extra check here.
+    pub async fn compact_before_next_assistant_response(
+        &mut self,
+        context_messages: &[rpi_agent::AgentMessage],
+    ) -> Vec<rpi_agent::AgentMessage> {
+        let Some(model) = self.model.clone() else {
+            return context_messages.to_vec();
+        };
+        if model.context_window == 0 {
+            return context_messages.to_vec();
+        }
+        let estimate = estimate_context_tokens(context_messages);
+        if !should_compact(
+            estimate.tokens,
+            u64::from(model.context_window),
+            &self.settings,
+        ) {
+            return context_messages.to_vec();
+        }
+        self.run_auto_compaction(CompactionReason::Threshold, false)
+            .await;
+        self.agent.state().messages
+    }
+
     /// `_runAutoCompaction` (agent-session.ts:2047-2215). Never fails
     /// outward: errors are reported via `compaction_end` and yield `false`.
     async fn run_auto_compaction(&mut self, reason: CompactionReason, will_retry: bool) -> bool {
         let mut started = false;
         let token = CancellationToken::new();
+        // `let fromExtension = false` (agent-session.ts:2251) — hoisted so
+        // the failure emits below observe it like the upstream catch block.
+        let mut from_extension = false;
 
         let outcome: Result<bool, RpiError> = async {
             // `if (!this.model) return false` (agent-session.ts:2052-2054).
@@ -705,11 +806,13 @@ impl CompactionRunner {
                         will_retry: false,
                         error_message: None,
                     });
+                    self.emit_session_compact_failed(reason, None, true, false, false)
+                        .await;
                     return Ok(false);
                 }
                 Err(error) => return Err(error),
             };
-            let from_extension = extension_compaction.is_some();
+            from_extension = extension_compaction.is_some();
 
             let result = match extension_compaction {
                 Some(compaction) => compaction,
@@ -738,6 +841,8 @@ impl CompactionRunner {
                     will_retry: false,
                     error_message: None,
                 });
+                self.emit_session_compact_failed(reason, None, true, false, from_extension)
+                    .await;
                 return Ok(false);
             }
 
@@ -801,8 +906,16 @@ impl CompactionRunner {
                         result: None,
                         aborted: false,
                         will_retry: false,
-                        error_message: Some(message),
+                        error_message: Some(message.clone()),
                     });
+                    self.emit_session_compact_failed(
+                        reason,
+                        Some(message),
+                        false,
+                        false,
+                        from_extension,
+                    )
+                    .await;
                 }
                 false
             }
