@@ -1,4 +1,5 @@
-//! Port of `packages/ai/src/image-models.generated.ts` @ pi 0.84.0 (a5f43bf8a).
+//! Port of `packages/ai/src/image-models.generated.ts` @ 9841914 (5ce4afbd9
+//! refreshed the generated literal; 42 → 50 models).
 //!
 //! The image-generation catalog (upstream `IMAGE_MODELS`), transcribed
 //! structure-identically from the checked-in TS literal: one provider
@@ -106,6 +107,44 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
                     input: vec![InputModality::Image, InputModality::Text],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "bytedance-seed/seedream-5-0-lite".to_owned(),
+                    name: "ByteDance Seed: Seedream 5.0 Lite".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "bytedance-seed/seedream-5-0-pro".to_owned(),
+                    name: "ByteDance Seed: Seedream 5.0 Pro".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
                     output: vec![ImagesOutputModality::Image],
                     cost: ModelCost {
                         rates: ModelCostRates {
@@ -273,6 +312,25 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 ImagesModel {
                     id: "krea/krea-2-medium-turbo".to_owned(),
                     name: "Krea: Krea 2 Medium Turbo".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "meta/muse-image".to_owned(),
+                    name: "Meta: Muse Image".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
@@ -594,6 +652,82 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                     headers: None,
                 },
                 ImagesModel {
+                    id: "recraft/recraft-v4-styles".to_owned(),
+                    name: "Recraft: Recraft V4 Styles".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "recraft/recraft-v4-styles-pro".to_owned(),
+                    name: "Recraft: Recraft V4 Styles Pro".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "recraft/recraft-v4-styles-pro-vector".to_owned(),
+                    name: "Recraft: Recraft V4 Styles Pro Vector".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "recraft/recraft-v4-styles-vector".to_owned(),
+                    name: "Recraft: Recraft V4 Styles Vector".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
                     id: "recraft/recraft-v4-vector".to_owned(),
                     name: "Recraft: Recraft V4 Vector".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
@@ -786,6 +920,25 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 ImagesModel {
                     id: "sourceful/riverflow-v2.5-pro".to_owned(),
                     name: "Sourceful: Riverflow V2.5 Pro".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "x-ai/grok-imagine-image-2.0".to_owned(),
+                    name: "xAI: Grok Imagine Image 2.0".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),

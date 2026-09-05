@@ -163,12 +163,13 @@ fn test_image_catalog_matches_upstream_model_for_model() {
     let ts = std::fs::read_to_string(&ts_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", ts_path.display()));
     let upstream = parse_upstream_models(&ts);
-    // Pin the upstream total (pi 0.84.0 @ a5f43bf8a): guards against the
-    // parser silently dropping blocks after an upstream format change.
+    // Pin the upstream total (pi @ 9841914, image literal refreshed by
+    // 5ce4afbd9): guards against the parser silently dropping blocks after
+    // an upstream format change.
     assert_eq!(
         upstream.len(),
-        42,
-        "upstream parser found {} model blocks, expected 42 \
+        50,
+        "upstream parser found {} model blocks, expected 50 \
          (upstream format may have changed)",
         upstream.len()
     );

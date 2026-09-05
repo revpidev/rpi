@@ -1272,41 +1272,48 @@ mod tests {
 
     /// Policy-enable candidates: known catalog model ∩ `policy.state ==
     /// "unconfigured"` ∩ (`model_picker_enabled` || fallback active).
+    ///
+    /// Catalog-sensitive fixture ids are derived from the vendored catalog
+    /// (upstream ef41a24b3 does the same for Copilot tests) so the test does
+    /// not break when models.dev retires models from the catalog (V14-09:
+    /// claude-sonnet-4 / -4.5 disappeared from the regenerated catalog).
     #[test]
     fn parse_model_catalog_policy_enable_candidates() {
+        let known: Vec<&str> = get_builtin_models("github-copilot")
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        let (candidate, fallback_candidate, configured) = (known[0], known[1], known[2]);
         let catalog = parse_github_copilot_model_catalog(
             &json!({
                 "data": [
                     // Known + unconfigured + picker: candidate.
-                    { "id": "claude-sonnet-4.5", "model_picker_enabled": true,
+                    { "id": candidate, "model_picker_enabled": true,
                       "policy": { "state": "unconfigured" } },
                     // Known + unconfigured but not picker-enabled: not a
                     // candidate while any picker model exists.
-                    { "id": "gpt-5.4", "model_picker_enabled": false,
+                    { "id": fallback_candidate, "model_picker_enabled": false,
                       "policy": { "state": "unconfigured" } },
                     // Unconfigured + picker but not in the known catalog.
                     { "id": "custom-model", "model_picker_enabled": true,
                       "policy": { "state": "unconfigured" } },
                     // Known + picker but already configured.
-                    { "id": "gpt-5.2", "model_picker_enabled": true,
+                    { "id": configured, "model_picker_enabled": true,
                       "policy": { "state": "enabled" } },
                 ]
             }),
             false,
         )
         .expect("catalog");
-        assert_eq!(
-            catalog.policy_model_ids,
-            vec!["claude-sonnet-4.5".to_owned()]
-        );
+        assert_eq!(catalog.policy_model_ids, vec![candidate.to_owned()]);
         // Availability has no known-catalog filter (only policy candidates
         // do): the unknown picker model stays selectable.
         assert_eq!(
             catalog.available_model_ids,
             vec![
-                "claude-sonnet-4.5".to_owned(),
+                candidate.to_owned(),
                 "custom-model".to_owned(),
-                "gpt-5.2".to_owned()
+                configured.to_owned()
             ]
         );
 
@@ -1315,14 +1322,17 @@ mod tests {
         let catalog = parse_github_copilot_model_catalog(
             &json!({
                 "data": [
-                    { "id": "gpt-5.4", "model_picker_enabled": false,
+                    { "id": fallback_candidate, "model_picker_enabled": false,
                       "policy": { "state": "unconfigured" } },
                 ]
             }),
             true,
         )
         .expect("catalog");
-        assert_eq!(catalog.policy_model_ids, vec!["gpt-5.4".to_owned()]);
+        assert_eq!(
+            catalog.policy_model_ids,
+            vec![fallback_candidate.to_owned()]
+        );
         assert!(catalog.available_model_ids.is_empty());
     }
 
@@ -1504,13 +1514,16 @@ mod tests {
 
     /// Unconfigured known models are enabled **sequentially** before the
     /// credential is finalized; freshly enabled ids join `availableModelIds`
-    /// (`b3edf0170` / `d5278eaac`, #6187/#7850).
+    /// (`b3edf0170` / `d5278eaac`, #6187/#7850). The unconfigured fixture id
+    /// is derived from the vendored catalog (upstream ef41a24b3 pattern;
+    /// claude-sonnet-4.5 was retired from the catalog by the V14-09 regen).
     #[tokio::test]
     async fn login_enables_unconfigured_known_models_sequentially() {
+        let unconfigured: String = get_builtin_models("github-copilot")[0].id.clone();
         let models_response = json!({
             "data": [
                 { "id": "gpt-4.1", "model_picker_enabled": true },
-                { "id": "claude-sonnet-4.5", "model_picker_enabled": true,
+                { "id": unconfigured, "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
                 { "id": "gpt-5.4", "model_picker_enabled": true,
                   "policy": { "state": "unconfigured" } },
@@ -1557,8 +1570,8 @@ mod tests {
         assert_eq!(
             policy_paths,
             vec![
-                "/api.individual.githubcopilot.com/models/claude-sonnet-4.5/policy",
-                "/api.individual.githubcopilot.com/models/gpt-5.4/policy",
+                format!("/api.individual.githubcopilot.com/models/{unconfigured}/policy"),
+                "/api.individual.githubcopilot.com/models/gpt-5.4/policy".to_owned(),
             ]
         );
         for policy in &policies {
@@ -1569,7 +1582,7 @@ mod tests {
         // Availability first, freshly enabled ids appended.
         assert_eq!(
             credential.extra.get("availableModelIds"),
-            Some(&json!(["gpt-4.1", "claude-sonnet-4.5", "gpt-5.4"]))
+            Some(&json!(["gpt-4.1", unconfigured, "gpt-5.4"]))
         );
     }
 

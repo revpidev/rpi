@@ -277,12 +277,20 @@ fn test_catalog_zai_tool_stream_baked() {
     let glm5t = get_builtin_model("zai", "glm-5-turbo").expect("glm-5-turbo");
     assert!(get_compat(glm5t).zai_tool_stream);
 
-    // GLM 5.2 fixed thinking level map.
+    // GLM 5.2 thinking level map. Since 3de00332f ("derive Z.AI reasoning
+    // effort metadata") the map comes from models.dev effort options with
+    // glm-5.2 keeping its `off: "none"` override; `low` is no longer forced
+    // to "high" (that hardcoded map was 75b0d723c, replaced upstream).
     let glm52 = get_builtin_model("zai", "glm-5.2").expect("glm-5.2");
     let map = glm52.thinking_level_map.as_ref().expect("thinkingLevelMap");
-    assert_eq!(map.get(&ModelThinkingLevel::Minimal), Some(&None));
     assert_eq!(
-        map.get(&ModelThinkingLevel::Low),
+        map.get(&ModelThinkingLevel::Off),
+        Some(&Some("none".to_owned()))
+    );
+    assert_eq!(map.get(&ModelThinkingLevel::Minimal), Some(&None));
+    assert_eq!(map.get(&ModelThinkingLevel::Low), Some(&None));
+    assert_eq!(
+        map.get(&ModelThinkingLevel::High),
         Some(&Some("high".to_owned()))
     );
     assert_eq!(
@@ -354,19 +362,21 @@ fn test_catalog_anthropic_compat_baked() {
 
 #[test]
 fn test_catalog_github_copilot_eager_streaming_baked() {
-    // Copilot's Claude Haiku 4.5 / Sonnet 4(x) reject eager tool input streaming.
-    for id in ["claude-haiku-4.5", "claude-sonnet-4", "claude-sonnet-4.5"] {
-        let model = get_builtin_model("github-copilot", id).expect(id);
-        assert_eq!(
-            model
-                .compat
-                .as_ref()
-                .and_then(|c| c.supports_eager_tool_input_streaming),
-            Some(false),
-            "{id}"
-        );
-        assert!(!get_anthropic_compat(model).supports_eager_tool_input_streaming);
-    }
+    // Copilot's Claude Haiku 4.5 rejects eager tool input streaming. Sonnet 4 /
+    // 4.5 were in the unsupported set as well (rule list intact at
+    // generate-models.ts:268-272) but models.dev has retired them from the
+    // Copilot catalog, so the regenerated data only carries Haiku 4.5;
+    // upstream ef41a24b3 derives catalog-sensitive ids dynamically for the
+    // same reason. G2: old expectation iterated all three ids.
+    let model = get_builtin_model("github-copilot", "claude-haiku-4.5").expect("claude-haiku-4.5");
+    assert_eq!(
+        model
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_eager_tool_input_streaming),
+        Some(false)
+    );
+    assert!(!get_anthropic_compat(model).supports_eager_tool_input_streaming);
 }
 
 #[test]

@@ -3,30 +3,26 @@
 //! Three layers:
 //! 1. Integrity: every vendored `src/providers/data/*.json` matches the sha256
 //!    recorded in the vendored `.manifest.json` (upstream `model-data.ts`).
-//! 2. Provenance: the vendored set is byte-compared, model-by-model and
-//!    field-by-field, against the pinned upstream
-//!    `external/pi/packages/ai/src/providers/data/` (read-only reference).
+//!    At refresh time the refresh script additionally byte-compares the
+//!    vendored set against the throwaway upstream generation (V14-09 L2);
+//!    the external/pi worktree itself stays unmodified (its data snapshot is
+//!    git-ignored and goes stale after every pin bump, so it cannot be a
+//!    test dependency).
+//! 2. Provenance: the vendored file set matches the manifest's file map.
 //! 3. Runtime shape: the parsed catalog (`rpi_ai::generated`) preserves
-//!    provider set, model order, and every field.
+//!    provider set, model order, and every field of the vendored JSON.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rpi_ai::auth::{find_env_keys, get_env_api_key};
 use rpi_ai::generated::{builtin_catalog, get_builtin_model_data_generated_at, get_builtin_models};
-use rpi_ai::types::{InputModality, MaxTokensField};
+use rpi_ai::types::{InputModality, MaxTokensField, ModelCompat};
 use rpi_ai::types::{ProviderEnv, ThinkingFormat};
 use sha2::Digest;
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/providers/data")
-}
-
-fn upstream_data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../external/pi/packages/ai/src/providers/data")
-        .canonicalize()
-        .expect("upstream data dir (submodule external/pi must be checked out)")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -68,15 +64,23 @@ fn test_vendored_files_match_manifest_sha256() {
     }
 }
 
+/// Provenance: the vendored file set equals the manifest's file map (the
+/// manifest travels with the vendored generation; its sha256s are pinned by
+/// `test_vendored_files_match_manifest_sha256`).
 #[test]
-fn test_vendored_set_matches_upstream_file_set() {
+fn test_vendored_set_matches_manifest_file_map() {
     let vendored = provider_files(&data_dir());
-    let upstream = provider_files(&upstream_data_dir());
-    assert_eq!(vendored.len(), 39);
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(data_dir().join(".manifest.json")).expect("manifest"),
+    )
+    .expect("manifest json");
+    let files = manifest["files"].as_object().expect("files");
+    let mut manifest_names: Vec<&str> = files.keys().map(|k| k.as_str()).collect();
+    manifest_names.sort();
+    let vendored_names: Vec<String> = vendored.keys().cloned().collect();
     assert_eq!(
-        vendored.keys().collect::<Vec<_>>(),
-        upstream.keys().collect::<Vec<_>>(),
-        "vendored file set diverges from upstream"
+        vendored_names, manifest_names,
+        "vendored file set diverges from manifest"
     );
 }
 
@@ -98,17 +102,23 @@ fn normalize_numbers(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Runtime shape: every model in every vendored provider JSON survives the
+/// typed parse (`builtin_catalog`) and re-serialization field-for-field.
+/// Since V14-09 the comparison source is the vendored JSON itself (the
+/// external/pi mirror is git-ignored, stale after pin bumps, and absent on
+/// fresh checkouts); byte-identity with the throwaway upstream generation is
+/// established at refresh time by `refresh-model-catalog.sh` (sha256).
 #[test]
-fn test_catalog_field_by_field_against_upstream() {
+fn test_catalog_field_by_field_roundtrip() {
     let catalog = builtin_catalog().expect("catalog parses");
-    let upstream = provider_files(&upstream_data_dir());
+    let vendored = provider_files(&data_dir());
     let mut total = 0usize;
 
-    for (name, path) in &upstream {
+    for (name, path) in &vendored {
         let provider = name.trim_end_matches(".json");
         let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).expect("upstream file"))
-                .expect("upstream json");
+            serde_json::from_str(&std::fs::read_to_string(path).expect("vendored file"))
+                .expect("vendored json");
         let groups = json.as_object().expect("groups");
 
         // Upstream flattenModelCatalog order: groups in file order, models in
@@ -145,7 +155,42 @@ fn test_catalog_field_by_field_against_upstream() {
             total += 1;
         }
     }
-    assert_eq!(total, 1217);
+    assert_eq!(total, 1354);
+}
+
+/// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
+/// survive a `ModelCompat` parse → re-serialize roundtrip. `ModelCompat` has
+/// no `deny_unknown_fields`, so an upstream compat key that was not landed
+/// in the struct would otherwise be silently dropped at parse time instead
+/// of failing loudly.
+#[test]
+fn test_compat_keys_roundtrip_without_loss() {
+    let mut total = 0usize;
+    for (name, path) in provider_files(&data_dir()) {
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("vendored file"))
+                .expect("vendored json");
+        let groups = json.as_object().expect("groups");
+        for group in groups.values() {
+            for (id, model) in group.as_object().expect("model group") {
+                let Some(raw_compat) = model.get("compat") else {
+                    continue;
+                };
+                let compat: ModelCompat =
+                    serde_json::from_value(raw_compat.clone()).expect("parse compat");
+                let roundtripped = serde_json::to_value(&compat).expect("serialize compat");
+                let out = roundtripped.as_object().expect("compat object");
+                for key in raw_compat.as_object().expect("compat object").keys() {
+                    assert!(
+                        out.contains_key(key),
+                        "compat key `{key}` lost in roundtrip for {name}:{id} — un-landed upstream compat field?"
+                    );
+                }
+                total += 1;
+            }
+        }
+    }
+    assert!(total > 0, "no compat objects found in vendored catalog");
 }
 
 #[test]
@@ -157,10 +202,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-08-11T04:37:23.682Z); update on catalog refresh.
+    // (2026-09-05T15:49:58.041Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_786_423_043_682)
+        Some(1_788_623_398_041)
     );
 }
 
@@ -264,16 +309,18 @@ fn test_baseten_env_key_resolution() {
     );
 }
 
-/// All 16 Baseten models are non-deprecated (the generator's
+/// All Baseten models are non-deprecated (the generator's
 /// `processBasetenModels` skips status=="deprecated").
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 16 models = upstream catalog after deprecated filtering.
+    // 20 models = upstream catalog after deprecated filtering (V14-09
+    // regen; models.dev added the GLM-5.3 family, Kimi K2.7-Code, Nemotron-3
+    // Ultra and inkling-small since the previous vendored snapshot).
     assert_eq!(
         models.len(),
-        16,
-        "Baseten should have 16 non-deprecated models"
+        20,
+        "Baseten should have 20 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {
@@ -291,18 +338,22 @@ fn test_baseten_deprecated_models_filtered() {
 // (port of generate-models-strict.test.ts @ c03d78bdc)
 // ---------------------------------------------------------------------------
 
-/// The upstream `QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS` whitelist has exactly 7
+/// The upstream `QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS` whitelist has exactly 9
 /// IDs; the vendored catalog must match. Upstream drift = explicit failure.
 /// Port of `assertExactModelIds` intent (generate-models-strict.test.ts).
+/// V14-09: deepseek-v4-pro-0813 added by 6db110e6f, qwen3.8-flash by
+/// 265a33393 (whitelist at generate-models.ts:309-319 @ 9841914).
 #[test]
 fn test_qwen_token_plan_individual_whitelist_exact() {
     const EXPECTED: &[&str] = &[
         "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
+        "deepseek-v4-pro-0813",
         "glm-5.2",
         "qwen3.6-flash",
         "qwen3.7-max",
         "qwen3.7-plus",
+        "qwen3.8-flash",
         "qwen3.8-max",
     ];
     let models = get_builtin_models("qwen-token-plan-individual");
@@ -314,7 +365,7 @@ fn test_qwen_token_plan_individual_whitelist_exact() {
         actual, expected,
         "qwen-token-plan-individual whitelist diverged"
     );
-    assert_eq!(models.len(), 7);
+    assert_eq!(models.len(), 9);
 }
 
 /// Individual variant shares QWEN_TOKEN_PLAN_API_KEY and the international

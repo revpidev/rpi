@@ -75,7 +75,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.cerebras.ai/v1",
         "Cerebras API key",
         "CEREBRAS_API_KEY",
-        3,
+        2,
     ),
     spec(
         deepseek_provider,
@@ -84,7 +84,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.deepseek.com",
         "DeepSeek API key",
         "DEEPSEEK_API_KEY",
-        2,
+        3,
     ),
     spec(
         fireworks_provider,
@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        17,
+        20,
     ),
     spec(
         groq_provider,
@@ -102,7 +102,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.groq.com/openai/v1",
         "Groq API key",
         "GROQ_API_KEY",
-        6,
+        7,
     ),
     spec(
         huggingface_provider,
@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        58,
+        71,
     ),
     spec(
         nvidia_provider,
@@ -120,7 +120,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://integrate.api.nvidia.com/v1",
         "NVIDIA API key",
         "NVIDIA_API_KEY",
-        29,
+        20,
     ),
     spec(
         together_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        18,
+        21,
     ),
     spec(
         xai_provider,
@@ -147,7 +147,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.xiaomimimo.com/v1",
         "Xiaomi API key",
         "XIAOMI_API_KEY",
-        6,
+        3,
     ),
     spec(
         xiaomi_token_plan_ams_provider,
@@ -156,7 +156,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-ams.xiaomimimo.com/v1",
         "Xiaomi Token Plan AMS API key",
         "XIAOMI_TOKEN_PLAN_AMS_API_KEY",
-        3,
+        2,
     ),
     spec(
         xiaomi_token_plan_cn_provider,
@@ -165,7 +165,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-cn.xiaomimimo.com/v1",
         "Xiaomi Token Plan CN API key",
         "XIAOMI_TOKEN_PLAN_CN_API_KEY",
-        3,
+        2,
     ),
     spec(
         xiaomi_token_plan_sgp_provider,
@@ -174,7 +174,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://token-plan-sgp.xiaomimimo.com/v1",
         "Xiaomi Token Plan SGP API key",
         "XIAOMI_TOKEN_PLAN_SGP_API_KEY",
-        3,
+        2,
     ),
 ];
 
@@ -296,16 +296,23 @@ async fn env_api_key_resolves_through_models_get_auth() {
     }
 }
 
-/// Upstream `xiaomi-models.test.ts`: the API-billing provider keeps
-/// mimo-v2-flash/mimo-v2-omni; the token-plan endpoints omit them.
+/// Upstream `xiaomi-models.test.ts` @ 9841914 (0e4d49541): deprecated
+/// MiMo V2 ids (mimo-v2-flash/-omni/-v2-pro) are omitted from every Xiaomi
+/// catalog; the mimo-v2.5 replacements stay.
 #[test]
 fn xiaomi_catalog_splits_api_billing_only_models() {
     let xiaomi = xiaomi_provider();
-    for id in ["mimo-v2-flash", "mimo-v2-omni"] {
-        let model = get_model(&xiaomi, id);
-        assert_eq!(model.api.as_str(), ApiKind::OPENAI_COMPLETIONS);
-        assert_eq!(model.base_url, "https://api.xiaomimimo.com/v1");
+    let xiaomi_models = xiaomi.get_models();
+    for id in ["mimo-v2-flash", "mimo-v2-omni", "mimo-v2-pro"] {
+        let ids: Vec<&str> = xiaomi_models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert!(!ids.contains(&id), "xiaomi deprecated {id} leaked");
     }
+    let replacement = get_model(&xiaomi, "mimo-v2.5");
+    assert_eq!(replacement.api.as_str(), ApiKind::OPENAI_COMPLETIONS);
+    assert_eq!(replacement.base_url, "https://api.xiaomimimo.com/v1");
 
     for factory in [
         xiaomi_token_plan_ams_provider,
@@ -317,7 +324,8 @@ fn xiaomi_catalog_splits_api_billing_only_models() {
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
         assert!(!ids.contains(&"mimo-v2-flash"), "{} flash", provider.id());
         assert!(!ids.contains(&"mimo-v2-omni"), "{} omni", provider.id());
-        assert!(ids.contains(&"mimo-v2.5-pro"), "{} pro", provider.id());
+        assert!(!ids.contains(&"mimo-v2-pro"), "{} v2-pro", provider.id());
+        assert!(ids.contains(&"mimo-v2.5-pro"), "{} v2.5-pro", provider.id());
         assert!(
             models
                 .iter()
@@ -450,23 +458,13 @@ fn fireworks_kimi_k2_6_anthropic_catalog_entry() {
     );
 }
 
-/// Upstream `fireworks-models.test.ts`: the Fire Pass turbo router entry and
-/// the GLM 5.2 Fast router aligned with the base model's OpenAI config.
+/// Upstream `fireworks-models.test.ts` @ 9841914: the GLM 5.2 Fast router is
+/// aligned with the base model's config (both on openai-completions since
+/// 1e4fbe384). The Fire Pass turbo router entry and its assertions were
+/// dropped upstream with the catalog refresh.
 #[test]
 fn fireworks_router_models_align_with_base() {
     let provider = fireworks_provider();
-    let models = provider.get_models();
-
-    let turbo = models
-        .iter()
-        .find(|model| {
-            model.id.starts_with("accounts/fireworks/routers/") && model.id.ends_with("-turbo")
-        })
-        .expect("turbo router model");
-    assert_eq!(turbo.api.as_str(), ApiKind::ANTHROPIC_MESSAGES);
-    assert_eq!(turbo.base_url, "https://api.fireworks.ai/inference");
-    assert_eq!(turbo.input, [InputModality::Text, InputModality::Image]);
-
     let base = get_model(&provider, "accounts/fireworks/models/glm-5p2");
     let fast = get_model(&provider, "accounts/fireworks/routers/glm-5p2-fast");
     assert_eq!(fast.api, base.api);
@@ -495,9 +493,11 @@ fn fireworks_and_xai_catalogs_use_both_mapped_apis() {
     let models = xai.get_models();
     let apis: std::collections::BTreeSet<&str> =
         models.iter().map(|model| model.api.as_str()).collect();
+    // 70e878d4c: every built-in xAI model routes through Responses (the
+    // openai-completions bucket is gone from the regenerated catalog).
     assert_eq!(
         apis,
-        std::collections::BTreeSet::from([ApiKind::OPENAI_COMPLETIONS, ApiKind::OPENAI_RESPONSES])
+        std::collections::BTreeSet::from([ApiKind::OPENAI_RESPONSES])
     );
 }
 
@@ -519,8 +519,8 @@ fn xai_catalog_excludes_retired_models() {
     }
 }
 
-/// Upstream `xai-responses.test.ts`: Responses with low/medium/high efforts
-/// only for Grok 4.5; Grok 4.3 stays on chat completions.
+/// Upstream `xai-responses.test.ts` @ 9841914: every built-in xAI model
+/// routes through Responses; thinking levels per model family.
 #[test]
 fn xai_grok_4_5_responses_thinking_levels() {
     let xai = xai_provider();
@@ -537,8 +537,28 @@ fn xai_grok_4_5_responses_thinking_levels() {
         ]
     );
 
+    let grok_4_6 = get_model(&xai, "grok-4.6");
+    assert_eq!(
+        get_supported_thinking_levels(&grok_4_6),
+        [
+            ModelThinkingLevel::Low,
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+        ]
+    );
+
     let grok_4_3 = get_model(&xai, "grok-4.3");
-    assert_eq!(grok_4_3.api.as_str(), ApiKind::OPENAI_COMPLETIONS);
+    assert_eq!(grok_4_3.api.as_str(), ApiKind::OPENAI_RESPONSES);
+    assert_eq!(
+        get_supported_thinking_levels(&grok_4_3),
+        [
+            ModelThinkingLevel::Off,
+            ModelThinkingLevel::Low,
+            ModelThinkingLevel::Medium,
+            ModelThinkingLevel::High,
+        ]
+    );
 }
 
 /// Spot-check the single-API factories route every catalog model through
