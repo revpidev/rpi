@@ -172,6 +172,7 @@ mod tests {
             model: "m".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -335,6 +336,37 @@ mod tests {
             to_json_event(&event),
             Err("message_update message is not an assistant message".to_owned())
         );
+    }
+
+    /// V14-03 FR-F R1 / V14-04 FR-D linkage: the `AssistantMessage`
+    /// `providerThinkingLevel` field rides message-bearing events verbatim —
+    /// camelCase, absent when `None` (ai/types.ts:437, 4e69b0c28). The
+    /// write/replay logic itself is V14-05; this pins the event-face shape.
+    #[test]
+    fn provider_thinking_level_serializes_camelcase_and_skips_none() {
+        let mut message = assistant_message("hi");
+        let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(message.clone()),
+        }));
+        let wire = to_json_event(&event).expect("convert");
+        assert!(
+            !serde_json::to_string(&wire)
+                .expect("serialize")
+                .contains("providerThinkingLevel"),
+            "None must be absent from the wire"
+        );
+
+        message.provider_thinking_level = Some("high".to_owned());
+        message.response_id = Some("resp_1".to_owned());
+        let event = AgentSessionEvent::Agent(Box::new(AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(message),
+        }));
+        let wire = to_json_event(&event).expect("convert");
+        assert_eq!(wire["message"]["providerThinkingLevel"], json!("high"));
+        // Field order matches upstream (responseId → providerThinkingLevel,
+        // types.ts:429-437).
+        let line = serde_json::to_string(&wire).expect("serialize");
+        assert!(line.contains("\"responseId\":\"resp_1\",\"providerThinkingLevel\":\"high\""));
     }
 
     /// `start`/`done`/`error` assistant events keep their `message`/`error`

@@ -578,6 +578,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -1174,10 +1175,10 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
     let base = build_base_options(model, context, options.as_ref(), None);
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
-        return stream(
+        return Ok(stream(
             model,
             context,
             GoogleVertexOptions {
@@ -1192,7 +1193,7 @@ pub fn stream_simple(
                 location: None,
                 adc_endpoints: None,
             },
-        );
+        ));
     };
 
     let clamped = clamp_thinking_level(model, reasoning.to_model_level());
@@ -1208,7 +1209,7 @@ pub fn stream_simple(
     };
 
     if is_gemini_3_pro_model(model) || is_gemini_3_flash_model(model) {
-        return stream(
+        return Ok(stream(
             model,
             context,
             GoogleVertexOptions {
@@ -1223,10 +1224,10 @@ pub fn stream_simple(
                 location: None,
                 adc_endpoints: None,
             },
-        );
+        ));
     }
 
-    stream(
+    Ok(stream(
         model,
         context,
         GoogleVertexOptions {
@@ -1245,7 +1246,7 @@ pub fn stream_simple(
             location: None,
             adc_endpoints: None,
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::GOOGLE_VERTEX`.
@@ -1282,7 +1283,7 @@ impl ProviderStreams for GoogleVertex {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }

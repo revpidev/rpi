@@ -38,7 +38,6 @@ use serde_json::{json, Value};
 use crate::api::anthropic_messages::resolve_cache_retention;
 use crate::api::constrained_sampling::create_grammar_tool_input_properties;
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
-use crate::api::lazy::immediate_error_stream;
 use crate::api::openai_completions::{
     get_client_api_key, mapped_or_level_name, off_is_not_null, off_value,
 };
@@ -412,6 +411,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -673,14 +673,15 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
-    if let Err(message) = get_client_api_key(
+) -> Result<AssistantMessageEventStream, String> {
+    // Auth check at the entry, before any stream is constructed
+    // (8b5899dce: openai-responses.ts streamSimple runs `getClientApiKey`
+    // first and throws synchronously — the Rust equivalent is `Err`).
+    get_client_api_key(
         &model.provider,
         options.as_ref().and_then(|o| o.stream.api_key.as_deref()),
         options.as_ref().and_then(|o| o.stream.headers.as_ref()),
-    ) {
-        return immediate_error_stream(model, &message);
-    }
+    )?;
 
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     let base = build_base_options(model, context, options.as_ref(), api_key);
@@ -690,7 +691,7 @@ pub fn stream_simple(
         .map(|reasoning| clamp_thinking_level(model, reasoning.to_model_level()))
         .filter(|level| *level != ModelThinkingLevel::Off);
 
-    stream(
+    Ok(stream(
         model,
         context,
         OpenAIResponsesOptions {
@@ -698,7 +699,7 @@ pub fn stream_simple(
             reasoning_effort,
             ..OpenAIResponsesOptions::default()
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::OPENAI_RESPONSES`.
@@ -732,7 +733,7 @@ impl ProviderStreams for OpenAiResponses {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }
@@ -1284,26 +1285,19 @@ mod tests {
 
     // -- stream_simple ----------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_stream_simple_missing_auth_is_stream_error() {
+    /// 8b5899dce: missing request auth fails synchronously
+    /// (types.ts:325-330) — `Err` return, not an in-stream error event.
+    #[test]
+    fn test_stream_simple_missing_auth_fails_synchronously() {
         let m = model(json!({}));
-        let events: Vec<StreamEvent> = stream_simple(
-            &m,
-            &common::context(vec![common::user_text("hi")], None),
-            None,
-        )
-        .collect()
-        .await;
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            StreamEvent::Error { error, .. } => {
-                assert_eq!(error.stop_reason, StopReason::Error);
-                assert_eq!(
-                    error.error_message.as_deref(),
-                    Some("No API key for provider: openai")
-                );
-            }
-            other => panic!("expected error event, got {other:?}"),
-        }
+        assert_eq!(
+            stream_simple(
+                &m,
+                &common::context(vec![common::user_text("hi")], None),
+                None
+            )
+            .err(),
+            Some("No API key for provider: openai".to_owned())
+        );
     }
 }

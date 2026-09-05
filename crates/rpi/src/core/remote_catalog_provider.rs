@@ -428,7 +428,7 @@ impl Provider for RemoteCatalogProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)
     }
 }

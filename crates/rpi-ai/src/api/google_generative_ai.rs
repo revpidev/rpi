@@ -41,7 +41,6 @@ use crate::api::google_shared::{
     resolve_google_function_calling_mode, retain_thought_signature, retry_google_request,
     supports_google_strict_tool_sampling, GoogleThinkingLevel,
 };
-use crate::api::lazy::immediate_error_stream;
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::models::{clamp_thinking_level, ProviderStreams};
@@ -410,6 +409,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -977,18 +977,18 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
+    // Auth check at the entry, before any stream is constructed
+    // (8b5899dce: google-generative-ai.ts streamSimple throws
+    // synchronously on a missing key — the Rust equivalent is `Err`).
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     if api_key.is_none() {
-        return immediate_error_stream(
-            model,
-            &format!("No API key for provider: {}", model.provider),
-        );
+        return Err(format!("No API key for provider: {}", model.provider));
     }
 
     let base = build_base_options(model, context, options.as_ref(), api_key);
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
-        return stream(
+        return Ok(stream(
             model,
             context,
             GoogleOptions {
@@ -1000,7 +1000,7 @@ pub fn stream_simple(
                     level: None,
                 }),
             },
-        );
+        ));
     };
 
     let clamped = clamp_thinking_level(model, reasoning.to_model_level());
@@ -1016,7 +1016,7 @@ pub fn stream_simple(
     };
 
     if is_gemini_3_pro_model(model) || is_gemini_3_flash_model(model) || is_gemma_4_model(model) {
-        return stream(
+        return Ok(stream(
             model,
             context,
             GoogleOptions {
@@ -1028,10 +1028,10 @@ pub fn stream_simple(
                     level: Some(get_thinking_level(effort, model)),
                 }),
             },
-        );
+        ));
     }
 
-    stream(
+    Ok(stream(
         model,
         context,
         GoogleOptions {
@@ -1047,7 +1047,7 @@ pub fn stream_simple(
                 level: None,
             }),
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::GOOGLE_GENERATIVE_AI`.
@@ -1080,7 +1080,7 @@ impl ProviderStreams for GoogleGenerativeAi {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }

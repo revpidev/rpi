@@ -71,7 +71,7 @@ impl ProviderStreams for CloudflareStreams {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         let model =
             resolve_cloudflare_model(model, options.as_ref().and_then(|o| o.stream.env.as_ref()));
         self.inner.stream_simple(&model, context, options)

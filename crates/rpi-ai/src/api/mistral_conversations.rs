@@ -60,7 +60,6 @@ use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
-use crate::api::lazy::immediate_error_stream;
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::models::{clamp_thinking_level, ProviderStreams};
@@ -1163,6 +1162,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -1460,12 +1460,12 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
+    // Auth check at the entry, before any stream is constructed
+    // (8b5899dce: mistral-conversations.ts streamSimple throws
+    // synchronously on a missing key — the Rust equivalent is `Err`).
     let Some(api_key) = options.as_ref().and_then(|o| o.stream.api_key.clone()) else {
-        return immediate_error_stream(
-            model,
-            &format!("No API key for provider: {}", model.provider),
-        );
+        return Err(format!("No API key for provider: {}", model.provider));
     };
 
     let base = build_base_options(model, context, options.as_ref(), Some(api_key));
@@ -1476,7 +1476,7 @@ pub fn stream_simple(
         .filter(|level| *level != ModelThinkingLevel::Off);
     let should_use_reasoning = model.reasoning && reasoning.is_some();
 
-    stream(
+    Ok(stream(
         model,
         context,
         MistralOptions {
@@ -1490,7 +1490,7 @@ pub fn stream_simple(
                 None
             },
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::MISTRAL_CONVERSATIONS`.
@@ -1523,7 +1523,7 @@ impl ProviderStreams for MistralConversations {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }
@@ -2176,6 +2176,7 @@ mod tests {
             model: "mistral-large-latest".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
@@ -2215,6 +2216,7 @@ mod tests {
             model: "mistral-large-latest".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -2502,23 +2504,14 @@ mod tests {
     // stream_simple mapping
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_stream_simple_requires_api_key() {
+    /// 8b5899dce: missing request auth fails synchronously (types.ts:325-330).
+    #[test]
+    fn test_stream_simple_requires_api_key() {
         let model = make_model(json!({}));
-        let events: Vec<StreamEvent> = stream_simple(&model, &context(vec![], None), None)
-            .collect()
-            .await;
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            StreamEvent::Error { error, .. } => {
-                assert_eq!(error.stop_reason, StopReason::Error);
-                assert_eq!(
-                    error.error_message,
-                    Some("No API key for provider: mistral".to_owned())
-                );
-            }
-            other => panic!("expected error event, got {other:?}"),
-        }
+        assert_eq!(
+            stream_simple(&model, &context(vec![], None), None).err(),
+            Some("No API key for provider: mistral".to_owned())
+        );
     }
 
     /// Captures the payload stream_simple builds, via an unreachable server
@@ -2550,6 +2543,7 @@ mod tests {
         unreachable.base_url = "http://127.0.0.1:9".to_owned();
         let ctx = context(vec![user_text("Hello")], None);
         let _: Vec<StreamEvent> = stream_simple(&unreachable, &ctx, Some(simple))
+            .expect("stream_simple")
             .collect()
             .await;
         let payload = captured.lock().expect("lock").clone();

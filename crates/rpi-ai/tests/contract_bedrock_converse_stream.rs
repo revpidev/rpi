@@ -1415,6 +1415,7 @@ async fn test_convert_messages_empty_text_placeholder() {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Default::default(),
         stop_reason: StopReason::ToolUse,
@@ -1464,6 +1465,7 @@ async fn test_convert_messages_assistant_blank_and_thinking() {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Default::default(),
         stop_reason: StopReason::Stop,
@@ -1839,7 +1841,10 @@ async fn test_stream_simple_budget_path_payload() {
     .await;
     let mut model = sonnet45.clone();
     model.base_url = base_url;
-    let events: Vec<StreamEvent> = stream_simple(&model, &ctx, Some(simple)).collect().await;
+    let events: Vec<StreamEvent> = stream_simple(&model, &ctx, Some(simple))
+        .expect("stream_simple")
+        .collect()
+        .await;
     assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     let _ = rx.recv().await;
     let payload = captured.lock().expect("payload slot").clone();
@@ -1886,7 +1891,10 @@ async fn test_stream_simple_budget_path_payload() {
     .await;
     let mut model = opus48;
     model.base_url = base_url;
-    let events: Vec<StreamEvent> = stream_simple(&model, &ctx, Some(simple)).collect().await;
+    let events: Vec<StreamEvent> = stream_simple(&model, &ctx, Some(simple))
+        .expect("stream_simple")
+        .collect()
+        .await;
     assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
     let _ = rx.recv().await;
     let payload = captured2.lock().expect("payload slot").clone();
@@ -1897,6 +1905,34 @@ async fn test_stream_simple_budget_path_payload() {
     assert_eq!(
         payload["additionalModelRequestFields"]["output_config"],
         json!({"effort": "xhigh"})
+    );
+}
+
+/// 8b5899dce deliberately did not touch bedrock: missing credentials stay an
+/// in-stream error (no synchronous `Err` at the `stream_simple` entry).
+/// Pinned so the adapter-contract change cannot leak into bedrock and
+/// create a failure semantics upstream does not have.
+#[tokio::test]
+async fn test_bedrock_stream_simple_missing_credentials_stay_in_stream() {
+    use rpi_ai::api::bedrock_converse_stream::stream_simple;
+
+    let model = make_model(
+        "anthropic.claude-sonnet-4-5-v2",
+        "Sonnet",
+        "http://127.0.0.1:9",
+        json!({}),
+    );
+    let ctx = context(vec![user_text("hi")]);
+    let stream = stream_simple(
+        &model,
+        &ctx,
+        Some(rpi_ai::types::SimpleStreamOptions::default()),
+    )
+    .expect("entry returns a stream — bedrock has no synchronous auth check");
+    let events: Vec<StreamEvent> = stream.collect().await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "connection failure must be encoded in-stream: {events:?}"
     );
 }
 

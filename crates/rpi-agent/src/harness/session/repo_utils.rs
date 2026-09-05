@@ -572,6 +572,7 @@ pub(crate) mod test_support {
             model: "claude-sonnet-4-5".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

@@ -2202,6 +2202,7 @@ mod tests {
             model: model.id.clone(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Pending,
@@ -2438,6 +2439,66 @@ mod tests {
             panic!("expected tool call block");
         };
         assert_eq!(call.id, "ctc_1|ctc_item");
+        assert_eq!(call.arguments.get("query"), Some(&json!("SELECT 1")));
+    }
+
+    /// 8b5899dce (custom-tool face): a `custom_tool_call` item's start block
+    /// carries `{[input_property]: item.input}` as its `toolcall_start`
+    /// arguments and emits no synthesized first delta — the next delta is
+    /// the explicit `custom_tool_call_input.delta`
+    /// (openai-responses-shared.ts:505-526).
+    #[test]
+    fn test_processor_custom_tool_call_start_carries_input_without_first_delta() {
+        let grammar_props = HashMap::from([("sql".to_owned(), "query".to_owned())]);
+        let raw = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "call_id": "ctc_9", "id": "ctc_item",
+                            "name": "sql", "input": "SELECT"}}),
+            json!({"type": "response.custom_tool_call_input.delta", "output_index": 0, "delta": " 1"}),
+            json!({"type": "response.custom_tool_call_input.done", "output_index": 0, "input": "SELECT 1"}),
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"type": "custom_tool_call", "call_id": "ctc_9", "id": "ctc_item",
+                            "name": "sql", "input": "SELECT 1"}}),
+            json!({"type": "response.completed", "response": {"id": "resp_1", "status": "completed"}}),
+        ];
+        let m = model(json!({}));
+        let (events, result, output) = replay(&m, &grammar_props, &raw);
+        assert_eq!(result, Ok(()));
+
+        // The start block's arguments already carry the item input.
+        let start = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallStart { partial, .. } => Some(partial.clone()),
+                _ => None,
+            })
+            .expect("toolcall_start event");
+        match &start.content[0] {
+            AssistantContent::ToolCall(call) => assert_eq!(
+                call.arguments,
+                json!({"query": "SELECT"}).as_object().cloned().unwrap()
+            ),
+            other => panic!("expected tool call block, got {other:?}"),
+        }
+
+        // No synthesized first delta after start: every delta comes from the
+        // explicit `custom_tool_call_input.delta`/`.done`, and their
+        // concatenation is exactly the complete arguments JSON.
+        let deltas: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&deltas).expect("deltas concatenate to JSON"),
+            json!({"query": "SELECT 1"})
+        );
+
+        let AssistantContent::ToolCall(call) = &output.content[0] else {
+            panic!("expected tool call block");
+        };
         assert_eq!(call.arguments.get("query"), Some(&json!("SELECT 1")));
     }
 

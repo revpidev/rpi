@@ -29,6 +29,7 @@ pub fn create_setup_error_message(
         model: model.to_owned(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Error,
@@ -92,21 +93,4 @@ where
     });
 
     outer
-}
-
-/// A stream that immediately terminates with a single error event. Adapters
-/// use this for synchronous pre-flight failures (upstream `streamSimple`
-/// throws before returning; rpi encodes the failure in the stream instead).
-pub fn immediate_error_stream(
-    model: &crate::types::Model,
-    message: &str,
-) -> AssistantMessageEventStream {
-    let event_stream = AssistantMessageEventStream::new();
-    let error = create_setup_error_message_for_model(model, message);
-    event_stream.push(StreamEvent::Error {
-        reason: ErrorReason::Error,
-        error: error.clone(),
-    });
-    event_stream.end(Some(error));
-    event_stream
 }

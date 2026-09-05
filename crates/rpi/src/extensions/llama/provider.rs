@@ -285,7 +285,7 @@ impl Provider for LlamaProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         self.api.stream_simple(model, context, options)
     }
 }

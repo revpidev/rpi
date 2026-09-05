@@ -1,5 +1,5 @@
 //! Contract tests for the azure-openai-responses adapter: drive `stream()` /
-//! `stream_simple()` over a scripted local HTTP server with recorded SSE
+//! `stream_simple` over a scripted local HTTP server with recorded SSE
 //! streams, and assert both sides of the contract — the request shape
 //! (method / path + `api-version` query / key headers / body JSON) and the
 //! emitted `StreamEvent` sequence. Mirrors `contract_adapters.rs`; the SSE
@@ -321,15 +321,19 @@ async fn test_azure_reasoning_replay_preserves_output_item_done_encrypted_conten
     let m = model(&base_url, json!({"reasoning": true}));
     // stream_simple with reasoning → effort/summary params + encrypted
     // content include (azure-openai-responses.ts:306-316).
-    let events = collect(AzureOpenAiResponses.stream_simple(
-        &m,
-        &context(vec![user_text("hi")]),
-        Some(SimpleStreamOptions {
-            stream: options(),
-            reasoning: Some(ThinkingLevel::High),
-            thinking_budgets: None,
-        }),
-    ))
+    let events = collect(
+        AzureOpenAiResponses
+            .stream_simple(
+                &m,
+                &context(vec![user_text("hi")]),
+                Some(SimpleStreamOptions {
+                    stream: options(),
+                    reasoning: Some(ThinkingLevel::High),
+                    thinking_budgets: None,
+                }),
+            )
+            .expect("stream_simple"),
+    )
     .await;
 
     let request = captured.recv().await.expect("request captured");

@@ -101,6 +101,7 @@ fn assistant_message(content: Vec<AssistantContent>) -> AssistantMessage {
         model: "m".into(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Stop,

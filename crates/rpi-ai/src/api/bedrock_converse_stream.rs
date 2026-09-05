@@ -1512,6 +1512,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -1894,22 +1895,22 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
     let base = build_base_options(model, context, options.as_ref(), None);
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
-        return stream(
+        return Ok(stream(
             model,
             context,
             BedrockOptions {
                 stream: base,
                 ..BedrockOptions::default()
             },
-        );
+        ));
     };
 
     if is_anthropic_claude_model(model) {
         if supports_adaptive_thinking(&model.id, &model.name) {
-            return stream(
+            return Ok(stream(
                 model,
                 context,
                 BedrockOptions {
@@ -1918,7 +1919,7 @@ pub fn stream_simple(
                     thinking_budgets: options.as_ref().and_then(|o| o.thinking_budgets.clone()),
                     ..BedrockOptions::default()
                 },
-            );
+            ));
         }
 
         // `None` max_tokens means the caller did not request an output cap;
@@ -1952,10 +1953,10 @@ pub fn stream_simple(
             ..BedrockOptions::default()
         };
         bedrock_options.stream.max_tokens = Some(max_tokens);
-        return stream(model, context, bedrock_options);
+        return Ok(stream(model, context, bedrock_options));
     }
 
-    stream(
+    Ok(stream(
         model,
         context,
         BedrockOptions {
@@ -1964,7 +1965,7 @@ pub fn stream_simple(
             thinking_budgets: options.as_ref().and_then(|o| o.thinking_budgets.clone()),
             ..BedrockOptions::default()
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::BEDROCK_CONVERSE_STREAM`.
@@ -1997,7 +1998,7 @@ impl ProviderStreams for BedrockConverseStream {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }

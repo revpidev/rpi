@@ -733,6 +733,7 @@ mod tests {
             model: "m1".to_string(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason,

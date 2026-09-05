@@ -323,6 +323,7 @@ fn initial_partial(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -948,9 +949,9 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
     let reasoning = options.as_ref().and_then(|options| options.reasoning);
-    stream(
+    Ok(stream(
         model,
         context,
         PiMessagesOptions {
@@ -959,7 +960,7 @@ pub fn stream_simple(
             tool_choice: None,
             debug: None,
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::PI_MESSAGES`.
@@ -992,7 +993,7 @@ impl ProviderStreams for PiMessages {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }

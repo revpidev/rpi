@@ -39,7 +39,6 @@ use serde_json::{json, Map, Value};
 use crate::api::codex_ws::cache as ws_cache;
 use crate::api::codex_ws::{self, CodexError};
 use crate::api::constrained_sampling::create_grammar_tool_input_properties;
-use crate::api::lazy::immediate_error_stream;
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::openai_responses::{apply_service_tier_pricing, OPENAI_TOOL_CALL_PROVIDERS};
 use crate::api::openai_responses_shared::{
@@ -856,6 +855,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -1579,13 +1579,13 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
+) -> Result<AssistantMessageEventStream, String> {
+    // Auth check at the entry, before any stream is constructed
+    // (8b5899dce: openai-codex-responses.ts streamSimple throws
+    // synchronously on a missing key — the Rust equivalent is `Err`).
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     if api_key.is_none() {
-        return immediate_error_stream(
-            model,
-            &format!("No API key for provider: {}", model.provider),
-        );
+        return Err(format!("No API key for provider: {}", model.provider));
     }
 
     let base = build_base_options(model, context, options.as_ref(), api_key);
@@ -1596,7 +1596,7 @@ pub fn stream_simple(
         .filter(|level| *level != ModelThinkingLevel::Off)
         .map(|level| level.as_str().to_owned());
 
-    stream(
+    Ok(stream(
         model,
         context,
         OpenAiCodexResponsesOptions {
@@ -1604,7 +1604,7 @@ pub fn stream_simple(
             reasoning_effort,
             ..OpenAiCodexResponsesOptions::default()
         },
-    )
+    ))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::OPENAI_CODEX_RESPONSES`
@@ -1634,7 +1634,7 @@ impl ProviderStreams for OpenAiCodexResponses {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }

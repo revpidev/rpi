@@ -51,8 +51,18 @@ use super::api::lazy::lazy_stream;
 use super::error::AiError;
 
 /// `ProviderStreams` — the API-adapter interface (design §3.3 `ApiStream`).
-/// Implementations return the event stream synchronously; all failures are
-/// encoded as `StreamEvent::Error` on the stream (never `Err`).
+/// Implementations return the event stream synchronously; once a stream is
+/// returned, request/model/runtime failures are encoded as
+/// `StreamEvent::Error` on the stream (never `Err`).
+///
+/// `stream_simple` may fail synchronously when request auth is missing
+/// (types.ts:325-330 @ 9841914, 8b5899dce): "Direct `streamSimple()` calls
+/// may throw synchronously when request auth is missing. Once a stream is
+/// returned, request/model/runtime failures should be encoded in that
+/// stream." The Rust equivalent of the upstream `throw` is the `Err`
+/// return; aggregation layers (`Models::stream_simple` via `lazy_stream`)
+/// convert it to an in-stream setup error event, matching upstream
+/// `lazyStream`'s `.catch`.
 pub trait ProviderStreams: Send + Sync {
     fn stream(
         &self,
@@ -66,7 +76,7 @@ pub trait ProviderStreams: Send + Sync {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream;
+    ) -> Result<AssistantMessageEventStream, String>;
 }
 
 /// `ModelsRequestTransforms` — the `transformHeaders` callback
@@ -159,7 +169,7 @@ pub trait Provider: Send + Sync {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream;
+    ) -> Result<AssistantMessageEventStream, String>;
 }
 
 /// `ModelsPublication` (models.ts:39-44 @ 4181f66) — the provider-owned
@@ -633,10 +643,25 @@ impl Provider for CreatedProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        self.dispatch(model, |streams| {
-            streams.stream_simple(model, context, options)
-        })
+    ) -> Result<AssistantMessageEventStream, String> {
+        // A model whose api has no adapter entry keeps the in-stream setup
+        // error (upstream: the JS `undefined.streamSimple()` TypeError is
+        // caught by `lazyStream` in `Models.streamSimple`, surfacing as an
+        // error event — auth is not the failure, so the sync-Err contract
+        // does not apply here).
+        match self.api_for(model) {
+            Some(streams) => streams.stream_simple(model, context, options),
+            None => {
+                let id = self.id.clone();
+                let api = model.api.clone();
+                Ok(lazy_stream(model, async move {
+                    Err(ModelsError::new(
+                        ModelsErrorCode::Stream,
+                        format!("Provider {id} has no API implementation for \"{api}\""),
+                    ))
+                }))
+            }
+        }
     }
 }
 
@@ -1558,7 +1583,14 @@ impl Models {
                     .as_ref()
                     .and_then(|o| o.simple.thinking_budgets.clone()),
             });
-            Ok(provider.stream_simple(&request_model, &context, simple_options))
+            provider
+                .stream_simple(&request_model, &context, simple_options)
+                .map_err(|message| {
+                    // Upstream `lazyStream` catch: the adapter's synchronous
+                    // auth throw surfaces as an in-stream setup error event
+                    // at this layer (8b5899dce; lazy.ts:55-60).
+                    ModelsError::new(ModelsErrorCode::Stream, message)
+                })
         })
     }
 
@@ -1763,6 +1795,7 @@ mod tests {
                 model: model.id.clone(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Pending,
@@ -1792,8 +1825,8 @@ mod tests {
             model: &Model,
             context: &Context,
             options: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
-            self.stream(model, context, options.map(|o| o.stream))
+        ) -> Result<AssistantMessageEventStream, String> {
+            Ok(self.stream(model, context, options.map(|o| o.stream)))
         }
     }
 
@@ -2473,7 +2506,7 @@ mod tests {
             _model: &Model,
             _context: &Context,
             _options: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
+        ) -> Result<AssistantMessageEventStream, String> {
             unreachable!("not used in refresh tests")
         }
     }
@@ -2704,7 +2737,7 @@ mod tests {
             model: &Model,
             context: &Context,
             options: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
+        ) -> Result<AssistantMessageEventStream, String> {
             self.inner.stream_simple(model, context, options)
         }
     }
@@ -2812,7 +2845,7 @@ mod tests {
             _: &Model,
             _: &Context,
             _: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
+        ) -> Result<AssistantMessageEventStream, String> {
             unreachable!("not used in refresh tests")
         }
     }
@@ -2897,8 +2930,8 @@ mod tests {
             model: &Model,
             ctx: &Context,
             options: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
-            self.stream(model, ctx, options.map(|o| o.stream))
+        ) -> Result<AssistantMessageEventStream, String> {
+            Ok(self.stream(model, ctx, options.map(|o| o.stream)))
         }
     }
 
@@ -2912,6 +2945,7 @@ mod tests {
             model: model.id.clone(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -4912,6 +4946,7 @@ mod tests {
                 model: model.id.clone(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
@@ -4935,8 +4970,8 @@ mod tests {
             model: &Model,
             context: &Context,
             _options: Option<SimpleStreamOptions>,
-        ) -> AssistantMessageEventStream {
-            self.stream(model, context, None)
+        ) -> Result<AssistantMessageEventStream, String> {
+            Ok(self.stream(model, context, None))
         }
     }
 

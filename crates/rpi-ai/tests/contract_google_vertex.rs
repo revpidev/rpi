@@ -615,6 +615,27 @@ async fn test_normal_flow_text_events_and_wire_shape() {
     assert!(body.get("generationConfig").is_none());
 }
 
+/// 8b5899dce deliberately did not touch google-vertex: missing credentials
+/// stay an in-stream error (the access token resolves inside the stream
+/// body). Pinned so the adapter-contract change cannot leak into vertex.
+#[tokio::test]
+async fn test_vertex_stream_simple_missing_credentials_stay_in_stream() {
+    // Unreachable endpoint, no api key / ADC env: the entry must still hand
+    // back a stream; the failure arrives as an in-stream error event.
+    let model = model("http://127.0.0.1:9");
+    let stream = stream_simple(
+        &model,
+        &context(vec![user_text("hi")]),
+        Some(SimpleStreamOptions::default()),
+    )
+    .expect("entry returns a stream — vertex has no synchronous auth check");
+    let events = collect(stream).await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "credential/connection failure must be encoded in-stream: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_thinking_flow_via_stream_simple() {
     let (base_url, mut rx) = serve(vec![sse(VERTEX_THINKING_SSE)]).await;
@@ -624,11 +645,10 @@ async fn test_thinking_flow_via_stream_simple() {
         reasoning: Some(ThinkingLevel::Medium),
         thinking_budgets: None,
     };
-    let events = collect(stream_simple(
-        &model,
-        &context(vec![user_text("hi")]),
-        Some(options),
-    ))
+    let events = collect(
+        stream_simple(&model, &context(vec![user_text("hi")]), Some(options))
+            .expect("stream_simple"),
+    )
     .await;
 
     assert_eq!(
@@ -673,9 +693,12 @@ async fn test_thinking_level_models_use_thinking_level_config() {
         reasoning: Some(ThinkingLevel::Low),
         thinking_budgets: None,
     };
-    let events =
-        collect(GoogleVertex.stream_simple(&model, &context(vec![user_text("hi")]), Some(options)))
-            .await;
+    let events = collect(
+        GoogleVertex
+            .stream_simple(&model, &context(vec![user_text("hi")]), Some(options))
+            .expect("stream_simple"),
+    )
+    .await;
     assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
 
     let request = rx.recv().await.expect("captured request");

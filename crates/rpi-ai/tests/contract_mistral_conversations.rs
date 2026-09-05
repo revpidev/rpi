@@ -1,5 +1,5 @@
 //! Contract tests for the mistral-conversations adapter: drive `stream()` /
-//! `stream_simple()` over a scripted local HTTP server with recorded SSE
+//! `stream_simple` over a scripted local HTTP server with recorded SSE
 //! streams, and assert both sides of the contract — the request shape
 //! (method / path / key headers / body JSON) and the emitted `StreamEvent`
 //! sequence. Mirrors `contract_adapters.rs`; the SSE payloads are recorded in
@@ -394,11 +394,15 @@ async fn test_mistral_prompt_mode_reasoning_stream() {
         &base_url,
         json!({"reasoning": true}),
     );
-    let events = collect(MistralConversations.stream_simple(
-        &m,
-        &context(vec![user_text("hi")]),
-        Some(simple_options(Some(ThinkingLevel::Medium), options())),
-    ))
+    let events = collect(
+        MistralConversations
+            .stream_simple(
+                &m,
+                &context(vec![user_text("hi")]),
+                Some(simple_options(Some(ThinkingLevel::Medium), options())),
+            )
+            .expect("stream_simple"),
+    )
     .await;
 
     let request = captured.recv().await.expect("request captured");
@@ -430,11 +434,15 @@ async fn test_mistral_reasoning_effort_stream() {
     // `reasoning_effort` instead of `prompt_mode`.
     let (base_url, mut captured) = serve(vec![(200, TEXT_SSE)]).await;
     let m = model("mistral-small-2603", &base_url, json!({"reasoning": true}));
-    let events = collect(MistralConversations.stream_simple(
-        &m,
-        &context(vec![user_text("hi")]),
-        Some(simple_options(Some(ThinkingLevel::Medium), options())),
-    ))
+    let events = collect(
+        MistralConversations
+            .stream_simple(
+                &m,
+                &context(vec![user_text("hi")]),
+                Some(simple_options(Some(ThinkingLevel::Medium), options())),
+            )
+            .expect("stream_simple"),
+    )
     .await;
 
     let request = captured.recv().await.expect("request captured");

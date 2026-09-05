@@ -120,11 +120,26 @@ pub enum ProxyAssistantMessageEvent {
     Done {
         reason: DoneReason,
         usage: Usage,
+        /// Exact provider-native effort level for the response
+        /// (proxy.ts:51, 4e69b0c28): written into `partial` so proxy-path
+        /// messages persist it like direct-path ones.
+        #[serde(
+            rename = "providerThinkingLevel",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_thinking_level: Option<String>,
     },
     Error {
         reason: ErrorReason,
         error_message: Option<String>,
         usage: Usage,
+        /// See [`ProxyAssistantMessageEvent::Done`]'s field
+        /// (proxy.ts:58).
+        #[serde(
+            rename = "providerThinkingLevel",
+            skip_serializing_if = "Option::is_none"
+        )]
+        provider_thinking_level: Option<String>,
     },
 }
 
@@ -368,10 +383,11 @@ async fn run(
     }
 
     // :179-207 — the read loop. The `TextDecoder` half is
-    // [`IncrementalUtf8Decoder`]; the line-buffer tail is discarded at the
-    // end, so a final line without `\n` is never processed (:193/:207).
+    // [`IncrementalUtf8Decoder`]; `sawTerminalEvent` tracks whether a
+    // `done`/`error` event arrived (:186, :195).
     let mut decoder = IncrementalUtf8Decoder::new();
     let mut buffer = String::new();
+    let mut saw_terminal_event = false;
     let mut byte_stream = response.bytes_stream();
     loop {
         let chunk = match signal {
@@ -394,26 +410,13 @@ async fn run(
         let mut lines: Vec<String> = buffer.split('\n').map(str::to_owned).collect();
         buffer = lines.pop().unwrap_or_default();
         for line in lines {
-            // :196 — only `data: `-prefixed lines are events.
-            if let Some(data) = line.strip_prefix("data: ") {
-                // :197-198 — `line.slice(6).trim()`.
-                let data = data.trim();
-                if !data.is_empty() {
-                    // :199-203 — `JSON.parse` failures abort the stream.
-                    let value: Value =
-                        serde_json::from_str(data).map_err(|error| error.to_string())?;
-                    // Unknown event types parse to `None` (already warned).
-                    if let Some(proxy_event) =
-                        parse_proxy_event(value).map_err(|error| error.to_string())?
-                    {
-                        if let Some(event) =
-                            process_proxy_event(proxy_event, partial, partial_jsons)?
-                        {
-                            stream.push(event);
-                        }
-                    }
-                }
-            }
+            process_data_line(
+                &line,
+                partial,
+                partial_jsons,
+                stream,
+                &mut saw_terminal_event,
+            )?;
         }
     }
 
@@ -421,8 +424,67 @@ async fn run(
     if signal.is_some_and(|token| token.is_cancelled()) {
         return Err("Request aborted by user".to_owned());
     }
-    // :213 — `stream.end()`; a terminal `done`/`error` event is expected to
+    // :213-217 — the final event may not be newline-terminated: flush the
+    // decoder and process whatever is left in the buffer (ebc374490, #8997 —
+    // the residual line used to be dropped, losing the last event).
+    buffer.push_str(&decoder.flush());
+    if !buffer.is_empty() {
+        process_data_line(
+            &buffer,
+            partial,
+            partial_jsons,
+            stream,
+            &mut saw_terminal_event,
+        )?;
+    }
+    // :219-233 — a clean EOF without a done/error event means the server
+    // dropped the response mid-stream; surface it as an error instead of
+    // leaving consumers waiting on a result that never arrives
+    // (ebc374490, #8997).
+    if !saw_terminal_event {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message =
+            Some("Connection closed by proxy server before the response completed".to_owned());
+        stream.push(StreamEvent::Error {
+            reason: ErrorReason::Error,
+            error: partial.clone(),
+        });
+    }
+    // :235 — `stream.end()`; a terminal `done`/`error` event is expected to
     // have arrived on the wire.
+    Ok(())
+}
+
+/// `processLine` (:194-206): one SSE line → zero or one stream event.
+/// Sets `saw_terminal_event` when the produced event terminates the stream
+/// (`done`/`error`, :195).
+fn process_data_line(
+    line: &str,
+    partial: &mut AssistantMessage,
+    partial_jsons: &mut HashMap<usize, String>,
+    stream: &AssistantMessageEventStream,
+    saw_terminal_event: &mut bool,
+) -> Result<(), String> {
+    // :196 — only `data: `-prefixed lines are events.
+    let Some(data) = line.strip_prefix("data: ") else {
+        return Ok(());
+    };
+    // :197-198 — `line.slice(6).trim()`.
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(());
+    }
+    // :199-203 — `JSON.parse` failures abort the stream.
+    let value: Value = serde_json::from_str(data).map_err(|error| error.to_string())?;
+    // Unknown event types parse to `None` (already warned).
+    if let Some(proxy_event) = parse_proxy_event(value).map_err(|error| error.to_string())? {
+        if let Some(event) = process_proxy_event(proxy_event, partial, partial_jsons)? {
+            if matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
+                *saw_terminal_event = true;
+            }
+            stream.push(event);
+        }
+    }
     Ok(())
 }
 
@@ -451,10 +513,10 @@ async fn proxy_error_message(status: reqwest::StatusCode, response: reqwest::Res
 
 /// `TextDecoder` with `{ stream: true }` (:180, :191): incremental UTF-8
 /// decoding with U+FFFD substitution; an incomplete trailing sequence is held
-/// across chunks. Unlike `rpi_ai::api::sse::SseDecoder` there is no
-/// end-of-stream flush (upstream never calls `decode()` without
-/// `{ stream: true }`), so a trailing incomplete sequence is dropped with the
-/// buffer tail.
+/// across chunks. [`IncrementalUtf8Decoder::flush`] is the end-of-stream
+/// `decoder.decode()` (:218, ebc374490). Unlike
+/// `rpi_ai::api::sse::SseDecoder` there is no event framing here — this type
+/// only decodes bytes into the line `String`.
 struct IncrementalUtf8Decoder {
     tail: Vec<u8>,
 }
@@ -494,6 +556,26 @@ impl IncrementalUtf8Decoder {
         }
         self.tail = combined[offset..].to_vec();
         decoded
+    }
+
+    /// `decoder.decode()` without `{ stream: true }` (:218): end-of-stream
+    /// flush — an incomplete trailing sequence becomes a single U+FFFD
+    /// instead of being held (ebc374490, #8997).
+    fn flush(&mut self) -> String {
+        let tail = std::mem::take(&mut self.tail);
+        if tail.is_empty() {
+            return String::new();
+        }
+        match std::str::from_utf8(&tail) {
+            Ok(valid) => valid.to_owned(),
+            Err(error) => {
+                let mut decoded = std::str::from_utf8(&tail[..error.valid_up_to()])
+                    .unwrap_or("")
+                    .to_owned();
+                decoded.push('\u{FFFD}');
+                decoded
+            }
+        }
     }
 }
 
@@ -675,7 +757,11 @@ fn process_proxy_event(
             }
         }
 
-        ProxyAssistantMessageEvent::Done { reason, usage } => {
+        ProxyAssistantMessageEvent::Done {
+            reason,
+            usage,
+            provider_thinking_level,
+        } => {
             // :350-353
             partial.stop_reason = match reason {
                 DoneReason::Stop => StopReason::Stop,
@@ -687,6 +773,11 @@ fn process_proxy_event(
                 DoneReason::Deferred => StopReason::Deferred,
             };
             partial.usage = usage;
+            // :382-384 — absent on the frame leaves any earlier value
+            // untouched (4e69b0c28).
+            if let Some(level) = provider_thinking_level {
+                partial.provider_thinking_level = Some(level);
+            }
             Ok(Some(StreamEvent::Done {
                 reason,
                 message: partial.clone(),
@@ -697,6 +788,7 @@ fn process_proxy_event(
             reason,
             error_message,
             usage,
+            provider_thinking_level,
         } => {
             // :355-359
             partial.stop_reason = match reason {
@@ -705,6 +797,10 @@ fn process_proxy_event(
             };
             partial.error_message = error_message;
             partial.usage = usage;
+            // :390-392 (4e69b0c28)
+            if let Some(level) = provider_thinking_level {
+                partial.provider_thinking_level = Some(level);
+            }
             Ok(Some(StreamEvent::Error {
                 reason,
                 error: partial.clone(),
@@ -749,6 +845,7 @@ fn initial_partial(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         error_message: None,
@@ -857,6 +954,15 @@ mod tests {
                 ProxyAssistantMessageEvent::Done {
                     reason: DoneReason::Stop,
                     usage: Usage::default(),
+                    provider_thinking_level: None,
+                },
+            ),
+            (
+                r#"{"type":"done","reason":"stop","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"providerThinkingLevel":"high"}"#,
+                ProxyAssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    usage: Usage::default(),
+                    provider_thinking_level: Some("high".to_owned()),
                 },
             ),
             (
@@ -865,6 +971,16 @@ mod tests {
                     reason: ErrorReason::Aborted,
                     error_message: Some("oops".to_owned()),
                     usage: Usage::default(),
+                    provider_thinking_level: None,
+                },
+            ),
+            (
+                r#"{"type":"error","reason":"error","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"providerThinkingLevel":"low"}"#,
+                ProxyAssistantMessageEvent::Error {
+                    reason: ErrorReason::Error,
+                    error_message: None,
+                    usage: Usage::default(),
+                    provider_thinking_level: Some("low".to_owned()),
                 },
             ),
         ];

@@ -2042,6 +2042,7 @@ mod tests {
             model: "m".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

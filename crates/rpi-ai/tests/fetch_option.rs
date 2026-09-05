@@ -135,11 +135,14 @@ fn terminal_error_message(events: &[StreamEvent]) -> &str {
 async fn passes_fetch_through_stream_simple_to_the_anthropic_sdk() {
     let probe = FetchProbe::default();
     let m = model("anthropic-messages", "test-provider", UNROUTABLE, json!({}));
-    let events = collect(rpi_ai::api::anthropic_messages::stream_simple(
-        &m,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::anthropic_messages::stream_simple(
+            &m,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
 
     assert_eq!(probe.calls(), 1, "custom fetch called exactly once");
@@ -156,20 +159,26 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
     let probe = FetchProbe::default();
 
     let completions = model("openai-completions", "test-provider", UNROUTABLE, json!({}));
-    let events = collect(rpi_ai::api::openai_completions::stream_simple(
-        &completions,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::openai_completions::stream_simple(
+            &completions,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
     let responses = model("openai-responses", "test-provider", UNROUTABLE, json!({}));
-    let events = collect(rpi_ai::api::openai_responses::stream_simple(
-        &responses,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::openai_responses::stream_simple(
+            &responses,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
@@ -179,11 +188,14 @@ async fn passes_fetch_through_stream_simple_to_openai_sdk_adapters() {
         UNROUTABLE,
         json!({}),
     );
-    let events = collect(rpi_ai::api::azure_openai_responses::stream_simple(
-        &azure,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::azure_openai_responses::stream_simple(
+            &azure,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
@@ -202,11 +214,14 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
         UNROUTABLE,
         json!({}),
     );
-    let events = collect(rpi_ai::api::mistral_conversations::stream_simple(
-        &mistral,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::mistral_conversations::stream_simple(
+            &mistral,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
@@ -219,11 +234,10 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
     );
     let mut options = simple_options(canned_fetch(&probe), &mock_token());
     options.stream.transport = Some(Transport::Sse);
-    let events = collect(rpi_ai::api::openai_codex_responses::stream_simple(
-        &codex,
-        &context(),
-        Some(options),
-    ))
+    let events = collect(
+        rpi_ai::api::openai_codex_responses::stream_simple(&codex, &context(), Some(options))
+            .expect("stream_simple"),
+    )
     .await;
     assert!(
         terminal_error_message(&events).contains("upstream rejected request"),
@@ -232,11 +246,14 @@ async fn uses_fetch_for_mistral_codex_sse_and_pi_messages() {
     );
 
     let pi = model("pi-messages", "test-provider", UNROUTABLE, json!({}));
-    let events = collect(rpi_ai::api::pi_messages::stream_simple(
-        &pi,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::pi_messages::stream_simple(
+            &pi,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(terminal_error_message(&events).contains("upstream rejected request"));
 
@@ -255,11 +272,14 @@ async fn rejects_custom_fetch_for_google_adapters() {
         UNROUTABLE,
         json!({}),
     );
-    let events = collect(rpi_ai::api::google_generative_ai::stream_simple(
-        &google,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::google_generative_ai::stream_simple(
+            &google,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert_eq!(
         terminal_error_message(&events),
@@ -267,11 +287,14 @@ async fn rejects_custom_fetch_for_google_adapters() {
     );
 
     let vertex = model("google-vertex", "test-provider", UNROUTABLE, json!({}));
-    let events = collect(rpi_ai::api::google_vertex::stream_simple(
-        &vertex,
-        &context(),
-        Some(simple_options(canned_fetch(&probe), "test-key")),
-    ))
+    let events = collect(
+        rpi_ai::api::google_vertex::stream_simple(
+            &vertex,
+            &context(),
+            Some(simple_options(canned_fetch(&probe), "test-key")),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert_eq!(
         terminal_error_message(&events),
@@ -294,11 +317,10 @@ async fn google_default_transport_is_not_rejected() {
     );
     let mut options = simple_options(canned_fetch(&FetchProbe::default()), "test-key");
     options.stream.request.fetch = None;
-    let events = collect(rpi_ai::api::google_generative_ai::stream_simple(
-        &google,
-        &context(),
-        Some(options),
-    ))
+    let events = collect(
+        rpi_ai::api::google_generative_ai::stream_simple(&google, &context(), Some(options))
+            .expect("stream_simple"),
+    )
     .await;
     assert!(
         !terminal_error_message(&events).contains("Custom fetch is not supported"),

@@ -2636,6 +2636,7 @@ mod tests {
                 model: "claude-test".to_owned(),
                 response_model: None,
                 response_id: None,
+                provider_thinking_level: None,
                 diagnostics: None,
                 usage: rpi_ai::types::Usage {
                     input: 1,

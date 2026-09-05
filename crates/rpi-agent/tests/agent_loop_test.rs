@@ -97,6 +97,7 @@ fn assistant_message(content: Vec<AssistantContent>, stop_reason: StopReason) ->
         model: "mock".to_owned(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason,

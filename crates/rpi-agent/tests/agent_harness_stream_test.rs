@@ -605,8 +605,8 @@ impl Provider for PayloadProbeProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        self.stream(model, context, options.map(|simple| simple.stream))
+    ) -> Result<AssistantMessageEventStream, String> {
+        Ok(self.stream(model, context, options.map(|simple| simple.stream)))
     }
 }
 

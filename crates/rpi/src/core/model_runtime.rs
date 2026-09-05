@@ -791,7 +791,7 @@ impl Provider for AuthOverridingProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         self.base.stream_simple(model, context, options)
     }
 }
@@ -857,7 +857,7 @@ impl Provider for RefreshDelegatingProvider {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         self.inner.stream_simple(model, context, options)
     }
 }

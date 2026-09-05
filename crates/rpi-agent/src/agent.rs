@@ -895,6 +895,7 @@ impl Agent {
             model: model.id.clone(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: if aborted {

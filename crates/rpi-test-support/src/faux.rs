@@ -119,6 +119,7 @@ pub fn faux_assistant_message(
         model: DEFAULT_MODEL_ID.to_owned(),
         response_model: None,
         response_id: options.response_id,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: default_usage(),
         stop_reason: options.stop_reason.unwrap_or(StopReason::Stop),
@@ -577,6 +578,7 @@ fn create_error_message(
         model: model_id.to_owned(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: default_usage(),
         stop_reason: StopReason::Error,
@@ -939,12 +941,12 @@ impl rpi_ai::models::Provider for FauxAiProvider {
         model: &Model,
         context: &Context,
         options: Option<rpi_ai::types::SimpleStreamOptions>,
-    ) -> rpi_ai::utils::event_stream::AssistantMessageEventStream {
+    ) -> Result<rpi_ai::utils::event_stream::AssistantMessageEventStream, String> {
         self.reasoning_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(options.as_ref().and_then(|simple| simple.reasoning));
-        self.stream(model, context, options.map(|simple| simple.stream))
+        Ok(self.stream(model, context, options.map(|simple| simple.stream)))
     }
 }
 

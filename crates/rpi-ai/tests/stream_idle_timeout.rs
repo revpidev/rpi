@@ -204,11 +204,14 @@ fn terminal(events: &[StreamEvent]) -> (&'static str, Option<String>) {
 async fn active_stream_longer_than_timeout_completes() {
     let script = sse_script(); // 5 gaps x 60ms ≈ 300ms total after headers
     let url = sse_server(0, script).await;
-    let events = collect(rpi_ai::api::anthropic_messages::stream_simple(
-        &model(&url),
-        &context(),
-        Some(options(250)),
-    ))
+    let events = collect(
+        rpi_ai::api::anthropic_messages::stream_simple(
+            &model(&url),
+            &context(),
+            Some(options(250)),
+        )
+        .expect("stream_simple"),
+    )
     .await;
 
     let (kind, error) = terminal(&events);
@@ -226,11 +229,14 @@ async fn silent_stream_dies_at_idle_timeout() {
     script.truncate(1);
     script.push((0, None));
     let url = sse_server(0, script).await;
-    let events = collect(rpi_ai::api::anthropic_messages::stream_simple(
-        &model(&url),
-        &context(),
-        Some(options(200)),
-    ))
+    let events = collect(
+        rpi_ai::api::anthropic_messages::stream_simple(
+            &model(&url),
+            &context(),
+            Some(options(200)),
+        )
+        .expect("stream_simple"),
+    )
     .await;
 
     let (kind, error) = terminal(&events);
@@ -249,11 +255,14 @@ async fn headers_wait_is_bounded() {
     // The server delays the response HEAD itself: no status line, no
     // headers, within the budget.
     let url = sse_server(60_000, vec![]).await;
-    let events = collect(rpi_ai::api::anthropic_messages::stream_simple(
-        &model(&url),
-        &context(),
-        Some(options(150)),
-    ))
+    let events = collect(
+        rpi_ai::api::anthropic_messages::stream_simple(
+            &model(&url),
+            &context(),
+            Some(options(150)),
+        )
+        .expect("stream_simple"),
+    )
     .await;
 
     let (kind, error) = terminal(&events);
@@ -271,22 +280,25 @@ async fn headers_wait_is_bounded() {
 async fn no_timeout_option_disables_enforcement() {
     let script = sse_script();
     let url = sse_server(0, script).await;
-    let events = collect(rpi_ai::api::anthropic_messages::stream_simple(
-        &model(&url),
-        &context(),
-        Some(SimpleStreamOptions {
-            stream: StreamOptions {
-                request: ProviderRequestOptions {
-                    api_key: Some("test-key".to_owned()),
-                    max_retries: Some(0),
-                    ..Default::default()
+    let events = collect(
+        rpi_ai::api::anthropic_messages::stream_simple(
+            &model(&url),
+            &context(),
+            Some(SimpleStreamOptions {
+                stream: StreamOptions {
+                    request: ProviderRequestOptions {
+                        api_key: Some("test-key".to_owned()),
+                        max_retries: Some(0),
+                        ..Default::default()
+                    },
+                    ..StreamOptions::default()
                 },
-                ..StreamOptions::default()
-            },
-            reasoning: None,
-            thinking_budgets: None,
-        }),
-    ))
+                reasoning: None,
+                thinking_budgets: None,
+            }),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     let (kind, error) = terminal(&events);
     assert_eq!(kind, "done", "stream must complete, error: {error:?}");

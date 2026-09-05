@@ -54,6 +54,7 @@ fn assistant_msg(text: &str) -> AgentMessage {
         model: "claude-test".to_owned(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage {
             input: 1,

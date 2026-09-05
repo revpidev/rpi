@@ -1017,6 +1017,12 @@ pub struct AssistantMessage {
     /// Provider-specific response/message identifier when exposed upstream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
+    /// Exact provider-native effort level used for this response. Absent
+    /// for legacy or unmanaged responses (types.ts:435-436). Type face +
+    /// proxy passthrough landed in V14-04; the Anthropic write/replay
+    /// logic is V14-05 (4e69b0c28 split across tasks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_thinking_level: Option<String>,
     /// Redacted provider/runtime diagnostics for failures and recoveries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
@@ -1233,9 +1239,23 @@ pub enum ErrorReason {
 /// `AssistantMessageEvent` — event protocol for the assistant message event
 /// stream. Called `StreamEvent` in rpi (design §3.2, coding-standards §4.1).
 ///
-/// Streams emit `Start` before partial updates, then terminate with either
-/// `Done` carrying the final successful message, or `Error` carrying the final
-/// message with stopReason "error"/"aborted" and errorMessage.
+/// Successful streams emit `start` before partial updates and terminate with
+/// `done`. A stream may terminate directly with `error` when request setup
+/// fails before generation starts; after `start`, failures also terminate
+/// with `error`. Direct `stream_simple` calls fail synchronously (the Rust
+/// `Err` equivalent of upstream's throw) when request auth is missing
+/// (types.ts:325-330 @ 9841914, 8b5899dce). Updates and `done` must never
+/// appear before `start`.
+///
+/// `partial` is the shared live response-so-far helper, not an event-time
+/// snapshot. Text and thinking blocks are empty when their `*_start` event
+/// is emitted and grow only through their corresponding `*_delta` events
+/// until the authoritative `*_end`. Redacted thinking may be complete at
+/// start and emit no deltas. Tool-call arguments at `toolcall_start` are
+/// provider-specific (empty for classic streaming JSON tools;
+/// `{[input_property]: ""}` / `{[input_property]: item.input}` for
+/// grammar/custom tools — 8b5899dce); `toolcall_delta` carries subsequent
+/// JSON updates.
 ///
 /// Contract: events for different content blocks may interleave; consumers
 /// correlate by `content_index` (requirements §4.2).
@@ -1736,6 +1756,7 @@ mod tests {
             model: "claude-x".to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,

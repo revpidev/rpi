@@ -743,9 +743,11 @@ async fn test_unknown_event_types_are_warned_and_skipped() {
 }
 
 #[tokio::test]
-async fn test_trailing_line_without_newline_is_dropped() {
-    // Upstream keeps the last incomplete line in `buffer` and never processes
-    // it (:193/:207): the `done` event below must not be emitted.
+async fn test_trailing_line_without_newline_is_flushed() {
+    // ebc374490 (#8997): the decoder is flushed and the residual line buffer
+    // is processed as a final line (:213-217) — the trailing `done` without
+    // `\n` used to be dropped, losing the last event. It now terminates the
+    // stream and suppresses the EOF synthetic error.
     let done_event = format!(r#"{{"type":"done","reason":"stop","usage":{USAGE_JSON}}}"#);
     let body = format!("data: {}\ndata: {}", r#"{"type":"start"}"#, done_event);
     let server = start_server(200, "OK", "text/event-stream", vec![Step::Write(body)]).await;
@@ -756,14 +758,24 @@ async fn test_trailing_line_without_newline_is_dropped() {
     );
     let events = collect(stream).await;
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert!(matches!(events[0], StreamEvent::Start { .. }));
+    match &events[1] {
+        StreamEvent::Done { reason, message } => {
+            assert_eq!(*reason, DoneReason::Stop);
+            // The flushed done event leaves no room for a synthetic error.
+            assert_eq!(message.stop_reason, StopReason::Stop);
+        }
+        other => panic!("expected done, got {other:?}"),
+    }
 }
 
 #[tokio::test]
-async fn test_stream_ends_cleanly_without_terminal_event() {
-    // A server may close the stream without a `done`/`error` proxy event;
-    // `stream.end()` still closes the event stream (:213).
+async fn test_eof_without_terminal_event_synthesizes_error() {
+    // ebc374490 (#8997): a clean EOF without a `done`/`error` event means
+    // the server dropped the response mid-stream — surfaced as a synthetic
+    // error (:219-233) instead of leaving consumers waiting on a result
+    // that never arrives.
     let server = start_server(
         200,
         "OK",
@@ -778,8 +790,82 @@ async fn test_stream_ends_cleanly_without_terminal_event() {
     );
     let events = collect(stream).await;
 
-    assert_eq!(events.len(), 1);
+    assert_eq!(events.len(), 2);
     assert!(matches!(events[0], StreamEvent::Start { .. }));
+    match &events[1] {
+        StreamEvent::Error { reason, error } => {
+            assert_eq!(*reason, ErrorReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            assert_eq!(
+                error.error_message.as_deref(),
+                Some("Connection closed by proxy server before the response completed")
+            );
+        }
+        other => panic!("expected synthetic error, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// providerThinkingLevel passthrough on done/error (4e69b0c28)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_done_event_carries_provider_thinking_level() {
+    let done = format!(
+        r#"{{"type":"done","reason":"stop","usage":{USAGE_JSON},"providerThinkingLevel":"high"}}"#
+    );
+    let server = start_server(
+        200,
+        "OK",
+        "text/event-stream",
+        vec![Step::Write(sse(&[r#"{"type":"start"}"#, &done]))],
+    )
+    .await;
+    let stream = stream_proxy(
+        &test_model(),
+        &test_context(),
+        test_options(&server.base_url),
+    );
+    let events = collect(stream).await;
+
+    let StreamEvent::Done { message, .. } = events.last().expect("done") else {
+        panic!("expected done event");
+    };
+    assert_eq!(
+        message.provider_thinking_level.as_deref(),
+        Some("high"),
+        "proxy-path messages must persist the provider effort level"
+    );
+}
+
+#[tokio::test]
+async fn test_error_event_carries_provider_thinking_level() {
+    let error = format!(
+        r#"{{"type":"error","reason":"error","errorMessage":"boom","usage":{USAGE_JSON},"providerThinkingLevel":"low"}}"#
+    );
+    let server = start_server(
+        200,
+        "OK",
+        "text/event-stream",
+        vec![Step::Write(sse(&[r#"{"type":"start"}"#, &error]))],
+    )
+    .await;
+    let stream = stream_proxy(
+        &test_model(),
+        &test_context(),
+        test_options(&server.base_url),
+    );
+    let events = collect(stream).await;
+
+    let StreamEvent::Error { error, .. } = events.last().expect("error") else {
+        panic!("expected error event");
+    };
+    assert_eq!(error.provider_thinking_level.as_deref(), Some("low"));
+    // Backward compatibility: frames without the field leave it absent
+    // (covered by every other done/error test constructing bare frames).
+    let StreamEvent::Start { .. } = events[0] else {
+        panic!("expected start");
+    };
 }
 
 // ---------------------------------------------------------------------------

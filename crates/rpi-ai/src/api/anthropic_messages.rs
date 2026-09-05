@@ -28,7 +28,6 @@ use tokio_util::sync::CancellationToken;
 
 use crate::api::constrained_sampling::resolve_json_schema_strict_sampling;
 use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input};
-use crate::api::lazy::immediate_error_stream;
 use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
 };
@@ -1452,6 +1451,7 @@ fn initial_output(model: &Model) -> AssistantMessage {
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: StopReason::Pending,
@@ -1694,19 +1694,20 @@ pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<SimpleStreamOptions>,
-) -> AssistantMessageEventStream {
-    if let Err(message) = assert_request_auth(
+) -> Result<AssistantMessageEventStream, String> {
+    // Auth check at the entry, before any stream is constructed
+    // (8b5899dce: anthropic-messages.ts streamSimple asserts request auth
+    // first and throws synchronously — the Rust equivalent is `Err`).
+    assert_request_auth(
         &model.provider,
         options.as_ref().and_then(|o| o.stream.api_key.as_deref()),
         options.as_ref().and_then(|o| o.stream.headers.as_ref()),
-    ) {
-        return immediate_error_stream(model, &message);
-    }
+    )?;
 
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     let base = build_base_options(model, context, options.as_ref(), api_key);
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
-        return stream(
+        return Ok(stream(
             model,
             context,
             AnthropicOptions {
@@ -1714,7 +1715,7 @@ pub fn stream_simple(
                 thinking_enabled: Some(false),
                 ..AnthropicOptions::default()
             },
-        );
+        ));
     };
 
     // Models with adaptive thinking use an effort level; older models use
@@ -1726,7 +1727,7 @@ pub fn stream_simple(
         == Some(true)
     {
         let effort = map_thinking_level_to_effort(model, Some(reasoning));
-        return stream(
+        return Ok(stream(
             model,
             context,
             AnthropicOptions {
@@ -1735,7 +1736,7 @@ pub fn stream_simple(
                 effort: Some(effort),
                 ..AnthropicOptions::default()
             },
-        );
+        ));
     }
 
     let adjusted = adjust_max_tokens_for_thinking(
@@ -1757,7 +1758,7 @@ pub fn stream_simple(
         ..AnthropicOptions::default()
     };
     anthropic_options.stream.max_tokens = Some(max_tokens);
-    stream(model, context, anthropic_options)
+    Ok(stream(model, context, anthropic_options))
 }
 
 /// `ProviderStreams` implementation for `ApiKind::ANTHROPIC_MESSAGES`.
@@ -1790,7 +1791,7 @@ impl ProviderStreams for AnthropicMessages {
         model: &Model,
         context: &Context,
         options: Option<SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
+    ) -> Result<AssistantMessageEventStream, String> {
         stream_simple(model, context, options)
     }
 }
@@ -1831,6 +1832,7 @@ pub(crate) mod tests {
             model: model_id.to_owned(),
             response_model: None,
             response_id: None,
+            provider_thinking_level: None,
             diagnostics: None,
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
@@ -3012,24 +3014,16 @@ pub(crate) mod tests {
     // stream_simple
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_stream_simple_missing_auth_is_stream_error() {
+    /// 8b5899dce: `streamSimple` throws before returning a stream when
+    /// request auth is missing (types.ts:325-330) — the Rust equivalent is
+    /// the synchronous `Err` return, not an in-stream error event.
+    #[test]
+    fn test_stream_simple_missing_auth_fails_synchronously() {
         let model = make_model(json!({}));
-        let events: Vec<StreamEvent> =
-            stream_simple(&model, &context(vec![user_text("hi")], None), None)
-                .collect()
-                .await;
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            StreamEvent::Error { error, .. } => {
-                assert_eq!(error.stop_reason, StopReason::Error);
-                assert_eq!(
-                    error.error_message.as_deref(),
-                    Some("No API key for provider: anthropic")
-                );
-            }
-            other => panic!("expected error event, got {other:?}"),
-        }
+        assert_eq!(
+            stream_simple(&model, &context(vec![user_text("hi")], None), None).err(),
+            Some("No API key for provider: anthropic".to_owned())
+        );
     }
 }
 

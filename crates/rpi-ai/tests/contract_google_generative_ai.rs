@@ -638,22 +638,20 @@ async fn preserves_raw_gemini_finish_reasons_for_google_generative_ai_errors() {
     );
 }
 
-#[tokio::test]
-async fn test_google_stream_simple_without_api_key_errors() {
+/// 8b5899dce: `streamSimple` throws before returning a stream when request
+/// auth is missing (types.ts:325-330) — the Rust equivalent is the
+/// synchronous `Err` return, not an in-stream error event.
+#[test]
+fn test_google_stream_simple_without_api_key_errors() {
     let m = model("http://127.0.0.1:1");
-    let events = collect(stream_simple(
-        &m,
-        &context(vec![user_text("hi")]),
-        Some(SimpleStreamOptions::default()),
-    ))
-    .await;
-    assert_eq!(event_kinds(&events), vec!["error"]);
-    let StreamEvent::Error { error, .. } = &events[0] else {
-        panic!("expected error event");
-    };
     assert_eq!(
-        error.error_message.as_deref(),
-        Some("No API key for provider: google")
+        stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(SimpleStreamOptions::default())
+        )
+        .err(),
+        Some("No API key for provider: google".to_owned())
     );
 }
 
@@ -670,11 +668,14 @@ async fn assert_thinking_config(
 ) {
     let (base_url, mut captured) = serve(vec![(200, GOOGLE_TEXT_SSE)]).await;
     let m = model_with_id(model_id, &base_url, json!({}));
-    let events = collect(stream_simple(
-        &m,
-        &context(vec![user_text("hi")]),
-        Some(simple_options(reasoning, budgets)),
-    ))
+    let events = collect(
+        stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(simple_options(reasoning, budgets)),
+        )
+        .expect("stream_simple"),
+    )
     .await;
     assert!(
         matches!(events.last(), Some(StreamEvent::Done { .. })),

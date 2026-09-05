@@ -134,6 +134,7 @@ fn create_failure_message(model: &Model, error_message: &str, aborted: bool) -> 
         model: model.id.clone(),
         response_model: None,
         response_id: None,
+        provider_thinking_level: None,
         diagnostics: None,
         usage: Usage::default(),
         stop_reason: if aborted {
