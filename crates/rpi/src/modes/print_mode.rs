@@ -152,9 +152,20 @@ pub async fn run_print_mode(
     let event_out = out.clone();
     let _unsubscribe = session.subscribe(std::sync::Arc::new(move |event: AgentSessionEvent| {
         if json_mode {
-            if let Ok(mut line) = serde_json::to_string(&to_json_event(&event)) {
-                line.push('\n');
-                event_out.write(&line);
+            // `toJsonEvent` can throw on invariant violations
+            // (json-event.ts:50, :24-26); upstream's unguarded call crashes
+            // the process. rpi rejects the event instead — stderr
+            // diagnostic, no wire line (V14-03 §5 实现取舍).
+            match to_json_event(&event) {
+                Ok(wire) => {
+                    if let Ok(mut line) = serde_json::to_string(&wire) {
+                        line.push('\n');
+                        event_out.write(&line);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("json event conversion failed: {error}");
+                }
             }
         }
     }));

@@ -217,7 +217,7 @@ async fn measure_update_bytes(text: &str) -> usize {
         );
 
         // Wire events are delta-only (7290 test: `not.toHaveProperty` both).
-        let wire = to_json_event(update);
+        let wire = to_json_event(update).expect("to_json_event");
         assert!(
             wire.get("message").is_none(),
             "wire message_update must drop `message`: {wire}"
@@ -283,7 +283,7 @@ async fn message_end_message_matches_assembled_deltas() {
     let mut assembled = String::new();
     let mut final_text: Option<String> = None;
     for event in events.iter() {
-        let wire = to_json_event(event);
+        let wire = to_json_event(event).expect("to_json_event");
         match wire.get("type").and_then(Value::as_str) {
             Some("message_update") => {
                 let delta_event = &wire["assistantMessageEvent"];

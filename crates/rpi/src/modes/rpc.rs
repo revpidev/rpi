@@ -2,8 +2,11 @@
 //!
 //! Port of `packages/coding-agent/src/modes/rpc/{rpc-mode,rpc-types,jsonl}.ts`
 //! @ pi 0.82.1 (2efa728), contract-anchored to `docs/rpc.md`, with the event
-//! emission path updated to pi 0.84.1+ (4181f66, T18): wire events pass
-//! through `to_json_event` (delta-only `message_update`, docs/rpc.md:952-956)
+//! emission path updated to pi 0.84.1+ (4181f66, T18) and the command table
+//! extended at pi 0.85.0+ (9841914, V14-03: `clear_queue`, a79b37334): wire
+//! events pass
+//! through `to_json_event` (delta-only `message_update` with cumulative
+//! `usage`, docs/rpc.md:952-956)
 //! and stdout writes go through a single blocking writer with backpressure
 //! (`core::output_guard`, mapping `writeRawStdout` +
 //! `waitForRawStdoutBackpressure`).
@@ -122,6 +125,9 @@ pub enum RpcCommand {
         images: Option<Vec<ImageContent>>,
     },
     Abort {
+        id: Option<String>,
+    },
+    ClearQueue {
         id: Option<String>,
     },
     NewSession {
@@ -260,6 +266,7 @@ impl RpcCommand {
             | RpcCommand::Steer { id, .. }
             | RpcCommand::FollowUp { id, .. }
             | RpcCommand::Abort { id }
+            | RpcCommand::ClearQueue { id }
             | RpcCommand::NewSession { id, .. }
             | RpcCommand::GetState { id }
             | RpcCommand::SetModel { id, .. }
@@ -298,6 +305,7 @@ impl RpcCommand {
             RpcCommand::Steer { .. } => "steer",
             RpcCommand::FollowUp { .. } => "follow_up",
             RpcCommand::Abort { .. } => "abort",
+            RpcCommand::ClearQueue { .. } => "clear_queue",
             RpcCommand::NewSession { .. } => "new_session",
             RpcCommand::GetState { .. } => "get_state",
             RpcCommand::SetModel { .. } => "set_model",
@@ -331,11 +339,12 @@ impl RpcCommand {
 }
 
 /// Known command `type` strings (for the `Unknown command` pre-check).
-const KNOWN_COMMAND_TYPES: [&str; 32] = [
+const KNOWN_COMMAND_TYPES: [&str; 33] = [
     "prompt",
     "steer",
     "follow_up",
     "abort",
+    "clear_queue",
     "new_session",
     "get_state",
     "set_model",
@@ -747,9 +756,19 @@ async fn rebind_session(
         // `message`/`partial` snapshots (docs/rpc.md:952-956). The blocking
         // write runs inside the agent loop's ordered listener barrier, so a
         // slow consumer stalls the event source (rpc-mode.ts:361-363).
-        if let Ok(mut line) = serde_json::to_string(&to_json_event(&event)) {
-            line.push('\n');
-            event_output.write(&line);
+        // A conversion failure (invariant violation) is rejected here —
+        // stderr diagnostic, no wire line — instead of upstream's
+        // unguarded-throw process crash (V14-03 §5 实现取舍).
+        match to_json_event(&event) {
+            Ok(wire) => {
+                if let Ok(mut line) = serde_json::to_string(&wire) {
+                    line.push('\n');
+                    event_output.write(&line);
+                }
+            }
+            Err(error) => {
+                eprintln!("json event conversion failed: {error}");
+            }
         }
         // `checkShutdownRequested` on agent_settled (rpc-mode.ts:357-359).
         if is_settled {
@@ -863,6 +882,13 @@ async fn dispatch(
         RpcCommand::Abort { .. } => {
             state.session().abort().await;
             Ok(None)
+        }
+        // `case "clear_queue"` (rpc-mode.ts:433-435): synchronous — takes
+        // and clears both queues, returns their text for client-side
+        // restoration (a79b37334, #8432).
+        RpcCommand::ClearQueue { .. } => {
+            let (steering, follow_up) = state.session().clear_queue();
+            Ok(Some(json!({ "steering": steering, "followUp": follow_up })))
         }
         RpcCommand::NewSession { parent_session, .. } => {
             let cancelled = runtime

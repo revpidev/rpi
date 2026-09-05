@@ -966,6 +966,76 @@ async fn steer_follow_up_abort_during_streaming() {
 }
 
 // ---------------------------------------------------------------------------
+// clear_queue (a79b37334, #8432)
+// ---------------------------------------------------------------------------
+
+/// `clear_queue` returns both queues' text and purges them: after the
+/// clear, `abort` settles the session without consuming the queued
+/// steering (docs/rpc.md:137-158 — clients compose Esc as
+/// `clear_queue` + `abort`, then restore the returned text in the
+/// editor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_queue_returns_and_purges_queues() {
+    let long_text = "word ".repeat(400);
+    let mut rpc = start_rpc_with(
+        FauxProviderOptions {
+            tokens_per_second: Some(60.0),
+            ..Default::default()
+        },
+        vec![assistant(&long_text)],
+    )
+    .await;
+
+    rpc.send(&json!({"id": "p1", "type": "prompt", "message": "start"}))
+        .await;
+    rpc.next_response(Some("p1")).await;
+    rpc.next_event("agent_start").await;
+
+    // Queue one steering and one follow-up while the stream is in flight.
+    rpc.send(&json!({"id": "st1", "type": "steer", "message": "steer note"}))
+        .await;
+    assert_eq!(rpc.next_response(Some("st1")).await["success"], true);
+    rpc.send(&json!({"id": "fu1", "type": "follow_up", "message": "later"}))
+        .await;
+    assert_eq!(rpc.next_response(Some("fu1")).await["success"], true);
+
+    // `clear_queue` returns both queues' text (rpc.md:141-152).
+    rpc.send(&json!({"id": "cq1", "type": "clear_queue"})).await;
+    let (response, events) = rpc.next_response_with_events(Some("cq1")).await;
+    assert_eq!(response["success"], true);
+    assert_eq!(response["command"], "clear_queue");
+    assert_eq!(
+        response["data"],
+        json!({"steering": ["steer note"], "followUp": ["later"]})
+    );
+    // The clear also emits a `queue_update` with both queues emptied
+    // (`emitQueueUpdate` inside `clearQueue`, agent-session.ts:1587-1595).
+    let queue = events
+        .iter()
+        .find(|e| e["type"] == "queue_update")
+        .expect("queue_update event");
+    assert_eq!(queue["steering"], json!([]));
+    assert_eq!(queue["followUp"], json!([]));
+
+    // Esc composition (rpc.md:155-158): `abort` after `clear_queue` waits
+    // for the session to become idle before responding — the cleared
+    // steering is NOT consumed (no new turn for it).
+    rpc.send(&json!({"id": "ab1", "type": "abort"})).await;
+    let (response, events) = rpc.next_response_with_events(Some("ab1")).await;
+    assert_eq!(response["success"], true);
+    assert!(
+        events.iter().any(|e| e["type"] == "agent_settled"),
+        "agent_settled missing: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| e["type"] == "turn_start"),
+        "cleared steering must not drive a new turn: {events:?}"
+    );
+
+    assert_eq!(rpc.close_and_wait().await, 0);
+}
+
+// ---------------------------------------------------------------------------
 // set_session_name / get_commands
 // ---------------------------------------------------------------------------
 
