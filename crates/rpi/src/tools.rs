@@ -396,4 +396,62 @@ mod wiring_tests {
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(tool_names, vec!["read", "grep", "find", "ls"]);
     }
+
+    // ---- FR-A (V14-10, #8627): relative paths resolve against the session
+    // cwd carried by ToolContext (upstream `ctx?.cwd || cwd`, read.ts:101 /
+    // bash.ts:250 &c). rpi sessions are constructed with an immutable cwd
+    // (no set-cwd path writes back into AgentSessionInner), so the
+    // creation-time snapshot IS the per-call session cwd — pinned here
+    // with a session cwd different from the process cwd (SDK-host scenario).
+    #[tokio::test]
+    async fn test_builtin_tools_resolve_relative_paths_against_session_cwd() {
+        struct TempSessionDir(PathBuf);
+        impl Drop for TempSessionDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let base = std::env::temp_dir().join(format!("v14-10-fr-a-{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        let _guard = TempSessionDir(base.clone());
+
+        // Precondition: the session cwd really differs from the process cwd,
+        // otherwise this test would pin nothing.
+        assert_ne!(std::env::current_dir().expect("process cwd"), base);
+
+        let ctx = ToolContext {
+            cwd: base.clone(),
+            session_env: None,
+        };
+        let tools = create_builtin_tools(
+            &ctx,
+            &names(&["write", "read"]),
+            &BuiltinToolOptions::default(),
+        );
+
+        // write lands inside the session cwd, not the process cwd.
+        tools[0]
+            .execute(
+                "test",
+                serde_json::json!({ "path": "relative-note.txt", "content": "session-cwd-payload" }),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("write ok");
+        assert!(base.join("relative-note.txt").is_file());
+
+        // read resolves the same relative path against the session cwd.
+        let result = tools[1]
+            .execute(
+                "test",
+                serde_json::json!({ "path": "relative-note.txt" }),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("read ok");
+        let text = serde_json::to_string(&result).expect("serialize");
+        assert!(text.contains("session-cwd-payload"), "read text: {text}");
+    }
 }

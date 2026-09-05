@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rpi::core::skills::{
     discover_skill_paths, expand_skill_command, format_skills_for_prompt, load_skills,
-    DiagnosticKind, DiscoverSkillsOptions, LoadSkillsOptions, SourceScope,
+    DiagnosticKind, DiscoverSkillsOptions, LoadSkillsOptions, SkillFileReadTool, SourceScope,
 };
 
 // ---------------------------------------------------------------------------
@@ -383,10 +383,10 @@ fn skills_xml_injection_gate_and_disable_model_invocation() {
     let result = load_discovered(&options);
     assert_eq!(result.skills.len(), 2);
 
-    // read tool inactive → nothing injected (system-prompt.ts:155-157).
-    assert_eq!(format_skills_for_prompt(&result.skills, false), "");
-
-    let xml = format_skills_for_prompt(&result.skills, true);
+    // 1d6dbf9e3: the "no read-capable tool" gate moved to the system-prompt
+    // builder (skillFileReadTool); rendering itself only depends on the
+    // tool whose instruction line to use.
+    let xml = format_skills_for_prompt(&result.skills, SkillFileReadTool::Read);
     assert!(xml.starts_with("\n\nThe following skills provide specialized instructions"));
     assert!(xml.contains("<available_skills>"));
     assert!(xml.contains("<name>visible</name>"));
@@ -429,7 +429,10 @@ fn skills_xml_block_exact_shape_from_disk() {
         "</available_skills>",
     ]
     .join("\n");
-    assert_eq!(format_skills_for_prompt(&result.skills, true), want);
+    assert_eq!(
+        format_skills_for_prompt(&result.skills, SkillFileReadTool::Read),
+        want
+    );
 }
 
 // ---------------------------------------------------------------------------

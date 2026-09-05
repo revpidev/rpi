@@ -405,6 +405,7 @@ pub fn collect_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBu
 
     let mut skill_mds = Vec::new();
     let mut root_loose = Vec::new();
+    let mut nested_md = Vec::new();
     for result in builder.build() {
         let entry = match result {
             Ok(entry) => entry,
@@ -424,12 +425,14 @@ pub fn collect_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBu
             skill_mds.push(path.to_path_buf());
             continue;
         }
-        // `mode === "pi" && dir === root` (package-manager.ts:406-409).
-        if mode == SkillDiscoveryMode::Rpi
-            && path.parent() == Some(dir)
-            && entry.file_name().to_string_lossy().ends_with(".md")
-        {
+        // `mode === "pi" && dir === root` (package-manager.ts:406-409);
+        // `mode === "agents" && dir !== root` (package-manager.ts:424-426,
+        // 5e11f6586 #8255).
+        let is_markdown = entry.file_name().to_string_lossy().ends_with(".md");
+        if mode == SkillDiscoveryMode::Rpi && path.parent() == Some(dir) && is_markdown {
             root_loose.push(path.to_path_buf());
+        } else if mode == SkillDiscoveryMode::Agents && path.parent() != Some(dir) && is_markdown {
+            nested_md.push(path.to_path_buf());
         }
     }
 
@@ -464,6 +467,19 @@ pub fn collect_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBu
         entries.extend(root_loose);
     }
 
+    // Agents mode: nested `.md` files join discovery (5e11f6586). Anything
+    // beneath a skill root was never reached upstream (a directory with
+    // SKILL.md short-circuits); the merged list keeps the (depth, path)
+    // deterministic order used for the SKILL.md entries, which matches
+    // upstream's parent-before-child traversal.
+    if mode == SkillDiscoveryMode::Agents && !nested_md.is_empty() {
+        nested_md.retain(|p| !skill_roots.iter().any(|root| p.starts_with(root)));
+        entries.extend(nested_md);
+        entries.sort_by(|a, b| {
+            (a.components().count(), a.as_os_str()).cmp(&(b.components().count(), b.as_os_str()))
+        });
+    }
+
     entries
 }
 
@@ -485,13 +501,17 @@ pub fn load_skills_from_dir(dir: &Path, source: SkillLoadSource) -> LoadSkillsRe
 }
 
 /// `loadSkillFromFile` (skills.ts:277-325): parse + validate one skill
-/// file. A missing/empty description drops the skill (with a warning);
-/// every other violation is a warning and the skill still loads.
+/// file. A missing/empty description drops the skill (with a warning for
+/// declared `SKILL.md` files; plain `.md` files are **silently** ignored —
+/// `8c2529dae`, #7805/#8012); every other violation is a warning and the
+/// skill still loads.
 fn load_skill_from_file(
     file_path: &Path,
     source: SkillLoadSource,
 ) -> (Option<Skill>, Vec<ResourceDiagnostic>) {
     let mut diagnostics = Vec::new();
+    // `basename(filePath) === "SKILL.md"` (skills.ts:282).
+    let is_declared_skill = file_path.file_name().is_some_and(|name| name == "SKILL.md");
 
     let raw = match std::fs::read_to_string(file_path) {
         Ok(raw) => raw,
@@ -503,10 +523,25 @@ fn load_skill_from_file(
     let (frontmatter, _body) = match parse_frontmatter(&raw) {
         Ok(parsed) => parsed,
         Err(error) => {
-            diagnostics.push(warning(error.to_string(), file_path));
+            // Parse failures only warn for declared skills (skills.ts:292-297).
+            if is_declared_skill {
+                diagnostics.push(warning(error.to_string(), file_path));
+            }
             return (None, diagnostics);
         }
     };
+
+    // `typeof description === "string" && description.trim() !== ""`
+    // (skills.ts:299; non-string values are tolerated as missing).
+    let has_description = frontmatter
+        .description
+        .as_deref()
+        .is_some_and(|d| !d.trim().is_empty());
+    // Plain `.md` files without a description are silently dropped
+    // (skills.ts:300-302, 8c2529dae).
+    if !is_declared_skill && !has_description {
+        return (None, diagnostics);
+    }
 
     let skill_dir = file_path
         .parent()
@@ -533,9 +568,10 @@ fn load_skill_from_file(
 
     // Still load with warnings — unless the description is missing entirely
     // (skills.ts:305-307).
-    let Some(description) = frontmatter.description.filter(|d| !d.trim().is_empty()) else {
+    if !has_description {
         return (None, diagnostics);
-    };
+    }
+    let description = frontmatter.description.unwrap();
 
     let skill = Skill {
         name,
@@ -1345,20 +1381,31 @@ pub fn load_skills(options: &LoadSkillsOptions) -> LoadSkillsResult {
 // (skills.ts:327-370, system-prompt.ts:97-101,155-157, agent-session.ts:1301-1325)
 // ---------------------------------------------------------------------------
 
-/// `formatSkillsForPrompt` (skills.ts:335-361) with the read-tool gate of
-/// system-prompt.ts inlined as a parameter: upstream only appends the
-/// section when the `read` tool is active
-/// (`tools.includes("read")`, or `selectedTools.includes("read")` for custom
-/// prompts — pass `true` when no tool selection exists, which upstream
-/// treats as "all tools").
-///
-/// Skills with `disable_model_invocation` are excluded from the prompt (they
-/// can only be invoked explicitly via `/skill:name`). Returns an empty
-/// string when nothing should be injected.
-pub fn format_skills_for_prompt(skills: &[Skill], read_tool_active: bool) -> String {
-    if !read_tool_active {
-        return String::new();
-    }
+/// The tool used to load skill files, selected by the system-prompt builder
+/// (`["read","bash"].find(tool => tools.includes(tool))`, system-prompt.ts:46).
+/// `1d6dbf9e3` (#8552): skills stay discoverable when only bash is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillFileReadTool {
+    Read,
+    Bash,
+}
+
+/// `formatSkillsForPrompt` (skills.ts:335-361). The `tool` that will load
+/// skill files selects the instruction line (upstream `fileReadTool:
+/// "read" | "bash"`, skills.ts:347); skills with `disable_model_invocation`
+/// are excluded from the prompt (they can only be invoked explicitly via
+/// `/skill:name`). Returns an empty string when no visible skill remains —
+/// the "no read-capable tool selected" gate itself lives in the caller
+/// (`skillFileReadTool && skills.length > 0`).
+pub fn format_skills_for_prompt(skills: &[Skill], tool: SkillFileReadTool) -> String {
+    let file_tool_line = match tool {
+        SkillFileReadTool::Read => {
+            "Use the read tool to load a skill's file when the task matches its description."
+        }
+        SkillFileReadTool::Bash => {
+            "Use bash to load a skill's file when the task matches its description."
+        }
+    };
     let visible: Vec<&Skill> = skills
         .iter()
         .filter(|s| !s.disable_model_invocation)
@@ -1369,8 +1416,7 @@ pub fn format_skills_for_prompt(skills: &[Skill], read_tool_active: bool) -> Str
 
     let mut lines = vec![
         "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
-        "Use the read tool to load a skill's file when the task matches its description."
-            .to_string(),
+        file_tool_line.to_string(),
         "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
         String::new(),
         "<available_skills>".to_string(),
@@ -1684,6 +1730,82 @@ mod tests {
 
         let entries = collect_skill_entries(&root, SkillDiscoveryMode::Agents);
         assert_eq!(entries, vec![root.join("mydir/SKILL.md")]);
+    }
+
+    /// FR-D R3 (V14-10, #8255, 5e11f6586): agents mode discovers non-root
+    /// `.md` files while root-level loose `.md` stay ignored; nothing
+    /// beneath a skill root is reached (the SKILL.md short-circuit).
+    #[test]
+    fn test_collect_skill_entries_agents_mode_discovers_nested_md() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("skills");
+        write(&root.join("loose.md"), "---\ndescription: x\n---\n");
+        write(
+            &root.join("grouped/nested.md"),
+            "---\ndescription: x\n---\n",
+        );
+        write(
+            &root.join("grouped/deeper.md"),
+            "---\ndescription: x\n---\n",
+        );
+        write(&root.join("grouped/notes.txt"), "not markdown");
+        write(&root.join("mydir/SKILL.md"), "---\ndescription: x\n---\n");
+        // Beneath a skill root: never discovered.
+        write(&root.join("mydir/other.md"), "---\ndescription: x\n---\n");
+
+        let entries = collect_skill_entries(&root, SkillDiscoveryMode::Agents);
+        // (depth, path) order: all three at depth 3, alphabetical.
+        assert_eq!(
+            entries,
+            vec![
+                root.join("grouped/deeper.md"),
+                root.join("grouped/nested.md"),
+                root.join("mydir/SKILL.md"),
+            ]
+        );
+    }
+
+    /// FR-D R2 (V14-10, #7805/#8012, 8c2529dae): plain `.md` files without a
+    /// description are silently ignored; `SKILL.md` without one warns and
+    /// does not load. Parse failures likewise only warn for `SKILL.md`.
+    #[test]
+    fn test_load_skill_from_file_declared_skill_diagnostics() {
+        let tmp = TempDir::new();
+        let root = tmp.path().join("skills");
+        write(&root.join("plain.md"), "---\ndescription: x\n---\n");
+        write(&root.join("nodesc.md"), "---\nname: n\n---\nbody");
+        write(&root.join("SKILL.md"), "---\nname: s\n---\nbody");
+        write(&root.join("broken.md"), "---\n: [unclosed\n---\nbody");
+
+        // Plain md with a description loads normally.
+        let (skill, diags) = load_skill_from_file(&root.join("plain.md"), SkillLoadSource::Project);
+        assert!(skill.is_some());
+        assert!(diags.is_empty());
+
+        // Plain md without a description: silent (no warning, no skill).
+        let (skill, diags) =
+            load_skill_from_file(&root.join("nodesc.md"), SkillLoadSource::Project);
+        assert!(skill.is_none());
+        assert!(diags.is_empty());
+
+        // SKILL.md without a description: warning + no skill.
+        let (skill, diags) = load_skill_from_file(&root.join("SKILL.md"), SkillLoadSource::Project);
+        assert!(skill.is_none());
+        assert_eq!(diags.len(), 1);
+        assert!(matches!(diags[0].kind, DiagnosticKind::Warning));
+
+        // Broken YAML: silent for plain md, warning for SKILL.md.
+        let (skill, diags) =
+            load_skill_from_file(&root.join("broken.md"), SkillLoadSource::Project);
+        assert!(skill.is_none());
+        assert!(diags.is_empty());
+        write(
+            &root.join("SKILLbroken/SKILL.md"),
+            "---\n: [unclosed\n---\nbody",
+        );
+        let (_skill, diags) =
+            load_skill_from_file(&root.join("SKILLbroken/SKILL.md"), SkillLoadSource::Project);
+        assert_eq!(diags.len(), 1);
     }
 
     #[test]
@@ -2068,13 +2190,16 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(
-            format_skills_for_prompt(std::slice::from_ref(&skill), true),
+            format_skills_for_prompt(std::slice::from_ref(&skill), SkillFileReadTool::Read),
             want
         );
 
         // disable-model-invocation skills are hidden from the prompt.
         skill.disable_model_invocation = true;
-        assert_eq!(format_skills_for_prompt(&[skill], true), "");
+        assert_eq!(
+            format_skills_for_prompt(&[skill], SkillFileReadTool::Read),
+            ""
+        );
     }
 
     #[test]
@@ -2082,12 +2207,22 @@ mod tests {
         let tmp = TempDir::new();
         let file = tmp.path().join("s/SKILL.md");
         let skill = make_skill("s", "d", &file);
+        // 1d6dbf9e3: the bash variant swaps only the instruction line; the
+        // "no read-capable tool" gate itself lives in the system-prompt
+        // builder (skillFileReadTool), not here.
+        let read_prompt =
+            format_skills_for_prompt(std::slice::from_ref(&skill), SkillFileReadTool::Read);
+        let bash_prompt = format_skills_for_prompt(&[skill], SkillFileReadTool::Bash);
+        assert!(read_prompt.contains(
+            "Use the read tool to load a skill's file when the task matches its description."
+        ));
+        assert!(bash_prompt
+            .contains("Use bash to load a skill's file when the task matches its description."));
         assert_eq!(
-            format_skills_for_prompt(std::slice::from_ref(&skill), false),
-            ""
+            read_prompt.replace("Use the read tool", "Use bash"),
+            bash_prompt
         );
-        assert!(!format_skills_for_prompt(&[skill], true).is_empty());
-        assert_eq!(format_skills_for_prompt(&[], true), "");
+        assert_eq!(format_skills_for_prompt(&[], SkillFileReadTool::Read), "");
     }
 
     // ---- /skill expansion ----

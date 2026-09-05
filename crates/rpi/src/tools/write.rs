@@ -171,14 +171,12 @@ impl AgentTool for WriteTool {
                 ));
             }
 
-            // Success message: `content.length` in JS is the UTF-16 code unit
-            // count (string length), NOT the byte count. We replicate this for
-            // parity with the upstream text output.
-            let byte_count = content.encode_utf16().count();
-
+            // e583b290a (#8979): the success message drops the count — it was
+            // the UTF-16 code unit count, not a byte count, so upstream
+            // removed it instead of fixing it (write.ts:87).
             Ok(AgentToolResult {
                 content: vec![ToolResultContent::Text(TextContent {
-                    text: format!("Successfully wrote {byte_count} bytes to {path_owned}"),
+                    text: format!("Successfully wrote to {path_owned}"),
                     ..Default::default()
                 })],
                 details: Value::Null,

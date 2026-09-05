@@ -1100,6 +1100,92 @@ fn test_prepare_invalid_json_string_edits_preserved() {
     assert_eq!(prepared, json!({"path": "file.txt", "edits": "not json"}));
 }
 
+// ---- FR-B (V14-10, #7835/#8011, ca21c1686): single-object edits input ----
+
+#[test]
+fn test_prepare_wraps_single_object_edits() {
+    let cwd = std::env::temp_dir();
+    let ctx = make_ctx(&cwd);
+    let tool = create_edit_tool(&ctx, EditToolOptions::default());
+
+    // `edits` directly a single edit object → one-element array.
+    let prepared = tool.prepare_arguments(json!({
+        "path": "file.txt",
+        "edits": {"oldText": "a", "newText": "b"}
+    }));
+    assert_eq!(
+        prepared,
+        json!({
+            "path": "file.txt",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        })
+    );
+
+    // Non-edit objects (missing either field) pass through untouched.
+    let prepared = tool.prepare_arguments(json!({
+        "path": "file.txt",
+        "edits": {"oldText": "a"}
+    }));
+    assert_eq!(
+        prepared,
+        json!({"path": "file.txt", "edits": {"oldText": "a"}})
+    );
+}
+
+#[test]
+fn test_prepare_parses_json_string_single_edit() {
+    let cwd = std::env::temp_dir();
+    let ctx = make_ctx(&cwd);
+    let tool = create_edit_tool(&ctx, EditToolOptions::default());
+
+    // JSON string containing a single edit object → wrapped array.
+    let prepared = tool.prepare_arguments(json!({
+        "path": "file.txt",
+        "edits": json!({"oldText": "a", "newText": "b"}).to_string()
+    }));
+    assert_eq!(
+        prepared,
+        json!({
+            "path": "file.txt",
+            "edits": [{"oldText": "a", "newText": "b"}]
+        })
+    );
+
+    // JSON string containing a non-edit object stays the original string.
+    let prepared = tool.prepare_arguments(json!({
+        "path": "file.txt",
+        "edits": "{\"foo\": 1}"
+    }));
+    assert_eq!(
+        prepared,
+        json!({"path": "file.txt", "edits": "{\"foo\": 1}"})
+    );
+}
+
+#[tokio::test]
+async fn test_single_object_edits_execute() {
+    let tmp = TempDir::new();
+    let file = tmp.path().join("single.txt");
+    std::fs::write(&file, "before\n").unwrap();
+
+    let ctx = make_ctx(tmp.path());
+    let tool = create_edit_tool(&ctx, EditToolOptions::default());
+    // The agent runtime invokes `prepare_arguments` before `execute`.
+    let prepared = tool.prepare_arguments(json!({
+        "path": "single.txt",
+        "edits": {"oldText": "before", "newText": "after"}
+    }));
+    let result = tool
+        .execute("test", prepared, CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_text(&result),
+        "Successfully replaced 1 block(s) in single.txt."
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\n");
+}
+
 #[tokio::test]
 async fn test_legacy_args_execute() {
     let tmp = TempDir::new();

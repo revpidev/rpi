@@ -339,7 +339,7 @@ fn context_files_injected_byte_exact_into_default_prompt() {
     let prompt = build_system_prompt(&options);
 
     let expected = format!(
-        "BASE\n\nAPPEND\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nglobal rules\n</project_instructions>\n\n<project_instructions path=\"{}\">\nrepo rules\n</project_instructions>\n\n</project_context>\n\nCurrent working directory: {}",
+        "BASE\n\nAPPEND\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"{}\">\nglobal rules\n</project_instructions>\n\n<project_instructions path=\"{}\">\nrepo rules\n</project_instructions>\n\n</project_context>\n\nCurrent working directory: {}\n",
         agent_dir.join("AGENTS.md").display(),
         tmp.path().join("repo/AGENTS.md").display(),
         cwd.display(),

@@ -355,8 +355,10 @@ fn append_project_context(prompt: &mut String, context_files: &[ContextFile]) {
 
 /// `buildSystemPrompt` (system-prompt.ts:28-162): build the system prompt
 /// with tools, guidelines, and context. The skills section is appended only
-/// when the `read` tool is available and [`BuildSystemPromptOptions::skills_xml`]
-/// is non-empty.
+/// when a skill-file-read tool (`read` or `bash`, system-prompt.ts:46,
+/// `1d6dbf9e3` #8552) is among the selected tools and
+/// [`BuildSystemPromptOptions::skills_xml`] is non-empty (the caller
+/// renders that XML for the detected tool).
 pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     // cwd.replace(/\\/g, "/")
     let prompt_cwd = options.cwd.to_string_lossy().replace('\\', "/");
@@ -372,6 +374,16 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
     let skills_xml = options.skills_xml.as_deref().filter(|s| !s.is_empty());
 
+    // Tools list + skill-file-read tool detection (system-prompt.ts:44-46):
+    // `selectedTools || ["read","bash","edit","write"]`, then the first
+    // of ["read","bash"] present in the list gates the skills section.
+    const DEFAULT_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
+    let tools: Vec<&str> = match &options.selected_tools {
+        Some(selected) => selected.iter().map(String::as_str).collect(),
+        None => DEFAULT_TOOLS.to_vec(),
+    };
+    let skill_file_read_tool = ["read", "bash"].iter().find(|tool| tools.contains(tool));
+
     // `if (customPrompt)` — an empty custom prompt falls through to the
     // default branch upstream (empty string is falsy).
     if let Some(custom_prompt) = options.custom_prompt.as_deref().filter(|s| !s.is_empty()) {
@@ -380,29 +392,24 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
         append_project_context(&mut prompt, &options.context_files);
 
-        // Skills section only if the read tool is available.
-        let custom_prompt_has_read = match &options.selected_tools {
-            None => true,
-            Some(tools) => tools.iter().any(|name| name == "read"),
-        };
-        if custom_prompt_has_read {
+        // Skills section only when a skill-file-read tool is available
+        // (system-prompt.ts:66-67, 1d6dbf9e3).
+        if skill_file_read_tool.is_some() {
             if let Some(skills_xml) = skills_xml {
                 prompt.push_str(skills_xml);
             }
         }
 
-        prompt.push_str(&format!("\nCurrent working directory: {prompt_cwd}"));
+        // `3dd4623ee` (#7887): the custom-prompt branch appends a trailing
+        // newline after the cwd line (system-prompt.ts:70) so following
+        // content never sticks to it.
+        prompt.push_str(&format!("\nCurrent working directory: {prompt_cwd}\n"));
         return prompt;
     }
 
     // Build the tools list based on the selected tools. A tool appears in
     // Available tools only when the caller provides a (truthy, i.e.
     // non-empty) one-line snippet.
-    const DEFAULT_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
-    let tools: Vec<&str> = match &options.selected_tools {
-        Some(selected) => selected.iter().map(String::as_str).collect(),
-        None => DEFAULT_TOOLS.to_vec(),
-    };
     let snippet = |name: &str| -> Option<&str> {
         options
             .tool_snippets
@@ -439,7 +446,6 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let has_grep = tools.contains(&"grep");
     let has_find = tools.contains(&"find");
     let has_ls = tools.contains(&"ls");
-    let has_read = tools.contains(&"read");
 
     // File exploration guidelines.
     if has_bash && !has_grep && !has_find && !has_ls {
@@ -478,8 +484,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
     append_project_context(&mut prompt, &options.context_files);
 
-    // Skills section only if the read tool is available.
-    if has_read {
+    // Skills section only when a skill-file-read tool is available
+    // (system-prompt.ts:161-162, 1d6dbf9e3).
+    if skill_file_read_tool.is_some() {
         if let Some(skills_xml) = skills_xml {
             prompt.push_str(skills_xml);
         }
@@ -515,9 +522,10 @@ mod tests {
             ..Default::default()
         };
         let prompt = build_system_prompt(&options);
+        // 3dd4623ee (#7887): custom-prompt cwd line ends with \n.
         assert_eq!(
             prompt,
-            "CUSTOM\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/agent/AGENTS.md\">\nglobal rules\n</project_instructions>\n\n<project_instructions path=\"/repo/AGENTS.md\">\nproject rules\n</project_instructions>\n\n</project_context>\n\nCurrent working directory: /repo"
+            "CUSTOM\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n<project_instructions path=\"/agent/AGENTS.md\">\nglobal rules\n</project_instructions>\n\n<project_instructions path=\"/repo/AGENTS.md\">\nproject rules\n</project_instructions>\n\n</project_context>\n\nCurrent working directory: /repo\n"
         );
     }
 
@@ -530,7 +538,7 @@ mod tests {
         };
         assert_eq!(
             build_system_prompt(&options),
-            "CUSTOM\nCurrent working directory: /repo"
+            "CUSTOM\nCurrent working directory: /repo\n"
         );
     }
 
@@ -625,9 +633,15 @@ mod tests {
             ..Default::default()
         };
         assert!(build_system_prompt(&base).contains("<skills>XML</skills>"));
-        // read not selected → skills dropped (custom branch).
+        // bash also keeps skills discoverable (1d6dbf9e3, #8552).
         let options = BuildSystemPromptOptions {
             selected_tools: Some(vec!["bash".to_string()]),
+            ..base.clone()
+        };
+        assert!(build_system_prompt(&options).contains("<skills>XML</skills>"));
+        // Neither read nor bash selected → skills dropped (custom branch).
+        let options = BuildSystemPromptOptions {
+            selected_tools: Some(vec!["edit".to_string(), "write".to_string()]),
             ..base.clone()
         };
         assert!(!build_system_prompt(&options).contains("<skills>XML</skills>"));
@@ -680,6 +694,16 @@ mod tests {
     fn cwd_backslashes_normalised() {
         let options = BuildSystemPromptOptions {
             custom_prompt: Some("C".to_string()),
+            cwd: PathBuf::from("C:\\Users\\dev"),
+            ..Default::default()
+        };
+        // Custom branch keeps the 3dd4623ee trailing newline.
+        assert!(
+            build_system_prompt(&options).ends_with("Current working directory: C:/Users/dev\n")
+        );
+        // Default branch has no trailing newline (system-prompt.ts:166).
+        let options = BuildSystemPromptOptions {
+            custom_prompt: None,
             cwd: PathBuf::from("C:\\Users\\dev"),
             ..Default::default()
         };

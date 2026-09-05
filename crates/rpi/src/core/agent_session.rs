@@ -1559,15 +1559,28 @@ impl AgentSession {
         };
         let skills = resources.skills.clone();
         let context_files = resources.context_files.clone();
-        let read_active = valid.iter().any(|name| name == "read");
-        let skills_xml = {
-            let xml = crate::core::skills::format_skills_for_prompt(&skills, read_active);
+        // system-prompt.ts:46 + agent-session.ts call site: the first of
+        // ["read","bash"] among the enabled tools picks both whether the
+        // skills section is injected and which instruction line it carries
+        // (1d6dbf9e3, #8552).
+        let skill_file_read_tool = ["read", "bash"]
+            .iter()
+            .find(|tool| valid.iter().any(|name| name == *tool))
+            .map(|tool| {
+                if *tool == "read" {
+                    crate::core::skills::SkillFileReadTool::Read
+                } else {
+                    crate::core::skills::SkillFileReadTool::Bash
+                }
+            });
+        let skills_xml = skill_file_read_tool.and_then(|tool| {
+            let xml = crate::core::skills::format_skills_for_prompt(&skills, tool);
             if xml.is_empty() {
                 None
             } else {
                 Some(xml)
             }
-        };
+        });
         drop(loader);
 
         let options = BuildSystemPromptOptions {

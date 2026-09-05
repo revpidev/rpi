@@ -178,6 +178,13 @@ pub fn random_uuid() -> String {
 mod tests {
     use super::*;
 
+    /// Serializes every test that calls [`uuidv7`] (or pokes `V7_STATE`):
+    /// the generator state is process-global and the sequence-exhaustion
+    /// test deliberately fills it to `MAX_SEQUENCE`, so parallel test threads
+    /// otherwise observe a poisoned window (intermittent ordering/exhaustion
+    /// failures unrelated to the code under test).
+    static TEST_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     const UUID_V7_RE_CHAR_CHECK: fn(&str) -> bool = |id: &str| {
         // ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$
         let parts: Vec<&str> = id.split('-').collect();
@@ -204,12 +211,14 @@ mod tests {
 
     #[test]
     fn uuidv7_matches_upstream_shape() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         let id = uuidv7(None).expect("uuid");
         assert!(UUID_V7_RE_CHAR_CHECK(&id), "not a uuidv7: {id}");
     }
 
     #[test]
     fn uuidv7_is_time_ordered() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         let a = uuidv7(None).expect("uuid");
         let b = uuidv7(None).expect("uuid");
         assert!(a <= b, "uuidv7 must be monotonic: {a} then {b}");
@@ -217,6 +226,7 @@ mod tests {
 
     #[test]
     fn uuidv7_external_timestamp_is_deterministic_and_monotonic() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         // Same supplied timestamp: sequence increments → lexicographic order.
         let a = uuidv7(Some(1_700_000_000_000)).expect("uuid");
         let b = uuidv7(Some(1_700_000_000_000)).expect("uuid");
@@ -227,6 +237,7 @@ mod tests {
 
     #[test]
     fn uuidv7_rejects_out_of_range_timestamp() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         let error = uuidv7(Some(MAX_UUID_V7_TIMESTAMP + 1)).expect_err("out of range");
         assert_eq!(
             error,
@@ -238,6 +249,7 @@ mod tests {
 
     #[test]
     fn uuidv7_sequence_exhaustion_errors_instead_of_wrapping() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         let mut state = V7_STATE.lock().expect("state");
         state.sequence = Some(MAX_SEQUENCE);
         drop(state);
@@ -251,6 +263,7 @@ mod tests {
 
     #[test]
     fn uuidv7_sequence_survives_timestamp_change_without_reset() {
+        let _guard = TEST_SERIALIZE.lock().expect("test lock");
         // The 41-bit sequence never resets on a new millisecond (upstream
         // ef3786544): two calls straddling a timestamp bump still increment.
         let a = uuidv7(Some(1_700_000_000_000)).expect("uuid");

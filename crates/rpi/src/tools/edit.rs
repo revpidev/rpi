@@ -183,9 +183,12 @@ impl AgentTool for EditTool {
 
     /// Legacy shim + JSON string parse (edit.ts:94-118).
     ///
-    /// 1. If `edits` is a JSON string, try to parse it as an array.
-    ///    (Some models — Opus 4.6, GLM-5.1 — send edits as a JSON string.)
-    /// 2. If both top-level `oldText` and `newText` are strings, fold them
+    /// 1. If `edits` is a JSON string, try to parse it as an array or a
+    ///    single edit object.
+    ///    (Some models — Opus 4.6, GLM-5.1 — send edits as a JSON string;
+    ///    others send a single edit object instead of a one-element array.)
+    /// 2. If `edits` is directly a single edit object, wrap it in an array.
+    /// 3. If both top-level `oldText` and `newText` are strings, fold them
     ///    into `edits[]` and remove the top-level fields.
     fn prepare_arguments(&self, args: Value) -> Value {
         let Some(obj) = args.as_object() else {
@@ -194,15 +197,20 @@ impl AgentTool for EditTool {
         };
         let mut map = obj.clone();
 
-        // 1. JSON string edits → array (edit.ts:102-107).
+        // 1/2. JSON string edits → array or single-edit wrap; direct
+        // single-edit object → wrap (edit.ts:114-124, ca21c1686).
         if let Some(edits_val) = map.get("edits") {
             if let Some(edits_str) = edits_val.as_str() {
                 if let Ok(parsed) = serde_json::from_str::<Value>(edits_str) {
                     if parsed.is_array() {
                         map.insert("edits".to_string(), parsed);
+                    } else if is_single_edit_input(&parsed) {
+                        map.insert("edits".to_string(), Value::Array(vec![parsed]));
                     }
                 }
                 // On parse failure, leave `edits` as the original string (silent).
+            } else if is_single_edit_input(edits_val) {
+                map.insert("edits".to_string(), Value::Array(vec![edits_val.clone()]));
             }
         }
 
@@ -379,4 +387,14 @@ impl AgentTool for EditTool {
         })
         .await
     }
+}
+
+/// `isSingleEditInput` (edit.ts:62-69, ca21c1686): a non-array object with
+/// both `oldText` and `newText` as strings.
+fn is_single_edit_input(value: &Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    obj.get("oldText").map(|v| v.is_string()).unwrap_or(false)
+        && obj.get("newText").map(|v| v.is_string()).unwrap_or(false)
 }

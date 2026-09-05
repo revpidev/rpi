@@ -625,4 +625,69 @@ mod tests {
         let result = process_image(&png, "image/png; charset=utf-8", true).unwrap();
         assert_eq!(result.mime_type, "image/png");
     }
+
+    // ---- EXIF orientation ----
+
+    /// Minimal TIFF blob containing only an Orientation field (little-endian).
+    fn make_orientation_tiff(orientation: u16) -> Vec<u8> {
+        let field = exif::Field {
+            tag: exif::Tag::Orientation,
+            ifd_num: exif::In::PRIMARY,
+            value: exif::Value::Short(vec![orientation]),
+        };
+        let mut writer = exif::experimental::Writer::new();
+        writer.push_field(&field);
+        let mut tiff = std::io::Cursor::new(Vec::new());
+        writer.write(&mut tiff, true).unwrap();
+        tiff.into_inner()
+    }
+
+    /// Splice an APP1 segment (marker + length + payload) into `jpeg`
+    /// right after the SOI marker.
+    fn splice_app1(jpeg: &[u8], payload: &[u8]) -> Vec<u8> {
+        assert_eq!(&jpeg[..2], b"\xff\xd8", "SOI");
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&[0xff, 0xe1]);
+        let len = (payload.len() + 2) as u16;
+        out.extend_from_slice(&len.to_be_bytes());
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    /// FR-F (V14-10, #8616 / `c6b00676b`): a non-EXIF APP1 segment (e.g.
+    /// XMP) in front of the EXIF APP1 must not hide the orientation — the
+    /// upstream handwritten parser stopped at the first APP1 and reported
+    /// no EXIF; kamadak-exif (deviation D-011) scans on to the EXIF APP1,
+    /// so the fix surface is covered by this regression pin.
+    #[test]
+    fn test_exif_orientation_after_non_exif_app1() {
+        // Base JPEG (2x1 red).
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(2, 1, Rgb([255, 0, 0]));
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+
+        // XMP APP1 first, then the EXIF APP1 carrying orientation 6.
+        let xmp_payload = b"http://ns.adobe.com/xap/1.0/\0<x:xmpmeta/>";
+        let with_xmp = splice_app1(&jpeg, xmp_payload);
+        let mut exif_payload = b"Exif\0\0".to_vec();
+        exif_payload.extend_from_slice(&make_orientation_tiff(6));
+        let with_both = splice_app1(&with_xmp, &exif_payload);
+
+        // The orientation survives the leading non-EXIF APP1.
+        assert_eq!(read_exif_orientation(&with_both), 6);
+        // Control: XMP-only APP1 reports no orientation.
+        assert_eq!(read_exif_orientation(&with_xmp), 1);
+        // End-to-end: orientation 6 rotates 90° CW → 1x2 becomes 2x1 stays…
+        // the 2x1 source becomes 1x2 after rotation.
+        let decoded = image::load_from_memory(&with_both).unwrap();
+        let rotated = apply_exif_orientation(decoded, &with_both);
+        assert_eq!((rotated.width(), rotated.height()), (1, 2));
+    }
 }

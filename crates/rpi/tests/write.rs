@@ -90,8 +90,8 @@ async fn test_write_byte_count_is_utf16() {
         .unwrap();
 
     if let rpi_ai::types::ToolResultContent::Text(t) = &result.content[0] {
-        // "héllo" has 5 UTF-16 code units
-        assert!(t.text.contains("Successfully wrote 5 bytes to out.txt"));
+        // e583b290a (#8979): the success message no longer reports a count.
+        assert_eq!(t.text, "Successfully wrote to out.txt");
     }
 }
 
@@ -188,7 +188,8 @@ async fn test_write_empty_content() {
         .unwrap();
 
     if let rpi_ai::types::ToolResultContent::Text(t) = &result.content[0] {
-        assert!(t.text.contains("Successfully wrote 0 bytes"));
+        // e583b290a (#8979): no count in the success message.
+        assert_eq!(t.text, "Successfully wrote to empty.txt");
     }
 
     let content = std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap();
