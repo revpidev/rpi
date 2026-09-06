@@ -20,8 +20,11 @@ use crate::tui::{
     TuiMouseHandlerResult, CURSOR_MARKER,
 };
 use crate::undo_stack::UndoStack;
-use crate::utils::{get_grapheme_segmenter, is_whitespace_char, slice_by_column, visible_width};
+use crate::utils::{
+    get_grapheme_segmenter, is_whitespace_char, slice_by_column, truncate_to_width, visible_width,
+};
 use crate::word_navigation::{find_word_backward, find_word_forward};
+use std::sync::Arc;
 
 /// Byte offset of the `chars`-th character in `value`; `chars` == char count
 /// maps to `value.len()`. Cursors are always on char boundaries.
@@ -54,6 +57,22 @@ enum LastAction {
     TypeWord,
 }
 
+/// `InputOptions["placeholderStyle"]` (input.ts:19): styles the
+/// placeholder text.
+pub type PlaceholderStyleFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// `InputOptions` (input.ts:15-19): all fields optional, mirroring
+/// upstream.
+#[derive(Default)]
+pub struct InputOptions {
+    /// `prompt` (default `"> "`, input.ts:50).
+    pub prompt: Option<String>,
+    /// `placeholder` (default `""`, input.ts:51).
+    pub placeholder: Option<String>,
+    /// `placeholderStyle` (default identity, input.ts:52).
+    pub placeholder_style: Option<PlaceholderStyleFn>,
+}
+
 /// Input component — single-line text input with horizontal scrolling
 /// (upstream `Input`, input.ts:19).
 pub struct Input {
@@ -64,6 +83,13 @@ pub struct Input {
     pub on_submit: Option<SubmitFn>,
     /// Called on escape/cancel (upstream `onEscape`).
     pub on_escape: Option<EscapeFn>,
+
+    /// Upstream `readonly prompt` (input.ts:28, options.prompt ?? "> ").
+    prompt: String,
+    /// Upstream `readonly placeholder` (input.ts:29, options.placeholder ?? "").
+    placeholder: String,
+    /// Upstream `readonly placeholderStyle` (input.ts:30).
+    placeholder_style: PlaceholderStyleFn,
 
     /// Focusable interface — set by TUI when focus changes.
     focused: bool,
@@ -87,11 +113,22 @@ pub struct Input {
 
 impl Input {
     pub fn new() -> Self {
+        Self::with_options(InputOptions::default())
+    }
+
+    /// `constructor` with options (input.ts:49-53): prompt/placeholder/
+    /// placeholderStyle with their defaults.
+    pub fn with_options(options: InputOptions) -> Self {
         Self {
             value: String::new(),
             cursor: 0,
             on_submit: None,
             on_escape: None,
+            prompt: options.prompt.unwrap_or_else(|| "> ".to_string()),
+            placeholder: options.placeholder.unwrap_or_default(),
+            placeholder_style: options
+                .placeholder_style
+                .unwrap_or_else(|| Arc::new(|text: &str| text.to_string())),
             focused: false,
             paste_buffer: String::new(),
             is_in_paste: false,
@@ -337,12 +374,31 @@ impl Component for Input {
     }
 
     fn render(&self, width: usize) -> Vec<String> {
-        // Calculate visible window
-        let prompt = "> ";
-        let available_width = width.saturating_sub(prompt.len());
+        // Calculate visible window (`width - visibleWidth(this.prompt)`,
+        // input.ts:414).
+        let prompt_width = visible_width(&self.prompt);
+        let available_width = width.saturating_sub(prompt_width);
 
         if available_width == 0 {
-            return vec![prompt.to_string()];
+            return vec![truncate_to_width(&self.prompt, width, "", false)];
+        }
+
+        // Placeholder rendering when empty (input.ts:420-429): the cursor
+        // sits on the first placeholder grapheme; the whole placeholder is
+        // styled with `placeholderStyle`.
+        if self.value.is_empty() && !self.placeholder.is_empty() {
+            let placeholder = truncate_to_width(&self.placeholder, available_width, "", false);
+            let mut graphemes = get_grapheme_segmenter().segment(&placeholder);
+            let at_cursor = graphemes.next().unwrap_or(" ");
+            let after_cursor = &placeholder[at_cursor.len()..];
+            let marker = if self.focused { CURSOR_MARKER } else { "" };
+            let placeholder_style = &self.placeholder_style;
+            let cursor_char = format!("\x1b[7m{}\x1b[27m", placeholder_style(at_cursor));
+            let text_with_cursor =
+                format!("{marker}{cursor_char}{}", placeholder_style(after_cursor));
+            let padding =
+                " ".repeat(available_width.saturating_sub(visible_width(&text_with_cursor)));
+            return vec![format!("{}{text_with_cursor}{padding}", self.prompt)];
         }
 
         let visible_text: Cow<'_, str>;
@@ -425,7 +481,7 @@ impl Component for Input {
         // Calculate visual width
         let visual_length = visible_width(&text_with_cursor);
         let padding = " ".repeat(available_width.saturating_sub(visual_length));
-        let line = format!("{prompt}{text_with_cursor}{padding}");
+        let line = format!("{}{text_with_cursor}{padding}", self.prompt);
 
         vec![line]
     }

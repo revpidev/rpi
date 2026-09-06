@@ -1,5 +1,16 @@
 {
-  "upstream": "external/pi @ 4181f66 (v0.84.1+), dist build",
+  "upstream": "external/pi @ 9841914 (v0.85.0+), dist build",
+  "meta": {
+    "pendingUpstreamKeys": [
+      "scrollbarTrack",
+      "scrollbarThumb"
+    ],
+    "pendingSplitCases": [
+      "invalid-missing-colors",
+      "invalid-color-value-type",
+      "invalid-name-slash"
+    ]
+  },
   "cases": [
     {
       "name": "vars-and-hex",
@@ -28,6 +39,9 @@
             "mdQuote": "\u001b[38;2;18;52;86m",
             "mdQuoteBorder": "\u001b[38;2;18;52;86m",
             "muted": "\u001b[38;2;18;52;86m",
+            "scrollbarThumb": "\u001b[38;2;18;52;86m",
+            "scrollbarTrack": "\u001b[38;2;18;52;86m",
+            "searchMatchText": "\u001b[38;2;18;52;86m",
             "success": "\u001b[38;5;196m",
             "syntaxComment": "\u001b[38;2;18;52;86m",
             "syntaxFunction": "\u001b[38;2;18;52;86m",
@@ -57,7 +71,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;2;18;52;86m",
-            "scrollbarThumb": "\u001b[48;2;18;52;86m",
+            "searchMatchBg": "\u001b[48;2;18;52;86m",
             "selectedBg": "\u001b[48;2;18;52;86m",
             "toolErrorBg": "\u001b[48;2;18;52;86m",
             "toolPendingBg": "\u001b[48;2;18;52;86m",
@@ -88,6 +102,9 @@
             "mdQuote": "\u001b[38;5;23m",
             "mdQuoteBorder": "\u001b[38;5;23m",
             "muted": "\u001b[38;5;23m",
+            "scrollbarThumb": "\u001b[38;5;23m",
+            "scrollbarTrack": "\u001b[38;5;23m",
+            "searchMatchText": "\u001b[38;5;23m",
             "success": "\u001b[38;5;196m",
             "syntaxComment": "\u001b[38;5;23m",
             "syntaxFunction": "\u001b[38;5;23m",
@@ -117,7 +134,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;5;23m",
-            "scrollbarThumb": "\u001b[48;5;23m",
+            "searchMatchBg": "\u001b[48;5;23m",
             "selectedBg": "\u001b[48;5;23m",
             "toolErrorBg": "\u001b[48;5;23m",
             "toolPendingBg": "\u001b[48;5;23m",
@@ -154,6 +171,9 @@
             "mdQuote": "\u001b[38;5;0m",
             "mdQuoteBorder": "\u001b[38;5;0m",
             "muted": "\u001b[38;5;0m",
+            "scrollbarThumb": "\u001b[38;5;0m",
+            "scrollbarTrack": "\u001b[38;5;0m",
+            "searchMatchText": "\u001b[38;5;0m",
             "success": "\u001b[38;5;232m",
             "syntaxComment": "\u001b[38;5;0m",
             "syntaxFunction": "\u001b[38;5;0m",
@@ -183,7 +203,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;5;0m",
-            "scrollbarThumb": "\u001b[48;5;0m",
+            "searchMatchBg": "\u001b[48;5;0m",
             "selectedBg": "\u001b[48;5;0m",
             "toolErrorBg": "\u001b[48;5;0m",
             "toolPendingBg": "\u001b[48;5;0m",
@@ -214,6 +234,9 @@
             "mdQuote": "\u001b[38;5;0m",
             "mdQuoteBorder": "\u001b[38;5;0m",
             "muted": "\u001b[38;5;0m",
+            "scrollbarThumb": "\u001b[38;5;0m",
+            "scrollbarTrack": "\u001b[38;5;0m",
+            "searchMatchText": "\u001b[38;5;0m",
             "success": "\u001b[38;5;232m",
             "syntaxComment": "\u001b[38;5;0m",
             "syntaxFunction": "\u001b[38;5;0m",
@@ -243,7 +266,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;5;0m",
-            "scrollbarThumb": "\u001b[48;5;0m",
+            "searchMatchBg": "\u001b[48;5;0m",
             "selectedBg": "\u001b[48;5;0m",
             "toolErrorBg": "\u001b[48;5;0m",
             "toolPendingBg": "\u001b[48;5;0m",
@@ -280,6 +303,9 @@
             "mdQuote": "\u001b[39m",
             "mdQuoteBorder": "\u001b[39m",
             "muted": "\u001b[39m",
+            "scrollbarThumb": "\u001b[39m",
+            "scrollbarTrack": "\u001b[39m",
+            "searchMatchText": "\u001b[39m",
             "success": "\u001b[39m",
             "syntaxComment": "\u001b[39m",
             "syntaxFunction": "\u001b[39m",
@@ -309,7 +335,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[49m",
-            "scrollbarThumb": "\u001b[49m",
+            "searchMatchBg": "\u001b[49m",
             "selectedBg": "\u001b[49m",
             "toolErrorBg": "\u001b[49m",
             "toolPendingBg": "\u001b[49m",
@@ -340,6 +366,9 @@
             "mdQuote": "\u001b[39m",
             "mdQuoteBorder": "\u001b[39m",
             "muted": "\u001b[39m",
+            "scrollbarThumb": "\u001b[39m",
+            "scrollbarTrack": "\u001b[39m",
+            "searchMatchText": "\u001b[39m",
             "success": "\u001b[39m",
             "syntaxComment": "\u001b[39m",
             "syntaxFunction": "\u001b[39m",
@@ -369,7 +398,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[49m",
-            "scrollbarThumb": "\u001b[49m",
+            "searchMatchBg": "\u001b[49m",
             "selectedBg": "\u001b[49m",
             "toolErrorBg": "\u001b[49m",
             "toolPendingBg": "\u001b[49m",
@@ -406,6 +435,9 @@
             "mdQuote": "\u001b[38;2;16;16;16m",
             "mdQuoteBorder": "\u001b[38;2;16;16;16m",
             "muted": "\u001b[38;2;16;16;16m",
+            "scrollbarThumb": "\u001b[38;2;16;16;16m",
+            "scrollbarTrack": "\u001b[38;2;16;16;16m",
+            "searchMatchText": "\u001b[38;2;16;16;16m",
             "success": "\u001b[38;2;16;16;16m",
             "syntaxComment": "\u001b[38;2;16;16;16m",
             "syntaxFunction": "\u001b[38;2;16;16;16m",
@@ -435,7 +467,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;2;16;16;16m",
-            "scrollbarThumb": "\u001b[48;2;16;16;16m",
+            "searchMatchBg": "\u001b[48;2;16;16;16m",
             "selectedBg": "\u001b[48;2;16;16;16m",
             "toolErrorBg": "\u001b[48;2;16;16;16m",
             "toolPendingBg": "\u001b[48;2;16;16;16m",
@@ -466,6 +498,9 @@
             "mdQuote": "\u001b[38;5;233m",
             "mdQuoteBorder": "\u001b[38;5;233m",
             "muted": "\u001b[38;5;233m",
+            "scrollbarThumb": "\u001b[38;5;233m",
+            "scrollbarTrack": "\u001b[38;5;233m",
+            "searchMatchText": "\u001b[38;5;233m",
             "success": "\u001b[38;5;233m",
             "syntaxComment": "\u001b[38;5;233m",
             "syntaxFunction": "\u001b[38;5;233m",
@@ -495,7 +530,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;5;233m",
-            "scrollbarThumb": "\u001b[48;5;233m",
+            "searchMatchBg": "\u001b[48;5;233m",
             "selectedBg": "\u001b[48;5;233m",
             "toolErrorBg": "\u001b[48;5;233m",
             "toolPendingBg": "\u001b[48;5;233m",
@@ -532,6 +567,9 @@
             "mdQuote": "\u001b[38;2;16;16;16m",
             "mdQuoteBorder": "\u001b[38;2;16;16;16m",
             "muted": "\u001b[38;2;16;16;16m",
+            "scrollbarThumb": "\u001b[38;2;16;16;16m",
+            "scrollbarTrack": "\u001b[38;2;16;16;16m",
+            "searchMatchText": "\u001b[38;2;16;16;16m",
             "success": "\u001b[38;2;16;16;16m",
             "syntaxComment": "\u001b[38;2;16;16;16m",
             "syntaxFunction": "\u001b[38;2;16;16;16m",
@@ -561,7 +599,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;2;16;16;16m",
-            "scrollbarThumb": "\u001b[48;2;16;16;16m",
+            "searchMatchBg": "\u001b[48;2;16;16;16m",
             "selectedBg": "\u001b[48;2;16;16;16m",
             "toolErrorBg": "\u001b[48;2;16;16;16m",
             "toolPendingBg": "\u001b[48;2;16;16;16m",
@@ -592,6 +630,9 @@
             "mdQuote": "\u001b[38;5;233m",
             "mdQuoteBorder": "\u001b[38;5;233m",
             "muted": "\u001b[38;5;233m",
+            "scrollbarThumb": "\u001b[38;5;233m",
+            "scrollbarTrack": "\u001b[38;5;233m",
+            "searchMatchText": "\u001b[38;5;233m",
             "success": "\u001b[38;5;233m",
             "syntaxComment": "\u001b[38;5;233m",
             "syntaxFunction": "\u001b[38;5;233m",
@@ -621,7 +662,7 @@
           },
           "bgColors": {
             "customMessageBg": "\u001b[48;5;233m",
-            "scrollbarThumb": "\u001b[48;5;233m",
+            "searchMatchBg": "\u001b[48;5;233m",
             "selectedBg": "\u001b[48;5;233m",
             "toolErrorBg": "\u001b[48;5;233m",
             "toolPendingBg": "\u001b[48;5;233m",
@@ -636,10 +677,10 @@
       "expected": {
         "content": "{\n  \"name\": \"invalid-missing-colors\",\n  \"colors\": {\n    \"accent\": \"#123456\",\n    \"border\": 7\n  }\n}",
         "truecolor": {
-          "error": "Invalid theme \"<path>/invalid-missing-colors.json\":\n\nMissing required color tokens:\n  - bashMode\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values."
+          "error": "Cannot read properties of undefined (reading 'startsWith')"
         },
         "256color": {
-          "error": "Invalid theme \"<path>/invalid-missing-colors.json\":\n\nMissing required color tokens:\n  - bashMode\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values."
+          "error": "Cannot read properties of undefined (reading 'startsWith')"
         }
       }
     },
@@ -648,13 +689,13 @@
       "expected": {
         "content": "{\n  \"name\": \"invalid-color-value-type\",\n  \"colors\": {\n    \"accent\": 256,\n    \"border\": true,\n    \"borderAccent\": \"#123456\",\n    \"borderMuted\": \"#123456\",\n    \"success\": \"#123456\",\n    \"error\": \"#123456\",\n    \"warning\": \"#123456\",\n    \"muted\": \"#123456\",\n    \"dim\": \"#123456\",\n    \"text\": \"#123456\",\n    \"thinkingText\": \"#123456\",\n    \"selectedBg\": \"#123456\",\n    \"userMessageBg\": \"#123456\",\n    \"userMessageText\": \"#123456\",\n    \"customMessageBg\": \"#123456\",\n    \"customMessageText\": \"#123456\",\n    \"customMessageLabel\": \"#123456\",\n    \"toolPendingBg\": \"#123456\",\n    \"toolSuccessBg\": \"#123456\",\n    \"toolErrorBg\": \"#123456\",\n    \"toolTitle\": \"#123456\",\n    \"toolOutput\": \"#123456\",\n    \"mdHeading\": \"#123456\",\n    \"mdLink\": \"#123456\",\n    \"mdLinkUrl\": \"#123456\",\n    \"mdCode\": \"#123456\",\n    \"mdCodeBlock\": \"#123456\",\n    \"mdCodeBlockBorder\": \"#123456\",\n    \"mdQuote\": \"#123456\",\n    \"mdQuoteBorder\": \"#123456\",\n    \"mdHr\": \"#123456\",\n    \"mdListBullet\": \"#123456\",\n    \"toolDiffAdded\": \"#123456\",\n    \"toolDiffRemoved\": \"#123456\",\n    \"toolDiffContext\": \"#123456\",\n    \"syntaxComment\": \"#123456\",\n    \"syntaxKeyword\": \"#123456\",\n    \"syntaxFunction\": \"#123456\",\n    \"syntaxVariable\": \"#123456\",\n    \"syntaxString\": \"#123456\",\n    \"syntaxNumber\": \"#123456\",\n    \"syntaxType\": \"#123456\",\n    \"syntaxOperator\": \"#123456\",\n    \"syntaxPunctuation\": \"#123456\",\n    \"thinkingOff\": \"#123456\",\n    \"thinkingMinimal\": \"#123456\",\n    \"thinkingLow\": \"#123456\",\n    \"thinkingMedium\": \"#123456\",\n    \"thinkingHigh\": \"#123456\",\n    \"thinkingXhigh\": \"#123456\",\n    \"bashMode\": \"#123456\"\n  }\n}",
         "truecolor": {
-          "errorPrefix": "Invalid theme \"<path>/invalid-color-value-type.json\":",
+          "errorPrefix": "value.startsWith is not a function",
           "errorContains": [
             "Other errors:"
           ]
         },
         "256color": {
-          "errorPrefix": "Invalid theme \"<path>/invalid-color-value-type.json\":",
+          "errorPrefix": "value.startsWith is not a function",
           "errorContains": [
             "Other errors:"
           ]
@@ -690,10 +731,130 @@
       "expected": {
         "content": "{\n  \"name\": \"foo/bar\",\n  \"colors\": {\n    \"accent\": \"#123456\",\n    \"border\": \"#123456\",\n    \"borderAccent\": \"#123456\",\n    \"borderMuted\": \"#123456\",\n    \"success\": \"#123456\",\n    \"error\": \"#123456\",\n    \"warning\": \"#123456\",\n    \"muted\": \"#123456\",\n    \"dim\": \"#123456\",\n    \"text\": \"#123456\",\n    \"thinkingText\": \"#123456\",\n    \"selectedBg\": \"#123456\",\n    \"userMessageBg\": \"#123456\",\n    \"userMessageText\": \"#123456\",\n    \"customMessageBg\": \"#123456\",\n    \"customMessageText\": \"#123456\",\n    \"customMessageLabel\": \"#123456\",\n    \"toolPendingBg\": \"#123456\",\n    \"toolSuccessBg\": \"#123456\",\n    \"toolErrorBg\": \"#123456\",\n    \"toolTitle\": \"#123456\",\n    \"toolOutput\": \"#123456\",\n    \"mdHeading\": \"#123456\",\n    \"mdLink\": \"#123456\",\n    \"mdLinkUrl\": \"#123456\",\n    \"mdCode\": \"#123456\",\n    \"mdCodeBlock\": \"#123456\",\n    \"mdCodeBlockBorder\": \"#123456\",\n    \"mdQuote\": \"#123456\",\n    \"mdQuoteBorder\": \"#123456\",\n    \"mdHr\": \"#123456\",\n    \"mdListBullet\": \"#123456\",\n    \"toolDiffAdded\": \"#123456\",\n    \"toolDiffRemoved\": \"#123456\",\n    \"toolDiffContext\": \"#123456\",\n    \"syntaxComment\": \"#123456\",\n    \"syntaxKeyword\": \"#123456\",\n    \"syntaxFunction\": \"#123456\",\n    \"syntaxVariable\": \"#123456\",\n    \"syntaxString\": \"#123456\",\n    \"syntaxNumber\": \"#123456\",\n    \"syntaxType\": \"#123456\",\n    \"syntaxOperator\": \"#123456\",\n    \"syntaxPunctuation\": \"#123456\",\n    \"thinkingOff\": \"#123456\",\n    \"thinkingMinimal\": \"#123456\",\n    \"thinkingLow\": \"#123456\",\n    \"thinkingMedium\": \"#123456\",\n    \"thinkingHigh\": \"#123456\",\n    \"thinkingXhigh\": \"#123456\",\n    \"bashMode\": \"#123456\"\n  }\n}",
         "truecolor": {
-          "error": "Invalid theme name \"foo/bar\": theme names cannot contain \"/\" because it is reserved for automatic light/dark theme settings."
+          "name": "foo/bar",
+          "fgColors": {
+            "accent": "\u001b[38;2;18;52;86m",
+            "bashMode": "\u001b[38;2;18;52;86m",
+            "border": "\u001b[38;2;18;52;86m",
+            "borderAccent": "\u001b[38;2;18;52;86m",
+            "borderMuted": "\u001b[38;2;18;52;86m",
+            "customMessageLabel": "\u001b[38;2;18;52;86m",
+            "customMessageText": "\u001b[38;2;18;52;86m",
+            "dim": "\u001b[38;2;18;52;86m",
+            "error": "\u001b[38;2;18;52;86m",
+            "mdCode": "\u001b[38;2;18;52;86m",
+            "mdCodeBlock": "\u001b[38;2;18;52;86m",
+            "mdCodeBlockBorder": "\u001b[38;2;18;52;86m",
+            "mdHeading": "\u001b[38;2;18;52;86m",
+            "mdHr": "\u001b[38;2;18;52;86m",
+            "mdLink": "\u001b[38;2;18;52;86m",
+            "mdLinkUrl": "\u001b[38;2;18;52;86m",
+            "mdListBullet": "\u001b[38;2;18;52;86m",
+            "mdQuote": "\u001b[38;2;18;52;86m",
+            "mdQuoteBorder": "\u001b[38;2;18;52;86m",
+            "muted": "\u001b[38;2;18;52;86m",
+            "scrollbarThumb": "\u001b[38;2;18;52;86m",
+            "scrollbarTrack": "\u001b[38;2;18;52;86m",
+            "searchMatchText": "\u001b[38;2;18;52;86m",
+            "success": "\u001b[38;2;18;52;86m",
+            "syntaxComment": "\u001b[38;2;18;52;86m",
+            "syntaxFunction": "\u001b[38;2;18;52;86m",
+            "syntaxKeyword": "\u001b[38;2;18;52;86m",
+            "syntaxNumber": "\u001b[38;2;18;52;86m",
+            "syntaxOperator": "\u001b[38;2;18;52;86m",
+            "syntaxPunctuation": "\u001b[38;2;18;52;86m",
+            "syntaxString": "\u001b[38;2;18;52;86m",
+            "syntaxType": "\u001b[38;2;18;52;86m",
+            "syntaxVariable": "\u001b[38;2;18;52;86m",
+            "text": "\u001b[38;2;18;52;86m",
+            "thinkingHigh": "\u001b[38;2;18;52;86m",
+            "thinkingLow": "\u001b[38;2;18;52;86m",
+            "thinkingMax": "\u001b[38;2;18;52;86m",
+            "thinkingMedium": "\u001b[38;2;18;52;86m",
+            "thinkingMinimal": "\u001b[38;2;18;52;86m",
+            "thinkingOff": "\u001b[38;2;18;52;86m",
+            "thinkingText": "\u001b[38;2;18;52;86m",
+            "thinkingXhigh": "\u001b[38;2;18;52;86m",
+            "toolDiffAdded": "\u001b[38;2;18;52;86m",
+            "toolDiffContext": "\u001b[38;2;18;52;86m",
+            "toolDiffRemoved": "\u001b[38;2;18;52;86m",
+            "toolOutput": "\u001b[38;2;18;52;86m",
+            "toolTitle": "\u001b[38;2;18;52;86m",
+            "userMessageText": "\u001b[38;2;18;52;86m",
+            "warning": "\u001b[38;2;18;52;86m"
+          },
+          "bgColors": {
+            "customMessageBg": "\u001b[48;2;18;52;86m",
+            "searchMatchBg": "\u001b[48;2;18;52;86m",
+            "selectedBg": "\u001b[48;2;18;52;86m",
+            "toolErrorBg": "\u001b[48;2;18;52;86m",
+            "toolPendingBg": "\u001b[48;2;18;52;86m",
+            "toolSuccessBg": "\u001b[48;2;18;52;86m",
+            "userMessageBg": "\u001b[48;2;18;52;86m"
+          }
         },
         "256color": {
-          "error": "Invalid theme name \"foo/bar\": theme names cannot contain \"/\" because it is reserved for automatic light/dark theme settings."
+          "name": "foo/bar",
+          "fgColors": {
+            "accent": "\u001b[38;5;23m",
+            "bashMode": "\u001b[38;5;23m",
+            "border": "\u001b[38;5;23m",
+            "borderAccent": "\u001b[38;5;23m",
+            "borderMuted": "\u001b[38;5;23m",
+            "customMessageLabel": "\u001b[38;5;23m",
+            "customMessageText": "\u001b[38;5;23m",
+            "dim": "\u001b[38;5;23m",
+            "error": "\u001b[38;5;23m",
+            "mdCode": "\u001b[38;5;23m",
+            "mdCodeBlock": "\u001b[38;5;23m",
+            "mdCodeBlockBorder": "\u001b[38;5;23m",
+            "mdHeading": "\u001b[38;5;23m",
+            "mdHr": "\u001b[38;5;23m",
+            "mdLink": "\u001b[38;5;23m",
+            "mdLinkUrl": "\u001b[38;5;23m",
+            "mdListBullet": "\u001b[38;5;23m",
+            "mdQuote": "\u001b[38;5;23m",
+            "mdQuoteBorder": "\u001b[38;5;23m",
+            "muted": "\u001b[38;5;23m",
+            "scrollbarThumb": "\u001b[38;5;23m",
+            "scrollbarTrack": "\u001b[38;5;23m",
+            "searchMatchText": "\u001b[38;5;23m",
+            "success": "\u001b[38;5;23m",
+            "syntaxComment": "\u001b[38;5;23m",
+            "syntaxFunction": "\u001b[38;5;23m",
+            "syntaxKeyword": "\u001b[38;5;23m",
+            "syntaxNumber": "\u001b[38;5;23m",
+            "syntaxOperator": "\u001b[38;5;23m",
+            "syntaxPunctuation": "\u001b[38;5;23m",
+            "syntaxString": "\u001b[38;5;23m",
+            "syntaxType": "\u001b[38;5;23m",
+            "syntaxVariable": "\u001b[38;5;23m",
+            "text": "\u001b[38;5;23m",
+            "thinkingHigh": "\u001b[38;5;23m",
+            "thinkingLow": "\u001b[38;5;23m",
+            "thinkingMax": "\u001b[38;5;23m",
+            "thinkingMedium": "\u001b[38;5;23m",
+            "thinkingMinimal": "\u001b[38;5;23m",
+            "thinkingOff": "\u001b[38;5;23m",
+            "thinkingText": "\u001b[38;5;23m",
+            "thinkingXhigh": "\u001b[38;5;23m",
+            "toolDiffAdded": "\u001b[38;5;23m",
+            "toolDiffContext": "\u001b[38;5;23m",
+            "toolDiffRemoved": "\u001b[38;5;23m",
+            "toolOutput": "\u001b[38;5;23m",
+            "toolTitle": "\u001b[38;5;23m",
+            "userMessageText": "\u001b[38;5;23m",
+            "warning": "\u001b[38;5;23m"
+          },
+          "bgColors": {
+            "customMessageBg": "\u001b[48;5;23m",
+            "searchMatchBg": "\u001b[48;5;23m",
+            "selectedBg": "\u001b[48;5;23m",
+            "toolErrorBg": "\u001b[48;5;23m",
+            "toolPendingBg": "\u001b[48;5;23m",
+            "toolSuccessBg": "\u001b[48;5;23m",
+            "userMessageBg": "\u001b[48;5;23m"
+          }
         }
       }
     },
@@ -735,7 +896,10 @@
       "mdQuote": "#808080",
       "mdQuoteBorder": "#808080",
       "muted": "#808080",
-      "scrollbarThumb": "#3a3a4a",
+      "scrollbarThumb": "#d4d4d4",
+      "scrollbarTrack": "#505050",
+      "searchMatchBg": "#3a3a4a",
+      "searchMatchText": "#d4d4d4",
       "selectedBg": "#3a3a4a",
       "success": "#b5bd68",
       "syntaxComment": "#6A9955",
@@ -790,7 +954,10 @@
       "mdQuote": "#6c6c6c",
       "mdQuoteBorder": "#6c6c6c",
       "muted": "#6c6c6c",
-      "scrollbarThumb": "#d0d0e0",
+      "scrollbarThumb": "#1f2328",
+      "scrollbarTrack": "#b0b0b0",
+      "searchMatchBg": "#d0d0e0",
+      "searchMatchText": "#1f2328",
       "selectedBg": "#d0d0e0",
       "success": "#588458",
       "syntaxComment": "#008000",

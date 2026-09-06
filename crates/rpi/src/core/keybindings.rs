@@ -2,14 +2,14 @@
 //! `packages/coding-agent/src/core/keybindings.ts` @ pi 0.82.1 (2efa728)
 //! and `packages/tui/src/keybindings.ts`.
 //!
-//! Provides the full keybinding definitions table (83 namespace ids), the
+//! Provides the full keybinding definitions table (90 namespace ids), the
 //! legacy-name migration table (59 entries), config-file loading with
 //! migration, conflict detection, and the [`KeybindingsManager`] that merges
-//! defaults with user overrides. The 41
+//! defaults with user overrides. The 47
 //! `tui.editor.*`/`tui.input.*`/`tui.select.*`/`tui.altScreen.*`
-//! defaults track `packages/tui/src/keybindings.ts` @ 4181f66 (b0d382e25 +
+//! defaults track `packages/tui/src/keybindings.ts` @ 9841914 (b0d382e25 +
 //! 16ad96ae8: ctrl+home/end/pageUp/pageDown aliases and the unbound-by-default
-//! `historyPrevious`/`historyNext` actions; the 8 `tui.altScreen.*` actions,
+//! `historyPrevious`/`historyNext` actions; the 14 `tui.altScreen.*` actions,
 //! T31).
 //!
 //! Intentional differences:
@@ -209,7 +209,7 @@ pub fn migrate_key_name(key: &str) -> &str {
 }
 
 // ===========================================================================
-// Keybinding Definitions (83 = 41 tui.* + 42 app.*)
+// Keybinding Definitions (90 = 47 tui.* + 43 app.*)
 // ===========================================================================
 
 static DEFINITIONS: OnceLock<Vec<(String, KeybindingDefinition)>> = OnceLock::new();
@@ -224,10 +224,10 @@ fn m(keys: &[&'static str]) -> KeyBindingValue {
     KeyBindingValue::Multiple(keys.iter().map(|k| k.to_string()).collect())
 }
 
-/// Build the full definitions table (83 entries, platform-specific defaults).
+/// Build the full definitions table (90 entries, platform-specific defaults).
 ///
-/// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:65-180
-/// @ 4181f66 + coding-agent/src/core/keybindings.ts:64-207).
+/// Order matches upstream `KEYBINDINGS` definition order (tui/src/keybindings.ts:65-216
+/// @ 9841914 + coding-agent/src/core/keybindings.ts:64-207).
 fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
     vec![
         // ---- tui.editor.* (23) ----
@@ -348,9 +348,11 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             m(&["escape", "ctrl+c"]),
             "Cancel selection",
         ),
-        // ---- tui.altScreen.* (8) ----
+        // ---- tui.altScreen.* (14) ----
         // These intentionally shadow the unmodified editor bindings in
         // fullscreen mode (tui/src/keybindings.ts:153 @ 4181f66).
+        // lineUp/lineDown + search family arrive @ 9841914 (1279952de,
+        // 00121ed99).
         (
             "tui.altScreen.pageUp",
             s("pageUp"),
@@ -372,6 +374,16 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             "Scroll viewport down half a page",
         ),
         (
+            "tui.altScreen.lineUp",
+            m(&[]),
+            "Scroll viewport up one line",
+        ),
+        (
+            "tui.altScreen.lineDown",
+            m(&[]),
+            "Scroll viewport down one line",
+        ),
+        (
             "tui.altScreen.previousPrompt",
             alt_screen_previous_prompt_default(),
             "Jump to previous semantic prompt",
@@ -380,6 +392,26 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             "tui.altScreen.nextPrompt",
             alt_screen_next_prompt_default(),
             "Jump to next semantic prompt",
+        ),
+        (
+            "tui.altScreen.search",
+            alt_screen_search_default(),
+            "Search the primary scroll view",
+        ),
+        (
+            "tui.altScreen.searchNext",
+            m(&["enter", "ctrl+g"]),
+            "Select the next search match",
+        ),
+        (
+            "tui.altScreen.searchPrevious",
+            m(&["shift+enter", "ctrl+shift+g"]),
+            "Select the previous search match",
+        ),
+        (
+            "tui.altScreen.searchClose",
+            s("escape"),
+            "Close transcript search",
         ),
         ("tui.altScreen.top", s("home"), "Scroll viewport to top"),
         (
@@ -596,6 +628,16 @@ fn alt_screen_next_prompt_default() -> KeyBindingValue {
         s("ctrl+down")
     } else {
         m(&["ctrl+shift+down", "ctrl+down"])
+    }
+}
+
+/// `tui.altScreen.search` (keybindings.ts:90-92 @ 9841914, 00121ed99 /
+/// 27b7a626d): windows/WSL `ctrl+f`; otherwise `ctrl+shift+f`.
+fn alt_screen_search_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("ctrl+f")
+    } else {
+        s("ctrl+shift+f")
     }
 }
 
@@ -992,9 +1034,9 @@ mod tests {
     #[test]
     fn test_definitions_count() {
         let defs = keybinding_definitions();
-        // 83 → 84: `app.thinking.save` added (keybindings.ts:101-104 @
-        // 2ff8ba622).
-        assert_eq!(defs.len(), 84, "expected 84 keybinding definitions");
+        // 84 → 90: search family + lineUp/lineDown added (tui/src/
+        // keybindings.ts @ 9841914, 00121ed99 / 1279952de).
+        assert_eq!(defs.len(), 90, "expected 90 keybinding definitions");
     }
 
     #[test]
@@ -1422,6 +1464,37 @@ mod windows_wsl_tests {
             alt_screen_next_prompt_default(),
             m(&["ctrl+shift+down", "ctrl+down"])
         );
+        // V14-15 (00121ed99 / 27b7a626d, coding-agent keybindings.ts:90-92):
+        // fullscreen search is ctrl+f on windows/WSL, ctrl+shift+f elsewhere
+        // (docs/keybindings.md TUI Fullscreen Viewport 对拍)。
+        assert_eq!(alt_screen_search_default(), s("ctrl+shift+f"));
+    }
+
+    #[test]
+    fn alt_screen_search_family_defaults_match_upstream_docs() {
+        // docs/keybindings.md TUI Fullscreen Viewport 节逐项对拍
+        // (tui/src/keybindings.ts:192-207 @ 9841914, 00121ed99)。
+        let defs = keybinding_definitions();
+        let find = |name: &str| {
+            defs.iter()
+                .find(|(id, _)| id == name)
+                .map(|(_, definition)| &definition.default_keys)
+                .unwrap_or_else(|| panic!("{name} defined"))
+        };
+        if production_use_windows_keybindings() {
+            assert_eq!(find("tui.altScreen.search"), &s("ctrl+f"));
+        } else {
+            assert_eq!(find("tui.altScreen.search"), &s("ctrl+shift+f"));
+        }
+        assert_eq!(find("tui.altScreen.searchNext"), &m(&["enter", "ctrl+g"]));
+        assert_eq!(
+            find("tui.altScreen.searchPrevious"),
+            &m(&["shift+enter", "ctrl+shift+g"])
+        );
+        assert_eq!(find("tui.altScreen.searchClose"), &s("escape"));
+        // 1279952de: unbound by default.
+        assert_eq!(find("tui.altScreen.lineUp"), &m(&[]));
+        assert_eq!(find("tui.altScreen.lineDown"), &m(&[]));
     }
 
     #[test]

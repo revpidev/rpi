@@ -111,21 +111,28 @@ pub enum Keybinding {
     SelectPageDown,
     SelectConfirm,
     SelectCancel,
-    // Alternate-screen viewport navigation (keybindings.ts:45-52 @ 4181f66)
+    // Alternate-screen viewport navigation (keybindings.ts:45-58 @ 9841914:
+    // lineUp/lineDown from 1279952de, search family from 00121ed99)
     AltScreenPageUp,
     AltScreenPageDown,
     AltScreenHalfPageUp,
     AltScreenHalfPageDown,
+    AltScreenLineUp,
+    AltScreenLineDown,
     AltScreenPreviousPrompt,
     AltScreenNextPrompt,
+    AltScreenSearch,
+    AltScreenSearchNext,
+    AltScreenSearchPrevious,
+    AltScreenSearchClose,
     AltScreenTop,
     AltScreenBottom,
 }
 
 impl Keybinding {
-    /// All 41 keybinding ids, in interface order (keybindings.ts:7-52
-    /// @ 4181f66).
-    pub const ALL: [Keybinding; 41] = [
+    /// All 47 keybinding ids, in interface order (keybindings.ts:7-58
+    /// @ 9841914).
+    pub const ALL: [Keybinding; 47] = [
         Self::EditorCursorUp,
         Self::EditorCursorDown,
         Self::EditorHistoryPrevious,
@@ -163,8 +170,14 @@ impl Keybinding {
         Self::AltScreenPageDown,
         Self::AltScreenHalfPageUp,
         Self::AltScreenHalfPageDown,
+        Self::AltScreenLineUp,
+        Self::AltScreenLineDown,
         Self::AltScreenPreviousPrompt,
         Self::AltScreenNextPrompt,
+        Self::AltScreenSearch,
+        Self::AltScreenSearchNext,
+        Self::AltScreenSearchPrevious,
+        Self::AltScreenSearchClose,
         Self::AltScreenTop,
         Self::AltScreenBottom,
     ];
@@ -210,8 +223,14 @@ impl Keybinding {
             Self::AltScreenPageDown => "tui.altScreen.pageDown",
             Self::AltScreenHalfPageUp => "tui.altScreen.halfPageUp",
             Self::AltScreenHalfPageDown => "tui.altScreen.halfPageDown",
+            Self::AltScreenLineUp => "tui.altScreen.lineUp",
+            Self::AltScreenLineDown => "tui.altScreen.lineDown",
             Self::AltScreenPreviousPrompt => "tui.altScreen.previousPrompt",
             Self::AltScreenNextPrompt => "tui.altScreen.nextPrompt",
+            Self::AltScreenSearch => "tui.altScreen.search",
+            Self::AltScreenSearchNext => "tui.altScreen.searchNext",
+            Self::AltScreenSearchPrevious => "tui.altScreen.searchPrevious",
+            Self::AltScreenSearchClose => "tui.altScreen.searchClose",
             Self::AltScreenTop => "tui.altScreen.top",
             Self::AltScreenBottom => "tui.altScreen.bottom",
         }
@@ -259,8 +278,14 @@ impl Keybinding {
             "tui.altScreen.pageDown" => Self::AltScreenPageDown,
             "tui.altScreen.halfPageUp" => Self::AltScreenHalfPageUp,
             "tui.altScreen.halfPageDown" => Self::AltScreenHalfPageDown,
+            "tui.altScreen.lineUp" => Self::AltScreenLineUp,
+            "tui.altScreen.lineDown" => Self::AltScreenLineDown,
             "tui.altScreen.previousPrompt" => Self::AltScreenPreviousPrompt,
             "tui.altScreen.nextPrompt" => Self::AltScreenNextPrompt,
+            "tui.altScreen.search" => Self::AltScreenSearch,
+            "tui.altScreen.searchNext" => Self::AltScreenSearchNext,
+            "tui.altScreen.searchPrevious" => Self::AltScreenSearchPrevious,
+            "tui.altScreen.searchClose" => Self::AltScreenSearchClose,
             "tui.altScreen.top" => Self::AltScreenTop,
             "tui.altScreen.bottom" => Self::AltScreenBottom,
             _ => return None,
@@ -609,9 +634,12 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
             multiple(&["escape", "ctrl+c"]),
             "Cancel selection",
         ),
-        // ---- tui.altScreen.* (8) ----
+        // ---- tui.altScreen.* (14) ----
         // These intentionally shadow the unmodified editor bindings in
-        // fullscreen mode (keybindings.ts:153 @ 4181f66).
+        // fullscreen mode (keybindings.ts:153 @ 4181f66). lineUp/lineDown
+        // (1279952de) and the search family (00121ed99) arrive @ 9841914;
+        // previousPrompt/nextPrompt gained their second `ctrl+up`/`ctrl+down`
+        // binding with 27b7a626d.
         entry(
             "tui.altScreen.pageUp",
             single("pageUp"),
@@ -633,14 +661,44 @@ fn build_tui_keybindings() -> Vec<(String, KeybindingDefinition)> {
             "Scroll viewport down half a page",
         ),
         entry(
+            "tui.altScreen.lineUp",
+            multiple(&[]),
+            "Scroll viewport up one line",
+        ),
+        entry(
+            "tui.altScreen.lineDown",
+            multiple(&[]),
+            "Scroll viewport down one line",
+        ),
+        entry(
             "tui.altScreen.previousPrompt",
-            single("ctrl+shift+up"),
+            multiple(&["ctrl+shift+up", "ctrl+up"]),
             "Jump to previous semantic prompt",
         ),
         entry(
             "tui.altScreen.nextPrompt",
-            single("ctrl+shift+down"),
+            multiple(&["ctrl+shift+down", "ctrl+down"]),
             "Jump to next semantic prompt",
+        ),
+        entry(
+            "tui.altScreen.search",
+            single("ctrl+shift+f"),
+            "Search the primary scroll view",
+        ),
+        entry(
+            "tui.altScreen.searchNext",
+            multiple(&["enter", "ctrl+g"]),
+            "Select the next search match",
+        ),
+        entry(
+            "tui.altScreen.searchPrevious",
+            multiple(&["shift+enter", "ctrl+shift+g"]),
+            "Select the previous search match",
+        ),
+        entry(
+            "tui.altScreen.searchClose",
+            single("escape"),
+            "Close transcript search",
         ),
         entry(
             "tui.altScreen.top",
@@ -1150,7 +1208,9 @@ mod tests {
         let keybindings = KeybindingsManager::with_defaults();
         let resolved = keybindings.get_resolved_bindings();
 
-        assert_eq!(resolved.len(), 41);
+        // 41 → 47: lineUp/lineDown + the search family (00121ed99,
+        // 1279952de @ 9841914).
+        assert_eq!(resolved.len(), 47);
         assert_eq!(
             resolved.get("tui.editor.cursorUp"),
             Some(&KeyBindingValue::Single("up".to_string()))

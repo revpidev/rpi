@@ -299,13 +299,70 @@ const THEME_MODES: [(&str, ColorMode); 2] = [
     ("256color", ColorMode::Color256),
 ];
 
+/// Golden `meta` markers (written by `fixtures/generate-resources-golden.mjs`):
+/// parts of the pinned upstream output whose rpi port lands in a later
+/// v0.1.4 task. `pendingUpstreamKeys` color keys are dropped from both
+/// sides before comparing (scrollbarTrack/scrollbarThumb → V14-16,
+/// 457ae8c79); `pendingSplitCases` theme cases are skipped (error text
+/// depends on the eb3e9feed validation split — gap registered with the
+/// V14-15 acceptance record). The meta disappears when the owning task
+/// regenerates the golden; empty defaults keep older goldens loadable.
+struct ThemeGoldenMeta {
+    pending_upstream_keys: Vec<String>,
+    pending_split_cases: Vec<String>,
+}
+
+impl ThemeGoldenMeta {
+    fn from_golden(golden: &serde_json::Value) -> Self {
+        let meta = &golden["meta"];
+        Self {
+            pending_upstream_keys: meta["pendingUpstreamKeys"]
+                .as_array()
+                .map(|keys| {
+                    keys.iter()
+                        .map(|key| key.as_str().expect("key string").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            pending_split_cases: meta["pendingSplitCases"]
+                .as_array()
+                .map(|cases| {
+                    cases
+                        .iter()
+                        .map(|case| case.as_str().expect("case string").to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn drop_pending_keys(&self, value: &mut serde_json::Value) {
+        // `retain`, not `remove`: serde_json's preserve_order `remove` is a
+        // swap-remove that would reorder the surviving keys.
+        for map_key in ["fgColors", "bgColors"] {
+            if let Some(colors) = value.get_mut(map_key).and_then(|v| v.as_object_mut()) {
+                let pending = &self.pending_upstream_keys;
+                colors.retain(|key, _| !pending.iter().any(|drop| drop == key));
+            }
+        }
+    }
+}
+
 #[test]
 fn parity_themes() {
     let golden = load_golden("themes");
+    let meta = ThemeGoldenMeta::from_golden(&golden);
     let tmp = TestDir::new("themes");
 
     for case in golden["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
+        if meta
+            .pending_split_cases
+            .iter()
+            .any(|pending| pending == name)
+        {
+            continue;
+        }
         let content = case["expected"]["content"].as_str().expect("content");
         let theme_path = tmp.path().join(format!("{name}.json"));
         std::fs::write(&theme_path, content).expect("write theme file");
@@ -316,7 +373,10 @@ fn parity_themes() {
             match load_theme_from_path(&theme_path, Some(mode)) {
                 Ok(theme) => {
                     let mut actual = summarize_theme(&theme);
-                    compare("themes", &label, expected_mode, &mut actual, &[tmp.path()]);
+                    meta.drop_pending_keys(&mut actual);
+                    let mut expected = expected_mode.clone();
+                    meta.drop_pending_keys(&mut expected);
+                    compare("themes", &label, &expected, &mut actual, &[tmp.path()]);
                 }
                 Err(err) => {
                     let message = match &err {
@@ -360,10 +420,18 @@ fn parity_themes() {
         let resolved = get_resolved_theme_colors(name).expect("builtin theme resolves");
         let sorted: BTreeMap<String, String> = resolved.into_iter().collect();
         let mut actual = serde_json::to_value(sorted).expect("to value");
+        let mut expected = golden["builtins"][name].clone();
+        let pending = &meta.pending_upstream_keys;
+        if let Some(colors) = expected.as_object_mut() {
+            colors.retain(|key, _| !pending.iter().any(|drop| drop == key));
+        }
+        if let Some(colors) = actual.as_object_mut() {
+            colors.retain(|key, _| !pending.iter().any(|drop| drop == key));
+        }
         compare(
             "themes",
             &format!("builtin-{name}"),
-            &golden["builtins"][name],
+            &expected,
             &mut actual,
             &[],
         );

@@ -61,7 +61,7 @@ import { DefaultResourceLoader } from "../external/pi/packages/coding-agent/dist
 const here = dirname(fileURLToPath(import.meta.url));
 const resourcesDir = join(here, "generated", "resources");
 
-const UPSTREAM = "external/pi @ 4181f66 (v0.84.1+), dist build";
+const UPSTREAM = "external/pi @ 9841914 (v0.85.0+), dist build";
 
 /** Replace every occurrence of `root` in any string with the `<path>` placeholder. */
 function stripRoot(value, root) {
@@ -342,6 +342,27 @@ const THEME_CASES = [
 ];
 
 function generateThemes() {
+	// The golden stays byte-faithful to the pinned upstream dist. Parts
+	// not yet ported to rpi at generation time are declared in `meta` — the
+	// Rust parity test filters/skips them until the owning task of the
+	// v0.1.4 batch lands and regenerates without the marker:
+	//
+	// - pendingUpstreamKeys: `scrollbarTrack`/`scrollbarThumb` (redesigned
+	//   scrollbar family, 457ae8c79 → V14-16; rpi still has the
+	//   pre-redesign single-style scrollbarThumb with the selectedBg
+	//   fallback).
+	// - pendingSplitCases: error cases whose text depends on the
+	//   eb3e9feed theme-validation split (validation moved out of
+	//   loadThemeFromPath into an interactive-mode-installed validator;
+	//   unported — gap registered with V14-15's acceptance record).
+	const meta = {
+		pendingUpstreamKeys: ["scrollbarTrack", "scrollbarThumb"],
+		pendingSplitCases: [
+			"invalid-missing-colors",
+			"invalid-color-value-type",
+			"invalid-name-slash",
+		],
+	};
 	const root = mkdtempSync(join(tmpdir(), "rpi-golden-themes-"));
 	try {
 		const cases = [];
@@ -381,7 +402,7 @@ function generateThemes() {
 			light: Object.fromEntries(Object.entries(getResolvedThemeColors("light")).sort()),
 		};
 
-		writeGolden("themes", stripRoot({ upstream: UPSTREAM, cases, builtins }, root));
+		writeGolden("themes", stripRoot({ upstream: UPSTREAM, meta, cases, builtins }, root));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

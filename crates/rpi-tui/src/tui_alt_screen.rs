@@ -47,15 +47,19 @@ use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use tokio::sync::oneshot;
 
+use crate::alt_screen_search::{
+    get_alt_screen_search_match_key, AltScreenSearchComponent, AltScreenSearchIndex,
+    AltScreenSearchMatch, NavigationButtonStyleFn,
+};
 use crate::components::alt_screen_flash::{AltScreenFlashContainer, DEFAULT_DURATION_MS};
 use crate::components::scroll_view::{
-    Follow, Overscroll, ScrollView, ScrollViewOptions, ScrollbarMode,
+    Follow, Overscroll, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollbarMode,
 };
 use crate::keybindings::{get_keybindings, Keybinding};
 use crate::keys::is_key_release;
@@ -79,11 +83,12 @@ use crate::terminal_image::{
 };
 use crate::tui::{
     composite_tui_line, dispatch_mouse_event, lock_component, lock_shared, retarget_mouse_event,
-    same_component, shared_component, Component, OverlayHandle, OverlayHandleOps, OverlayOptions,
-    OverlayUnfocusOptions, RenderHandle, SharedComponent, SharedTerminal,
-    TerminalColorSchemeListener, Tui, TuiInputListener, TuiInputListenerResult, TuiMode,
-    TuiMouseButton, TuiMouseDispatchResult, TuiMouseDispatchTarget, TuiMouseEvent,
-    TuiMouseEventType, TuiMouseHandlerResult, TuiStopOptions, ViewportTui, CURSOR_MARKER,
+    same_component, shared_component, Component, OverlayAnchor, OverlayBounds, OverlayHandle,
+    OverlayHandleOps, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions, RenderHandle,
+    SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener, Tui, TuiInputListener,
+    TuiInputListenerResult, TuiMode, TuiMouseButton, TuiMouseDispatchResult,
+    TuiMouseDispatchTarget, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult,
+    TuiStopOptions, ViewportTui, CURSOR_MARKER,
 };
 use crate::tui_base::{
     schedule_render, PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
@@ -91,7 +96,7 @@ use crate::tui_base::{
 };
 use crate::utils::{
     extract_ansi_code, get_grapheme_cell_range, get_osc8_link_at_column, get_word_segmenter,
-    slice_by_column, strip_terminal_sequences, visible_width,
+    slice_by_column, strip_terminal_sequences, truncate_to_width, visible_width,
 };
 
 // =============================================================================
@@ -244,6 +249,47 @@ struct ScrollbarTarget {
     geometry: ScrollbarGeometry,
 }
 
+/// `ScrollToEndIndicatorRect` (tui-alt-screen.ts:138-141 @ 9841914,
+/// 79680533c): the composited label's hit rectangle.
+#[derive(Debug, Clone, Copy)]
+struct ScrollToEndIndicatorRect {
+    row: u32,
+    column: u32,
+    width: u32,
+}
+
+/// `SearchSelectionMode` (tui-alt-screen.ts:144 @ 9841914, 00121ed99).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchSelectionMode {
+    Query,
+    Retain,
+    Next,
+    Previous,
+}
+
+/// `ActiveSearch` (tui-alt-screen.ts:146-156 @ 9841914). The upstream
+/// `overlay?: OverlayHandle` is replaced by the overlay stack `entry_id`
+/// (hide / focus checks / bounds all resolve against the inner overlay
+/// state without an outer handle).
+struct ActiveSearch {
+    component: SharedComponent,
+    index: AltScreenSearchIndex,
+    overlay_entry_id: u64,
+    query: String,
+    matches: Arc<Vec<AltScreenSearchMatch>>,
+    selected_index: i64,
+    selected_key: Option<String>,
+    anchor_row: usize,
+    selection_mode: SearchSelectionMode,
+}
+
+/// `SearchHighlightRange` (tui-alt-screen.ts:158-162).
+struct SearchHighlightRange {
+    start_col: usize,
+    end_col: usize,
+    current: bool,
+}
+
 /// Merge adjacent word segments that consist solely of Hiragana into one
 /// (see the D-093 note in `get_word_selection`; upstream `Intl.Segmenter`
 /// yields the whole run as one word-like segment).
@@ -297,11 +343,34 @@ fn with_scroll_view<R>(shared: &SharedComponent, f: impl FnOnce(&ScrollView) -> 
     guard.as_scroll_view().map(f)
 }
 
+/// Drain the shared pending-op queue into a locked inner guard (callback
+/// variant of [`TuiAltScreen::drain_pending_ops`]).
+fn drain_pending_into(inner: &Arc<Mutex<TuiAltScreenInner>>, pending: &Arc<Mutex<Vec<PendingOp>>>) {
+    loop {
+        let ops: Vec<PendingOp> = std::mem::take(&mut *lock_shared(pending));
+        if ops.is_empty() {
+            return;
+        }
+        let mut guard = lock_shared(inner);
+        for op in ops {
+            op(&mut guard);
+        }
+    }
+}
+
 /// `openUrl` callback (tui-alt-screen.ts:123).
 pub type OpenUrlCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// `onRightClickPaste` callback (tui-alt-screen.ts:125).
 pub type RightClickPasteCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// `searchMatchStyle` / `searchCurrentMatchStyle` callbacks
+/// (tui-alt-screen.ts:170-172 @ 9841914, 00121ed99).
+pub type SearchTextStyleFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// `scrollToEndIndicator` callback (tui-alt-screen.ts:177-180 @ 9841914,
+/// 79680533c): the label text composited on the last row.
+pub type ScrollToEndIndicatorFn = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// `TuiAltScreenOptions` (tui-alt-screen.ts:117-126). Not serialized (holds
 /// callbacks); see the header note.
@@ -313,6 +382,19 @@ pub struct TuiAltScreenOptions {
     /// `mouse` (default true): capture mouse events for viewport scrolling
     /// and application-owned text selection.
     pub mouse: Option<bool>,
+    /// `searchMatchStyle`: style a non-current transcript search match
+    /// (default underline, tui-alt-screen.ts:265).
+    pub search_match_style: Option<SearchTextStyleFn>,
+    /// `searchCurrentMatchStyle`: style the current transcript search match
+    /// (default bold + inverse, tui-alt-screen.ts:266).
+    pub search_current_match_style: Option<SearchTextStyleFn>,
+    /// `searchNavigationButtonStyle`: style a transcript search navigation
+    /// button (tui-alt-screen.ts:267).
+    pub search_navigation_button_style: Option<NavigationButtonStyleFn>,
+    /// `scrollToEndIndicator`: render a clickable jump-to-end label, centered
+    /// on the last row of a follow-end primary scroll view while that view is
+    /// scrolled away from its end (79680533c #9080).
+    pub scroll_to_end_indicator: Option<ScrollToEndIndicatorFn>,
     /// `openUrl`: open an OSC 8 hyperlink activated with a primary click.
     pub open_url: Option<OpenUrlCallback>,
     /// `onRightClickPaste`: handle an unmodified secondary-button press for
@@ -482,6 +564,11 @@ pub(crate) struct TuiAltScreenInner {
     selection_press_active: bool,
     scrollbar_drag: Option<ScrollbarDrag>,
     scrollbar_hover: Option<SharedComponent>,
+    /// `scrollToEndIndicatorRect` (tui-alt-screen.ts:221 @ 9841914,
+    /// 79680533c).
+    scroll_to_end_indicator_rect: Option<ScrollToEndIndicatorRect>,
+    /// `activeSearch` (tui-alt-screen.ts:222 @ 9841914, 00121ed99).
+    active_search: Option<ActiveSearch>,
     pressed_url: Option<String>,
     selection_dragged: bool,
     wheel_scroll_lines: u64,
@@ -502,6 +589,14 @@ pub(crate) struct TuiAltScreenInner {
     last_component_click: Option<LastComponentClick>,
     open_url: Option<OpenUrlCallback>,
     on_right_click_paste: Option<RightClickPasteCallback>,
+    /// `searchMatchStyle` (default underline, tui-alt-screen.ts:265).
+    search_match_style: SearchTextStyleFn,
+    /// `searchCurrentMatchStyle` (default bold + inverse, :266).
+    search_current_match_style: SearchTextStyleFn,
+    /// `searchNavigationButtonStyle` (default identity, :267).
+    search_navigation_button_style: NavigationButtonStyleFn,
+    /// `scrollToEndIndicator` (:268).
+    scroll_to_end_indicator: Option<ScrollToEndIndicatorFn>,
     /// `process.platform === "win32"` (see header note).
     win32: bool,
     /// `process.env.TERM_PROGRAM` for the VS Code right-click exclusion
@@ -513,6 +608,17 @@ pub(crate) struct TuiAltScreenInner {
     /// Render handle handed to the layout engine and the flash container
     /// (upstream `() => this.requestRender()`).
     render_handle: RenderHandle,
+    /// Weak self-reference for component callbacks that must mutate the
+    /// inner state while the inner lock is held (search query changes;
+    /// upstream closures capture the live TUI object, JS GC semantics).
+    /// Set right after construction in [`TuiAltScreen::build`].
+    self_handle: Weak<Mutex<TuiAltScreenInner>>,
+    /// Shared with the outer handle's `pending` queue (the callback-side
+    /// equivalent of [`TuiAltScreen::run_or_queue`]).
+    pending_ops: Arc<Mutex<Vec<PendingOp>>>,
+    /// Shared with the outer handle's overlay-id counter (search overlays
+    /// are created from input handlers that already hold the inner lock).
+    next_overlay_id: Arc<AtomicU64>,
 }
 
 impl Deref for TuiAltScreenInner {
@@ -612,6 +718,8 @@ impl TuiAltScreen {
             })
         };
         let implicit_children = Arc::new(Mutex::new(Vec::new()));
+        let pending: Arc<Mutex<Vec<PendingOp>>> = Arc::new(Mutex::new(Vec::new()));
+        let next_overlay_id: Arc<AtomicU64> = Arc::new(AtomicU64::new(1));
         let implicit_document = shared_component(ImplicitDocument {
             children: Arc::clone(&implicit_children),
             mouse_layout: RefCell::new(None),
@@ -651,6 +759,8 @@ impl TuiAltScreen {
             selection_press_active: false,
             scrollbar_drag: None,
             scrollbar_hover: None,
+            scroll_to_end_indicator_rect: None,
+            active_search: None,
             pressed_url: None,
             selection_dragged: false,
             // `Math.max(1, Math.floor(options.wheelScrollLines ?? 1))`
@@ -664,19 +774,37 @@ impl TuiAltScreen {
             last_component_click: None,
             open_url: options.open_url,
             on_right_click_paste: options.on_right_click_paste,
+            search_match_style: options
+                .search_match_style
+                .unwrap_or_else(|| Arc::new(|text: &str| format!("\x1b[4m{text}\x1b[24m"))),
+            search_current_match_style: options
+                .search_current_match_style
+                .unwrap_or_else(|| Arc::new(|text: &str| format!("\x1b[1;7m{text}\x1b[22;27m"))),
+            search_navigation_button_style: options
+                .search_navigation_button_style
+                .unwrap_or_else(|| Arc::new(|text: &str, _hovered: bool| text.to_string())),
+            scroll_to_end_indicator: options.scroll_to_end_indicator,
             win32: options.win32_override.unwrap_or(cfg!(windows)),
             term_program: options.term_program_override,
             render_handle,
+            self_handle: Weak::new(),
+            pending_ops: Arc::clone(&pending),
+            next_overlay_id: Arc::clone(&next_overlay_id),
         };
+        let inner = Arc::new(Mutex::new(inner));
+        {
+            let mut guard = lock_shared(&inner);
+            guard.self_handle = Arc::downgrade(&inner);
+        }
         TuiAltScreen {
-            inner: Arc::new(Mutex::new(inner)),
+            inner,
             terminal,
             schedule,
-            pending: Arc::new(Mutex::new(Vec::new())),
+            pending,
             inbox: Arc::new(Mutex::new(VecDeque::new())),
             implicit_scroll_view,
             next_listener_id: Arc::new(AtomicU64::new(1)),
-            next_overlay_id: Arc::new(AtomicU64::new(1)),
+            next_overlay_id,
             size_cache,
         }
     }
@@ -1392,6 +1520,8 @@ impl TuiAltScreenInner {
     /// output) BEFORE `terminal.stop`; the alt screen is exited in
     /// [`TuiAltScreenInner::after_terminal_stop`].
     fn before_terminal_stop(&mut self, _options: TuiStopOptions) {
+        // `this.closeSearch()` (tui-alt-screen.ts:366 @ 9841914, 00121ed99).
+        self.close_search();
         self.stop_selection_auto_scroll();
         self.selection_press_active = false;
         self.stop_scrollbar_hover();
@@ -1563,6 +1693,359 @@ impl TuiAltScreenInner {
         }
     }
 
+    // --- transcript search (tui-alt-screen.ts:494-638 @ 9841914,
+    //     00121ed99 / 7d399e7be / 2d4116333) ------------------------------
+
+    /// Callback-side `run_or_queue`: search-component callbacks fire while
+    /// the inner lock is held (input dispatch), so mutations queue into the
+    /// shared pending list and drain at the end of the current input event
+    /// ([`TuiAltScreen::tick`], same ordering as upstream's synchronous
+    /// closure call — the op runs before the next render).
+    fn queue_or_run(
+        weak: &Weak<Mutex<TuiAltScreenInner>>,
+        pending: &Arc<Mutex<Vec<PendingOp>>>,
+        op: impl FnOnce(&mut TuiAltScreenInner) + Send + 'static,
+    ) {
+        let Some(inner) = weak.upgrade() else {
+            return;
+        };
+        let mut op: Option<PendingOp> = Some(Box::new(op));
+        let direct = match inner.try_lock() {
+            Ok(mut guard) => {
+                if let Some(op) = op.take() {
+                    op(&mut guard);
+                }
+                drop(guard);
+                op.is_none()
+            }
+            Err(_) => false,
+        };
+        if direct {
+            drain_pending_into(&inner, pending);
+        } else if let Some(op) = op.take() {
+            lock_shared(pending).push(op);
+        }
+    }
+
+    /// `toggleSearch` (tui-alt-screen.ts:495-520): open the search overlay
+    /// anchored top-right at 40% width (min 32, margin 1), or close an
+    /// active search.
+    fn toggle_search(&mut self) {
+        if self.active_search.is_some() {
+            self.close_search();
+            return;
+        }
+        let weak = self.self_handle.clone();
+        let pending = Arc::clone(&self.pending_ops);
+        let on_query_change: crate::alt_screen_search::SearchQueryChangeFn =
+            Arc::new(move |query: &str| {
+                let query = query.to_string();
+                Self::queue_or_run(&weak, &pending, move |inner| {
+                    inner.update_search_query(&query);
+                });
+            });
+        let component = shared_component(AltScreenSearchComponent::new(
+            on_query_change,
+            Some(Arc::clone(&self.search_navigation_button_style)),
+        ));
+        let entry_id = self.next_overlay_id.fetch_add(1, Ordering::Relaxed);
+        self.active_search = Some(ActiveSearch {
+            component: component.clone(),
+            index: AltScreenSearchIndex::new(),
+            overlay_entry_id: entry_id,
+            query: String::new(),
+            matches: Arc::new(Vec::new()),
+            selected_index: -1,
+            selected_key: None,
+            anchor_row: with_scroll_view(&self.get_primary_scroll_view(), ScrollView::scroll_top)
+                .unwrap_or(0),
+            selection_mode: SearchSelectionMode::Query,
+        });
+        self.show_overlay(
+            entry_id,
+            component,
+            Some(OverlayOptions {
+                anchor: Some(OverlayAnchor::TopRight),
+                width: Some(SizeValue::Percent(40.0)),
+                min_width: Some(32),
+                margin: Some(OverlayMarginSpec::Uniform(1)),
+                ..OverlayOptions::default()
+            }),
+        );
+    }
+
+    /// `closeSearch` (tui-alt-screen.ts:522-528).
+    fn close_search(&mut self) {
+        let Some(search) = self.active_search.take() else {
+            return;
+        };
+        self.overlay_hide(search.overlay_entry_id);
+        self.request_render(false);
+    }
+
+    /// `updateSearchQuery` (tui-alt-screen.ts:530-539): re-anchor on the
+    /// current selection (or the current scroll position), then re-run the
+    /// query-mode selection on the next refresh.
+    fn update_search_query(&mut self, query: &str) {
+        let anchor_row = match self.active_search.as_ref() {
+            None => return,
+            Some(search) if query == search.query => return,
+            Some(search) => search
+                .matches
+                .get(search.selected_index.max(0) as usize)
+                .and_then(|selected| selected.segments.first())
+                .map(|segment| segment.row)
+                .or_else(|| {
+                    with_scroll_view(&self.get_primary_scroll_view(), ScrollView::scroll_top)
+                })
+                .unwrap_or(0),
+        };
+        let Some(search) = self.active_search.as_mut() else {
+            return;
+        };
+        search.anchor_row = anchor_row;
+        search.query = query.to_string();
+        search.selection_mode = SearchSelectionMode::Query;
+        let component = Arc::clone(&search.component);
+        let mut guard = lock_component(&component);
+        if let Some(component) = guard.as_search_component_mut() {
+            component.set_result(-1, 0);
+        }
+        drop(guard);
+        self.request_render(false);
+    }
+
+    /// `navigateSearch` (tui-alt-screen.ts:541-546).
+    fn navigate_search(&mut self, direction: i64) {
+        let Some(search) = self.active_search.as_mut() else {
+            return;
+        };
+        if search.query.is_empty() {
+            return;
+        }
+        search.selection_mode = if direction < 0 {
+            SearchSelectionMode::Previous
+        } else {
+            SearchSelectionMode::Next
+        };
+        self.request_render(false);
+    }
+
+    /// `getSearchNavigationDirectionAt` (tui-alt-screen.ts:548-555).
+    fn get_search_navigation_direction_at(&self, x: u32, y: u32) -> Option<i32> {
+        let search = self.active_search.as_ref()?;
+        let bounds = self.overlay_get_bounds(search.overlay_entry_id)?;
+        if (x as isize) < bounds.col as isize
+            || (x as isize) >= bounds.col as isize + bounds.width as isize
+            || (y as isize) < bounds.row as isize
+            || (y as isize) >= bounds.row as isize + bounds.height as isize
+        {
+            return None;
+        }
+        let component = lock_component(&search.component);
+        let search_component = component.as_search_component()?;
+        search_component.get_navigation_direction_at(
+            (y as isize - bounds.row as isize) as i32,
+            (x as isize - bounds.col as isize) as i32,
+        )
+    }
+
+    /// `handleSearchMouseEvent` (tui-alt-screen.ts:558-569): hover tracking
+    /// for the ↑/↓ buttons and press-activated navigation.
+    fn handle_search_mouse_event(&mut self, event: &SgrMouseEvent) -> bool {
+        let Some(search) = self.active_search.as_ref() else {
+            return false;
+        };
+        let component = Arc::clone(&search.component);
+        let direction = self.get_search_navigation_direction_at(event.x, event.y);
+        let changed = {
+            let mut guard = lock_component(&component);
+            match guard.as_search_component_mut() {
+                Some(component) => component.set_hovered_navigation_direction(direction),
+                None => false,
+            }
+        };
+        if changed {
+            self.request_render(false);
+        }
+        if direction.is_none()
+            || event.release
+            || (event.button & 32) != 0
+            || (event.button & 3) != 0
+        {
+            return false;
+        }
+        self.navigate_search(direction.expect("checked above") as i64);
+        true
+    }
+
+    /// `refreshSearch` (tui-alt-screen.ts:570-638): re-run the index, apply
+    /// the selection-mode state machine, and reveal the selection. Returns
+    /// whether the scroll position changed (the caller re-renders the
+    /// layout).
+    fn refresh_search(&mut self, layout: &LayoutFrame) -> bool {
+        let Some(search) = self.active_search.as_mut() else {
+            return false;
+        };
+        let scroll_view = layout
+            .primary_scroll_view
+            .clone()
+            .unwrap_or_else(|| self.implicit_scroll_view.clone());
+        let lines = get_scroll_view_box(layout, &scroll_view)
+            .and_then(|layout_box| layout_box.scroll_content_lines.clone());
+        // (upstream `!lines || !search.query.trim()` — both arms share the
+        // same reset)
+        let bail_no_query = |search: &mut ActiveSearch| {
+            search.matches = Arc::new(Vec::new());
+            search.selected_index = -1;
+            search.selected_key = None;
+            search.selection_mode = SearchSelectionMode::Retain;
+            let component = Arc::clone(&search.component);
+            let mut guard = lock_component(&component);
+            if let Some(component) = guard.as_search_component_mut() {
+                component.set_result(-1, 0);
+            }
+        };
+        if lines.is_none() {
+            bail_no_query(search);
+            return false;
+        }
+        if search.query.trim().is_empty() {
+            bail_no_query(search);
+            return false;
+        }
+        let lines = lines.expect("checked above");
+
+        let should_reveal_selection = search.selection_mode != SearchSelectionMode::Retain;
+        let query = search.query.clone();
+        // `Arc<[String]>` derefs to the slice — no per-frame copy.
+        let result = search.index.search(&lines, &query);
+        let matches = Arc::clone(&result.matches);
+        search.matches = Arc::clone(&matches);
+        if !result.changed && search.selection_mode == SearchSelectionMode::Retain {
+            return false;
+        }
+
+        let exact_index: i64 = if result.changed {
+            match &search.selected_key {
+                Some(key) => matches
+                    .iter()
+                    .position(|search_match| &get_alt_screen_search_match_key(search_match) == key)
+                    .map(|index| index as i64)
+                    .unwrap_or(-1),
+                None => -1,
+            }
+        } else {
+            search.selected_index
+        };
+        let mut selected_index: i64 = -1;
+        if !matches.is_empty() {
+            let last = matches.len() as i64 - 1;
+            match search.selection_mode {
+                SearchSelectionMode::Query => {
+                    // Binary search for the first match at or after the
+                    // anchor row (tui-alt-screen.ts:598-603).
+                    let mut low: i64 = 0;
+                    let mut high: i64 = matches.len() as i64;
+                    while low < high {
+                        let middle = low + (high - low) / 2;
+                        let row = matches[middle as usize]
+                            .segments
+                            .first()
+                            .map(|segment| segment.row as i64)
+                            .unwrap_or(0);
+                        if row < search.anchor_row as i64 {
+                            low = middle + 1;
+                        } else {
+                            high = middle;
+                        }
+                    }
+                    selected_index = if low < matches.len() as i64 { low } else { 0 };
+                }
+                SearchSelectionMode::Next => {
+                    let base = if exact_index >= 0 {
+                        exact_index
+                    } else {
+                        search.selected_index.min(last)
+                    };
+                    selected_index = if base < 0 {
+                        0
+                    } else {
+                        (base + 1) % matches.len() as i64
+                    };
+                }
+                SearchSelectionMode::Previous => {
+                    let base = if exact_index >= 0 {
+                        exact_index
+                    } else {
+                        search.selected_index.min(last)
+                    };
+                    selected_index = if base < 0 {
+                        matches.len() as i64 - 1
+                    } else {
+                        (base - 1 + matches.len() as i64) % matches.len() as i64
+                    };
+                }
+                SearchSelectionMode::Retain => {
+                    selected_index = if exact_index >= 0 {
+                        exact_index
+                    } else {
+                        search.selected_index.max(0).min(last)
+                    };
+                }
+            }
+        }
+
+        search.selected_index = selected_index;
+        search.selected_key = if selected_index >= 0 {
+            matches
+                .get(selected_index as usize)
+                .map(get_alt_screen_search_match_key)
+        } else {
+            None
+        };
+        search.selection_mode = SearchSelectionMode::Retain;
+        {
+            let component = Arc::clone(&search.component);
+            let mut guard = lock_component(&component);
+            if let Some(component) = guard.as_search_component_mut() {
+                component.set_result(selected_index, matches.len());
+            }
+        }
+        if !should_reveal_selection {
+            return false;
+        }
+
+        let selected = matches.get(selected_index.max(0) as usize);
+        let (first_segment, last_segment) =
+            match selected.map(|selected| (selected.segments.first(), selected.segments.last())) {
+                Some((Some(first), Some(last))) => (first, last),
+                _ => return false,
+            };
+        let viewport_height =
+            with_scroll_view(&scroll_view, ScrollView::viewport_height).unwrap_or(0);
+        let box_ = get_scroll_view_box(layout, &scroll_view);
+        if box_.is_none() || viewport_height == 0 {
+            return false;
+        }
+        let before = with_scroll_view(&scroll_view, ScrollView::scroll_top).unwrap_or(0) as i64;
+        let visible_bottom = before + viewport_height as i64 - 1;
+        let mut target = before;
+        if (first_segment.row as i64) < before || (last_segment.row as i64) > visible_bottom {
+            target = first_segment.row as i64 - (viewport_height as i64 / 3);
+        }
+        with_scroll_view(&scroll_view, |view| {
+            view.scroll_to_with_options(
+                target,
+                ScrollViewScrollToOptions {
+                    disable_follow: true,
+                },
+            )
+        });
+        let after = with_scroll_view(&scroll_view, ScrollView::scroll_top).unwrap_or(0) as i64;
+        after != before
+    }
+
     // --- input routing (tui-alt-screen.ts:385-460) -------------------------
 
     /// `handleInput` with the upstream first-position viewport listener
@@ -1606,6 +2089,15 @@ impl TuiAltScreenInner {
             self.selection_press_active = false;
             self.stop_selection_auto_scroll();
             self.stop_scrollbar_hover();
+            if self.active_search.as_ref().is_some_and(|search| {
+                let component = Arc::clone(&search.component);
+                let mut guard = lock_component(&component);
+                guard
+                    .as_search_component_mut()
+                    .is_some_and(|component| component.set_hovered_navigation_direction(None))
+            }) {
+                self.request_render(false);
+            }
             self.stop_scrollbar_drag();
             self.pressed_url = None;
             self.selection_dragged = false;
@@ -1671,9 +2163,40 @@ impl TuiAltScreenInner {
         let keybindings = get_keybindings()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Search toggle runs before the overlay-input deferral
+        // (tui-alt-screen.ts:704-707 @ 9841914, 00121ed99).
+        if keybindings.matches(data, Keybinding::AltScreenSearch) {
+            if !is_release {
+                self.toggle_search();
+            }
+            return Some(consume());
+        }
+        // While the search overlay holds focus, its navigation/close keys are
+        // consumed here and never reach the search input
+        // (tui-alt-screen.ts:708-719).
+        if self.search_overlay_is_focused() {
+            if keybindings.matches(data, Keybinding::AltScreenSearchNext) {
+                if !is_release {
+                    self.navigate_search(1);
+                }
+                return Some(consume());
+            }
+            if keybindings.matches(data, Keybinding::AltScreenSearchPrevious) {
+                if !is_release {
+                    self.navigate_search(-1);
+                }
+                return Some(consume());
+            }
+            if keybindings.matches(data, Keybinding::AltScreenSearchClose) {
+                if !is_release {
+                    self.close_search();
+                }
+                return Some(consume());
+            }
+        }
         // The active-search overlay exception (tui-alt-screen.ts:644-645
-        // second conjunct) arrives with V14-15; until then a focused overlay
-        // always defers viewport-scroll keys (transient deviation, G2).
+        // second conjunct, V14-15): a focused search overlay still lets
+        // wheel/page keys control the transcript.
         if self.should_defer_viewport_input_to_overlay() {
             return None;
         }
@@ -1704,6 +2227,18 @@ impl TuiAltScreenInner {
         if keybindings.matches(data, Keybinding::AltScreenHalfPageDown) {
             if !is_release {
                 self.scroll_by_inner((viewport_height / 2).max(1) as i64);
+            }
+            return Some(consume());
+        }
+        if keybindings.matches(data, Keybinding::AltScreenLineUp) {
+            if !is_release {
+                self.scroll_by_inner(-1);
+            }
+            return Some(consume());
+        }
+        if keybindings.matches(data, Keybinding::AltScreenLineDown) {
+            if !is_release {
+                self.scroll_by_inner(1);
             }
             return Some(consume());
         }
@@ -1742,12 +2277,24 @@ impl TuiAltScreenInner {
     //     introduced by 71026970a) -----------------------------------------
 
     /// `shouldDeferViewportInputToOverlay` (tui-alt-screen.ts:644-645 @
-    /// 9841914, 2e4d23959): while an overlay holds keyboard focus, viewport
-    /// scrolling keys and unconsumed wheel events let the overlay handle the
-    /// input instead. The active-search exception (second conjunct upstream)
-    /// arrives with V14-15.
+    /// 9841914, 2e4d23959 + 00121ed99): while an overlay holds keyboard
+    /// focus, viewport scrolling keys and unconsumed wheel events let the
+    /// overlay handle the input instead — except the active search overlay,
+    /// which only takes the keys it consumes above and lets wheel/page keys
+    /// keep controlling the transcript (second conjunct).
     fn should_defer_viewport_input_to_overlay(&self) -> bool {
-        self.base.is_overlay_focused()
+        self.base.is_overlay_focused() && !self.search_overlay_is_focused()
+    }
+
+    /// `this.activeSearch?.overlay?.isFocused() === true`
+    /// (tui-alt-screen.ts:708, 645): the search overlay's component holds
+    /// keyboard focus.
+    fn search_overlay_is_focused(&self) -> bool {
+        self.active_search.as_ref().is_some_and(|search| {
+            self.focused_component
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, &search.component))
+        })
     }
 
     /// `clearComponentMouseGesture` (tui-alt-screen.ts:647-653 @ 9841914):
@@ -2035,10 +2582,19 @@ impl TuiAltScreenInner {
             return;
         }
 
-        // handleSearchMouseEvent (V14-15) slots in here upstream.
+        // `handleSearchMouseEvent` (tui-alt-screen.ts:908 @ 9841914,
+        // 00121ed99): hover tracking + button-press navigation.
+        if self.handle_search_mouse_event(&raw) {
+            return;
+        }
 
         let overlay = self.dispatch_mouse_to_overlay(&event);
         if !overlay.hit {
+            // `handleScrollToEndIndicatorMouseEvent` (tui-alt-screen.ts:913
+            // @ 9841914, 79680533c).
+            if self.handle_scroll_to_end_indicator_mouse_event(&raw) {
+                return;
+            }
             let handled = self.handle_scrollbar_mouse_event(raw);
             if self.scrollbar_drag.is_none() {
                 self.update_scrollbar_hover(raw.x, raw.y);
@@ -2112,6 +2668,25 @@ impl TuiAltScreenInner {
     /// integrated terminal — `TERM_PROGRAM=vscode` terminals already paste
     /// on right click themselves (`374e56e55`, #8186). Clipboard paste is
     /// best-effort.
+    /// `handleScrollToEndIndicatorMouseEvent` (tui-alt-screen.ts:1010-1017
+    /// @ 9841914, 79680533c): a primary-button press (no motion bit) on the
+    /// composited jump-to-end label scrolls to the bottom.
+    fn handle_scroll_to_end_indicator_mouse_event(&mut self, event: &SgrMouseEvent) -> bool {
+        let Some(rect) = self.scroll_to_end_indicator_rect else {
+            return false;
+        };
+        if event.release || (event.button & 32) != 0 || (event.button & 3) != 0 {
+            return false;
+        }
+        if event.y != rect.row || event.x < rect.column || event.x >= rect.column + rect.width {
+            return false;
+        }
+        let scroll_view = self.get_primary_scroll_view();
+        with_scroll_view(&scroll_view, ScrollView::scroll_to_end);
+        self.request_render(false);
+        true
+    }
+
     fn handle_right_click_paste(&mut self, event: SgrMouseEvent) -> bool {
         if self.on_right_click_paste.is_none()
             || !self.win32
@@ -2834,6 +3409,219 @@ impl TuiAltScreenInner {
         self.flashes.flash("Copied!", DEFAULT_DURATION_MS);
     }
 
+    /// `applySearchTextHighlight` (tui-alt-screen.ts:1458-1476 @ 9841914,
+    /// 00121ed99): style every plain-text run of the slice, re-emitting
+    /// inner SGR codes verbatim between runs.
+    fn apply_search_text_highlight(&self, text: &str, current: bool) -> String {
+        let style = if current {
+            &self.search_current_match_style
+        } else {
+            &self.search_match_style
+        };
+        let mut result = String::new();
+        let mut plain_start = 0;
+        let mut index = 0;
+        while index < text.len() {
+            let Some(ansi) = extract_ansi_code(text, index) else {
+                index += 1;
+                continue;
+            };
+            if index > plain_start {
+                result.push_str(&style(&text[plain_start..index]));
+            }
+            result.push_str(ansi.code);
+            index += ansi.length;
+            plain_start = index;
+        }
+        if plain_start < text.len() {
+            result.push_str(&style(&text[plain_start..]));
+        }
+        result
+    }
+
+    /// `applySearchHighlights` (tui-alt-screen.ts:1478-1537 @ 9841914,
+    /// 00121ed99 / 2d4116333): highlight only the matches intersecting the
+    /// visible viewport — binary search to the first candidate, clamp each
+    /// segment to the scroll-view box and scrollbar column, and restyle the
+    /// plain runs of each hit slice (current match distinct from the rest).
+    fn apply_search_highlights(&self, screen: Vec<String>, layout: &LayoutFrame) -> Vec<String> {
+        let Some(search) = self.active_search.as_ref() else {
+            return screen;
+        };
+        if search.selected_index < 0 || search.matches.is_empty() {
+            return screen;
+        }
+        let scroll_view = layout
+            .primary_scroll_view
+            .clone()
+            .unwrap_or_else(|| self.implicit_scroll_view.clone());
+        let Some(box_) = get_scroll_view_box(layout, &scroll_view) else {
+            return screen;
+        };
+
+        let scroll_top = with_scroll_view(&scroll_view, ScrollView::scroll_top).unwrap_or(0);
+        let mut ranges_by_row: std::collections::HashMap<usize, Vec<SearchHighlightRange>> =
+            std::collections::HashMap::new();
+        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_)
+            .map(|geometry| geometry.column)
+            .unwrap_or(isize::MAX);
+        let min_row = box_.rect.y.max(box_.clip.y).max(0) as usize;
+        let max_row = screen
+            .len()
+            .min((box_.rect.y + box_.rect.height as isize).max(0) as usize)
+            .min((box_.clip.y + box_.clip.height as isize).max(0) as usize);
+        let min_column = box_.rect.x.max(box_.clip.x).max(0) as usize;
+        let terminal_columns = self.terminal().columns() as isize;
+        let max_column = terminal_columns
+            .min((box_.rect.x + box_.rect.width as isize).max(0))
+            .min((box_.clip.x + box_.clip.width as isize).max(0))
+            .min(scrollbar_column)
+            .max(0) as usize;
+        let min_content_row = scroll_top + min_row - box_.rect.y.max(0) as usize;
+        let max_content_row = scroll_top + max_row - box_.rect.y.max(0) as usize - 1;
+
+        let matches = &search.matches;
+        let mut low = 0usize;
+        let mut high = matches.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let last_row = matches[middle]
+                .segments
+                .last()
+                .map(|segment| segment.row)
+                .unwrap_or(0);
+            if last_row < min_content_row {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        for match_index in low..matches.len() {
+            let search_match = &matches[match_index];
+            let first_row = search_match
+                .segments
+                .first()
+                .map(|segment| segment.row)
+                .unwrap_or(0);
+            if first_row > max_content_row {
+                break;
+            }
+            for segment in &search_match.segments {
+                let row = box_.rect.y + segment.row as isize - scroll_top as isize;
+                if row < min_row as isize || row >= max_row as isize {
+                    continue;
+                }
+                let start_col =
+                    min_column.max((box_.rect.x + segment.start_col as isize).max(0) as usize);
+                let end_col =
+                    max_column.min((box_.rect.x + segment.end_col as isize).max(0) as usize);
+                if end_col <= start_col {
+                    continue;
+                }
+                ranges_by_row
+                    .entry(row.max(0) as usize)
+                    .or_default()
+                    .push(SearchHighlightRange {
+                        start_col,
+                        end_col,
+                        current: match_index as i64 == search.selected_index,
+                    });
+            }
+        }
+
+        let mut result = screen;
+        for (row, mut ranges) in ranges_by_row {
+            let Some(line) = result.get_mut(row) else {
+                continue;
+            };
+            if is_image_line(line) {
+                continue;
+            }
+            let line_width = visible_width(line);
+            ranges.sort_by_key(|range| std::cmp::Reverse(range.start_col));
+            for range in ranges {
+                let start_col = range.start_col.min(line_width);
+                let end_col = range.end_col.min(line_width);
+                if end_col <= start_col {
+                    continue;
+                }
+                let before = slice_by_column(line, 0, start_col, true);
+                let highlighted = slice_by_column(line, start_col, end_col - start_col, true);
+                let after = slice_by_column(line, end_col, line_width - end_col, true);
+                *line = format!(
+                    "{before}{}{after}",
+                    self.apply_search_text_highlight(&highlighted, range.current)
+                );
+            }
+        }
+        result
+    }
+
+    /// `compositeScrollToEndIndicator` (tui-alt-screen.ts:1611-1628 @
+    /// 9841914, 79680533c): center the jump-to-end label on the last row of
+    /// a follow-end primary scroll view scrolled away from its end, and
+    /// record its hit rectangle.
+    fn composite_scroll_to_end_indicator(
+        &mut self,
+        screen: Vec<String>,
+        layout: &LayoutFrame,
+        width: usize,
+    ) -> Vec<String> {
+        self.scroll_to_end_indicator_rect = None;
+        let Some(indicator) = self.scroll_to_end_indicator.clone() else {
+            return screen;
+        };
+        let scroll_view = layout
+            .primary_scroll_view
+            .clone()
+            .unwrap_or_else(|| self.implicit_scroll_view.clone());
+        let follows_and_scrolled_away = with_scroll_view(&scroll_view, |view| {
+            view.follows_end() && !view.is_following_end()
+        });
+        if !follows_and_scrolled_away.unwrap_or(false) {
+            return screen;
+        }
+        let Some(box_) = get_scroll_view_box(layout, &scroll_view) else {
+            return screen;
+        };
+        let clip = &box_.clip;
+        if clip.width == 0 || clip.height == 0 {
+            return screen;
+        }
+        let row = clip.y + clip.height as isize - 1;
+        if row < 0 || row as usize >= screen.len() {
+            return screen;
+        }
+        if is_image_line(&screen[row as usize]) {
+            return screen;
+        }
+        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_)
+            .map(|geometry| geometry.column)
+            .unwrap_or(clip.x + clip.width as isize);
+        let available_width = (scrollbar_column - clip.x).max(0) as usize;
+        let text = truncate_to_width(&indicator(), available_width, "", false);
+        let text_width = visible_width(&text);
+        if text_width == 0 {
+            return screen;
+        }
+        let column = clip.x + ((available_width - text_width) / 2) as isize;
+        let mut result = screen;
+        let composited = composite_tui_line(
+            &result[row as usize],
+            &text,
+            column as i32,
+            text_width as i32,
+            width as i32,
+        );
+        result[row as usize] = composited;
+        self.scroll_to_end_indicator_rect = Some(ScrollToEndIndicatorRect {
+            row: row.max(0) as u32,
+            column: column.max(0) as u32,
+            width: text_width as u32,
+        });
+        result
+    }
+
     /// `applySelectionHighlight` (tui-alt-screen.ts:899-914): wrap the
     /// selected text in reverse video, re-applying `\x1b[7m` after every SGR
     /// sequence inside the selection (resets would otherwise cancel it).
@@ -3016,12 +3804,20 @@ impl TuiAltScreenInner {
             .layout_root
             .clone()
             .unwrap_or_else(|| self.implicit_scroll_view.clone());
-        let next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
+        let mut next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
+        // `refreshSearch` (tui-alt-screen.ts:1652-1654 @ 9841914): a
+        // selection reveal scrolls the view — re-render the layout so the
+        // highlight and indicator composite against the scrolled frame.
+        if self.refresh_search(&next_layout) {
+            next_layout = render_layout_frame(&root, width, height, self.render_handle.clone());
+        }
         let mut screen: Vec<String> = next_layout
             .lines
             .iter()
             .map(|line| strip_osc133_zone_prefix(line).to_string())
             .collect();
+        screen = self.apply_search_highlights(screen, &next_layout);
+        screen = self.composite_scroll_to_end_indicator(screen, &next_layout, width);
         screen = self.composite_overlays(screen, width as i32, height as i32);
         if screen.len() > height {
             screen.drain(..screen.len() - height);
@@ -3377,6 +4173,11 @@ impl OverlayHandleOps for TuiAltScreen {
                 .is_some_and(|focused| same_component(focused, &entry.component))
         })
         .unwrap_or(false)
+    }
+
+    fn get_bounds(&self, entry_id: u64) -> Option<OverlayBounds> {
+        self.try_read(move |inner| inner.overlay_get_bounds(entry_id))
+            .flatten()
     }
 }
 
@@ -5986,6 +6787,787 @@ mod tests {
             "no viewport scroll for a handled wheel"
         );
 
+        stop(&tui);
+    }
+    /// Char (column) index of `needle` in `line` (JS `indexOf` returns a
+    /// UTF-16 unit index; these tests need columns, not byte offsets).
+    fn column_of(line: &str, needle: &str) -> i32 {
+        let byte = line.find(needle).expect("needle in line");
+        line[..byte].chars().count() as i32
+    }
+
+    fn column_of_last(line: &str, needle: &str) -> i32 {
+        let byte = line.rfind(needle).expect("needle in line");
+        line[..byte].chars().count() as i32
+    }
+
+    // ---------------------------------------------------------------------
+    // V14-15: fullscreen transcript search (00121ed99 / 7d399e7be /
+    // 2d4116333) and scrollToEndIndicator (79680533c)
+    // ---------------------------------------------------------------------
+
+    /// Upstream test layout: `ScrollView(follow: "end", primary)` over the
+    /// transcript, docked above a fixed editor/footer VStack, on a TUI built
+    /// with `options`.
+    fn transcript_with_dock(
+        lines: Vec<String>,
+        options: TuiAltScreenOptions,
+        columns: usize,
+        rows: usize,
+    ) -> (SharedComponent, TuiAltScreen, VirtualTerminal) {
+        let terminal = VirtualTerminal::new(columns, rows);
+        let tui = TuiAltScreen::with_options(Box::new(terminal.clone()), None, None, options);
+        let transcript = shared_component(ScrollView::new(
+            shared_component(TestText {
+                lines: Arc::new(Mutex::new(lines)),
+            }),
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        let dock = shared_component(VStack::new(
+            vec![
+                StackChild::Component(text("editor")),
+                StackChild::Component(text("footer")),
+            ],
+            StackOptions::default(),
+        ));
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Entry(
+                    transcript.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(0.0)),
+                        grow: Some(1.0),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+                StackChild::Entry(
+                    dock,
+                    StackEntryOptions {
+                        basis: Some(Basis::Auto),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+            ],
+            StackOptions::default(),
+        ))));
+        (transcript, tui, terminal)
+    }
+
+    // it("renders transcript search with a muted placeholder and right-aligned
+    // controls") (tui-alt-screen.test.ts:553)
+    #[test]
+    fn search_component_renders_placeholder_and_right_aligned_controls() {
+        let _caps = CapsGuard::lock_only();
+        let query_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&query_log);
+        let component = AltScreenSearchComponent::new(
+            Arc::new(move |query: &str| {
+                lock_shared(&log).push(query.to_string());
+            }),
+            None,
+        );
+        let rendered = Component::render(&component, 48);
+        let lines: Vec<String> = rendered
+            .iter()
+            .map(|l| strip_terminal_sequences(l))
+            .collect();
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| visible_width(line) == 48));
+        assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'));
+        assert_eq!(
+            lines[1],
+            format!("│ {:<width$} │", "Find in transcript", width = 44)
+        );
+        assert!(rendered[1].contains("\x1b[2m"));
+        assert_eq!(
+            lines[2]
+                .trim_start_matches('└')
+                .trim_end_matches('┘')
+                .trim_matches('─'),
+            " ↑ Shift+Enter · ↓ Enter "
+        );
+        let controls = lines[2].clone();
+        let arrow_col = column_of(&controls, "↑");
+        assert_eq!(
+            component.get_navigation_direction_at(2, arrow_col),
+            Some(-1)
+        );
+        let shift_enter = column_of(&controls, "Shift+Enter");
+        assert_eq!(
+            component.get_navigation_direction_at(2, shift_enter + 5),
+            Some(-1)
+        );
+        let separator = column_of(&controls, "·");
+        assert_eq!(component.get_navigation_direction_at(2, separator), None);
+        let next_arrow = column_of(&controls, "↓");
+        assert_eq!(
+            component.get_navigation_direction_at(2, next_arrow),
+            Some(1)
+        );
+        let next_enter = column_of_last(&controls, "Enter");
+        assert_eq!(
+            component.get_navigation_direction_at(2, next_enter + 2),
+            Some(1)
+        );
+        // Other rows never hit the buttons.
+        assert_eq!(component.get_navigation_direction_at(0, arrow_col), None);
+
+        // Typing reports the query and replaces the placeholder with n/m.
+        let mut component = component;
+        component.handle_input("n");
+        assert_eq!(lock_shared(&query_log).as_slice(), ["n"]);
+        component.set_result(0, 2);
+        let populated = Component::render(&component, 48);
+        let plain: Vec<String> = populated
+            .iter()
+            .map(|l| strip_terminal_sequences(l))
+            .collect();
+        assert!(plain[1].contains('n'));
+        assert!(plain[1].contains("1/2"));
+        assert!(populated[1].contains("\x1b[2m 1/2 \x1b[22m"));
+        assert!(!plain.iter().any(|line| line.contains("Find in transcript")));
+    }
+
+    /// Narrow overlay: the button labels degrade (alt-screen-search.ts:297).
+    #[test]
+    fn search_component_degrades_on_narrow_width() {
+        let component = AltScreenSearchComponent::new(Arc::new(|_: &str| {}), None);
+        let rendered = Component::render(&component, 20);
+        let lines: Vec<String> = rendered
+            .iter()
+            .map(|l| strip_terminal_sequences(l))
+            .collect();
+        // Width 20 → inner 18: " ↑ Shift+Enter · ↓ Enter " does not fit, the
+        // labels collapse to bare arrows separated by one space.
+        assert!(
+            lines[2].contains("↑ ↓") || lines[2].contains("↑ ·↓"),
+            "got {:?}",
+            lines[2]
+        );
+    }
+
+    /// macOS test injection: `alt` renders as `Option`
+    /// (alt-screen-search.ts:268).
+    #[test]
+    fn search_button_key_renames_alt_to_option_on_darwin() {
+        let _caps = CapsGuard::lock_only();
+        {
+            use crate::keybindings::{KeyBindingValue, KeybindingsConfig, KeybindingsManager};
+            let mut config = KeybindingsConfig::new();
+            config.insert(
+                "tui.altScreen.searchPrevious".to_string(),
+                KeyBindingValue::Single("alt+enter".to_string()),
+            );
+            crate::keybindings::set_keybindings(KeybindingsManager::new(
+                crate::keybindings::tui_keybindings().to_vec(),
+                config,
+            ));
+        }
+        let _restore = scopeguard_defaults();
+        let mut component = AltScreenSearchComponent::new(Arc::new(|_: &str| {}), None);
+        component.set_darwin_override(Some(true));
+        let rendered = Component::render(&component, 48);
+        let plain = strip_terminal_sequences(&rendered[2]);
+        assert!(plain.contains("Option+Enter"), "got: {plain:?}");
+        component.set_darwin_override(Some(false));
+        let rendered = Component::render(&component, 48);
+        let plain = strip_terminal_sequences(&rendered[2]);
+        assert!(plain.contains("Alt+Enter"), "got: {plain:?}");
+    }
+
+    // it("searches the transcript with Ctrl+Shift+F and restores editor focus
+    // on close") (tui-alt-screen.test.ts:691)
+    #[test]
+    fn searches_transcript_with_ctrl_shift_f_and_restores_editor_focus_on_close() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(60, 8);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        struct EditorStub {
+            inputs: Arc<Mutex<Vec<String>>>,
+        }
+        impl Component for EditorStub {
+            fn render(&self, _width: usize) -> Vec<String> {
+                vec!["editor".to_string()]
+            }
+            fn handle_input(&mut self, data: &str) {
+                lock_shared(&self.inputs).push(data.to_string());
+            }
+            fn as_focusable(&self) -> Option<&dyn Focusable> {
+                Some(self)
+            }
+            fn as_focusable_mut(&mut self) -> Option<&mut dyn Focusable> {
+                Some(self)
+            }
+        }
+        impl Focusable for EditorStub {
+            fn focused(&self) -> bool {
+                false
+            }
+            fn set_focused(&mut self, _focused: bool) {}
+        }
+        let editor_inputs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let editor = shared_component(EditorStub {
+            inputs: Arc::clone(&editor_inputs),
+        });
+        let transcript = shared_component(ScrollView::new(
+            shared_component(TestText {
+                lines: Arc::new(Mutex::new(
+                    (0..12)
+                        .map(|index| {
+                            if index == 4 {
+                                "line 5 needle one".to_string()
+                            } else if index == 9 {
+                                "line 10 needle two".to_string()
+                            } else {
+                                format!("line {}", index + 1)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+            }),
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Entry(
+                    transcript.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(0.0)),
+                        grow: Some(1.0),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+                StackChild::Entry(
+                    editor.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(1.0)),
+                        shrink: Some(0.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.set_focus(Some(editor.clone()));
+        tui.start();
+        settle(&tui);
+
+        // ctrl+shift+f (kitty CSI-u) opens the search; typing fills it.
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "needle");
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("2/2")));
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("line 10 needle two")));
+        assert!(lock_shared(&editor_inputs).is_empty());
+        // Default current-match style (tui-alt-screen.ts:266).
+        assert!(terminal.writes().contains("\x1b[1;7mneedle\x1b[22;27m"));
+
+        // Manual wheel scrolling does not snap back to the current match
+        // (selectionMode stays "retain", tui-alt-screen.ts:580-589).
+        for _ in 0..6 {
+            send_input(&terminal, &tui, "\x1b[<64;1;4M");
+        }
+        settle(&tui);
+        assert_eq!(with_sv(&transcript, ScrollView::scroll_top), 0);
+        let viewport = terminal.get_viewport();
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("needle") && line.contains("2/2")));
+
+        // ctrl+g → next match.
+        send_input(&terminal, &tui, "\x07");
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("1/2")));
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("line 5 needle one")));
+
+        // ctrl+shift+g → previous match.
+        send_input(&terminal, &tui, "\x1b[103;6u");
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("2/2")));
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("line 10 needle two")));
+
+        // escape closes; plain keys flow back to the editor.
+        send_input(&terminal, &tui, "\x1b");
+        send_input(&terminal, &tui, "x");
+        settle(&tui);
+        assert!(!terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        assert_eq!(lock_shared(&editor_inputs).as_slice(), ["x"]);
+
+        stop(&tui);
+    }
+
+    // it("navigates transcript search with hoverable arrow buttons and toggles
+    // it with its shortcut") (tui-alt-screen.test.ts:581)
+    #[test]
+    fn navigates_search_with_hoverable_arrow_buttons_and_toggles_with_shortcut() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(120, 6);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                search_navigation_button_style: Some(Arc::new(|text: &str, hovered: bool| {
+                    format!(
+                        "{}{text}\x1b[49m",
+                        if hovered { "\x1b[45m" } else { "\x1b[44m" }
+                    )
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("needle one\nmiddle\nneedle two\nend"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "needle");
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("1/2")));
+        assert!(viewport
+            .iter()
+            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+
+        let arrow_row = viewport
+            .iter()
+            .position(|line| line.contains('↑') && line.contains('↓'))
+            .expect("button row");
+        let arrow_column = column_of_last(&viewport[arrow_row], "Enter") as u32 + 1;
+        // Motion (button 35) over the next button → hovered style emitted.
+        send_input(
+            &terminal,
+            &tui,
+            &format!("\x1b[<35;{arrow_column};{}M", arrow_row as u32 + 1),
+        );
+        settle(&tui);
+        assert!(terminal.writes().contains("\x1b[45m↓ Enter\x1b[49m"));
+        // Click the next button → 2/2.
+        send_input(
+            &terminal,
+            &tui,
+            &format!("\x1b[<0;{arrow_column};{}M", arrow_row as u32 + 1),
+        );
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("2/2")));
+
+        let viewport = terminal.get_viewport();
+        let arrow_column = column_of(&viewport[arrow_row], "Shift+Enter") as u32 + 3;
+        send_input(
+            &terminal,
+            &tui,
+            &format!("\x1b[<0;{arrow_column};{}M", arrow_row as u32 + 1),
+        );
+        settle(&tui);
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("1/2")));
+
+        // Toggle with ctrl+shift+f again closes the overlay.
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        settle(&tui);
+        assert!(!terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("↑ Shift+Enter · ↓ Enter")));
+        stop(&tui);
+    }
+
+    // it("does not treat transcript box drawing as search navigation buttons")
+    // (tui-alt-screen.test.ts:628)
+    #[test]
+    fn box_drawing_is_not_treated_as_search_navigation_buttons() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(80, 10);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text(
+            &[
+                "needle one",
+                "middle",
+                "needle two",
+                "filler",
+                "┌────────────────────────────────────────┐",
+                "│ box                                    │",
+                "└────────────────────────────────────────┘",
+                "end",
+            ]
+            .join("\n"),
+        ));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "needle");
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("1/2")));
+
+        let box_bottom_row = viewport
+            .iter()
+            .position(|line| line.starts_with('└'))
+            .expect("box bottom");
+        send_input(
+            &terminal,
+            &tui,
+            &format!("\x1b[<0;24;{}M", box_bottom_row as u32 + 1),
+        );
+        settle(&tui);
+
+        let viewport = terminal.get_viewport();
+        assert!(viewport.iter().any(|line| line.contains("1/2")));
+        assert!(!viewport.iter().any(|line| line.contains("2/2")));
+        stop(&tui);
+    }
+
+    // it("uses configured styles for current and non-current search matches")
+    // (tui-alt-screen.test.ts:668)
+    #[test]
+    fn uses_configured_styles_for_current_and_non_current_search_matches() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(60, 4);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                search_match_style: Some(Arc::new(|text: &str| format!("\x1b[41m{text}\x1b[49m"))),
+                search_current_match_style: Some(Arc::new(|text: &str| {
+                    format!("\x1b[42m{text}\x1b[49m")
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("needle first\nmiddle\nneedle second\nend"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "needle");
+        settle(&tui);
+
+        assert!(terminal.writes().contains("\x1b[42mneedle\x1b[49m"));
+        assert!(terminal.writes().contains("\x1b[41mneedle\x1b[49m"));
+        stop(&tui);
+    }
+
+    // it("keeps viewport scrolling while transcript search is focused")
+    // (tui-alt-screen.test.ts:1873; the R5 search exception to the
+    // overlay-input deferral)
+    #[test]
+    fn keeps_viewport_scrolling_while_transcript_search_is_focused() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(20, 6);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text(
+            &(1..=12)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        tui.start();
+        settle(&tui);
+        let top_before = tui.viewport_top();
+
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        settle(&tui);
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("↑ ↓")));
+
+        // PageUp and wheel still scroll the transcript (the focused search
+        // overlay only consumes its own keys).
+        send_input(&terminal, &tui, "\x1b[5~");
+        send_input(&terminal, &tui, "\x1b[<64;1;4M");
+        settle(&tui);
+        assert!(tui.viewport_top() < top_before);
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("↑ ↓")));
+        stop(&tui);
+    }
+
+    /// R6: complete SGR mouse sequences arriving while the search input holds
+    /// focus never reach the query (the viewport listener consumes all mouse
+    /// sequences; fragmented sequences are reassembled by the stdin buffer
+    /// before the TUI sees them — stdin_buffer.rs:273
+    /// `extract_complete_sequences`, verified by its own test suite).
+    #[test]
+    fn sgr_mouse_sequences_do_not_pollute_the_search_query() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(60, 8);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("needle one\nmiddle\nneedle two"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[102;6u");
+        send_input(&terminal, &tui, "need");
+        settle(&tui);
+        // Motion + press + release mouse sequences around the overlay.
+        send_input(&terminal, &tui, "\x1b[<35;40;1M");
+        send_input(&terminal, &tui, "\x1b[<0;40;1M");
+        send_input(&terminal, &tui, "\x1b[<0;40;1m");
+        // A wheel event likewise.
+        send_input(&terminal, &tui, "\x1b[<64;1;3M");
+        settle(&tui);
+        let viewport = terminal.get_viewport();
+        // Query still "need" → 1/2, no stray characters in the box.
+        assert!(viewport.iter().any(|line| line.contains("1/2")));
+        let input_row = viewport
+            .iter()
+            .find(|line| line.contains("need"))
+            .expect("query row");
+        let plain = strip_terminal_sequences(input_row);
+        assert!(
+            !plain.contains('[') && !plain.contains('M'),
+            "no mouse bytes leaked into the query: {plain:?}"
+        );
+        stop(&tui);
+    }
+
+    // it("scrolls the transcript by one line with custom bindings")
+    // (tui-alt-screen.test.ts:772; 1279952de FR-C R1)
+    #[test]
+    fn scrolls_the_transcript_by_one_line_with_custom_bindings() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(20, 10);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        {
+            use crate::keybindings::{KeyBindingValue, KeybindingsConfig, KeybindingsManager};
+            let mut config = KeybindingsConfig::new();
+            config.insert(
+                "tui.altScreen.lineUp".to_string(),
+                KeyBindingValue::Single("ctrl+y".to_string()),
+            );
+            config.insert(
+                "tui.altScreen.lineDown".to_string(),
+                KeyBindingValue::Single("ctrl+e".to_string()),
+            );
+            crate::keybindings::set_keybindings(KeybindingsManager::new(
+                crate::keybindings::tui_keybindings().to_vec(),
+                config,
+            ));
+        }
+        let _restore = scopeguard_defaults();
+        tui.add_child(text(
+            &(1..=30)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        tui.start();
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 20);
+
+        send_input(&terminal, &tui, "\x19"); // ctrl+y → lineUp
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 19);
+
+        send_input(&terminal, &tui, "\x05"); // ctrl+e → lineDown
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 20);
+        stop(&tui);
+    }
+
+    /// Unbound by default: plain `ctrl+y` does nothing without a user
+    /// binding (1279952de).
+    #[test]
+    fn line_scroll_actions_are_unbound_by_default() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(20, 10);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text(
+            &(1..=30)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        tui.start();
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 20);
+
+        send_input(&terminal, &tui, "\x19");
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 20);
+        stop(&tui);
+    }
+
+    // it("shows a clickable jump-to-end indicator on the transcript's last row
+    // while scrolled up") (tui-alt-screen.test.ts:97; 79680533c)
+    #[test]
+    fn shows_clickable_jump_to_end_indicator_while_scrolled_up() {
+        let _caps = CapsGuard::lock_only();
+        let (transcript, tui, terminal) = transcript_with_dock(
+            (1..=8).map(|i| format!("line {i}")).collect::<Vec<_>>(),
+            TuiAltScreenOptions {
+                scroll_to_end_indicator: Some(Arc::new(|| {
+                    "\x1b[7m ↓ Jump to end \x1b[27m".to_string()
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+            30,
+            6,
+        );
+        tui.start();
+        settle(&tui);
+        assert!(!terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("Jump to end")));
+
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+        assert_eq!(terminal.get_viewport()[3], "line 7  ↓ Jump to end         ");
+        assert_eq!(terminal.get_viewport()[4].trim_end(), "editor");
+
+        // Pressing next to the label starts a selection instead of jumping.
+        send_input(&terminal, &tui, "\x1b[<0;2;4M");
+        send_input(&terminal, &tui, "\x1b[<0;2;4m");
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+
+        send_input(&terminal, &tui, "\x1b[<0;15;4M");
+        send_input(&terminal, &tui, "\x1b[<0;15;4m");
+        settle(&tui);
+        assert!(with_sv(&transcript, ScrollView::is_following_end));
+        assert_eq!(
+            terminal
+                .get_viewport()
+                .iter()
+                .map(|line| line.trim_end().to_string())
+                .collect::<Vec<_>>(),
+            vec!["line 5", "line 6", "line 7", "line 8", "editor", "footer"]
+        );
+        stop(&tui);
+    }
+
+    // it("never shows the jump-to-end indicator for a primary scroll view
+    // without follow-end") (tui-alt-screen.test.ts:174)
+    #[test]
+    fn never_shows_jump_to_end_indicator_without_follow_end() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(30, 3);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                scroll_to_end_indicator: Some(Arc::new(|| " ↓ Jump to end ".to_string())),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        let transcript = shared_component(ScrollView::new(
+            text("one\ntwo\nthree\nfour\nfive"),
+            ScrollViewOptions {
+                primary: true,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        tui.set_layout_root(Some(transcript.clone()));
+        tui.start();
+        settle(&tui);
+
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+        assert!(!terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("Jump to end")));
+        stop(&tui);
+    }
+
+    /// FR-B R3 wiring: the indicator label carries the current
+    /// `tui.altScreen.bottom` key display and `selectedBg`/`text` styling
+    /// (tui-renderer.ts:29-34) — exercised through the same options the app
+    /// passes (`fullscreen_alt_screen_options` lives in the rpi crate; this
+    /// checks the contract from the tui side with an equivalent closure).
+    #[test]
+    fn jump_to_end_indicator_label_reflects_bottom_shortcut() {
+        let _caps = CapsGuard::lock_only();
+        let (transcript, tui, terminal) = transcript_with_dock(
+            (1..=8).map(|i| format!("line {i}")).collect::<Vec<_>>(),
+            TuiAltScreenOptions {
+                scroll_to_end_indicator: Some(Arc::new(move || {
+                    // keyDisplayText("tui.altScreen.bottom") with the app
+                    // default table → "End".
+                    let shortcut = {
+                        let manager = crate::keybindings::get_keybindings()
+                            .read()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let keys = manager.get_keys_by_id("tui.altScreen.bottom");
+                        if keys.is_empty() {
+                            String::new()
+                        } else {
+                            // capitalize parts like formatKeys
+                            keys[0]
+                                .split('+')
+                                .map(|part| {
+                                    let mut chars = part.chars();
+                                    match chars.next() {
+                                        Some(first) => {
+                                            first.to_uppercase().collect::<String>()
+                                                + chars.as_str()
+                                        }
+                                        None => String::new(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("+")
+                        }
+                    };
+                    if shortcut.is_empty() {
+                        " ↓ Jump to latest message ".to_string()
+                    } else {
+                        format!(" ↓ Jump to latest message · {shortcut} ")
+                    }
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+            40,
+            6,
+        );
+        let _ = &transcript;
+        tui.start();
+        settle(&tui);
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        let row = terminal.get_viewport()[3].clone();
+        assert!(
+            row.contains("↓ Jump to latest message · End"),
+            "label with bottom shortcut: {row:?}"
+        );
         stop(&tui);
     }
 }

@@ -991,6 +991,62 @@ fn select_list_theme(theme: &Arc<Theme>) -> Arc<SelectListTheme> {
     })
 }
 
+/// `createInteractiveTui` fullscreen branch (tui-renderer.ts:21-40 @ 9841914,
+/// 00121ed99 + 79680533c): theme-aware search styling and the clickable
+/// jump-to-end indicator. The closures capture the shared theme handle so
+/// they follow theme changes without recreating the renderer.
+fn fullscreen_alt_screen_options(
+    theme_handle: &Arc<Mutex<Arc<Theme>>>,
+) -> rpi_tui::tui_alt_screen::TuiAltScreenOptions {
+    use rpi_tui::tui_alt_screen::{ScrollToEndIndicatorFn, SearchTextStyleFn, TuiAltScreenOptions};
+    use std::sync::Arc as StdArc;
+
+    let style_search_match: StdArc<dyn Fn(&str) -> String + Send + Sync> = {
+        let match_theme: Arc<Mutex<Arc<Theme>>> = Arc::clone(theme_handle);
+        StdArc::new(move |text: &str| {
+            let theme = lock(&match_theme);
+            theme.bg("searchMatchBg", &theme.fg("searchMatchText", text))
+        })
+    };
+    let search_match_style: SearchTextStyleFn = {
+        let style = StdArc::clone(&style_search_match);
+        StdArc::new(move |text: &str| Theme::underline(&style(text)))
+    };
+    let search_current_match_style: SearchTextStyleFn = {
+        let style = StdArc::clone(&style_search_match);
+        StdArc::new(move |text: &str| Theme::bold(&Theme::inverse(&style(text))))
+    };
+    let search_navigation_button_style: rpi_tui::alt_screen_search::NavigationButtonStyleFn =
+        StdArc::new(move |text: &str, hovered: bool| {
+            if hovered {
+                Theme::underline(text)
+            } else {
+                text.to_string()
+            }
+        });
+    let scroll_to_end_indicator: ScrollToEndIndicatorFn = {
+        let indicator_theme: Arc<Mutex<Arc<Theme>>> = Arc::clone(theme_handle);
+        StdArc::new(move || {
+            let theme = lock(&indicator_theme);
+            let shortcut = key_display_text("tui.altScreen.bottom");
+            let label = if shortcut.is_empty() {
+                " ↓ Jump to latest message ".to_string()
+            } else {
+                format!(" ↓ Jump to latest message · {shortcut} ")
+            };
+            theme.bg("selectedBg", &theme.fg("text", &label))
+        })
+    };
+
+    TuiAltScreenOptions {
+        search_match_style: Some(search_match_style),
+        search_current_match_style: Some(search_current_match_style),
+        search_navigation_button_style: Some(search_navigation_button_style),
+        scroll_to_end_indicator: Some(scroll_to_end_indicator),
+        ..TuiAltScreenOptions::default()
+    }
+}
+
 /// Resolve the active theme from settings (default `dark`).
 fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) -> Arc<Theme> {
     // ThemeController constructor (theme-controller.ts:41-46): the
@@ -1238,10 +1294,12 @@ pub(crate) struct InteractiveUi {
     /// Agent directory (for renderer log directories), stored so
     /// `switch_tui_mode` on `InteractiveUi` can construct a new renderer.
     pub(crate) agent_dir: Mutex<PathBuf>,
-    /// Shared theme handle for the fullscreen scrollbar style closure
-    /// (interactive-mode.ts:874 `scrollbarStyle: (text) =>
-    /// theme.bg("scrollbarThumb", text)`). Updated in `apply_theme` so the
-    /// scrollbar follows theme changes without recreating the scroll view.
+    /// Shared theme handle for the fullscreen renderer closures — the
+    /// scrollbar style (interactive-mode.ts:874 `scrollbarStyle: (text) =>
+    /// theme.bg("scrollbarThumb", text)`) and, since V14-15, the
+    /// transcript-search styles and jump-to-end indicator
+    /// (tui-renderer.ts:21-40 @ 9841914). Updated in `apply_theme` so every
+    /// closure follows theme changes without recreating the renderer.
     pub(crate) scrollbar_theme: Arc<Mutex<Arc<Theme>>>,
     /// Weak ref to the mounted settings selector, for the TuiMode rollback
     /// path (interactive-mode.ts:4561). Set when the selector mounts, cleared
@@ -1338,7 +1396,7 @@ impl InteractiveUi {
                     terminal,
                     Some(show_hardware_cursor),
                     Some(agent_dir),
-                    rpi_tui::tui_alt_screen::TuiAltScreenOptions::default(),
+                    fullscreen_alt_screen_options(&self.scrollbar_theme),
                 ))
             }
             TuiMode::Regular => Renderer::Main(TuiMainScreen::with_shared_terminal(
@@ -3966,6 +4024,10 @@ impl InteractiveMode {
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
         let clear_on_shrink = session.settings_manager(|settings| settings.get_clear_on_shrink());
+        // Shared fullscreen theme handle (tui-renderer.ts:21-40): the
+        // search-style and jump-indicator closures capture it; `apply_theme`
+        // swaps the inner Arc so every closure follows theme changes.
+        let theme_handle: Arc<Mutex<Arc<Theme>>> = Arc::new(Mutex::new(Arc::clone(&theme)));
         // Renderer selection (interactive-mode.ts:343-352, 540-546 @ f074efd92):
         // `tui_mode == Fullscreen` → `TuiAltScreen`; otherwise → `TuiMainScreen`.
         let ui: TuiHandle = if options.tui_mode == TuiMode::Fullscreen {
@@ -3973,7 +4035,7 @@ impl InteractiveMode {
                 terminal,
                 Some(show_hardware_cursor),
                 Some(agent_dir.clone()),
-                rpi_tui::tui_alt_screen::TuiAltScreenOptions::default(),
+                fullscreen_alt_screen_options(&theme_handle),
             );
             let handle = TuiHandle::from_alt(alt);
             handle.set_clear_on_shrink(clear_on_shrink);
@@ -4114,7 +4176,7 @@ impl InteractiveMode {
             fullscreen_layout_root: Mutex::new(None),
             fullscreen_transcript_scroll_view: Mutex::new(None),
             agent_dir: Mutex::new(agent_dir),
-            scrollbar_theme: Arc::new(Mutex::new(Arc::clone(&theme))),
+            scrollbar_theme: theme_handle,
             settings_selector_weak: Mutex::new(None),
             extension_input_listeners: Mutex::new(Vec::new()),
         });

@@ -232,6 +232,22 @@ pub trait Component: Send {
         None
     }
 
+    /// Downcast-style accessor for the transcript search overlay component
+    /// (V14-15 extension to the frozen contract, same precedent as
+    /// [`Component::as_scroll_view`]): the alternate-screen renderer reads
+    /// navigation-button hit ranges and drives result/hover state through
+    /// this. Default: not a search component.
+    fn as_search_component(&self) -> Option<&crate::alt_screen_search::AltScreenSearchComponent> {
+        None
+    }
+
+    /// Mutable counterpart of [`Component::as_search_component`].
+    fn as_search_component_mut(
+        &mut self,
+    ) -> Option<&mut crate::alt_screen_search::AltScreenSearchComponent> {
+        None
+    }
+
     /// Upstream optional `handleMouse` member (tui.ts:123-124 @ 9841914,
     /// introduced by 71026970a): normalized mouse handler. Default `None` —
     /// the component ignores mouse input, exactly like upstream components
@@ -730,6 +746,16 @@ pub struct OverlayUnfocusOptions {
     pub target: Option<SharedComponent>,
 }
 
+/// `OverlayBounds` (tui.ts:266-271): last rendered terminal-relative overlay
+/// rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayBounds {
+    pub row: i32,
+    pub col: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// `parseSizeValue` (tui.ts:152-161). Percent values floor like upstream
 /// (`Math.floor((referenceSize * pct) / 100)`).
 pub(crate) fn parse_size_value(value: Option<&SizeValue>, reference_size: i32) -> Option<i32> {
@@ -1037,6 +1063,7 @@ pub(crate) trait OverlayHandleOps: Send + Sync {
     fn focus(&self, entry_id: u64);
     fn unfocus(&self, entry_id: u64, options: Option<OverlayUnfocusOptions>);
     fn is_focused(&self, entry_id: u64) -> bool;
+    fn get_bounds(&self, entry_id: u64) -> Option<OverlayBounds>;
 }
 
 impl OverlayHandle {
@@ -1076,6 +1103,13 @@ impl OverlayHandle {
     /// on lock contention.
     pub fn is_focused(&self) -> bool {
         self.ops.is_focused(self.entry_id)
+    }
+
+    /// Get the most recent rendered bounds for a visible overlay
+    /// (tui.ts:284 @ 9841914, 00121ed99). `None` when the overlay is off the
+    /// stack, hidden, or has not rendered yet.
+    pub fn get_bounds(&self) -> Option<OverlayBounds> {
+        self.ops.get_bounds(self.entry_id)
     }
 }
 
@@ -1122,6 +1156,11 @@ impl OverlayHandleOps for TuiMainScreen {
                 .is_some_and(|focused| same_component(focused, &entry.component))
         })
         .unwrap_or(false)
+    }
+
+    fn get_bounds(&self, entry_id: u64) -> Option<OverlayBounds> {
+        self.try_read(move |inner| inner.overlay_get_bounds(entry_id))
+            .flatten()
     }
 }
 

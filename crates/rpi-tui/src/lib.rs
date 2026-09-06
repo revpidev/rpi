@@ -12,6 +12,7 @@
 //! terminal_* modules first, then components, the TUI core and terminal
 //! state recovery (`recovery`, coding-standards §8.5).
 
+pub mod alt_screen_search;
 pub mod autocomplete;
 pub mod components;
 pub mod error;

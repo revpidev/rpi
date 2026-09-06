@@ -103,12 +103,26 @@ struct ScrollViewState {
     content_height: usize,
     current_viewport_height: usize,
     following_end: bool,
+    /// `followSuppressedAtEnd` (scroll-view.ts:35 @ 9841914, 00121ed99):
+    /// set by search reveal scrolls with `disableFollow` landing on the
+    /// exact end — keeps `updateLayout` from re-engaging the follow until a
+    /// real scroll moves off the end.
+    follow_suppressed_at_end: bool,
     request_render_callback: Option<RenderHandle>,
     transient_scrollbar_visible: bool,
     scrollbar_active: bool,
     /// Replaces upstream's `scrollbarHideTimer` (scroll-view.ts:31); see the
     /// header note on the explicit-deadline timer model.
     hide_deadline: Option<Instant>,
+}
+
+/// `ScrollViewScrollToOptions` (scroll-view.ts:16-18 @ 9841914,
+/// 00121ed99).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollViewScrollToOptions {
+    /// Keep follow-end disabled even when the target is the current content
+    /// end.
+    pub disable_follow: bool,
 }
 
 /// `ScrollView` (scroll-view.ts:16-195).
@@ -142,6 +156,7 @@ impl ScrollView {
                 content_height: 0,
                 current_viewport_height: 0,
                 following_end: follow_end,
+                follow_suppressed_at_end: false,
                 request_render_callback: None,
                 transient_scrollbar_visible: false,
                 scrollbar_active: false,
@@ -160,9 +175,17 @@ impl ScrollView {
         self.state.borrow().current_scroll_top
     }
 
-    /// `get isFollowingEnd` (scroll-view.ts:53-55).
+    /// `get isFollowingEnd` (scroll-view.ts:53-55) — whether the view is
+    /// currently pinned to the end.
     pub fn is_following_end(&self) -> bool {
         self.state.borrow().following_end
+    }
+
+    /// `readonly followEnd` option (scroll-view.ts:18) — whether following
+    /// the end is enabled at all (distinct from `is_following_end`, which is
+    /// the current pin state).
+    pub fn follows_end(&self) -> bool {
+        self.follow_end
     }
 
     /// `get viewportHeight` (scroll-view.ts:57-59).
@@ -261,18 +284,34 @@ impl ScrollView {
         self.mark_scrollbar_activity_state(&mut state);
     }
 
-    /// `scrollTo` (scroll-view.ts:113-122).
+    /// `scrollTo` (scroll-view.ts:127-146 @ 9841914, 00121ed99): clamped
+    /// scroll with optional follow-end suppression at the exact end.
     pub fn scroll_to(&self, scroll_top: i64) {
+        self.scroll_to_with_options(scroll_top, ScrollViewScrollToOptions::default());
+    }
+
+    /// `scrollTo(scrollTop, options)`.
+    pub fn scroll_to_with_options(&self, scroll_top: i64, options: ScrollViewScrollToOptions) {
         let callback = {
             let mut state = self.state.borrow_mut();
             let max_scroll_top = max_scroll_top(&state) as i64;
             let next = scroll_top.clamp(0, max_scroll_top);
-            if next == state.current_scroll_top as i64 {
+            let next_follow_suppressed_at_end = options.disable_follow && next == max_scroll_top;
+            let next_following_end =
+                !next_follow_suppressed_at_end && self.follow_end && next == max_scroll_top;
+            if next == state.current_scroll_top as i64
+                && next_following_end == state.following_end
+                && next_follow_suppressed_at_end == state.follow_suppressed_at_end
+            {
                 return;
             }
+            let moved = next != state.current_scroll_top as i64;
             state.current_scroll_top = next as usize;
-            state.following_end = self.follow_end && next == max_scroll_top;
-            self.mark_scrollbar_activity_state(&mut state);
+            state.following_end = next_following_end;
+            state.follow_suppressed_at_end = next_follow_suppressed_at_end;
+            if moved {
+                self.mark_scrollbar_activity_state(&mut state);
+            }
             state.request_render_callback.clone()
         };
         if let Some(callback) = callback {
@@ -280,8 +319,9 @@ impl ScrollView {
         }
     }
 
-    /// `scrollBy` (scroll-view.ts:124-138): returns the unconsumed delta
-    /// (signed — negative when scrolling up past the start).
+    /// `scrollBy` (scroll-view.ts:148-166 @ 9841914, 00121ed99): returns the
+    /// unconsumed delta (signed — negative when scrolling up past the
+    /// start). Any scroll clears the follow suppression.
     pub fn scroll_by(&self, lines: i64) -> i64 {
         if lines == 0 {
             return 0;
@@ -296,10 +336,14 @@ impl ScrollView {
             };
             let next = (start + lines).clamp(0, max_scroll_top);
             let moved = next - start;
+            let was_following_end = state.following_end;
             state.current_scroll_top = next as usize;
             state.following_end = self.follow_end && next == max_scroll_top;
+            state.follow_suppressed_at_end = false;
             let callback = if moved != 0 {
                 self.mark_scrollbar_activity_state(&mut state);
+                state.request_render_callback.clone()
+            } else if state.following_end != was_following_end {
                 state.request_render_callback.clone()
             } else {
                 None
@@ -309,7 +353,7 @@ impl ScrollView {
         if let Some(callback) = callback {
             callback.request_render();
         }
-        // `requested - moved` (scroll-view.ts:137).
+        // `requested - moved` (scroll-view.ts:166).
         unconsumed
     }
 
@@ -322,6 +366,7 @@ impl ScrollView {
             let changed = state.current_scroll_top != 0 || state.following_end != target_following;
             state.current_scroll_top = 0;
             state.following_end = target_following;
+            state.follow_suppressed_at_end = false;
             if changed {
                 self.mark_scrollbar_activity_state(&mut state);
                 state.request_render_callback.clone()
@@ -334,7 +379,7 @@ impl ScrollView {
         }
     }
 
-    /// `scrollToEnd` (scroll-view.ts:152-161).
+    /// `scrollToEnd` (scroll-view.ts:168-183 @ 9841914).
     pub fn scroll_to_end(&self) {
         let callback = {
             let mut state = self.state.borrow_mut();
@@ -343,6 +388,7 @@ impl ScrollView {
                 state.current_scroll_top != next || state.following_end != self.follow_end;
             state.current_scroll_top = next;
             state.following_end = self.follow_end;
+            state.follow_suppressed_at_end = false;
             if changed {
                 self.mark_scrollbar_activity_state(&mut state);
                 state.request_render_callback.clone()
@@ -355,7 +401,7 @@ impl ScrollView {
         }
     }
 
-    /// `updateLayout` (scroll-view.ts:163-172).
+    /// `updateLayout` (scroll-view.ts:188-201 @ 9841914).
     pub fn update_layout(
         &self,
         content_height: usize,
@@ -372,7 +418,13 @@ impl ScrollView {
         } else {
             state.current_scroll_top = state.current_scroll_top.min(max_scroll_top);
         }
-        if self.follow_end && state.current_scroll_top == max_scroll_top {
+        if state.current_scroll_top < max_scroll_top {
+            state.follow_suppressed_at_end = false;
+        }
+        if self.follow_end
+            && state.current_scroll_top == max_scroll_top
+            && !state.follow_suppressed_at_end
+        {
             state.following_end = true;
         }
         if state.content_height <= state.current_viewport_height {

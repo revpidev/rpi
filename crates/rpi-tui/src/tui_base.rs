@@ -42,9 +42,9 @@ use crate::terminal_colors::{
 use crate::terminal_image::{get_capabilities, is_image_line, set_cell_dimensions, CellDimensions};
 use crate::tui::{
     composite_tui_line, lock_component, lock_shared, parse_size_value, same_component, Component,
-    OverlayAnchor, OverlayMargin, OverlayMarginSpec, OverlayOptions, OverlayUnfocusOptions,
-    SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener, TuiInputListener,
-    CURSOR_MARKER, SEGMENT_RESET,
+    OverlayAnchor, OverlayBounds, OverlayMargin, OverlayMarginSpec, OverlayOptions,
+    OverlayUnfocusOptions, SharedComponent, SharedTerminal, SizeValue, TerminalColorSchemeListener,
+    TuiInputListener, CURSOR_MARKER, SEGMENT_RESET,
 };
 use crate::utils::{normalize_terminal_output, slice_by_column, visible_width};
 
@@ -254,6 +254,7 @@ pub(crate) struct TuiBase {
 /// substitution, same as the overlay stack itself).
 #[derive(Clone)]
 pub(crate) struct RenderedOverlayLayout {
+    pub(crate) entry_id: u64,
     pub(crate) component: SharedComponent,
     pub(crate) row: i32,
     pub(crate) col: i32,
@@ -951,6 +952,23 @@ impl TuiBase {
         !self.overlay_stack.is_empty()
     }
 
+    /// `OverlayHandle.getBounds` body (tui.ts:777-779 @ 9841914): the most
+    /// recent rendered bounds for a visible overlay. Rendered layouts only
+    /// include on-stack visible overlays and reset every composite — the
+    /// same liveness as upstream's entry/bounds check.
+    pub(crate) fn overlay_get_bounds(&self, entry_id: u64) -> Option<OverlayBounds> {
+        self.rendered_overlay_layouts
+            .borrow()
+            .iter()
+            .find(|layout| layout.entry_id == entry_id)
+            .map(|layout| OverlayBounds {
+                row: layout.row,
+                col: layout.col,
+                width: layout.width,
+                height: layout.height,
+            })
+    }
+
     /// `compositeOverlays` (tui.ts:1036-1095): composite all overlays into
     /// content lines (sorted by focusOrder, higher = on top). Shared by the
     /// main-screen (`doRender`, tui.ts:1291) and alternate-screen
@@ -970,6 +988,7 @@ impl TuiBase {
 
         // Pre-render all visible overlays and calculate positions.
         struct Rendered {
+            entry_id: u64,
             component: SharedComponent,
             overlay_lines: Vec<String>,
             row: i32,
@@ -1011,6 +1030,7 @@ impl TuiBase {
             );
             min_lines_needed = min_lines_needed.max(layout.row + overlay_lines.len() as i32);
             rendered.push(Rendered {
+                entry_id: entry.id,
                 component: Arc::clone(&entry.component),
                 overlay_lines,
                 row: layout.row,
@@ -1025,6 +1045,7 @@ impl TuiBase {
         *self.rendered_overlay_layouts.borrow_mut() = rendered
             .iter()
             .map(|overlay| RenderedOverlayLayout {
+                entry_id: overlay.entry_id,
                 component: Arc::clone(&overlay.component),
                 row: overlay.row,
                 col: overlay.col,
