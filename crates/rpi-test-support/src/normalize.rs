@@ -54,6 +54,27 @@ const ID_KEYS: &[&str] = &[
 /// JSON object keys whose values are working-directory paths.
 const CWD_KEYS: &[&str] = &["cwd"];
 
+/// Canonicalize the placement of `errorMessage` inside an object that also
+/// has a `timestamp` key (assistant messages): move it to the object end.
+///
+/// Rationale (M5, session fixtures @ 9841914): JSON object key order is not
+/// part of the session-format contract, and upstream itself emits two
+/// orders depending on the construction path — fresh object literals put
+/// `errorMessage` before `timestamp` (`createErrorMessage`,
+/// `handleRunFailure`), while spread-cloned/accumulated messages append it
+/// after `timestamp` (`createAbortedMessage`, adapter abort paths). Both the
+/// `abort` (appended) and `compaction-overflow` (fresh) fixtures pin real
+/// upstream bytes with different orders; canonicalizing at diff time keeps
+/// the byte anchor for everything else without modeling JS key-insertion
+/// order in the Rust type system.
+fn canonicalize_error_message_placement(map: &mut serde_json::Map<String, Value>) {
+    if map.contains_key("errorMessage") && map.contains_key("timestamp") {
+        if let Some((_, value)) = map.shift_remove_entry("errorMessage") {
+            map.insert("errorMessage".to_owned(), value);
+        }
+    }
+}
+
 /// Stateful normalizer. Reuse one instance per side of a comparison so id
 /// placeholders stay consistent across lines / events of that side.
 #[derive(Debug, Default)]
@@ -112,6 +133,7 @@ impl Normalizer {
                     }
                     self.normalize_json(val);
                 }
+                canonicalize_error_message_placement(map);
             }
             Value::Array(items) => {
                 for item in items {

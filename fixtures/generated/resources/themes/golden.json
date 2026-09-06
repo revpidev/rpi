@@ -1,12 +1,5 @@
 {
   "upstream": "external/pi @ 9841914 (v0.85.0+), dist build",
-  "meta": {
-    "pendingSplitCases": [
-      "invalid-missing-colors",
-      "invalid-color-value-type",
-      "invalid-name-slash"
-    ]
-  },
   "cases": [
     {
       "name": "vars-and-hex",
@@ -686,15 +679,11 @@
         "content": "{\n  \"name\": \"invalid-color-value-type\",\n  \"colors\": {\n    \"accent\": 256,\n    \"border\": true,\n    \"borderAccent\": \"#123456\",\n    \"borderMuted\": \"#123456\",\n    \"success\": \"#123456\",\n    \"error\": \"#123456\",\n    \"warning\": \"#123456\",\n    \"muted\": \"#123456\",\n    \"dim\": \"#123456\",\n    \"text\": \"#123456\",\n    \"thinkingText\": \"#123456\",\n    \"selectedBg\": \"#123456\",\n    \"userMessageBg\": \"#123456\",\n    \"userMessageText\": \"#123456\",\n    \"customMessageBg\": \"#123456\",\n    \"customMessageText\": \"#123456\",\n    \"customMessageLabel\": \"#123456\",\n    \"toolPendingBg\": \"#123456\",\n    \"toolSuccessBg\": \"#123456\",\n    \"toolErrorBg\": \"#123456\",\n    \"toolTitle\": \"#123456\",\n    \"toolOutput\": \"#123456\",\n    \"mdHeading\": \"#123456\",\n    \"mdLink\": \"#123456\",\n    \"mdLinkUrl\": \"#123456\",\n    \"mdCode\": \"#123456\",\n    \"mdCodeBlock\": \"#123456\",\n    \"mdCodeBlockBorder\": \"#123456\",\n    \"mdQuote\": \"#123456\",\n    \"mdQuoteBorder\": \"#123456\",\n    \"mdHr\": \"#123456\",\n    \"mdListBullet\": \"#123456\",\n    \"toolDiffAdded\": \"#123456\",\n    \"toolDiffRemoved\": \"#123456\",\n    \"toolDiffContext\": \"#123456\",\n    \"syntaxComment\": \"#123456\",\n    \"syntaxKeyword\": \"#123456\",\n    \"syntaxFunction\": \"#123456\",\n    \"syntaxVariable\": \"#123456\",\n    \"syntaxString\": \"#123456\",\n    \"syntaxNumber\": \"#123456\",\n    \"syntaxType\": \"#123456\",\n    \"syntaxOperator\": \"#123456\",\n    \"syntaxPunctuation\": \"#123456\",\n    \"thinkingOff\": \"#123456\",\n    \"thinkingMinimal\": \"#123456\",\n    \"thinkingLow\": \"#123456\",\n    \"thinkingMedium\": \"#123456\",\n    \"thinkingHigh\": \"#123456\",\n    \"thinkingXhigh\": \"#123456\",\n    \"bashMode\": \"#123456\"\n  }\n}",
         "truecolor": {
           "errorPrefix": "value.startsWith is not a function",
-          "errorContains": [
-            "Other errors:"
-          ]
+          "errorContains": []
         },
         "256color": {
           "errorPrefix": "value.startsWith is not a function",
-          "errorContains": [
-            "Other errors:"
-          ]
+          "errorContains": []
         }
       }
     },

@@ -299,49 +299,15 @@ const THEME_MODES: [(&str, ColorMode); 2] = [
     ("256color", ColorMode::Color256),
 ];
 
-/// Golden `meta` markers (written by `fixtures/generate-resources-golden.mjs`):
-/// parts of the pinned upstream output whose rpi port lands in a later
-/// v0.1.4 task. The scrollbarTrack/scrollbarThumb key filter was REMOVED
-/// with V14-16 (457ae8c79 ported); `pendingSplitCases` theme cases are
-/// still skipped (error text depends on the eb3e9feed validation split —
-/// gap registered with the V14-15 acceptance record, deferred to M5).
-/// Empty defaults keep older goldens loadable.
-struct ThemeGoldenMeta {
-    pending_split_cases: Vec<String>,
-}
-
-impl ThemeGoldenMeta {
-    fn from_golden(golden: &serde_json::Value) -> Self {
-        let meta = &golden["meta"];
-        Self {
-            pending_split_cases: meta["pendingSplitCases"]
-                .as_array()
-                .map(|cases| {
-                    cases
-                        .iter()
-                        .map(|case| case.as_str().expect("case string").to_string())
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    }
-}
-
 #[test]
 fn parity_themes() {
     let golden = load_golden("themes");
-    let meta = ThemeGoldenMeta::from_golden(&golden);
     let tmp = TestDir::new("themes");
 
+    // eb3e9feed (M5): every case is compared — the lenient library path
+    // matches the golden's raw-TypeError/passthrough behavior.
     for case in golden["cases"].as_array().expect("cases array") {
         let name = case["name"].as_str().expect("case name");
-        if meta
-            .pending_split_cases
-            .iter()
-            .any(|pending| pending == name)
-        {
-            continue;
-        }
         let content = case["expected"]["content"].as_str().expect("content");
         let theme_path = tmp.path().join(format!("{name}.json"));
         std::fs::write(&theme_path, content).expect("write theme file");

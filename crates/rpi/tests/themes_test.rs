@@ -221,25 +221,23 @@ fn test_custom_theme_with_empty_string_default() {
     assert_eq!(theme.get_fg_ansi("accent"), "\x1b[39m");
 }
 
-// --- Invalid theme diagnostics -------------------------------------------
-
+// --- Invalid theme diagnostics (eb3e9feed split) -------------------------
+/// The structured "Invalid theme" diagnostics live in the installed
+/// validator (`validate_theme_json`, theme-json.ts); the bare library path
+/// is lenient (see themes.rs tests). The binary installs the validator at
+/// startup (app.rs, main.ts:1004).
 #[test]
 fn test_missing_colors_diagnostics() {
-    let tmp = TempDir::new();
-    let theme_path = tmp.path().join("missing.json");
-
     let theme_json = serde_json::json!({
         "name": "missing",
         "colors": { "accent": "#ff0000" }
     });
-    fs::write(&theme_path, serde_json::to_string(&theme_json).unwrap()).unwrap();
-
-    let result = load_theme_from_path(&theme_path, Some(ColorMode::TrueColor));
+    let result = validate_theme_json("missing", &theme_json);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Missing required color tokens"));
     assert!(err.contains("border"));
-    assert!(!err.contains("accent")); // accent is present, shouldn't be listed
+    assert!(!err.contains("  - accent")); // accent is present, shouldn't be listed
 }
 
 #[test]
@@ -252,7 +250,7 @@ fn test_invalid_color_value_diagnostics() {
         "name": "bad-types",
         "colors": serde_json::Value::Object(colors),
     });
-    let result = parse_theme_json("test", &theme_json);
+    let result = validate_theme_json("test", &theme_json);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("Other errors"));

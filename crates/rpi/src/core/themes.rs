@@ -248,13 +248,40 @@ pub const CSI_2031L_DISABLE: &[u8] = b"\x1b[?2031l";
 /// reference (`"primary"`), empty string (`""` = terminal default), or 256
 /// -colour palette index (0-255).
 ///
-/// Port of `ColorValueSchema` / `ColorValue` (theme.ts:24-29).
+/// Port of `ColorValueSchema` / `ColorValue` (theme.ts:24-29). The
+/// [`Raw`](ColorValue::Raw) arm models the eb3e9feed lenient cast: without an
+/// installed validator (see [`set_theme_json_validator`]),
+/// `loadThemeFromPath` accepts the JSON as-is and any non-string/non-number
+/// value flows into `resolveVarRefs`, which crashes with the JS TypeError
+/// wording (pinned byte-for-byte by the themes golden).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColorValue {
     /// Hex `"#RRGGBB"`, variable reference name, or empty string.
     Str(String),
     /// 256-colour palette index (0-255).
     Index(u32),
+    /// Lenient passthrough of an unvalidated JSON value.
+    Raw(RawColorValue),
+}
+
+/// The unvalidated shapes carried by [`ColorValue::Raw`] (only reachable
+/// through the lenient parse path — the installed validator rejects them
+/// with structured diagnostics instead).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawColorValue {
+    /// `undefined` — never parsed from JSON; only arises from the `??`
+    /// fallback keys in `with_color_fallbacks` when the source color is
+    /// missing (upstream `colors.muted ?? colors.muted` stays `undefined`).
+    Undefined,
+    /// JSON `null`.
+    Null,
+    /// JSON `true`/`false`.
+    Bool(bool),
+    /// A number outside 0-255 (in-range integers parse as
+    /// [`ColorValue::Index`]).
+    Number(f64),
+    /// Arrays and objects.
+    Other(serde_json::Value),
 }
 
 impl serde::Serialize for ColorValue {
@@ -265,6 +292,14 @@ impl serde::Serialize for ColorValue {
         match self {
             ColorValue::Str(s) => serializer.serialize_str(s),
             ColorValue::Index(i) => serializer.serialize_u32(*i),
+            // Raw values only round-trip on the lenient path; `undefined`
+            // has no JSON form and serializes as null.
+            ColorValue::Raw(RawColorValue::Undefined) | ColorValue::Raw(RawColorValue::Null) => {
+                serializer.serialize_none()
+            }
+            ColorValue::Raw(RawColorValue::Bool(b)) => serializer.serialize_bool(*b),
+            ColorValue::Raw(RawColorValue::Number(n)) => serializer.serialize_f64(*n),
+            ColorValue::Raw(RawColorValue::Other(v)) => v.serialize(serializer),
         }
     }
 }
@@ -278,18 +313,24 @@ impl<'de> serde::Deserialize<'de> for ColorValue {
         match value {
             serde_json::Value::String(s) => Ok(ColorValue::Str(s)),
             serde_json::Value::Number(n) => {
-                let i = n.as_u64().ok_or_else(|| {
-                    serde::de::Error::custom(format!("expected integer 0-255, got {}", n))
-                })?;
-                if i > 255 {
-                    return Err(serde::de::Error::custom(format!(
-                        "expected integer 0-255, got {}",
-                        i
-                    )));
+                if let Some(i) = n.as_u64() {
+                    if i <= 255 {
+                        return Ok(ColorValue::Index(i as u32));
+                    }
                 }
-                Ok(ColorValue::Index(i as u32))
+                // Out-of-range/fractional numbers pass through leniently
+                // (eb3e9feed: the unvalidated cast keeps them; resolveVarRefs
+                // returns numbers as-is and fgAnsi prints the raw index).
+                Ok(ColorValue::Raw(RawColorValue::Number(
+                    n.as_f64().unwrap_or_default(),
+                )))
             }
-            _ => Err(serde::de::Error::custom("expected string or integer 0-255")),
+            // Bools/null/arrays/objects stay raw instead of failing the
+            // deserialization — without an installed validator upstream's
+            // cast accepts them and the crash happens in resolveVarRefs.
+            serde_json::Value::Bool(b) => Ok(ColorValue::Raw(RawColorValue::Bool(b))),
+            serde_json::Value::Null => Ok(ColorValue::Raw(RawColorValue::Null)),
+            other => Ok(ColorValue::Raw(RawColorValue::Other(other))),
         }
     }
 }
@@ -390,9 +431,13 @@ pub struct ThemeExport {
     pub info_bg: Option<ColorValue>,
 }
 
-/// Parsed theme JSON (theme.ts:31-103).
+/// Parsed theme JSON (theme.ts:31-103). `name` defaults to an empty string
+/// on the lenient path (upstream's unchecked cast leaves it `undefined`;
+/// both are only reachable without an installed validator — the validator
+/// requires the string).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ThemeJson {
+    #[serde(default)]
     pub name: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub vars: HashMap<String, ColorValue>,
@@ -620,6 +665,27 @@ fn resolve_var_refs(
             visited.insert(s.clone());
             resolve_var_refs(referenced, vars, visited)
         }
+        // Lenient-cast values (eb3e9feed): upstream `resolveVarRefs` reads
+        // `value.startsWith("#")` before any string check, so `undefined`/
+        // `null` raise "Cannot read properties of … (reading 'startsWith')"
+        // and any other non-number/non-string type raises
+        // "value.startsWith is not a function" — the JS TypeError wording
+        // is pinned byte-for-byte by the themes golden (unvalidated path).
+        ColorValue::Raw(RawColorValue::Undefined) => Err(RpiError::Resource(
+            "Cannot read properties of undefined (reading 'startsWith')".to_string(),
+        )),
+        ColorValue::Raw(RawColorValue::Null) => Err(RpiError::Resource(
+            "Cannot read properties of null (reading 'startsWith')".to_string(),
+        )),
+        ColorValue::Raw(RawColorValue::Bool(_)) | ColorValue::Raw(RawColorValue::Other(_)) => Err(
+            RpiError::Resource("value.startsWith is not a function".to_string()),
+        ),
+        // `typeof value === "number"` returns as-is (theme.ts:234); the raw
+        // index prints through the 256-colour escape (fgAnsi typeof number,
+        // theme.ts:204). Negative/fractional values saturate to the integer
+        // index (upstream would print the raw number — an unpinned edge of
+        // the lenient path).
+        ColorValue::Raw(RawColorValue::Number(n)) => Ok(ResolvedColor::Index(n.max(0.0) as u32)),
     }
 }
 
@@ -641,31 +707,25 @@ fn resolve_theme_colors(
 /// (457ae8c79: the scrollbar tokens became optional foreground colors);
 /// `searchMatchBg`/`searchMatchText` → `selectedBg`/`text` (00121ed99).
 fn with_color_fallbacks(mut colors: HashMap<String, ColorValue>) -> HashMap<String, ColorValue> {
-    if !colors.contains_key("thinkingMax") {
-        if let Some(xhigh) = colors.get("thinkingXhigh") {
-            colors.insert("thinkingMax".to_string(), xhigh.clone());
+    // `colors.<key> ?? colors.<source>` spread semantics (theme.ts:261-277
+    // @ 9841914): the key is always created — when the source is missing the
+    // value stays `undefined` (only reachable on the lenient path; the
+    // installed validator requires every source color).
+    fn fallback_to(colors: &mut HashMap<String, ColorValue>, key: &str, source: &str) {
+        if colors.contains_key(key) {
+            return;
         }
+        let value = colors
+            .get(source)
+            .cloned()
+            .unwrap_or(ColorValue::Raw(RawColorValue::Undefined));
+        colors.insert(key.to_string(), value);
     }
-    if !colors.contains_key("scrollbarTrack") {
-        if let Some(muted) = colors.get("muted") {
-            colors.insert("scrollbarTrack".to_string(), muted.clone());
-        }
-    }
-    if !colors.contains_key("scrollbarThumb") {
-        if let Some(text) = colors.get("text") {
-            colors.insert("scrollbarThumb".to_string(), text.clone());
-        }
-    }
-    if !colors.contains_key("searchMatchBg") {
-        if let Some(selected_bg) = colors.get("selectedBg") {
-            colors.insert("searchMatchBg".to_string(), selected_bg.clone());
-        }
-    }
-    if !colors.contains_key("searchMatchText") {
-        if let Some(text) = colors.get("text") {
-            colors.insert("searchMatchText".to_string(), text.clone());
-        }
-    }
+    fallback_to(&mut colors, "thinkingMax", "thinkingXhigh");
+    fallback_to(&mut colors, "scrollbarTrack", "muted");
+    fallback_to(&mut colors, "scrollbarThumb", "text");
+    fallback_to(&mut colors, "searchMatchBg", "selectedBg");
+    fallback_to(&mut colors, "searchMatchText", "text");
     colors
 }
 
@@ -699,7 +759,54 @@ pub fn assert_theme_name_is_valid(name: &str) -> Result<(), RpiError> {
 ///
 /// Collects structured diagnostics for missing colour tokens and other schema
 /// errors, then deserialises into [`ThemeJson`].
+/// The validator installed through [`set_theme_json_validator`]
+/// (theme.ts:29-42, eb3e9feed): full theme-JSON validation with the
+/// structured "Invalid theme" diagnostics. A plain `fn` pointer is enough
+/// (upstream passes the module function itself, no closures).
+pub type ThemeJsonValidator = fn(&str, &serde_json::Value) -> Result<ThemeJson, RpiError>;
+
+static THEME_JSON_VALIDATOR: std::sync::RwLock<Option<ThemeJsonValidator>> =
+    std::sync::RwLock::new(None);
+
+/// Install full theme validation (theme.ts:37-42). Without it, documents
+/// are accepted as-is, which is what built-in themes already do: validating
+/// user-authored JSON is an app-level decision (upstream `pi` installs the
+/// validator in `main.ts:1004` during startup, before the first theme
+/// loads; the library paths — and the parity goldens — keep the lenient
+/// fallback).
+pub fn set_theme_json_validator(validator: ThemeJsonValidator) {
+    *THEME_JSON_VALIDATOR
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(validator);
+}
+
+/// Parse a theme JSON value (theme.ts:488-494 @ 9841914, eb3e9feed):
+/// installed validator first; otherwise the lenient fallback only checks
+/// for an object with a `"colors"` map and casts the rest through as-is
+/// (invalid shapes surface later, in [`resolve_var_refs`], with the JS
+/// TypeError wording).
 pub fn parse_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJson, RpiError> {
+    if let Some(validate) = *THEME_JSON_VALIDATOR
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    {
+        return validate(label, value);
+    }
+    if !value.is_object() || !value.as_object().is_some_and(|o| o.contains_key("colors")) {
+        return Err(RpiError::Resource(format!(
+            "Invalid theme \"{label}\": expected an object with a \"colors\" map."
+        )));
+    }
+    let theme_json: ThemeJson = serde_json::from_value(value.clone())
+        .map_err(|e| RpiError::Resource(format!("Invalid theme \"{label}\": {e}")))?;
+    Ok(theme_json)
+}
+
+/// Validate one theme document, throwing a message that names the offending
+/// tokens (theme-json.ts:103-146 @ 9841914, eb3e9feed — the typebox schema
+/// and its error formatting moved out of `theme.ts`; the diagnostic text is
+/// unchanged from the pre-split inline validation).
+pub fn validate_theme_json(label: &str, value: &serde_json::Value) -> Result<ThemeJson, RpiError> {
     let mut missing_colors: Vec<String> = Vec::new();
     let mut other_errors: Vec<String> = Vec::new();
 
@@ -840,7 +947,10 @@ pub fn parse_theme_json_content(label: &str, content: &str) -> Result<ThemeJson,
 
 static BUILTIN_THEMES: OnceLock<HashMap<String, ThemeJson>> = OnceLock::new();
 
-/// Lazily parsed built-in dark/light themes (theme.ts:440-451).
+/// Lazily parsed built-in dark/light themes (theme.ts:440-451). Built-in
+/// themes are never validated (eb3e9feed: upstream `loadThemeJson` returns
+/// them raw; validation is only for user-authored documents), so the JSON
+/// deserializes directly — no `parse_theme_json`/validator round-trip.
 pub fn get_builtin_themes() -> &'static HashMap<String, ThemeJson> {
     BUILTIN_THEMES.get_or_init(|| {
         let mut themes = HashMap::new();
@@ -848,14 +958,14 @@ pub fn get_builtin_themes() -> &'static HashMap<String, ThemeJson> {
             .expect("built-in dark theme JSON is verified valid at development time");
         themes.insert(
             "dark".to_string(),
-            parse_theme_json("dark", &dark_val)
+            serde_json::from_value(dark_val)
                 .expect("built-in dark theme is verified valid at development time"),
         );
         let light_val: serde_json::Value = serde_json::from_str(LIGHT_THEME_JSON)
             .expect("built-in light theme JSON is verified valid at development time");
         themes.insert(
             "light".to_string(),
-            parse_theme_json("light", &light_val)
+            serde_json::from_value(light_val)
                 .expect("built-in light theme is verified valid at development time"),
         );
         themes
@@ -1756,12 +1866,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_theme_json_missing_colors() {
+    fn test_validate_theme_json_missing_colors() {
         let json: serde_json::Value = serde_json::json!({
             "name": "test",
             "colors": {}
         });
-        let result = parse_theme_json("test", &json);
+        let result = validate_theme_json("test", &json);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Missing required color tokens"));
@@ -1769,7 +1879,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_theme_json_invalid_name_slash() {
+    fn test_validate_theme_json_invalid_name_slash() {
         let mut colors = serde_json::Map::new();
         for key in REQUIRED_COLOR_KEYS {
             colors.insert(
@@ -1781,7 +1891,7 @@ mod tests {
             "name": "foo/bar",
             "colors": serde_json::Value::Object(colors),
         });
-        let result = parse_theme_json("test", &json);
+        let result = validate_theme_json("test", &json);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("cannot contain"));
     }
@@ -1801,7 +1911,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_theme_json_integer_out_of_range() {
+    fn test_validate_theme_json_integer_out_of_range() {
         let mut colors = serde_json::Map::new();
         for key in REQUIRED_COLOR_KEYS {
             colors.insert((*key).to_string(), serde_json::json!(300));
@@ -1810,16 +1920,118 @@ mod tests {
             "name": "bad256",
             "colors": serde_json::Value::Object(colors),
         });
-        let result = parse_theme_json("test", &json);
+        let result = validate_theme_json("test", &json);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_parse_theme_json_content_valid() {
+    fn test_validate_theme_json_content_missing_colors() {
         let content = r#"{"name":"test","colors":{},"vars":{}}"#.to_string();
-        // This should fail because colors is empty (missing required keys)
-        let result = parse_theme_json_content("test", &content);
-        assert!(result.is_err());
+        // Under the installed validator this fails because colors is empty
+        // (missing required keys); the lenient fallback accepts it.
+        let value: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert!(validate_theme_json("test", &value).is_err());
+        assert!(parse_theme_json("test", &value).is_ok());
+    }
+
+    // --- eb3e9feed split: the lenient fallback (no validator installed) ---
+
+    /// `parseThemeJson` fallback (theme.ts:488-494 @ 9841914): without an
+    /// installed validator only "an object with a \"colors\" map" is
+    /// checked.
+    #[test]
+    fn test_lenient_parse_requires_only_a_colors_map() {
+        for bad in [
+            serde_json::json!("just a string"),
+            serde_json::json!(42),
+            serde_json::json!({ "name": "no-colors" }),
+            serde_json::json!([1, 2]),
+        ] {
+            let result = parse_theme_json("test", &bad);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expected an object with a \"colors\" map."),
+                "minimal check must reject {bad}"
+            );
+        }
+        // A document with a colors map passes through unvalidated — the
+        // name-slash check lives in the validator only.
+        let json = serde_json::json!({ "name": "foo/bar", "colors": {} });
+        let parsed = parse_theme_json("test", &json).expect("lenient cast");
+        assert_eq!(parsed.name, "foo/bar");
+    }
+
+    /// Lenient load of a partial theme: the `??` fallback keys stay
+    /// `undefined` and resolution crashes with the JS TypeError wording
+    /// pinned by the themes golden (invalid-missing-colors).
+    #[test]
+    fn test_lenient_partial_theme_undefined_fallback_error() {
+        let json = serde_json::json!({
+            "name": "invalid-missing-colors",
+            "colors": { "accent": "#123456", "border": 7 }
+        });
+        let theme_json = parse_theme_json("test", &json).expect("lenient cast");
+        let error = create_theme(&theme_json, Some(ColorMode::TrueColor), None).unwrap_err();
+        let message = match error {
+            RpiError::Resource(inner) => inner,
+            other => other.to_string(),
+        };
+        assert_eq!(
+            message,
+            "Cannot read properties of undefined (reading 'startsWith')"
+        );
+    }
+
+    /// Lenient load with a boolean color: `value.startsWith` is not a
+    /// function (invalid-color-value-type golden, errorPrefix). A full
+    /// required map keeps the undefined fallback keys out of the picture so
+    /// the boolean is what resolution trips over.
+    #[test]
+    fn test_lenient_boolean_color_error() {
+        let mut colors: HashMap<String, ColorValue> = REQUIRED_COLOR_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), ColorValue::Str("#000000".to_string())))
+            .collect();
+        colors.insert(
+            "accent".to_string(),
+            ColorValue::Raw(RawColorValue::Bool(true)),
+        );
+        let theme_json = ThemeJson {
+            name: "bool-color".to_string(),
+            vars: HashMap::new(),
+            colors,
+            export: None,
+        };
+        let error = create_theme(&theme_json, Some(ColorMode::TrueColor), None).unwrap_err();
+        let message = match error {
+            RpiError::Resource(inner) => inner,
+            other => other.to_string(),
+        };
+        assert_eq!(message, "value.startsWith is not a function");
+    }
+
+    /// Out-of-range numbers pass through leniently and render the raw index
+    /// (theme.ts:204 `typeof color === "number"`).
+    #[test]
+    fn test_lenient_out_of_range_number_renders_raw_index() {
+        let mut colors: HashMap<String, ColorValue> = REQUIRED_COLOR_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), ColorValue::Str("#000000".to_string())))
+            .collect();
+        colors.insert(
+            "accent".to_string(),
+            ColorValue::Raw(RawColorValue::Number(300.0)),
+        );
+        let theme_json = ThemeJson {
+            name: "wide-index".to_string(),
+            vars: HashMap::new(),
+            colors,
+            export: None,
+        };
+        let theme = create_theme(&theme_json, Some(ColorMode::TrueColor), None).unwrap();
+        assert_eq!(theme.get_fg_ansi("accent"), "\x1b[38;5;300m");
     }
 
     // --- create_theme -----------------------------------------------------

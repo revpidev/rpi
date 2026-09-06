@@ -306,10 +306,12 @@ const THEME_CASES = [
 		name: "invalid-color-value-type",
 		json: { name: "invalid-color-value-type", colors: { ...baseColors("#123456"), accent: 256, border: true } },
 		error: true,
-		// The error body is typebox-validator wording upstream vs the port's
-		// hand-rolled validator wording — only the stable parts are pinned.
+		// eb3e9feed: without an installed validator loadThemeFromPath casts
+		// the JSON as-is and resolveVarRefs crashes on the boolean — the raw
+		// TypeError prefix is the whole stable contract ("Other errors:"
+		// wording belongs to the validator, which the golden never installs).
 		engineDependent: true,
-		errorContains: ["Other errors:"],
+		errorContains: [],
 	},
 	{
 		name: "invalid-circular-var",
@@ -342,25 +344,10 @@ const THEME_CASES = [
 ];
 
 function generateThemes() {
-	// The golden stays byte-faithful to the pinned upstream dist. Parts
-	// not yet ported to rpi at generation time are declared in `meta` — the
-	// Rust parity test filters/skips them until the owning task of the
-	// v0.1.4 batch lands and regenerates without the marker:
-	//
-	// - pendingUpstreamKeys: REMOVED with V14-16 (scrollbarTrack/Thumb now
-	//   ported, 457ae8c79).
-	// - pendingSplitCases: error cases whose text depends on the
-	//   eb3e9feed theme-validation split (validation moved out of
-	//   loadThemeFromPath into an interactive-mode-installed validator;
-	//   unported — gap registered with V14-15's acceptance record, deferred
-	//   to M5).
-	const meta = {
-		pendingSplitCases: [
-			"invalid-missing-colors",
-			"invalid-color-value-type",
-			"invalid-name-slash",
-		],
-	};
+	// The golden stays byte-faithful to the pinned upstream dist. The
+	// `pendingSplitCases` meta marker was removed with the M5 port of the
+	// eb3e9feed theme-validation split (rpi `themes.rs` now models the
+	// lenient cast + installed validator seam); every case is compared.
 	const root = mkdtempSync(join(tmpdir(), "rpi-golden-themes-"));
 	try {
 		const cases = [];
@@ -400,7 +387,7 @@ function generateThemes() {
 			light: Object.fromEntries(Object.entries(getResolvedThemeColors("light")).sort()),
 		};
 
-		writeGolden("themes", stripRoot({ upstream: UPSTREAM, meta, cases, builtins }, root));
+		writeGolden("themes", stripRoot({ upstream: UPSTREAM, cases, builtins }, root));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

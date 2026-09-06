@@ -2,8 +2,8 @@
 /**
  * Rpi fixtures generator (runbook step: see fixtures/README.md §2).
  *
- * Runs the pinned upstream Pi (recording pin: pi 0.84.1+, external/pi @
- * 4181f66 — see the pin note in fixtures/README.md; the current repo pin
+ * Runs the pinned upstream Pi (recording pin: pi v0.85.0+, external/pi @
+ * 9841914 — see the pin note in fixtures/README.md; the current repo pin
  * lives in UPSTREAM.md) with the
  * faux provider and fixed prompt scripts over the SDK (`createAgentSession`),
  * then exports, per scenario:

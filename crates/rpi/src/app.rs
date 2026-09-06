@@ -589,6 +589,13 @@ async fn prepare_initial_message(
 
 /// `main` (main.ts:473-864). Returns the process exit code.
 pub async fn run_app(args: Vec<String>) -> i32 {
+    // main.ts:1004: "pi reads user-authored themes, so it opts into full
+    // validation before any theme loads" (eb3e9feed split — the library's
+    // default is the lenient cast, which the parity goldens pin; the
+    // installed validator gives users the structured "Invalid theme"
+    // diagnostics, unchanged from pre-split).
+    crate::core::themes::set_theme_json_validator(crate::core::themes::validate_theme_json);
+
     // Note: `Stdout`/`Stderr` values lock internally per write. Holding a
     // process-global `StdoutLock`/`StderrLock` across `.await` deadlocks any
     // spawned task that writes to stdout/stderr (RPC writer/command tasks).

@@ -1,5 +1,5 @@
 {
-  "upstream": "external/pi @ 4181f66 (v0.84.1+), dist build",
+  "upstream": "external/pi @ 9841914 (v0.85.0+), dist build",
   "cwd": "repo/sub",
   "cliSkillPaths": [
     "cli/cli-skill",
@@ -153,7 +153,7 @@
     "themeDiagnostics": [
       {
         "type": "warning",
-        "message": "Invalid theme \"<path>/repo/sub/.rpi/extra-themes/broken-theme.json\":\n\nMissing required color tokens:\n  - accent\n  - bashMode\n  - border\n  - borderAccent\n  - borderMuted\n  - customMessageBg\n  - customMessageLabel\n  - customMessageText\n  - dim\n  - error\n  - mdCode\n  - mdCodeBlock\n  - mdCodeBlockBorder\n  - mdHeading\n  - mdHr\n  - mdLink\n  - mdLinkUrl\n  - mdListBullet\n  - mdQuote\n  - mdQuoteBorder\n  - muted\n  - selectedBg\n  - success\n  - syntaxComment\n  - syntaxFunction\n  - syntaxKeyword\n  - syntaxNumber\n  - syntaxOperator\n  - syntaxPunctuation\n  - syntaxString\n  - syntaxType\n  - syntaxVariable\n  - text\n  - thinkingHigh\n  - thinkingLow\n  - thinkingMedium\n  - thinkingMinimal\n  - thinkingOff\n  - thinkingText\n  - thinkingXhigh\n  - toolDiffAdded\n  - toolDiffContext\n  - toolDiffRemoved\n  - toolErrorBg\n  - toolOutput\n  - toolPendingBg\n  - toolSuccessBg\n  - toolTitle\n  - userMessageBg\n  - userMessageText\n  - warning\n\nPlease add these colors to your theme's \"colors\" object.\nSee the built-in themes (dark.json, light.json) for reference values.",
+        "message": "Cannot read properties of undefined (reading 'startsWith')",
         "path": "<path>/repo/sub/.rpi/extra-themes/broken-theme.json",
         "collision": null
       },
