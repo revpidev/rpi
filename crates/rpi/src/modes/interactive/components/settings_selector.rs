@@ -56,17 +56,6 @@ const SETTINGS_SUBMENU_SELECT_LIST_LAYOUT: SelectListLayoutOptions = SelectListL
     truncate_primary: None,
 };
 
-/// `THINKING_DESCRIPTIONS` (settings-selector.ts:32-40), minus the "off"
-/// entry (see module header).
-const THINKING_DESCRIPTIONS: [(&str, &str); 6] = [
-    ("minimal", "Very brief reasoning (~1k tokens)"),
-    ("low", "Light reasoning (~2k tokens)"),
-    ("medium", "Moderate reasoning (~8k tokens)"),
-    ("high", "Deep reasoning (~16k tokens)"),
-    ("xhigh", "Extra-high reasoning (~32k tokens)"),
-    ("max", "Maximum reasoning"),
-];
-
 /// `DEFAULT_PROJECT_TRUST_LABELS` (settings-selector.ts:42-46).
 const DEFAULT_PROJECT_TRUST_LABELS: [(DefaultProjectTrust, &str); 3] = [
     (DefaultProjectTrust::Ask, "Ask"),
@@ -114,8 +103,19 @@ pub struct SettingsSelectorOptions {
     pub follow_up_mode: QueueMode,
     pub transport: TransportSetting,
     pub http_idle_timeout_ms: u64,
+    /// Global default thinking level (the per-model "(clear override)"
+    /// description; the plain "Default thinking level" entry was removed
+    /// upstream, 5b3caaf4c).
     pub thinking_level: ThinkingLevel,
-    pub available_thinking_levels: Vec<ThinkingLevel>,
+    /// Per-model thinking overrides snapshot (settings-selector.ts:53-54).
+    pub model_thinking_levels: std::collections::BTreeMap<String, rpi_agent::types::ThinkingLevel>,
+    /// `availableDefaultModels` (settings-selector.ts:53): catalog snapshot
+    /// for the per-model picker.
+    pub available_default_models: Vec<rpi_ai::types::Model>,
+    /// `currentModel` — pinned first in the picker.
+    pub current_model: Option<rpi_ai::types::Model>,
+    /// `defaultModel` ("provider/id" or "not set") — pinned second.
+    pub default_model: String,
     pub current_theme: String,
     /// Upstream `TerminalTheme` (`"dark" | "light"`).
     pub terminal_theme: TerminalColorScheme,
@@ -156,7 +156,17 @@ pub enum SettingsChange {
     FollowUpMode(QueueMode),
     Transport(TransportSetting),
     HttpIdleTimeoutMs(u64),
-    ThinkingLevel(ThinkingLevel),
+    /// `onModelThinkingLevelChange` (settings-selector.ts:102).
+    ModelThinkingLevelChange {
+        provider: String,
+        model_id: String,
+        level: rpi_agent::types::ThinkingLevel,
+    },
+    /// `onModelThinkingLevelRemove` (settings-selector.ts:103).
+    ModelThinkingLevelRemove {
+        provider: String,
+        model_id: String,
+    },
     Theme(String),
     ThemePreview(String),
     HideThinkingBlock(bool),
@@ -333,17 +343,6 @@ fn thinking_level_to_str(level: ThinkingLevel) -> &'static str {
     }
 }
 
-fn parse_thinking_level(value: &str) -> ThinkingLevel {
-    match value {
-        "low" => ThinkingLevel::Low,
-        "medium" => ThinkingLevel::Medium,
-        "high" => ThinkingLevel::High,
-        "xhigh" => ThinkingLevel::Xhigh,
-        "max" => ThinkingLevel::Max,
-        _ => ThinkingLevel::Minimal,
-    }
-}
-
 /// `DEFAULT_PROJECT_TRUST_BY_LABEL` (settings-selector.ts:48-50).
 fn trust_from_label(label: &str) -> Option<DefaultProjectTrust> {
     DEFAULT_PROJECT_TRUST_LABELS
@@ -496,13 +495,33 @@ impl Component for WarningSettingsSubmenu {
 // Generic select submenu (settings-selector.ts:162-224)
 // ---------------------------------------------------------------------------
 
-/// `SelectSubmenu` (settings-selector.ts:162-224): title + optional
-/// description + `SelectList` + hint.
+/// `SelectSubmenuOptions` (settings-submenu.ts:20-23 @ ee29aa118).
+#[derive(Default)]
+struct SelectSubmenuOptions {
+    /// Enable type-to-search fuzzy filtering.
+    searchable: bool,
+    /// Override the select list layout (column widths).
+    layout: Option<SelectListLayoutOptions>,
+}
+
+/// Shared select-callback slot: every list rebuild re-attaches thin
+/// forwarders (`buildSelectList`, settings-submenu.ts:108-121).
+type SharedSelectItemFn = Arc<Mutex<Option<SelectItemFn>>>;
+type SharedCancelFn = Arc<Mutex<Option<Box<dyn FnMut() + Send>>>>;
+
+/// `SelectSubmenu` (settings-submenu.ts:26-141 @ ee29aa118): title +
+/// optional description + optional search input + `SelectList` + hint.
 struct SelectSubmenu {
     title: String,
     description: String,
     select_list: SelectList,
     theme: Arc<Theme>,
+    layout: SelectListLayoutOptions,
+    /// Search input (searchable mode only).
+    search: Option<rpi_tui::components::input::Input>,
+    all_options: Vec<SelectItem>,
+    on_select: SharedSelectItemFn,
+    on_cancel: SharedCancelFn,
 }
 
 impl SelectSubmenu {
@@ -517,27 +536,121 @@ impl SelectSubmenu {
         on_select: Option<SelectItemFn>,
         on_cancel: Option<Box<dyn FnMut() + Send>>,
         on_selection_change: Option<SelectItemFn>,
+        submenu_options: Option<SelectSubmenuOptions>,
     ) -> Self {
-        let current_index = options.iter().position(|o| o.value == current_value);
-        let max_visible = options.len().min(10);
-        let mut select_list = SelectList::new(
-            options,
-            max_visible,
-            select_list_theme,
-            Some(SETTINGS_SUBMENU_SELECT_LIST_LAYOUT),
+        let submenu_options = submenu_options.unwrap_or_default();
+        let layout = submenu_options
+            .layout
+            .unwrap_or(SETTINGS_SUBMENU_SELECT_LIST_LAYOUT);
+        let on_select: SharedSelectItemFn = Arc::new(Mutex::new(on_select));
+        let on_cancel: SharedCancelFn = Arc::new(Mutex::new(on_cancel));
+        let on_selection_change: SharedSelectItemFn = Arc::new(Mutex::new(on_selection_change));
+        let select_list = Self::build_select_list(
+            &options,
+            current_value,
+            &select_list_theme,
+            layout.clone(),
+            Arc::clone(&on_select),
+            Arc::clone(&on_cancel),
+            on_selection_change,
         );
-        if let Some(current_index) = current_index {
-            select_list.set_selected_index(current_index);
-        }
-        select_list.on_select = on_select;
-        select_list.on_cancel = on_cancel;
-        select_list.on_selection_change = on_selection_change;
+        let search = if submenu_options.searchable {
+            let mut input = rpi_tui::components::input::Input::new();
+            use rpi_tui::tui::Focusable as _;
+            input.set_focused(false);
+            Some(input)
+        } else {
+            None
+        };
         Self {
             title: title.to_string(),
             description: description.to_string(),
             select_list,
             theme,
+            layout,
+            search,
+            all_options: options,
+            on_select,
+            on_cancel,
         }
+    }
+
+    /// `buildSelectList` (settings-submenu.ts:108-121): fresh list with
+    /// forwarder callbacks so rebuilds keep the wiring.
+    #[allow(clippy::too_many_arguments)]
+    fn build_select_list(
+        options: &[SelectItem],
+        preselect: &str,
+        select_list_theme: &Arc<SelectListTheme>,
+        layout: SelectListLayoutOptions,
+        on_select: SharedSelectItemFn,
+        on_cancel: SharedCancelFn,
+        on_selection_change: SharedSelectItemFn,
+    ) -> SelectList {
+        let mut list = SelectList::new(
+            options.to_vec(),
+            options.len().min(10),
+            Arc::clone(select_list_theme),
+            Some(layout),
+        );
+        if let Some(index) = options.iter().position(|o| o.value == preselect) {
+            list.set_selected_index(index);
+        }
+        list.on_select = Some(Box::new(move |item: &SelectItem| {
+            if let Ok(mut callback) = on_select.lock() {
+                if let Some(callback) = callback.as_mut() {
+                    callback(item);
+                }
+            }
+        }));
+        list.on_cancel = Some(Box::new(move || {
+            if let Ok(mut callback) = on_cancel.lock() {
+                if let Some(callback) = callback.as_mut() {
+                    callback();
+                }
+            }
+        }));
+        list.on_selection_change = Some(Box::new(move |item: &SelectItem| {
+            if let Ok(mut callback) = on_selection_change.lock() {
+                if let Some(callback) = callback.as_mut() {
+                    callback(item);
+                }
+            }
+        }));
+        list
+    }
+
+    /// `applyFilter` (settings-submenu.ts:124-131): rebuild the list from
+    /// the fuzzy-filtered options (label + description text).
+    fn apply_filter(&mut self, select_list_theme: &Arc<SelectListTheme>, query: &str) {
+        let filtered: Vec<SelectItem> = if query.is_empty() {
+            self.all_options.clone()
+        } else {
+            rpi_tui::fuzzy::fuzzy_filter(self.all_options.clone(), query, |item: &SelectItem| {
+                format!(
+                    "{} {}",
+                    item.label,
+                    item.description.clone().unwrap_or_default()
+                )
+            })
+        };
+        let selected_value = self
+            .select_list
+            .get_selected_item()
+            .map(|item| item.value.clone())
+            .unwrap_or_default();
+        self.select_list = Self::build_select_list(
+            &filtered,
+            &selected_value,
+            select_list_theme,
+            self.layout.clone(),
+            Arc::clone(&self.on_select),
+            Arc::clone(&self.on_cancel),
+            // Upstream `buildSelectList` re-attaches onSelectionChange; a
+            // rebuild during filtering triggers no selection event, so a
+            // no-op forwarder is equivalent here.
+            Arc::new(Mutex::new(None)),
+        );
     }
 }
 
@@ -549,15 +662,453 @@ impl Component for SelectSubmenu {
             lines.push(String::new());
             lines.push(self.theme.fg("muted", &self.description));
         }
+        if let Some(search_input) = &self.search {
+            lines.push(String::new());
+            lines.extend(search_input.render(width));
+        }
         lines.push(String::new());
         lines.extend(self.select_list.render(width));
         lines.push(String::new());
-        lines.push(self.theme.fg("dim", "  Enter to select · Esc to go back"));
+        let hint = if self.search.is_some() {
+            "  Type to filter · Enter to select · Esc to go back"
+        } else {
+            "  Enter to select · Esc to go back"
+        };
+        lines.push(self.theme.fg("dim", hint));
         lines
     }
 
+    /// `handleInput` (settings-submenu.ts:133-141): navigation keys reach
+    /// the list; everything else feeds the search input and refilters.
     fn handle_input(&mut self, data: &str) {
+        if self.search.is_some() {
+            let keybindings = rpi_tui::keybindings::get_keybindings();
+            let read = keybindings.read().unwrap_or_else(|e| e.into_inner());
+            let is_nav = read.matches_id(data, "tui.select.up")
+                || read.matches_id(data, "tui.select.down")
+                || read.matches_id(data, "tui.select.confirm")
+                || read.matches_id(data, "tui.select.cancel");
+            drop(read);
+            if is_nav {
+                self.select_list.handle_input(data);
+                return;
+            }
+            let select_list_theme = select_list_theme(Arc::clone(&self.theme));
+            let Some(search_input) = self.search.as_mut() else {
+                return;
+            };
+            search_input.handle_input(data);
+            let query = search_input.get_value().to_string();
+            self.apply_filter(&select_list_theme, &query);
+            return;
+        }
         self.select_list.handle_input(data);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-model thinking submenu (settings-selector.ts:577-662 @ 2ff8ba622 +
+// ee29aa118 + a669db3c3 + f2a622789; SteppedSubmenu shape,
+// settings-submenu.ts:148-235)
+// ---------------------------------------------------------------------------
+
+/// `CLEAR_OVERRIDE_VALUE` (settings-selector.ts:41).
+const CLEAR_OVERRIDE_VALUE: &str = "__clear__";
+
+/// `MODEL_PICKER_LAYOUT` (settings-selector.ts:30, a669db3c3).
+const MODEL_PICKER_LAYOUT: SelectListLayoutOptions = SelectListLayoutOptions {
+    min_primary_column_width: Some(12),
+    max_primary_column_width: Some(46),
+    truncate_primary: None,
+};
+
+/// `modelSettingKey` (settings-selector.ts:176-178).
+fn model_setting_key(model: &rpi_ai::types::Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+/// `modelDisplayLabel` (settings-selector.ts:180-182 @ a669db3c3): plain
+/// `modelid [provider]` for titles.
+fn model_display_label(model: &rpi_ai::types::Model) -> String {
+    format!("{} [{}]", model.id, model.provider)
+}
+
+/// `modelItemLabel` (settings-selector.ts:190-192 @ a669db3c3): list rows
+/// use a muted provider badge like /model.
+fn model_item_label(model: &rpi_ai::types::Model, theme: &Theme) -> String {
+    format!(
+        "{} {}",
+        model.id,
+        theme.fg("muted", &format!("[{}]", model.provider))
+    )
+}
+
+/// `modelThinkingOverridesSummary` (settings-selector.ts:199-201): the
+/// "model-thinking" item current value. Upstream shows the count
+/// (`{count} configured`); the value is computed fresh at display time.
+fn model_thinking_overrides_summary(
+    overrides: &std::collections::BTreeMap<String, rpi_agent::types::ThinkingLevel>,
+) -> String {
+    if overrides.is_empty() {
+        "not set".to_string()
+    } else {
+        format!("{} configured", overrides.len())
+    }
+}
+
+/// Description per agent-side thinking level value ("off" included) —
+/// `THINKING_DESCRIPTIONS` (settings-selector.ts:29-40).
+fn model_thinking_description(level: &str) -> &'static str {
+    match level {
+        "off" => "No reasoning",
+        "minimal" => "Very brief reasoning (~1k tokens)",
+        "low" => "Light reasoning (~2k tokens)",
+        "medium" => "Moderate reasoning (~8k tokens)",
+        "high" => "Deep reasoning (~16k tokens)",
+        "xhigh" => "Extra-high reasoning (~32k tokens)",
+        _ => "Maximum reasoning",
+    }
+}
+
+/// Agent-side thinking level value string (`rpi_agent::types::ThinkingLevel`
+/// = `rpi_ai::ModelThinkingLevel`, off included).
+fn agent_level_str(level: &rpi_agent::types::ThinkingLevel) -> &'static str {
+    match level {
+        rpi_agent::types::ThinkingLevel::Off => "off",
+        rpi_agent::types::ThinkingLevel::Minimal => "minimal",
+        rpi_agent::types::ThinkingLevel::Low => "low",
+        rpi_agent::types::ThinkingLevel::Medium => "medium",
+        rpi_agent::types::ThinkingLevel::High => "high",
+        rpi_agent::types::ThinkingLevel::Xhigh => "xhigh",
+        rpi_agent::types::ThinkingLevel::Max => "max",
+    }
+}
+
+/// Agent-side thinking level from a value string.
+fn agent_level_from_str(value: &str) -> Option<rpi_agent::types::ThinkingLevel> {
+    match value {
+        "off" => Some(rpi_agent::types::ThinkingLevel::Off),
+        "minimal" => Some(rpi_agent::types::ThinkingLevel::Minimal),
+        "low" => Some(rpi_agent::types::ThinkingLevel::Low),
+        "medium" => Some(rpi_agent::types::ThinkingLevel::Medium),
+        "high" => Some(rpi_agent::types::ThinkingLevel::High),
+        "xhigh" => Some(rpi_agent::types::ThinkingLevel::Xhigh),
+        "max" => Some(rpi_agent::types::ThinkingLevel::Max),
+        _ => None,
+    }
+}
+
+/// Callback: apply a per-model thinking override
+/// (`onModelThinkingLevelChange`, settings-selector.ts:102).
+type ModelThinkingChangeFn = Box<dyn FnMut(&str, &str, rpi_agent::types::ThinkingLevel) + Send>;
+/// Callback: remove a per-model thinking override
+/// (`onModelThinkingLevelRemove`, settings-selector.ts:103).
+type ModelThinkingRemoveFn = Box<dyn FnMut(&str, &str) + Send>;
+
+/// The model-thinking two-step submenu (upstream `SteppedSubmenu` with
+/// `loop: true`): step 1 = searchable model picker; step 2 = level picker
+/// with ✓ markers and a "(clear override)" row. Esc goes back a step (Esc
+/// at step 0 cancels); a level selection applies the override and loops
+/// back to step 0 (settings-submenu.ts:148-235).
+struct ModelThinkingSubmenu {
+    inner: Arc<Mutex<ModelThinkingInner>>,
+}
+
+struct ModelThinkingInner {
+    available_models: Vec<rpi_ai::types::Model>,
+    current_model: Option<rpi_ai::types::Model>,
+    default_model: String,
+    /// Shared with the settings item (constructor-local mutable copy,
+    /// settings-selector.ts:463): updates survive submenu re-entry and
+    /// feed the summary written back to the item.
+    overrides: Arc<Mutex<std::collections::BTreeMap<String, rpi_agent::types::ThinkingLevel>>>,
+    /// Global default (for the clear-override description).
+    thinking_level: ThinkingLevel,
+    theme: Arc<Theme>,
+    select_list_theme: Arc<SelectListTheme>,
+    on_change: Option<ModelThinkingChangeFn>,
+    on_remove: Option<ModelThinkingRemoveFn>,
+    on_done: Option<Box<dyn FnMut() + Send>>,
+    step: usize,
+    context_model: Option<String>,
+    component: Option<Box<dyn rpi_tui::tui::Component + Send>>,
+}
+
+impl ModelThinkingSubmenu {
+    #[allow(clippy::too_many_arguments)] // mirrors the upstream SteppedSubmenu wiring
+    #[allow(clippy::type_complexity)] // mirrors the upstream callback type
+    fn new(
+        available_models: Vec<rpi_ai::types::Model>,
+        current_model: Option<rpi_ai::types::Model>,
+        default_model: String,
+        overrides: Arc<Mutex<std::collections::BTreeMap<String, rpi_agent::types::ThinkingLevel>>>,
+        thinking_level: ThinkingLevel,
+        theme: Arc<Theme>,
+        select_list_theme: Arc<SelectListTheme>,
+        on_change: ModelThinkingChangeFn,
+        on_remove: ModelThinkingRemoveFn,
+        on_done: Box<dyn FnMut() + Send>,
+    ) -> Self {
+        let inner = Arc::new(Mutex::new(ModelThinkingInner {
+            available_models,
+            current_model,
+            default_model,
+            overrides,
+            thinking_level,
+            theme,
+            select_list_theme,
+            on_change: Some(on_change),
+            on_remove: Some(on_remove),
+            on_done: Some(on_done),
+            step: 0,
+            context_model: None,
+            component: None,
+        }));
+        build_model_step(&inner);
+        Self { inner }
+    }
+}
+
+/// `buildStep(0)` — the model picker (settings-selector.ts:583-617):
+/// current model first, then the persisted default, then provider order;
+/// `modelid [provider]` labels (a669db3c3), override values as
+/// descriptions; searchable (ee29aa118); "Step 1/2 · " title prefix.
+fn build_model_step(inner: &Arc<Mutex<ModelThinkingInner>>) {
+    let (items, preselect, theme, select_list_theme) = {
+        let state = lock(inner);
+        let current_model_key = state
+            .current_model
+            .as_ref()
+            .map(model_setting_key)
+            .unwrap_or_default();
+        let default_model_key = state.default_model.clone();
+        let mut sorted = state.available_models.clone();
+        sorted.sort_by(|a, b| {
+            let a_key = model_setting_key(a);
+            let b_key = model_setting_key(b);
+            if a_key == current_model_key {
+                std::cmp::Ordering::Less
+            } else if b_key == current_model_key {
+                std::cmp::Ordering::Greater
+            } else if a_key == default_model_key {
+                std::cmp::Ordering::Less
+            } else if b_key == default_model_key {
+                std::cmp::Ordering::Greater
+            } else {
+                a.provider.cmp(&b.provider)
+            }
+        });
+        let overrides = lock(&state.overrides).clone();
+        let mut items: Vec<SelectItem> = sorted
+            .iter()
+            .map(|model| {
+                let key = model_setting_key(model);
+                SelectItem {
+                    description: overrides
+                        .get(&key)
+                        .map(|level| agent_level_str(level).to_string()),
+                    label: model_item_label(model, &state.theme),
+                    value: key,
+                }
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(SelectItem {
+                value: "__none__".to_string(),
+                label: "No models available".to_string(),
+                description: Some("Log in to a provider or configure an API key first".to_string()),
+            });
+        }
+        let preselect = if !current_model_key.is_empty() {
+            current_model_key
+        } else {
+            default_model_key
+        };
+        (
+            items,
+            preselect,
+            Arc::clone(&state.theme),
+            Arc::clone(&state.select_list_theme),
+        )
+    };
+    lock(inner).step = 0;
+
+    let select_inner = Arc::clone(inner);
+    let on_select: SelectItemFn = Box::new(move |item: &SelectItem| {
+        // Step 1 → step 2 (SteppedSubmenu advances on select).
+        let mut state = lock(&select_inner);
+        state.context_model = Some(item.value.clone());
+        drop(state);
+        build_level_step(&select_inner);
+    });
+    let cancel_inner = Arc::clone(inner);
+    let on_cancel: Box<dyn FnMut() + Send> = Box::new(move || model_thinking_done(&cancel_inner));
+
+    let menu = SelectSubmenu::new(
+        "Per-Model Thinking Level",
+        "Step 1/2 · Select a model to configure",
+        items,
+        &preselect,
+        theme,
+        select_list_theme,
+        Some(on_select),
+        Some(on_cancel),
+        None,
+        Some(SelectSubmenuOptions {
+            searchable: true,
+            layout: Some(MODEL_PICKER_LAYOUT),
+        }),
+    );
+    lock(inner).component = Some(Box::new(menu));
+}
+
+/// `buildStep(1)` — the level picker (settings-selector.ts:619-646):
+/// supported levels (or `off` for non-reasoning models) with `✓ ` markers
+/// on the active override (f2a622789) + "(clear override)" when one exists.
+fn build_level_step(inner: &Arc<Mutex<ModelThinkingInner>>) {
+    let (title, items, preselect, theme, select_list_theme) = {
+        let state = lock(inner);
+        let key = state.context_model.clone().unwrap_or_default();
+        let model = state
+            .available_models
+            .iter()
+            .find(|model| model_setting_key(model) == key);
+        let title = match model {
+            Some(model) => format!("Thinking Level for {}", model_display_label(model)),
+            None => format!("Thinking Level for {key}"),
+        };
+        let mut items: Vec<SelectItem> = Vec::new();
+        let mut preselect = String::new();
+        if let Some(model) = model {
+            let overrides = lock(&state.overrides);
+            let active = overrides.get(&key).copied();
+            let levels: Vec<rpi_agent::types::ThinkingLevel> = if model.reasoning {
+                rpi_ai::models::get_supported_thinking_levels(model)
+            } else {
+                vec![rpi_agent::types::ThinkingLevel::Off]
+            };
+            for level in levels {
+                let value = agent_level_str(&level);
+                if active == Some(level) {
+                    preselect = value.to_string();
+                }
+                items.push(SelectItem {
+                    value: value.to_string(),
+                    label: format!(
+                        "{}{}",
+                        if active == Some(level) {
+                            "\u{2713} "
+                        } else {
+                            "  "
+                        },
+                        value
+                    ),
+                    description: Some(model_thinking_description(value).to_string()),
+                });
+            }
+            if active.is_some() {
+                items.push(SelectItem {
+                    value: CLEAR_OVERRIDE_VALUE.to_string(),
+                    label: "  (clear override)".to_string(),
+                    description: Some(format!(
+                        "Revert to global default ({})",
+                        thinking_level_to_str(state.thinking_level)
+                    )),
+                });
+            }
+        }
+        (
+            title,
+            items,
+            preselect,
+            Arc::clone(&state.theme),
+            Arc::clone(&state.select_list_theme),
+        )
+    };
+    lock(inner).step = 1;
+
+    let select_inner = Arc::clone(inner);
+    let on_select: SelectItemFn = Box::new(move |item: &SelectItem| {
+        // Final step: deliver the result, then loop back to step 0
+        // (SteppedSubmenu `{ loop: true }`).
+        let mut state = lock(&select_inner);
+        let Some(key) = state.context_model.clone() else {
+            return;
+        };
+        let Some((provider, model_id)) = key.split_once('/') else {
+            return;
+        };
+        if item.value == CLEAR_OVERRIDE_VALUE {
+            lock(&state.overrides).remove(&key);
+            if let Some(on_remove) = state.on_remove.as_mut() {
+                on_remove(provider, model_id);
+            }
+        } else if let Some(level) = agent_level_from_str(&item.value) {
+            lock(&state.overrides).insert(key.clone(), level);
+            if let Some(on_change) = state.on_change.as_mut() {
+                on_change(provider, model_id, level);
+            }
+        }
+        state.context_model = None;
+        drop(state);
+        build_model_step(&select_inner);
+    });
+    let cancel_inner = Arc::clone(inner);
+    // Esc at step > 0 goes back one step (SteppedSubmenu onCancel).
+    let on_cancel: Box<dyn FnMut() + Send> = Box::new(move || {
+        build_model_step(&cancel_inner);
+    });
+
+    let menu = SelectSubmenu::new(
+        &title,
+        "Step 2/2 · Select default thinking level for this model",
+        items,
+        &preselect,
+        theme,
+        select_list_theme,
+        Some(on_select),
+        Some(on_cancel),
+        None,
+        None,
+    );
+    lock(inner).component = Some(Box::new(menu));
+}
+
+/// The SteppedSubmenu top-level cancel (Esc at step 0 / final done):
+/// writes the fresh summary back to the item.
+fn model_thinking_done(inner: &Arc<Mutex<ModelThinkingInner>>) {
+    let mut state = lock(inner);
+    if let Some(mut on_done) = state.on_done.take() {
+        on_done();
+    }
+}
+
+impl rpi_tui::tui::Component for ModelThinkingSubmenu {
+    fn render(&self, width: usize) -> Vec<String> {
+        match &lock(&self.inner).component {
+            Some(component) => component.render(width),
+            None => Vec::new(),
+        }
+    }
+
+    fn handle_input(&mut self, data: &str) {
+        // Take the component out so a step transition inside `handle_input`
+        // can replace it (ThemeSubmenu pattern; upstream swaps the active
+        // child mid-dispatch).
+        let component = lock(&self.inner).component.take();
+        if let Some(mut component) = component {
+            component.handle_input(data);
+            let mut inner = lock(&self.inner);
+            if inner.component.is_none() {
+                inner.component = Some(component);
+            }
+        }
+    }
+
+    fn invalidate(&mut self) {
+        if let Some(component) = lock(&self.inner).component.as_mut() {
+            component.invalidate();
+        }
     }
 }
 
@@ -565,26 +1116,36 @@ impl Component for SelectSubmenu {
 // Theme submenu (settings-selector.ts:226-467)
 // ---------------------------------------------------------------------------
 
-/// `themeItems` (settings-selector.ts:226-228).
-fn theme_items(available_themes: &[String]) -> Vec<SelectItem> {
+/// `themeItems` (settings-selector.ts:194-199 @ 3fc3ef532): the CURRENT
+/// (saved) theme keeps a `✓ ` prefix while the preview cursor browses —
+/// the marker distinguishes the saved value from the preview.
+fn theme_items(available_themes: &[String], current_theme: &str) -> Vec<SelectItem> {
     available_themes
         .iter()
         .map(|name| SelectItem {
             value: name.clone(),
-            label: name.clone(),
+            label: format!(
+                "{}{}",
+                if name == current_theme {
+                    "\u{2713} "
+                } else {
+                    "  "
+                },
+                name
+            ),
             description: None,
         })
         .collect()
 }
 
-/// `singleModeThemeItems` (settings-selector.ts:232-241).
-fn single_mode_theme_items(available_themes: &[String]) -> Vec<SelectItem> {
+/// `singleModeThemeItems` (settings-selector.ts:202-212 @ 3fc3ef532).
+fn single_mode_theme_items(available_themes: &[String], current_theme: &str) -> Vec<SelectItem> {
     let mut items = vec![SelectItem {
         value: AUTOMATIC_THEME_VALUE.to_string(),
-        label: "Automatic".to_string(),
+        label: "  Automatic".to_string(),
         description: Some("Use separate themes for light and dark terminal appearance".to_string()),
     }];
-    items.extend(theme_items(available_themes));
+    items.extend(theme_items(available_themes, current_theme));
     items
 }
 
@@ -783,7 +1344,7 @@ fn cancel(inner: &Arc<Mutex<ThemeSubmenuInner>>) {
 fn show_single_menu(inner: &Arc<Mutex<ThemeSubmenuInner>>) {
     let items = {
         let inner = lock(inner);
-        single_mode_theme_items(&inner.available_themes)
+        single_mode_theme_items(&inner.available_themes, &inner.single_theme)
     };
     let current = lock(inner).single_theme.clone();
 
@@ -837,6 +1398,7 @@ fn show_single_menu(inner: &Arc<Mutex<ThemeSubmenuInner>>) {
         Some(on_select),
         Some(on_cancel),
         Some(on_selection_change),
+        None,
     );
     lock(inner).component = Some(Box::new(menu));
 }
@@ -995,24 +1557,26 @@ fn theme_select_factory(
             }
         });
 
-        let (theme, select_list_theme, available_themes) = {
+        let (theme, select_list_theme, available_themes, current) = {
             let inner = lock(&inner);
             (
                 Arc::clone(&inner.theme),
                 Arc::clone(&inner.select_list_theme),
                 inner.available_themes.clone(),
+                current_value.to_string(),
             )
         };
         let select = SelectSubmenu::new(
             title,
             description,
-            theme_items(&available_themes),
+            theme_items(&available_themes, &current),
             current_value,
             theme,
             select_list_theme,
             Some(on_select),
             Some(on_cancel),
             Some(on_selection_change),
+            None,
         );
         Box::new(select)
     })
@@ -1097,6 +1661,11 @@ impl SettingsSelectorComponent {
         // `currentWarnings` (settings-selector.ts:480): snapshot mutated by
         // the warnings submenu, shared through the submenu factory.
         let current_warnings = Arc::new(Mutex::new(options.warnings.clone()));
+        // Shared per-model thinking overrides (constructor-local mutable
+        // copy, settings-selector.ts:463): updates survive submenu
+        // re-entry and feed the summary written back to the item.
+        let current_model_thinking_levels =
+            Arc::new(Mutex::new(options.model_thinking_levels.clone()));
 
         let mut items: Vec<SettingItem> = vec![
             SettingItem {
@@ -1293,57 +1862,84 @@ impl SettingsSelectorComponent {
                     })
                 }),
             },
+            // "model-thinking" (settings-selector.ts:577-662 @ 2ff8ba622 +
+            // ee29aa118 searchable + a669db3c3 labels + f2a622789 markers):
+            // per-model thinking overrides. The plain "Default thinking
+            // level" entry was REMOVED upstream (5b3caaf4c — Ctrl+S in
+            // /thinking is the default-setting path).
             SettingItem {
-                id: "thinking".to_string(),
-                label: "Thinking level".to_string(),
-                description: Some("Reasoning depth for thinking-capable models".to_string()),
-                current_value: thinking_level_to_str(options.thinking_level).to_string(),
+                id: "model-thinking".to_string(),
+                label: "Default thinking level per model".to_string(),
+                description: Some(format!(
+                    "Override the default thinking level for specific models. {} cycles in-session.",
+                    crate::modes::interactive::components::keybinding_hints::key_text(
+                        "app.thinking.cycle"
+                    )
+                )),
+                current_value: model_thinking_overrides_summary(&options.model_thinking_levels)
+                    .to_string(),
                 values: None,
                 submenu: Some({
                     let on_change = Arc::clone(&on_change);
                     let theme = Arc::clone(&theme);
                     let select_list_theme = Arc::clone(&select_list_theme);
-                    let levels = options.available_thinking_levels.clone();
-                    Box::new(move |current_value: &str, done: SubmenuDone| {
-                        let done = Arc::new(Mutex::new(Some(done)));
-                        let items: Vec<SelectItem> = levels
-                            .iter()
-                            .map(|level| {
-                                let name = thinking_level_to_str(*level);
-                                SelectItem {
-                                    value: name.to_string(),
-                                    label: name.to_string(),
-                                    description: THINKING_DESCRIPTIONS
-                                        .iter()
-                                        .find(|(n, _)| *n == name)
-                                        .map(|(_, d)| d.to_string()),
-                                }
-                            })
-                            .collect();
-                        // Clone into fresh locals so the inner `move`
-                        // closures capture those instead of moving the
-                        // outer captures out of this FnMut.
-                        let on_change = Arc::clone(&on_change);
-                        let done_select = Arc::clone(&done);
-                        let on_select: SelectItemFn = Box::new(move |item: &SelectItem| {
-                            lock(&on_change)(SettingsChange::ThinkingLevel(
-                                parse_thinking_level(&item.value),
-                            ));
-                            call_done(&done_select, Some(item.value.clone()));
-                        });
-                        let on_cancel: Box<dyn FnMut() + Send> =
-                            Box::new(move || call_done(&done, None));
-                        Box::new(SelectSubmenu::new(
-                            "Thinking Level",
-                            "Select reasoning depth for thinking-capable models",
-                            items,
-                            current_value,
+                    let available_models = options.available_default_models.clone();
+                    let current_model = options.current_model.clone();
+                    let default_model = options.default_model.clone();
+                    let thinking_level = options.thinking_level;
+                    let overrides = Arc::clone(&current_model_thinking_levels);
+                    Box::new(move |_current_value: &str, done: SubmenuDone| {
+                        Box::new(ModelThinkingSubmenu::new(
+                            available_models.clone(),
+                            current_model.clone(),
+                            default_model.clone(),
+                            Arc::clone(&overrides),
+                            thinking_level,
                             Arc::clone(&theme),
                             Arc::clone(&select_list_theme),
-                            Some(on_select),
-                            Some(on_cancel),
-                            None,
-                        ))
+                            {
+                                let on_change = Arc::clone(&on_change);
+                                let overrides = Arc::clone(&overrides);
+                                Box::new(
+                                    move |provider: &str,
+                                          model_id: &str,
+                                          level: rpi_agent::types::ThinkingLevel| {
+                                        lock(&overrides).insert(
+                                            format!("{provider}/{model_id}"),
+                                            level,
+                                        );
+                                        lock(&on_change)(SettingsChange::ModelThinkingLevelChange {
+                                            provider: provider.to_string(),
+                                            model_id: model_id.to_string(),
+                                            level,
+                                        });
+                                    },
+                                )
+                            },
+                            {
+                                let on_change = Arc::clone(&on_change);
+                                let overrides = Arc::clone(&overrides);
+                                Box::new(move |provider: &str, model_id: &str| {
+                                    lock(&overrides).remove(&format!("{provider}/{model_id}"));
+                                    lock(&on_change)(SettingsChange::ModelThinkingLevelRemove {
+                                        provider: provider.to_string(),
+                                        model_id: model_id.to_string(),
+                                    });
+                                })
+                            },
+                            {
+                                // Cancel/done writes the fresh summary back
+                                // to the item's current value
+                                // (SteppedSubmenu `done(summary())`).
+                                let done = Arc::new(Mutex::new(Some(done)));
+                                let overrides = Arc::clone(&overrides);
+                                Box::new(move || {
+                                    let summary = model_thinking_overrides_summary(&lock(&overrides))
+                                        .to_string();
+                                    call_done(&done, Some(summary));
+                                })
+                            },
+                        )) as Box<dyn rpi_tui::tui::Component + Send>
                     })
                 }),
             },
@@ -1799,14 +2395,10 @@ mod tests {
             transport: Transport::Auto,
             http_idle_timeout_ms: 300_000,
             thinking_level: ThinkingLevel::High,
-            available_thinking_levels: vec![
-                ThinkingLevel::Minimal,
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
-                ThinkingLevel::Xhigh,
-                ThinkingLevel::Max,
-            ],
+            model_thinking_levels: Default::default(),
+            available_default_models: Vec::new(),
+            current_model: None,
+            default_model: "not set".to_string(),
             current_theme: "dark".to_string(),
             terminal_theme: TerminalColorScheme::Dark,
             available_themes: vec!["dark".to_string(), "light".to_string()],
@@ -2091,15 +2683,25 @@ mod tests {
         assert!(!lines.join("\n").contains("Anthropic extra usage"));
     }
 
+    /// "model-thinking" per-model overrides submenu (2ff8ba622 +
+    /// ee29aa118 + a669db3c3 + f2a622789). The old "thinking" entry test
+    /// (session-level select via settings) is retired with the entry
+    /// (5b3caaf4c, G2 registered).
     #[test]
-    fn thinking_submenu_selects_level_and_writes_back() {
+    fn model_thinking_submenu_sets_and_clears_overrides() {
         install_keybindings();
         let (received, on_change) = changes();
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
-        let mut component =
-            SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
-        // Move to the Thinking level item (index 26 with image rows, 24
-        // without).
+        let mut opts = options();
+        // Two reasoning models; the current one sorts first.
+        opts.available_default_models = vec![
+            test_model("alpha", "a1", true),
+            test_model("beta", "b1", true),
+        ];
+        opts.current_model = Some(test_model("beta", "b1", true));
+        let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
+        // Move to the model-thinking item (same index the old thinking
+        // entry occupied: 26 with image rows, 24 without).
         let target = if get_capabilities().images.is_some() {
             26
         } else {
@@ -2109,21 +2711,137 @@ mod tests {
             component.handle_input("\x1b[B");
         }
         component.handle_input("\r");
-        let lines = render_plain(&component, 100);
-        let joined = lines.join("\n");
-        assert!(joined.contains("Thinking Level"));
-        assert!(joined.contains("Deep reasoning (~16k tokens)"));
-        // The current level (high) is pre-selected; move up to medium and
-        // confirm.
-        component.handle_input("\x1b[A");
+        let joined = render_plain(&component, 100).join("\n");
+        // Step 1: searchable model picker, current model first,
+        // `modelid [provider]` labels (a669db3c3).
+        assert!(joined.contains("Per-Model Thinking Level"));
+        assert!(joined.contains("Step 1/2"));
+        assert!(joined.contains("Type to filter"), "searchable hint");
+        let b1 = joined
+            .lines()
+            .find(|l| l.contains("b1 [beta]"))
+            .expect("current model listed");
+        let b1_index = joined.lines().position(|l| l == b1).unwrap();
+        let a1_index = joined
+            .lines()
+            .position(|l| l.contains("a1 [alpha]"))
+            .expect("alpha listed");
+        assert!(b1_index < a1_index, "current model pinned first");
+
+        // Enter on b1 → step 2: level picker with ✓ on nothing yet and no
+        // clear-override row.
+        component.handle_input("\r");
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("Step 2/2"));
+        assert!(joined.contains("Thinking Level for b1 [beta]"));
+        assert!(!joined.contains("(clear override)"));
+
+        // Select high → change event + loop back to step 1 with the
+        // override shown as the description.
+        component.handle_input("\r"); // first level (off — EXTENDED list head)
+        let events = received.lock().unwrap();
+        assert!(events.contains(&SettingsChange::ModelThinkingLevelChange {
+            provider: "beta".to_string(),
+            model_id: "b1".to_string(),
+            level: rpi_agent::types::ThinkingLevel::Off,
+        }));
+        drop(events);
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("Step 1/2"));
+        assert!(joined.contains("off"), "override as description");
+
+        // Re-enter b1 → ✓ off + (clear override) row.
+        component.handle_input("\r");
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("\u{2713} off"), "active override marked");
+        assert!(joined.contains("(clear override)"));
+        // Move down to the clear row (last of 6: off/minimal/low/medium/
+        // high + clear; the list wraps, so 5 downs land on it).
+        for _ in 0..5 {
+            component.handle_input("\x1b[B");
+        }
         component.handle_input("\r");
         let events = received.lock().unwrap();
-        assert!(events.contains(&SettingsChange::ThinkingLevel(ThinkingLevel::Medium)));
-        // Done wrote the value back to the item.
-        let lines = render_plain(&component, 100);
-        assert!(lines
-            .iter()
-            .any(|l| l.contains("Thinking level") && l.contains("medium")));
+        assert!(events.contains(&SettingsChange::ModelThinkingLevelRemove {
+            provider: "beta".to_string(),
+            model_id: "b1".to_string(),
+        }));
+    }
+
+    #[test]
+    fn model_thinking_submenu_esc_goes_back_and_cancels() {
+        install_keybindings();
+        let (_received, on_change) = changes();
+        let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
+        let mut opts = options();
+        opts.available_default_models = vec![test_model("alpha", "a1", true)];
+        let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
+        let target = if get_capabilities().images.is_some() {
+            26
+        } else {
+            24
+        };
+        for _ in 0..target {
+            component.handle_input("\x1b[B");
+        }
+        component.handle_input("\r"); // open submenu
+        component.handle_input("\r"); // → level step
+                                      // Esc at step 2 goes back to step 1 (SteppedSubmenu).
+        component.handle_input("\x1b");
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("Step 1/2"), "esc backs to model step");
+        // Esc at step 1 closes the submenu and writes the summary back.
+        component.handle_input("\x1b");
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("Default thinking level per model"));
+        assert!(joined.contains("not set"));
+    }
+
+    /// Non-reasoning models offer only "off" (settings-selector.ts:629-631).
+    #[test]
+    fn model_thinking_submenu_non_reasoning_model_offers_off() {
+        install_keybindings();
+        let (_received, on_change) = changes();
+        let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
+        let mut opts = options();
+        opts.available_default_models = vec![test_model("alpha", "a1", false)];
+        let mut component = SettingsSelectorComponent::new(opts, theme(), on_change, on_cancel);
+        let target = if get_capabilities().images.is_some() {
+            26
+        } else {
+            24
+        };
+        for _ in 0..target {
+            component.handle_input("\x1b[B");
+        }
+        component.handle_input("\r"); // open submenu
+        component.handle_input("\r"); // → level step
+        let joined = render_plain(&component, 100).join("\n");
+        assert!(joined.contains("off"));
+        assert!(joined.contains("No reasoning"));
+    }
+
+    fn test_model(provider: &str, id: &str, reasoning: bool) -> rpi_ai::types::Model {
+        use rpi_ai::types::{ApiKind, InputModality, ModelCost, ModelCostRates};
+        rpi_ai::types::Model {
+            name: format!("{provider} {id}"),
+            id: id.to_string(),
+            api: ApiKind("anthropic-messages".to_string()),
+            provider: provider.to_string(),
+            base_url: "https://example.invalid".to_string(),
+            reasoning,
+            thinking_level_map: None,
+            input: vec![InputModality::Text],
+            cost: ModelCost {
+                rates: ModelCostRates::default(),
+                tiers: None,
+            },
+            context_window: 200_000,
+            max_tokens: 8_192,
+            headers: None,
+            compat: None,
+            sampling_params: None,
+        }
     }
 
     #[test]

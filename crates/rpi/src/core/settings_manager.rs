@@ -3864,4 +3864,31 @@ mod tests {
         );
         assert_eq!(reloaded.get_fullscreen_scrollbar(), ScrollbarMode::Auto);
     }
+
+    // V14-12 FR-G: BOM normalization (#8337) + error paths
+    // (`1e1a6e27b`/`913bcf339`, #7829).
+
+    #[test]
+    fn bom_prefixed_settings_load_like_clean_files() {
+        let dirs = test_dirs();
+        let clean = r#"{"defaultModel": "m1"}"#;
+        std::fs::write(global_path(&dirs), format!("\u{FEFF}{clean}")).unwrap();
+        let mut manager = create(&dirs);
+        assert_eq!(manager.get_default_model().as_deref(), Some("m1"));
+        assert!(manager.drain_errors().is_empty(), "BOM is not an error");
+    }
+
+    #[test]
+    fn settings_errors_carry_the_source_path() {
+        let dirs = test_dirs();
+        std::fs::write(global_path(&dirs), "{invalid json").unwrap();
+        let mut manager = create(&dirs);
+        let errors = manager.drain_errors();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].scope, SettingsScope::Global);
+        assert_eq!(
+            errors[0].path.as_deref(),
+            Some(global_path(&dirs).to_str().expect("utf8 path"))
+        );
+    }
 }

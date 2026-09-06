@@ -40,6 +40,10 @@ pub struct TrustOption {
     pub value: String,
     pub label: String,
     pub description: Option<String>,
+    /// `isSavedOption` (trust-selector.ts:93-98 @ f2a622789): the option
+    /// matching the persisted decision keeps a visible `✓ ` marker while
+    /// browsing.
+    pub saved: bool,
 }
 
 /// `(text) => theme.fg("border", text)` (dynamic-border.ts:14).
@@ -83,11 +87,18 @@ impl TrustSelectorComponent {
         mut on_select: Box<dyn FnMut(&str) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
     ) -> Self {
+        // Leading `✓ `/two-space marker column (updateList,
+        // trust-selector.ts:105-115 @ f2a622789): the saved decision stays
+        // marked while the cursor browses.
         let items: Vec<SelectItem> = options
             .into_iter()
             .map(|option| SelectItem {
+                label: format!(
+                    "{}{}",
+                    if option.saved { "\u{2713} " } else { "  " },
+                    option.label
+                ),
                 value: option.value,
-                label: option.label,
                 description: option.description,
             })
             .collect();
@@ -165,11 +176,13 @@ mod tests {
                 value: "trust".into(),
                 label: "Trust".into(),
                 description: Some("Trust this folder".into()),
+                saved: false,
             },
             TrustOption {
                 value: "untrust".into(),
                 label: "Do not trust".into(),
                 description: Some("Do not trust this folder".into()),
+                saved: false,
             },
         ]
     }

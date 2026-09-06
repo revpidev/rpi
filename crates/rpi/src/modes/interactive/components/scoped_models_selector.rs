@@ -46,11 +46,30 @@ fn is_enabled(enabled_ids: &EnabledIds, id: &str) -> bool {
     }
 }
 
-/// `toggle` (scoped-models-selector.ts:25-30): the first toggle on "all
-/// enabled" starts with only this one.
-fn toggle(enabled_ids: &EnabledIds, id: &str) -> EnabledIds {
+/// `normalizeEnabled` (scoped-models-selector.ts:25-27 @ f2a622789):
+/// collapse an explicit list back to `None` (= all enabled) when it covers
+/// every available model.
+fn normalize_enabled(result: Vec<String>, all_ids: &[String]) -> EnabledIds {
+    if result.len() == all_ids.len() && result.iter().all(|id| all_ids.contains(id)) {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// `toggle` (scoped-models-selector.ts:29-35 @ f2a622789): from the
+/// all-enabled state the first toggle disables just this one (checks stay
+/// visible on the rest); re-adding the last disabled model collapses back
+/// to all-enabled.
+fn toggle(enabled_ids: &EnabledIds, all_ids: &[String], id: &str) -> EnabledIds {
     match enabled_ids {
-        None => Some(vec![id.to_string()]),
+        None => Some(
+            all_ids
+                .iter()
+                .filter(|model_id| *model_id != id)
+                .cloned()
+                .collect(),
+        ),
         Some(ids) => {
             let mut result = ids.clone();
             match result.iter().position(|existing| existing == id) {
@@ -59,7 +78,7 @@ fn toggle(enabled_ids: &EnabledIds, id: &str) -> EnabledIds {
                 }
                 None => result.push(id.to_string()),
             }
-            Some(result)
+            normalize_enabled(result, all_ids)
         }
     }
 }
@@ -81,11 +100,7 @@ fn enable_all(
             result.push(id.clone());
         }
     }
-    if result.len() == all_ids.len() && result.iter().all(|id| all_ids.contains(id)) {
-        None
-    } else {
-        Some(result)
-    }
+    normalize_enabled(result, all_ids)
 }
 
 /// `clearAll` (scoped-models-selector.ts:42-48).
@@ -396,7 +411,7 @@ impl Component for ScopedModelsSelectorComponent {
                 let Some(item) = self.filtered_items.get(self.selected_index).cloned() else {
                     return;
                 };
-                self.enabled_ids = toggle(&self.enabled_ids, &item.full_id);
+                self.enabled_ids = toggle(&self.enabled_ids, &self.all_ids, &item.full_id);
                 self.is_dirty = true;
                 self.refresh();
                 self.notify_change();
@@ -536,7 +551,6 @@ impl Component for ScopedModelsSelectorComponent {
                 .saturating_sub(MAX_VISIBLE)
                 .min(self.selected_index.saturating_sub(MAX_VISIBLE / 2));
             let end_index = (start_index + MAX_VISIBLE).min(len);
-            let all_enabled = self.enabled_ids.is_none();
 
             for i in start_index..end_index {
                 let item = &self.filtered_items[i];
@@ -550,10 +564,15 @@ impl Component for ScopedModelsSelectorComponent {
                     Some(model) => model.id.clone(),
                     None => item.full_id.clone(),
                 };
+                // Unavailable models strike through (f2a622789).
+                let styled_id = match &item.model {
+                    Some(_) => id.clone(),
+                    None => Theme::strikethrough(&id),
+                };
                 let model_text = if is_selected {
-                    self.theme.fg("accent", &id)
+                    self.theme.fg("accent", &styled_id)
                 } else {
-                    id
+                    styled_id
                 };
                 let provider_badge = self.theme.fg(
                     "muted",
@@ -562,14 +581,16 @@ impl Component for ScopedModelsSelectorComponent {
                         None => " [unavailable]".to_string(),
                     },
                 );
-                let status = match &item.model {
-                    Some(_) if all_enabled => String::new(),
-                    Some(_) if item.enabled => self.theme.fg("success", " ✓"),
-                    Some(_) => self.theme.fg("dim", " ✗"),
-                    None => self.theme.fg("dim", " ✗"),
+                // Leading `✓ ` marker for enabled available models — shown
+                // in the all-enabled state too (f2a622789); unavailable
+                // models never check.
+                let status = if item.model.is_some() && item.enabled {
+                    self.theme.fg("accent", "✓ ")
+                } else {
+                    "  ".to_string()
                 };
                 lines.push(truncate_to_width(
-                    &format!("{prefix}{model_text}{provider_badge}{status}"),
+                    &format!("{prefix}{status}{model_text}{provider_badge}"),
                     width,
                     "...",
                     false,
@@ -779,16 +800,17 @@ mod tests {
                 "beta/b1".to_string(),
             ]),
         );
-        // Explicit list: all three enabled, no marks.
+        // Explicit list with all three enabled: leading ✓ markers on every
+        // row (f2a622789 — checks also show in the all-enabled state).
         let rows = list_rows(&h.component.render(80));
-        assert_eq!(rows[0], "→ a1 [alpha] ✓");
+        assert_eq!(rows[0], "→ ✓ a1 [alpha]");
         // Enter toggles the selected (first) model off.
         h.component.handle_input("\r");
         let rows = list_rows(&h.component.render(80));
         // The disabled id falls to the end of the sorted list.
-        assert_eq!(rows[0], "→ a2 [alpha] ✓");
-        assert_eq!(rows[1], "  b1 [beta] ✓");
-        assert_eq!(rows[2], "  a1 [alpha] ✗");
+        assert_eq!(rows[0], "→ ✓ a2 [alpha]");
+        assert_eq!(rows[1], "  ✓ b1 [beta]");
+        assert_eq!(rows[2], "    a1 [alpha]");
         let changes = h.changes.lock().unwrap();
         assert_eq!(
             *changes,
@@ -797,17 +819,34 @@ mod tests {
     }
 
     #[test]
-    fn first_toggle_starts_with_only_that_model() {
+    fn first_toggle_disables_only_that_model() {
         install_keybindings();
         let mut h = harness(sample_models(), None);
-        // Move down to b1 (last), then toggle: enabled = [b1] only
-        // (scoped-models-selector.ts:26: first toggle starts with only this
-        // one).
+        // Move down to b1 (last), then toggle from the all-enabled state:
+        // only b1 is disabled, the rest keep their checks
+        // (f2a622789 — old expectation "starts with only this one"
+        // registered per G2).
         h.component.handle_input("\x1b[B");
         h.component.handle_input("\x1b[B");
         h.component.handle_input("\r");
         let changes = h.changes.lock().unwrap();
-        assert_eq!(*changes, vec![Some(vec!["beta/b1".to_string()])]);
+        assert_eq!(
+            *changes,
+            vec![Some(vec!["alpha/a1".to_string(), "alpha/a2".to_string()])]
+        );
+    }
+
+    #[test]
+    fn toggle_back_collapses_to_all_enabled() {
+        install_keybindings();
+        let mut h = harness(sample_models(), None);
+        // Disable a1, then re-enable it: the explicit list covers every
+        // model again and collapses to None (normalizeEnabled, f2a622789).
+        h.component.handle_input("\r"); // a1 off (falls to the end)
+        h.component.handle_input("\x1b[A"); // wrap up to a1 (sorted last)
+        h.component.handle_input("\r"); // a1 back on
+        let changes = h.changes.lock().unwrap();
+        assert_eq!(changes.last(), Some(&None));
     }
 
     #[test]
@@ -879,12 +918,15 @@ mod tests {
     fn save_persists_and_clears_dirty_flag() {
         install_keybindings();
         let mut h = harness(sample_models(), None);
-        h.component.handle_input("\r"); // toggle → dirty
+        h.component.handle_input("\r"); // toggle → dirty (a1 disabled)
         h.component.handle_input("\x13"); // Ctrl+S
         let persists = h.persists.lock().unwrap();
-        // The first toggle from "all enabled" enables only the toggled id
-        // (scoped-models-selector.ts:26).
-        assert_eq!(persists[0], Some(vec!["alpha/a1".to_string()]));
+        // The first toggle from "all enabled" disables only the toggled id
+        // (f2a622789).
+        assert_eq!(
+            persists[0],
+            Some(vec!["alpha/a2".to_string(), "beta/b1".to_string()])
+        );
         let joined = plain(h.component.render(80)).join("\n");
         assert!(!joined.contains("(unsaved)"), "saved footer is not dirty");
     }

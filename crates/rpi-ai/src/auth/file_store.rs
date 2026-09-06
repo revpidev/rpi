@@ -1426,4 +1426,84 @@ mod tests {
         assert_eq!(read_file_json(&auth_path), json!({}));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // V14-12 FR-G: BOM normalization + permission preservation.
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    // #8337 (`1355cd36e`): a BOM-prefixed auth.json parses like a clean one.
+    #[tokio::test]
+    async fn bom_prefixed_auth_json_loads() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        let clean = serde_json::to_string(&json!({
+            "anthropic": { "type": "api_key", "key": "sk-bom" }
+        }))
+        .expect("serialize");
+        std::fs::write(&auth_path, format!("\u{FEFF}{clean}")).expect("write bom");
+
+        let credential =
+            read_stored_credential("anthropic", &auth_path).expect("credential parses");
+        assert!(
+            matches!(&credential, Credential::ApiKey(key) if key.key.as_deref() == Some("sk-bom")),
+            "BOM-stripped parse"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #7779 (`c49906ec7`): overwriting an existing file preserves its
+    // permissions (no post-write chmod); creation still uses 0o600.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn modify_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        write_auth_json(
+            &auth_path,
+            json!({ "anthropic": { "type": "api_key", "key": "old" } }),
+        );
+        // Admin-tightened mode (e.g. 0o640 group-readable).
+        std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o640))
+            .expect("chmod");
+
+        let storage = FileCredentialStore::new(&auth_path);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect("modify");
+
+        assert_eq!(mode_of(&auth_path), 0o640, "existing mode preserved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_auth_json_created_with_0600() {
+        let dir = temp_dir();
+        let auth_path = dir.join("auth.json");
+        let storage = FileCredentialStore::new(&auth_path);
+        storage
+            .modify(
+                "anthropic",
+                modify_fn(|_| Ok(Some(api_key_credential("new")))),
+                None,
+            )
+            .await
+            .expect("modify");
+        assert_eq!(mode_of(&auth_path), 0o600, "creation mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -88,7 +88,7 @@ pub type SelectListTextFn = Box<dyn Fn(&str) -> String + Send + Sync>;
 /// Primary-column truncator (upstream `truncatePrimary`).
 #[allow(clippy::type_complexity)] // mirrors the upstream callback type exactly
 pub type TruncatePrimaryFn =
-    Box<dyn Fn(&SelectListTruncatePrimaryContext<'_>) -> String + Send + Sync>;
+    std::sync::Arc<dyn Fn(&SelectListTruncatePrimaryContext<'_>) -> String + Send + Sync>;
 /// Item callback (upstream `(item: SelectItem) => void`).
 pub type SelectItemFn = Box<dyn FnMut(&SelectItem) + Send>;
 
@@ -129,8 +129,10 @@ pub struct SelectListTruncatePrimaryContext<'a> {
 }
 
 /// Layout options for the primary column (upstream
-/// `SelectListLayoutOptions`, select-list.ts:34-38).
-#[derive(Default)]
+/// `SelectListLayoutOptions`, select-list.ts:34-38). `Clone` so submenu
+/// components can rebuild their list with the same geometry
+/// (settings-submenu.ts `buildSelectList`).
+#[derive(Default, Clone)]
 pub struct SelectListLayoutOptions {
     pub min_primary_column_width: Option<usize>,
     pub max_primary_column_width: Option<usize>,
@@ -550,7 +552,7 @@ mod tests {
             Some(SelectListLayoutOptions {
                 min_primary_column_width: Some(12),
                 max_primary_column_width: Some(12),
-                truncate_primary: Some(Box::new(
+                truncate_primary: Some(std::sync::Arc::new(
                     |context: &SelectListTruncatePrimaryContext<'_>| {
                         if context.text.chars().count() <= context.max_width {
                             return context.text.to_string();

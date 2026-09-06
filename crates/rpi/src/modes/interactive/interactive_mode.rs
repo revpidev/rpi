@@ -4569,23 +4569,7 @@ impl InteractiveMode {
         if let Some(message) = self.options.model_fallback_message.clone() {
             self.ui_state.show_warning(&message);
         }
-
-        // `startupDiagnostics` (interactive-mode.ts:1075-1093 @ 913bcf339):
-        // errors → showError, warnings → showWarning, info → showStatus —
-        // visible at startup, includes settings file paths, non-blocking.
-        for diagnostic in &self.options.startup_diagnostics {
-            match diagnostic.level {
-                crate::cli::diagnostics::DiagnosticLevel::Error => {
-                    self.ui_state.show_error(&diagnostic.message);
-                }
-                crate::cli::diagnostics::DiagnosticLevel::Warning => {
-                    self.ui_state.show_warning(&diagnostic.message);
-                }
-                crate::cli::diagnostics::DiagnosticLevel::Info => {
-                    self.ui_state.show_status(&diagnostic.message);
-                }
-            }
-        }
+        self.show_startup_diagnostics();
 
         // Main interactive loop (interactive-mode.ts:910-919).
         loop {
@@ -4630,6 +4614,26 @@ impl InteractiveMode {
         };
         if let Ok(theme) = crate::core::themes::load_theme(&name, None) {
             self.ui_state.apply_theme(Arc::new(theme));
+        }
+    }
+
+    /// `startupDiagnostics` rendering (interactive-mode.ts:1075-1093 @
+    /// 913bcf339): errors → showError, warnings → showWarning, info →
+    /// showStatus — visible at startup, includes settings file paths,
+    /// non-blocking.
+    fn show_startup_diagnostics(&self) {
+        for diagnostic in &self.options.startup_diagnostics {
+            match diagnostic.level {
+                crate::cli::diagnostics::DiagnosticLevel::Error => {
+                    self.ui_state.show_error(&diagnostic.message);
+                }
+                crate::cli::diagnostics::DiagnosticLevel::Warning => {
+                    self.ui_state.show_warning(&diagnostic.message);
+                }
+                crate::cli::diagnostics::DiagnosticLevel::Info => {
+                    self.ui_state.show_status(&diagnostic.message);
+                }
+            }
         }
     }
 
@@ -8680,5 +8684,41 @@ mod tests {
             TuiMode::Regular,
             "fatal exit with Transcript switches to regular regardless of user setting"
         );
+    }
+
+    /// V14-12 FR-G R3 (#7829): invalid settings surface in the TUI as a
+    /// visible warning naming the offending file (startup diagnostics
+    /// path, `913bcf339`).
+    #[tokio::test]
+    async fn startup_diagnostics_render_as_tui_warnings_with_path() {
+        let harness = build_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let options = InteractiveModeOptions {
+            startup_diagnostics: vec![
+                crate::core::agent_session_services::AgentSessionRuntimeDiagnostic {
+                    level: crate::cli::diagnostics::DiagnosticLevel::Warning,
+                    message: format!(
+                        "Invalid settings file {}: expected value",
+                        harness
+                            .runtime
+                            .services()
+                            .agent_dir
+                            .join("settings.json")
+                            .display()
+                    ),
+                },
+            ],
+            ..Default::default()
+        };
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            options,
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        let before = chat_children(&mode.ui_state);
+        // The same rendering the run loop performs right after init.
+        mode.show_startup_diagnostics();
+        let after = chat_children(&mode.ui_state);
+        assert_eq!(after, before + 1, "warning appended to the transcript");
     }
 }

@@ -183,11 +183,24 @@ fn format_http_idle_timeout_ms(timeout_ms: u64) -> String {
 /// `getProjectTrustOptions` (trust-manager.ts:52-74): the five options
 /// (session-only variants included) as local [`TrustOption`]s. The `value`
 /// strings are interpreted by [`InteractiveUi::show_trust_selector`].
-fn build_trust_options(cwd: &Path) -> Vec<TrustOption> {
+fn build_trust_options(
+    cwd: &Path,
+    saved_entry: Option<&(std::path::PathBuf, bool)>,
+) -> Vec<TrustOption> {
+    // `isSavedOption` (trust-selector.ts:93-98 @ f2a622789): an option is
+    // "saved" when its persisted path + decision match the nearest saved
+    // entry; session-only variants have no saved path and never match.
+    let is_saved = |saved_path: Option<&Path>, trusted: bool| match saved_entry {
+        Some((entry_path, entry_decision)) => {
+            saved_path.is_some_and(|path| path == entry_path) && *entry_decision == trusted
+        }
+        None => false,
+    };
     let mut options = vec![TrustOption {
         value: "trust".to_string(),
         label: "Trust".to_string(),
         description: Some(format!("Trust {}", cwd.display())),
+        saved: is_saved(Some(cwd), true),
     }];
     if let Some(parent) = cwd.parent() {
         options.push(TrustOption {
@@ -198,22 +211,26 @@ fn build_trust_options(cwd: &Path) -> Vec<TrustOption> {
                 parent.display(),
                 cwd.display()
             )),
+            saved: is_saved(Some(parent), true),
         });
     }
     options.push(TrustOption {
         value: "trust-session".to_string(),
         label: "Trust (this session only)".to_string(),
         description: None,
+        saved: false,
     });
     options.push(TrustOption {
         value: "untrust".to_string(),
         label: "Do not trust".to_string(),
         description: Some(format!("Do not trust {}", cwd.display())),
+        saved: is_saved(Some(cwd), false),
     });
     options.push(TrustOption {
         value: "untrust-session".to_string(),
         label: "Do not trust (this session only)".to_string(),
         description: None,
+        saved: false,
     });
     options
 }
@@ -344,9 +361,38 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
                 format_http_idle_timeout_ms(timeout_ms)
             ));
         }
-        SettingsChange::ThinkingLevel(level) => {
-            session.set_thinking_level(setting_to_model_thinking(level));
-            ui.update_editor_border_color();
+        SettingsChange::ModelThinkingLevelChange {
+            provider,
+            model_id,
+            level,
+        } => {
+            session.settings_manager(|s| s.set_model_thinking_level(&provider, &model_id, level));
+            // If the override is for the current model, apply it to the
+            // session too (interactive-mode.ts:4653-4658).
+            let current = session.model();
+            if current
+                .as_ref()
+                .is_some_and(|model| model.provider == provider && model.id == model_id)
+            {
+                session.set_thinking_level(level);
+                ui.update_editor_border_color();
+            }
+        }
+        SettingsChange::ModelThinkingLevelRemove { provider, model_id } => {
+            session.settings_manager(|s| s.remove_model_thinking_level(&provider, &model_id));
+            // If the override was for the current model, revert to the
+            // global default (interactive-mode.ts:4660-4668).
+            let current = session.model();
+            if current
+                .as_ref()
+                .is_some_and(|model| model.provider == provider && model.id == model_id)
+            {
+                let global_default = session
+                    .settings_manager(|s| s.get_default_thinking_level())
+                    .unwrap_or(crate::core::model_resolver::DEFAULT_THINKING_LEVEL);
+                session.set_thinking_level(global_default);
+                ui.update_editor_border_color();
+            }
         }
         SettingsChange::Theme(theme_setting) => {
             session.settings_manager(|s| s.set_theme(&theme_setting));
@@ -1046,12 +1092,22 @@ impl InteractiveUi {
             http_idle_timeout_ms: session
                 .settings_manager(|s| s.get_http_idle_timeout_ms())
                 .unwrap_or(crate::core::settings_manager::DEFAULT_HTTP_IDLE_TIMEOUT_MS),
-            thinking_level: model_thinking_to_setting(session.thinking_level()),
-            available_thinking_levels: session
-                .get_available_thinking_levels()
-                .into_iter()
-                .map(model_thinking_to_setting)
-                .collect(),
+            // `thinkingLevel` here is the global DEFAULT (not the session
+            // level) — interactive-mode.ts:4577.
+            thinking_level: model_thinking_to_setting(
+                session
+                    .settings_manager(|s| s.get_default_thinking_level())
+                    .unwrap_or(crate::core::model_resolver::DEFAULT_THINKING_LEVEL),
+            ),
+            model_thinking_levels: session.settings_manager(|s| s.get_all_model_thinking_levels()),
+            available_default_models: session.model_runtime().get_available_snapshot(),
+            current_model: session.model(),
+            default_model: session.settings_manager(|s| {
+                match (s.get_default_provider(), s.get_default_model()) {
+                    (Some(provider), Some(id)) => format!("{provider}/{id}"),
+                    _ => "not set".to_string(),
+                }
+            }),
             current_theme: session
                 .settings_manager(|s| s.get_theme_setting())
                 .unwrap_or_else(|| "dark".to_string()),
@@ -1556,7 +1612,10 @@ impl InteractiveUi {
             .agent_dir()
             .to_path_buf();
         let store = ProjectTrustStore::new(&agent_dir);
-        let options = build_trust_options(&cwd);
+        // The nearest saved decision (findNearestTrustEntry) feeds the
+        // per-option saved markers.
+        let saved_entry = store.get_entry(&cwd).ok().flatten();
+        let options = build_trust_options(&cwd, saved_entry.as_ref());
 
         let select_ui = Arc::clone(ui);
         let selector = Arc::new(Mutex::new(TrustSelectorComponent::new(

@@ -353,4 +353,78 @@ mod tests {
         assert!(leftovers.is_empty(), "tmp leftovers: {leftovers:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // V14-12 FR-G: BOM normalization (#8337) + permission inheritance
+    // (#7779, `c49906ec7`): the tmp+rename replacement preserves the
+    // existing target's mode.
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[tokio::test]
+    async fn test_bom_prefixed_models_store_loads() {
+        let dir = std::env::temp_dir().join(format!("rpi-models-store-bom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("models-store.json");
+        let clean = serde_json::to_string(&serde_json::json!({
+            "providers": { "openai": { "models": [], "lastModified": 1 } }
+        }))
+        .expect("serialize");
+        std::fs::write(&path, format!("\u{FEFF}{clean}")).expect("write bom");
+        let store = JsonFileModelsStore::load(path.clone()).await.expect("load");
+        assert!(
+            store.read("openai", None).await.expect("read").is_some(),
+            "BOM-stripped parse"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_persist_inherits_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("rpi-models-store-perm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("models-store.json");
+        // Seed a store, then tighten the mode (admin-set ACL stand-in).
+        let store = JsonFileModelsStore::load(path.clone()).await.expect("load");
+        store
+            .write(
+                "openai",
+                ModelsStoreEntry {
+                    models: vec![],
+                    last_modified: Some(1),
+                    checked_at: None,
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        // A second write goes through tmp+rename; the mode must survive.
+        store
+            .write(
+                "openai",
+                ModelsStoreEntry {
+                    models: vec![],
+                    last_modified: Some(2),
+                    checked_at: None,
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("rewrite");
+        assert_eq!(mode_of(&path), 0o640, "mode inherited across rename");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
