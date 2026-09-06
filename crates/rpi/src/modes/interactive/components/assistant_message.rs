@@ -11,14 +11,19 @@
 //!   component stores its own clone.
 
 use std::boxed::Box as StdBox;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use rpi_ai::types::{AssistantContent, AssistantMessage, StopReason};
 use rpi_ext_host::types::MarkdownTransformerFn;
 use rpi_tui::components::markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
+use rpi_tui::components::mouse_region::MouseRegion;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
-use rpi_tui::tui::{Component, Container};
+use rpi_tui::tui::{
+    shared_component_from_boxed, Component, Container, TuiMouseButton, TuiMouseEvent,
+    TuiMouseEventResult, TuiMouseEventType, TuiMouseHandlerResult,
+};
 
 use crate::core::themes::Theme;
 
@@ -30,6 +35,16 @@ use super::util::{OSC133_ZONE_END, OSC133_ZONE_FINAL, OSC133_ZONE_START};
 pub struct AssistantMessageComponent {
     content_container: Container,
     hide_thinking_block: bool,
+    /// `thinkingVisibilityOverrides` (assistant-message.ts:24 @ 9841914,
+    /// `71026970a`): per-thinking-run visibility overrides keyed by run
+    /// index, toggled by clicking the block (FR-A R9). Shared interior
+    /// mutability so the `MouseRegion` callback — which runs while this
+    /// component is locked for `handle_mouse` — can record toggles without
+    /// re-entering the component (the toggle is drained and applied right
+    /// after the child dispatch returns, before the next render).
+    thinking_visibility_overrides: Arc<StdMutex<BTreeMap<usize, bool>>>,
+    /// Run indices whose blocks were clicked since the last drain.
+    pending_visibility_toggles: Arc<StdMutex<Vec<usize>>>,
     markdown_theme: Arc<MarkdownTheme>,
     hidden_thinking_label: String,
     output_pad: usize,
@@ -59,6 +74,7 @@ type VisibleSignature = (
     Option<String>,
     bool,
     Vec<(u64, u64)>,
+    u64,
 );
 
 /// (len, hash) fingerprint of a visible block's content.
@@ -67,6 +83,19 @@ fn block_fingerprint(text: &str) -> (u64, u64) {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     (text.len() as u64, hasher.finish())
+}
+
+/// Stable fingerprint of the thinking-visibility overrides (part of the
+/// rebuild signature since V14-14: a click toggle must invalidate the
+/// cached rebuild even when the message itself is unchanged).
+fn overrides_fingerprint(overrides: &BTreeMap<usize, bool>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (run, hidden) in overrides {
+        run.hash(&mut hasher);
+        hidden.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]
@@ -104,6 +133,8 @@ impl AssistantMessageComponent {
         let mut component = Self {
             content_container: Container::new(),
             hide_thinking_block,
+            thinking_visibility_overrides: Arc::new(StdMutex::new(BTreeMap::new())),
+            pending_visibility_toggles: Arc::new(StdMutex::new(Vec::new())),
             markdown_theme,
             hidden_thinking_label: hidden_thinking_label.into(),
             output_pad,
@@ -120,9 +151,15 @@ impl AssistantMessageComponent {
         component
     }
 
-    /// `setHideThinkingBlock` (assistant-message.ts:51-56).
+    /// `setHideThinkingBlock` (assistant-message.ts:51-56): also clears the
+    /// per-run visibility overrides (:60) — the global setting replaces any
+    /// click-toggled state.
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
         self.hide_thinking_block = hide;
+        self.thinking_visibility_overrides
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         if let Some(message) = self.last_message.clone() {
             self.update_content(&message, self.is_streaming);
         }
@@ -179,6 +216,12 @@ impl AssistantMessageComponent {
                     AssistantContent::ToolCall(_) => None,
                 })
                 .collect::<Vec<_>>(),
+            overrides_fingerprint(
+                &self
+                    .thinking_visibility_overrides
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            ),
         );
         // FR-B R1 (V13-06): the message is borrowed — exactly one clone here
         // stores `last_message`; callers no longer clone before calling.
@@ -204,6 +247,7 @@ impl AssistantMessageComponent {
 
         // Render content in order (assistant-message.ts:98-146).
         let mut i = 0;
+        let mut thinking_run_index = 0usize;
         while i < message.content.len() {
             match &message.content[i] {
                 // Assistant text messages with no background - trim the text.
@@ -247,20 +291,28 @@ impl AssistantMessageComponent {
                     let has_visible_content_after =
                         message.content[i..].iter().any(has_visible_content_block);
 
-                    if self.hide_thinking_block {
-                        // Show one static label for each run of thinking
-                        // blocks when hidden (assistant-message.ts:128-132).
+                    // Per-run visibility override + clickable toggle
+                    // (assistant-message.ts:141-171 @ 9841914, 71026970a):
+                    // each run is wrapped in a MouseRegion; a left click
+                    // flips the run's override and rebuilds the content.
+                    let run_index = thinking_run_index;
+                    thinking_run_index += 1;
+                    let hidden = self
+                        .thinking_visibility_overrides
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&run_index)
+                        .copied()
+                        .unwrap_or(self.hide_thinking_block);
+                    let thinking_component: StdBox<dyn Component> = if hidden {
+                        // Show one static label for the run when hidden
+                        // (assistant-message.ts:128-132).
                         let label = Theme::italic(
                             &self.theme.fg("thinkingText", &self.hidden_thinking_label),
                         );
-                        self.content_container.add_child(StdBox::new(Text::new(
-                            label,
-                            self.output_pad,
-                            0,
-                            None,
-                        )));
+                        StdBox::new(Text::new(label, self.output_pad, 0, None))
                     } else {
-                        // Render each run of thinking blocks as one Markdown
+                        // Render the run of thinking blocks as one Markdown
                         // section (assistant-message.ts:134-140).
                         let thinking_style = DefaultTextStyle {
                             color: Some(Box::new({
@@ -270,16 +322,45 @@ impl AssistantMessageComponent {
                             italic: true,
                             ..Default::default()
                         };
-                        let markdown = Markdown::new(
+                        StdBox::new(Markdown::new(
                             thinking_blocks.join("\n\n"),
                             self.output_pad,
                             0,
                             Arc::clone(&self.markdown_theme),
                             Some(thinking_style),
                             self.markdown_options("assistant-thinking"),
-                        );
-                        self.content_container.add_child(StdBox::new(markdown));
-                    }
+                        ))
+                    };
+                    let overrides = Arc::clone(&self.thinking_visibility_overrides);
+                    let pending = Arc::clone(&self.pending_visibility_toggles);
+                    self.content_container
+                        .add_child(StdBox::new(MouseRegion::new(
+                            shared_component_from_boxed(thinking_component),
+                            Box::new(move |event| {
+                                if event.event_type != TuiMouseEventType::Click
+                                    || event.button != TuiMouseButton::Left
+                                {
+                                    return None;
+                                }
+                                // Upstream flips the override synchronously and
+                                // rebuilds; the port records the toggle (the
+                                // component is locked for `handle_mouse`) and the
+                                // drain below applies it before the next render.
+                                let mut overrides = overrides
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                overrides.insert(run_index, !hidden);
+                                drop(overrides);
+                                pending
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .push(run_index);
+                                Some(TuiMouseEventResult {
+                                    handled: true,
+                                    ..Default::default()
+                                })
+                            }),
+                        )));
                     if has_visible_content_after {
                         self.content_container
                             .add_child(StdBox::new(Spacer::new(1)));
@@ -362,6 +443,26 @@ impl AssistantMessageComponent {
             ..Default::default()
         })
     }
+
+    /// Apply thinking-visibility toggles recorded by `MouseRegion` callbacks
+    /// during a dispatch and rebuild the content
+    /// (assistant-message.ts:165-167 @ 9841914 — upstream rebuilds
+    /// synchronously inside the callback; the port defers to here because
+    /// the component is locked for `handle_mouse`).
+    fn drain_pending_visibility_toggles(&mut self) {
+        let toggles = std::mem::take(
+            &mut *self
+                .pending_visibility_toggles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if toggles.is_empty() {
+            return;
+        }
+        if let Some(message) = self.last_message.clone() {
+            self.update_content(&message, self.is_streaming);
+        }
+    }
 }
 
 /// `hasVisibleContent` predicate (assistant-message.ts:89-91, 124-126).
@@ -385,6 +486,17 @@ impl Component for AssistantMessageComponent {
         let last = lines.len() - 1;
         lines[last] = format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}{}", lines[last]);
         lines
+    }
+
+    /// Mouse dispatch through the content container
+    /// (`AssistantMessageComponent extends Container`, assistant-message.ts:14:
+    /// `Container.prototype.handleMouse` hit-tests the children — including
+    /// the `MouseRegion`-wrapped thinking blocks). Click-recorded visibility
+    /// toggles are applied right after the dispatch returns.
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        let result = self.content_container.handle_mouse(event);
+        self.drain_pending_visibility_toggles();
+        result
     }
 
     fn invalidate(&mut self) {
@@ -794,5 +906,113 @@ mod tests {
         assert!(calls[0].is_streaming);
         // width - padding_x * 2 = 50 - 2.
         assert_eq!(calls[0].available_width, 48);
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: thinking-block click toggle (assistant-message.ts:141-171 @
+    // 9841914, 71026970a — FR-A R9)
+    // ------------------------------------------------------------------
+
+    use rpi_tui::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn click(y: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type: TuiMouseEventType::Click,
+            button: TuiMouseButton::Left,
+            x: 2,
+            y,
+            screen_x: 2,
+            screen_y: y,
+            width: 40,
+            height: 20,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: Some(1),
+        }
+    }
+
+    #[test]
+    fn clicking_a_thinking_block_toggles_its_visibility() {
+        let mut component = AssistantMessageComponent::new(
+            Some(message(vec![thinking("secret thoughts"), text("answer")])),
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // Initially visible (hideThinkingBlock=false).
+        assert!(strip_ansi(&component.render(60).join("\n")).contains("secret thoughts"));
+
+        // Click row 1 (the spacer is row 0, the thinking block follows).
+        match component.handle_mouse(&click(1)) {
+            Some(TuiMouseHandlerResult::Event(event)) => assert!(event.handled),
+            _ => panic!("click on the thinking block is handled"),
+        }
+        // Collapsed to the label after the click.
+        assert!(!strip_ansi(&component.render(60).join("\n")).contains("secret thoughts"));
+        assert!(strip_ansi(&component.render(60).join("\n")).contains("Thinking..."));
+
+        // Clicking the label expands it again.
+        component.handle_mouse(&click(1));
+        assert!(strip_ansi(&component.render(60).join("\n")).contains("secret thoughts"));
+
+        // Right-button and non-click events do nothing.
+        let mut right = click(1);
+        right.button = TuiMouseButton::Right;
+        assert!(component.handle_mouse(&right).is_none());
+        let mut press = click(1);
+        press.event_type = TuiMouseEventType::Press;
+        assert!(component.handle_mouse(&press).is_none());
+        assert!(strip_ansi(&component.render(60).join("\n")).contains("secret thoughts"));
+    }
+
+    #[test]
+    fn thinking_overrides_survive_content_updates_and_clear_on_global_toggle() {
+        let mut component = AssistantMessageComponent::new(
+            Some(message(vec![
+                thinking("first secret"),
+                text("middle"),
+                thinking("second secret"),
+                text("answer"),
+            ])),
+            false,
+            theme(),
+            markdown_theme(&load_theme("dark", None).unwrap()),
+            "Thinking...",
+            1,
+            Vec::new(),
+        );
+        // Two runs separated by text. Collapse the first (spacer row 0,
+        // run 0 starts at row 1).
+        component.handle_mouse(&click(1));
+        let rendered = strip_ansi(&component.render(60).join("\n"));
+        assert!(!rendered.contains("first secret"), "{rendered}");
+        assert!(rendered.contains("second secret"), "{rendered}");
+
+        // A streaming update with identical content keeps the override.
+        component.update_content(
+            &message(vec![
+                thinking("first secret"),
+                text("middle"),
+                thinking("second secret"),
+                text("answer"),
+            ]),
+            true,
+        );
+        let rendered = strip_ansi(&component.render(60).join("\n"));
+        assert!(
+            !rendered.contains("first secret"),
+            "override survives updates: {rendered}"
+        );
+
+        // Toggling the global setting clears the overrides
+        // (assistant-message.ts:60).
+        component.set_hide_thinking_block(false);
+        let rendered = strip_ansi(&component.render(60).join("\n"));
+        assert!(rendered.contains("first secret"));
     }
 }

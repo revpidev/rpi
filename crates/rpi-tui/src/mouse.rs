@@ -47,7 +47,8 @@ pub const FOCUS_IN: &str = "\x1b[I";
 /// `FOCUS_OUT` (tui-alt-screen.ts:52): terminal lost focus.
 pub const FOCUS_OUT: &str = "\x1b[O";
 
-/// `WheelEvent` (tui-alt-screen.ts:101-105).
+/// `WheelEvent` (tui-alt-screen.ts:101-105 @ 9841914; the `button` member
+/// carries the raw SGR code so mouse-event creation can decode modifiers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WheelEvent {
     /// `-1` scroll up, `1` scroll down (upstream `-1 | 1`).
@@ -56,6 +57,8 @@ pub struct WheelEvent {
     pub x: u32,
     /// 0-based row.
     pub y: u32,
+    /// Raw SGR button code (`64` up / `65` down, plus modifier bits).
+    pub button: u32,
 }
 
 /// `SgrMouseEvent` (tui-alt-screen.ts:94-99).
@@ -98,6 +101,7 @@ pub fn parse_wheel_event(data: &str) -> Option<WheelEvent> {
             direction: if direction == 0 { -1 } else { 1 },
             x: caps.get(2)?.as_str().parse::<u32>().ok()?.saturating_sub(1),
             y: caps.get(3)?.as_str().parse::<u32>().ok()?.saturating_sub(1),
+            button,
         });
     }
     if data.len() == 6 && data.starts_with("\x1b[M") {
@@ -116,6 +120,7 @@ pub fn parse_wheel_event(data: &str) -> Option<WheelEvent> {
             direction: if direction == 0 { -1 } else { 1 },
             x: u32::from(bytes[4]).saturating_sub(33),
             y: u32::from(bytes[5]).saturating_sub(33),
+            button: button as u32,
         });
     }
     None
@@ -220,6 +225,7 @@ mod tests {
         assert_eq!(event.direction, -1);
         assert_eq!(event.x, 14);
         assert_eq!(event.y, 19);
+        assert_eq!(event.button, 64);
     }
 
     #[test]

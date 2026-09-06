@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
 use rpi_tui::keybindings::get_keybindings;
-use rpi_tui::tui::{Component, Focusable};
+use rpi_tui::tui::{Component, Focusable, TuiMouseEvent, TuiMouseHandlerResult};
 use rpi_tui::tui_handle::TuiHandle;
 
 /// App-action handler (upstream `() => void`).
@@ -266,6 +266,10 @@ impl Component for CustomEditorRegion {
 
     fn handle_input(&mut self, data: &str) {
         lock_editor(&self.inner).handle_input(data);
+    }
+
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        lock_editor(&self.inner).editor.handle_mouse(event)
     }
 
     fn invalidate(&mut self) {

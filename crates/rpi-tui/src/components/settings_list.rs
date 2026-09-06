@@ -26,7 +26,10 @@ use std::sync::{Arc, Mutex};
 use crate::components::input::Input;
 use crate::fuzzy::fuzzy_filter;
 use crate::keybindings::{get_keybindings, Keybinding};
-use crate::tui::Component;
+use crate::tui::{
+    Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+    TuiMouseHandlerResult,
+};
 use crate::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 
 /// `SettingItem` (settings-list.ts:7-19).
@@ -117,6 +120,9 @@ pub struct SettingsList {
     submenu_component: Option<Box<dyn Component>>,
     submenu_item_index: Option<usize>,
     submenu_done_queue: Arc<Mutex<VecDeque<SubmenuResult>>>,
+    /// `mousePressedIndex` (settings-list.ts:43 @ 9841914, 71026970a): the
+    /// row pressed by the last mouse press, consumed by the matching click.
+    mouse_pressed_index: Option<usize>,
 }
 
 impl SettingsList {
@@ -145,6 +151,7 @@ impl SettingsList {
             submenu_component: None,
             submenu_item_index: None,
             submenu_done_queue: Arc::new(Mutex::new(VecDeque::new())),
+            mouse_pressed_index: None,
         }
     }
 
@@ -174,6 +181,29 @@ impl SettingsList {
         } else {
             Some(selected_index)
         }
+    }
+
+    /// `getDisplayItems().length` (settings-list.ts:250-252 @ 9841914): the
+    /// filtered length when search is enabled, else the item count.
+    fn display_len(&self) -> usize {
+        if self.search_enabled {
+            self.filtered_indices.len()
+        } else {
+            self.items.len()
+        }
+    }
+
+    /// `getVisibleRange(displayItems)` (settings-list.ts:256-262 @ 9841914):
+    /// the visible window centered on the selection, clamped to the list
+    /// bounds.
+    fn get_visible_range(&self) -> (usize, usize) {
+        let display_len = self.display_len();
+        let start_index = self
+            .selected_index
+            .saturating_sub(self.max_visible / 2)
+            .min(display_len.saturating_sub(self.max_visible));
+        let end_index = (start_index + self.max_visible).min(display_len);
+        (start_index, end_index)
     }
 
     /// `activateItem` (settings-list.ts:199-221).
@@ -309,11 +339,7 @@ impl SettingsList {
         }
 
         // Calculate visible range with scrolling.
-        let start_index = self
-            .selected_index
-            .saturating_sub(self.max_visible / 2)
-            .min(display_len.saturating_sub(self.max_visible));
-        let end_index = (start_index + self.max_visible).min(display_len);
+        let (start_index, end_index) = self.get_visible_range();
 
         // Calculate max label width for alignment (over ALL items, matching
         // upstream `this.items.map(...)`).
@@ -405,6 +431,100 @@ impl Component for SettingsList {
         }
 
         self.render_main_list(width)
+    }
+
+    /// `SettingsList.prototype.handleMouse` (settings-list.ts:179-221 @
+    /// 9841914, 71026970a + 9841914c7): an active submenu receives the event
+    /// first (any result bubbles focus to this list, which owns the
+    /// keyboard); with search enabled the search input owns row 0 and row 1
+    /// is a spacer; below that, wheel moves the selection and left
+    /// press/click select + activate. Hover (move) never changes the
+    /// selection — "Hover must not change selection: the visible range is
+    /// centered on it" (settings-list.ts:201, 9841914c7).
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        if let Some(submenu_component) = self.submenu_component.as_mut() {
+            // Upstream: `const result = this.submenuComponent.handleMouse?.(event);
+            //  return result ? { ...result, focus: true } : undefined;`
+            // (settings-list.ts:182-186) — the list owns the keyboard.
+            return submenu_component.handle_mouse(event).map(|mut result| {
+                if let TuiMouseHandlerResult::Event(event) = &mut result {
+                    event.focus = true;
+                }
+                result
+            });
+        }
+
+        if self.search_enabled && self.search_input.is_some() {
+            if event.y == 0 {
+                return self
+                    .search_input
+                    .as_mut()
+                    .and_then(|search_input| search_input.handle_mouse(event))
+                    .map(|mut result| {
+                        if let TuiMouseHandlerResult::Event(event) = &mut result {
+                            event.focus = true;
+                        }
+                        result
+                    });
+            }
+            if event.y == 1 {
+                return None;
+            }
+        }
+
+        let display_len = self.display_len();
+        if display_len == 0 {
+            return None;
+        }
+        if event.event_type == TuiMouseEventType::Wheel
+            && event.wheel_delta.map(|delta| delta != 0).unwrap_or(false)
+        {
+            let delta = if event.wheel_delta.unwrap_or(0) < 0 {
+                -1i64
+            } else {
+                1
+            };
+            let previous_index = self.selected_index as i64;
+            self.selected_index =
+                (self.selected_index as i64 + delta).clamp(0, display_len as i64 - 1) as usize;
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                render: Some(self.selected_index as i64 != previous_index),
+                ..Default::default()
+            }));
+        }
+        // Hover must not change selection: the visible range is centered on it.
+        if event.button != TuiMouseButton::Left
+            || (event.event_type != TuiMouseEventType::Press
+                && event.event_type != TuiMouseEventType::Click)
+        {
+            return None;
+        }
+
+        let row_offset: isize = if self.search_enabled { 2 } else { 0 };
+        let (start_index, end_index) = self.get_visible_range();
+        let item_index = start_index as isize + event.y - row_offset;
+        if item_index < start_index as isize || item_index >= end_index as isize {
+            return None;
+        }
+        let item_index = item_index as usize;
+        if event.event_type == TuiMouseEventType::Press {
+            self.mouse_pressed_index = Some(item_index);
+            self.selected_index = item_index;
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                focus: true,
+                ..Default::default()
+            }));
+        }
+        // Click: activate the pressed row (or the clicked row when no press
+        // was observed, e.g. a synthesized click from the selection path).
+        self.selected_index = self.mouse_pressed_index.take().unwrap_or(item_index);
+        self.activate_item();
+        Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+            handled: true,
+            ..Default::default()
+        }))
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -844,5 +964,167 @@ mod tests {
         let mut settings = list(vec![item("a", "alpha", "1"), item("b", "beta", "2")], None);
         settings.update_value("b", "updated");
         assert_eq!(settings.items[1].current_value, "updated");
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: handleMouse (settings-list.ts:179-221 @ 9841914,
+    // 71026970a + 9841914c7)
+    // ------------------------------------------------------------------
+
+    use crate::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn settings_mouse_event(
+        event_type: TuiMouseEventType,
+        button: TuiMouseButton,
+        y: isize,
+        wheel_delta: Option<isize>,
+    ) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button,
+            x: 3,
+            y,
+            screen_x: 3,
+            screen_y: y,
+            width: 40,
+            height: 8,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta,
+            click_count: None,
+        }
+    }
+
+    fn five_settings() -> Vec<SettingItem> {
+        (0..5)
+            .map(|i| {
+                let mut setting = item(&format!("s{i}"), &format!("Setting {i}"), &format!("v{i}"));
+                setting.values = Some(vec![format!("v{i}"), format!("w{i}")]);
+                setting
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mouse_press_and_click_select_and_activate() {
+        let changes: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let changes_flag = Arc::clone(&changes);
+        let mut list = SettingsList::new(five_settings(), 3, theme(), None);
+        list.on_change = Some(Box::new(move |id, _| {
+            changes_flag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(id.to_string());
+        }));
+
+        // Press row 1: selection moves, focus claimed.
+        match list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            1,
+            None,
+        )) {
+            Some(TuiMouseHandlerResult::Event(event)) => assert!(event.focus),
+            _ => panic!("press returns focus"),
+        }
+        assert_eq!(list.selected_item().unwrap().id, "s1");
+
+        // Click row 2: the still-recorded pressed row (s1) wins — upstream
+        // `this.selectedIndex = this.mousePressedIndex ?? itemIndex`
+        // (settings-list.ts:214).
+        list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Click,
+            TuiMouseButton::Left,
+            2,
+            None,
+        ));
+        // The pressed row was consumed; a second click on row 2 activates
+        // the clicked row.
+        list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Click,
+            TuiMouseButton::Left,
+            2,
+            None,
+        ));
+        assert_eq!(
+            changes.lock().unwrap_or_else(|e| e.into_inner()).to_vec(),
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_moves_selection_without_notifying() {
+        let mut list = SettingsList::new(five_settings(), 3, theme(), None);
+        list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Wheel,
+            TuiMouseButton::None,
+            0,
+            Some(1),
+        ));
+        assert_eq!(list.selected_item().unwrap().id, "s1");
+        // wheel down once from s1 → s2 (upstream: no onSelectionChange hook
+        // on the settings list, nothing to observe beyond the index).
+        let _ = list.get_visible_range();
+    }
+
+    #[test]
+    fn hover_move_never_changes_settings_selection() {
+        // FR-E (9841914c7).
+        let mut list = SettingsList::new(five_settings(), 3, theme(), None);
+        for y in 0..5 {
+            list.handle_mouse(&settings_mouse_event(
+                TuiMouseEventType::Move,
+                TuiMouseButton::None,
+                y,
+                None,
+            ));
+        }
+        assert_eq!(list.selected_item().unwrap().id, "s0");
+    }
+
+    #[test]
+    fn search_rows_forward_to_the_search_input() {
+        // With search enabled, row 0 is the search input; row 1 is the
+        // spacer (ignored); items start at row 2.
+        let mut list = SettingsList::new(
+            five_settings(),
+            3,
+            theme(),
+            Some(SettingsListOptions {
+                enable_search: true,
+            }),
+        );
+        // A left press on row 0 (the empty search input) positions the
+        // search cursor and bubbles focus to the list.
+        match list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            0,
+            None,
+        )) {
+            Some(TuiMouseHandlerResult::Event(event)) => assert!(event.focus),
+            _ => panic!("search input press bubbles focus"),
+        }
+        // Row 1 (spacer): no result.
+        assert!(list
+            .handle_mouse(&settings_mouse_event(
+                TuiMouseEventType::Press,
+                TuiMouseButton::Left,
+                1,
+                None,
+            ))
+            .is_none());
+        // Row 2 is the first item row.
+        match list.handle_mouse(&settings_mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            2,
+            None,
+        )) {
+            Some(TuiMouseHandlerResult::Event(event)) => assert!(event.focus),
+            _ => panic!("first item row press"),
+        }
+        assert_eq!(list.selected_item().unwrap().id, "s0");
     }
 }

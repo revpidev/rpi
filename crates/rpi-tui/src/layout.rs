@@ -839,3 +839,33 @@ pub fn get_scroll_views_at(frame: &LayoutFrame, x: isize, y: isize) -> Vec<Share
     result.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     result.into_iter().map(|(shared, _)| shared).collect()
 }
+
+/// `getLayoutBoxesAt` (layout.ts:415-424 @ 9841914, 71026970a): the visual
+/// hit path from the deepest component to the layout root. A box is on the
+/// path when its CLIP contains the point (ancestors whose clip contains the
+/// point are included); ordering is layer descending then depth descending
+/// (stable sort keeps DFS order within equal keys, like JS).
+pub fn get_layout_boxes_at(frame: &LayoutFrame, x: isize, y: isize) -> Vec<&LayoutBox> {
+    fn visit<'a>(
+        layout_box: &'a LayoutBox,
+        x: isize,
+        y: isize,
+        depth: usize,
+        result: &mut Vec<(&'a LayoutBox, i32, usize)>,
+    ) {
+        if !contains_point(&layout_box.clip, x, y) {
+            return;
+        }
+        result.push((layout_box, layout_box.layer, depth));
+        for child in &layout_box.children {
+            visit(child, x, y, depth + 1, result);
+        }
+    }
+    let mut result = Vec::new();
+    visit(&frame.root, x, y, 0, &mut result);
+    result.sort_by_key(|entry| (std::cmp::Reverse(entry.1), std::cmp::Reverse(entry.2)));
+    result
+        .into_iter()
+        .map(|(layout_box, _, _)| layout_box)
+        .collect()
+}

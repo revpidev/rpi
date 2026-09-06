@@ -210,11 +210,13 @@ pub fn segment_words(text: &str) -> Vec<WordSegment<'_>> {
             segments.extend(segment_han_run(chunk));
         } else {
             // UAX #29 word boundaries (the upstream rule engine around the
-            // dictionary ranges).
-            for segment in get_word_segmenter().segment(chunk) {
+            // dictionary ranges). `isWordLike` goes through the unified
+            // approximation (V14-14 D-093).
+            let segmenter = get_word_segmenter();
+            for segment in segmenter.segment(chunk) {
                 segments.push(WordSegment {
                     segment,
-                    is_word_like: segment.chars().any(|c| c.is_alphanumeric()),
+                    is_word_like: segmenter.is_word_like(segment),
                 });
             }
         }

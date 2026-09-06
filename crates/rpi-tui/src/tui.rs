@@ -121,7 +121,21 @@
 //!   symbol protocol, layout-node.ts:48-51) and `as_scroll_view` (scroll
 //!   dispatch after hit-testing, same precedent as `as_focusable`). Both
 //!   default to `None`, so existing components are unaffected.
+//! - V14-14 extension of the frozen component contract (`71026970a`): the
+//!   normalized mouse types (`TuiMouseEvent` family below), the defaulted
+//!   `Component::handle_mouse` (upstream optional `handleMouse` member),
+//!   `dispatch_mouse_event` / `retarget_mouse_event`, and the frozen
+//!   `Container::handle_mouse` hit-test with the `mouseLayout` cache.
+//!   Ownership adaptation: upstream stores live JS references in
+//!   `TuiMouseDispatchTarget`/focus targets; here the target is always the
+//!   `SharedComponent` the renderer dispatched to — owned subtrees receive
+//!   re-dispatch through their shared root's `handle_mouse` chain, and
+//!   keyboard focus lands on that root (which forwards `handle_input`
+//!   internally, same pattern as `SharedEntry`/`SharedChild`). Nested
+//!   forwarding containers must therefore forward `handle_mouse` like they
+//!   forward `handle_input`.
 
+use std::cell::RefCell;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -217,6 +231,16 @@ pub trait Component: Send {
     fn as_scroll_view(&self) -> Option<&ScrollView> {
         None
     }
+
+    /// Upstream optional `handleMouse` member (tui.ts:123-124 @ 9841914,
+    /// introduced by 71026970a): normalized mouse handler. Default `None` —
+    /// the component ignores mouse input, exactly like upstream components
+    /// without the member (V14-14 extension to the frozen contract). Called
+    /// while the component's own mutex is held; see the lock-contract note on
+    /// [`Component`].
+    fn handle_mouse(&mut self, _event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        None
+    }
 }
 
 /// Components that can receive focus and display a hardware cursor.
@@ -266,6 +290,18 @@ impl std::fmt::Debug for RenderHandle {
 #[derive(Default)]
 pub struct Container {
     pub children: Vec<Box<dyn Component>>,
+    /// `mouseLayout` (tui.ts:321 @ 9841914): per-child rendered heights at
+    /// the width of the last `render`, reused by `handle_mouse` hit-testing;
+    /// invalidated by width changes. Interior mutability because upstream
+    /// writes it from `render` (same pattern as `Box`'s render cache).
+    mouse_layout: RefCell<Option<MouseLayout>>,
+}
+
+/// `{ width, children: [{ component, height }] }` (tui.ts:321); the port
+/// stores only the heights — the children are owned in order.
+struct MouseLayout {
+    width: usize,
+    heights: Vec<usize>,
 }
 
 impl Container {
@@ -297,9 +333,14 @@ impl Container {
 impl Component for Container {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
+        let mut heights = Vec::with_capacity(self.children.len());
         for child in &self.children {
-            lines.extend(child.render(width));
+            let child_lines = child.render(width);
+            heights.push(child_lines.len());
+            lines.extend(child_lines);
         }
+        // `this.mouseLayout = { width, children: mouseChildren }` (tui.ts:376).
+        *self.mouse_layout.borrow_mut() = Some(MouseLayout { width, heights });
         lines
     }
 
@@ -308,6 +349,254 @@ impl Component for Container {
             child.invalidate();
         }
     }
+
+    /// `Container.prototype.handleMouse` (tui.ts:344-365 @ 9841914,
+    /// 71026970a): row hit-test over the children (heights from the
+    /// `mouseLayout` cache when the width matches, measured by rendering
+    /// otherwise — the measurement result is not cached, like upstream),
+    /// then dispatch with the child-local `y`/`height`.
+    ///
+    /// Upstream focus bubbling (`result?.focus && (this as
+    /// Component).handleInput → focusTarget: this`) never fires for the
+    /// plain Container: upstream `Container` defines no `handleInput`, and
+    /// the port's frozen `Container` likewise forwards no keyboard input.
+    /// Components that both hit-test children and handle keys (Editor,
+    /// SettingsList) implement their own forwarding and bubble focus to
+    /// themselves, exactly like upstream subclasses that define
+    /// `handleInput`.
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        if event.y < 0 || event.y >= event.height {
+            return None;
+        }
+        let width = event.width.max(1) as usize;
+        let cached_width_matches = self
+            .mouse_layout
+            .borrow()
+            .as_ref()
+            .is_some_and(|layout| layout.width == width);
+        let heights = if cached_width_matches {
+            self.mouse_layout
+                .borrow()
+                .as_ref()
+                .map(|layout| layout.heights.clone())
+                .unwrap_or_default()
+        } else {
+            self.children
+                .iter()
+                .map(|child| child.render(width).len())
+                .collect::<Vec<_>>()
+        };
+        let mut child_y: isize = 0;
+        for (child, child_height) in self.children.iter_mut().zip(heights) {
+            let child_height = child_height as isize;
+            if event.y >= child_y && event.y < child_y + child_height {
+                let child_event =
+                    event.with_local(event.x, event.y - child_y, event.width, child_height);
+                // Owned children cannot be dispatch targets (see the
+                // `TuiMouseHandlerResult` note); the dispatcher attaches
+                // this container's shared root instead.
+                return child.handle_mouse(&child_event);
+            }
+            child_y += child_height;
+        }
+        None
+    }
+}
+
+// =============================================================================
+// Normalized mouse events (tui.ts:21-99 @ 9841914, 71026970a)
+// =============================================================================
+
+/// `TuiMouseEventType` (tui.ts:21 @ 9841914).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiMouseEventType {
+    Press,
+    Release,
+    Move,
+    Drag,
+    Click,
+    Wheel,
+}
+
+/// `TuiMouseButton` (tui.ts:22 @ 9841914).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuiMouseButton {
+    Left,
+    Middle,
+    Right,
+    /// Motion without a button held / wheel events (upstream `"none"`).
+    #[default]
+    None,
+}
+
+/// `TuiMouseEvent` (tui.ts:25-43 @ 9841914): normalized cell-based mouse
+/// event. Coordinates are zero-based; the signed type covers local offsets
+/// computed by forwarding containers (e.g. `Box` subtracts its padding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TuiMouseEvent {
+    pub event_type: TuiMouseEventType,
+    pub button: TuiMouseButton,
+    /// Coordinates local to the receiving component.
+    pub x: isize,
+    pub y: isize,
+    /// Absolute terminal coordinates.
+    pub screen_x: isize,
+    pub screen_y: isize,
+    /// Current component bounds.
+    pub width: isize,
+    pub height: isize,
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+    /// Logical lines; negative values scroll up.
+    pub wheel_delta: Option<isize>,
+    /// Consecutive click count when the type is `Click`.
+    pub click_count: Option<u32>,
+}
+
+impl TuiMouseEvent {
+    /// Rebuild the local coordinate fields (used by forwarding containers
+    /// and `retarget_mouse_event` to mirror upstream's spread-and-override
+    /// `{ ...event, y, height }`).
+    pub fn with_local(&self, x: isize, y: isize, width: isize, height: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            x,
+            y,
+            width,
+            height,
+            ..*self
+        }
+    }
+}
+
+/// `TuiMouseEventResult` (tui.ts:46-57 @ 9841914). All flags default off;
+/// `capture` implies handled, `focus` implies handled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TuiMouseEventResult {
+    /// Stop propagation and suppress renderer-level fallback behavior.
+    pub handled: bool,
+    /// Route subsequent drag/release events to this component. Implies
+    /// handled.
+    pub capture: bool,
+    /// Give keyboard focus to this component. Implies handled.
+    pub focus: bool,
+    /// Explicitly request or suppress a render. Move and release default to
+    /// false; press, click, drag, and wheel default to true.
+    pub render: Option<bool>,
+}
+
+/// `TuiMouseDispatchTarget` (tui.ts:60-68 @ 9841914): internal target
+/// metadata used by containers and alternate-screen dispatch. The component
+/// is the shared root the renderer dispatched to (see the header note on the
+/// V14-14 ownership adaptation).
+#[derive(Clone)]
+pub struct TuiMouseDispatchTarget {
+    pub component: SharedComponent,
+    pub origin_x: isize,
+    pub origin_y: isize,
+    pub width: isize,
+    pub height: isize,
+}
+
+/// `TuiMouseDispatchResult` (tui.ts:70-78 @ 9841914): the result of
+/// dispatching to a concrete component. `handled` is always true upstream;
+/// its absence is encoded as `None`.
+#[derive(Clone)]
+pub struct TuiMouseDispatchResult {
+    pub capture: bool,
+    pub focus: bool,
+    pub render: Option<bool>,
+    pub target: TuiMouseDispatchTarget,
+    /// Keyboard focus target, which may be a delegating parent container.
+    pub focus_target: Option<SharedComponent>,
+}
+
+impl TuiMouseDispatchResult {
+    /// Flatten to the plain result shape (used by `MouseRegion`, which
+    /// forwards either the child's dispatch result or its own plain result).
+    pub fn event_result(&self) -> TuiMouseEventResult {
+        TuiMouseEventResult {
+            handled: true,
+            capture: self.capture,
+            focus: self.focus,
+            render: self.render,
+        }
+    }
+}
+
+/// Return type of [`Component::handle_mouse`] — upstream
+/// `handleMouse?(event): TuiMouseEventResult | undefined`, where a
+/// forwarding wrapper's result may already carry a resolved dispatch
+/// target (upstream detects this structurally via `"target" in result`,
+/// tui.ts:84). Wrappers whose children are [`SharedComponent`]s
+/// (`MouseRegion`, the implicit document) forward the child's exact
+/// dispatch target so gesture re-dispatch pins the child (capture/move
+/// routing); wrappers over owned children return [`Event`] and the
+/// dispatcher attaches the shared root as the target (the re-dispatch
+/// re-runs its hit-test — see the V14-14 header note).
+#[derive(Clone)]
+pub enum TuiMouseHandlerResult {
+    /// Plain result; the dispatcher wraps it with the component as target.
+    Event(TuiMouseEventResult),
+    /// Pre-resolved dispatch result from a shared child; the dispatcher
+    /// passes it through unchanged.
+    Forwarded(TuiMouseDispatchResult),
+}
+
+impl From<TuiMouseEventResult> for TuiMouseHandlerResult {
+    fn from(result: TuiMouseEventResult) -> Self {
+        TuiMouseHandlerResult::Event(result)
+    }
+}
+
+/// `dispatchMouseEvent` (tui.ts:81-90 @ 9841914): dispatch an event to a
+/// component and retain the exact target and coordinate transform.
+/// Containers use this when forwarding events to nested children.
+///
+/// Semantics 1:1 with upstream: no `handle_mouse` → `None`; a result with
+/// none of handled/capture/focus → `None`; otherwise the result is promoted
+/// with the component as the dispatch target (and as the focus target when
+/// `focus` is set). A forwarded dispatch result passes through unchanged
+/// (upstream `if ("target" in result) return result`).
+pub fn dispatch_mouse_event(
+    component: &SharedComponent,
+    event: &TuiMouseEvent,
+) -> Option<TuiMouseDispatchResult> {
+    match lock_component(component).handle_mouse(event)? {
+        TuiMouseHandlerResult::Forwarded(result) => Some(result),
+        TuiMouseHandlerResult::Event(result) => {
+            if !result.handled && !result.capture && !result.focus {
+                return None;
+            }
+            Some(TuiMouseDispatchResult {
+                capture: result.capture,
+                focus: result.focus,
+                render: result.render,
+                target: TuiMouseDispatchTarget {
+                    component: Arc::clone(component),
+                    origin_x: event.screen_x - event.x,
+                    origin_y: event.screen_y - event.y,
+                    width: event.width,
+                    height: event.height,
+                },
+                focus_target: result.focus.then(|| Arc::clone(component)),
+            })
+        }
+    }
+}
+
+/// `retargetMouseEvent` (tui.ts:101-106 @ 9841914): recreate local
+/// coordinates for a previously dispatched mouse target.
+pub fn retarget_mouse_event(
+    event: &TuiMouseEvent,
+    target: &TuiMouseDispatchTarget,
+) -> TuiMouseEvent {
+    event.with_local(
+        event.screen_x - target.origin_x,
+        event.screen_y - target.origin_y,
+        target.width,
+        target.height,
+    )
 }
 
 // =============================================================================
@@ -833,5 +1122,264 @@ impl OverlayHandleOps for TuiMainScreen {
                 .is_some_and(|focused| same_component(focused, &entry.component))
         })
         .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod mouse_dispatch_tests {
+    //! Intent ports of the component-mouse-dispatch assertions introduced by
+    //! `71026970a` (upstream tui.test.ts "dispatchMouseEvent" suites) plus
+    //! the frozen-Container hit-test coverage.
+    use super::*;
+    use crate::components::text::Text;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Component recording every received event; answers from a fixed
+    /// result table keyed by event type.
+    struct Recording {
+        label: &'static str,
+        results: Vec<(TuiMouseEventType, TuiMouseEventResult)>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    impl Component for Recording {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec![self.label.to_string()]
+        }
+
+        fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .iter()
+                .find(|(event_type, _)| *event_type == event.event_type)
+                .map(|(_, result)| TuiMouseHandlerResult::Event(*result))
+        }
+    }
+
+    fn event(event_type: TuiMouseEventType, x: isize, y: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button: TuiMouseButton::Left,
+            x,
+            y,
+            screen_x: 10 + x,
+            screen_y: 5 + y,
+            width: 20,
+            height: 10,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: None,
+        }
+    }
+
+    #[test]
+    fn dispatch_without_handler_returns_none() {
+        // dispatchMouseEvent: `component.handleMouse?.(event)` is undefined
+        // for components without the member (tui.ts:82-83).
+        let component = shared_component(Text::new("hi", 0, 0, None));
+        assert!(dispatch_mouse_event(&component, &event(TuiMouseEventType::Press, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn dispatch_drops_all_false_results() {
+        // `!result.handled && !result.capture && !result.focus → undefined`
+        // (tui.ts:84-85).
+        let component = shared_component(Recording {
+            label: "r",
+            results: vec![(TuiMouseEventType::Press, TuiMouseEventResult::default())],
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        assert!(dispatch_mouse_event(&component, &event(TuiMouseEventType::Press, 0, 0)).is_none());
+    }
+
+    #[test]
+    fn dispatch_wraps_target_from_event_coordinates() {
+        // target.origin = screen - local; target.component = the dispatched
+        // component; focus implies focusTarget (tui.ts:86-90).
+        let component = shared_component(Recording {
+            label: "r",
+            results: vec![(
+                TuiMouseEventType::Press,
+                TuiMouseEventResult {
+                    handled: true,
+                    focus: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::new(AtomicUsize::new(0)),
+        });
+        let result =
+            dispatch_mouse_event(&component, &event(TuiMouseEventType::Press, 3, 2)).unwrap();
+        assert!(same_component(&result.target.component, &component));
+        assert_eq!(result.target.origin_x, 10);
+        assert_eq!(result.target.origin_y, 5);
+        assert_eq!(result.target.width, 20);
+        assert_eq!(result.target.height, 10);
+        let focus_target = result.focus_target.expect("focus implies focusTarget");
+        assert!(same_component(&focus_target, &component));
+    }
+
+    #[test]
+    fn retarget_rebuilds_local_coordinates() {
+        let component = shared_component(Text::new("hi", 0, 0, None));
+        let target = TuiMouseDispatchTarget {
+            component,
+            origin_x: 4,
+            origin_y: 2,
+            width: 8,
+            height: 3,
+        };
+        let retargeted = retarget_mouse_event(&event(TuiMouseEventType::Move, 99, 99), &target);
+        assert_eq!(retargeted.x, 10 + 99 - 4);
+        assert_eq!(retargeted.y, 5 + 99 - 2);
+        assert_eq!(retargeted.width, 8);
+        assert_eq!(retargeted.height, 3);
+        // Screen coordinates and modifiers pass through untouched.
+        assert_eq!(retargeted.screen_x, 10 + 99);
+        assert_eq!(retargeted.screen_y, 5 + 99);
+    }
+
+    #[test]
+    fn container_hit_test_translates_child_coordinates() {
+        // Container.prototype.handleMouse (tui.ts:344-365): the event's y is
+        // translated into the matched child's local frame; the matched child
+        // is the only one visited.
+        let child_hits = Arc::new(AtomicUsize::new(0));
+        let other_hits = Arc::new(AtomicUsize::new(0));
+
+        let mut container = Container::new();
+        container.add_child(Box::new(Text::new("first", 0, 0, None)));
+        container.add_child(Box::new(Recording {
+            label: "second",
+            results: vec![(
+                TuiMouseEventType::Press,
+                TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::clone(&child_hits),
+        }));
+        container.add_child(Box::new(Recording {
+            label: "third",
+            results: vec![(
+                TuiMouseEventType::Press,
+                TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::clone(&other_hits),
+        }));
+
+        // Prime the mouseLayout at width 20: first renders 1 line, second 1,
+        // third 1 → the y=1 row is the second child's local y=0.
+        container.render(20);
+        let mut event = event(TuiMouseEventType::Press, 0, 1);
+        event.width = 20;
+        event.height = 3;
+        let result = match container.handle_mouse(&event).unwrap() {
+            TuiMouseHandlerResult::Event(result) => result,
+            TuiMouseHandlerResult::Forwarded(_) => panic!("owned children never forward targets"),
+        };
+        assert!(result.handled);
+        assert_eq!(child_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(other_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn container_remeasures_when_width_changes() {
+        // The mouseLayout cache is keyed by width (tui.ts:347): a different
+        // width re-renders the children to measure instead of reusing stale
+        // heights. A child whose height depends on the width must be found
+        // at the fresh row.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut container = Container::new();
+        container.add_child(Box::new(WrappingText::new("aaaa bbbb cccc")));
+        container.add_child(Box::new(Recording {
+            label: "target",
+            results: vec![(
+                TuiMouseEventType::Click,
+                TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                },
+            )],
+            seen: Arc::clone(&hits),
+        }));
+
+        container.render(20);
+        // At width 20 the first child takes 1 line; the target is row 1.
+        let mut wide = event(TuiMouseEventType::Click, 0, 1);
+        wide.width = 20;
+        wide.height = 5;
+        assert!(container.handle_mouse(&wide).is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // At width 8 the first child wraps to 3 lines; row 1 still belongs
+        // to it, so the target must NOT be hit (stale heights would route
+        // row 1 to the target).
+        hits.store(0, Ordering::SeqCst);
+        let mut narrow = event(TuiMouseEventType::Click, 0, 1);
+        narrow.width = 8;
+        narrow.height = 5;
+        assert!(container.handle_mouse(&narrow).is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // …and its row 3 now hits the target.
+        let mut row3 = event(TuiMouseEventType::Click, 0, 3);
+        row3.width = 8;
+        row3.height = 5;
+        assert!(container.handle_mouse(&row3).is_some());
+    }
+
+    #[test]
+    fn container_bounds_check_rejects_out_of_range_rows() {
+        let mut container = Container::new();
+        container.add_child(Box::new(Text::new("only", 0, 0, None)));
+        container.render(10);
+        let mut out = event(TuiMouseEventType::Press, 0, 4);
+        out.width = 10;
+        out.height = 1;
+        assert!(container.handle_mouse(&out).is_none());
+        let mut negative = event(TuiMouseEventType::Press, 0, -1);
+        negative.width = 10;
+        negative.height = 1;
+        assert!(container.handle_mouse(&negative).is_none());
+    }
+
+    /// `Text` that hard-wraps at the render width (upstream tests use
+    /// width-sensitive children to exercise the mouseLayout cache).
+    struct WrappingText {
+        text: String,
+    }
+
+    impl WrappingText {
+        fn new(text: &str) -> Self {
+            Self {
+                text: text.to_string(),
+            }
+        }
+    }
+
+    impl Component for WrappingText {
+        fn render(&self, width: usize) -> Vec<String> {
+            let wrap_width = width;
+            self.text
+                .split(' ')
+                .fold(Vec::<String>::new(), |mut lines, word| {
+                    match lines.last_mut() {
+                        Some(last)
+                            if visible_width(last) + 1 + visible_width(word) <= wrap_width =>
+                        {
+                            last.push(' ');
+                            last.push_str(word);
+                        }
+                        _ => lines.push(word.to_string()),
+                    }
+                    lines
+                })
+        }
     }
 }

@@ -42,6 +42,7 @@
 //! - `lastDocument` (tui-alt-screen.ts:133) is kept for parity although
 //!   upstream never reads it back.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
@@ -62,8 +63,8 @@ use crate::kitty_registry::{
     clear_kitty_image_cache, kitty_image_cache_has_entries, prepare_kitty_screen,
 };
 use crate::layout::{
-    get_scroll_view_box, get_scroll_views_at, render_layout_frame, LayoutBox, LayoutFrame,
-    ScrollbarGeometry,
+    get_layout_boxes_at, get_scroll_view_box, get_scroll_views_at, render_layout_frame, LayoutBox,
+    LayoutFrame, ScrollbarGeometry,
 };
 use crate::mouse::{
     is_mouse_sequence, is_multiplexer_env, parse_sgr_mouse_event, parse_wheel_event, SgrMouseEvent,
@@ -77,10 +78,12 @@ use crate::terminal_image::{
     set_capabilities, ImageProtocol, TerminalCapabilities,
 };
 use crate::tui::{
-    composite_tui_line, lock_component, lock_shared, same_component, shared_component, Component,
-    OverlayHandle, OverlayHandleOps, OverlayOptions, OverlayUnfocusOptions, RenderHandle,
-    SharedComponent, SharedTerminal, TerminalColorSchemeListener, Tui, TuiInputListener,
-    TuiInputListenerResult, TuiMode, TuiStopOptions, ViewportTui, CURSOR_MARKER,
+    composite_tui_line, dispatch_mouse_event, lock_component, lock_shared, retarget_mouse_event,
+    same_component, shared_component, Component, OverlayHandle, OverlayHandleOps, OverlayOptions,
+    OverlayUnfocusOptions, RenderHandle, SharedComponent, SharedTerminal,
+    TerminalColorSchemeListener, Tui, TuiInputListener, TuiInputListenerResult, TuiMode,
+    TuiMouseButton, TuiMouseDispatchResult, TuiMouseDispatchTarget, TuiMouseEvent,
+    TuiMouseEventType, TuiMouseHandlerResult, TuiStopOptions, ViewportTui, CURSOR_MARKER,
 };
 use crate::tui_base::{
     schedule_render, PendingOsc11BackgroundQuery, PendingTerminalColorSchemeQuery, RenderSchedule,
@@ -111,6 +114,13 @@ const END_SYNCHRONIZED_OUTPUT: &str = "\x1b[?2026l";
 const PAGE_SCROLL_OVERLAP: usize = 4;
 /// `DOUBLE_CLICK_INTERVAL_MS` (tui-alt-screen.ts:61).
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
+/// `TERMINAL_WORD_SELECTION_JOINERS` (tui-alt-screen.ts:81 @ 9841914,
+/// `1ac6128e6` #7746): regular mode delegates double-click selection to the
+/// terminal emulator. Fullscreen owns mouse selection, so mirror common
+/// terminal word-selection behavior by keeping paths and kebab-case tokens
+/// whole.
+const TERMINAL_WORD_SELECTION_JOINERS: [&str; 2] = ["/", "-"];
 /// The selection auto-scroll `setInterval` period (tui-alt-screen.ts:737).
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -200,6 +210,13 @@ struct ClickTarget {
     word_end: usize,
 }
 
+/// Result of [`TuiAltScreenInner::dispatch_mouse_to_overlay`] (upstream
+/// `{ hit: boolean; result?: TuiMouseDispatchResult }`, tui.ts:824).
+struct OverlayMouseDispatch {
+    hit: bool,
+    result: Option<TuiMouseDispatchResult>,
+}
+
 /// `ScrollbarDrag` (tui-alt-screen.ts:107-110).
 #[derive(Clone)]
 struct ScrollbarDrag {
@@ -207,11 +224,60 @@ struct ScrollbarDrag {
     grab_offset: isize,
 }
 
+/// `lastComponentClick` state (tui-alt-screen.ts:102-104 @ 9841914,
+/// 71026970a): component-click counting for the synthesized-click
+/// `clickCount` (identity = component + cell; window =
+/// [`DOUBLE_CLICK_INTERVAL`]).
+#[derive(Clone)]
+struct LastComponentClick {
+    timestamp: Instant,
+    count: u32,
+    component: SharedComponent,
+    x: u32,
+    y: u32,
+}
+
 /// `ScrollbarTarget` (tui-alt-screen.ts:112-115).
 #[derive(Clone)]
 struct ScrollbarTarget {
     scroll_view: SharedComponent,
     geometry: ScrollbarGeometry,
+}
+
+/// Merge adjacent word segments that consist solely of Hiragana into one
+/// (see the D-093 note in `get_word_selection`; upstream `Intl.Segmenter`
+/// yields the whole run as one word-like segment).
+fn merge_hiragana_runs(
+    segments: Vec<(&str, usize, usize, bool, bool)>,
+) -> Vec<(&str, usize, usize, bool, bool)> {
+    fn all_hiragana(segment: &str) -> bool {
+        !segment.is_empty()
+            && segment
+                .chars()
+                .all(|c| ('\u{3040}'..='\u{309F}').contains(&c))
+    }
+    let mut merged: Vec<(&str, usize, usize, bool, bool)> = Vec::with_capacity(segments.len());
+    for (text, start, end, selectable, joiner) in segments {
+        // All-Hiragana segments are selectable and never joiners; merging
+        // only affects the column range (the merged text is never re-read).
+        let is_hiragana_run = !joiner && selectable && all_hiragana(text);
+        match merged.last_mut() {
+            Some(last)
+                if is_hiragana_run
+                    && !last.4
+                    && last.3
+                    && last
+                        .0
+                        .chars()
+                        .all(|c| ('\u{3040}'..='\u{309F}').contains(&c)) =>
+            {
+                last.2 = end;
+            }
+            _ => merged.push((text, start, end, selectable, joiner)),
+        }
+        let _ = is_hiragana_run;
+    }
+    merged
 }
 
 /// Upstream `scrollViewA === scrollViewB` for optional scroll views
@@ -257,6 +323,12 @@ pub struct TuiAltScreenOptions {
     /// `cfg!(windows)`.
     #[doc(hidden)]
     pub win32_override: Option<bool>,
+    /// Test injection for upstream's `process.env.TERM_PROGRAM` read in the
+    /// right-click-paste exclusion (`374e56e55`): `None` reads the real
+    /// environment; `Some(None)` models an unset variable and
+    /// `Some(Some(value))` a fixed value.
+    #[doc(hidden)]
+    pub term_program_override: Option<Option<String>>,
 }
 
 // =============================================================================
@@ -269,15 +341,24 @@ pub struct TuiAltScreenOptions {
 /// lock while the renderer's inner lock is held mid-render).
 struct ImplicitDocument {
     children: Arc<Mutex<Vec<SharedComponent>>>,
+    /// `Container.prototype` `mouseLayout` (tui.ts:321 @ 9841914): per-child
+    /// rendered heights at the width of the last render, for the
+    /// `handle_mouse` hit-test (the upstream implicit document is a plain
+    /// `Container`, tui-alt-screen.ts:170).
+    mouse_layout: RefCell<Option<(usize, Vec<usize>)>>,
 }
 
 impl Component for ImplicitDocument {
     fn render(&self, width: usize) -> Vec<String> {
         let children = lock_shared(&self.children).clone();
         let mut lines = Vec::new();
+        let mut heights = Vec::with_capacity(children.len());
         for child in &children {
-            lines.extend(lock_component(child).render(width));
+            let child_lines = lock_component(child).render(width);
+            heights.push(child_lines.len());
+            lines.extend(child_lines);
         }
+        *self.mouse_layout.borrow_mut() = Some((width, heights));
         lines
     }
 
@@ -286,6 +367,48 @@ impl Component for ImplicitDocument {
         for child in &children {
             lock_component(child).invalidate();
         }
+    }
+
+    /// The implicit document is a plain `Container` upstream
+    /// (tui-alt-screen.ts:170); its `Container.prototype.handleMouse`
+    /// (tui.ts:344-365 @ 9841914) hit-tests the shared children and
+    /// dispatches with child-local coordinates — this is how layout-box
+    /// dispatch reaches the TUI children (the layout engine does not
+    /// descend into the implicit document).
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        if event.y < 0 || event.y >= event.height {
+            return None;
+        }
+        let width = event.width.max(1) as usize;
+        let children = lock_shared(&self.children).clone();
+        let cached_heights = self
+            .mouse_layout
+            .borrow()
+            .as_ref()
+            .filter(|(cached_width, _)| *cached_width == width)
+            .map(|(_, heights)| heights.clone());
+        let heights = match cached_heights {
+            Some(heights) => heights,
+            None => children
+                .iter()
+                .map(|child| lock_component(child).render(width).len())
+                .collect::<Vec<_>>(),
+        };
+        let mut child_y: isize = 0;
+        for (child, child_height) in children.iter().zip(heights) {
+            let child_height = child_height as isize;
+            if event.y >= child_y && event.y < child_y + child_height {
+                let child_event =
+                    event.with_local(event.x, event.y - child_y, event.width, child_height);
+                // The child IS the dispatch target (upstream: the implicit
+                // document is a plain Container returning the child's
+                // dispatchMouseEvent result verbatim).
+                return dispatch_mouse_event(child, &child_event)
+                    .map(TuiMouseHandlerResult::Forwarded);
+            }
+            child_y += child_height;
+        }
+        None
     }
 }
 
@@ -363,10 +486,30 @@ pub(crate) struct TuiAltScreenInner {
     selection_dragged: bool,
     wheel_scroll_lines: u64,
     mouse_enabled: bool,
+    /// `mouseCapture` (tui-alt-screen.ts:96 @ 9841914, 71026970a): the
+    /// component that requested drag/release routing via a `capture` result.
+    mouse_capture: Option<TuiMouseDispatchTarget>,
+    /// `mousePressTarget` (:97): the component that handled the press, for
+    /// gesture re-dispatch and synthesized-click routing.
+    mouse_press_target: Option<TuiMouseDispatchTarget>,
+    /// `mousePressPoint` (:98): the raw cell of the press.
+    mouse_press_point: Option<(u32, u32)>,
+    /// `mousePressMoved` (:99): whether the pointer moved cells during the
+    /// press (suppresses the synthesized click).
+    mouse_press_moved: bool,
+    /// `lastComponentClick` (:102-104): double/triple-click counting for
+    /// component clicks (mirrors `ClickTarget` for the selection path).
+    last_component_click: Option<LastComponentClick>,
     open_url: Option<OpenUrlCallback>,
     on_right_click_paste: Option<RightClickPasteCallback>,
     /// `process.platform === "win32"` (see header note).
     win32: bool,
+    /// `process.env.TERM_PROGRAM` for the VS Code right-click exclusion
+    /// (tui-alt-screen.ts:996 @ 9841914, 374e56e55). `None` reads the real
+    /// environment; `Some(None)` models an unset variable and
+    /// `Some(Some(value))` a fixed value (test injection, same pattern as
+    /// `win32_override`).
+    term_program: Option<Option<String>>,
     /// Render handle handed to the layout engine and the flash container
     /// (upstream `() => this.requestRender()`).
     render_handle: RenderHandle,
@@ -471,6 +614,7 @@ impl TuiAltScreen {
         let implicit_children = Arc::new(Mutex::new(Vec::new()));
         let implicit_document = shared_component(ImplicitDocument {
             children: Arc::clone(&implicit_children),
+            mouse_layout: RefCell::new(None),
         });
         // `new ScrollView(this.implicitDocument, { follow: "end", primary: true })`
         // (tui-alt-screen.ts:176).
@@ -513,9 +657,15 @@ impl TuiAltScreen {
             // (tui-alt-screen.ts:178); `u64` is already floored.
             wheel_scroll_lines: options.wheel_scroll_lines.unwrap_or(1).max(1),
             mouse_enabled: options.mouse.unwrap_or(true),
+            mouse_capture: None,
+            mouse_press_target: None,
+            mouse_press_point: None,
+            mouse_press_moved: false,
+            last_component_click: None,
             open_url: options.open_url,
             on_right_click_paste: options.on_right_click_paste,
             win32: options.win32_override.unwrap_or(cfg!(windows)),
+            term_program: options.term_program_override,
             render_handle,
         };
         TuiAltScreen {
@@ -1432,11 +1582,13 @@ impl TuiAltScreenInner {
         self.handle_input_dispatch(data);
     }
 
-    /// `handleViewportInput` (tui-alt-screen.ts:385-460): the first input
-    /// listener — focus events, wheel routing, mouse (paste / scrollbar /
-    /// selection), the mouse-sequence catch-all, and the eight
-    /// `tui.altScreen.*` keybinding actions. Returns `Some(consume)` when the
-    /// input is swallowed.
+    /// `handleViewportInput` (tui-alt-screen.ts:385-460 @ 9841914): the
+    /// first input listener — focus events, mouse (component dispatch /
+    /// paste / scrollbar / selection), the mouse-sequence catch-all, and the
+    /// eight `tui.altScreen.*` keybinding actions. Returns `Some(consume)`
+    /// when the input is swallowed. Mouse dispatch and the overlay-input
+    /// deferral (`2e4d23959`) are part of the V14-14 port of
+    /// `71026970a`.
     fn handle_viewport_input(&mut self, data: &str) -> Option<TuiInputListenerResult> {
         let consume = || TuiInputListenerResult {
             consume: true,
@@ -1444,21 +1596,31 @@ impl TuiAltScreenInner {
         };
 
         if data == FOCUS_OUT {
+            // `4a879dd75` (#7892): a lost focus clears the selection/gesture
+            // state as before, but a re-render is only requested when a
+            // non-empty active selection was actually cleared — an empty
+            // selection must not wipe the screen state on every focus loss.
             let had_active_selection = self.selection_press_active;
+            let had_non_empty_active_selection =
+                had_active_selection && self.get_selection_bounds().is_some();
             self.selection_press_active = false;
             self.stop_selection_auto_scroll();
             self.stop_scrollbar_hover();
             self.stop_scrollbar_drag();
             self.pressed_url = None;
             self.selection_dragged = false;
+            self.clear_component_mouse_gesture();
+            self.last_component_click = None;
             if had_active_selection {
                 self.selection_anchor = None;
                 self.selection_focus = None;
                 self.selection_granularity = SelectionGranularity::Character;
                 self.selection_initial_range = None;
+                if had_non_empty_active_selection {
+                    self.request_render(false);
+                }
             }
             self.last_click = None;
-            self.request_render(false);
             return Some(consume());
         }
         if data == FOCUS_IN {
@@ -1466,20 +1628,39 @@ impl TuiAltScreenInner {
         }
 
         if let Some(wheel_event) = parse_wheel_event(data) {
+            // Wheel events reach components first (`71026970a`); the
+            // viewport scroll only runs when no component consumed them and
+            // no overlay holds focus (`2e4d23959`, FR-G).
+            let event = self.create_mouse_event(
+                TuiMouseEventType::Wheel,
+                wheel_event.button,
+                wheel_event.x,
+                wheel_event.y,
+                Some(i64::from(wheel_event.direction) * self.wheel_scroll_lines as i64),
+                None,
+            );
+            let overlay = self.dispatch_mouse_to_overlay(&event);
+            let result = overlay.result.clone().or_else(|| {
+                if overlay.hit {
+                    None
+                } else {
+                    self.dispatch_mouse_to_layout(&event)
+                }
+            });
+            if let Some(result) = result {
+                if self.apply_mouse_dispatch_result(&event, result) {
+                    self.request_render(false);
+                }
+                return Some(consume());
+            }
+            if self.should_defer_viewport_input_to_overlay() {
+                return None;
+            }
             self.route_wheel(wheel_event);
             return Some(consume());
         }
         if let Some(mouse_event) = parse_sgr_mouse_event(data) {
-            if self.handle_right_click_paste(mouse_event) {
-                return Some(consume());
-            }
-            let handled = self.handle_scrollbar_mouse_event(mouse_event);
-            if self.scrollbar_drag.is_none() {
-                self.update_scrollbar_hover(mouse_event.x, mouse_event.y);
-            }
-            if !handled {
-                self.handle_selection_mouse_event(mouse_event);
-            }
+            self.handle_mouse_event(mouse_event);
             return Some(consume());
         }
         if is_mouse_sequence(data) {
@@ -1490,6 +1671,12 @@ impl TuiAltScreenInner {
         let keybindings = get_keybindings()
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The active-search overlay exception (tui-alt-screen.ts:644-645
+        // second conjunct) arrives with V14-15; until then a focused overlay
+        // always defers viewport-scroll keys (transient deviation, G2).
+        if self.should_defer_viewport_input_to_overlay() {
+            return None;
+        }
         let primary = self.get_primary_scroll_view();
         let viewport_height = with_scroll_view(&primary, ScrollView::viewport_height).unwrap_or(0);
         if keybindings.matches(data, Keybinding::AltScreenPageUp) {
@@ -1551,6 +1738,345 @@ impl TuiAltScreenInner {
         None
     }
 
+    // --- component mouse dispatch (tui-alt-screen.ts:642-939 @ 9841914,
+    //     introduced by 71026970a) -----------------------------------------
+
+    /// `shouldDeferViewportInputToOverlay` (tui-alt-screen.ts:644-645 @
+    /// 9841914, 2e4d23959): while an overlay holds keyboard focus, viewport
+    /// scrolling keys and unconsumed wheel events let the overlay handle the
+    /// input instead. The active-search exception (second conjunct upstream)
+    /// arrives with V14-15.
+    fn should_defer_viewport_input_to_overlay(&self) -> bool {
+        self.base.is_overlay_focused()
+    }
+
+    /// `clearComponentMouseGesture` (tui-alt-screen.ts:647-653 @ 9841914):
+    /// drop the component press/capture gesture state (focus loss, gesture
+    /// end).
+    fn clear_component_mouse_gesture(&mut self) {
+        self.mouse_capture = None;
+        self.mouse_press_target = None;
+        self.mouse_press_point = None;
+        self.mouse_press_moved = false;
+    }
+
+    /// `decodeMouseButton` (tui-alt-screen.ts:770-783 @ 9841914).
+    fn decode_mouse_button(button: u32) -> TuiMouseButton {
+        match button & 3 {
+            0 => TuiMouseButton::Left,
+            1 => TuiMouseButton::Middle,
+            2 => TuiMouseButton::Right,
+            _ => TuiMouseButton::None,
+        }
+    }
+
+    /// `createMouseEvent` (tui-alt-screen.ts:785-806 @ 9841914): the raw SGR
+    /// fields become a normalized event — screen == local coordinates at the
+    /// top level, bounds clamped to at least one cell, modifiers from the
+    /// SGR modifier bits, `button: "none"` for wheel events.
+    fn create_mouse_event(
+        &self,
+        event_type: TuiMouseEventType,
+        button: u32,
+        x: u32,
+        y: u32,
+        wheel_delta: Option<i64>,
+        click_count: Option<u32>,
+    ) -> TuiMouseEvent {
+        let rows = self.terminal().rows();
+        let columns = self.terminal().columns();
+        TuiMouseEvent {
+            event_type,
+            button: if event_type == TuiMouseEventType::Wheel {
+                TuiMouseButton::None
+            } else {
+                Self::decode_mouse_button(button)
+            },
+            x: x as isize,
+            y: y as isize,
+            screen_x: x as isize,
+            screen_y: y as isize,
+            width: 1.max(usize::from(columns)) as isize,
+            height: 1.max(usize::from(rows)) as isize,
+            shift: button & 4 != 0,
+            alt: button & 8 != 0,
+            ctrl: button & 16 != 0,
+            wheel_delta: wheel_delta.map(|delta| delta as isize),
+            click_count,
+        }
+    }
+
+    /// `dispatchMouseToOverlay` (tui.ts:824-848 @ 9841914): dispatch to the
+    /// visually topmost rendered overlay under the pointer; a hit without a
+    /// result suppresses the layout dispatch below it.
+    fn dispatch_mouse_to_overlay(&self, event: &TuiMouseEvent) -> OverlayMouseDispatch {
+        let layouts = self.base.rendered_overlay_layouts.borrow();
+        for layout in layouts.iter().rev() {
+            if event.screen_x < layout.col as isize
+                || event.screen_x >= layout.col as isize + layout.width as isize
+                || event.screen_y < layout.row as isize
+                || event.screen_y >= layout.row as isize + layout.height as isize
+            {
+                continue;
+            }
+            let overlay_event = event.with_local(
+                event.screen_x - layout.col as isize,
+                event.screen_y - layout.row as isize,
+                layout.width as isize,
+                layout.height as isize,
+            );
+            let result =
+                dispatch_mouse_event(&layout.component, &overlay_event).map(|mut result| {
+                    // `result.focus ? { ...result, focusTarget:
+                    // layout.entry.component } : result` — the overlay entry
+                    // stays the keyboard focus owner for nested hits.
+                    if result.focus {
+                        result.focus_target = Some(Arc::clone(&layout.component));
+                    }
+                    result
+                });
+            return OverlayMouseDispatch { hit: true, result };
+        }
+        OverlayMouseDispatch {
+            hit: false,
+            result: None,
+        }
+    }
+
+    /// `dispatchMouseToLayout` (tui-alt-screen.ts:808-827 @ 9841914):
+    /// deepest-first walk over the layout boxes containing the point.
+    /// Layout containers (stacks / scroll views) are skipped like upstream's
+    /// `getLayoutNode && handleMouse === Container.prototype.handleMouse`
+    /// check — rpi layout containers never override `handle_mouse`.
+    fn dispatch_mouse_to_layout(&self, event: &TuiMouseEvent) -> Option<TuiMouseDispatchResult> {
+        let layout = self.current_layout.as_ref()?;
+        let mut visited: Vec<*const Mutex<Box<dyn Component>>> = Vec::new();
+        let boxes = get_layout_boxes_at(layout, event.screen_x, event.screen_y);
+        for layout_box in boxes {
+            let pointer = Arc::as_ptr(&layout_box.component);
+            if visited.contains(&pointer) {
+                continue;
+            }
+            if lock_component(&layout_box.component)
+                .layout_node()
+                .is_some()
+            {
+                continue;
+            }
+            visited.push(pointer);
+            let child_event = event.with_local(
+                event.screen_x - layout_box.rect.x,
+                event.screen_y - layout_box.rect.y,
+                layout_box.rect.width as isize,
+                layout_box.rect.height as isize,
+            );
+            if let Some(result) = dispatch_mouse_event(&layout_box.component, &child_event) {
+                return Some(result);
+            }
+        }
+        None
+    }
+
+    /// `applyMouseDispatchResult` (tui-alt-screen.ts:829-841 @ 9841914):
+    /// move keyboard focus, record pointer capture, and decide whether a
+    /// render is needed (`render ?? focusChanged || press/click/drag/wheel`).
+    fn apply_mouse_dispatch_result(
+        &mut self,
+        event: &TuiMouseEvent,
+        result: TuiMouseDispatchResult,
+    ) -> bool {
+        let focus_target = self.base.resolve_mouse_focus_target(
+            result
+                .focus_target
+                .as_ref()
+                .unwrap_or(&result.target.component),
+        );
+        let focus_changed = result.focus
+            && !self
+                .base
+                .focused_component
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, &focus_target));
+        if result.focus {
+            self.base.set_focus(Some(focus_target));
+        }
+        if result.capture {
+            self.mouse_capture = Some(result.target.clone());
+        }
+        result.render.unwrap_or(
+            focus_changed
+                || event.event_type == TuiMouseEventType::Press
+                || event.event_type == TuiMouseEventType::Click
+                || event.event_type == TuiMouseEventType::Drag
+                || event.event_type == TuiMouseEventType::Wheel,
+        )
+    }
+
+    /// `dispatchMouseToTarget` (tui-alt-screen.ts:843-847 @ 9841914):
+    /// re-dispatch to a saved press/capture target with rebuilt local
+    /// coordinates.
+    fn dispatch_mouse_to_target(
+        &self,
+        event: &TuiMouseEvent,
+        target: &TuiMouseDispatchTarget,
+    ) -> Option<TuiMouseDispatchResult> {
+        let retargeted = retarget_mouse_event(event, target);
+        dispatch_mouse_event(&target.component, &retargeted)
+    }
+
+    /// `getComponentClickCount` (tui-alt-screen.ts:855-868 @ 9841914):
+    /// consecutive clicks on the same component cell count up within
+    /// [`DOUBLE_CLICK_INTERVAL`], cycling 1 → 2 → 3 → 1.
+    fn get_component_click_count(
+        &mut self,
+        target: &TuiMouseDispatchTarget,
+        x: u32,
+        y: u32,
+    ) -> u32 {
+        let now = Instant::now();
+        let count = match &self.last_component_click {
+            Some(previous)
+                if now.saturating_duration_since(previous.timestamp) <= DOUBLE_CLICK_INTERVAL
+                    && same_component(&previous.component, &target.component)
+                    && previous.x == x
+                    && previous.y == y =>
+            {
+                (previous.count % 3) + 1
+            }
+            _ => 1,
+        };
+        self.last_component_click = Some(LastComponentClick {
+            timestamp: now,
+            count,
+            component: Arc::clone(&target.component),
+            x,
+            y,
+        });
+        count
+    }
+
+    /// `clearTextSelection` (tui-alt-screen.ts:869-880 @ 9841914): drop all
+    /// selection state (press consumed by a component, URL activation, …).
+    fn clear_text_selection(&mut self) {
+        self.stop_selection_auto_scroll();
+        self.selection_press_active = false;
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        self.selection_granularity = SelectionGranularity::Character;
+        self.selection_initial_range = None;
+        self.pressed_url = None;
+        self.selection_dragged = false;
+    }
+
+    /// `handleMouseEvent` (tui-alt-screen.ts:870-909 @ 9841914): the SGR
+    /// event state machine. Active component gestures (capture or press
+    /// target) receive move/drag/release directly, with a click synthesized
+    /// on a same-cell release; otherwise the event goes to the search
+    /// overlay (V14-15), the topmost overlay, the layout, and finally the
+    /// screen-level selection / right-click paste fallbacks.
+    fn handle_mouse_event(&mut self, raw: SgrMouseEvent) {
+        let is_motion = raw.button & 32 != 0;
+        let event_type = if raw.release {
+            TuiMouseEventType::Release
+        } else if is_motion {
+            if Self::decode_mouse_button(raw.button) == TuiMouseButton::None {
+                TuiMouseEventType::Move
+            } else {
+                TuiMouseEventType::Drag
+            }
+        } else {
+            TuiMouseEventType::Press
+        };
+        let event = self.create_mouse_event(event_type, raw.button, raw.x, raw.y, None, None);
+
+        // `if (this.mouseCapture || this.mousePressTarget)` — an active
+        // component gesture re-dispatches directly to its target.
+        if let Some(target) = self
+            .mouse_capture
+            .clone()
+            .or_else(|| self.mouse_press_target.clone())
+        {
+            if let Some((press_x, press_y)) = self.mouse_press_point {
+                if raw.x != press_x || raw.y != press_y {
+                    self.mouse_press_moved = true;
+                    self.last_component_click = None;
+                }
+            }
+            let mut render = false;
+            if let Some(target_result) = self.dispatch_mouse_to_target(&event, &target) {
+                render = self.apply_mouse_dispatch_result(&event, target_result);
+            }
+            if raw.release {
+                let same_cell = !self.mouse_press_moved
+                    && self
+                        .mouse_press_point
+                        .is_some_and(|(press_x, press_y)| press_x == raw.x && press_y == raw.y);
+                if same_cell {
+                    let click_count = self.get_component_click_count(&target, raw.x, raw.y);
+                    let click_event = self.create_mouse_event(
+                        TuiMouseEventType::Click,
+                        raw.button,
+                        raw.x,
+                        raw.y,
+                        None,
+                        Some(click_count),
+                    );
+                    if let Some(click_result) = self.dispatch_mouse_to_target(&click_event, &target)
+                    {
+                        render =
+                            self.apply_mouse_dispatch_result(&click_event, click_result) || render;
+                    }
+                }
+                self.clear_component_mouse_gesture();
+            }
+            if render {
+                self.request_render(false);
+            }
+            return;
+        }
+
+        // handleSearchMouseEvent (V14-15) slots in here upstream.
+
+        let overlay = self.dispatch_mouse_to_overlay(&event);
+        if !overlay.hit {
+            let handled = self.handle_scrollbar_mouse_event(raw);
+            if self.scrollbar_drag.is_none() {
+                self.update_scrollbar_hover(raw.x, raw.y);
+            }
+            if handled {
+                return;
+            }
+        } else {
+            self.stop_scrollbar_hover();
+        }
+
+        let result = overlay.result.or_else(|| {
+            if overlay.hit {
+                None
+            } else {
+                self.dispatch_mouse_to_layout(&event)
+            }
+        });
+        if let Some(result) = result {
+            let render = self.apply_mouse_dispatch_result(&event, result.clone());
+            if event_type == TuiMouseEventType::Press {
+                self.clear_text_selection();
+                self.mouse_press_target = Some(result.target);
+                self.mouse_press_point = Some((raw.x, raw.y));
+                self.mouse_press_moved = false;
+            }
+            if render {
+                self.request_render(false);
+            }
+            return;
+        }
+
+        if self.handle_right_click_paste(raw) {
+            return;
+        }
+        self.handle_selection_mouse_event(raw);
+    }
+
     /// `routeWheel` (tui-alt-screen.ts:489-501): deepest scroll view under
     /// the pointer first, chaining the unconsumed delta; the primary scroll
     /// view is the fallback. `overscroll: "contain"` stops the chain.
@@ -1581,10 +2107,17 @@ impl TuiAltScreenInner {
         self.request_render(false);
     }
 
-    /// `handleRightClickPaste` (tui-alt-screen.ts:514-524): unmodified
-    /// secondary-button press on Windows; clipboard paste is best-effort.
+    /// `handleRightClickPaste` (tui-alt-screen.ts:992-1010 @ 9841914):
+    /// unmodified secondary-button press on Windows, except under VS Code's
+    /// integrated terminal — `TERM_PROGRAM=vscode` terminals already paste
+    /// on right click themselves (`374e56e55`, #8186). Clipboard paste is
+    /// best-effort.
     fn handle_right_click_paste(&mut self, event: SgrMouseEvent) -> bool {
-        if self.on_right_click_paste.is_none() || !self.win32 || event.release || event.button != 2
+        if self.on_right_click_paste.is_none()
+            || !self.win32
+            || self.is_vscode_term_program()
+            || event.release
+            || event.button != 2
         {
             return false;
         }
@@ -1592,6 +2125,20 @@ impl TuiAltScreenInner {
             callback();
         }
         true
+    }
+
+    /// `process.env.TERM_PROGRAM?.toLowerCase() === "vscode"`
+    /// (tui-alt-screen.ts:996 @ 9841914): VS Code terminals (including
+    /// `code-serve` variants reporting plain `vscode`) handle right-click
+    /// paste natively. The environment read goes through
+    /// [`TuiAltScreenOptions::term_program_override`] when injected
+    /// (tests never touch the real environment, coding-standards §12.4).
+    fn is_vscode_term_program(&self) -> bool {
+        let term_program: Option<String> = match &self.term_program {
+            Some(injected) => injected.clone(),
+            None => std::env::var("TERM_PROGRAM").ok(),
+        };
+        term_program.is_some_and(|program| program.to_lowercase() == "vscode")
     }
 
     // --- scrollbar (tui-alt-screen.ts:526-603) -----------------------------
@@ -1793,23 +2340,68 @@ impl TuiAltScreenInner {
             .unwrap_or_default()
     }
 
-    /// `getWordSelection` (tui-alt-screen.ts:644-658): the word segment
-    /// covering the point's column (ICU word bounds over the stripped line).
+    /// `getWordSelection` (tui-alt-screen.ts:1150-1185 @ 9841914,
+    /// `1ac6128e6` #7746): the word segment covering the point's column,
+    /// with `"/"`/`"-"` joiner segments gluing adjacent word-like segments
+    /// into one range (paths and kebab-case tokens stay whole — fullscreen
+    /// owns mouse selection and mirrors common terminal word-selection
+    /// behavior). Joining is bidirectional: a joiner extends through any
+    /// neighboring selectable segment whose far side is also a joiner.
     fn get_word_selection(&self, point: &SelectionPoint) -> Option<SelectionRange> {
         let line = strip_terminal_sequences(&self.get_selection_source_line(point));
         let segmenter = get_word_segmenter();
-        let mut start = 0usize;
-        for segment in segmenter.segment(&line) {
-            let end = start + visible_width(segment);
-            if point.col >= start && point.col < end {
-                return Some(SelectionRange {
-                    start: point.with(start, false),
-                    end: point.with(end, true),
-                });
-            }
-            start = end;
+        // `TERMINAL_WORD_SELECTION_JOINERS` (tui-alt-screen.ts:81).
+        let is_joiner = |segment: &str| TERMINAL_WORD_SELECTION_JOINERS.contains(&segment);
+        // Segments with their text, column ranges, and the
+        // selectable/joiner flags (tui-alt-screen.ts:1152-1160 @ 9841914).
+        let mut word_segments: Vec<(&str, usize, usize, bool, bool)> = segmenter
+            .segment(&line)
+            .fold((Vec::new(), 0usize), |(mut acc, start), segment: &str| {
+                let end = start + visible_width(segment);
+                let joiner = is_joiner(segment);
+                let selectable = segmenter.is_word_like(segment) || joiner;
+                acc.push((segment, start, end, selectable, joiner));
+                (acc, end)
+            })
+            .0;
+        // D-093 refinement (calibrated against Node 24 / ICU 78):
+        // `Intl.Segmenter` keeps Hiragana runs as one word-like segment,
+        // while plain UAX #29 (`split_word_bounds`) breaks between every
+        // Hiragana character. Merge adjacent all-Hiragana segments so the
+        // double-click word selection over Japanese text matches upstream
+        // (Katakana runs are already joined by UAX #29 WB13; the
+        // Katakana/Hiragana and Hiragana/Han boundaries stay breaks, like
+        // ICU).
+        word_segments = merge_hiragana_runs(word_segments);
+        let segments: Vec<(usize, usize, bool, bool)> = word_segments
+            .iter()
+            .map(|&(_, start, end, selectable, joiner)| (start, end, selectable, joiner))
+            .collect();
+        let clicked_segment_index = segments
+            .iter()
+            .position(|(start, end, _, _)| point.col >= *start && point.col < *end)?;
+
+        // `canJoin` (tui-alt-screen.ts:1167-1169): both sides selectable and
+        // at least one a joiner.
+        let can_join = |left: &(usize, usize, bool, bool), right: &(usize, usize, bool, bool)| {
+            left.2 && right.2 && (left.3 || right.3)
+        };
+        let mut selection_start = segments[clicked_segment_index].0;
+        let mut selection_end = segments[clicked_segment_index].1;
+        let mut index = clicked_segment_index;
+        while index > 0 && can_join(&segments[index - 1], &segments[index]) {
+            selection_start = segments[index - 1].0;
+            index -= 1;
         }
-        None
+        let mut index = clicked_segment_index;
+        while index + 1 < segments.len() && can_join(&segments[index], &segments[index + 1]) {
+            selection_end = segments[index + 1].1;
+            index += 1;
+        }
+        Some(SelectionRange {
+            start: point.with(selection_start, false),
+            end: point.with(selection_end, true),
+        })
     }
 
     /// `getLineSelection` (tui-alt-screen.ts:660-665).
@@ -1960,11 +2552,17 @@ impl TuiAltScreenInner {
         self.selection_drag_pointer = None;
     }
 
-    /// `handleSelectionMouseEvent` (tui-alt-screen.ts:768-833): the primary
-    /// button's press / drag-motion / release state machine. Orphan events
-    /// (release or motion without an active press) are swallowed.
+    /// `handleSelectionMouseEvent` (tui-alt-screen.ts:1292-1362 @ 9841914):
+    /// the primary button's press / drag-motion / release state machine.
+    /// Orphan events (release or motion without an active press) are
+    /// swallowed. Release accepts the SGR button code 3 (the generic
+    /// "no button" release many terminals send, `83aed2ba5` #7963), and a
+    /// press+release on the same cell without movement synthesizes a
+    /// component click before the selection/copy fallbacks run
+    /// (`71026970a`).
     fn handle_selection_mouse_event(&mut self, event: SgrMouseEvent) {
-        if (event.button & 3) != 0 {
+        let button = event.button & 3;
+        if button != 0 && !(event.release && button == 3) {
             return;
         }
         let anchor_scroll_view = self
@@ -1982,11 +2580,11 @@ impl TuiAltScreenInner {
                 return;
             };
             self.update_selection_focus(point.clone());
-            let clicked_url = if !self.selection_dragged
+            let is_click = !self.selection_dragged
                 && same_optional_scroll_view(&anchor.scroll_view, &point.scroll_view)
                 && anchor.row == point.row
-                && anchor.col == point.col
-            {
+                && anchor.col == point.col;
+            let clicked_url = if is_click {
                 self.pressed_url.clone()
             } else {
                 None
@@ -1999,6 +2597,43 @@ impl TuiAltScreenInner {
                 self.request_render(false);
                 return;
             }
+            if is_click {
+                // Synthesized click (tui-alt-screen.ts:1324-1336 @ 9841914,
+                // 71026970a): offer the click to the overlay/layout
+                // component tree before the selection fallbacks run.
+                let click_count = self
+                    .last_click
+                    .as_ref()
+                    .map(|click| click.count)
+                    .unwrap_or(1);
+                let click_event = self.create_mouse_event(
+                    TuiMouseEventType::Click,
+                    event.button,
+                    event.x,
+                    event.y,
+                    None,
+                    Some(click_count),
+                );
+                let overlay = self.dispatch_mouse_to_overlay(&click_event);
+                let result = overlay.result.or_else(|| {
+                    if overlay.hit {
+                        None
+                    } else {
+                        self.dispatch_mouse_to_layout(&click_event)
+                    }
+                });
+                if let Some(result) = result {
+                    let render = self.apply_mouse_dispatch_result(&click_event, result);
+                    self.clear_text_selection();
+                    if render {
+                        self.request_render(false);
+                    }
+                    return;
+                }
+            }
+            // `copyOnSelect` arrives with V14-16; the current baseline
+            // copies the selection on release (the pre-copyOnSelect
+            // behavior, equivalent to `copyOnSelect: true`).
             self.copy_selection_to_clipboard();
             self.request_render(false);
             return;
@@ -2774,7 +3409,7 @@ mod tests {
         osc52_sequence, send_input, settle, state_lock, EnvGuard, RecordingTerminal, TestTui,
         VirtualTerminal, VtEvent,
     };
-    use crate::tui::{shared_component, Focusable};
+    use crate::tui::{shared_component, Focusable, SizeValue, TuiMouseEventResult};
     use std::sync::atomic::AtomicBool;
     use std::sync::MutexGuard;
 
@@ -3916,30 +4551,6 @@ mod tests {
         tui.start();
         settle(&tui);
 
-        {
-            let event = parse_sgr_mouse_event("\x1b[<0;1;1M").unwrap();
-            let mut inner = tui.lock_inner();
-            eprintln!("parsed");
-            let sv = inner.current_layout.as_ref().and_then(|layout| {
-                crate::layout::get_scroll_views_at(layout, event.x as isize, event.y as isize)
-                    .into_iter()
-                    .next()
-            });
-            eprintln!("hit test: {:?}", sv.is_some());
-            let anchor = inner.get_selection_point(event, sv.as_ref());
-            eprintln!(
-                "anchor: row={} col={} sv={}",
-                anchor.row,
-                anchor.col,
-                anchor.scroll_view.is_some()
-            );
-            let word = inner.get_word_selection(&anchor);
-            eprintln!("word: {:?}", word.is_some());
-            let cc = inner.get_click_count(&anchor, word.as_ref());
-            eprintln!("click count: {cc}");
-        }
-        return;
-        #[allow(unreachable_code)]
         send_input(&terminal, &tui, "\x1b[<0;1;1M");
         send_input(&terminal, &tui, "\x1b[<32;4;2M");
         send_input(&terminal, &tui, "\x1b[<0;4;2m");
@@ -4737,6 +5348,643 @@ mod tests {
         let viewport = terminal.get_viewport();
         assert!(viewport[0].ends_with(" Second "));
         assert!(!viewport.iter().any(|line| line.contains("First")));
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // V14-14: component mouse dispatch + click synthesis + fix family
+    // (`71026970a`, `2470ea440`, `83aed2ba5`, `1ac6128e6`, `9841914c7`,
+    // `374e56e55`, `2e4d23959`, `4a879dd75`)
+    // ---------------------------------------------------------------------
+
+    /// (label, event type, x, click count) entries recorded by `MouseSpy`.
+    type MouseSpyLog = Arc<Mutex<Vec<(&'static str, TuiMouseEventType, u32, Option<u32>)>>>;
+
+    /// Component recording mouse events into a shared log; answers with a
+    /// fixed result table keyed by event type.
+    struct MouseSpy {
+        label: &'static str,
+        results: Vec<(TuiMouseEventType, TuiMouseEventResult)>,
+        log: MouseSpyLog,
+    }
+
+    impl Component for MouseSpy {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec![format!("{} row", self.label)]
+        }
+
+        fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+            lock_shared(&self.log).push((
+                self.label,
+                event.event_type,
+                event.x as u32,
+                event.click_count,
+            ));
+            self.results
+                .iter()
+                .find(|(event_type, _)| *event_type == event.event_type)
+                .map(|(_, result)| TuiMouseHandlerResult::Event(*result))
+        }
+    }
+
+    fn press_result() -> TuiMouseEventResult {
+        TuiMouseEventResult {
+            handled: true,
+            focus: true,
+            ..Default::default()
+        }
+    }
+
+    fn click_result() -> TuiMouseEventResult {
+        TuiMouseEventResult {
+            handled: true,
+            ..Default::default()
+        }
+    }
+
+    /// Decode the last OSC 52 clipboard write from the terminal output.
+    fn last_osc52_clipboard(terminal: &RecordingTerminal) -> Option<String> {
+        let mut last = None;
+        for event in terminal.events() {
+            if let VtEvent::Write(data) = event {
+                let data: String = data.clone();
+                if let Some(start) = data.find("\x1b]52;c;") {
+                    let payload = &data[start + 7..];
+                    if let Some(end) = payload.find('\x07') {
+                        if let Ok(bytes) =
+                            base64::engine::general_purpose::STANDARD.decode(&payload[..end])
+                        {
+                            last = Some(String::from_utf8(bytes).unwrap_or_default());
+                        }
+                    }
+                }
+            }
+        }
+        last
+    }
+
+    #[test]
+    fn gesture_press_release_same_cell_synthesizes_click_with_count() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        // A component that handles presses (e.g. a list row) and clicks.
+        tui.add_child(shared_component(MouseSpy {
+            label: "spy",
+            results: vec![
+                (TuiMouseEventType::Press, press_result()),
+                (TuiMouseEventType::Click, click_result()),
+            ],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+
+        // Single press+release on the same cell: press handled → gesture
+        // path; release synthesizes click 1 (tui-alt-screen.ts:895-905).
+        send_input(&terminal, &tui, "\x1b[<0;2;1M");
+        send_input(&terminal, &tui, "\x1b[<0;2;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            events
+                .iter()
+                .any(|(label, event_type, x, count)| *label == "spy"
+                    && *event_type == TuiMouseEventType::Click
+                    && *x == 1
+                    && *count == Some(1)),
+            "events: {events:?}"
+        );
+
+        // Immediate second press+release on the same cell: click 2.
+        send_input(&terminal, &tui, "\x1b[<0;2;1M");
+        send_input(&terminal, &tui, "\x1b[<0;2;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        let clicks: Vec<_> = events
+            .iter()
+            .filter(|(label, event_type, _, _)| {
+                *label == "spy" && *event_type == TuiMouseEventType::Click
+            })
+            .collect();
+        assert_eq!(clicks.len(), 2, "events: {events:?}");
+        assert_eq!(clicks[0].3, Some(1));
+        assert_eq!(clicks[1].3, Some(2), "double click counts up");
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn gesture_release_after_movement_does_not_synthesize_click() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        tui.add_child(shared_component(MouseSpy {
+            label: "spy",
+            results: vec![(TuiMouseEventType::Press, press_result())],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+
+        // Press at (2,1), drag to (5,1), release there: moved → no click.
+        send_input(&terminal, &tui, "\x1b[<0;2;1M");
+        send_input(&terminal, &tui, "\x1b[<32;5;1M");
+        send_input(&terminal, &tui, "\x1b[<0;5;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            !events
+                .iter()
+                .any(|(_, event_type, _, _)| *event_type == TuiMouseEventType::Click),
+            "no click after movement: {events:?}"
+        );
+        // The drag and release were still routed to the press target.
+        assert!(
+            events
+                .iter()
+                .any(|(_, event_type, x, _)| *event_type == TuiMouseEventType::Drag && *x == 4),
+            "drag re-dispatched to press target: {events:?}"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn selection_release_same_cell_synthesizes_click_for_components() {
+        // The second click-synthesis point (tui-alt-screen.ts:1324-1336):
+        // press fell through to screen selection (component ignores press),
+        // and the release synthesizes a click for the MouseRegion-style
+        // handler.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        tui.add_child(shared_component(MouseSpy {
+            label: "region",
+            results: vec![(TuiMouseEventType::Click, click_result())],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;2;1M");
+        send_input(&terminal, &tui, "\x1b[<0;2;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            events
+                .iter()
+                .any(|(label, event_type, _, _)| *label == "region"
+                    && *event_type == TuiMouseEventType::Click),
+            "selection release synthesizes click: {events:?}"
+        );
+        // The click result clears the selection instead of copying it (no
+        // OSC 52 write for an empty selection anyway — assert no clipboard).
+        assert_eq!(last_osc52_clipboard(&terminal), None);
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn captured_component_receives_subsequent_events_without_hit_test() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        // Captures on press (tui.ts:50, tui-alt-screen.ts:836-837).
+        tui.add_child(shared_component(MouseSpy {
+            label: "capturer",
+            results: vec![
+                (
+                    TuiMouseEventType::Press,
+                    TuiMouseEventResult {
+                        handled: true,
+                        capture: true,
+                        ..Default::default()
+                    },
+                ),
+                (TuiMouseEventType::Click, click_result()),
+            ],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;2;1M");
+        // Move off the component: capture routing still delivers the move.
+        send_input(&terminal, &tui, "\x1b[<35;10;3M");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            events
+                .iter()
+                .any(|(label, event_type, _, _)| *label == "capturer"
+                    && *event_type == TuiMouseEventType::Move),
+            "capture routes off-target moves: {events:?}"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn overlay_hit_consumes_and_hit_without_result_blocks_layout() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        // Layout child: claims presses (must NOT receive overlay-area hits).
+        tui.add_child(shared_component(MouseSpy {
+            label: "layout",
+            results: vec![
+                (TuiMouseEventType::Press, press_result()),
+                (TuiMouseEventType::Click, click_result()),
+            ],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+
+        // Overlay WITHOUT a handler (hit-but-no-result must still block the
+        // layout dispatch, tui.ts:846-847).
+        tui.show_overlay(
+            text("overlay content"),
+            Some(OverlayOptions {
+                width: Some(SizeValue::Absolute(16)),
+                row: Some(SizeValue::Absolute(0)),
+                col: Some(SizeValue::Absolute(2)),
+                ..Default::default()
+            }),
+        );
+        settle(&tui);
+
+        // Press inside the overlay: the layout spy must not see it.
+        send_input(&terminal, &tui, "\x1b[<0;4;1M");
+        send_input(&terminal, &tui, "\x1b[<0;4;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            !events.iter().any(|(label, _, _, _)| *label == "layout"),
+            "overlay hit blocks layout dispatch: {events:?}"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn overlay_handler_receives_clicks_and_focused_overlay_defers_viewport_keys() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (transcript, handle) = numbered_text(20);
+        tui.add_child(transcript);
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        let overlay = shared_component(MouseSpy {
+            label: "overlay",
+            results: vec![
+                (TuiMouseEventType::Press, press_result()),
+                (TuiMouseEventType::Click, click_result()),
+            ],
+            log: Arc::clone(&log),
+        });
+        tui.start();
+        settle(&tui);
+        let before_top = tui.viewport_top();
+        assert_eq!(before_top, 16, "follows the end of 20 lines");
+
+        let _overlay_handle = tui.show_overlay(
+            overlay,
+            Some(OverlayOptions {
+                width: Some(SizeValue::Absolute(16)),
+                row: Some(SizeValue::Absolute(0)),
+                col: Some(SizeValue::Absolute(2)),
+                ..Default::default()
+            }),
+        );
+        settle(&tui);
+        // showOverlay focuses the overlay → isOverlayFocused (FR-G).
+        assert!(tui.lock_inner().base.is_overlay_focused());
+
+        // Click inside the overlay reaches its handler (dispatch order:
+        // overlay before layout).
+        send_input(&terminal, &tui, "\x1b[<0;4;1M");
+        send_input(&terminal, &tui, "\x1b[<0;4;1m");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            events
+                .iter()
+                .any(|(label, event_type, _, _)| *label == "overlay"
+                    && *event_type == TuiMouseEventType::Click),
+            "overlay handler receives click: {events:?}"
+        );
+
+        // FR-G (2e4d23959): wheel and PageUp defer to the focused overlay —
+        // the viewport must not scroll.
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        send_input(&terminal, &tui, "\x1b[5~");
+        settle(&tui);
+        assert_eq!(
+            tui.viewport_top(),
+            before_top,
+            "focused overlay defers viewport scrolling"
+        );
+
+        // Closing the overlay restores viewport scrolling.
+        _overlay_handle.hide();
+        settle(&tui);
+        assert!(!tui.lock_inner().base.is_overlay_focused());
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), before_top - 1);
+        let _ = handle;
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn sgr_release_button_three_completes_selection() {
+        // FR-C (83aed2ba5 #7963): terminals reporting the generic release
+        // code (button bits 3) must complete the selection. Old behavior
+        // rejected the release, leaving the press active.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        // Release with button code 3 (the "no button" release).
+        send_input(&terminal, &tui, "\x1b[<3;4;2m");
+        settle(&tui);
+
+        assert_eq!(
+            last_osc52_clipboard(&terminal),
+            Some("alpha\nbeta".to_string())
+        );
+        // The gesture fully ended: a following motion is ignored.
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        settle(&tui);
+        assert_eq!(
+            last_osc52_clipboard(&terminal),
+            Some("alpha\nbeta".to_string()),
+            "no second copy for orphan motion"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn double_click_word_selection_joins_slash_and_dash() {
+        // FR-D (1ac6128e6 #7746): "foo/bar-baz" double-click selects the
+        // whole path+kebab token via the joiner segments.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(30, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("foo/bar-baz qux"));
+        tui.start();
+        settle(&tui);
+
+        // Double-click the "bar" part: both clicks land inside the joined
+        // token; the selection covers "foo/bar-baz" (col 0..11).
+        send_input(&terminal, &tui, "\x1b[<0;7;1M");
+        send_input(&terminal, &tui, "\x1b[<0;7;1m");
+        send_input(&terminal, &tui, "\x1b[<0;7;1M");
+        send_input(&terminal, &tui, "\x1b[<0;7;1m");
+        settle(&tui);
+        assert_eq!(
+            last_osc52_clipboard(&terminal),
+            Some("foo/bar-baz".to_string()),
+            "joiners glue the word-like segments"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn double_click_word_selection_matrix() {
+        // FR-D edge matrix: plain words, mixed "a/b-c", punctuation
+        // separators (not joiners), and leading/trailing joiners.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(40, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("a/b-c foo,bar -lead tail- 你好"));
+        tui.start();
+        settle(&tui);
+
+        let click_at = |col: usize| {
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1M", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1m", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1M", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1m", c = col + 1));
+        };
+
+        // Layout: "a/b-c foo,bar -lead tail- 你好"
+        //           01234 5 6..12 13 14..18 19 20..24 25 26 27
+
+        // "a/b-c" (cols 0..4): whole token.
+        click_at(2);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("a/b-c".to_string()));
+
+        // "foo,bar": comma is not a joiner — only "foo".
+        click_at(7);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("foo".to_string()));
+
+        // "-lead" (cols 14..18): the space before it is not selectable, so
+        // the token does not glue to "foo,bar" — but its own leading "-"
+        // joiner glues to "lead" → "-lead" whole.
+        click_at(15);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("-lead".to_string()));
+
+        // "tail-" (cols 20..24): trailing joiner stays attached.
+        click_at(22);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("tail-".to_string()));
+
+        // CJK (cols 26..27): each Han char is its own word-like segment
+        // (no joiners).
+        click_at(26);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("你".to_string()));
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn double_click_hiragana_run_selects_whole_run() {
+        // D-093 refinement: Intl.Segmenter keeps Hiragana runs whole; the
+        // selection path merges the per-character UAX #29 segments
+        // (`merge_hiragana_runs`), so a double-click over hiragana selects
+        // the run like the upstream terminal.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(30, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("こんにちは世界"));
+        tui.start();
+        settle(&tui);
+
+        let click_at = |col: usize| {
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1M", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1m", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1M", c = col + 1));
+            send_input(&terminal, &tui, &format!("\x1b[<0;{c};1m", c = col + 1));
+        };
+        // The hiragana run こんにちは (columns 0..9, two columns per char)
+        // selects whole; the Han part (columns 10..13) stays per-character.
+        click_at(2);
+        assert_eq!(
+            last_osc52_clipboard(&terminal),
+            Some("こんにちは".to_string())
+        );
+        click_at(10);
+        assert_eq!(last_osc52_clipboard(&terminal), Some("世".to_string()));
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn vscode_term_program_suppresses_right_click_paste() {
+        // FR-F (374e56e55 #8186): VS Code's terminal handles right-click
+        // paste itself; rpi must not double-paste under TERM_PROGRAM=vscode.
+        let _caps = CapsGuard::lock_only();
+        for (term_program, expect_paste) in [
+            (Some(Some("vscode".to_string())), false),
+            (Some(Some("VSCode".to_string())), false),
+            (Some(Some("code.cmd".to_string())), true),
+            (Some(None), true),
+            (None, true),
+        ] {
+            let pasted = Arc::new(AtomicBool::new(false));
+            let pasted_flag = Arc::clone(&pasted);
+            let terminal = RecordingTerminal::new(20, 4);
+            let tui = TuiAltScreen::with_options(
+                Box::new(terminal.clone()),
+                None,
+                None,
+                TuiAltScreenOptions {
+                    win32_override: Some(true),
+                    on_right_click_paste: Some(Arc::new(move || {
+                        pasted_flag.store(true, Ordering::SeqCst);
+                    })),
+                    term_program_override: term_program.clone(),
+                    ..Default::default()
+                },
+            );
+            tui.add_child(text("content"));
+            tui.start();
+            settle(&tui);
+            send_input(&terminal, &tui, "\x1b[<2;3;2M");
+            settle(&tui);
+            assert_eq!(
+                pasted.load(Ordering::SeqCst),
+                expect_paste,
+                "TERM_PROGRAM={term_program:?}"
+            );
+            stop(&tui);
+        }
+    }
+
+    #[test]
+    fn focus_out_without_selection_does_not_render() {
+        // FR-H (4a879dd75 #7892): clearing empty selection state on focus
+        // loss must not request a render.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+        let writes_before = terminal.events().len();
+
+        send_input(&terminal, &tui, "\x1b[O");
+        settle(&tui);
+        assert_eq!(
+            terminal.events().len(),
+            writes_before,
+            "no render output for an empty selection"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn focus_out_with_active_selection_renders_once() {
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        // Non-empty active selection: press + drag (selection visible).
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        settle(&tui);
+        let writes_before = terminal.events().len();
+        // Still press-active (no release yet) → hadActiveSelection.
+        send_input(&terminal, &tui, "\x1b[O");
+        settle(&tui);
+        assert!(
+            terminal.events().len() > writes_before,
+            "non-empty selection cleared on focus loss renders"
+        );
+        // The selection is gone: the next release-less motion copies
+        // nothing new.
+        assert_eq!(
+            last_osc52_clipboard(&terminal),
+            None,
+            "selection dropped without a release copy"
+        );
+
+        stop(&tui);
+    }
+
+    #[test]
+    fn wheel_events_reach_layout_components() {
+        // SelectList-style wheel handling inside the layout
+        // (71026970a): the wheel dispatches to components (implicit-document
+        // hit-test) before the viewport fallback; a handled wheel stops the
+        // viewport routing.
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let log: MouseSpyLog = Arc::new(Mutex::new(Vec::new()));
+        // The spy is the whole document (1 row) — the wheel over it is
+        // dispatched to it and handled, so routeWheel never runs.
+        tui.add_child(shared_component(MouseSpy {
+            label: "wheel",
+            results: vec![(
+                TuiMouseEventType::Wheel,
+                TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                },
+            )],
+            log: Arc::clone(&log),
+        }));
+        tui.start();
+        settle(&tui);
+        assert_eq!(tui.viewport_top(), 0);
+
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        let events = lock_shared(&log).clone();
+        assert!(
+            events
+                .iter()
+                .any(|(label, event_type, _, _)| *label == "wheel"
+                    && *event_type == TuiMouseEventType::Wheel),
+            "wheel dispatched to components: {events:?}"
+        );
+        assert_eq!(
+            tui.viewport_top(),
+            0,
+            "no viewport scroll for a handled wheel"
+        );
 
         stop(&tui);
     }

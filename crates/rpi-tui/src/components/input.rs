@@ -10,11 +10,15 @@
 //!   public property, set by the TUI).
 
 use std::borrow::Cow;
+use std::cell::Cell;
 
 use crate::keybindings::{get_keybindings, Keybinding};
 use crate::keys::decode_kitty_printable;
 use crate::kill_ring::{KillRing, KillRingPushOptions};
-use crate::tui::{Component, Focusable, CURSOR_MARKER};
+use crate::tui::{
+    Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+    TuiMouseHandlerResult, CURSOR_MARKER,
+};
 use crate::undo_stack::UndoStack;
 use crate::utils::{get_grapheme_segmenter, is_whitespace_char, slice_by_column, visible_width};
 use crate::word_navigation::{find_word_backward, find_word_forward};
@@ -74,6 +78,11 @@ pub struct Input {
 
     // Undo support
     undo_stack: UndoStack<InputState>,
+
+    /// `renderedStartColumn` (input.ts:35 @ 9841914, 71026970a): the
+    /// horizontal-scroll offset of the last render, for click-to-cursor
+    /// positioning. Interior mutability because `render` takes `&self`.
+    rendered_start_column: Cell<usize>,
 }
 
 impl Input {
@@ -86,10 +95,17 @@ impl Input {
             focused: false,
             paste_buffer: String::new(),
             is_in_paste: false,
+            rendered_start_column: Cell::new(0),
             kill_ring: KillRing::new(),
             last_action: None,
             undo_stack: UndoStack::new(),
         }
+    }
+
+    /// Cursor position in characters (test assertions for the V14-14
+    /// click-to-cursor port; the field itself stays private).
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     pub fn get_value(&self) -> &str {
@@ -280,6 +296,42 @@ impl Component for Input {
         }
     }
 
+    /// `Input.prototype.handleMouse` (input.ts:229-247 @ 9841914,
+    /// 71026970a): a left-button press on the input row positions the cursor
+    /// at the clicked grapheme — the visible column (past the two-column
+    /// `"> "` prompt) is translated through the horizontal-scroll offset of
+    /// the last render. A click past the last grapheme keeps the cursor at
+    /// the end.
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        if event.event_type != TuiMouseEventType::Press
+            || event.button != TuiMouseButton::Left
+            || event.y != 0
+        {
+            return None;
+        }
+        let visible_column = (event.x - 2).max(0);
+        let target_column = self.rendered_start_column.get() as isize + visible_column;
+        let mut current_column: isize = 0;
+        // Default to the end (upstream `this.cursor = this.value.length`).
+        self.cursor = self.value.chars().count();
+        let mut char_index = 0usize;
+        for grapheme in get_grapheme_segmenter().segment(&self.value) {
+            let next_column = current_column + visible_width(grapheme) as isize;
+            if target_column < next_column {
+                self.cursor = char_index;
+                break;
+            }
+            char_index += grapheme.chars().count();
+            current_column = next_column;
+        }
+        self.last_action = None;
+        Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+            handled: true,
+            focus: true,
+            ..Default::default()
+        }))
+    }
+
     fn invalidate(&mut self) {
         // No cached state to invalidate currently
     }
@@ -299,6 +351,7 @@ impl Component for Input {
 
         if total_width < available_width {
             // Everything fits (leave room for cursor at end)
+            self.rendered_start_column.set(0);
             visible_text = Cow::Borrowed(&self.value);
             cursor_display = self.cursor;
         } else {
@@ -323,6 +376,7 @@ impl Component for Input {
                     // Cursor in middle
                     cursor_col.saturating_sub(half_width)
                 };
+                self.rendered_start_column.set(start_col);
 
                 visible_text =
                     Cow::Owned(slice_by_column(&self.value, start_col, scroll_width, true));
@@ -1276,5 +1330,93 @@ mod tests {
         // Undo removes "abc"
         input.handle_input("\x1b[45;5u"); // Ctrl+- (undo)
         assert_eq!(input.get_value(), "");
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: handleMouse (input.ts:229-247 @ 9841914, 71026970a)
+    // ------------------------------------------------------------------
+
+    use crate::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn input_mouse_event(event_type: TuiMouseEventType, x: isize, y: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button: TuiMouseButton::Left,
+            x,
+            y,
+            screen_x: x,
+            screen_y: y,
+            width: 20,
+            height: 1,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: None,
+        }
+    }
+
+    /// Cursor position after a click, in characters.
+    fn cursor_after_click(input: &mut Input, x: isize) -> usize {
+        match input.handle_mouse(&input_mouse_event(TuiMouseEventType::Press, x, 0)) {
+            Some(TuiMouseHandlerResult::Event(event)) => {
+                assert!(event.handled && event.focus);
+            }
+            _ => panic!("press on the input row returns handled+focus"),
+        }
+        input.cursor()
+    }
+
+    #[test]
+    fn click_positions_cursor_at_the_clicked_grapheme() {
+        let mut field = input();
+        type_text(&mut field, "héllo wörld");
+        // "> " prompt occupies the first 2 columns; x=4 lands on "l" (char 2).
+        assert_eq!(cursor_after_click(&mut field, 4), 2);
+        // x=8 is visible column 6 → the "w" (char 6).
+        assert_eq!(cursor_after_click(&mut field, 8), 6);
+        // Clicking past the end clamps to the end.
+        assert_eq!(cursor_after_click(&mut field, 19), 11);
+    }
+
+    #[test]
+    fn click_through_horizontal_scroll_uses_rendered_start_column() {
+        let mut field = input();
+        type_text(&mut field, "012345678901234567890123456789");
+        // Render at width 20: available 18, the tail is visible; the click
+        // column maps through the scroll offset recorded by render.
+        let _ = field.render(20);
+        // A click on the far right column lands near the value end.
+        let cursor = cursor_after_click(&mut field, 19);
+        assert!(
+            cursor >= 28,
+            "cursor {cursor} must sit at the scrolled tail"
+        );
+    }
+
+    #[test]
+    fn click_ignores_other_rows_buttons_and_non_press_events() {
+        let mut field = input();
+        type_text(&mut field, "hello");
+        // Row != 0.
+        assert!(field
+            .handle_mouse(&input_mouse_event(TuiMouseEventType::Press, 3, 1))
+            .is_none());
+        // Non-press types.
+        for event_type in [
+            TuiMouseEventType::Click,
+            TuiMouseEventType::Release,
+            TuiMouseEventType::Move,
+        ] {
+            let mut event = input_mouse_event(event_type, 3, 0);
+            event.button = TuiMouseButton::Left;
+            assert!(field.handle_mouse(&event).is_none());
+        }
+        // Non-left buttons.
+        for button in [TuiMouseButton::Middle, TuiMouseButton::Right] {
+            let mut event = input_mouse_event(TuiMouseEventType::Press, 3, 0);
+            event.button = button;
+            assert!(field.handle_mouse(&event).is_none());
+        }
     }
 }

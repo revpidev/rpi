@@ -41,16 +41,21 @@
 use std::any::Any;
 use std::boxed::Box as StdBox;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::image::{Image, ImageOptions, ImageTheme};
+use rpi_tui::components::mouse_region::MouseRegion;
 use rpi_tui::components::r#box::Box as TuiBox;
 use rpi_tui::components::spacer::Spacer;
 use rpi_tui::components::text::Text;
 use rpi_tui::terminal_image::{
     get_capabilities, get_image_dimensions, image_fallback, ImageProtocol,
 };
-use rpi_tui::tui::{Component, Container, RenderHandle};
+use rpi_tui::tui::{
+    shared_component_from_boxed, Component, Container, RenderHandle, TuiMouseButton, TuiMouseEvent,
+    TuiMouseEventResult, TuiMouseEventType, TuiMouseHandlerResult,
+};
 use serde_json::Value;
 
 use crate::core::themes::Theme;
@@ -224,7 +229,12 @@ pub struct ToolExecutionComponent {
     // The three render shells; exactly one is displayed, selected by
     // `has_renderer_definition` + `render_shell` (tool-execution.ts:63-76).
     content_box: TuiBox,
-    content_text: Text,
+    /// `contentTextRegion` (tool-execution.ts:50, 104 @ 9841914,
+    /// `71026970a`): the generic fallback `Text` wrapped in a
+    /// click-to-expand `MouseRegion`. Rebuilt in `update_display`
+    /// (upstream mutates one long-lived Text object; the port recreates the
+    /// stateless Text per rebuild, which is observably identical).
+    content_text_region: Option<MouseRegion>,
     self_render_container: Container,
     renderer_state: RendererStateSlot,
     image_components: Vec<Image>,
@@ -233,6 +243,14 @@ pub struct ToolExecutionComponent {
     tool_call_id: String,
     args: Value,
     expanded: bool,
+    /// Click-to-expand toggle request recorded by the result regions'
+    /// `MouseRegion` callbacks (`createResultRegion`, tool-execution.ts:
+    /// 172-178 @ 9841914); applied by [`Self::drain_pending_expand_toggle`]
+    /// after the dispatch returns (the component is locked then).
+    pending_expand_toggle: Arc<AtomicBool>,
+    /// `this.result` presence, shared with the same callbacks (upstream
+    /// checks `!this.result` before toggling, tool-execution.ts:174).
+    has_result: Arc<AtomicBool>,
     show_images: bool,
     image_width_cells: usize,
     is_partial: bool,
@@ -270,7 +288,7 @@ impl ToolExecutionComponent {
             crate::modes::interactive::tool_renderers::builtin_tool_definition(&tool_name);
         let mut component = Self {
             content_box: TuiBox::new(0, 0, None),
-            content_text: Text::new("", 0, 0, None),
+            content_text_region: None,
             self_render_container: Container::new(),
             renderer_state: RendererStateSlot::default(),
             image_components: Vec::new(),
@@ -279,6 +297,8 @@ impl ToolExecutionComponent {
             tool_call_id: tool_call_id.into(),
             args,
             expanded: false,
+            pending_expand_toggle: Arc::new(AtomicBool::new(false)),
+            has_result: Arc::new(AtomicBool::new(false)),
             show_images: options.show_images,
             image_width_cells: options.image_width_cells,
             is_partial: true,
@@ -297,13 +317,13 @@ impl ToolExecutionComponent {
 
         // Always create all shell variants (tool-execution.ts:65-76):
         // contentBox for default renderer-based composition, selfRenderContainer
-        // for self-framing renderers, contentText for the generic fallback.
+        // for self-framing renderers, contentText for the generic fallback
+        // (built lazily by `update_display` into `content_text_region`).
         let pending_bg = {
             let theme = Arc::clone(&component.theme);
             Box::new(move |t: &str| theme.bg("toolPendingBg", t))
         };
-        component.content_box = TuiBox::new(1, 1, Some(pending_bg.clone()));
-        component.content_text = Text::new("", 1, 1, Some(pending_bg));
+        component.content_box = TuiBox::new(1, 1, Some(pending_bg));
 
         component.update_display();
         component
@@ -337,6 +357,42 @@ impl ToolExecutionComponent {
             0,
             None,
         )
+    }
+
+    /// `createResultRegion` (tool-execution.ts:172-178 @ 9841914,
+    /// `71026970a`): wrap a rendered component so a left click toggles the
+    /// expanded state (only once a result exists). The callback records the
+    /// toggle; the component applies it after the dispatch returns (it is
+    /// locked for `handle_mouse` — upstream flips `setExpanded` synchronously
+    /// inside the callback).
+    fn create_result_region(&self, component: StdBox<dyn Component>) -> MouseRegion {
+        let pending = Arc::clone(&self.pending_expand_toggle);
+        let has_result = Arc::clone(&self.has_result);
+        MouseRegion::new(
+            shared_component_from_boxed(component),
+            Box::new(move |event| {
+                if !has_result.load(Ordering::SeqCst)
+                    || event.event_type != TuiMouseEventType::Click
+                    || event.button != TuiMouseButton::Left
+                {
+                    return None;
+                }
+                pending.store(true, Ordering::SeqCst);
+                Some(TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                })
+            }),
+        )
+    }
+
+    /// Apply a click-recorded expand toggle (`setExpanded(!this.expanded)`,
+    /// tool-execution.ts:175 @ 9841914).
+    fn drain_pending_expand_toggle(&mut self) {
+        if self.pending_expand_toggle.swap(false, Ordering::SeqCst) && self.result.is_some() {
+            let expanded = self.expanded;
+            self.set_expanded(!expanded);
+        }
     }
 
     /// `createResultFallback` (tool-execution.ts:139-145 @ 9841914,
@@ -397,6 +453,7 @@ impl ToolExecutionComponent {
     /// `updateResult` (tool-execution.ts:164-176).
     pub fn update_result(&mut self, result: ToolResultState, is_partial: bool) {
         self.result = Some(result);
+        self.has_result.store(true, Ordering::SeqCst);
         self.is_partial = is_partial;
         self.update_display();
         self.maybe_convert_images_for_kitty();
@@ -544,7 +601,9 @@ impl ToolExecutionComponent {
             match self.get_render_shell() {
                 RenderShell::Default => {
                     // contentBox is used for default renderer-based
-                    // composition (tool-execution.ts:66-68).
+                    // composition (tool-execution.ts:66-68). Every rendered
+                    // child is wrapped in a click-to-expand result region
+                    // (tool-execution.ts:315-353 @ 9841914).
                     self.content_box.set_bg_fn(Some(bg_fn));
                     self.content_box.clear();
                     // The result component is BUILT before the call component
@@ -558,22 +617,28 @@ impl ToolExecutionComponent {
                     // renderers are stateless across the two hooks, so the
                     // swap is unobservable for them.
                     let result_component = self.render_result_component();
-                    self.content_box.add_child(self.render_call_component());
+                    self.content_box.add_child(StdBox::new(
+                        self.create_result_region(self.render_call_component()),
+                    ));
                     if let Some(component) = result_component {
-                        self.content_box.add_child(component);
+                        self.content_box
+                            .add_child(StdBox::new(self.create_result_region(component)));
                     }
                 }
                 RenderShell::Self_ => {
                     // selfRenderContainer is used when the tool renders its
                     // own framing (tool-execution.ts:66-68). Same
                     // result-before-call BUILD order as the Default shell
-                    // (see the note above, V13-11).
+                    // (see the note above, V13-11) and the same
+                    // click-to-expand wrapping (tool-execution.ts:315-353).
                     self.self_render_container.clear();
                     let result_component = self.render_result_component();
-                    self.self_render_container
-                        .add_child(self.render_call_component());
+                    self.self_render_container.add_child(StdBox::new(
+                        self.create_result_region(self.render_call_component()),
+                    ));
                     if let Some(component) = result_component {
-                        self.self_render_container.add_child(component);
+                        self.self_render_container
+                            .add_child(StdBox::new(self.create_result_region(component)));
                     }
                 }
             }
@@ -583,8 +648,16 @@ impl ToolExecutionComponent {
             // (tool-execution.ts:356-358) is dead code there; the port omits
             // the unobservable variable.
         } else {
-            self.content_text.set_custom_bg_fn(Some(bg_fn));
-            self.content_text.set_text(self.format_tool_execution());
+            // `this.contentText.setCustomBgFn(...)` / `setText(...)`
+            // (tool-execution.ts:360-361): the generic fallback text is
+            // rebuilt into its click-to-expand region
+            // (`contentTextRegion`, tool-execution.ts:104).
+            self.content_text_region = Some(self.create_result_region(StdBox::new(Text::new(
+                self.format_tool_execution(),
+                1,
+                1,
+                Some(bg_fn),
+            ))));
         }
 
         // Images are appended after the shell (tool-execution.ts:321-354).
@@ -688,7 +761,12 @@ impl Component for ToolExecutionComponent {
                 RenderShell::Self_ => unreachable!("handled above"),
             }
         } else {
-            lines.extend(self.content_text.render(width));
+            lines.extend(
+                self.content_text_region
+                    .as_ref()
+                    .map(|region| region.render(width))
+                    .unwrap_or_default(),
+            );
         }
         for (i, image_component) in self.image_components.iter().enumerate() {
             if let Some(spacer) = self.image_spacers.get(i) {
@@ -701,9 +779,39 @@ impl Component for ToolExecutionComponent {
 
     fn invalidate(&mut self) {
         self.content_box.invalidate();
-        self.content_text.invalidate();
+        if let Some(content_text_region) = self.content_text_region.as_mut() {
+            content_text_region.invalidate();
+        }
         self.self_render_container.invalidate();
         self.update_display();
+    }
+
+    /// Mouse dispatch through the active render shell
+    /// (`ToolExecutionComponent extends Container`, tool-execution.ts:14:
+    /// `Container.prototype.handleMouse` hit-tests the children — the
+    /// spacer row first, then the shell whose rows start at 1; the image
+    /// components define no handlers, so dispatch stops at the shell).
+    /// Click-recorded expand toggles are applied right after the dispatch
+    /// returns.
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        let result = if !self.hide_component && event.y >= 1 {
+            let child_event =
+                event.with_local(event.x, event.y - 1, event.width, (event.height - 1).max(0));
+            if self.has_renderer_definition() {
+                match self.get_render_shell() {
+                    RenderShell::Default => self.content_box.handle_mouse(&child_event),
+                    RenderShell::Self_ => self.self_render_container.handle_mouse(&child_event),
+                }
+            } else {
+                self.content_text_region
+                    .as_mut()
+                    .and_then(|region| region.handle_mouse(&child_event))
+            }
+        } else {
+            None
+        };
+        self.drain_pending_expand_toggle();
+        result
     }
 
     fn set_expanded(&mut self, expanded: bool) {
@@ -1259,5 +1367,82 @@ mod tests {
             "stale error preview survived the result: {stripped}"
         );
         assert_header_bg(&lines, &theme, "toolSuccessBg");
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: result-region click-to-expand (tool-execution.ts:172-178,
+    // 315-353 @ 9841914, 71026970a — FR-A R9)
+    // ------------------------------------------------------------------
+
+    use rpi_tui::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn tool_click(y: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type: TuiMouseEventType::Click,
+            button: TuiMouseButton::Left,
+            x: 2,
+            y,
+            screen_x: 2,
+            screen_y: y,
+            width: 60,
+            height: 20,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: Some(1),
+        }
+    }
+
+    #[test]
+    fn clicking_the_result_region_toggles_expanded() {
+        let _caps = CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut component = make_fallback_component();
+        component.update_result(result_with_lines(30), false);
+        let collapsed = strip_ansi(&component.render(60).join("\n"));
+        assert!(
+            collapsed.contains("more lines,"),
+            "collapsed preview shows the expand hint"
+        );
+
+        // Row 0 is the leading spacer, row 1 the Box's top padding; the
+        // clickable content starts at row 2.
+        match component.handle_mouse(&tool_click(2)) {
+            Some(TuiMouseHandlerResult::Event(event)) => assert!(event.handled),
+            _ => panic!("click on the result region is handled"),
+        }
+        let expanded = strip_ansi(&component.render(60).join("\n"));
+        assert!(
+            !expanded.contains("more lines,"),
+            "expanded output has no hint"
+        );
+        assert!(expanded.lines().count() > collapsed.lines().count());
+
+        // Click again to collapse.
+        component.handle_mouse(&tool_click(2));
+        let re_collapsed = strip_ansi(&component.render(60).join("\n"));
+        assert!(re_collapsed.contains("more lines,"));
+
+        // Right-button clicks are ignored (the region declines and the
+        // renderer's selection fallback runs instead).
+        let mut right = tool_click(2);
+        right.button = TuiMouseButton::Right;
+        assert!(component.handle_mouse(&right).is_none());
+
+        // Non-click types are ignored (press starts selection upstream).
+        let mut press = tool_click(2);
+        press.event_type = TuiMouseEventType::Press;
+        assert!(component.handle_mouse(&press).is_none());
+        assert!(strip_ansi(&component.render(60).join("\n")).contains("more lines,"));
+    }
+
+    #[test]
+    fn clicks_before_any_result_are_declined() {
+        // Upstream: `if (!this.result || ...) return undefined`
+        // (tool-execution.ts:174) — a click on a pending tool falls through
+        // to the selection path.
+        let _caps = CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut component = make_component();
+        assert!(component.handle_mouse(&tool_click(1)).is_none());
     }
 }

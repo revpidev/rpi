@@ -24,6 +24,7 @@
 //!   public handle type stays in `tui.rs` next to the [`Tui`](crate::tui::Tui)
 //!   trait.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU16;
@@ -237,8 +238,27 @@ pub(crate) struct TuiBase {
     pub(crate) focus_order_counter: u64,
     pub(crate) overlay_stack: Vec<OverlayStackEntry>,
     pub(crate) overlay_focus_restore: OverlayFocusRestoreState,
+    /// `renderedOverlayLayouts` (tui.ts:492 @ 9841914): the on-screen
+    /// geometry of every composited overlay from the last render,
+    /// focusOrder-sorted bottom→top (used by alternate-screen mouse
+    /// dispatch, `dispatchMouseToOverlay`). Interior mutability because
+    /// `compositeOverlays` runs from `render(&self)`.
+    pub(crate) rendered_overlay_layouts: RefCell<Vec<RenderedOverlayLayout>>,
     pub(crate) schedule: Arc<Mutex<RenderSchedule>>,
     pub(crate) size_cache: TerminalSizeCache,
+}
+
+/// One entry of `TuiBase::rendered_overlay_layouts` (upstream
+/// `RenderedOverlayLayout`, tui.ts:296-299 @ 9841914). The `entry_id`
+/// replaces upstream's live `entry` reference (ADR-style identity
+/// substitution, same as the overlay stack itself).
+#[derive(Clone)]
+pub(crate) struct RenderedOverlayLayout {
+    pub(crate) component: SharedComponent,
+    pub(crate) row: i32,
+    pub(crate) col: i32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
 }
 
 impl TuiBase {
@@ -274,6 +294,7 @@ impl TuiBase {
             focus_order_counter: 0,
             overlay_stack: Vec::new(),
             overlay_focus_restore: OverlayFocusRestoreState::Inactive,
+            rendered_overlay_layouts: RefCell::new(Vec::new()),
             schedule,
             size_cache,
         }
@@ -810,6 +831,35 @@ impl TuiBase {
             .any(|entry| self.is_overlay_visible(entry))
     }
 
+    /// `isOverlayFocused` (tui.ts:806-811 @ 9841914, 2e4d23959): the focused
+    /// component is a visible overlay. Used by alternate-screen input
+    /// routing to defer viewport scrolling to the overlay.
+    pub(crate) fn is_overlay_focused(&self) -> bool {
+        self.overlay_stack.iter().any(|entry| {
+            self.focused_component
+                .as_ref()
+                .is_some_and(|focused| same_component(focused, &entry.component))
+                && self.is_overlay_visible(entry)
+        })
+    }
+
+    /// `resolveMouseFocusTarget` (tui.ts:813-821 @ 9841914, 71026970a): keep
+    /// overlay containers as keyboard focus owners when a nested control is
+    /// clicked — the topmost visible overlay containing the component wins.
+    pub(crate) fn resolve_mouse_focus_target(
+        &self,
+        component: &SharedComponent,
+    ) -> SharedComponent {
+        for entry in self.overlay_stack.iter().rev() {
+            if self.is_overlay_visible(entry)
+                && TuiBase::contains_component(&entry.component, component)
+            {
+                return Arc::clone(&entry.component);
+            }
+        }
+        Arc::clone(component)
+    }
+
     /// `isOverlayVisible` (tui.ts:612-618).
     pub(crate) fn is_overlay_visible(&self, entry: &OverlayStackEntry) -> bool {
         if entry.hidden {
@@ -912,12 +962,15 @@ impl TuiBase {
         term_height: i32,
     ) -> Vec<String> {
         if self.overlay_stack.is_empty() {
+            // `this.renderedOverlayLayouts = []` (tui.ts:1281 @ 9841914).
+            self.rendered_overlay_layouts.borrow_mut().clear();
             return lines;
         }
         let mut result = lines;
 
         // Pre-render all visible overlays and calculate positions.
         struct Rendered {
+            component: SharedComponent,
             overlay_lines: Vec<String>,
             row: i32,
             col: i32,
@@ -958,12 +1011,27 @@ impl TuiBase {
             );
             min_lines_needed = min_lines_needed.max(layout.row + overlay_lines.len() as i32);
             rendered.push(Rendered {
+                component: Arc::clone(&entry.component),
                 overlay_lines,
                 row: layout.row,
                 col: layout.col,
                 width: initial.width,
             });
         }
+
+        // `this.renderedOverlayLayouts = rendered.map(...)` (tui.ts:1316-1322
+        // @ 9841914) — focusOrder-sorted bottom→top, consumed back-to-front by
+        // mouse dispatch (`dispatchMouseToOverlay`, tui.ts:824-848).
+        *self.rendered_overlay_layouts.borrow_mut() = rendered
+            .iter()
+            .map(|overlay| RenderedOverlayLayout {
+                component: Arc::clone(&overlay.component),
+                row: overlay.row,
+                col: overlay.col,
+                width: overlay.width,
+                height: overlay.overlay_lines.len() as i32,
+            })
+            .collect();
 
         // Pad to at least terminal height so overlays have screen-relative
         // positions. Excludes maxLinesRendered: the historical high-water mark

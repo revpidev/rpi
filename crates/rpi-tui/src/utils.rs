@@ -82,6 +82,17 @@ impl WordSegmenter {
     pub fn segment<'a>(&self, text: &'a str) -> unicode_segmentation::UWordBounds<'a> {
         text.split_word_bounds()
     }
+
+    /// Approximation of `Intl.SegmentData.isWordLike` (utils.ts:17 @ 9841914;
+    /// consumed by the double-click word selection, tui-alt-screen.ts:1157):
+    /// a UAX #29 word segment is word-like when it contains at least one
+    /// alphabetic or numeric character (V14-14 D-093, unified with
+    /// `word_navigation` — ICU's rule-status based classification agrees on
+    /// the pinned corpora; exotic cases like digit + punctuation segments
+    /// may differ).
+    pub fn is_word_like(&self, segment: &str) -> bool {
+        segment.chars().any(|c| c.is_alphanumeric())
+    }
 }
 
 /// Check if a grapheme cluster (after segmentation) could possibly be an RGI
@@ -5880,5 +5891,105 @@ mod tests {
         assert_eq!(get_osc8_link_at_column("", 0), None);
         // Non-OSC-8 sequences do not start a link.
         assert_eq!(get_osc8_link_at_column("\x1b[31mtext\x1b[0m", 0), None);
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14 D-093 calibration: UAX #29 word segmentation + the isWordLike
+    // approximation vs the upstream Intl.Segmenter (utils.ts:17 @ 9841914).
+    // Expected segment lists and isWordLike flags are pinned from
+    // Node 24 / ICU 78 `new Intl.Segmenter(undefined, { granularity:
+    // "word" })` over this corpus; the joiner expansion consumed by
+    // `getWordSelection` (tui-alt-screen.ts:1150-1185) agrees row for row.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn word_segmentation_and_is_word_like_match_intl_segmenter_corpus() {
+        // (input, expected [(segment, isWordLike)])
+        let corpus: &[(&str, &[(&str, bool)])] = &[
+            (
+                "foo/bar-baz",
+                &[
+                    ("foo", true),
+                    ("/", false),
+                    ("bar", true),
+                    ("-", false),
+                    ("baz", true),
+                ],
+            ),
+            (
+                "hello world",
+                &[("hello", true), (" ", false), ("world", true)],
+            ),
+            // ExtendNumLet keeps identifiers whole; digits + letters are
+            // word-like.
+            (
+                "a1_b2 snake_case_token",
+                &[("a1_b2", true), (" ", false), ("snake_case_token", true)],
+            ),
+            // Numbers: MidNum keeps decimals whole; leading signs split.
+            (
+                "3.14 -7",
+                &[("3.14", true), (" ", false), ("-", false), ("7", true)],
+            ),
+            // Punctuation runs are their own non-word segments.
+            ("foo,bar", &[("foo", true), (",", false), ("bar", true)]),
+            // CJK: each Han character is its own word-like segment (the
+            // plain segmenter applies no dictionary at undefined locale).
+            ("你好", &[("你", true), ("好", true)]),
+            // Emoji are not word-like.
+            ("👍 x", &[("👍", false), (" ", false), ("x", true)]),
+            // KNOWN D-093 divergence (calibrated against Node 24 / ICU 78):
+            // `Intl.Segmenter` keeps Hiragana runs as ONE word-like segment
+            // ("かわいい"); plain UAX #29 breaks between every Hiragana
+            // character. The word-selection path compensates by merging
+            // adjacent all-Hiragana segments (see `merge_hiragana_runs` in
+            // `tui_alt_screen.rs`); the raw segmenter output is pinned here
+            // per-character to make the delta explicit.
+            (
+                "かわいい",
+                &[("か", true), ("わ", true), ("い", true), ("い", true)],
+            ),
+            // Katakana runs stay whole in plain UAX #29 already (WB13), like
+            // ICU.
+            ("レポート", &[("レポート", true)]),
+            // Mixed alphanumeric + punctuation: MidNumLet joins inside
+            // the token, so "v1.2rc1" is one word-like segment.
+            (
+                "v1.2rc1 (final)",
+                &[
+                    ("v1.2rc1", true),
+                    (" ", false),
+                    ("(", false),
+                    ("final", true),
+                    (")", false),
+                ],
+            ),
+            // Hiragana kept whole by UAX #29 (letter run without
+            // dictionary boundaries at undefined locale) is one segment in
+            // ICU; the Rust UAX #29 tables agree on this run.
+            ("レポート", &[("レポート", true)]),
+        ];
+
+        let segmenter = crate::utils::get_word_segmenter();
+        for (input, expected) in corpus {
+            let actual: Vec<(&str, bool)> = segmenter
+                .segment(input)
+                .map(|segment| (segment, segmenter.is_word_like(segment)))
+                .collect();
+            assert_eq!(&actual, expected, "segmentation mismatch for {input:?}");
+        }
+    }
+
+    #[test]
+    fn is_word_like_approximation_matches_intl_flags() {
+        let segmenter = crate::utils::get_word_segmenter();
+        // Word-like: letters, digits, mixed with ExtendNumLet.
+        for segment in ["a", "Z9", "件", "a_1", "über"] {
+            assert!(segmenter.is_word_like(segment), "{segment:?}");
+        }
+        // Not word-like: punctuation, whitespace, emoji, symbols.
+        for segment in ["", "/", "-", ",", " ", "。", "👍", "→", "()"] {
+            assert!(!segmenter.is_word_like(segment), "{segment:?}");
+        }
     }
 }

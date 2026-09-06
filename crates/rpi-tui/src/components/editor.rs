@@ -44,7 +44,10 @@ use crate::components::select_list::{
 use crate::keybindings::{get_keybindings, Keybinding};
 use crate::keys::{decode_printable_key, matches_key};
 use crate::kill_ring::{KillRing, KillRingPushOptions};
-use crate::tui::{Component, Focusable, CURSOR_MARKER};
+use crate::tui::{
+    Component, Focusable, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+    TuiMouseHandlerResult, CURSOR_MARKER,
+};
 use crate::tui_handle::TuiHandle;
 use crate::undo_stack::UndoStack;
 use crate::utils::{
@@ -613,6 +616,14 @@ pub struct Editor {
     /// A `Cell`: render takes `&self`.
     scroll_offset: Cell<usize>,
 
+    /// `renderedVisibleLineCount` (editor.ts:300 @ 9841914, 71026970a):
+    /// content rows of the last render (excluding borders/autocomplete),
+    /// for click-to-cursor bounds. A `Cell`: render takes `&self`.
+    rendered_visible_line_count: Cell<usize>,
+    /// `renderedAutocompleteHeight` (editor.ts:301 @ 9841914): autocomplete
+    /// rows of the last render, for mouse hit-testing. A `Cell` likewise.
+    rendered_autocomplete_height: Cell<usize>,
+
     /// Border color (can be changed dynamically; upstream `borderColor`,
     /// editor.ts:291).
     pub border_color: Box<dyn Fn(&str) -> String + Send + Sync>,
@@ -698,6 +709,8 @@ impl Editor {
             padding_x,
             last_width: Cell::new(80),
             scroll_offset: Cell::new(0),
+            rendered_visible_line_count: Cell::new(1),
+            rendered_autocomplete_height: Cell::new(0),
             border_color,
             autocomplete_provider: None,
             autocomplete_trigger_characters: trigger_characters,
@@ -3071,6 +3084,9 @@ impl Component for Editor {
         // Get visible lines slice.
         let visible_lines = &layout_lines
             [scroll_offset..(scroll_offset + max_visible_lines).min(layout_lines.len())];
+        // `this.renderedVisibleLineCount = visibleLines.length` (editor.ts:544
+        // @ 9841914).
+        self.rendered_visible_line_count.set(visible_lines.len());
 
         let mut result: Vec<String> = Vec::new();
         let left_padding = " ".repeat(padding_x);
@@ -3162,6 +3178,9 @@ impl Component for Editor {
         }
 
         // Add autocomplete list if active.
+        // `this.renderedAutocompleteHeight = autocompleteResult.length`
+        // (editor.ts:606-609 @ 9841914; 0 when no popup is shown).
+        self.rendered_autocomplete_height.set(0);
         if self.autocomplete_ui.borrow().state.is_some() {
             let autocomplete_result = {
                 let ui = self.autocomplete_ui.borrow();
@@ -3170,6 +3189,8 @@ impl Component for Editor {
                     .map(|list| list.render(content_width))
                     .unwrap_or_default()
             };
+            self.rendered_autocomplete_height
+                .set(autocomplete_result.len());
             for line in autocomplete_result {
                 let line_width = visible_width(&line);
                 let line_padding = " ".repeat(content_width.saturating_sub(line_width));
@@ -3178,6 +3199,118 @@ impl Component for Editor {
         }
 
         result
+    }
+
+    /// `Editor.prototype.handleMouse` (editor.ts:620-680 @ 9841914,
+    /// 2470ea440): only synthesized **clicks** position the cursor — press,
+    /// drag, and release are left unhandled so the renderer's screen-level
+    /// text selection can run over the editor rows (drag to select, release
+    /// to copy); the renderer synthesizes the click when press and release
+    /// land on the same cell without movement. Clicks on the autocomplete
+    /// rows forward to the list (any result bubbles focus to the editor,
+    /// which owns the keyboard, editor.ts:639).
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        // Autocomplete popup rows sit below the editor body: border +
+        // rendered content rows + border (editor.ts:621).
+        let autocomplete_start_row = self.rendered_visible_line_count.get() as isize + 2;
+        let autocomplete_height = self.rendered_autocomplete_height.get() as isize;
+        if self.autocomplete_ui.borrow().state.is_some()
+            && event.y >= autocomplete_start_row
+            && event.y < autocomplete_start_row + autocomplete_height
+        {
+            let max_padding = ((event.width as usize).saturating_sub(1)) / 2;
+            let padding_x = self.padding_x.min(max_padding);
+            let content_width = ((event.width as usize).saturating_sub(padding_x * 2)).max(1);
+            let forwarded = event.with_local(
+                event.x - padding_x as isize,
+                event.y - autocomplete_start_row,
+                content_width as isize,
+                autocomplete_height,
+            );
+            // The list is an owned child, so the dispatcher attaches this
+            // editor as the target; upstream forces focus on any result
+            // (editor.ts:639 `{ ...result, focus: true }`) — the editor
+            // owns the keyboard for the popup rows.
+            let result = self
+                .autocomplete_ui
+                .borrow_mut()
+                .list
+                .as_mut()
+                .and_then(|list| list.handle_mouse(&forwarded));
+            return result.map(|mut result| {
+                if let TuiMouseHandlerResult::Event(event) = &mut result {
+                    event.focus = true;
+                }
+                result
+            });
+        }
+
+        // Leave press/drag/release unhandled so the renderer's screen-level
+        // text selection can run over the editor rows (drag to select,
+        // release to copy). The renderer synthesizes a click when press and
+        // release land on the same cell without movement, which is the
+        // gesture that positions the cursor (editor.ts:641-644, 2470ea440).
+        if event.event_type != TuiMouseEventType::Click || event.button != TuiMouseButton::Left {
+            return None;
+        }
+        if event.y <= 0 || event.y > self.rendered_visible_line_count.get() as isize {
+            // Clicks on the borders: consumed (no cursor move).
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                focus: true,
+                ..Default::default()
+            }));
+        }
+
+        let visual_lines = self.build_visual_line_map(self.last_width.get());
+        let visual_line_index = self.scroll_offset.get() + (event.y as usize - 1);
+        let visual_line = visual_lines.get(visual_line_index)?;
+        let logical_line = self.state.lines.get(visual_line.logical_line)?.clone();
+        // Visual-line columns are character indices; convert to byte
+        // offsets for the slice (upstream `slice` on UTF-16 indices).
+        let chunk_start_byte = char_to_byte(&logical_line, visual_line.start_col);
+        let chunk_end_byte =
+            char_to_byte(&logical_line, visual_line.start_col + visual_line.length);
+        let chunk = logical_line[chunk_start_byte..chunk_end_byte].to_string();
+        let max_padding = ((event.width as usize).saturating_sub(1)) / 2;
+        let padding_x = self.padding_x.min(max_padding);
+        let target_column = (event.x - padding_x as isize).max(0) as usize;
+        let mut visible_column = 0usize;
+        let mut target_index = chunk.chars().count();
+        let mut last_grapheme_index = 0usize;
+        for segment in self.grapheme_segments(&chunk) {
+            let next_column = visible_column + visible_width(segment.segment);
+            last_grapheme_index = segment.index;
+            if target_column < next_column {
+                target_index = segment.index;
+                break;
+            }
+            visible_column = next_column;
+        }
+        // A click at the very end of a wrapped (non-final) segment snaps to
+        // the last grapheme instead of pasting onto the next line
+        // (editor.ts:666-667).
+        let is_last_segment = visual_line_index == visual_lines.len() - 1
+            || visual_lines
+                .get(visual_line_index + 1)
+                .map(|next| next.logical_line != visual_line.logical_line)
+                .unwrap_or(true);
+        if !is_last_segment && target_index == chunk.chars().count() && !chunk.is_empty() {
+            target_index = last_grapheme_index;
+        }
+
+        self.state.cursor_line = visual_line.logical_line;
+        self.set_cursor_col(visual_line.start_col + target_index);
+        self.last_action = None;
+        self.exit_history_browsing();
+        if self.autocomplete_ui.borrow().state.is_some() {
+            self.update_autocomplete();
+        }
+        Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+            handled: true,
+            focus: true,
+            ..Default::default()
+        }))
     }
 
     fn handle_input(&mut self, data: &str) {
@@ -8363,5 +8496,109 @@ mod tests {
         editor.handle_input("\r");
 
         assert_eq!(*submitted.lock().unwrap(), pasted_text);
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: handleMouse (editor.ts:620-680 @ 9841914, 2470ea440)
+    // ------------------------------------------------------------------
+
+    use crate::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn editor_mouse_event(
+        event_type: TuiMouseEventType,
+        button: TuiMouseButton,
+        x: isize,
+        y: isize,
+    ) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button,
+            x,
+            y,
+            screen_x: x,
+            screen_y: y,
+            width: 80,
+            height: 10,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: None,
+        }
+    }
+
+    #[test]
+    fn press_drag_and_release_are_left_for_screen_selection() {
+        // FR-B (2470ea440): only synthesized clicks position the cursor;
+        // press/drag/release return None so the renderer's selection can run
+        // over the editor rows.
+        let mut ed = editor();
+        type_text(&mut ed, "hello");
+        let _ = ed.render(80);
+        for (event_type, button) in [
+            (TuiMouseEventType::Press, TuiMouseButton::Left),
+            (TuiMouseEventType::Drag, TuiMouseButton::Left),
+            (TuiMouseEventType::Release, TuiMouseButton::Left),
+            (TuiMouseEventType::Click, TuiMouseButton::Right),
+            (TuiMouseEventType::Move, TuiMouseButton::None),
+        ] {
+            assert!(
+                ed.handle_mouse(&editor_mouse_event(event_type, button, 3, 1))
+                    .is_none(),
+                "{event_type:?}/{button:?} must stay unhandled"
+            );
+        }
+    }
+
+    #[test]
+    fn click_on_border_rows_is_consumed_without_moving_the_cursor() {
+        let mut ed = editor();
+        type_text(&mut ed, "hello");
+        let _ = ed.render(80);
+        let (line, col) = ed.get_cursor();
+        for y in [0isize, 2] {
+            // y=0: top border; y=2: bottom border (single content line).
+            match ed.handle_mouse(&editor_mouse_event(
+                TuiMouseEventType::Click,
+                TuiMouseButton::Left,
+                3,
+                y,
+            )) {
+                Some(TuiMouseHandlerResult::Event(event)) => {
+                    assert!(event.handled && event.focus);
+                }
+                _ => panic!("border clicks are consumed"),
+            }
+        }
+        assert_eq!(ed.get_cursor(), (line, col), "cursor unchanged");
+    }
+
+    #[test]
+    fn click_positions_the_cursor_on_the_clicked_grapheme() {
+        let mut ed = editor();
+        type_text(&mut ed, "hello world");
+        let _ = ed.render(80);
+        // Content row 1; the default editor has no side padding, so column
+        // x maps directly to the grapheme column.
+        assert!(ed
+            .handle_mouse(&editor_mouse_event(
+                TuiMouseEventType::Click,
+                TuiMouseButton::Left,
+                3,
+                1
+            ))
+            .is_some());
+        assert_eq!(ed.get_cursor(), (0, 3), "click on the second 'l'");
+
+        // Click far past the line end clamps to the end of the line.
+        assert!(ed
+            .handle_mouse(&editor_mouse_event(
+                TuiMouseEventType::Click,
+                TuiMouseButton::Left,
+                78,
+                1
+            ))
+            .is_some());
+        assert_eq!(ed.get_cursor(), (0, 11));
     }
 }

@@ -14,7 +14,7 @@ use std::boxed::Box as StdBox;
 use std::cell::RefCell;
 
 use crate::components::text::ColorFn;
-use crate::tui::Component;
+use crate::tui::{Component, TuiMouseEvent, TuiMouseHandlerResult};
 use crate::utils::{apply_background_to_line, visible_width};
 
 type RenderCache = Option<CacheEntry>;
@@ -24,6 +24,13 @@ struct CacheEntry {
     width: usize,
     bg_sample: Option<String>,
     lines: Vec<String>,
+}
+
+/// `mouseLayout` (box.ts:76 @ 9841914): per-child rendered heights at the
+/// content width of the last `render`, reused by `handle_mouse` hit-testing.
+struct MouseLayout {
+    content_width: usize,
+    heights: Vec<usize>,
 }
 
 /// Box component - a container that applies padding and background to all
@@ -36,6 +43,7 @@ pub struct Box {
 
     // Cache for rendered output
     cache: RefCell<RenderCache>,
+    mouse_layout: RefCell<Option<MouseLayout>>,
 }
 
 impl Box {
@@ -46,6 +54,7 @@ impl Box {
             padding_y,
             bg_fn,
             cache: RefCell::new(None),
+            mouse_layout: RefCell::new(None),
         }
     }
 
@@ -123,10 +132,22 @@ impl Component for Box {
         let content_width = width.saturating_sub(self.padding_x * 2).max(1);
         let left_pad = " ".repeat(self.padding_x);
 
-        // Render all children
-        let mut child_lines: Vec<String> = Vec::new();
+        // `this.mouseLayout = { width: contentWidth, children:
+        // mouseChildren }` (box.ts:128 @ 9841914) — heights of the children
+        // as rendered at the content width, for `handle_mouse` hit-testing.
+        let mut child_heights = Vec::with_capacity(self.children.len());
+        let mut per_child_lines = Vec::with_capacity(self.children.len());
         for child in &self.children {
             let lines = child.render(content_width);
+            child_heights.push(lines.len());
+            per_child_lines.push(lines);
+        }
+        *self.mouse_layout.borrow_mut() = Some(MouseLayout {
+            content_width,
+            heights: child_heights,
+        });
+        let mut child_lines: Vec<String> = Vec::new();
+        for lines in per_child_lines {
             for line in lines {
                 child_lines.push(format!("{left_pad}{line}"));
             }
@@ -181,6 +202,56 @@ impl Component for Box {
         for child in &mut self.children {
             child.invalidate();
         }
+    }
+
+    /// `Box.prototype.handleMouse` (box.ts:75-97 @ 9841914, 71026970a):
+    /// hit-test over the children at the content offset — coordinates are
+    /// translated to the child's local frame (`x` clamped to the content
+    /// origin, `y` relative to the child's row window, `width`/`height` the
+    /// content width and the child's height). Heights come from the
+    /// `mouseLayout` cache when the content width matches, else a
+    /// measure-only render (not cached, like upstream). Upstream `Box`
+    /// defines no `handleInput`, so no focus bubbling (see the `Container`
+    /// note in `tui.rs`).
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        let content_width = (event.width - (self.padding_x * 2) as isize).max(1) as usize;
+        let content_y = event.y - self.padding_y as isize;
+        let content_x = event.x - self.padding_x as isize;
+        let cached_width_matches = self
+            .mouse_layout
+            .borrow()
+            .as_ref()
+            .is_some_and(|layout| layout.content_width == content_width);
+        let heights = if cached_width_matches {
+            self.mouse_layout
+                .borrow()
+                .as_ref()
+                .map(|layout| layout.heights.clone())
+                .unwrap_or_default()
+        } else {
+            self.children
+                .iter()
+                .map(|child| child.render(content_width).len())
+                .collect::<Vec<_>>()
+        };
+        let mut child_y: isize = 0;
+        for (child, child_height) in self.children.iter_mut().zip(heights) {
+            let child_height = child_height as isize;
+            if content_y >= child_y && content_y < child_y + child_height {
+                let child_event = event.with_local(
+                    content_x,
+                    content_y - child_y,
+                    content_width as isize,
+                    child_height,
+                );
+                // Owned children cannot be dispatch targets (see the
+                // `TuiMouseHandlerResult` note in `tui.rs`); the dispatcher
+                // attaches this Box's shared root instead.
+                return child.handle_mouse(&child_event);
+            }
+            child_y += child_height;
+        }
+        None
     }
 }
 
@@ -297,5 +368,91 @@ mod tests {
         let before = b.render(10);
         b.invalidate();
         assert_eq!(before, b.render(10));
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: handleMouse (box.ts:75-97 @ 9841914, 71026970a)
+    // ------------------------------------------------------------------
+
+    use crate::tui::{
+        TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+        TuiMouseHandlerResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Records clicks with the received local coordinates.
+    struct ClickSpy {
+        seen: Arc<AtomicUsize>,
+        x: Arc<Mutex<isize>>,
+        y: Arc<Mutex<isize>>,
+    }
+
+    impl Component for ClickSpy {
+        fn render(&self, _width: usize) -> Vec<String> {
+            vec!["row".to_string()]
+        }
+
+        fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+            if event.event_type == TuiMouseEventType::Click {
+                self.seen.fetch_add(1, Ordering::SeqCst);
+                *self.x.lock().unwrap() = event.x;
+                *self.y.lock().unwrap() = event.y;
+                return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                    handled: true,
+                    ..Default::default()
+                }));
+            }
+            None
+        }
+    }
+
+    fn box_mouse_event(event_type: TuiMouseEventType, x: isize, y: isize) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button: TuiMouseButton::Left,
+            x,
+            y,
+            screen_x: x,
+            screen_y: y,
+            width: 20,
+            height: 10,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: None,
+        }
+    }
+
+    #[test]
+    fn handle_mouse_translates_content_coordinates() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_x = Arc::new(Mutex::new(0));
+        let seen_y = Arc::new(Mutex::new(0));
+        let mut b = Box::new(2, 1, None);
+        b.add_child(StdBox::new(Text::new("filler", 0, 0, None)));
+        b.add_child(StdBox::new(ClickSpy {
+            seen: Arc::clone(&seen),
+            x: Arc::clone(&seen_x),
+            y: Arc::clone(&seen_y),
+        }));
+        b.render(20);
+
+        // Top padding row: no child at contentY = -1.
+        assert!(b
+            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 0))
+            .is_none());
+        // Filler row (contentY 0): filler has no handler.
+        assert!(b
+            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 1))
+            .is_none());
+        // Spy row (contentY 1 → local y 0; x shifted by padding 2).
+        assert!(b
+            .handle_mouse(&box_mouse_event(TuiMouseEventType::Click, 5, 2))
+            .is_some());
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert_eq!(*seen_x.lock().unwrap(), 3);
+        assert_eq!(*seen_y.lock().unwrap(), 0);
     }
 }

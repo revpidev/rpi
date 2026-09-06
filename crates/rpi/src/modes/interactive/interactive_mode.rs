@@ -87,7 +87,7 @@ use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
 use rpi_tui::tui::{
     shared_component_from_boxed, Component, Container, Focusable, RenderHandle, SharedComponent,
-    TuiMode, TuiStopOptions,
+    TuiMode, TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions,
 };
 use rpi_tui::tui_handle::{Renderer, TuiHandle};
 use rpi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
@@ -605,6 +605,10 @@ impl<T: Component> Component for SharedChild<T> {
         lock(&self.0).render(width)
     }
 
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        lock(&self.0).handle_mouse(event)
+    }
+
     fn invalidate(&mut self) {
         lock(&self.0).invalidate();
     }
@@ -627,6 +631,10 @@ impl<T: Component + Focusable> Component for FocusableRegion<T> {
 
     fn handle_input(&mut self, data: &str) {
         lock(&self.0).handle_input(data);
+    }
+
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        lock(&self.0).handle_mouse(event)
     }
 
     fn invalidate(&mut self) {
@@ -673,6 +681,10 @@ impl Component for SharedEntry {
 
     fn handle_input(&mut self, data: &str) {
         lock(&self.0).handle_input(data);
+    }
+
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        lock(&self.0).handle_mouse(event)
     }
 
     fn invalidate(&mut self) {

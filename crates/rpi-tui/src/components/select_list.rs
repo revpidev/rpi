@@ -18,7 +18,10 @@
 use std::sync::Arc;
 
 use crate::keybindings::{get_keybindings, Keybinding};
-use crate::tui::Component;
+use crate::tui::{
+    Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
+    TuiMouseHandlerResult,
+};
 use crate::utils::{truncate_to_width, visible_width};
 
 const DEFAULT_PRIMARY_COLUMN_WIDTH: usize = 32;
@@ -155,6 +158,9 @@ pub struct SelectList {
     pub on_cancel: Option<Box<dyn FnMut() + Send>>,
     /// Called when the selection moves (upstream `onSelectionChange`).
     pub on_selection_change: Option<SelectItemFn>,
+    /// `mousePressedIndex` (select-list.ts:44 @ 9841914, 71026970a): the
+    /// row pressed by the last mouse press, consumed by the matching click.
+    mouse_pressed_index: Option<usize>,
 }
 
 impl SelectList {
@@ -175,6 +181,7 @@ impl SelectList {
             on_select: None,
             on_cancel: None,
             on_selection_change: None,
+            mouse_pressed_index: None,
         }
     }
 
@@ -201,6 +208,17 @@ impl SelectList {
     /// (upstream `getSelectedItem`, select-list.ts:225-228).
     pub fn get_selected_item(&self) -> Option<&SelectItem> {
         self.filtered_items.get(self.selected_index)
+    }
+
+    /// `getVisibleRange` (select-list.ts:172-180 @ 9841914): the visible
+    /// window centered on the selection, clamped to the list bounds.
+    fn get_visible_range(&self) -> (usize, usize) {
+        let start_index = self
+            .selected_index
+            .saturating_sub(self.max_visible / 2)
+            .min(self.filtered_items.len().saturating_sub(self.max_visible));
+        let end_index = (start_index + self.max_visible).min(self.filtered_items.len());
+        (start_index, end_index)
     }
 
     fn render_item(
@@ -335,6 +353,82 @@ impl Component for SelectList {
         // No cached state to invalidate currently
     }
 
+    /// `SelectList.prototype.handleMouse` (select-list.ts:109-140 @ 9841914,
+    /// 71026970a + 9841914c7): wheel moves the selection one item per
+    /// event; a left press selects and focuses the row under the pointer;
+    /// the matching click confirms it (`onSelect`). Hover (move) never
+    /// changes the selection — "Hover must not change selection: the visible
+    /// range is centered on it" (select-list.ts:118, 9841914c7).
+    fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
+        if self.filtered_items.is_empty() {
+            return None;
+        }
+        if event.event_type == TuiMouseEventType::Wheel
+            && event.wheel_delta.map(|delta| delta != 0).unwrap_or(false)
+        {
+            let delta = if event.wheel_delta.unwrap_or(0) < 0 {
+                -1i64
+            } else {
+                1
+            };
+            let previous_index = self.selected_index as i64;
+            self.selected_index = (self.selected_index as i64 + delta)
+                .clamp(0, self.filtered_items.len() as i64 - 1)
+                as usize;
+            if self.selected_index as i64 != previous_index {
+                self.notify_selection_change();
+            }
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                render: Some(self.selected_index as i64 != previous_index),
+                ..Default::default()
+            }));
+        }
+        // Hover must not change selection: the visible range is centered on it.
+        if event.button != TuiMouseButton::Left
+            || (event.event_type != TuiMouseEventType::Press
+                && event.event_type != TuiMouseEventType::Click)
+        {
+            return None;
+        }
+        let (start_index, end_index) = self.get_visible_range();
+        let item_index = start_index as isize + event.y;
+        if item_index < start_index as isize || item_index >= end_index as isize {
+            return None;
+        }
+        let item_index = item_index as usize;
+
+        if event.event_type == TuiMouseEventType::Press {
+            self.mouse_pressed_index = Some(item_index);
+            if self.selected_index != item_index {
+                self.selected_index = item_index;
+                self.notify_selection_change();
+            }
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                focus: true,
+                ..Default::default()
+            }));
+        }
+        // Click: confirm the pressed row (or the clicked row when no press
+        // was observed, e.g. a synthesized click from the selection path).
+        let clicked_index = self.mouse_pressed_index.take().unwrap_or(item_index);
+        let changed = self.selected_index != clicked_index;
+        self.selected_index = clicked_index;
+        if changed {
+            self.notify_selection_change();
+        }
+        if let Some(on_select) = self.on_select.as_mut() {
+            if let Some(selected_item) = self.filtered_items.get(self.selected_index) {
+                on_select(selected_item);
+            }
+        }
+        Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+            handled: true,
+            ..Default::default()
+        }))
+    }
+
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines: Vec<String> = Vec::new();
 
@@ -347,11 +441,7 @@ impl Component for SelectList {
         let primary_column_width = self.get_primary_column_width();
 
         // Calculate visible range with scrolling
-        let start_index = self
-            .selected_index
-            .saturating_sub(self.max_visible / 2)
-            .min(self.filtered_items.len().saturating_sub(self.max_visible));
-        let end_index = (start_index + self.max_visible).min(self.filtered_items.len());
+        let (start_index, end_index) = self.get_visible_range();
 
         // Render visible items
         for i in start_index..end_index {
@@ -576,5 +666,210 @@ mod tests {
             visible_index_of(&rendered[0], "first"),
             visible_index_of(&rendered[1], "second")
         );
+    }
+
+    // ------------------------------------------------------------------
+    // V14-14: handleMouse (select-list.ts:109-140 @ 9841914,
+    // 71026970a + 9841914c7)
+    // ------------------------------------------------------------------
+
+    use crate::tui::{TuiMouseButton, TuiMouseEvent, TuiMouseEventType, TuiMouseHandlerResult};
+
+    fn mouse_event(
+        event_type: TuiMouseEventType,
+        button: TuiMouseButton,
+        y: isize,
+        wheel_delta: Option<isize>,
+    ) -> TuiMouseEvent {
+        TuiMouseEvent {
+            event_type,
+            button,
+            x: 0,
+            y,
+            screen_x: 0,
+            screen_y: y,
+            width: 20,
+            height: 5,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta,
+            click_count: None,
+        }
+    }
+
+    fn five_item_list() -> SelectList {
+        SelectList::new(
+            vec![
+                item("one", None),
+                item("two", None),
+                item("three", None),
+                item("four", None),
+                item("five", None),
+            ],
+            3,
+            Arc::new(crate::components::select_list::SelectListTheme::identity()),
+            None,
+        )
+    }
+
+    #[test]
+    fn mouse_press_selects_row_and_claims_focus() {
+        let mut list = five_item_list();
+        let result = list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            2,
+            None,
+        ));
+        match result {
+            Some(TuiMouseHandlerResult::Event(event)) => {
+                assert!(event.handled);
+                assert!(event.focus);
+            }
+            _ => panic!("press returns handled+focus"),
+        }
+        assert_eq!(list.get_selected_item().unwrap().value, "three");
+    }
+
+    #[test]
+    fn mouse_click_confirms_the_pressed_row() {
+        let picked: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let picked_flag = Arc::clone(&picked);
+        let mut list = five_item_list();
+        list.on_select = Some(Box::new(move |picked| {
+            picked_flag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(picked.value.clone());
+        }));
+        // Press row 1 then click row 1: the click confirms the pressed row.
+        list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            1,
+            None,
+        ));
+        list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Click,
+            TuiMouseButton::Left,
+            1,
+            None,
+        ));
+        assert_eq!(
+            picked.lock().unwrap_or_else(|e| e.into_inner()).to_vec(),
+            vec!["two".to_string()],
+            "click fires onSelect for the pressed row"
+        );
+
+        // A click without a preceding press confirms the clicked row (row 2
+        // is inside the visible window; row 4 would be outside and ignored).
+        list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Click,
+            TuiMouseButton::Left,
+            2,
+            None,
+        ));
+        assert_eq!(
+            picked.lock().unwrap_or_else(|e| e.into_inner()).to_vec(),
+            vec!["two".to_string(), "three".to_string()]
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_moves_selection_one_row_per_event() {
+        let mut list = five_item_list();
+        let notified: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let notified_flag = Arc::clone(&notified);
+        list.on_selection_change = Some(Box::new(move |picked| {
+            notified_flag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(picked.value.clone());
+        }));
+
+        let down = list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Wheel,
+            TuiMouseButton::None,
+            0,
+            Some(3),
+        ));
+        match down {
+            Some(TuiMouseHandlerResult::Event(event)) => {
+                assert!(event.handled);
+                assert_eq!(event.render, Some(true), "render when the index moved");
+            }
+            _ => panic!("wheel returns handled"),
+        }
+        assert_eq!(list.get_selected_item().unwrap().value, "two");
+
+        // Wheel up at the top edge clamps without a selection-change render.
+        list.set_selected_index(0);
+        let up = list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Wheel,
+            TuiMouseButton::None,
+            0,
+            Some(-3),
+        ));
+        match up {
+            Some(TuiMouseHandlerResult::Event(event)) => {
+                assert_eq!(event.render, Some(false), "no render when clamped");
+            }
+            _ => panic!("wheel returns handled"),
+        }
+        assert_eq!(list.get_selected_item().unwrap().value, "one");
+    }
+
+    #[test]
+    fn hover_move_never_changes_the_selection() {
+        // FR-E (9841914c7): "Hover must not change selection: the visible
+        // range is centered on it."
+        let mut list = five_item_list();
+        list.set_selected_index(0);
+        for y in 0..5 {
+            list.handle_mouse(&mouse_event(
+                TuiMouseEventType::Move,
+                TuiMouseButton::None,
+                y,
+                None,
+            ));
+        }
+        // Move events carry button bits 0 in some encodings; the guard must
+        // still reject them by type.
+        for y in 0..5 {
+            list.handle_mouse(&mouse_event(
+                TuiMouseEventType::Move,
+                TuiMouseButton::Left,
+                y,
+                None,
+            ));
+        }
+        assert_eq!(list.get_selected_item().unwrap().value, "one");
+    }
+
+    #[test]
+    fn mouse_events_outside_visible_rows_are_ignored() {
+        let mut list = five_item_list();
+        // maxVisible=3 → rows 0..2; row 5 is outside.
+        let result = list.handle_mouse(&mouse_event(
+            TuiMouseEventType::Press,
+            TuiMouseButton::Left,
+            5,
+            None,
+        ));
+        assert!(result.is_none());
+        assert_eq!(list.get_selected_item().unwrap().value, "one");
+    }
+
+    #[test]
+    fn non_left_buttons_are_ignored() {
+        let mut list = five_item_list();
+        for button in [TuiMouseButton::Middle, TuiMouseButton::Right] {
+            let result = list.handle_mouse(&mouse_event(TuiMouseEventType::Press, button, 1, None));
+            assert!(result.is_none());
+        }
+        assert_eq!(list.get_selected_item().unwrap().value, "one");
     }
 }
