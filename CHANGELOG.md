@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.4] - 2026-09-08
+
+### 主线
+
+- **上游追平 v0.85.0**（V14-01…18，ADR-0023）：行为金标准从 `4181f66`（v0.84.1+）升级到 `9841914`（v0.85.0+，698 commits / 866 文件），18 个对拍任务按「上游锚点 → rpi 落点 → 断言证据」三元组逐条恢复行为对拍绿。分域摘要见 `changes/v0.1.4.md`（发布 changelog 单一事实源），关键用户可观测面：
+  - **协议与会话**：compaction 触发时机对齐（#6879 BREAKING——终轮不再触发）；会话管理修复九项（fork compaction 重映射 #8989 / import 同名 #8985 / RPC abort 取消手动 compaction #8920 等）；`message_update` 恢复累计 usage（#7982）、`toolcall_start` 附 id/toolName（#7953）、新命令 `clear_queue`（#8432）。
+  - **Providers**：Anthropic 每轮 effort 持久化与 refusal fallback（managed Claude 请求体组合 + providerThinkingLevel 落盘）；Bedrock 原始响应头转发；NO_PROXY 语义重写（#8737：根域/子域/IPv6/host:port/`*`）；七 adapter 默认 User-Agent；模型目录重生成至 v0.85.0 数据（GPT-6 Astra、compat 字段）。
+  - **工具 / CLI / 扩展**：七内建工具 cwd 改执行时会话基准（#8627）；skills 三修复（#8552/#7805/#8255）；`--` 分隔符（#7269）、`--use-theme`（#7722）、选择器会话级作用域（#8356：Ctrl+S 才写全局）、Windows/WSL 默认键位（#8372）、配置健壮性（BOM #8337 / 权限 #7779 / 带路径错误 #7829）。
+  - **TUI**：鼠标分发基础设施全套 + 选择修复族（双击选词/右键粘贴去重/hover 不改选择）；全屏 transcript 搜索与跳转指示（#8800）；滚动条重设计 + 验证式复制（OSC 52 + 回读 + toast）；LaTeX/表格渲染修复族；working indicator 内嵌 editor 边框；thinking 切换就地更新；终端能力覆盖三 env（`RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + `terminal.*` 设置）与 SSH 下 Alt+Enter 双超时（#7899）；rpi-tui 与配置 env 离婚（`c505f4c19`，`RPI_TUI_DEBUG_REDRAW`/`rpi-tui-*.log` 改名，二进制行为不变）。
+- **M5 收口**：主题校验拆分移植（eb3e9feed——库路径 lenient cast + 应用层安装式校验器）；fixtures 全量重录钉死 9841914；偏离 D-092…D-100 全闭环（3 登记 + 5 核销 + 2 未触发转正）。
+
+### 内部
+
+- workspace 版本 bump 0.1.4 + Cargo.lock 同步；全量门禁 5685 用例零失败。
+- parity-checklist §3.8 v0.1.4 增量映射补录；rpi-pages changelog/latest-version 同步。
+
 ## [0.1.3] - 2026-09-03
 
 ### 新增
