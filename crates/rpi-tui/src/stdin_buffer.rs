@@ -1,4 +1,6 @@
-//! Port of `packages/tui/src/stdin-buffer.ts` @ pi 0.82.1 (2efa728).
+//! Port of `packages/tui/src/stdin-buffer.ts` @ pi 0.82.1 (2efa728), with
+//! the dual sequence/escape timeouts tracking 9841914 (06ed87167 +
+//! 2a95ef70d / #7899).
 //!
 //! `StdinBuffer` buffers input and emits complete sequences. stdin data can
 //! arrive in partial chunks, especially for escape sequences like mouse
@@ -39,6 +41,14 @@ use std::time::{Duration, Instant};
 const ESC: &str = "\x1b";
 const BRACKETED_PASTE_START: &str = "\x1b[200~";
 const BRACKETED_PASTE_END: &str = "\x1b[201~";
+
+/// `DEFAULT_SEQUENCE_TIMEOUT_MS` (stdin-buffer.ts:23 @ 9841914): wait for an
+/// incomplete CSI/mouse fragment. Was 10ms before #7899 split the single
+/// timeout.
+const DEFAULT_SEQUENCE_TIMEOUT_MS: u64 = 50;
+/// `DEFAULT_ESCAPE_TIMEOUT_MS` (stdin-buffer.ts:24 @ 9841914): wait after a
+/// lone ESC before treating it as the Escape key.
+const DEFAULT_ESCAPE_TIMEOUT_MS: u64 = 10;
 
 /// Whether a string is a complete escape sequence or needs more data
 /// (upstream `isCompleteSequence`).
@@ -347,18 +357,26 @@ fn extract_complete_sequences(buffer: &str) -> (Vec<String>, String) {
     (sequences, String::new())
 }
 
-/// Options for [`StdinBuffer`] (upstream `StdinBufferOptions`).
+/// Options for [`StdinBuffer`] (upstream `StdinBufferOptions`,
+/// stdin-buffer.ts:22-33 @ 9841914).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StdinBufferOptions {
-    /// Maximum time to wait for sequence completion (default: 10ms).
-    /// After this time, the buffer is flushed even if incomplete.
+    /// Maximum time to wait for an incomplete sequence such as CSI or mouse
+    /// (default: 50ms, `DEFAULT_SEQUENCE_TIMEOUT_MS`). After this time, the
+    /// buffer is flushed even if incomplete.
     pub timeout: Duration,
+    /// Maximum time to wait after a lone ESC before treating it as the
+    /// Escape key (default: 10ms, `DEFAULT_ESCAPE_TIMEOUT_MS`). Increase for
+    /// high-latency Alt+key input (SSH) — see
+    /// [`crate::terminal::resolve_escape_timeout_ms`].
+    pub escape_timeout: Duration,
 }
 
 impl Default for StdinBufferOptions {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_millis(10),
+            timeout: Duration::from_millis(DEFAULT_SEQUENCE_TIMEOUT_MS),
+            escape_timeout: Duration::from_millis(DEFAULT_ESCAPE_TIMEOUT_MS),
         }
     }
 }
@@ -381,6 +399,7 @@ pub struct StdinBuffer {
     /// flush is scheduled; the buffer must be flushed once `now >= deadline`.
     deadline: Option<Instant>,
     timeout: Duration,
+    escape_timeout: Duration,
     paste_mode: bool,
     paste_buffer: String,
     pending_kitty_printable_codepoint: Option<u32>,
@@ -393,6 +412,7 @@ impl StdinBuffer {
             buffer: String::new(),
             deadline: None,
             timeout: options.timeout,
+            escape_timeout: options.escape_timeout,
             paste_mode: false,
             paste_buffer: String::new(),
             pending_kitty_printable_codepoint: None,
@@ -483,7 +503,16 @@ impl StdinBuffer {
         }
 
         if !self.buffer.is_empty() {
-            self.deadline = Some(Instant::now() + self.timeout);
+            // `this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs`
+            // (stdin-buffer.ts:285-293, 2a95ef70d / #7899): a lone ESC uses
+            // the escape timeout; any other incomplete tail (CSI/mouse
+            // fragments) uses the sequence timeout.
+            let timeout_ms = if self.buffer == "\x1b" {
+                self.escape_timeout
+            } else {
+                self.timeout
+            };
+            self.deadline = Some(Instant::now() + timeout_ms);
         }
 
         events
@@ -987,6 +1016,78 @@ mod tests {
 
         // After timeout, should emit
         assert_eq!(buffer.flush_expired(past_timeout()), ["\x1b"]);
+    }
+
+    /// "should flush a lone ESC as Escape when CR arrives after the timeout"
+    /// (stdin-buffer.test.ts:139-150 @ 9841914, 2a95ef70d / #7899):
+    /// legacy-mode Alt+Enter is ESC + CR; when the bytes land further apart
+    /// than the escape timeout, ESC flushes alone and the host sees Escape
+    /// (interrupt) instead of Alt+Enter.
+    #[test]
+    fn lone_esc_flushes_as_escape_when_cr_arrives_after_timeout() {
+        let mut buffer = new_buffer(); // escape timeout 10ms, sequence 50ms
+        assert_eq!(buffer.process("\x1b"), []);
+        // > 10ms after the ESC was buffered (the escape deadline governs a
+        // lone ESC, not the 50ms sequence timeout).
+        let after_deadline =
+            buffer.flush_deadline().expect("escape deadline scheduled") + Duration::from_millis(1);
+        assert_eq!(buffer.flush_expired(after_deadline), ["\x1b"]);
+        assert_eq!(data_events(&buffer.process("\r")), ["\r"]);
+    }
+
+    /// "should merge ESC + CR split across chunks within a larger timeout"
+    /// (stdin-buffer.test.ts:152-165): with `escapeTimeout: 100`, ESC and CR
+    /// split further apart than the default 10ms still reassemble into one
+    /// Alt+Enter sequence.
+    #[test]
+    fn esc_cr_split_across_chunks_merges_within_larger_escape_timeout() {
+        let mut buffer = StdinBuffer::new(StdinBufferOptions {
+            escape_timeout: Duration::from_millis(100),
+            ..StdinBufferOptions::default()
+        });
+        assert_eq!(buffer.process("\x1b"), []);
+        // The scheduled deadline is the configured escape timeout (~100ms,
+        // allowing for elapsed time since it was armed), and 20ms in (< 100ms)
+        // nothing has flushed — the upstream test waits `wait(20)`.
+        let deadline = buffer.flush_deadline().expect("escape deadline scheduled");
+        let remaining = deadline.duration_since(std::time::Instant::now());
+        assert!(
+            remaining > Duration::from_millis(90) && remaining <= Duration::from_millis(100),
+            "escape deadline should be ~100ms, got {remaining:?}"
+        );
+        assert_eq!(
+            buffer.flush_expired(deadline - Duration::from_millis(80)),
+            Vec::<String>::new()
+        );
+        // CR arrives before the configured timeout elapses → merged.
+        let events = buffer.process("\r");
+        assert_eq!(data_events(&events), ["\x1b\r"]);
+    }
+
+    /// "does not apply the sequence timeout to a lone ESC"
+    /// (stdin-buffer.test.ts:167-179): a lone ESC always uses the escape
+    /// timeout (10ms), never the longer sequence timeout (100ms here).
+    #[test]
+    fn sequence_timeout_does_not_apply_to_lone_esc() {
+        let mut buffer = StdinBuffer::new(StdinBufferOptions {
+            timeout: Duration::from_millis(100),
+            ..StdinBufferOptions::default()
+        });
+        assert_eq!(buffer.process("\x1b"), []);
+        // The scheduled deadline is the ~10ms escape deadline even though the
+        // sequence timeout is 100ms; 20ms in the ESC flushes alone.
+        let deadline = buffer.flush_deadline().expect("escape deadline scheduled");
+        let remaining = deadline.duration_since(std::time::Instant::now());
+        assert!(
+            remaining <= Duration::from_millis(10),
+            "lone ESC must use the ~10ms escape deadline, not the 100ms \
+             sequence timeout; got {remaining:?}"
+        );
+        assert_eq!(
+            buffer.flush_expired(deadline + Duration::from_millis(10)),
+            ["\x1b"]
+        );
+        assert_eq!(data_events(&buffer.process("\r")), ["\r"]);
     }
 
     #[test]

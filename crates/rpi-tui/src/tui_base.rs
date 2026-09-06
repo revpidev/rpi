@@ -142,29 +142,11 @@ pub(crate) struct CursorPos {
 /// `TUI.MIN_RENDER_INTERVAL_MS` (tui.ts:309).
 const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 
-/// `RPI_HARDWARE_CURSOR` (ADR-0001 rename of `PI_HARDWARE_CURSOR`, tui.ts:312).
-const ENV_HARDWARE_CURSOR: &str = "RPI_HARDWARE_CURSOR";
-/// `RPI_CLEAR_ON_SHRINK` (ADR-0001 rename of `PI_CLEAR_ON_SHRINK`, tui.ts:313).
-const ENV_CLEAR_ON_SHRINK: &str = "RPI_CLEAR_ON_SHRINK";
-/// `RPI_CODING_AGENT_DIR` (ADR-0001 rename of `PI_CODING_AGENT_DIR`,
-/// tui.ts:332).
-const ENV_CODING_AGENT_DIR: &str = "RPI_CODING_AGENT_DIR";
-
-/// Upstream `process.env.X === "1"` checks.
+/// `RPI_TUI_DEBUG_REDRAW`-style `process.env.X === "1"` checks (the env
+/// names themselves live next to their consumers; the only configuration env
+/// rpi-tui still reads is its own debug face, see `tui_main_screen.rs`).
 pub(crate) fn env_flag_is_1(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
-}
-
-/// Default log directory: `~/.rpi/agent` (upstream `~/.pi/agent`, tui.ts:332).
-fn default_log_directory() -> PathBuf {
-    home_dir().join(".rpi").join("agent")
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Upstream `renderRequested` / `renderTimer` / `lastRenderAt` (tui.ts:306-308)
@@ -234,7 +216,10 @@ pub(crate) struct TuiBase {
     pub(crate) terminal_color_scheme_listeners: Vec<(u64, TerminalColorSchemeListener)>,
     pub(crate) terminal_color_scheme_notifications_enabled: bool,
     pub(crate) pending_terminal_color_scheme_queries: Vec<PendingTerminalColorSchemeQuery>,
-    pub(crate) log_directory: PathBuf,
+    /// Directory for debug/crash logs. When `None`, debug logging is
+    /// disabled and crash dumps fall back to the OS temp directory
+    /// (tui.ts:486-487 @ 9841914).
+    pub(crate) log_directory: Option<PathBuf>,
     pub(crate) focus_order_counter: u64,
     pub(crate) overlay_stack: Vec<OverlayStackEntry>,
     pub(crate) overlay_focus_restore: OverlayFocusRestoreState,
@@ -263,9 +248,13 @@ pub(crate) struct RenderedOverlayLayout {
 }
 
 impl TuiBase {
-    /// Upstream `TuiBase` constructor (tui.ts:363-370). `terminal`,
-    /// `schedule` and `size_cache` are created by the renderer handle first
-    /// (they are shared with it) and passed in here.
+    /// Upstream `TuiBase` constructor (tui.ts:363-370 → 478-502 @ 9841914,
+    /// c505f4c19 / #8699): the library no longer reads configuration env —
+    /// `showHardwareCursor` defaults to a hardcoded `false` when not passed
+    /// (same for `clearOnShrink`), and `logDirectory` has no fallback
+    /// (`undefined` stays `undefined`; the app layer injects it explicitly).
+    /// `terminal`, `schedule` and `size_cache` are created by the renderer
+    /// handle first (they are shared with it) and passed in here.
     pub(crate) fn new(
         terminal: SharedTerminal,
         show_hardware_cursor: Option<bool>,
@@ -279,9 +268,8 @@ impl TuiBase {
             focused_component: None,
             input_listeners: Vec::new(),
             on_debug: None,
-            show_hardware_cursor: show_hardware_cursor
-                .unwrap_or_else(|| env_flag_is_1(ENV_HARDWARE_CURSOR)),
-            clear_on_shrink: env_flag_is_1(ENV_CLEAR_ON_SHRINK),
+            show_hardware_cursor: show_hardware_cursor.unwrap_or(false),
+            clear_on_shrink: false,
             full_redraw_count: 0,
             stopped: false,
             pending_osc11_background_replies: 0,
@@ -289,9 +277,7 @@ impl TuiBase {
             terminal_color_scheme_listeners: Vec::new(),
             terminal_color_scheme_notifications_enabled: false,
             pending_terminal_color_scheme_queries: Vec::new(),
-            log_directory: log_directory
-                .or_else(|| std::env::var_os(ENV_CODING_AGENT_DIR).map(PathBuf::from))
-                .unwrap_or_else(default_log_directory),
+            log_directory,
             focus_order_counter: 0,
             overlay_stack: Vec::new(),
             overlay_focus_restore: OverlayFocusRestoreState::Inactive,

@@ -222,16 +222,6 @@ pub fn startup_benchmark_enabled() -> bool {
     is_truthy_env_flag(std::env::var(ENV_STARTUP_BENCHMARK).ok().as_deref())
 }
 
-/// `PI_DEBUG_REDRAW` (tui/src/tui.ts:1331) — Rpi rename (ADR-0001).
-pub const ENV_DEBUG_REDRAW: &str = "RPI_DEBUG_REDRAW";
-
-/// `process.env.PI_DEBUG_REDRAW === "1"` (tui.ts:1331).
-pub fn debug_redraw_enabled() -> bool {
-    std::env::var(ENV_DEBUG_REDRAW)
-        .map(|v| v == "1")
-        .unwrap_or(false)
-}
-
 /// `PI_TUI_WRITE_LOG` (tui/src/terminal.ts:112) — Rpi rename (ADR-0001).
 pub const ENV_TUI_WRITE_LOG: &str = "RPI_TUI_WRITE_LOG";
 
@@ -413,25 +403,25 @@ mod tests {
         assert!(!cache_retention_long());
     }
 
-    // Port of experimental.ts:2 / timings.ts:6 / tui.ts:1331 — exact "1".
+    // Port of experimental.ts:2 / timings.ts:6 / settings-manager.ts:1182 /
+    // settings-manager.ts:1098 — exact "1" (RPI_DEBUG_REDRAW was removed with
+    // the pi-tui env divorce, c505f4c19 / #8699 — upstream coding-agent no
+    // longer reads any redraw env).
     #[test]
     fn test_exact_one_flags() {
         let (_lock, _guard) = EnvGuard::set(&[
             (ENV_EXPERIMENTAL, None),
             (ENV_TIMING, None),
-            (ENV_DEBUG_REDRAW, None),
             (ENV_HARDWARE_CURSOR, None),
             (ENV_CLEAR_ON_SHRINK, None),
         ]);
         assert!(!experimental_enabled());
         assert!(!timing_enabled());
-        assert!(!debug_redraw_enabled());
         assert!(!hardware_cursor_enabled());
         assert!(!clear_on_shrink_enabled());
         for (name, _) in [
             (ENV_EXPERIMENTAL, ()),
             (ENV_TIMING, ()),
-            (ENV_DEBUG_REDRAW, ()),
             (ENV_HARDWARE_CURSOR, ()),
             (ENV_CLEAR_ON_SHRINK, ()),
         ] {
@@ -440,7 +430,6 @@ mod tests {
         // "true" is NOT accepted for the === "1" flags.
         assert!(!experimental_enabled());
         assert!(!timing_enabled());
-        assert!(!debug_redraw_enabled());
         assert!(!hardware_cursor_enabled());
         assert!(!clear_on_shrink_enabled());
         std::env::set_var(ENV_EXPERIMENTAL, "1");

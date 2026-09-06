@@ -52,6 +52,7 @@ use crate::tools::path_utils::{normalize_path, resolve_path};
 // Re-exported from rpi-tui to match upstream settings-manager re-exporting
 // TuiMode and ScrollViewScrollbar (settings-manager.ts:36, :138).
 pub use rpi_tui::components::scroll_view::ScrollbarMode;
+pub use rpi_tui::terminal_image::{ImageProtocol, TerminalCapabilityOverrides};
 pub use rpi_tui::tui::TuiMode;
 
 /// `DEFAULT_HTTP_IDLE_TIMEOUT_MS` (http-dispatcher.ts:4).
@@ -2069,6 +2070,30 @@ impl SettingsManager {
             .unwrap_or(true)
     }
 
+    /// `getTerminalCapabilityOverrides` (settings-manager.ts:1131-1141 @
+    /// 9841914, e86823096 / #8665): map `terminal.images` (`"kitty"`/
+    /// `"iterm2"` → protocol, `false` → disabled, `"auto"`/absent → no
+    /// override) and boolean `terminal.trueColor` / `terminal.hyperlinks`
+    /// (`"auto"`/absent → no override) into the programmatic capability
+    /// override set.
+    pub fn get_terminal_capability_overrides(&self) -> TerminalCapabilityOverrides {
+        let images = match self.settings.nested("terminal", "images") {
+            Some(Value::String(protocol)) if protocol == "kitty" => {
+                Some(Some(ImageProtocol::Kitty))
+            }
+            Some(Value::String(protocol)) if protocol == "iterm2" => {
+                Some(Some(ImageProtocol::ITerm2))
+            }
+            Some(Value::Bool(false)) => Some(None),
+            _ => None,
+        };
+        TerminalCapabilityOverrides {
+            images,
+            true_color: self.settings.nested_bool("terminal", "trueColor"),
+            hyperlinks: self.settings.nested_bool("terminal", "hyperlinks"),
+        }
+    }
+
     /// `setShowImages` (settings-manager.ts:1067-1074).
     pub fn set_show_images(&mut self, show: bool) {
         self.global_settings
@@ -3520,6 +3545,172 @@ mod tests {
     // =======================================================================
     // Field-level write persistence (settings-manager.ts:578-607)
     // =======================================================================
+
+    // =======================================================================
+    // Terminal capability overrides (settings-manager.ts:1131-1141)
+    // =======================================================================
+
+    // =======================================================================
+    // Env fallback chain: showHardwareCursor / clearOnShrink
+    // (settings-manager.ts:1093-1099, 1305-1308; V14-18 FR-A R4 — the env
+    // reads moved from pi-tui into the app layer, c505f4c19 / #8699, and the
+    // rpi binary's observable behavior must not change)
+    // =======================================================================
+
+    /// `getShowHardwareCursor` — setting first, then `RPI_HARDWARE_CURSOR
+    /// === "1"`, default false (settings-manager.ts:1305-1308).
+    #[test]
+    fn test_get_show_hardware_cursor_env_fallback_chain() {
+        // Each phase re-locks ENV_LOCK, so earlier guards are dropped in
+        // nested blocks.
+        {
+            let dirs = test_dirs();
+            let (_lock, _env) = EnvGuard::set(&[("RPI_HARDWARE_CURSOR", Some("1"))]);
+            let manager = create(&dirs);
+            assert!(manager.get_show_hardware_cursor(), "env=1 with no setting");
+
+            // The stored setting wins over the env.
+            write_json(&global_path(&dirs), json!({"showHardwareCursor": false}));
+            let manager = create(&dirs);
+            assert!(!manager.get_show_hardware_cursor());
+        }
+        // Env unset / not "1" → default false.
+        {
+            let dirs = test_dirs();
+            let (_lock, _env) = EnvGuard::set(&[("RPI_HARDWARE_CURSOR", None)]);
+            let manager = create(&dirs);
+            assert!(!manager.get_show_hardware_cursor());
+        }
+        {
+            let dirs = test_dirs();
+            let (_lock, _env) = EnvGuard::set(&[("RPI_HARDWARE_CURSOR", Some("true"))]);
+            let manager = create(&dirs);
+            assert!(!manager.get_show_hardware_cursor(), "===\"1\" is exact");
+        }
+    }
+
+    /// `getClearOnShrink` — setting first, then `RPI_CLEAR_ON_SHRINK === "1"`,
+    /// default false (settings-manager.ts:1093-1099).
+    #[test]
+    fn test_get_clear_on_shrink_env_fallback_chain() {
+        {
+            let dirs = test_dirs();
+            let (_lock, _env) = EnvGuard::set(&[("RPI_CLEAR_ON_SHRINK", Some("1"))]);
+            let manager = create(&dirs);
+            assert!(manager.get_clear_on_shrink(), "env=1 with no setting");
+
+            write_json(
+                &global_path(&dirs),
+                json!({"terminal": {"clearOnShrink": false}}),
+            );
+            let manager = create(&dirs);
+            assert!(!manager.get_clear_on_shrink());
+        }
+        {
+            let dirs = test_dirs();
+            let (_lock, _env) = EnvGuard::set(&[("RPI_CLEAR_ON_SHRINK", None)]);
+            let manager = create(&dirs);
+            assert!(!manager.get_clear_on_shrink());
+        }
+    }
+
+    /// FR-B R3 集成 seam（V14-18）：settings → `set_capability_overrides` →
+    /// `get_capabilities` 的完整注入链（interactive-mode.ts:522, 1940 @
+    /// 9841914 在 rpi 侧的两处调用即此 wiring）。`terminal.trueColor=false`
+    /// 设置在能力面生效。
+    #[test]
+    fn test_terminal_capability_overrides_compose_with_tui_layer() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({"terminal": {"trueColor": false, "hyperlinks": true}}),
+        );
+        let manager = create(&dirs);
+        let overrides = manager.get_terminal_capability_overrides();
+        // Same wiring as `interactive_mode.rs` `with_terminal` /
+        // `apply_runtime_settings`.
+        rpi_tui::terminal_image::set_capability_overrides(overrides);
+        let caps = rpi_tui::terminal_image::get_capabilities();
+        assert!(
+            !caps.true_color,
+            "terminal.trueColor=false must take effect"
+        );
+        assert!(caps.hyperlinks);
+        // Cleanup: restore defaults so later tests see no overrides.
+        rpi_tui::terminal_image::set_capability_overrides(Default::default());
+        rpi_tui::terminal_image::reset_capabilities_cache();
+    }
+
+    /// `getTerminalCapabilityOverrides` (settings-manager.ts:1131-1141 @
+    /// 9841914, e86823096 / #8665): `terminal.images` maps
+    /// `"kitty"`/`"iterm2"`/`false` and leaves `"auto"`/absent alone;
+    /// boolean `trueColor`/`hyperlinks` override while `"auto"`/absent do
+    /// not.
+    #[test]
+    fn test_get_terminal_capability_overrides_maps_settings() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({
+                "terminal": {
+                    "images": "kitty",
+                    "trueColor": false,
+                    "hyperlinks": true
+                }
+            }),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides {
+                images: Some(Some(ImageProtocol::Kitty)),
+                true_color: Some(false),
+                hyperlinks: Some(true),
+            }
+        );
+
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            json!({
+                "terminal": {
+                    "images": "iterm2",
+                    "trueColor": "auto",
+                    "hyperlinks": "auto"
+                }
+            }),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides {
+                images: Some(Some(ImageProtocol::ITerm2)),
+                true_color: None,
+                hyperlinks: None,
+            }
+        );
+
+        // `images: false` disables; `"auto"` and absent produce no override.
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"terminal": {"images": false}}));
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides {
+                images: Some(None),
+                true_color: None,
+                hyperlinks: None,
+            }
+        );
+
+        let dirs = test_dirs();
+        write_json(&global_path(&dirs), json!({"terminal": {"images": "auto"}}));
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_terminal_capability_overrides(),
+            TerminalCapabilityOverrides::default()
+        );
+    }
 
     /// Nested objects write per modified sub-key: sub-keys added externally
     /// on disk survive a nested write (settings-manager.ts:591-599).

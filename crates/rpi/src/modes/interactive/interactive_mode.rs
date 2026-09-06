@@ -4186,6 +4186,13 @@ impl InteractiveMode {
         let show_hardware_cursor =
             session.settings_manager(|settings| settings.get_show_hardware_cursor());
         let clear_on_shrink = session.settings_manager(|settings| settings.get_clear_on_shrink());
+        // `setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides())`
+        // (interactive-mode.ts:522 @ 9841914, e86823096 / #8665): the JSON
+        // `terminal.{hyperlinks,images,trueColor}` settings are injected as
+        // programmatic overrides before any renderer queries capabilities.
+        rpi_tui::terminal_image::set_capability_overrides(
+            session.settings_manager(|settings| settings.get_terminal_capability_overrides()),
+        );
         // Shared fullscreen theme handle (tui-renderer.ts:21-40): the
         // search-style and jump-indicator closures capture it; `apply_theme`
         // swaps the inner Arc so every closure follows theme changes.

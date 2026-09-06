@@ -4,7 +4,10 @@
 //! Port of `packages/tui/src/terminal-image.ts` @ pi 0.82.1 (2efa728), with
 //! `detect_capabilities_with` tracking the 4181f66 revision (fa07e7bd9:
 //! Windows consoles fall back to truecolor when no terminal is positively
-//! identified). The Kitty image metadata registry
+//! identified) and the capability-override layer (env
+//! `RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + programmatic
+//! `set_capability_overrides`, e86823096 / #8665) and the Zed branch
+//! (`649214477` / #8828) tracking 9841914. The Kitty image metadata registry
 //! (`register_kitty_image_metadata` / `get_kitty_image_metadata` /
 //! `crop_kitty_image_line` / `get_kitty_image_placement`) and the
 //! `render_image` registration call also track the 4181f66 revision
@@ -53,6 +56,16 @@ pub struct TerminalCapabilities {
     pub hyperlinks: bool,
 }
 
+/// `Partial<TerminalCapabilities>` — the programmatic override set of
+/// [`set_capability_overrides`] (terminal-image.ts:29, 170-182 @ 9841914).
+/// `None` = not overridden; `images: Some(None)` = explicitly disabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TerminalCapabilityOverrides {
+    pub images: Option<Option<ImageProtocol>>,
+    pub true_color: Option<bool>,
+    pub hyperlinks: Option<bool>,
+}
+
 /// `CellDimensions` (terminal-image.ts:11-14).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CellDimensions {
@@ -99,6 +112,15 @@ static CELL_DIMENSIONS: Mutex<CellDimensions> = Mutex::new(CellDimensions::DEFAU
 
 static CACHED_CAPABILITIES: Mutex<Option<TerminalCapabilities>> = Mutex::new(None);
 
+/// `capabilityOverrides` (terminal-image.ts:29) — programmatic overrides
+/// applied on top of environment detection by `get_capabilities`.
+static CAPABILITY_OVERRIDES: Mutex<TerminalCapabilityOverrides> =
+    Mutex::new(TerminalCapabilityOverrides {
+        images: None,
+        true_color: None,
+        hyperlinks: None,
+    });
+
 fn lock_cell_dimensions() -> std::sync::MutexGuard<'static, CellDimensions> {
     CELL_DIMENSIONS
         .lock()
@@ -109,6 +131,30 @@ fn lock_cached_capabilities() -> std::sync::MutexGuard<'static, Option<TerminalC
     CACHED_CAPABILITIES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_capability_overrides() -> std::sync::MutexGuard<'static, TerminalCapabilityOverrides> {
+    CAPABILITY_OVERRIDES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// `RPI_HYPERLINKS` (ADR-0001 rename of `PI_HYPERLINKS`, e86823096 / #8665).
+const ENV_HYPERLINKS: &str = "RPI_HYPERLINKS";
+/// `RPI_IMAGE_PROTOCOL` (ADR-0001 rename of `PI_IMAGE_PROTOCOL`).
+const ENV_IMAGE_PROTOCOL: &str = "RPI_IMAGE_PROTOCOL";
+/// `RPI_TRUE_COLOR` (ADR-0001 rename of `PI_TRUE_COLOR`).
+const ENV_TRUE_COLOR: &str = "RPI_TRUE_COLOR";
+
+/// `parseBooleanCapabilityOverride` (terminal-image.ts:130-132):
+/// `"1"` → `Some(true)`, `"0"` → `Some(false)`, anything else (unset
+/// included) → `None` (no override).
+fn parse_boolean_capability_override(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
 }
 
 /// `getCellDimensions` (terminal-image.ts:36-38).
@@ -189,12 +235,52 @@ pub fn detect_capabilities() -> TerminalCapabilities {
 }
 
 /// `detectCapabilities(tmuxForwardsHyperlink)` (terminal-image.ts:65-133
-/// @ 4181f66).
+/// @ 4181f66 → 134-157 @ 9841914, e86823096 / #8665): environment detection
+/// with the capability env overrides applied on top — an overridden
+/// `RPI_HYPERLINKS` also replaces the tmux probe (constant closure) so the
+/// probe is not spawned; `RPI_IMAGE_PROTOCOL` accepts `kitty`/`iterm2`
+/// (protocol), `none`/`0` (disabled); `RPI_TRUE_COLOR` takes `1`/`0`.
+/// Unset/ unrecognized values preserve the auto-detection result.
 pub fn detect_capabilities_with(
     tmux_forwards_hyperlink: impl Fn() -> bool,
 ) -> TerminalCapabilities {
-    // `isWindowsConsole = process.platform === "win32"` (terminal-image.ts:74).
-    detect_capabilities_inner(cfg!(windows), tmux_forwards_hyperlink)
+    detect_capabilities_env(cfg!(windows), &tmux_forwards_hyperlink)
+}
+
+fn detect_capabilities_env(
+    is_windows_console: bool,
+    tmux_forwards_hyperlink: &dyn Fn() -> bool,
+) -> TerminalCapabilities {
+    let hyperlinks =
+        parse_boolean_capability_override(std::env::var(ENV_HYPERLINKS).ok().as_deref());
+    let detected = match hyperlinks {
+        Some(hyperlinks) => detect_capabilities_inner(is_windows_console, move || hyperlinks),
+        None => detect_capabilities_inner(is_windows_console, tmux_forwards_hyperlink),
+    };
+    // `process.env.PI_IMAGE_PROTOCOL?.toLowerCase()` — "kitty"/"iterm2" map
+    // to the protocol, "none"/"0" disable images, anything else (unset
+    // included) leaves the detected value (terminal-image.ts:141-146).
+    let image_protocol = env_var(ENV_IMAGE_PROTOCOL).to_lowercase();
+    let images = match image_protocol.as_str() {
+        "kitty" => Some(Some(ImageProtocol::Kitty)),
+        "iterm2" => Some(Some(ImageProtocol::ITerm2)),
+        "none" | "0" => Some(None),
+        _ => None,
+    };
+    let true_color =
+        parse_boolean_capability_override(std::env::var(ENV_TRUE_COLOR).ok().as_deref());
+
+    let mut capabilities = detected;
+    if let Some(images) = images {
+        capabilities.images = images;
+    }
+    if let Some(true_color) = true_color {
+        capabilities.true_color = true_color;
+    }
+    if let Some(hyperlinks) = hyperlinks {
+        capabilities.hyperlinks = hyperlinks;
+    }
+    capabilities
 }
 
 /// Body of `detectCapabilities` with the platform check explicit so tests can
@@ -280,15 +366,11 @@ fn detect_capabilities_inner(
         };
     }
 
-    if term_program == "vscode" {
-        return TerminalCapabilities {
-            images: None,
-            true_color: true,
-            hyperlinks: true,
-        };
-    }
-
-    if term_program == "alacritty" {
+    // `termProgram === "alacritty" || termProgram === "vscode" ||
+    // termProgram === "zed"` (terminal-image.ts:112-115 @ 9841914;
+    // `zed` joined in 649214477 / #8828): truecolor + hyperlinks on, images
+    // off.
+    if term_program == "alacritty" || term_program == "vscode" || term_program == "zed" {
         return TerminalCapabilities {
             images: None,
             true_color: true,
@@ -327,15 +409,48 @@ fn detect_capabilities_inner(
     }
 }
 
-/// `getCapabilities` (terminal-image.ts:127-132).
+/// `getCapabilities` (terminal-image.ts:159-168 @ 9841914): cached; the
+/// programmatic overrides replace the tmux probe when hyperlinks are
+/// overridden (so the probe is not spawned) and then spread over the
+/// detected capabilities — programmatic wins over both detection and env.
 pub fn get_capabilities() -> TerminalCapabilities {
     let mut cache = lock_cached_capabilities();
-    *cache.get_or_insert_with(detect_capabilities)
+    *cache.get_or_insert_with(|| {
+        let overrides = *lock_capability_overrides();
+        let mut capabilities = match overrides.hyperlinks {
+            Some(hyperlinks) => detect_capabilities_with(move || hyperlinks),
+            None => detect_capabilities(),
+        };
+        if let Some(images) = overrides.images {
+            capabilities.images = images;
+        }
+        if let Some(true_color) = overrides.true_color {
+            capabilities.true_color = true_color;
+        }
+        if let Some(hyperlinks) = overrides.hyperlinks {
+            capabilities.hyperlinks = hyperlinks;
+        }
+        capabilities
+    })
 }
 
 /// `resetCapabilitiesCache` (terminal-image.ts:134-136).
 pub fn reset_capabilities_cache() {
     *lock_cached_capabilities() = None;
+}
+
+/// `setCapabilityOverrides` (terminal-image.ts:170-182 @ 9841914,
+/// e86823096 / #8665): replace the programmatic overrides and invalidate
+/// the capabilities cache; a no-op when unchanged (keeps a populated cache).
+pub fn set_capability_overrides(overrides: TerminalCapabilityOverrides) {
+    {
+        let mut current = lock_capability_overrides();
+        if *current == overrides {
+            return;
+        }
+        *current = overrides;
+    }
+    reset_capabilities_cache();
 }
 
 /// `setCapabilities` (terminal-image.ts:138-141): override the cached
@@ -1049,7 +1164,7 @@ mod tests {
     /// `withEnv` (terminal-image.test.ts:37-55): clears every capability env
     /// var, applies `overrides` (None = unset), runs `f`, then restores.
     fn with_env(overrides: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        const ENV_KEYS: [&str; 13] = [
+        const ENV_KEYS: [&str; 16] = [
             "TERM",
             "TERM_PROGRAM",
             "TERMINAL_EMULATOR",
@@ -1063,6 +1178,9 @@ mod tests {
             "CMUX_WORKSPACE_ID",
             "WARP_SESSION_ID",
             "WARP_TERMINAL_SESSION_UUID",
+            "RPI_HYPERLINKS",
+            "RPI_IMAGE_PROTOCOL",
+            "RPI_TRUE_COLOR",
         ];
         let _guard = TEST_STATE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let saved: Vec<(&str, Option<String>)> = ENV_KEYS
@@ -1453,6 +1571,182 @@ mod tests {
         with_env(&[("TERM_PROGRAM", Some("vscode"))], || {
             let caps = detect_capabilities();
             assert!(caps.hyperlinks);
+        });
+    }
+
+    /// "enables Alacritty capabilities for Zed" (terminal-image.test.ts:404-408,
+    /// 649214477 / #8828).
+    #[test]
+    fn test_detect_capabilities_enables_alacritty_capabilities_for_zed() {
+        with_env(&[("TERM_PROGRAM", Some("zed"))], || {
+            assert_eq!(
+                detect_capabilities(),
+                TerminalCapabilities {
+                    images: None,
+                    true_color: true,
+                    hyperlinks: true,
+                }
+            );
+        });
+    }
+
+    /// "applies environment overrides" (terminal-image.test.ts:228-238,
+    /// e86823096 / #8665).
+    #[test]
+    fn test_detect_capabilities_applies_environment_overrides() {
+        with_env(
+            &[
+                ("RPI_HYPERLINKS", Some("1")),
+                ("RPI_IMAGE_PROTOCOL", Some("kitty")),
+                ("RPI_TRUE_COLOR", Some("1")),
+            ],
+            || {
+                assert_eq!(
+                    detect_capabilities(),
+                    TerminalCapabilities {
+                        images: Some(ImageProtocol::Kitty),
+                        true_color: true,
+                        hyperlinks: true,
+                    }
+                );
+            },
+        );
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("iterm.app")),
+                ("RPI_HYPERLINKS", Some("0")),
+                ("RPI_IMAGE_PROTOCOL", Some("none")),
+                ("RPI_TRUE_COLOR", Some("0")),
+            ],
+            || {
+                assert_eq!(
+                    detect_capabilities(),
+                    TerminalCapabilities {
+                        images: None,
+                        true_color: false,
+                        hyperlinks: false,
+                    }
+                );
+            },
+        );
+    }
+
+    /// "preserves auto-detection for auto environment overrides"
+    /// (terminal-image.test.ts:240-254): unrecognized values ("auto") leave
+    /// the detected capabilities untouched.
+    #[test]
+    fn test_detect_capabilities_preserves_auto_detection_for_auto_overrides() {
+        with_env(
+            &[
+                ("TERM_PROGRAM", Some("ghostty")),
+                ("RPI_HYPERLINKS", Some("auto")),
+                ("RPI_IMAGE_PROTOCOL", Some("auto")),
+                ("RPI_TRUE_COLOR", Some("auto")),
+            ],
+            || {
+                assert_eq!(
+                    detect_capabilities(),
+                    TerminalCapabilities {
+                        images: Some(ImageProtocol::Kitty),
+                        true_color: true,
+                        hyperlinks: true,
+                    }
+                );
+            },
+        );
+    }
+
+    /// "applies and clears programmatic overrides"
+    /// (terminal-image.test.ts:256-268).
+    #[test]
+    fn test_capability_overrides_apply_and_clear() {
+        // `with_env` alone serializes against the other capability tests via
+        // `TEST_STATE_LOCK` (nesting `with_globals` inside would deadlock on
+        // the same non-reentrant lock).
+        with_env(
+            &[
+                ("RPI_HYPERLINKS", Some("1")),
+                ("RPI_IMAGE_PROTOCOL", Some("kitty")),
+                ("RPI_TRUE_COLOR", Some("1")),
+            ],
+            || {
+                set_capability_overrides(TerminalCapabilityOverrides {
+                    images: Some(None),
+                    true_color: Some(false),
+                    hyperlinks: Some(false),
+                });
+                assert_eq!(
+                    get_capabilities(),
+                    TerminalCapabilities {
+                        images: None,
+                        true_color: false,
+                        hyperlinks: false,
+                    }
+                );
+                set_capability_overrides(TerminalCapabilityOverrides::default());
+                assert_eq!(
+                    get_capabilities(),
+                    TerminalCapabilities {
+                        images: Some(ImageProtocol::Kitty),
+                        true_color: true,
+                        hyperlinks: true,
+                    }
+                );
+                // Cleanup mirrors the upstream `finally` block.
+                set_capability_overrides(TerminalCapabilityOverrides::default());
+                reset_capabilities_cache();
+            },
+        );
+    }
+
+    /// "bypasses the tmux probe when hyperlinks are overridden"
+    /// (terminal-image.test.ts:270-284): the constant closure replaces the
+    /// probe so it is never spawned.
+    #[test]
+    fn test_detect_capabilities_bypasses_tmux_probe_when_hyperlinks_overridden() {
+        let probed = std::sync::atomic::AtomicBool::new(false);
+        with_env(
+            &[
+                ("TMUX", Some("/tmp/tmux-1000/default,1234,0")),
+                ("RPI_HYPERLINKS", Some("1")),
+                ("RPI_IMAGE_PROTOCOL", Some("kitty")),
+            ],
+            || {
+                let caps = detect_capabilities_with(|| {
+                    probed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    false
+                });
+                assert!(!probed.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(caps.hyperlinks);
+                assert_eq!(caps.images, Some(ImageProtocol::Kitty));
+            },
+        );
+    }
+
+    /// `setCapabilityOverrides` no-ops (keeps the cache) when the overrides
+    /// are unchanged (terminal-image.ts:171-177).
+    #[test]
+    fn test_set_capability_overrides_noop_when_unchanged() {
+        with_globals(|| {
+            set_capability_overrides(TerminalCapabilityOverrides {
+                images: Some(None),
+                true_color: None,
+                hyperlinks: None,
+            });
+            // Prime the cache with the override applied.
+            let cached = get_capabilities();
+            assert_eq!(cached.images, None);
+            // Same overrides again: the cache must stay populated (the
+            // identity check via an env that would change detection).
+            set_capability_overrides(TerminalCapabilityOverrides {
+                images: Some(None),
+                true_color: None,
+                hyperlinks: None,
+            });
+            assert_eq!(get_capabilities(), cached);
+            // Cleanup.
+            set_capability_overrides(TerminalCapabilityOverrides::default());
+            reset_capabilities_cache();
         });
     }
 

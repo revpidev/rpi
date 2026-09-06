@@ -92,14 +92,20 @@
 //!   is not reported by `TuiMainScreen::next_deadline` /
 //!   `TuiMainScreen::has_pending_work`, so the host loop can sleep until the
 //!   restart.
-//! - Env vars renamed per ADR-0001: `PI_HARDWARE_CURSOR` →
-//!   `RPI_HARDWARE_CURSOR`, `PI_CLEAR_ON_SHRINK` → `RPI_CLEAR_ON_SHRINK`,
-//!   `PI_DEBUG_REDRAW` → `RPI_DEBUG_REDRAW`, `PI_TUI_DEBUG` →
-//!   `RPI_TUI_DEBUG`, `PI_CODING_AGENT_DIR` → `RPI_CODING_AGENT_DIR`; the
-//!   default log directory is `~/.rpi/agent` (upstream `~/.pi/agent`). Log
-//!   files: `pi-debug.log` → `rpi-debug.log`, `pi-crash.log` →
-//!   `rpi-crash.log`; the `RPI_TUI_DEBUG` dump directory is `/tmp/rpi-tui`
-//!   (upstream `/tmp/tui`).
+//! - Env contract per ADR-0001 + c505f4c19 / #8699 (9841914, V14-18 FR-A):
+//!   the library no longer reads any coding-agent configuration env —
+//!   `show_hardware_cursor` / `clear_on_shrink` default to `false` and
+//!   `log_directory` passes through as-is (`None` = debug logging disabled,
+//!   crash dumps to the OS temp dir); the app layer (rpi crate) reads
+//!   `RPI_HARDWARE_CURSOR` / `RPI_CLEAR_ON_SHRINK` itself and injects the
+//!   agent directory explicitly. The library's own debug face is
+//!   `RPI_TUI_DEBUG_REDRAW` (upstream `PI_TUI_DEBUG_REDRAW`, renamed from
+//!   `PI_DEBUG_REDRAW`; ADR-0001 prefix mapping of the *new* upstream name),
+//!   `RPI_TUI_DEBUG` (upstream `PI_TUI_DEBUG`) and `RPI_TUI_WRITE_LOG`
+//!   (upstream `PI_TUI_WRITE_LOG`). Log files: `rpi-tui-debug.log` /
+//!   `rpi-tui-crash.log` (upstream `pi-tui-debug.log` / `pi-tui-crash.log`);
+//!   the `RPI_TUI_DEBUG` dump directory is `/tmp/rpi-tui` (upstream
+//!   `/tmp/tui`).
 //! - `SizeValue` is an enum; upstream's invalid-percentage-string fallback
 //!   (`"abc%"` → anchor center) applies to negative/NaN percent values.
 //! - `add_input_listener` / `on_terminal_color_scheme_change` return numeric
@@ -109,7 +115,7 @@
 //!   `TuiMainScreen::tick`.
 //! - The width-overflow path truncates the line with `slice_by_column` and
 //!   continues rendering (ADR-0020, deviation D-086; upstream stops the TUI
-//!   and throws). A diagnostic snapshot is still written to `rpi-crash.log`
+//!   and throws). A diagnostic snapshot is still written to `rpi-tui-crash.log`
 //!   (header notes render continued; deduplicated per offending line). Lines
 //!   whose pessimistic width (`visible_width` + `width_divergence_extra`)
 //!   exceeds the terminal width are truncated until they fit pessimistically,

@@ -29,9 +29,16 @@
 //! - Resize: on unix, SIGWINCH is forwarded by a tokio task when `start()` is
 //!   called inside a tokio runtime; without a runtime no resize events are
 //!   delivered. Upstream's Windows console resize events (libuv `resize`)
-//!   and the self-SIGWINCH dimension refresh (terminal.ts:152-156) are not
-//!   ported — crossterm's `terminal::size()` queries the ioctl on every
-//!   call, so dimensions can never go stale across suspend/resume.
+//!   and the self-SIGWINCH dimension refresh (terminal.ts:44-58 @ 9841914,
+//!   `refreshTerminalDimensions`) are not ported — crossterm's
+//!   `terminal::size()` queries the ioctl on every call, so dimensions can
+//!   never go stale across suspend/resume. Upstream wraps the self-signal in
+//!   try/catch because restricted seccomp/LSM policies return EACCES for
+//!   `kill(2)` (605a1b038 / #8898) — that crash surface does not exist here
+//!   (no self-signal is sent anywhere; the forwarder only *listens* for
+//!   SIGWINCH). Preventive clause: if a self-signal refresh is ever
+//!   introduced, the send must ignore `Err` returns (EPERM/EACCES), matching
+//!   the upstream catch-and-skip semantics (V14-18 FR-D).
 //! - Raw mode: the previous state is captured with crossterm's
 //!   `is_raw_mode_enabled()` (upstream `process.stdin.isRaw || false`).
 //!   `process.stdin.pause()` in `stop()` (terminal.ts:446) has no Rust
@@ -78,7 +85,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::keys::set_kitty_protocol_active;
 use crate::native_modifiers::{is_native_modifier_pressed, ModifierKey};
-use crate::stdin_buffer::{StdinBuffer, StdinBufferEvent};
+use crate::stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 
 /// `TERMINAL_PROGRESS_KEEPALIVE_MS` (terminal.ts:11).
 const TERMINAL_PROGRESS_KEEPALIVE: Duration = Duration::from_millis(1000);
@@ -156,6 +163,45 @@ fn is_keyboard_protocol_negotiation_sequence_prefix(sequence: &str) -> bool {
 /// `isAppleTerminalSession` (terminal.ts:40-42).
 pub fn is_apple_terminal_session() -> bool {
     cfg!(target_os = "macos") && std::env::var("TERM_PROGRAM").as_deref() == Ok("Apple_Terminal")
+}
+
+/// `DEFAULT_ESCAPE_TIMEOUT_MS` (terminal.ts:118 @ 9841914).
+const DEFAULT_ESCAPE_TIMEOUT: Duration = Duration::from_millis(10);
+/// `DEFAULT_SSH_ESCAPE_TIMEOUT_MS` (terminal.ts:119 @ 9841914): legacy
+/// Alt+key input is ESC plus another byte; high-latency transports need a
+/// longer reassembly window.
+const DEFAULT_SSH_ESCAPE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// `resolveEscapeTimeoutMs` (terminal.ts:117-135 @ 9841914, 06ed87167 +
+/// 2a95ef70d / #7899): how long to wait for the rest of an escape sequence
+/// before dispatching a lone ESC as the Escape key. `RPI_TUI_ESC_TIMEOUT`
+/// (ADR-0001 rename of `PI_TUI_ESC_TIMEOUT`) wins when it parses as a finite
+/// positive number of milliseconds (JS `Number()` semantics: whitespace is
+/// trimmed, garbage is `NaN`); otherwise an SSH session
+/// (`SSH_CONNECTION`/`SSH_TTY`) gets 100ms, everything else 10ms.
+///
+/// The `getenv` seam mirrors upstream's `env` parameter for tests.
+pub fn resolve_escape_timeout_ms_with(getenv: impl Fn(&str) -> Option<String>) -> Duration {
+    let configured =
+        getenv("RPI_TUI_ESC_TIMEOUT").and_then(|value| value.trim().parse::<f64>().ok());
+    if let Some(configured) = configured {
+        if configured.is_finite() && configured > 0.0 {
+            // Fractional milliseconds round-trip through `Duration`
+            // (`Number("12.5")` stays 12.5 upstream); absurd magnitudes
+            // saturate instead of panicking (a JS `setTimeout` of 1e30 simply
+            // never fires).
+            return Duration::try_from_secs_f64(configured / 1000.0).unwrap_or(Duration::MAX);
+        }
+    }
+    if getenv("SSH_CONNECTION").is_some() || getenv("SSH_TTY").is_some() {
+        return DEFAULT_SSH_ESCAPE_TIMEOUT;
+    }
+    DEFAULT_ESCAPE_TIMEOUT
+}
+
+/// `resolveEscapeTimeoutMs()` with the real environment (terminal.ts:217).
+pub fn resolve_escape_timeout_ms() -> Duration {
+    resolve_escape_timeout_ms_with(|key| std::env::var(key).ok())
 }
 
 /// `normalizeNativeShiftEnterInput` (terminal.ts:44-51 @ 4181f66, 73dd066ee).
@@ -451,10 +497,16 @@ impl<W: Write> ProcessTerminal<W> {
     /// The upstream `process.stdin.on("data", ...)` wiring corresponds to the
     /// reader thread + channel set up in `start()`.
     fn query_and_enable_kitty_protocol(&mut self) {
-        // `setupStdinBuffer` (terminal.ts:177-205): `new StdinBuffer({ timeout: 10 })`
-        // (10ms is the StdinBuffer default). The upstream `data`/`paste`
-        // handlers correspond to `handle_stdin_data` / `route_data_sequence`.
-        self.stdin_buffer = Some(StdinBuffer::default());
+        // `setupStdinBuffer` (terminal.ts:177-205 → 209-228 @ 9841914):
+        // `new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() })`
+        // (terminal.ts:217) — only the escape timeout is injected; the
+        // sequence timeout stays at the 50ms default (stdin-buffer.ts:23).
+        // The upstream `data`/`paste` handlers correspond to
+        // `handle_stdin_data` / `route_data_sequence`.
+        self.stdin_buffer = Some(StdinBuffer::new(StdinBufferOptions {
+            escape_timeout: resolve_escape_timeout_ms(),
+            ..StdinBufferOptions::default()
+        }));
         self.keyboard_protocol_pushed = true;
         self.clear_keyboard_protocol_negotiation_buffer();
         // `KITTY_KEYBOARD_PROTOCOL_QUERY` (terminal.ts:17).
@@ -1192,6 +1244,76 @@ mod tests {
 
     // --- normalizeNativeShiftEnterInput (upstream describe
     //     "normalizeNativeShiftEnterInput", terminal.test.ts @ 4181f66, 73dd066ee) ---
+
+    // --- resolveEscapeTimeoutMs (terminal.ts:117-135 @ 9841914, 06ed87167 +
+    //     2a95ef70d / #7899; V14-18 FR-E R1) ---
+
+    fn env_map<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+    #[test]
+    fn resolve_escape_timeout_defaults_to_10ms() {
+        assert_eq!(
+            resolve_escape_timeout_ms_with(|_| None),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn resolve_escape_timeout_env_wins_when_finite_positive() {
+        let env = env_map(&[("RPI_TUI_ESC_TIMEOUT", "100")]);
+        assert_eq!(
+            resolve_escape_timeout_ms_with(env),
+            Duration::from_millis(100)
+        );
+        // Fractional and whitespace-padded values pass through JS `Number()`.
+        let env = env_map(&[("RPI_TUI_ESC_TIMEOUT", " 12.5 ")]);
+        assert_eq!(
+            resolve_escape_timeout_ms_with(env),
+            Duration::from_micros(12_500)
+        );
+        // The env override beats the SSH detection.
+        let env = env_map(&[
+            ("RPI_TUI_ESC_TIMEOUT", "25"),
+            ("SSH_CONNECTION", "10.0.0.1 5555 10.0.0.2 22"),
+        ]);
+        assert_eq!(
+            resolve_escape_timeout_ms_with(env),
+            Duration::from_millis(25)
+        );
+    }
+
+    #[test]
+    fn resolve_escape_timeout_ignores_invalid_values() {
+        // 0 / negative / garbage / non-finite are not finite positives.
+        for value in ["0", "-5", "", "abc", "1e999", "NaN"] {
+            let pairs = [("RPI_TUI_ESC_TIMEOUT", value)];
+            let env = env_map(&pairs);
+            assert_eq!(
+                resolve_escape_timeout_ms_with(env),
+                Duration::from_millis(10),
+                "value {value:?} must fall through to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_escape_timeout_ssh_gets_100ms() {
+        for key in ["SSH_CONNECTION", "SSH_TTY"] {
+            let pairs = [(key, "/dev/pts/3")];
+            let env = env_map(&pairs);
+            assert_eq!(
+                resolve_escape_timeout_ms_with(env),
+                Duration::from_millis(100),
+                "SSH indicator {key} must raise the timeout"
+            );
+        }
+    }
 
     #[test]
     fn rewrites_return_to_csi_u_shift_enter_when_native_detection_enabled_and_shift_pressed() {

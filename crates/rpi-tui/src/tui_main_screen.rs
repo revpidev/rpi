@@ -108,8 +108,10 @@ fn extract_kitty_image_rows(line: &str) -> usize {
         .unwrap_or(1)
 }
 
-/// `RPI_DEBUG_REDRAW` (ADR-0001 rename of `PI_DEBUG_REDRAW`, tui.ts:1331).
-const ENV_DEBUG_REDRAW: &str = "RPI_DEBUG_REDRAW";
+/// `RPI_TUI_DEBUG_REDRAW` (ADR-0001 rename of `PI_TUI_DEBUG_REDRAW`,
+/// tui-main-screen.ts:321 @ 9841914; upstream renamed `PI_DEBUG_REDRAW` in
+/// c505f4c19 / #8699 — pi-tui no longer reads coding-agent env).
+const ENV_DEBUG_REDRAW: &str = "RPI_TUI_DEBUG_REDRAW";
 /// `RPI_TUI_DEBUG` (ADR-0001 rename of `PI_TUI_DEBUG`, tui.ts:1577).
 const ENV_TUI_DEBUG: &str = "RPI_TUI_DEBUG";
 
@@ -221,7 +223,7 @@ pub(crate) struct TuiMainScreenInner {
     hardware_cursor_row: i32,
     max_lines_rendered: usize,
     previous_viewport_top: i32,
-    /// ADR-0020: content of the last overwide line logged to `rpi-crash.log`;
+    /// ADR-0020: content of the last overwide line logged to `rpi-tui-crash.log`;
     /// deduplicates the diagnostic snapshot while a persistent overwide line
     /// streams (render no longer stops on the first offense).
     last_overwide_log_line: Option<String>,
@@ -1145,7 +1147,7 @@ impl TuiMainScreenInner {
     /// 1. Overwide lines (`visible_width > width`) are truncated with
     ///    `slice_by_column`, like the alt-screen renderer does
     ///    (`tui_alt_screen.rs`), so a component bug cannot kill the session; a
-    ///    diagnostic snapshot is still written to `rpi-crash.log`.
+    ///    diagnostic snapshot is still written to `rpi-tui-crash.log`.
     /// 2. Lines whose pessimistic width (`visible_width` +
     ///    `width_divergence_extra`) exceeds the terminal width are truncated
     ///    until they fit pessimistically, so a terminal that renders
@@ -1187,7 +1189,15 @@ impl TuiMainScreenInner {
         if self.last_overwide_log_line.as_deref() == Some(line) {
             return;
         }
-        let crash_log_path = self.log_directory.join("rpi-crash.log");
+        // Upstream crash dump: `path.join(this.logDirectory ?? os.tmpdir(),
+        // "pi-tui-crash.log")` (tui-main-screen.ts:519 @ 9841914); without a
+        // log directory the dump goes to the OS temp dir. This rpi-side
+        // width-guard variant (ADR-0020/D-086) shares the same file.
+        let crash_log_path = self
+            .log_directory
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("rpi-tui-crash.log");
         let mut crash_data = format!(
             "Overwide rendered line truncated at {} (render continued; not a crash)\nTerminal width: {}\nLine {} visible width: {}\n\n=== All rendered lines ===\n",
             iso_timestamp_now(),
@@ -1210,13 +1220,21 @@ impl TuiMainScreenInner {
         }
     }
 
-    /// `logRedraw` (tui.ts:1331-1338); env var renamed to `RPI_DEBUG_REDRAW`
-    /// (ADR-0001) and the log file to `rpi-debug.log`.
+    /// `logRedraw` (tui-main-screen.ts:321-330 @ 9841914); env var renamed
+    /// `PI_DEBUG_REDRAW` → `PI_TUI_DEBUG_REDRAW` (ADR-0001: `RPI_TUI_DEBUG_REDRAW`)
+    /// and the log file `pi-debug.log` → `pi-tui-debug.log` (`rpi-tui-debug.log`)
+    /// by c505f4c19 / #8699. With no `logDirectory` the redraw log is fully
+    /// disabled even when the env is set (upstream: `PI_TUI_DEBUG_REDRAW === "1"
+    /// ? this.logDirectory : undefined`, `redrawLogDirectory === undefined`
+    /// returns early).
     fn log_redraw(&self, reason: &str, new_lines_len: usize, height: i32) {
         if !env_flag_is_1(ENV_DEBUG_REDRAW) {
             return;
         }
-        let log_path = self.log_directory.join("rpi-debug.log");
+        let Some(log_directory) = &self.log_directory else {
+            return;
+        };
+        let log_path = log_directory.join("rpi-tui-debug.log");
         let message = format!(
             "[{}] fullRender: {} (prev={}, new={}, height={})\n",
             iso_timestamp_now(),
@@ -2188,6 +2206,36 @@ mod tests {
     // tui-render.test.ts: "TUI debug logging"
     // -------------------------------------------------------------------------
 
+    /// c505f4c19 / #8699 (V14-18 FR-A R1): the library hardcodes `false`
+    /// defaults for `show_hardware_cursor` / `clear_on_shrink` and no longer
+    /// reads `RPI_HARDWARE_CURSOR` / `RPI_CLEAR_ON_SHRINK` (the app layer
+    /// reads them and injects explicitly; tui.ts:478-502 @ 9841914). Explicit
+    /// construction parameters still pass through.
+    #[test]
+    fn constructor_defaults_ignore_capability_env() {
+        let _lock = state_lock();
+        let _env_a = EnvGuard::set("RPI_HARDWARE_CURSOR", Some("1"));
+        let _env_b = EnvGuard::set("RPI_CLEAR_ON_SHRINK", Some("1"));
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::new(Box::new(terminal));
+        assert!(
+            !tui.get_show_hardware_cursor(),
+            "library must not read RPI_HARDWARE_CURSOR"
+        );
+        assert!(
+            !tui.get_clear_on_shrink(),
+            "library must not read RPI_CLEAR_ON_SHRINK"
+        );
+
+        // Explicit injection still works (upstream `if (showHardwareCursor !==
+        // undefined)` pass-through).
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::with_options(Box::new(terminal), Some(true), None);
+        assert!(tui.get_show_hardware_cursor());
+        tui.set_clear_on_shrink(true);
+        assert!(tui.get_clear_on_shrink());
+    }
+
     #[test]
     fn debug_logging_writes_redraw_logs_to_the_provided_directory() {
         let _lock = state_lock();
@@ -2202,13 +2250,67 @@ mod tests {
         tui.start();
         settle(&tui);
 
-        let log = std::fs::read_to_string(log_dir.join("rpi-debug.log"))
-            .unwrap_or_else(|err| panic!("missing rpi-debug.log: {err}"));
+        let log = std::fs::read_to_string(log_dir.join("rpi-tui-debug.log"))
+            .unwrap_or_else(|err| panic!("missing rpi-tui-debug.log: {err}"));
         assert!(
             log.contains("fullRender: first render"),
             "expected redraw log, got: {log}"
         );
         tui.stop(TuiStopOptions::default());
+        let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    /// c505f4c19 / #8699 (V14-18 FR-A R2/R3): without a log directory the
+    /// redraw log is fully disabled even when `RPI_TUI_DEBUG_REDRAW=1`
+    /// (upstream `redrawLogDirectory === undefined` early return), and no
+    /// directory fallback applies.
+    #[test]
+    fn debug_logging_without_log_directory_is_disabled() {
+        let _lock = state_lock();
+        let scratch = temp_log_dir();
+        std::fs::create_dir_all(&scratch).expect("create scratch dir");
+        // No log directory on purpose; the `RPI_CODING_AGENT_DIR` fallback was
+        // removed together with the env reads (FR-A R1). Point the legacy
+        // fallback env at the scratch dir so a stray write is observable.
+        let _env_dir = EnvGuard::set("RPI_CODING_AGENT_DIR", Some(scratch.to_str().unwrap()));
+        let _env = EnvGuard::set("RPI_TUI_DEBUG_REDRAW", Some("1"));
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::with_options(Box::new(terminal.clone()), None, None);
+        let (component, lines) = test_component(&["test"]);
+        let _ = lines;
+        tui.add_child(component);
+        tui.start();
+        settle(&tui);
+        tui.stop(TuiStopOptions::default());
+
+        assert!(
+            std::fs::read_dir(&scratch).unwrap().next().is_none(),
+            "no redraw log may be written without a log directory"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// c505f4c19 / #8699 (V14-18 FR-A R2): the pre-rename env
+    /// `RPI_DEBUG_REDRAW` no longer enables redraw logging even when a log
+    /// directory is given.
+    #[test]
+    fn debug_logging_ignores_pre_rename_env() {
+        let _lock = state_lock();
+        let log_dir = temp_log_dir();
+        let _env_old = EnvGuard::set("RPI_DEBUG_REDRAW", Some("1"));
+        let _env = EnvGuard::set(ENV_DEBUG_REDRAW, None);
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui =
+            TuiMainScreen::with_options(Box::new(terminal.clone()), None, Some(log_dir.clone()));
+        let (component, lines) = test_component(&["test"]);
+        let _ = lines;
+        tui.add_child(component);
+        tui.start();
+        settle(&tui);
+        tui.stop(TuiStopOptions::default());
+
+        assert!(!log_dir.join("rpi-tui-debug.log").exists());
+        assert!(!log_dir.join("rpi-debug.log").exists());
         let _ = std::fs::remove_dir_all(&log_dir);
     }
 
@@ -6243,12 +6345,12 @@ mod tests {
 
     /// An overwide line no longer panics: it is truncated to the terminal
     /// width, rendering continues, and a diagnostic snapshot is written to
-    /// `rpi-crash.log` (once per distinct offending line).
+    /// `rpi-tui-crash.log` (once per distinct offending line).
     #[test]
     fn overwide_line_is_truncated_and_render_continues() {
         let terminal = VirtualTerminal::new(40, 10);
         let log_dir = temp_log_dir();
-        let crash_log = log_dir.join("rpi-crash.log");
+        let crash_log = log_dir.join("rpi-tui-crash.log");
         let tui =
             TuiMainScreen::with_options(Box::new(terminal.clone()), None, Some(log_dir.clone()));
         let (component, lines) = test_component(&["short", &"x".repeat(50)]);
@@ -6293,6 +6395,35 @@ mod tests {
         let log = std::fs::read_to_string(&crash_log).expect("crash log rewritten");
         assert!(log.contains("Line 1 visible width: 60"), "new line: {log}");
         tui.stop(TuiStopOptions::default());
+    }
+
+    /// c505f4c19 / #8699 (V14-18 FR-A R3): with no log directory the crash
+    /// dump falls back to the OS temp dir (`os.tmpdir()`, tui-main-screen.ts:519)
+    /// and the file is named `rpi-tui-crash.log` (`pi-tui-crash.log` upstream).
+    #[test]
+    fn overwide_crash_dump_without_log_directory_goes_to_temp_dir() {
+        // Distinct offending line per run: the dedup only tracks within one
+        // renderer instance, but a leftover file from an earlier run must not
+        // satisfy the assertion.
+        let offending = format!("{}-{}", "z".repeat(50), std::process::id());
+        let crash_path = std::env::temp_dir().join("rpi-tui-crash.log");
+        let _ = std::fs::remove_file(&crash_path);
+
+        let terminal = VirtualTerminal::new(40, 10);
+        let tui = TuiMainScreen::with_options(Box::new(terminal.clone()), None, None);
+        let (component, _lines) = test_component(&["short", &offending]);
+        tui.add_child(component);
+        tui.start();
+        render_and_flush(&tui);
+        tui.stop(TuiStopOptions::default());
+
+        let log = std::fs::read_to_string(&crash_path)
+            .expect("crash dump in temp dir without a log directory");
+        assert!(
+            log.starts_with("Overwide rendered line truncated at "),
+            "header: {log}"
+        );
+        let _ = std::fs::remove_file(&crash_path);
     }
 
     /// A line measured exactly the terminal width that contains

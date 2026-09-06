@@ -2445,6 +2445,13 @@ impl InteractiveUi {
     /// the settings selector); the `!clearOnShrink` status-container clear is
     /// folded into the rebind's full render-state reset.
     fn apply_runtime_settings(&self, session: &AgentSession) {
+        // `setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides())`
+        // (interactive-mode.ts:1940 @ 9841914, e86823096 / #8665): refresh
+        // the capability overrides first — the rebind re-renders with the
+        // current `terminal.*` settings.
+        rpi_tui::terminal_image::set_capability_overrides(
+            session.settings_manager(|settings| settings.get_terminal_capability_overrides()),
+        );
         let manager = session.session_manager();
         let cwd = lock(&manager).get_cwd().to_path_buf();
         drop(manager);
