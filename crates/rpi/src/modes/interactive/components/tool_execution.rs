@@ -56,6 +56,12 @@ use serde_json::Value;
 use crate::core::themes::Theme;
 use crate::tools::sanitize::{sanitize_binary_output, strip_ansi};
 
+use super::keybinding_hints::key_hint;
+
+/// `FALLBACK_PREVIEW_LINES` (tool-execution.ts:40, e14afc648 / V14-11 FR-G):
+/// collapsed generic-fallback preview height.
+const FALLBACK_PREVIEW_LINES: usize = 10;
+
 /// `ToolExecutionOptions` (tool-execution.ts:8-11).
 #[derive(Debug, Clone, Copy)]
 pub struct ToolExecutionOptions {
@@ -333,13 +339,39 @@ impl ToolExecutionComponent {
         )
     }
 
-    /// `createResultFallback` (tool-execution.ts:139-145).
+    /// `createResultFallback` (tool-execution.ts:139-145 @ 9841914,
+    /// e14afc648/V14-11 FR-G): collapsed shows the first
+    /// [`FALLBACK_PREVIEW_LINES`] lines with a `... (N more lines, …)` hint
+    /// (`keyHint("app.tools.expand", "to expand")`); expanded shows the
+    /// full output. Only the generic fallback — renderers and built-in
+    /// tools are unaffected.
     fn create_result_fallback(&self) -> Option<Text> {
         let output = get_text_output(self.result.as_ref(), self.show_images);
         if output.is_empty() {
             return None;
         }
-        Some(Text::new(self.theme.fg("toolOutput", &output), 0, 0, None))
+        let lines: Vec<&str> = output.split('\n').collect();
+        let display_end = if self.expanded {
+            lines.len()
+        } else {
+            FALLBACK_PREVIEW_LINES.min(lines.len())
+        };
+        let remaining = lines.len() - display_end;
+        let mut text = lines[..display_end]
+            .iter()
+            .map(|line| self.theme.fg("toolOutput", line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if remaining > 0 {
+            text += &format!(
+                "\n{} {}{}",
+                self.theme
+                    .fg("muted", &format!("... ({remaining} more lines,")),
+                key_hint(&self.theme, "app.tools.expand", "to expand"),
+                self.theme.fg("muted", ")"),
+            );
+        }
+        Some(Text::new(text, 0, 0, None))
     }
 
     /// `updateArgs` (tool-execution.ts:147-150).
@@ -878,6 +910,80 @@ mod tests {
         assert_eq!(component.image_width_cells, 30);
         component.set_image_width_cells(0);
         assert_eq!(component.image_width_cells, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // V14-11 FR-G: generic fallback preview folding (e14afc648,
+    // tool-execution.ts:40, 139-145)
+    // ------------------------------------------------------------------
+
+    /// A component WITH a renderer definition whose hooks return `None` —
+    /// the path where `createResultFallback` applies (a definition exists
+    /// but neither its result hook nor a built-in renders the result).
+    fn make_fallback_component() -> ToolExecutionComponent {
+        ToolExecutionComponent::new(
+            "custom-tool",
+            "call_1",
+            serde_json::json!({"path": "src/main.rs"}),
+            ToolExecutionOptions::default(),
+            Some(Arc::new(ShellStub(Some(RenderShell::Default)))),
+            theme(),
+            RenderHandle::new(|| {}),
+            "/cwd",
+        )
+    }
+
+    fn result_with_lines(count: usize) -> ToolResultState {
+        let body: Vec<String> = (1..=count).map(|index| format!("l{index:02}")).collect();
+        ToolResultState {
+            content: vec![ToolResultContentLoose::text(body.join("\n"))],
+            is_error: false,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn fallback_collapsed_previews_ten_lines_with_expand_hint() {
+        let mut component = make_fallback_component();
+        component.update_result(result_with_lines(15), false);
+        let stripped = strip_ansi(&component.render(60).join("\n"));
+        // First 10 lines shown…
+        for index in 1..=10 {
+            assert!(stripped.contains(&format!("l{index:02}")), "line {index}");
+        }
+        assert!(stripped.contains("... (5 more lines,"));
+        assert!(stripped.contains("to expand"));
+        // The 11th-15th lines are cut.
+        for index in 11..=15 {
+            assert!(!stripped.contains(&format!("l{index:02}")), "line {index}");
+        }
+    }
+
+    #[test]
+    fn fallback_expanded_shows_all_lines_without_hint() {
+        let mut component = make_fallback_component();
+        component.update_result(result_with_lines(15), false);
+        component.set_expanded(true);
+        let stripped = strip_ansi(&component.render(60).join("\n"));
+        for index in 1..=15 {
+            assert!(stripped.contains(&format!("l{index:02}")), "line {index}");
+        }
+        assert!(!stripped.contains("more lines"));
+    }
+
+    #[test]
+    fn fallback_short_output_never_folds() {
+        let mut component = make_fallback_component();
+        component.update_result(result_with_lines(5), false);
+        let stripped = strip_ansi(&component.render(60).join("\n"));
+        assert!(stripped.contains("l05"));
+        assert!(!stripped.contains("more lines"));
+        // Exactly at the limit: no folding (remaining == 0).
+        let mut boundary = make_component();
+        boundary.update_result(result_with_lines(10), false);
+        let stripped = strip_ansi(&boundary.render(60).join("\n"));
+        assert!(stripped.contains("l10"));
+        assert!(!stripped.contains("more lines"));
     }
 
     #[test]

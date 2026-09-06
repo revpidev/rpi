@@ -363,16 +363,27 @@ impl ExtensionLoader {
                 self.runtime.clone(),
                 cwd.to_string_lossy().into_owned(),
             );
-            match (input.factory())(api).await {
+            // `initializeExtension` (loader.ts:541-560 @ a69bef789): commit
+            // on success, discard (rollback) on failure.
+            let outcome = async {
+                (input.factory())(api.clone()).await?;
+                api.commit_load().await.map_err(|e| e.to_string())?;
+                Ok::<(), String>(())
+            }
+            .await;
+            match outcome {
                 Ok(()) => {
                     // `extension.hidden` post-load (resource-loader.ts:905).
                     extension.set_hidden(input.hidden());
                     result.extensions.push(extension);
                 }
-                Err(error) => result.errors.push(ExtensionLoadError {
-                    path: extension_path,
-                    error,
-                }),
+                Err(error) => {
+                    api.discard_load();
+                    result.errors.push(ExtensionLoadError {
+                        path: extension_path,
+                        error,
+                    });
+                }
             }
         }
 
@@ -462,10 +473,24 @@ impl ExtensionLoader {
                 factory
             }
         };
-        factory(api)
-            .await
-            .map_err(|e| format!("Failed to load extension: {e}"))?;
-        Ok(extension)
+        // `initializeExtension` (loader.ts:541-560): commit/discard.
+        let outcome = async {
+            factory(api.clone())
+                .await
+                .map_err(|e| format!("Failed to load extension: {e}"))?;
+            api.commit_load()
+                .await
+                .map_err(|e| format!("Failed to load extension: {e}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => Ok(extension),
+            Err(error) => {
+                api.discard_load();
+                Err(error)
+            }
+        }
     }
 
     /// Load a native (abi_stable) plugin path (T15 W7).
@@ -482,10 +507,24 @@ impl ExtensionLoader {
             self.runtime.clone(),
             cwd.to_string_lossy().into_owned(),
         );
-        crate::native::load_native_plugin(path, api, capabilities)
-            .await
-            .map_err(|e| format!("Failed to load extension: {e}"))?;
-        Ok(extension)
+        // `initializeExtension` (loader.ts:541-560): commit/discard.
+        let outcome = async {
+            crate::native::load_native_plugin(path, api.clone(), capabilities)
+                .await
+                .map_err(|e| format!("Failed to load extension: {e}"))?;
+            api.commit_load()
+                .await
+                .map_err(|e| format!("Failed to load extension: {e}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => Ok(extension),
+            Err(error) => {
+                api.discard_load();
+                Err(error)
+            }
+        }
     }
 
     /// Assemble the ordered, canonically deduped path list

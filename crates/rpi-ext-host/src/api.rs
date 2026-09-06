@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -114,14 +114,31 @@ impl EventBus {
 /// and tracks subscriptions for auto-unsubscribe on `invalidate()`
 /// (6ca423447, loader.ts:410-419). The raw bus is still reachable via
 /// [`Self::bus`] for host-internal use.
+/// `TrackedEventBus` — `pi.events` with load-transaction awareness.
+/// During factory execution the unsubscribe is also retained by the load
+/// transaction (`loadingUnsubscribers`, loader.ts:464-468 @ a69bef789 /
+/// V14-11 FR-F) so a failed factory's subscriptions are rolled back.
 pub struct TrackedEventBus {
     bus: EventBus,
     runtime: ExtensionRuntime,
+    load: Option<Arc<LoadTransaction>>,
 }
 
 impl TrackedEventBus {
     pub(crate) fn new(bus: EventBus, runtime: ExtensionRuntime) -> Self {
-        TrackedEventBus { bus, runtime }
+        TrackedEventBus {
+            bus,
+            runtime,
+            load: None,
+        }
+    }
+
+    fn with_load(bus: EventBus, runtime: ExtensionRuntime, load: Arc<LoadTransaction>) -> Self {
+        TrackedEventBus {
+            bus,
+            runtime,
+            load: Some(load),
+        }
     }
 
     /// Access the underlying raw bus (host-internal callers that need to emit
@@ -133,6 +150,9 @@ impl TrackedEventBus {
     /// `events.emit` (loader.ts:411-413 after 6ca423447).
     pub fn emit(&self, channel: &str, data: Value) -> Result<(), ExtError> {
         self.runtime.assert_active()?;
+        if let Some(load) = &self.load {
+            load.assert_active()?;
+        }
         self.bus.emit(channel, data);
         Ok(())
     }
@@ -141,8 +161,186 @@ impl TrackedEventBus {
     /// stale context throws instead of registering (T23.2).
     pub fn on(&self, channel: &str, handler: BusHandler) -> Result<Unsubscribe, ExtError> {
         self.runtime.assert_active()?;
+        if let Some(load) = &self.load {
+            load.assert_active()?;
+        }
         let unsubscribe = self.bus.on(channel, handler);
-        Ok(self.runtime.track_event_bus_subscription(unsubscribe))
+        let unsubscribe = self.runtime.track_event_bus_subscription(unsubscribe);
+        if let Some(load) = &self.load {
+            return Ok(load.share_and_track_unsubscribe(unsubscribe));
+        }
+        Ok(unsubscribe)
+    }
+}
+
+// ============================================================================
+// Load transaction (loader.ts:252-277, 458-482 @ a69bef789 — V14-11 FR-F)
+// ============================================================================
+
+/// One deferred runtime mutation captured while a factory runs
+/// (`pendingRuntimeChanges` entries — provider registrations made through
+/// `applyRuntimeChange`). Prefixed to satisfy clippy's variant-postfix lint
+/// without diverging from the upstream names in spirit.
+pub(crate) enum PendingRuntimeChange {
+    Register {
+        name: String,
+        config: Value,
+    },
+    RegisterNative {
+        provider: Arc<dyn rpi_ai::models::Provider>,
+    },
+    Unregister {
+        name: String,
+    },
+}
+
+/// The `createExtensionAPI` load state: registration writes that target
+/// SHARED runtime state (flag defaults, provider registrations, event-bus
+/// subscriptions) are buffered while the factory runs, applied on
+/// `commit`, and dropped (with the subscriptions unsubscribed) on
+/// `discard`. Writes into the extension object itself need no buffering —
+/// a failed extension is dropped whole.
+///
+/// State machine: `Loading` → `Active` (commit) | `Failed` (discard);
+/// both terminal. Mirrors the upstream `state` closure field.
+pub(crate) struct LoadTransaction {
+    extension_path: String,
+    state: std::sync::atomic::AtomicU8,
+    /// `pendingFlagValues` — first registration per name wins (Map.set
+    /// guard), applied only where the runtime has no value yet.
+    pending_flag_values: Mutex<Vec<(String, FlagValue)>>,
+    pending_runtime_changes: Mutex<Vec<PendingRuntimeChange>>,
+    /// `loadingUnsubscribers` — bus subscriptions to undo on discard.
+    loading_unsubscribers: Mutex<Vec<Unsubscribe>>,
+}
+
+const LOAD_LOADING: u8 = 0;
+const LOAD_ACTIVE: u8 = 1;
+const LOAD_FAILED: u8 = 2;
+
+impl LoadTransaction {
+    pub(crate) fn new(extension_path: &str) -> Self {
+        LoadTransaction {
+            extension_path: extension_path.to_owned(),
+            state: std::sync::atomic::AtomicU8::new(LOAD_LOADING),
+            pending_flag_values: Mutex::new(Vec::new()),
+            pending_runtime_changes: Mutex::new(Vec::new()),
+            loading_unsubscribers: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Already-committed view for late-bound API handles
+    /// (`ExtensionApi::for_extension`).
+    pub(crate) fn active(extension_path: &str) -> Self {
+        let transaction = Self::new(extension_path);
+        transaction
+            .state
+            .store(LOAD_ACTIVE, std::sync::atomic::Ordering::Release);
+        transaction
+    }
+
+    fn is_loading(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == LOAD_LOADING
+    }
+
+    /// `assertActive` on the api level: a discarded (failed) load rejects
+    /// further use of the captured API object (loader.ts:262-267).
+    pub(crate) fn assert_active(&self) -> Result<(), ExtError> {
+        if self.state.load(std::sync::atomic::Ordering::Acquire) == LOAD_FAILED {
+            return Err(ExtError::Call(format!(
+                "Extension \"{}\" failed to load and its API is no longer active.",
+                self.extension_path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Buffer a flag default — first registration per name wins
+    /// (`if (!pendingFlagValues.has(name)) …`, loader.ts:278-280).
+    pub(crate) fn push_flag_default(&self, name: String, value: FlagValue) {
+        let mut pending = self.pending_flag_values.lock_inner();
+        if !pending.iter().any(|(existing, _)| *existing == name) {
+            pending.push((name, value));
+        }
+    }
+
+    pub(crate) fn push_runtime_change(&self, change: PendingRuntimeChange) {
+        self.pending_runtime_changes.lock_inner().push(change);
+    }
+
+    /// Retain a bus unsubscribe for rollback (`loadingUnsubscribers.push`,
+    /// loader.ts:465-467). Returns the shareable idempotent wrapper the
+    /// caller hands out — `Unsubscribe` is `FnOnce`, so the same
+    /// subscription is shared through an `Option` slot.
+    pub(crate) fn share_and_track_unsubscribe(&self, unsubscribe: Unsubscribe) -> Unsubscribe {
+        let shared: Arc<Mutex<Option<Unsubscribe>>> = Arc::new(Mutex::new(Some(unsubscribe)));
+        let rollback = {
+            let shared = shared.clone();
+            let rollback: Unsubscribe = Box::new(move || {
+                if let Some(unsubscribe) = shared.lock_inner().take() {
+                    unsubscribe();
+                }
+            });
+            rollback
+        };
+        if self.is_loading() {
+            self.loading_unsubscribers.lock_inner().push(rollback);
+        }
+        Box::new(move || {
+            if let Some(unsubscribe) = shared.lock_inner().take() {
+                unsubscribe();
+            }
+        })
+    }
+
+    /// `clearPending` + apply-on-commit read side.
+    pub(crate) fn take_flag_values(&self) -> Vec<(String, FlagValue)> {
+        std::mem::take(&mut *self.pending_flag_values.lock_inner())
+    }
+
+    pub(crate) fn take_runtime_changes(&self) -> Vec<PendingRuntimeChange> {
+        std::mem::take(&mut *self.pending_runtime_changes.lock_inner())
+    }
+
+    pub(crate) fn take_unsubscribers(&self) -> Vec<Unsubscribe> {
+        std::mem::take(&mut *self.loading_unsubscribers.lock_inner())
+    }
+
+    /// `state = "active"` (loader.ts:467). Returns false when already
+    /// terminal (commit/discard are idempotent like upstream).
+    pub(crate) fn set_active(&self) -> bool {
+        self.state
+            .compare_exchange(
+                LOAD_LOADING,
+                LOAD_ACTIVE,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// `state = "failed"` (loader.ts:471-476). Returns whether this call
+    /// transitioned (only the first discard runs the unsubscribers).
+    pub(crate) fn set_failed(&self) -> bool {
+        self.state
+            .compare_exchange(
+                LOAD_LOADING,
+                LOAD_FAILED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Poison-proof `Mutex` access for the load transaction buffers.
+trait LockInner<T> {
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockInner<T> for Mutex<T> {
+    fn lock_inner(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -251,12 +449,16 @@ pub struct SendMessageOptions {
 }
 
 /// `sendUserMessage` options (types.ts:1289-1292). No `nextTurn`: upstream
-/// rejects it for streaming delivery.
+/// rejects it for streaming delivery. `expandPromptTemplates` (b987ead35,
+/// V14-11 FR-D): whether to dispatch extension commands and expand skill
+/// commands and prompt templates — default `false`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendUserMessageOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deliver_as: Option<DeliverAs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expand_prompt_templates: Option<bool>,
 }
 
 /// `ExecOptions` (exec.ts:11-18). `signal` is not serializable; cancellation
@@ -1155,7 +1357,9 @@ impl ExtensionContext {
     }
 
     /// `pi.events` — tracked bus wrapper (6ca423447). Enforces `assertActive`
-    /// and auto-unsubscribes on `invalidate()`.
+    /// and auto-unsubscribes on `invalidate()`. During a factory the
+    /// subscriptions are additionally retained by the load transaction
+    /// (FR-F rollback).
     pub fn events(&self) -> TrackedEventBus {
         TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
     }
@@ -1653,15 +1857,17 @@ fn extension_namespace(extension_path: &str) -> String {
     }
 }
 
-/// The `pi` object handed to extension factories (`ExtensionAPI`,
-/// types.ts:1179-1414). Cheap to clone; clones share the extension
-/// registration maps and the runtime (upstream closes over the same
-/// objects).
+/// The `pi` object handed to extension factories (`createExtensionAPI`'s
+/// `api`, loader.ts:252-482; `ExtensionAPI`, types.ts:1179-1414). Cheap to
+/// clone; clones share the extension registration maps, the runtime, and
+/// the load transaction (FR-F: while the factory runs, shared-state
+/// registration writes are buffered).
 #[derive(Clone)]
 pub struct ExtensionApi {
     extension: Arc<LoadedExtension>,
     runtime: ExtensionRuntime,
     cwd: String,
+    load: Arc<LoadTransaction>,
 }
 
 impl ExtensionApi {
@@ -1670,23 +1876,94 @@ impl ExtensionApi {
         runtime: ExtensionRuntime,
         cwd: String,
     ) -> Self {
+        let load = Arc::new(LoadTransaction::new(&extension.path));
         ExtensionApi {
             extension,
             runtime,
             cwd,
+            load,
         }
     }
 
     /// Re-attach an API handle to an already-loaded extension (the upstream
     /// API object closes over the same extension/runtime, so this is
     /// equivalent; used by hosts handing `pi` to late-bound callbacks, and
-    /// by tests).
+    /// by tests). The load transaction is pre-committed (Active).
     pub fn for_extension(
         extension: Arc<LoadedExtension>,
         runtime: ExtensionRuntime,
         cwd: &str,
     ) -> Self {
-        Self::new(extension, runtime, cwd.to_owned())
+        Self::new_committed(extension, runtime, cwd.to_owned())
+    }
+
+    pub(crate) fn new_committed(
+        extension: Arc<LoadedExtension>,
+        runtime: ExtensionRuntime,
+        cwd: String,
+    ) -> Self {
+        let load = Arc::new(LoadTransaction::active(&extension.path));
+        ExtensionApi {
+            extension,
+            runtime,
+            cwd,
+            load,
+        }
+    }
+
+    /// The per-api `assertActive` (loader.ts:262-267): rejected after the
+    /// load was discarded — a captured `pi` from a failed factory must not
+    /// keep registering.
+    fn assert_api_active(&self) -> Result<(), ExtError> {
+        self.load.assert_active()
+    }
+
+    /// `load.commit()` (loader.ts:461-469): apply the buffered flag
+    /// defaults and provider registrations, mark the API active. Fails
+    /// when the runtime went stale mid-load (upstream commit throws —
+    /// `initializeExtension` then discards and reports the error).
+    pub(crate) async fn commit_load(&self) -> Result<(), ExtError> {
+        if !self.load.is_loading() {
+            return Ok(());
+        }
+        self.runtime.assert_active()?;
+        for (name, value) in self.load.take_flag_values() {
+            // `if (!runtime.flagValues.has(name))` — or_insert keeps any
+            // existing (CLI-set) value.
+            self.runtime.set_flag_default(&name, value);
+        }
+        for change in self.load.take_runtime_changes() {
+            match change {
+                PendingRuntimeChange::Register { name, config } => self
+                    .runtime
+                    .register_provider(&name, config, &self.extension.path)
+                    .await
+                    .map_err(ExtError::Call)?,
+                PendingRuntimeChange::RegisterNative { provider } => self
+                    .runtime
+                    .register_native_provider(provider, &self.extension.path)
+                    .await
+                    .map_err(ExtError::Call)?,
+                PendingRuntimeChange::Unregister { name } => {
+                    self.runtime.unregister_provider(&name).await;
+                }
+            }
+        }
+        self.load.set_active();
+        Ok(())
+    }
+
+    /// `load.discard()` (loader.ts:471-476): mark failed, unsubscribe the
+    /// subscriptions taken during the factory, drop the pending buffers.
+    pub(crate) fn discard_load(&self) {
+        if !self.load.set_failed() {
+            return;
+        }
+        for unsubscribe in self.load.take_unsubscribers() {
+            unsubscribe();
+        }
+        self.load.take_flag_values();
+        self.load.take_runtime_changes();
     }
 
     /// The extension this API registers into.
@@ -1714,6 +1991,7 @@ impl ExtensionApi {
 
     /// `pi.on(event, handler)` — raw JSON handler (the L0/L1-shared shape).
     pub fn on(&self, event: &str, handler: EventHandler) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.push_handler(event, handler);
         Ok(())
@@ -1751,6 +2029,7 @@ impl ExtensionApi {
     /// re-registration overwrites in place (JS `Map.set`); cross-extension
     /// conflicts resolve at query time (runner.ts:447-457).
     pub fn register_tool(&self, tool: ToolDefinition) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_tool(RegisteredTool {
             definition: tool,
@@ -1772,6 +2051,7 @@ impl ExtensionApi {
     /// registration survives and stays active. Unknown names (including
     /// built-ins and repeat calls) return `false` without error.
     pub fn unregister_tool(&self, name: &str) -> Result<bool, ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         let removed = self.extension.remove_tool(name);
         if removed {
@@ -1790,6 +2070,7 @@ impl ExtensionApi {
         description: Option<String>,
         handler: CommandHandlerFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_command(RegisteredCommand {
             name: name.to_owned(),
@@ -1809,6 +2090,7 @@ impl ExtensionApi {
         get_argument_completions: Option<ArgumentCompletionsFn>,
         handler: CommandHandlerFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_command(RegisteredCommand {
             name: name.to_owned(),
@@ -1828,6 +2110,7 @@ impl ExtensionApi {
         description: Option<String>,
         handler: ShortcutHandlerFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_shortcut(ExtensionShortcut {
             shortcut: shortcut.to_lowercase(),
@@ -1838,7 +2121,13 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.registerFlag(name, options)` (loader.ts:274-283).
+    /// `pi.registerFlag(name, options)` (loader.ts:274-283 + :316-322 @
+    /// 9841914, f47faf459/V14-11 FR-E): a `default` whose variant does not
+    /// match the declared `type` is rejected — the error message mirrors
+    /// upstream (`Invalid default for flag "…": expected <type>, got
+    /// <typeof>`), and the throw fails the factory (hence the FR-F
+    /// discard). During the factory the default is buffered in the load
+    /// transaction and applied on commit.
     pub fn register_flag(
         &self,
         name: &str,
@@ -1846,7 +2135,28 @@ impl ExtensionApi {
         flag_type: FlagType,
         default: Option<FlagValue>,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
+        if let Some(default) = &default {
+            let matches = matches!(
+                (default, flag_type),
+                (FlagValue::Boolean(_), FlagType::Boolean)
+                    | (FlagValue::String(_), FlagType::String)
+            );
+            if !matches {
+                let expected = match flag_type {
+                    FlagType::Boolean => "boolean",
+                    FlagType::String => "string",
+                };
+                let got = match default {
+                    FlagValue::Boolean(_) => "boolean",
+                    FlagValue::String(_) => "string",
+                };
+                return Err(ExtError::Call(format!(
+                    "Invalid default for flag \"{name}\": expected {expected}, got {got}"
+                )));
+            }
+        }
         self.extension.insert_flag(ExtensionFlag {
             name: name.to_owned(),
             description,
@@ -1855,7 +2165,15 @@ impl ExtensionApi {
             extension_path: self.extension.path.clone(),
         });
         if let Some(default) = default {
-            self.runtime.set_flag_default(name, default);
+            // loader.ts:277-282: only where the runtime has no value yet;
+            // during loading the default goes to the pending buffer (FR-F).
+            if self.runtime.get_flag_value(name).is_none() {
+                if self.load.is_loading() {
+                    self.load.push_flag_default(name.to_owned(), default);
+                } else {
+                    self.runtime.set_flag_default(name, default);
+                }
+            }
         }
         Ok(())
     }
@@ -1876,6 +2194,7 @@ impl ExtensionApi {
         custom_type: &str,
         renderer: MessageRenderFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension
             .insert_message_renderer(custom_type, renderer);
@@ -1888,6 +2207,7 @@ impl ExtensionApi {
         custom_type: &str,
         renderer: EntryRenderFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.insert_entry_renderer(custom_type, renderer);
         Ok(())
@@ -1901,6 +2221,7 @@ impl ExtensionApi {
         &self,
         transformer: crate::types::MarkdownTransformerFn,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
         self.extension.set_markdown_transformer(transformer);
         Ok(())
@@ -2022,9 +2343,19 @@ impl ExtensionApi {
     }
 
     /// `pi.registerProvider(name, config)` (loader.ts:374-382, name+config
-    /// signature).
+    /// signature; `applyRuntimeChange` @ a69bef789 — buffered during the
+    /// factory, applied on commit, dropped on discard).
     pub async fn register_provider(&self, name: &str, config: Value) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
+        if self.load.is_loading() {
+            self.load
+                .push_runtime_change(PendingRuntimeChange::Register {
+                    name: name.to_owned(),
+                    config,
+                });
+            return Ok(());
+        }
         self.runtime
             .register_provider(name, config, &self.extension.path)
             .await
@@ -2038,7 +2369,13 @@ impl ExtensionApi {
         &self,
         provider: Arc<dyn rpi_ai::models::Provider>,
     ) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
+        if self.load.is_loading() {
+            self.load
+                .push_runtime_change(PendingRuntimeChange::RegisterNative { provider });
+            return Ok(());
+        }
         self.runtime
             .register_native_provider(provider, &self.extension.path)
             .await
@@ -2048,7 +2385,15 @@ impl ExtensionApi {
 
     /// `pi.unregisterProvider(name)` (loader.ts:384-387).
     pub async fn unregister_provider(&self, name: &str) -> Result<(), ExtError> {
+        self.assert_api_active()?;
         self.runtime.assert_active()?;
+        if self.load.is_loading() {
+            self.load
+                .push_runtime_change(PendingRuntimeChange::Unregister {
+                    name: name.to_owned(),
+                });
+            return Ok(());
+        }
         self.runtime.unregister_provider(name).await;
         Ok(())
     }
@@ -2134,9 +2479,16 @@ impl ExtensionApi {
         Ok(())
     }
 
-    /// `pi.events` (loader.ts:389 + 6ca423447 tracking wrapper).
+    /// `pi.events` (loader.ts:389 + 6ca423447 tracking wrapper). During a
+    /// factory the subscriptions are additionally retained by the load
+    /// transaction (FR-F rollback, a69bef789).
     pub fn events(&self) -> TrackedEventBus {
-        TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
+        let load = self.load.clone();
+        if load.is_loading() {
+            TrackedEventBus::with_load(self.runtime.event_bus(), self.runtime.clone(), load)
+        } else {
+            TrackedEventBus::new(self.runtime.event_bus(), self.runtime.clone())
+        }
     }
 }
 

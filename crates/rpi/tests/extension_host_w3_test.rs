@@ -98,15 +98,19 @@ async fn session_fixture(
     host: NativeExtensionHost,
     provider_options: FauxProviderOptions,
 ) -> SessionFixture {
-    session_fixture_full(responses, host, provider_options, None).await
+    session_fixture_full(responses, host, provider_options, None, Vec::new()).await
 }
 
 /// `models_json` optionally writes agent_dir/models.json (provider override/restore tests).
+/// `agent_files` optionally writes extra files under agent_dir before the
+/// services load (e.g. prompt templates for sendUserMessage expansion).
+#[allow(clippy::too_many_arguments)]
 async fn session_fixture_full(
     responses: Vec<FauxResponseStep>,
     host: NativeExtensionHost,
     provider_options: FauxProviderOptions,
     models_json: Option<&str>,
+    agent_files: Vec<(String, String)>,
 ) -> SessionFixture {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("cwd");
@@ -115,6 +119,12 @@ async fn session_fixture_full(
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     if let Some(models_json) = models_json {
         std::fs::write(agent_dir.join("models.json"), models_json).expect("models.json");
+    }
+    for (rel, content) in agent_files {
+        let path = agent_dir.join(&rel);
+        std::fs::create_dir_all(path.parent().expect("parent"))
+            .expect("create parent for agent file");
+        std::fs::write(&path, content).expect("agent file");
     }
 
     let mut options = provider_options;
@@ -397,6 +407,66 @@ async fn w3_send_user_message_streaming_without_deliver_as_errors() {
     );
 }
 
+/// V14-11 FR-D (`b987ead35`, #7857): `sendUserMessage`'s
+/// `expandPromptTemplates` — `true` expands prompt templates (and skill
+/// commands), the default keeps the raw text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3_send_user_message_expand_prompt_templates_option() {
+    let (host, slot) = host_with_api(Vec::new()).await;
+    let template = "---\ndescription: expansion probe\n---\nEXPANDED-BODY-HERE\n".to_owned();
+    let fixture = session_fixture_full(
+        vec![text_step("ok"), text_step("ok")],
+        host,
+        FauxProviderOptions::default(),
+        None,
+        vec![("prompts/expandme.md".to_owned(), template)],
+    )
+    .await;
+
+    // Default (options absent): raw template name goes through unexpanded.
+    let api = slot_api(&slot);
+    api.send_user_message(json!("/expandme"), None)
+        .expect("send_user_message");
+    wait_until(|| last_user_text(&fixture).is_some()).await;
+    fixture.session.wait_for_idle().await;
+    assert_eq!(last_user_text(&fixture), Some("/expandme".to_owned()));
+
+    // Explicit true: the template body is expanded (the expanded text is
+    // what reaches the LLM and lands in the tree).
+    api.send_user_message(
+        json!("/expandme"),
+        Some(rpi_ext_host::api::SendUserMessageOptions {
+            deliver_as: None,
+            expand_prompt_templates: Some(true),
+        }),
+    )
+    .expect("send_user_message");
+    wait_until(|| last_user_text(&fixture).as_deref() == Some("EXPANDED-BODY-HERE")).await;
+    fixture.session.wait_for_idle().await;
+    assert_eq!(
+        last_user_text(&fixture),
+        Some("EXPANDED-BODY-HERE".to_owned())
+    );
+}
+
+/// The last user message text in session state (the text that reached the
+/// LLM request).
+fn last_user_text(fixture: &SessionFixture) -> Option<String> {
+    fixture.session.messages().iter().rev().find_map(|message| {
+        let value = serde_json::to_value(message).ok()?;
+        if value.get("role")?.as_str()? != "user" {
+            return None;
+        }
+        value.pointer("/content").and_then(|content| match content {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(blocks) => blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(Value::as_str).map(str::to_owned)),
+            _ => None,
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // setActiveTools / getAllTools（agent-session.ts:926-941, 906-913）
 // ---------------------------------------------------------------------------
@@ -639,6 +709,7 @@ async fn w3_register_provider_queue_flush_runtime_and_unregister() {
         Some(
             r#"{"providers":{"base-p":{"name":"Base","baseUrl":"https://base.invalid","api":"openai-completions","apiKey":"sk-base","models":[{"id":"base-1","name":"Base One","reasoning":false,"input":["text"],"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0},"contextWindow":8192,"maxTokens":1024}]}}}"#,
         ),
+        Vec::new(),
     )
     .await;
     let runtime = fixture.session.model_runtime().clone();

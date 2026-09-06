@@ -126,7 +126,7 @@ async fn trust_path_reload_keeps_builtin_inline_and_orders_by_final_paths() {
     write_wasm(&cwd, ".rpi/extensions/local.wasm", WATCH_GUEST_WAT);
     write_wasm(&agent_dir, "extensions/global.wasm", WATCH_GUEST_WAT);
 
-    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let host = Arc::new(NativeExtensionHost::new(&cwd.to_string_lossy()));
     let pre_errors = host
         .load_startup_pre_trust(agent_dir.clone(), Vec::new(), vec![inline.clone()], false)
         .await;
@@ -199,7 +199,7 @@ async fn no_extensions_final_drops_pretrust_global_extensions() {
 
     write_wasm(&agent_dir, "extensions/global.wasm", WATCH_GUEST_WAT);
 
-    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let host = Arc::new(NativeExtensionHost::new(&cwd.to_string_lossy()));
     let pre_errors = host
         .load_startup_pre_trust(agent_dir.clone(), Vec::new(), vec![inline.clone()], false)
         .await;
@@ -244,7 +244,7 @@ async fn no_extensions_pretrust_skips_global_discovery() {
 
     write_wasm(&agent_dir, "extensions/global.wasm", WATCH_GUEST_WAT);
 
-    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let host = Arc::new(NativeExtensionHost::new(&cwd.to_string_lossy()));
     let pre_errors = host
         .load_startup_pre_trust(agent_dir.clone(), Vec::new(), vec![inline.clone()], true)
         .await;
@@ -266,7 +266,7 @@ async fn wat_fixture_guest_loads_and_subscribes() {
     let cwd = dir.path().join("cwd");
     let agent_dir = dir.path().join("agent");
     let wasm = write_wasm(&agent_dir, "extensions/g.wasm", WATCH_GUEST_WAT);
-    let host = NativeExtensionHost::new(&cwd.to_string_lossy());
+    let host = Arc::new(NativeExtensionHost::new(&cwd.to_string_lossy()));
     let errors = host.load_paths(&[wasm]).await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(host.has_handlers("session_start"));

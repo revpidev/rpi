@@ -73,7 +73,7 @@ impl ReplacedSessionContext {
         content: Option<rpi_ai::types::UserContent>,
         display: bool,
         details: Option<serde_json::Value>,
-        trigger_turn: bool,
+        trigger_turn: Option<bool>,
         deliver_as: Option<crate::core::agent_session::CustomDeliverAs>,
     ) -> Result<(), RpiError> {
         self.session
@@ -93,9 +93,10 @@ impl ReplacedSessionContext {
         text: &str,
         images: Option<Vec<rpi_ai::types::ImageContent>>,
         deliver_as: Option<crate::core::extensions::StreamingBehavior>,
+        expand_prompt_templates: Option<bool>,
     ) -> Result<(), RpiError> {
         self.session
-            .send_user_message(text, images, deliver_as)
+            .send_user_message(text, images, deliver_as, expand_prompt_templates)
             .await
     }
 }

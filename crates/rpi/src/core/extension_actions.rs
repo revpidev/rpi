@@ -125,7 +125,10 @@ impl HostActions for SessionHostActions {
                     content,
                     display,
                     details,
-                    options.trigger_turn.unwrap_or(false),
+                    // `triggerTurn` crosses as `undefined` when unset — the
+                    // session branches on `!= Some(false)` (steer) vs
+                    // `== Some(true)` (run), mirroring agent-session.ts:1497-1508.
+                    options.trigger_turn,
                     deliver_as,
                 )
                 .await
@@ -134,20 +137,26 @@ impl HostActions for SessionHostActions {
 
     /// `sendUserMessage` → `sendUserMessage` (agent-session.ts:2366-2373);
     /// content normalization at agent-session.ts:1476-1492.
+    /// `expandPromptTemplates` rides through (b987ead35, V14-11 FR-D).
     fn send_user_message(&self, content: Value, options: Option<SendUserMessageOptions>) {
         let Some(session) = self.session() else {
             return;
         };
         let (text, images) = normalize_user_message_content(content);
-        let deliver_as = options
-            .and_then(|o| o.deliver_as)
-            .map(|deliver| match deliver {
-                DeliverAs::FollowUp => StreamingBehavior::FollowUp,
-                // `sendUserMessage` has no `nextTurn` upstream (types.ts:1292).
-                DeliverAs::Steer | DeliverAs::NextTurn => StreamingBehavior::Steer,
-            });
+        let (deliver_as, expand_prompt_templates) = options
+            .map(|options| {
+                let deliver_as = options.deliver_as.map(|deliver| match deliver {
+                    DeliverAs::FollowUp => StreamingBehavior::FollowUp,
+                    // `sendUserMessage` has no `nextTurn` upstream (types.ts:1292).
+                    DeliverAs::Steer | DeliverAs::NextTurn => StreamingBehavior::Steer,
+                });
+                (deliver_as, options.expand_prompt_templates)
+            })
+            .unwrap_or((None, None));
         self.spawn_reporting("send_user_message", async move {
-            session.send_user_message(&text, images, deliver_as).await
+            session
+                .send_user_message(&text, images, deliver_as, expand_prompt_templates)
+                .await
         });
     }
 

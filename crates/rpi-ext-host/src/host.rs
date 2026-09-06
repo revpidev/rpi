@@ -263,7 +263,7 @@ impl NativeExtensionHost {
     /// last load against a fresh runtime, and re-apply the UI bridge. The
     /// session-level caller re-binds actions and emits
     /// `session_start`/`resources_discover` with reason `"reload"`.
-    pub async fn reload(&self) -> Vec<crate::types::ExtensionLoadError> {
+    pub async fn reload(self: &Arc<Self>) -> Vec<crate::types::ExtensionLoadError> {
         let spec = read(&self.last_load).clone();
         let previous_flags = self.runtime().flag_values();
 
@@ -277,7 +277,10 @@ impl NativeExtensionHost {
             new_runtime.set_flag_value(&name, value);
         }
         if let Some((bridge, mode)) = read(&self.last_ui).clone() {
-            new_runtime.set_ui_bridge(Some(bridge), mode);
+            // Re-wrap against the fresh core (setUIContext on the new
+            // runner, upstream reload path).
+            let wrapped = self.wrap_ui_prompt(bridge);
+            new_runtime.set_ui_bridge(Some(wrapped), mode);
         }
         *write(&self.runtime) = new_runtime.clone();
         write(&self.loader).set_runtime(new_runtime);
@@ -314,10 +317,40 @@ impl NativeExtensionHost {
         self.core().create_command_context()
     }
 
-    /// `setUIContext` (runner.ts:429-432).
-    pub fn set_ui(&self, ui: Option<Arc<dyn UiBridge>>, mode: ExtensionMode) {
+    /// `setUIContext` (runner.ts:429-432) + `wrapUIPromptContext`
+    /// (runner.ts:438-461 @ ccfe79ed2, V14-11 FR-C): the bound bridge is
+    /// decorated with the `ui_prompt_*` depth counter; events dispatch
+    /// fire-and-forget through this host's current runner core. `last_ui`
+    /// keeps the RAW bridge so `/reload` re-wraps against the fresh core.
+    pub fn set_ui(self: &Arc<Self>, ui: Option<Arc<dyn UiBridge>>, mode: ExtensionMode) {
         *write(&self.last_ui) = ui.clone().map(|bridge| (bridge, mode));
-        self.runtime().set_ui_bridge(ui, mode);
+        let wrapped = ui.map(|bridge| self.wrap_ui_prompt(bridge));
+        self.runtime().set_ui_bridge(wrapped, mode);
+    }
+
+    /// Build the `ui_prompt_*` decorator for a bound bridge. The sink holds
+    /// a weak host handle so the decoration cannot keep the host alive.
+    /// Dispatch is ordered FIFO through a channel drained by one consumer
+    /// task (the `queueMicrotask` ordering equivalent, runner.ts:482-486)
+    /// and never awaited by the prompt itself (handler errors are
+    /// contained by the runner's serial `emit`).
+    fn wrap_ui_prompt(self: &Arc<Self>, bridge: Arc<dyn UiBridge>) -> Arc<dyn UiBridge> {
+        let weak = Arc::downgrade(self);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                while let Some((event, payload)) = rx.recv().await {
+                    let Some(host) = weak.upgrade() else {
+                        break;
+                    };
+                    host.emit(&event, payload).await;
+                }
+            });
+        }
+        let sink: crate::bridges::UiPromptEventSink = Arc::new(move |event, payload| {
+            let _ = tx.send((event.to_owned(), payload));
+        });
+        Arc::new(crate::bridges::UiPromptBridge::new(bridge, sink))
     }
 
     /// Drop the UI bridge without touching the mode — dispose paths use

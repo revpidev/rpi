@@ -458,11 +458,40 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 Some("string") => FlagType::String,
                 _ => FlagType::Boolean,
             };
-            let default = args.get("default").and_then(|v| match v {
+            let raw_default = args.get("default").filter(|v| !v.is_null());
+            let default = raw_default.and_then(|v| match v {
                 Value::Bool(b) => Some(FlagValue::Boolean(*b)),
                 Value::String(s) => Some(FlagValue::String(s.clone())),
                 _ => None,
             });
+            // f47faf459 (V14-11 FR-E): reject a default whose JSON type does
+            // not match the declared flag type — including kinds that have
+            // no FlagValue variant (upstream compares `typeof`).
+            if let Some(raw) = raw_default {
+                let matches = matches!(
+                    (&default, flag_type),
+                    (Some(FlagValue::Boolean(_)), FlagType::Boolean)
+                        | (Some(FlagValue::String(_)), FlagType::String)
+                );
+                if !matches {
+                    let expected = match flag_type {
+                        FlagType::Boolean => "boolean",
+                        FlagType::String => "string",
+                    };
+                    let got = match raw {
+                        Value::Bool(_) => "boolean",
+                        Value::String(_) => "string",
+                        Value::Number(_) => "number",
+                        _ => "object",
+                    };
+                    return err(
+                        "call",
+                        format!(
+                            "Invalid default for flag \"{name}\": expected {expected}, got {got}"
+                        ),
+                    );
+                }
+            }
             state
                 .api
                 .register_flag(
@@ -471,7 +500,7 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                     flag_type,
                     default,
                 )
-                .map_err(|e| ("stale", e.to_string()))?;
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
             Ok(Value::Null)
         }
 
@@ -590,6 +619,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 .cloned()
                 .map(|options| SendUserMessageOptions {
                     deliver_as: options.get("deliverAs").and_then(parse_deliver_as),
+                    expand_prompt_templates: options
+                        .get("expandPromptTemplates")
+                        .and_then(Value::as_bool),
                 });
             state
                 .api

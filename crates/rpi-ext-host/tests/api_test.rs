@@ -408,6 +408,219 @@ async fn api_flag_defaults_and_per_extension_visibility() {
 }
 
 // ---------------------------------------------------------------------------
+// V14-11 FR-E: registerFlag default/type validation (f47faf459,
+// loader.ts:316-322)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_register_flag_rejects_type_mismatched_defaults() {
+    let runtime = ExtensionRuntime::new();
+    let extension = Arc::new(rpi_ext_host::api::LoadedExtension::new(
+        "<inline:mismatch>",
+        "<inline:mismatch>",
+    ));
+    let api = ExtensionApi::for_extension(extension, runtime, "/test-cwd");
+
+    // bool↔string cross matrix → exact upstream error text
+    // (`Invalid default for flag "…": expected <type>, got <typeof>`).
+    let err = api
+        .register_flag(
+            "mixed-up",
+            None,
+            FlagType::String,
+            Some(FlagValue::Boolean(true)),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "extension call failed: Invalid default for flag \"mixed-up\": expected string, got boolean"
+    );
+    let err = api
+        .register_flag(
+            "mixed-up",
+            None,
+            FlagType::Boolean,
+            Some(FlagValue::String("yes".into())),
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "extension call failed: Invalid default for flag \"mixed-up\": expected boolean, got string"
+    );
+    // Matching variants register fine; no default is fine too.
+    api.register_flag(
+        "ok-bool",
+        None,
+        FlagType::Boolean,
+        Some(FlagValue::Boolean(false)),
+    )
+    .unwrap();
+    api.register_flag(
+        "ok-string",
+        None,
+        FlagType::String,
+        Some(FlagValue::String("d".into())),
+    )
+    .unwrap();
+    api.register_flag("ok-none", None, FlagType::Boolean, None)
+        .unwrap();
+    assert_eq!(
+        api.get_flag("ok-bool").unwrap(),
+        Some(FlagValue::Boolean(false))
+    );
+}
+
+/// The validation error fails the factory (upstream throw) and the load
+/// surfaces it as an isolated error (loader.ts:316-322 + :541-560).
+#[tokio::test]
+async fn api_register_flag_type_mismatch_fails_the_factory() {
+    let host = NativeExtensionHost::new("/test-cwd");
+    let failing = inline_ext_async("bad-flag", |api| {
+        Box::pin(async move {
+            api.register_flag(
+                "wrong-type",
+                None,
+                FlagType::String,
+                Some(FlagValue::Boolean(true)),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    });
+    let errors = host.load_inline(&[failing]).await;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(
+        errors[0].error,
+        "extension call failed: Invalid default for flag \"wrong-type\": expected string, got boolean"
+    );
+    // The flag never became visible.
+    assert_eq!(host.runtime().get_flag_value("wrong-type"), None);
+}
+
+// ---------------------------------------------------------------------------
+// V14-11 FR-F: factory failure rollback (a69bef789, loader.ts:252-277,
+// 461-476, 541-560)
+// ---------------------------------------------------------------------------
+
+/// A factory that registers (flag default, bus subscription, provider)
+/// and THEN fails leaves zero residue: no flag value, no live bus
+/// handler, no provider registration — and sibling extensions load fine.
+#[tokio::test]
+async fn api_factory_failure_rolls_back_registrations() {
+    let bus_hits: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+    let hits = Arc::new(bus_hits);
+    let seen = hits.clone();
+    let inner_seen = hits.clone();
+    let doomed = inline_ext_async("doomed", move |api| {
+        let seen = inner_seen.clone();
+        Box::pin(async move {
+            // Registration writes during the factory…
+            api.register_flag(
+                "doomed-flag",
+                None,
+                FlagType::String,
+                Some(FlagValue::String("poof".into())),
+            )
+            .map_err(|e| e.to_string())?;
+            let handler_seen = seen.clone();
+            let _unsubscribe = api
+                .events()
+                .on(
+                    "doomed-channel",
+                    Arc::new(move |_payload| {
+                        handler_seen
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push("doomed");
+                    }),
+                )
+                .map_err(|e| e.to_string())?;
+            api.register_provider("doomed-provider", json!({"baseUrl": "https://x"}))
+                .await
+                .map_err(|e| e.to_string())?;
+            // …then the factory fails.
+            Err("doomed factory failed".to_owned())
+        })
+    });
+    let survivor = inline_ext("survivor", |api| {
+        api.register_flag(
+            "survivor-flag",
+            None,
+            FlagType::Boolean,
+            Some(FlagValue::Boolean(true)),
+        )
+        .unwrap();
+    });
+
+    let host = NativeExtensionHost::new("/test-cwd");
+    let errors = host.load_inline(&[doomed, survivor]).await;
+    // Failure isolated; the survivor loaded.
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].path, "<inline:doomed>");
+    assert_eq!(host.get_extension_paths(), vec!["<inline:survivor>"]);
+
+    // Flag default discarded.
+    assert_eq!(host.runtime().get_flag_value("doomed-flag"), None);
+    assert_eq!(
+        host.runtime().get_flag_value("survivor-flag"),
+        Some(FlagValue::Boolean(true))
+    );
+
+    // Bus subscription rolled back: emitting reaches nobody.
+    host.event_bus().emit("doomed-channel", json!({}));
+    assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+    // Provider registration discarded: nothing flushes on bind.
+    let actions = Arc::new(MockActions::default());
+    host.bind_actions(actions.clone()).await;
+    assert!(actions
+        .registered_providers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty());
+}
+
+/// Commit on success: the pending flag default and provider registration
+/// land exactly once.
+#[tokio::test]
+async fn api_factory_success_commits_pending_registrations() {
+    let host = host_with(vec![inline_ext_async("ok", |api| {
+        Box::pin(async move {
+            api.register_flag(
+                "pending-flag",
+                None,
+                FlagType::String,
+                Some(FlagValue::String("committed".into())),
+            )
+            .map_err(|e| e.to_string())?;
+            api.register_provider("pending-provider", json!({"baseUrl": "https://y"}))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+    })])
+    .await;
+
+    assert_eq!(
+        host.runtime().get_flag_value("pending-flag"),
+        Some(FlagValue::String("committed".into()))
+    );
+    let actions = Arc::new(MockActions::default());
+    host.bind_actions(actions.clone()).await;
+    assert_eq!(
+        actions
+            .registered_providers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        [(
+            "pending-provider".to_owned(),
+            json!({"baseUrl": "https://y"})
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Provider registration queue (loader.ts:206-219, runner.ts:349-407)
 // ---------------------------------------------------------------------------
 

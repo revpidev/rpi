@@ -560,7 +560,7 @@ async fn w5_reload_reruns_factories_preserves_flags_and_stales_old() {
     }));
 
     let tmp = TempDir::new();
-    let host = NativeExtensionHost::new(&tmp.path().to_string_lossy());
+    let host = std::sync::Arc::new(NativeExtensionHost::new(&tmp.path().to_string_lossy()));
     let errors = host
         .load_startup_final(
             tmp.path().join("agent"),

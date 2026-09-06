@@ -62,6 +62,8 @@ pub const EVENT_BEFORE_AGENT_START: &str = "before_agent_start";
 pub const EVENT_AGENT_START: &str = "agent_start";
 pub const EVENT_AGENT_END: &str = "agent_end";
 pub const EVENT_AGENT_SETTLED: &str = "agent_settled";
+pub const EVENT_UI_PROMPT_START: &str = "ui_prompt_start";
+pub const EVENT_UI_PROMPT_END: &str = "ui_prompt_end";
 pub const EVENT_TURN_START: &str = "turn_start";
 pub const EVENT_TURN_END: &str = "turn_end";
 pub const EVENT_MESSAGE_START: &str = "message_start";
@@ -77,10 +79,10 @@ pub const EVENT_INPUT: &str = "input";
 pub const EVENT_TOOL_CALL: &str = "tool_call";
 pub const EVENT_TOOL_RESULT: &str = "tool_result";
 
-/// All 34 event names, in the upstream `ExtensionAPI.on()` overload order
-/// (types.ts:1257-1301). `ui_prompt_start` / `ui_prompt_end` are V14-11
-/// scope and not yet registered here.
-pub const ALL_EVENTS: [&str; 34] = [
+/// All 36 event names, in the upstream `ExtensionAPI.on()` overload order
+/// (types.ts:1257-1301; `ui_prompt_start` / `ui_prompt_end` at :1286-1287,
+/// ccfe79ed2 / V14-11 FR-C).
+pub const ALL_EVENTS: [&str; 36] = [
     EVENT_PROJECT_TRUST,
     EVENT_RESOURCES_DISCOVER,
     EVENT_SESSION_START,
@@ -101,6 +103,8 @@ pub const ALL_EVENTS: [&str; 34] = [
     EVENT_AGENT_START,
     EVENT_AGENT_END,
     EVENT_AGENT_SETTLED,
+    EVENT_UI_PROMPT_START,
+    EVENT_UI_PROMPT_END,
     EVENT_TURN_START,
     EVENT_TURN_END,
     EVENT_MESSAGE_START,

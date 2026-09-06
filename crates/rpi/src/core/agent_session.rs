@@ -399,6 +399,10 @@ struct AgentSessionInner {
     steering_messages: Mutex<Vec<String>>,
     follow_up_messages: Mutex<Vec<String>>,
     pending_next_turn_messages: Mutex<Vec<AgentMessage>>,
+    /// `_pendingCustomMessages` (agent-session.ts:331): custom messages sent
+    /// with `triggerTurn: false` while streaming, appended once the current
+    /// turn's tool results are in state and session (240eb29c4, #8537).
+    pending_custom_messages: Mutex<Vec<AgentMessage>>,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
 
     /// `_turnIndex` (agent-session.ts:344): reset to 0 on `agent_start`,
@@ -530,6 +534,7 @@ impl AgentSession {
             steering_messages: Mutex::new(Vec::new()),
             follow_up_messages: Mutex::new(Vec::new()),
             pending_next_turn_messages: Mutex::new(Vec::new()),
+            pending_custom_messages: Mutex::new(Vec::new()),
             last_assistant_message: Mutex::new(None),
             turn_index: AtomicU32::new(0),
             retry_attempt: Mutex::new(0),
@@ -832,6 +837,16 @@ impl AgentSession {
                     self.set_retry_attempt(0);
                 }
             }
+        }
+
+        // A turn ends after its assistant message and every tool result has
+        // been appended, so this is the first point in the run where a
+        // context-only custom message can be inserted without landing
+        // between a tool call and its result. Flushing after the extension
+        // and listener dispatch above also picks up messages that turn_end
+        // handlers queued (agent-session.ts:714-721, 240eb29c4).
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            self.flush_pending_custom_messages();
         }
     }
 
@@ -1625,6 +1640,7 @@ impl AgentSession {
         // finally (agent-session.ts:1068-1072).
         *lock(&self.inner.system_prompt_override) = None;
         self.flush_pending_bash_messages();
+        self.flush_pending_custom_messages();
         self.emit_agent_settled().await;
         result
     }
@@ -1744,8 +1760,10 @@ impl AgentSession {
                 return Ok(None);
             }
 
-            // Flush pending bash messages before the new prompt.
+            // Flush any pending bash and custom messages before the new
+            // prompt (agent-session.ts:1226-1227).
             self.flush_pending_bash_messages();
+            self.flush_pending_custom_messages();
 
             // Validate model (agent-session.ts:1177-1195).
             let Some(model) = self.model() else {
@@ -1977,14 +1995,25 @@ impl AgentSession {
         Ok(())
     }
 
-    /// `sendCustomMessage` (agent-session.ts:1429-1463).
+    /// `sendCustomMessage` (agent-session.ts:1484-1510 @ 9841914):
+    /// - `deliverAs: "nextTurn"` → pending-next-turn queue;
+    /// - streaming + `trigger_turn != Some(false)` → steer / followUp
+    ///   (undefined defaults to steering-eligible, 47b5119d0);
+    /// - not streaming + `trigger_turn == Some(true)` → new turn;
+    /// - streaming + `trigger_turn == Some(false)` → pending queue, appended
+    ///   after the turn's tool results (240eb29c4, #8537);
+    /// - otherwise → append to state/session + message events.
+    ///
+    /// `trigger_turn` is `Option<bool>` because upstream treats `undefined`
+    /// differently per branch: `!== false` (steer) vs truthy (run turn).
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_custom_message(
         &self,
         custom_type: &str,
         content: Option<UserContent>,
         display: bool,
         details: Option<serde_json::Value>,
-        trigger_turn: bool,
+        trigger_turn: Option<bool>,
         deliver_as: Option<CustomDeliverAs>,
     ) -> Result<(), RpiError> {
         let message = AgentMessage::Custom(CustomMessage {
@@ -1997,49 +2026,81 @@ impl AgentSession {
         });
         if deliver_as == Some(CustomDeliverAs::NextTurn) {
             lock(&self.inner.pending_next_turn_messages).push(message);
-        } else if self.is_streaming() {
+        } else if self.is_streaming() && trigger_turn != Some(false) {
             match deliver_as {
                 Some(CustomDeliverAs::FollowUp) => self.inner.agent.follow_up(message),
                 _ => self.inner.agent.steer(message),
             }
-        } else if trigger_turn {
+        } else if trigger_turn == Some(true) {
             self.run_agent_prompt(vec![message]).await?;
+        } else if self.is_streaming() {
+            // Appending now would put the message between an assistant tool
+            // call and its result, which providers that validate message
+            // order reject on replay. Defer to the end of the turn. Nothing
+            // is emitted yet: message events must not describe messages the
+            // session tree does not contain (agent-session.ts:1505-1510).
+            lock(&self.inner.pending_custom_messages).push(message);
         } else {
-            let mut messages = self.inner.agent.state().messages;
-            messages.push(message.clone());
-            self.inner.agent.set_messages(messages);
-            let result = lock(&self.inner.session_manager).append_custom_message_entry(
-                custom_type,
-                content.unwrap_or_default(),
-                display,
-                details,
-            );
-            if let Err(error) = result {
-                tracing::warn!("session append failed: {error}");
-            }
-            self.emit(AgentSessionEvent::Agent(Box::new(
-                AgentEvent::MessageStart {
-                    message: message.clone(),
-                },
-            )));
-            self.emit(AgentSessionEvent::Agent(Box::new(AgentEvent::MessageEnd {
-                message,
-            })));
+            self.append_custom_message(message);
         }
         Ok(())
     }
 
-    /// `sendUserMessage` (agent-session.ts:1472-1503).
+    /// `_appendCustomMessage` (agent-session.ts:1512-1525): state append +
+    /// session entry + `message_start`/`message_end` events.
+    fn append_custom_message(&self, message: AgentMessage) {
+        let AgentMessage::Custom(custom) = &message else {
+            return;
+        };
+        let mut messages = self.inner.agent.state().messages;
+        messages.push(message.clone());
+        self.inner.agent.set_messages(messages);
+        let result = lock(&self.inner.session_manager).append_custom_message_entry(
+            &custom.custom_type,
+            custom.content.clone(),
+            custom.display,
+            custom.details.clone(),
+        );
+        if let Err(error) = result {
+            tracing::warn!("session append failed: {error}");
+        }
+        self.emit(AgentSessionEvent::Agent(Box::new(
+            AgentEvent::MessageStart {
+                message: message.clone(),
+            },
+        )));
+        self.emit(AgentSessionEvent::Agent(Box::new(AgentEvent::MessageEnd {
+            message,
+        })));
+    }
+
+    /// `_flushPendingCustomMessages` (agent-session.ts:1527-1541): append
+    /// custom messages queued while the agent was running, in order.
+    /// Called at `turn_end` (after the extension and listener dispatch), in
+    /// the `_runAgentPrompt` finally, and before a new prompt — the first
+    /// points where the queue is guaranteed to no longer sit between a
+    /// tool call and its result.
+    fn flush_pending_custom_messages(&self) {
+        let pending = std::mem::take(&mut *lock(&self.inner.pending_custom_messages));
+        for message in pending {
+            self.append_custom_message(message);
+        }
+    }
+
+    /// `sendUserMessage` (agent-session.ts:1472-1503 + :1548-1575 @ 9841914,
+    /// b987ead35/V14-11 FR-D): `expand_prompt_templates` defaults to false
+    /// (`?? false` upstream).
     pub async fn send_user_message(
         &self,
         text: &str,
         images: Option<Vec<ImageContent>>,
         deliver_as: Option<StreamingBehavior>,
+        expand_prompt_templates: Option<bool>,
     ) -> Result<(), RpiError> {
         self.prompt(
             text,
             PromptOptions {
-                expand_prompt_templates: Some(false),
+                expand_prompt_templates: Some(expand_prompt_templates.unwrap_or(false)),
                 streaming_behavior: deliver_as,
                 images,
                 source: Some(InputSource::Extension),
