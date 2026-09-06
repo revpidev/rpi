@@ -1,8 +1,9 @@
-//! Port of `packages/tui/src/layout.ts` @ pi 4181f66.
+//! Port of `packages/tui/src/layout.ts` @ pi 9841914.
 //!
 //! The layout engine: walks the component tree via `Component::layout_node`
 //! (the T30 replacement for upstream's `LAYOUT_NODE` symbol protocol),
 //! measures stack/scroll containers, and paints the frame into a line buffer.
+//! The redesigned full-track scrollbar overlay (457ae8c79) ships here.
 //!
 //! Intentional differences:
 //! - `LayoutBox.parent` is omitted — upstream never reads it (it is only
@@ -32,14 +33,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::components::scroll_view::ScrollbarStyleFn;
+use crate::components::scroll_view::ScrollbarMode;
 use crate::components::stack::{allocate_stack_sizes, visible_stack_entries};
 use crate::layout_node::{Basis, LayoutNode, LayoutViewport, StackAlign, StackKind};
 use crate::terminal_image::{crop_kitty_image_line, get_kitty_image_metadata, is_image_line};
 use crate::tui::{
     composite_tui_line, lock_component, RenderHandle, SharedComponent, CURSOR_MARKER,
 };
-use crate::utils::{extract_ansi_code, get_grapheme_cell_range, slice_by_column, visible_width};
+use crate::utils::{
+    extract_ansi_code, get_active_background_ansi, get_grapheme_cell_range, slice_by_column,
+    visible_width,
+};
 
 /// `LayoutRect` (layout.ts:10-15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,14 +482,19 @@ fn layout_component(
     }
 }
 
-/// `styleScrollbarCell` (layout.ts:243-264): apply the scrollbar style to the
-/// single terminal cell at `column` WITHOUT replacing the cell's text —
-/// wide graphemes spanning the column are styled whole.
-fn style_scrollbar_cell(
+/// `replaceScrollbarCell` (layout.ts:249-278 @ 9841914, 457ae8c79):
+/// overlay the scrollbar glyph onto the cell at `column`, REPLACING the
+/// underlying grapheme. Wide graphemes spanning the column are replaced
+/// whole (padded); `preserve_target_background` re-emits the target cell's
+/// active background color after the reset/hyperlink-close prefix so the
+/// overlay keeps the underlying background instead of inheriting the
+/// replaced cell's foreground styling.
+fn replace_scrollbar_cell(
     line: &str,
     column: usize,
     total_width: usize,
-    style: &ScrollbarStyleFn,
+    replacement: &str,
+    preserve_target_background: bool,
 ) -> String {
     if is_image_line(line) {
         return line.to_string();
@@ -498,7 +507,8 @@ fn style_scrollbar_cell(
     let target = slice_by_column(line, start, end - start, true);
     let after = slice_by_column(line, end, total_width.saturating_sub(end), true);
 
-    // ANSI prefixes stay OUTSIDE the styled text (layout.ts:253-260).
+    // The target's leading ANSI run (kept as the background source only;
+    // the glyph itself is replaced, so the codes are NOT re-emitted).
     let mut target_prefix = String::new();
     let mut target_index = 0;
     while target_index < target.len() {
@@ -508,32 +518,39 @@ fn style_scrollbar_cell(
         target_prefix.push_str(ansi.code);
         target_index += ansi.length;
     }
-    let target_text = &target[target_index..];
-    let owned_target;
-    let target_text = if target_text.is_empty() {
-        owned_target = " ".repeat(end - start);
-        owned_target.as_str()
-    } else {
-        target_text
-    };
     let before_padding = " ".repeat(start.saturating_sub(visible_width(&before)));
-    format!(
-        "{before}{before_padding}{target_prefix}{}{after}",
-        style(target_text)
-    )
+    let cell_padding_before = " ".repeat(column.saturating_sub(start));
+    let cell_padding_after = " ".repeat(end.saturating_sub(column + 1));
+    let background = if preserve_target_background {
+        get_active_background_ansi(&target_prefix)
+    } else {
+        String::new()
+    };
+    // `\x1b[0m\x1b]8;;\x07` (layout.ts:276): reset styles, close any open
+    // OSC 8 hyperlink, then optionally re-open the preserved background.
+    format!("{before}{before_padding}\x1b[0m\x1b]8;;\x07{background}{cell_padding_before}{replacement}{cell_padding_after}{after}")
 }
 
-/// `getScrollbarGeometry` (layout.ts:266-291).
-pub fn get_scrollbar_geometry(layout_box: &LayoutBox) -> Option<ScrollbarGeometry> {
+/// `getScrollbarGeometry` (layout.ts:280-307 @ 9841914, 457ae8c79).
+/// `include_hidden_auto` reveals a hidden `auto` scrollbar with overflow
+/// (the hover hit-test uses it to wake the track as the pointer enters).
+pub fn get_scrollbar_geometry(
+    layout_box: &LayoutBox,
+    include_hidden_auto: bool,
+) -> Option<ScrollbarGeometry> {
     let shared = layout_box.scroll_view.as_ref()?;
-    let (is_visible, scroll_top) = {
-        let guard = lock_component(shared);
-        let scroll_view = guard.as_scroll_view()?;
-        (scroll_view.is_scrollbar_visible(), scroll_view.scroll_top())
-    };
-    if !is_visible || layout_box.rect.width == 0 || layout_box.rect.height == 0 {
+    if layout_box.rect.width == 0 || layout_box.rect.height == 0 {
         return None;
     }
+    let (is_visible, scroll_top, scrollbar) = {
+        let guard = lock_component(shared);
+        let scroll_view = guard.as_scroll_view()?;
+        (
+            scroll_view.is_scrollbar_visible(),
+            scroll_view.scroll_top(),
+            scroll_view.scrollbar(),
+        )
+    };
 
     let content_height = layout_box
         .children
@@ -547,11 +564,18 @@ pub fn get_scrollbar_geometry(layout_box: &LayoutBox) -> Option<ScrollbarGeometr
         })
         .unwrap_or(0);
     let track_height = layout_box.rect.height;
+    let can_reveal_hidden_auto =
+        include_hidden_auto && scrollbar == ScrollbarMode::Auto && content_height > track_height;
+    if !is_visible && !can_reveal_hidden_auto {
+        return None;
+    }
 
     // f64 so content_height == 0 yields +inf and `min(track, inf) == track`,
     // exactly like upstream's division by zero.
     let track = track_height as f64;
     let content = content_height as f64;
+    // `minThumbHeight = min(2, trackHeight)`; a 1-row track keeps a 1-row
+    // thumb (layout.ts:289-292).
     let min_thumb_height = (2.0f64).min(track);
     let thumb_height = min_thumb_height.max(track.min(((track * track) / content).round()));
     let thumb_height = thumb_height as usize;
@@ -577,24 +601,33 @@ pub fn get_scrollbar_geometry(layout_box: &LayoutBox) -> Option<ScrollbarGeometr
     })
 }
 
-/// `paintScrollbar` (layout.ts:293-302).
+/// `paintScrollbar` (layout.ts:309-330 @ 9841914, 457ae8c79): the full
+/// track renders; thumb rows use `█` while the scrollbar is active
+/// (hover/drag) and `┃` otherwise, other rows render the track glyph `│`.
+/// `always` reserves an unstyled column, so the underlying background is
+/// only preserved for the transient overlay modes.
 fn paint_scrollbar(layout_box: &LayoutBox, screen: &mut [String], total_width: usize) {
-    let Some(geometry) = get_scrollbar_geometry(layout_box) else {
-        return;
-    };
     let Some(shared) = layout_box.scroll_view.as_ref() else {
         return;
     };
-    let style = {
+    let (track_style, thumb_style, is_active, scrollbar) = {
         let guard = lock_component(shared);
-        match guard.as_scroll_view() {
-            Some(scroll_view) => scroll_view.scrollbar_style.clone(),
-            None => return,
-        }
+        let Some(scroll_view) = guard.as_scroll_view() else {
+            return;
+        };
+        (
+            scroll_view.scrollbar_track_style.clone(),
+            scroll_view.scrollbar_thumb_style.clone(),
+            scroll_view.is_scrollbar_active(),
+            scroll_view.scrollbar(),
+        )
+    };
+    let Some(geometry) = get_scrollbar_geometry(layout_box, false) else {
+        return;
     };
 
-    for offset in 0..geometry.thumb_height {
-        let row = geometry.thumb_top + offset as isize;
+    for offset in 0..geometry.track_height {
+        let row = geometry.track_top + offset as isize;
         if row < layout_box.clip.y
             || row >= layout_box.clip.y + layout_box.clip.height as isize
             || row < 0
@@ -602,11 +635,19 @@ fn paint_scrollbar(layout_box: &LayoutBox, screen: &mut [String], total_width: u
         {
             continue;
         }
-        screen[row as usize] = style_scrollbar_cell(
+        let is_thumb =
+            row >= geometry.thumb_top && row < geometry.thumb_top + geometry.thumb_height as isize;
+        let replacement = if is_thumb {
+            thumb_style(if is_active { "█" } else { "┃" })
+        } else {
+            track_style("│")
+        };
+        screen[row as usize] = replace_scrollbar_cell(
             &screen[row as usize],
             geometry.column as usize,
             total_width,
-            &style,
+            &replacement,
+            scrollbar != ScrollbarMode::Always,
         );
     }
 }

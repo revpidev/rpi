@@ -1,10 +1,6 @@
 {
   "upstream": "external/pi @ 9841914 (v0.85.0+), dist build",
   "meta": {
-    "pendingUpstreamKeys": [
-      "scrollbarTrack",
-      "scrollbarThumb"
-    ],
     "pendingSplitCases": [
       "invalid-missing-colors",
       "invalid-color-value-type",

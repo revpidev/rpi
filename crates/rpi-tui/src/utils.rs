@@ -1041,6 +1041,15 @@ impl AnsiCodeTracker {
             || self.active_hyperlink.is_some()
     }
 
+    /// `getActiveBackgroundCode` (utils.ts:694-697): only the background
+    /// color active at the end of the tracked text.
+    fn get_active_background_code(&self) -> String {
+        self.bg_color
+            .as_ref()
+            .map(|code| format!("\x1b[{code}m"))
+            .unwrap_or_default()
+    }
+
     /// Get reset codes for attributes that need to be turned off at line end
     /// (`getLineEndReset`, utils.ts:600-609). Underline must be closed to
     /// prevent bleeding into padding. Active OSC 8 hyperlinks must be closed
@@ -1071,6 +1080,17 @@ fn update_tracker_from_text(text: &str, tracker: &mut AnsiCodeTracker) {
             i += ch.len_utf8();
         }
     }
+}
+
+/// Return only the background color active at the end of an ANSI-styled
+/// string (`getActiveBackgroundAnsi`, utils.ts:746-751 @ 9841914,
+/// 457ae8c79). The redesigned scrollbar keeps the underlying cell
+/// background beneath the overlay glyph by re-emitting this code after the
+/// style reset (layout.ts:276).
+pub fn get_active_background_ansi(text: &str) -> String {
+    let mut tracker = AnsiCodeTracker::default();
+    update_tracker_from_text(text, &mut tracker);
+    tracker.get_active_background_code()
 }
 
 /// ECMA-262 `\s` (WhiteSpace + LineTerminator + U+FEFF). Differs from Rust's

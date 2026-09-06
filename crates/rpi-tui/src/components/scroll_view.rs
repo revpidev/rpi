@@ -1,8 +1,10 @@
-//! Port of `packages/tui/src/components/scroll-view.ts` @ pi 4181f66.
+//! Port of `packages/tui/src/components/scroll-view.ts` @ pi 9841914.
 //!
 //! `ScrollView`: a fixed single-child container with scroll state, follow-end
 //! tracking and a three-mode scrollbar (`hidden` / `auto` / `always`, where
 //! `auto` is transient — shown on scroll activity, hidden after a delay).
+//! The scrollbar styling split into `scrollbarTrackStyle` / `scrollbarThumbStyle`
+//! ships with the 457ae8c79 redesign.
 //!
 //! Intentional differences:
 //! - The transient-scrollbar timer is NOT a thread/`setTimeout`: state holds
@@ -64,21 +66,36 @@ pub enum Overscroll {
     Contain,
 }
 
-/// `scrollbarStyle?: (text: string) => string` (scroll-view.ts:12).
+/// `scrollbarTrackStyle` / `scrollbarThumbStyle`
+/// (scroll-view.ts:12-13 @ 9841914, 457ae8c79): `(text: string) => string`.
+/// The pre-redesign single `scrollbarStyle` hook was split into track and
+/// thumb hooks (breaking API change).
 pub type ScrollbarStyleFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
-/// Default `scrollbarStyle` (scroll-view.ts:45): grey background on the cell.
-fn default_scrollbar_style(text: &str) -> String {
-    format!("\x1b[100m{text}\x1b[49m")
+/// Default `scrollbarTrackStyle` (scroll-view.ts:53): bright-black
+/// foreground on the track glyph.
+fn default_scrollbar_track_style(text: &str) -> String {
+    format!("\x1b[90m{text}\x1b[39m")
 }
 
-/// `ScrollViewOptions` (scroll-view.ts:6-14), minus `axis` (see header note).
+/// Default `scrollbarThumbStyle` (scroll-view.ts:54): white foreground on
+/// the thumb glyph.
+fn default_scrollbar_thumb_style(text: &str) -> String {
+    format!("\x1b[37m{text}\x1b[39m")
+}
+
+/// `ScrollViewOptions` (scroll-view.ts:6-15), minus `axis` (see header note).
 pub struct ScrollViewOptions {
     pub follow: Follow,
     pub primary: bool,
     pub overscroll: Overscroll,
     pub scrollbar: ScrollbarMode,
-    pub scrollbar_style: Option<ScrollbarStyleFn>,
+    /// `scrollbarTrackStyle` (scroll-view.ts:12-13 @ 9841914): styles the
+    /// track glyph `│`.
+    pub scrollbar_track_style: Option<ScrollbarStyleFn>,
+    /// `scrollbarThumbStyle`: styles the thumb glyph `┃` (or `█` while
+    /// active).
+    pub scrollbar_thumb_style: Option<ScrollbarStyleFn>,
     pub scrollbar_hide_delay: Duration,
 }
 
@@ -89,14 +106,15 @@ impl Default for ScrollViewOptions {
             primary: false,
             overscroll: Overscroll::Chain,
             scrollbar: ScrollbarMode::Hidden,
-            scrollbar_style: None,
-            // `scrollbarHideDelayMs ?? 1000` (scroll-view.ts:46).
+            scrollbar_track_style: None,
+            scrollbar_thumb_style: None,
+            // `scrollbarHideDelayMs ?? 1000` (scroll-view.ts:55).
             scrollbar_hide_delay: Duration::from_millis(1000),
         }
     }
 }
 
-/// Mutable scroll state (upstream private fields, scroll-view.ts:22-31).
+/// Mutable scroll state (upstream private fields, scroll-view.ts:27-37).
 struct ScrollViewState {
     current_scrollbar: ScrollbarMode,
     current_scroll_top: usize,
@@ -111,7 +129,7 @@ struct ScrollViewState {
     request_render_callback: Option<RenderHandle>,
     transient_scrollbar_visible: bool,
     scrollbar_active: bool,
-    /// Replaces upstream's `scrollbarHideTimer` (scroll-view.ts:31); see the
+    /// Replaces upstream's `scrollbarHideTimer` (scroll-view.ts:37); see the
     /// header note on the explicit-deadline timer model.
     hide_deadline: Option<Instant>,
 }
@@ -125,20 +143,22 @@ pub struct ScrollViewScrollToOptions {
     pub disable_follow: bool,
 }
 
-/// `ScrollView` (scroll-view.ts:16-195).
+/// `ScrollView` (scroll-view.ts:20-228).
 pub struct ScrollView {
     child: SharedComponent,
     follow_end: bool,
     primary: bool,
     overscroll: Overscroll,
-    /// Upstream `readonly scrollbarStyle` (scroll-view.ts:21).
-    pub scrollbar_style: ScrollbarStyleFn,
+    /// Upstream `readonly scrollbarTrackStyle` (scroll-view.ts:25).
+    pub scrollbar_track_style: ScrollbarStyleFn,
+    /// Upstream `readonly scrollbarThumbStyle` (scroll-view.ts:26).
+    pub scrollbar_thumb_style: ScrollbarStyleFn,
     scrollbar_hide_delay: Duration,
     state: RefCell<ScrollViewState>,
 }
 
 impl ScrollView {
-    /// Upstream constructor (scroll-view.ts:33-47).
+    /// Upstream constructor (scroll-view.ts:41-56 @ 9841914).
     pub fn new(component: SharedComponent, options: ScrollViewOptions) -> Self {
         let follow_end = options.follow == Follow::End;
         ScrollView {
@@ -146,9 +166,12 @@ impl ScrollView {
             follow_end,
             primary: options.primary,
             overscroll: options.overscroll,
-            scrollbar_style: options
-                .scrollbar_style
-                .unwrap_or_else(|| Arc::new(default_scrollbar_style)),
+            scrollbar_track_style: options
+                .scrollbar_track_style
+                .unwrap_or_else(|| Arc::new(default_scrollbar_track_style)),
+            scrollbar_thumb_style: options
+                .scrollbar_thumb_style
+                .unwrap_or_else(|| Arc::new(default_scrollbar_thumb_style)),
             scrollbar_hide_delay: options.scrollbar_hide_delay,
             state: RefCell::new(ScrollViewState {
                 current_scrollbar: options.scrollbar,
@@ -165,50 +188,50 @@ impl ScrollView {
         }
     }
 
-    /// The single fixed child (upstream private `child`, scroll-view.ts:17).
+    /// The single fixed child (upstream private `child`, scroll-view.ts:21).
     pub fn child(&self) -> SharedComponent {
         self.child.clone()
     }
 
-    /// `get scrollTop` (scroll-view.ts:49-51).
+    /// `get scrollTop` (scroll-view.ts:58-60).
     pub fn scroll_top(&self) -> usize {
         self.state.borrow().current_scroll_top
     }
 
-    /// `get isFollowingEnd` (scroll-view.ts:53-55) — whether the view is
+    /// `get isFollowingEnd` (scroll-view.ts:62-64) — whether the view is
     /// currently pinned to the end.
     pub fn is_following_end(&self) -> bool {
         self.state.borrow().following_end
     }
 
-    /// `readonly followEnd` option (scroll-view.ts:18) — whether following
+    /// `readonly followEnd` option (scroll-view.ts:22) — whether following
     /// the end is enabled at all (distinct from `is_following_end`, which is
     /// the current pin state).
     pub fn follows_end(&self) -> bool {
         self.follow_end
     }
 
-    /// `get viewportHeight` (scroll-view.ts:57-59).
+    /// `get viewportHeight` (scroll-view.ts:66-68).
     pub fn viewport_height(&self) -> usize {
         self.state.borrow().current_viewport_height
     }
 
-    /// `get scrollbar` (scroll-view.ts:61-63).
+    /// `get scrollbar` (scroll-view.ts:70-72).
     pub fn scrollbar(&self) -> ScrollbarMode {
         self.state.borrow().current_scrollbar
     }
 
-    /// Upstream `readonly primary` (scroll-view.ts:19).
+    /// Upstream `readonly primary` (scroll-view.ts:23).
     pub fn primary(&self) -> bool {
         self.primary
     }
 
-    /// Upstream `readonly overscroll` (scroll-view.ts:20).
+    /// Upstream `readonly overscroll` (scroll-view.ts:24).
     pub fn overscroll(&self) -> Overscroll {
         self.overscroll
     }
 
-    /// `get isScrollbarVisible` (scroll-view.ts:65-70).
+    /// `get isScrollbarVisible` (scroll-view.ts:74-80).
     pub fn is_scrollbar_visible(&self) -> bool {
         let state = self.state.borrow();
         if state.current_scrollbar == ScrollbarMode::Always {
@@ -219,7 +242,13 @@ impl ScrollView {
             && state.transient_scrollbar_visible
     }
 
-    /// `setScrollbar` (scroll-view.ts:72-78).
+    /// `get isScrollbarActive` (scroll-view.ts:81-83): whether the
+    /// pointer hovers or drags the scrollbar (thumb renders `█` while set).
+    pub fn is_scrollbar_active(&self) -> bool {
+        self.state.borrow().scrollbar_active
+    }
+
+    /// `setScrollbar` (scroll-view.ts:85-91).
     pub fn set_scrollbar(&self, scrollbar: ScrollbarMode) {
         let callback = {
             let mut state = self.state.borrow_mut();
@@ -249,7 +278,7 @@ impl ScrollView {
         }
     }
 
-    /// `markScrollbarActivity` (scroll-view.ts:84-98) on already-borrowed
+    /// `markScrollbarActivity` (scroll-view.ts:97-112) on already-borrowed
     /// state. Shows the transient scrollbar and (re)arms the hide deadline —
     /// unless the scrollbar is being dragged (`scrollbar_active`), in which
     /// case no deadline is armed (upstream clears the timer and returns).
@@ -267,21 +296,29 @@ impl ScrollView {
         state.hide_deadline = Some(Instant::now() + self.scrollbar_hide_delay);
     }
 
-    /// `hideTransientScrollbar` (scroll-view.ts:100-105) on already-borrowed
+    /// `hideTransientScrollbar` (scroll-view.ts:114-119) on already-borrowed
     /// state.
     fn hide_transient_scrollbar_state(state: &mut ScrollViewState) {
         state.transient_scrollbar_visible = false;
         state.hide_deadline = None;
     }
 
-    /// `setScrollbarActive` (scroll-view.ts:107-111).
+    /// `setScrollbarActive` (scroll-view.ts:120-124): toggles the
+    /// hover/drag state and requests a render (the redesigned scrollbar
+    /// paints `█` while active, 457ae8c79).
     pub fn set_scrollbar_active(&self, active: bool) {
-        let mut state = self.state.borrow_mut();
-        if active == state.scrollbar_active {
-            return;
+        let callback = {
+            let mut state = self.state.borrow_mut();
+            if active == state.scrollbar_active {
+                return;
+            }
+            state.scrollbar_active = active;
+            self.mark_scrollbar_activity_state(&mut state);
+            state.request_render_callback.clone()
+        };
+        if let Some(callback) = callback {
+            callback.request_render();
         }
-        state.scrollbar_active = active;
-        self.mark_scrollbar_activity_state(&mut state);
     }
 
     /// `scrollTo` (scroll-view.ts:127-146 @ 9841914, 00121ed99): clamped
@@ -319,7 +356,7 @@ impl ScrollView {
         }
     }
 
-    /// `scrollBy` (scroll-view.ts:148-166 @ 9841914, 00121ed99): returns the
+    /// `scrollBy` (scroll-view.ts:148-166 @ 9841914): returns the
     /// unconsumed delta (signed — negative when scrolling up past the
     /// start). Any scroll clears the follow suppression.
     pub fn scroll_by(&self, lines: i64) -> i64 {
@@ -357,7 +394,7 @@ impl ScrollView {
         unconsumed
     }
 
-    /// `scrollToStart` (scroll-view.ts:140-150).
+    /// `scrollToStart` (scroll-view.ts:164-175).
     pub fn scroll_to_start(&self) {
         let callback = {
             let mut state = self.state.borrow_mut();
@@ -401,7 +438,7 @@ impl ScrollView {
         }
     }
 
-    /// `updateLayout` (scroll-view.ts:188-201 @ 9841914).
+    /// `updateLayout` (scroll-view.ts:189-213 @ 9841914).
     pub fn update_layout(
         &self,
         content_height: usize,
@@ -500,7 +537,7 @@ impl ScrollLayoutState for ScrollView {
 }
 
 impl Component for ScrollView {
-    /// `render` (scroll-view.ts:186-190): render the child at the content
+    /// `render` (scroll-view.ts:215-219): render the child at the content
     /// width; when a scrollbar column is reserved, pad every line with one
     /// trailing space to cover it.
     fn render(&self, width: usize) -> Vec<String> {
@@ -523,7 +560,7 @@ impl Component for ScrollView {
     }
 
     fn layout_node(&self) -> Option<LayoutNode<'_>> {
-        // `[LAYOUT_NODE]()` (scroll-view.ts:192-194).
+        // `[LAYOUT_NODE]()` (scroll-view.ts:221-223).
         Some(LayoutNode::Scroll(ScrollLayoutNode {
             component: self.child.clone(),
             state: self,
@@ -757,6 +794,25 @@ mod tests {
     }
 
     // ---- fallback render ----
+
+    #[test]
+    fn scrollbar_style_hooks_default_to_track_90_and_thumb_37() {
+        // 457ae8c79 (scroll-view.ts:53-54): the split hooks default to a
+        // bright-black track and a white thumb, both closing only the
+        // foreground (`\x1b[39m`).
+        let view = text_view(ScrollViewOptions::default());
+        assert_eq!((view.scrollbar_track_style)("│"), "\x1b[90m│\x1b[39m");
+        assert_eq!((view.scrollbar_thumb_style)("┃"), "\x1b[37m┃\x1b[39m");
+
+        let custom: ScrollbarStyleFn = Arc::new(|text: &str| format!("<{text}>"));
+        let styled = text_view(ScrollViewOptions {
+            scrollbar_track_style: Some(Arc::clone(&custom)),
+            scrollbar_thumb_style: Some(custom),
+            ..ScrollViewOptions::default()
+        });
+        assert_eq!((styled.scrollbar_track_style)("│"), "<│>");
+        assert_eq!((styled.scrollbar_thumb_style)("█"), "<█>");
+    }
 
     #[test]
     fn render_pads_a_trailing_space_over_the_reserved_scrollbar_column() {

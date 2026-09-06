@@ -522,6 +522,44 @@ impl TuiHandle {
             tui.set_fullscreen_scrollbar(mode);
         }
     }
+
+    /// `setCopyOnSelect` (tui-alt-screen.ts:285-287 @ 9841914) forwarded from
+    /// `applyRuntimeSettings` / the settings change
+    /// (interactive-mode.ts:1943-1945, 4774-4776). No-op on the main screen
+    /// (upstream guards with `instanceof TuiAltScreen`).
+    pub fn set_copy_on_select(&self, enabled: bool) {
+        if let RendererClone::Alt(tui) = self.renderer_clone() {
+            tui.set_copy_on_select(enabled);
+        }
+    }
+
+    /// `getCopyOnSelect` (tui-alt-screen.ts:271-273). `true` on the main
+    /// screen — callers gate on [`TuiHandle::mode`] first (the upstream
+    /// `instanceof TuiAltScreen` guard), so the value is never read there.
+    pub fn get_copy_on_select(&self) -> bool {
+        match self.renderer_clone() {
+            RendererClone::Main(_) => true,
+            RendererClone::Alt(tui) => tui.get_copy_on_select(),
+        }
+    }
+
+    /// `hasActiveSelection` (tui-alt-screen.ts:293-295). `false` on the main
+    /// screen.
+    pub fn has_active_selection(&self) -> bool {
+        match self.renderer_clone() {
+            RendererClone::Main(_) => false,
+            RendererClone::Alt(tui) => tui.has_active_selection(),
+        }
+    }
+
+    /// `copyActiveSelectionToClipboard` (tui-alt-screen.ts:297-301).
+    /// `false` on the main screen.
+    pub fn copy_active_selection_to_clipboard(&self) -> bool {
+        match self.renderer_clone() {
+            RendererClone::Main(_) => false,
+            RendererClone::Alt(tui) => tui.copy_active_selection_to_clipboard(),
+        }
+    }
 }
 
 /// Lock the inner renderer (poisoning recovered like `lock_shared`).

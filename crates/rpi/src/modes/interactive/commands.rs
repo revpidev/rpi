@@ -72,6 +72,19 @@ use crate::RpiError;
 /// `MAX_OSC52_ENCODED_LENGTH` (utils/clipboard.ts:20).
 const MAX_OSC52_ENCODED_LENGTH: usize = 100_000;
 
+/// Build the OSC 52 clipboard write for `text` under the shared encoded
+/// length cap (`emitOsc52`, utils/clipboard.ts:26-33). Shared by the
+/// `/copy` / `app.message.copy` message path and the fullscreen selection
+/// `copySelection` injection (tui-renderer.ts:38-42 @ 9841914) so both
+/// clipboard doors produce identical bytes and the same verified outcome.
+pub(crate) fn emit_osc52_with_cap(text: &str) -> Result<String, String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    if encoded.len() > MAX_OSC52_ENCODED_LENGTH {
+        return Err("Text too large to copy via OSC 52 (100KB limit)".to_string());
+    }
+    Ok(format!("\x1b]52;c;{encoded}\x07"))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -289,9 +302,21 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `handleCopyCommand` (interactive-mode.ts:5605-5618): copy the last
-    /// assistant message through the local clipboard hook.
-    pub(crate) fn handle_copy_command(&self) {
+    /// `handleCopyCommand` (interactive-mode.ts:6134-6165 @ 9841914,
+    /// 4e4949299): with `prefer_selection` (the `app.message.copy` keybinding
+    /// path), a fullscreen renderer with copyOnSelect disabled and an active
+    /// selection copies THAT selection instead of the last assistant
+    /// message; otherwise copy the last assistant message through the local
+    /// clipboard hook.
+    pub(crate) fn handle_copy_command(&self, prefer_selection: bool) {
+        if prefer_selection
+            && self.ui.mode() == rpi_tui::tui::TuiMode::Fullscreen
+            && !self.ui.get_copy_on_select()
+            && self.ui.has_active_selection()
+        {
+            self.ui.copy_active_selection_to_clipboard();
+            return;
+        }
         let Some(text) = self.session().get_last_assistant_text() else {
             self.show_error("No agent messages to copy yet.");
             return;
@@ -309,11 +334,7 @@ impl InteractiveUi {
     /// OSC 52 escape directly (`emitOsc52`, utils/clipboard.ts:26-33) with
     /// the same encoded-length cap. TODO: native tool integration.
     fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-        if encoded.len() > MAX_OSC52_ENCODED_LENGTH {
-            return Err("Text too large to copy via OSC 52 (100KB limit)".to_string());
-        }
-        let osc52 = format!("\x1b]52;c;{encoded}\x07");
+        let osc52 = emit_osc52_with_cap(text)?;
         self.ui.with_terminal(|terminal| terminal.write(&osc52));
         Ok(())
     }
@@ -879,7 +900,7 @@ mod tests {
     async fn copy_command_empty_shows_error() {
         let (mode, _terminal) = mode_harness().await;
         let ui = &mode.ui_state;
-        ui.handle_copy_command();
+        ui.handle_copy_command(false);
         let rendered = chat_render(ui);
         assert!(
             rendered.contains("No agent messages to copy yet."),
@@ -895,7 +916,7 @@ mod tests {
             vec![text_content("hello")],
             StopReason::Stop,
         )]);
-        ui.handle_copy_command();
+        ui.handle_copy_command(false);
         let writes = terminal.writes();
         assert!(
             writes.contains("\x1b]52;c;") && writes.ends_with('\x07'),
@@ -908,10 +929,6 @@ mod tests {
             "rendered: {rendered}"
         );
     }
-
-    // ---------------------------------------------------------------------
-    // /export
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn export_command_writes_jsonl_file() {

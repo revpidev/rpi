@@ -46,10 +46,6 @@ fn visible_lines(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn strip_all(lines: &[String]) -> Vec<String> {
-    lines.iter().map(|line| strip_ansi(line)).collect()
-}
-
 fn noop_render_handle() -> RenderHandle {
     RenderHandle::new(|| {})
 }
@@ -510,16 +506,21 @@ fn tracks_follow_end_state_and_returns_unused_scroll_delta() {
     });
 }
 
-/// layout.test.ts:193-271 (segments a-i inline).
+/// layout.test.ts:193-297 @ 9841914 (segments a-i inline; rewritten for
+/// the 457ae8c79 full-track glyph scrollbar: the overlay REPLACES the
+/// underlying cell content instead of styling it).
 #[test]
-fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
+fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
     let source_lines = [
         "abcd界", "abcde2", "abcde3", "abcde4", "abcde5", "abcde6", "abcde7", "abcde8",
     ];
     let content_background = "\x1b[42m";
-    let scrollbar_background = "\x1b[48;5;1m";
-    let scrollbar_style: ScrollbarStyleFn =
-        Arc::new(move |text| format!("{scrollbar_background}{text}\x1b[49m"));
+    let track_color = "\x1b[38;5;2m";
+    let thumb_color = "\x1b[38;5;1m";
+    let scrollbar_track_style: ScrollbarStyleFn =
+        Arc::new(move |text| format!("{track_color}{text}\x1b[39m"));
+    let scrollbar_thumb_style: ScrollbarStyleFn =
+        Arc::new(move |text| format!("{thumb_color}{text}\x1b[39m"));
     let content = Text::new(
         source_lines.join("\n"),
         0,
@@ -532,54 +533,79 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
         shared_component(content),
         ScrollViewOptions {
             scrollbar: ScrollbarMode::Auto,
-            scrollbar_style: Some(scrollbar_style.clone()),
+            scrollbar_track_style: Some(scrollbar_track_style.clone()),
+            scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
             scrollbar_hide_delay: Duration::from_millis(10),
             ..ScrollViewOptions::default()
         },
     ));
     let render = || render_layout_frame(&scroll_view, 6, 4, noop_render_handle()).lines;
-    let thumb_rows = |lines: &[String]| -> Vec<bool> {
-        lines
-            .iter()
-            .map(|line| line.contains(scrollbar_background))
-            .collect()
-    };
+    let visible =
+        |lines: &[String]| -> Vec<String> { lines.iter().map(|line| strip_ansi(line)).collect() };
 
     // (a) No scroll activity yet: no scrollbar, content passes through.
-    let lines = render();
-    assert_eq!(thumb_rows(&lines), [false, false, false, false]);
-    assert_eq!(strip_all(&lines), source_lines[..4]);
+    assert_eq!(visible(&render()), source_lines[..4]);
 
-    // (b) Activity shows the thumb; the styled cell keeps its text, and the
-    // content background stays outside the scrollbar style.
+    // (b) Activity reveals the full track: `│` above/below the `┃` thumb,
+    // positioned by the proportional offset (scrollTop=2/max=4 → thumb rows
+    // 1-2 of 4).
     with_scroll_view(&scroll_view, |sv| {
         sv.scroll_by(2);
     });
     let lines = render();
-    assert_eq!(thumb_rows(&lines), [false, true, true, false]);
-    assert_eq!(strip_all(&lines), source_lines[2..6]);
-    let (Some(last_content), Some(last_scrollbar)) = (
-        lines[1].rfind(content_background),
-        lines[1].rfind(scrollbar_background),
-    ) else {
-        panic!("expected both backgrounds in line 1: {:?}", lines[1]);
-    };
-    assert!(last_content < last_scrollbar);
+    assert_eq!(visible(&lines), ["abcde│", "abcde┃", "abcde┃", "abcde│"]);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.contains(track_color))
+            .collect::<Vec<_>>(),
+        [true, false, false, true]
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.contains(thumb_color))
+            .collect::<Vec<_>>(),
+        [false, true, true, false]
+    );
 
-    // (c) The transient scrollbar hides once the deadline passes (tick).
+    // (c) Active (hover/drag) expands the thumb to `█`.
+    with_scroll_view(&scroll_view, |sv| sv.set_scrollbar_active(true));
+    let lines = render();
+    assert_eq!(visible(&lines), ["abcde│", "abcde█", "abcde█", "abcde│"]);
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| l.contains(thumb_color))
+            .collect::<Vec<_>>(),
+        [false, true, true, false]
+    );
+    // The preserved underlying background is re-emitted before the glyph.
+    let (Some(last_content), Some(last_thumb)) = (
+        lines[1].rfind(content_background),
+        lines[1].rfind(thumb_color),
+    ) else {
+        panic!("expected both colors in line 1: {:?}", lines[1]);
+    };
+    assert!(last_content < last_thumb);
+    with_scroll_view(&scroll_view, |sv| sv.set_scrollbar_active(false));
+
+    // (d) The transient scrollbar hides once the deadline passes (tick).
     std::thread::sleep(Duration::from_millis(30));
     with_scroll_view(&scroll_view, |sv| sv.tick(Instant::now()));
-    let lines = render();
-    assert_eq!(thumb_rows(&lines), [false, false, false, false]);
+    assert_eq!(visible(&render()), source_lines[2..6]);
 
-    // (d) At the end the thumb hugs the bottom rows.
+    // (e) At the end the thumb hugs the bottom rows.
     with_scroll_view(&scroll_view, |sv| sv.scroll_to_end());
-    let lines = render();
-    assert_eq!(thumb_rows(&lines), [false, false, true, true]);
-    assert_eq!(strip_all(&lines), source_lines[4..]);
+    assert_eq!(visible(&render()), ["abcde│", "abcde│", "abcde┃", "abcde┃"]);
 
-    // (e) follow=end stays pinned across content growth; no scrollbar without
-    // scroll activity.
+    // (f) At the start a wide grapheme under the column is replaced whole
+    // (padding before the glyph: "abcd界" → "abcd ┃").
+    with_scroll_view(&scroll_view, |sv| sv.scroll_to_start());
+    assert_eq!(visible(&render())[0], "abcd ┃");
+
+    // (g) follow=end stays pinned across content growth; no scrollbar
+    // without scroll activity.
     let (followed_content, followed_handle) =
         shared_lines(source_lines.iter().map(|s| s.to_string()).collect());
     let followed = shared_component(ScrollView::new(
@@ -587,7 +613,8 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
         ScrollViewOptions {
             follow: Follow::End,
             scrollbar: ScrollbarMode::Auto,
-            scrollbar_style: Some(scrollbar_style.clone()),
+            scrollbar_track_style: Some(scrollbar_track_style.clone()),
+            scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
             ..ScrollViewOptions::default()
         },
     ));
@@ -601,14 +628,15 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
     assert!(growth_frame
         .lines
         .iter()
-        .all(|line| !line.contains(scrollbar_background)));
+        .all(|line| !strip_ansi(line).contains(['│', '┃'])));
 
-    // (f) Content fitting the viewport never shows the auto scrollbar.
+    // (h) Content fitting the viewport never shows the auto scrollbar.
     let fitting = shared_component(ScrollView::new(
         text("1\n2"),
         ScrollViewOptions {
             scrollbar: ScrollbarMode::Auto,
-            scrollbar_style: Some(scrollbar_style.clone()),
+            scrollbar_track_style: Some(scrollbar_track_style.clone()),
+            scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
             ..ScrollViewOptions::default()
         },
     ));
@@ -619,53 +647,72 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
     assert!(render_layout_frame(&fitting, 6, 4, noop_render_handle())
         .lines
         .iter()
-        .all(|line| !line.contains(scrollbar_background)));
+        .all(|line| !strip_ansi(line).contains(['│', '┃'])));
 
-    // (g) scrollbar=always reserves a column and styles the full track when
-    // the content fits.
+    // (i) scrollbar=always reserves a column (child width 5) and renders
+    // the thumb even when the content fits.
     let always_fitting = shared_component(ScrollView::new(
         text("1\n2"),
         ScrollViewOptions {
             scrollbar: ScrollbarMode::Always,
-            scrollbar_style: Some(scrollbar_style.clone()),
+            scrollbar_track_style: Some(scrollbar_track_style.clone()),
+            scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
             ..ScrollViewOptions::default()
         },
     ));
     let always_fitting_frame = render_layout_frame(&always_fitting, 6, 4, noop_render_handle());
     assert_eq!(always_fitting_frame.root.children[0].rect.width, 5);
-    assert!(always_fitting_frame
-        .lines
+    assert!(visible(&always_fitting_frame.lines)
         .iter()
-        .all(|line| line.contains(scrollbar_background)));
+        .all(|line| line.ends_with('┃')));
 
-    // (h) With overflow the thumb covers track^2/content rows (2 of 4 here).
+    // (j) With overflow: 2 thumb rows + 2 track rows, and the reserved
+    // column's reset prefix sits after the content background (unstyled
+    // reservation — no background preservation in `always` mode).
     let always_overflowing = shared_component(ScrollView::new(
-        shared_component(Text::new(source_lines.join("\n"), 0, 0, None)),
+        text(&source_lines.join("\n")),
         ScrollViewOptions {
             scrollbar: ScrollbarMode::Always,
-            scrollbar_style: Some(scrollbar_style.clone()),
+            scrollbar_track_style: Some(scrollbar_track_style.clone()),
+            scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
             ..ScrollViewOptions::default()
         },
     ));
     let always_overflowing_frame =
         render_layout_frame(&always_overflowing, 6, 4, noop_render_handle());
     assert_eq!(always_overflowing_frame.root.children[0].rect.width, 5);
-    assert_eq!(
-        always_overflowing_frame
-            .lines
-            .iter()
-            .filter(|line| line.contains(scrollbar_background))
-            .count(),
-        2
-    );
+    let stripped = visible(&always_overflowing_frame.lines);
+    assert_eq!(stripped.iter().filter(|l| l.ends_with('┃')).count(), 2);
+    assert_eq!(stripped.iter().filter(|l| l.ends_with('│')).count(), 2);
+    for line in &always_overflowing_frame.lines {
+        // JS `lastIndexOf(needle, fromIndex)`: the last occurrence at or
+        // before the scrollbar style index.
+        let scrollbar_style_index = line
+            .rfind(track_color)
+            .into_iter()
+            .chain(line.rfind(thumb_color))
+            .max()
+            .unwrap_or(0);
+        let reset_prefix = "\x1b[0m\x1b]8;;\x07";
+        let reserved_column_reset_index = line
+            .rmatch_indices(reset_prefix)
+            .map(|(index, _)| index)
+            .find(|index| *index <= scrollbar_style_index);
+        let Some(reserved_column_reset_index) = reserved_column_reset_index else {
+            panic!("expected reserved-column reset before the scrollbar style: {line:?}");
+        };
+        assert!(reserved_column_reset_index > line.rfind(content_background).unwrap_or(0));
+    }
 
-    // (i) Thumb-height matrix at viewport 20.
+    // (k) Thumb-height matrix at viewport 20: proportional down to the
+    // 2-row floor.
     let thumb_height_for = |content_height: usize| -> usize {
         let sized = shared_component(ScrollView::new(
             text(&vec!["x"; content_height].join("\n")),
             ScrollViewOptions {
                 scrollbar: ScrollbarMode::Auto,
-                scrollbar_style: Some(scrollbar_style.clone()),
+                scrollbar_track_style: Some(scrollbar_track_style.clone()),
+                scrollbar_thumb_style: Some(scrollbar_thumb_style.clone()),
                 ..ScrollViewOptions::default()
             },
         ));
@@ -676,7 +723,7 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
         render_layout_frame(&sized, 6, 20, noop_render_handle())
             .lines
             .iter()
-            .filter(|line| line.contains(scrollbar_background))
+            .filter(|line| strip_ansi(line).ends_with('┃'))
             .count()
     };
     assert_eq!(thumb_height_for(21), 19);
@@ -685,7 +732,58 @@ fn renders_a_transient_proportional_scrollbar_without_replacing_cell_content() {
     assert_eq!(thumb_height_for(400), 2);
 }
 
-/// layout.test.ts:273-284.
+/// layout.test.ts:306-333 @ 9841914: the overlay keeps ONLY the underlying
+/// background beneath the glyph — foreground styling (a border color on the
+/// replaced cell) is dropped, and the preserved background is re-emitted
+/// after the reset/hyperlink-close prefix.
+#[test]
+fn preserves_only_the_underlying_background_beneath_overlay_scrollbar_glyphs() {
+    let background = "\x1b[42m";
+    let border_foreground = "\x1b[31m";
+    // Upstream inline mock renders per-width; the frame is always width 6,
+    // so fixed lines are equivalent: background + "x"×5 + red border │.
+    let content = counting_lines(vec![
+        format!(
+            "{background}xxxxx{border_foreground}│\x1b[39m\x1b[49m"
+        );
+        8
+    ])
+    .0;
+    let scroll_view = shared_component(ScrollView::new(
+        content,
+        ScrollViewOptions {
+            scrollbar: ScrollbarMode::Auto,
+            scrollbar_track_style: Some(Arc::new(|text: &str| text.to_string())),
+            scrollbar_thumb_style: Some(Arc::new(|text: &str| text.to_string())),
+            ..ScrollViewOptions::default()
+        },
+    ));
+    render_layout_frame(&scroll_view, 6, 4, noop_render_handle());
+    with_scroll_view(&scroll_view, |sv| {
+        sv.scroll_by(1);
+    });
+    let frame = render_layout_frame(&scroll_view, 6, 4, noop_render_handle());
+
+    assert_eq!(
+        frame
+            .lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>(),
+        ["xxxxx│", "xxxxx┃", "xxxxx┃", "xxxxx│"]
+    );
+    for line in &frame.lines {
+        assert!(line.contains(background), "background kept: {line:?}");
+        assert!(!line.contains(border_foreground), "fg dropped: {line:?}");
+        assert!(
+            line.contains(&format!("\x1b[0m\x1b]8;;\x07{background}")),
+            "preserved background re-emitted after the reset prefix: {line:?}"
+        );
+    }
+}
+
+/// layout.test.ts:334-345 @ 9841914 (457ae8c79: the reserved column
+/// renders the `┃` thumb glyph when the content fits).
 #[test]
 fn updates_reserved_scrollbar_layout_at_runtime() {
     let scroll_view = shared_component(ScrollView::new(
@@ -710,7 +808,7 @@ fn updates_reserved_scrollbar_layout_at_runtime() {
         )
     };
     let always = render();
-    assert_eq!(visible_lines(&always.lines), ["12345", "6"]);
+    assert_eq!(visible_lines(&always.lines), ["12345┃", "6    ┃"]);
     assert_eq!(always.root.children[0].rect.width, 6);
     assert_eq!(always.root.children[0].children[0].rect.width, 5);
 

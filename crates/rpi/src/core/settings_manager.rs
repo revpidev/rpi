@@ -2387,6 +2387,22 @@ impl SettingsManager {
         self.save();
     }
 
+    /// `getFullscreenCopyOnSelect` (settings-manager.ts:1232-1235 @ 9841914,
+    /// 4e4949299): default `true`; no effect in regular TUI mode.
+    pub fn get_fullscreen_copy_on_select(&self) -> bool {
+        self.settings
+            .get_bool("fullscreenCopyOnSelect")
+            .unwrap_or(true)
+    }
+
+    /// `setFullscreenCopyOnSelect` (settings-manager.ts:1237-1241).
+    pub fn set_fullscreen_copy_on_select(&mut self, enabled: bool) {
+        self.global_settings
+            .set("fullscreenCopyOnSelect", Value::Bool(enabled));
+        self.mark_modified("fullscreenCopyOnSelect", None);
+        self.save();
+    }
+
     /// `getWarnings` (settings-manager.ts:1225-1227) — returns a copy;
     /// defaults are applied by consumers (`anthropicExtraUsage`: true).
     pub fn get_warnings(&self) -> WarningSettings {
@@ -3844,18 +3860,21 @@ mod tests {
             FullscreenExitOutput::Transcript
         );
         assert_eq!(manager.get_fullscreen_scrollbar(), ScrollbarMode::Auto);
+        assert!(manager.get_fullscreen_copy_on_select());
 
         manager.set_fullscreen_exit_output(FullscreenExitOutput::ResumeHint);
         manager.set_fullscreen_scrollbar(ScrollbarMode::Hidden);
+        manager.set_fullscreen_copy_on_select(false);
 
         let saved = read_json(&global_path(&dirs));
         assert_eq!(saved["fullscreenExitOutput"], json!("resume-hint"));
         assert_eq!(saved["fullscreenScrollbar"], json!("hidden"));
+        assert_eq!(saved["fullscreenCopyOnSelect"], json!(false));
 
         // Invalid values fall back to defaults
         write_json(
             &global_path(&dirs),
-            json!({"fullscreenExitOutput": "nothing", "fullscreenScrollbar": "sometimes"}),
+            json!({"fullscreenExitOutput": "nothing", "fullscreenScrollbar": "sometimes", "fullscreenCopyOnSelect": "yes"}),
         );
         let reloaded = create(&dirs);
         assert_eq!(
@@ -3863,6 +3882,7 @@ mod tests {
             FullscreenExitOutput::Transcript
         );
         assert_eq!(reloaded.get_fullscreen_scrollbar(), ScrollbarMode::Auto);
+        assert!(reloaded.get_fullscreen_copy_on_select());
     }
 
     // V14-12 FR-G: BOM normalization (#8337) + error paths

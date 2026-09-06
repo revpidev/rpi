@@ -138,6 +138,7 @@ pub struct SettingsSelectorOptions {
     pub tui_mode: rpi_tui::tui::TuiMode,
     pub fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput,
     pub fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode,
+    pub fullscreen_copy_on_select: bool,
     pub warnings: WarningSettings,
 }
 
@@ -187,6 +188,9 @@ pub enum SettingsChange {
     TuiMode(rpi_tui::tui::TuiMode),
     FullscreenExitOutput(crate::core::settings_manager::FullscreenExitOutput),
     FullscreenScrollbar(rpi_tui::components::scroll_view::ScrollbarMode),
+    /// `onFullscreenCopyOnSelectChange` (settings-selector.ts:124 @ 9841914,
+    /// 4e4949299).
+    FullscreenCopyOnSelect(bool),
     Warnings(WarningSettings),
 }
 
@@ -1986,6 +1990,22 @@ impl SettingsSelectorComponent {
                 ]),
                 submenu: None,
             },
+            // settings-selector.ts:698-704 @ 9841914, 4e4949299.
+            SettingItem {
+                id: "fullscreen-copy-on-select".to_string(),
+                label: "Fullscreen copy on select".to_string(),
+                description: Some(
+                    "Automatically copy selected text in fullscreen mode; disable to copy selections with Ctrl+X"
+                        .to_string(),
+                ),
+                current_value: if options.fullscreen_copy_on_select {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                },
+                values: Some(vec!["true".to_string(), "false".to_string()]),
+                submenu: None,
+            },
             SettingItem {
                 id: "theme".to_string(),
                 label: "Theme".to_string(),
@@ -2305,6 +2325,9 @@ impl SettingsSelectorComponent {
                 "fullscreen-scrollbar" => {
                     SettingsChange::FullscreenScrollbar(parse_fullscreen_scrollbar(new_value))
                 }
+                "fullscreen-copy-on-select" => {
+                    SettingsChange::FullscreenCopyOnSelect(new_value == "true")
+                }
                 "theme" => SettingsChange::Theme(new_value.to_string()),
                 _ => return,
             };
@@ -2420,6 +2443,7 @@ mod tests {
             tui_mode: rpi_tui::tui::TuiMode::Regular,
             fullscreen_exit_output: crate::core::settings_manager::FullscreenExitOutput::Transcript,
             fullscreen_scrollbar: rpi_tui::components::scroll_view::ScrollbarMode::Auto,
+            fullscreen_copy_on_select: true,
             warnings: WarningSettings {
                 anthropic_extra_usage: Some(true),
             },
@@ -2509,10 +2533,11 @@ mod tests {
         assert!(joined.contains("false"));
         assert!(joined.contains("Autocomplete max items"));
         assert!(joined.contains("Enter/Space to change · Esc to cancel"));
-        // Scroll hint shows the item count (29 items without image rows, 31
-        // with them; the 10-row window always scrolls).
+        // Scroll hint shows the item count (30 items without image rows, 32
+        // with them; +fullscreen-copy-on-select, 4e4949299; the 10-row
+        // window always scrolls).
         let supports_images = get_capabilities().images.is_some();
-        let item_count = if supports_images { 31 } else { 29 };
+        let item_count = if supports_images { 32 } else { 30 };
         assert!(lines
             .iter()
             .any(|l| l.contains(&format!("(1/{item_count})"))));
@@ -2854,9 +2879,9 @@ mod tests {
         // Theme item index: 30 with image rows, 28 without (3 T32 items
         // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            30
+            31
         } else {
-            28
+            29
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2905,9 +2930,9 @@ mod tests {
         // Theme item index: 30 with image rows, 28 without (3 T32 items
         // added before theme: tui-mode, fullscreen-exit-output, fullscreen-scrollbar).
         let target = if get_capabilities().images.is_some() {
-            30
+            31
         } else {
-            28
+            29
         };
         for _ in 0..target {
             component.handle_input("\x1b[B");
@@ -2949,10 +2974,10 @@ mod tests {
         let on_cancel: Box<dyn FnMut() + Send> = Box::new(|| {});
         let component = SettingsSelectorComponent::new(options(), theme(), on_change, on_cancel);
 
-        // The full item count is now 29 (no images) or 31 (with images),
-        // up from 26/28 — the 3 T32 items.
+        // The full item count is now 30 (no images) or 32 (with images):
+        // 26 base + 3 T32 items + fullscreen-copy-on-select (4e4949299).
         let supports_images = get_capabilities().images.is_some();
-        let expected = if supports_images { 31 } else { 29 };
+        let expected = if supports_images { 32 } else { 30 };
         let lines = render_plain(&component, 100);
         let joined = lines.join("\n");
         // The scroll indicator shows the total count.

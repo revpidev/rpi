@@ -347,16 +347,14 @@ function generateThemes() {
 	// Rust parity test filters/skips them until the owning task of the
 	// v0.1.4 batch lands and regenerates without the marker:
 	//
-	// - pendingUpstreamKeys: `scrollbarTrack`/`scrollbarThumb` (redesigned
-	//   scrollbar family, 457ae8c79 → V14-16; rpi still has the
-	//   pre-redesign single-style scrollbarThumb with the selectedBg
-	//   fallback).
+	// - pendingUpstreamKeys: REMOVED with V14-16 (scrollbarTrack/Thumb now
+	//   ported, 457ae8c79).
 	// - pendingSplitCases: error cases whose text depends on the
 	//   eb3e9feed theme-validation split (validation moved out of
 	//   loadThemeFromPath into an interactive-mode-installed validator;
-	//   unported — gap registered with V14-15's acceptance record).
+	//   unported — gap registered with V14-15's acceptance record, deferred
+	//   to M5).
 	const meta = {
-		pendingUpstreamKeys: ["scrollbarTrack", "scrollbarThumb"],
 		pendingSplitCases: [
 			"invalid-missing-colors",
 			"invalid-color-value-type",

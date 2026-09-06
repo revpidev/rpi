@@ -372,6 +372,14 @@ pub type SearchTextStyleFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// 79680533c): the label text composited on the last row.
 pub type ScrollToEndIndicatorFn = Arc<dyn Fn() -> String + Send + Sync>;
 
+/// `copySelection?: (text: string) => Promise<boolean>`
+/// (tui-alt-screen.ts:190 @ 9841914, 4caa3c440): copy selected text to the
+/// system clipboard, returning success. Upstream's hook is async; the rpi
+/// render loop is synchronous, so the seam runs the clipboard write inline
+/// and returns `bool` — same terminal bytes, same flash timing (established
+/// async-flattening convention, cf. the V13 host_call synchronization).
+pub type CopySelectionFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// `TuiAltScreenOptions` (tui-alt-screen.ts:117-126). Not serialized (holds
 /// callbacks); see the header note.
 #[derive(Default)]
@@ -400,6 +408,14 @@ pub struct TuiAltScreenOptions {
     /// `onRightClickPaste`: handle an unmodified secondary-button press for
     /// clipboard paste. Enabled on Windows only upstream.
     pub on_right_click_paste: Option<RightClickPasteCallback>,
+    /// `copyOnSelect` (default true): automatically copy selected text to
+    /// the clipboard on mouse release (tui-alt-screen.ts:185 @ 9841914,
+    /// 4e4949299).
+    pub copy_on_select: Option<bool>,
+    /// `copySelection`: verified clipboard write hook
+    /// (4caa3c440 #8110). When omitted, selections copy via a bare OSC 52
+    /// write that is assumed successful (upstream default).
+    pub copy_selection: Option<CopySelectionFn>,
     /// Test injection for upstream's `process.platform === "win32"` check
     /// (tui-alt-screen.test.ts stubs `process.platform`); production uses
     /// `cfg!(windows)`.
@@ -589,6 +605,12 @@ pub(crate) struct TuiAltScreenInner {
     last_component_click: Option<LastComponentClick>,
     open_url: Option<OpenUrlCallback>,
     on_right_click_paste: Option<RightClickPasteCallback>,
+    /// `copyOnSelect` (tui-alt-screen.ts:152 @ 9841914, 4e4949299);
+    /// mutable via [`TuiAltScreen::set_copy_on_select`].
+    copy_on_select: bool,
+    /// `copySelection` injection (tui-alt-screen.ts:155 @ 9841914,
+    /// 4caa3c440).
+    copy_selection: Option<CopySelectionFn>,
     /// `searchMatchStyle` (default underline, tui-alt-screen.ts:265).
     search_match_style: SearchTextStyleFn,
     /// `searchCurrentMatchStyle` (default bold + inverse, :266).
@@ -774,6 +796,10 @@ impl TuiAltScreen {
             last_component_click: None,
             open_url: options.open_url,
             on_right_click_paste: options.on_right_click_paste,
+            // `this.copyOnSelect = options.copyOnSelect ?? true`
+            // (tui-alt-screen.ts:271).
+            copy_on_select: options.copy_on_select.unwrap_or(true),
+            copy_selection: options.copy_selection,
             search_match_style: options
                 .search_match_style
                 .unwrap_or_else(|| Arc::new(|text: &str| format!("\x1b[4m{text}\x1b[24m"))),
@@ -1237,6 +1263,38 @@ impl TuiAltScreen {
     pub fn set_fullscreen_scrollbar(&self, mode: ScrollbarMode) {
         let scroll_view = self.get_primary_scroll_view();
         with_scroll_view(&scroll_view, |sv| sv.set_scrollbar(mode));
+    }
+
+    /// `getCopyOnSelect` (tui-alt-screen.ts:284-286 @ 9841914, 4e4949299).
+    /// `true` on lock contention (the default).
+    pub fn get_copy_on_select(&self) -> bool {
+        self.try_read(|inner| inner.copy_on_select).unwrap_or(true)
+    }
+
+    /// `setCopyOnSelect` (tui-alt-screen.ts:288-290): runtime toggle.
+    pub fn set_copy_on_select(&self, enabled: bool) {
+        self.run_or_queue(move |inner| inner.copy_on_select = enabled);
+    }
+
+    /// `hasActiveSelection` (tui-alt-screen.ts:293-295): whether the
+    /// fullscreen viewport has a non-empty active text selection. `false`
+    /// on lock contention.
+    pub fn has_active_selection(&self) -> bool {
+        self.try_read(|inner| inner.get_active_selection_text().is_some())
+            .unwrap_or(false)
+    }
+
+    /// `copyActiveSelectionToClipboard` (tui-alt-screen.ts:298-302): copy
+    /// the active selection through the configured clipboard path; `false`
+    /// when there is nothing to copy. Uses `try_lock`: callers inside the
+    /// inner-lock-held input dispatch must defer via the interactive-mode
+    /// event drain (blocking here would self-deadlock the non-reentrant
+    /// mutex; `false` models "nothing copied synchronously").
+    pub fn copy_active_selection_to_clipboard(&self) -> bool {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return false;
+        };
+        inner.copy_active_selection_to_clipboard()
     }
 
     /// Access the terminal (upstream `public terminal`, tui.ts:296). Same
@@ -2613,6 +2671,12 @@ impl TuiAltScreenInner {
                 self.dispatch_mouse_to_layout(&event)
             }
         });
+        eprintln!(
+            "[DBG layout dispatch] x={} y={} consumed={}",
+            event.x,
+            event.y,
+            result.is_some()
+        );
         if let Some(result) = result {
             let render = self.apply_mouse_dispatch_result(&event, result.clone());
             if event_type == TuiMouseEventType::Press {
@@ -2716,22 +2780,29 @@ impl TuiAltScreenInner {
         term_program.is_some_and(|program| program.to_lowercase() == "vscode")
     }
 
-    // --- scrollbar (tui-alt-screen.ts:526-603) -----------------------------
+    // --- scrollbar (tui-alt-screen.ts:1018-1108 @ 9841914) -------------
 
-    /// `getScrollbarTargetAt` (tui-alt-screen.ts:526-541): the first
-    /// (deepest) scroll view whose visible scrollbar thumb covers the point.
-    fn get_scrollbar_target_at(&self, x: isize, y: isize) -> Option<ScrollbarTarget> {
+    /// `getScrollbarTargetAt` (tui-alt-screen.ts:1018-1037): the first
+    /// (deepest) scroll view whose scrollbar TRACK covers the point.
+    /// `include_hidden_auto` reveals a hidden `auto` track (the hover
+    /// hit-test wakes it as the pointer enters, 457ae8c79).
+    fn get_scrollbar_target_at(
+        &self,
+        x: isize,
+        y: isize,
+        include_hidden_auto: bool,
+    ) -> Option<ScrollbarTarget> {
         if self.has_overlay() {
             return None;
         }
         let layout = self.current_layout.as_ref()?;
         for scroll_view in get_scroll_views_at(layout, x, y) {
             let geometry = get_scroll_view_box(layout, &scroll_view)
-                .and_then(crate::layout::get_scrollbar_geometry);
+                .and_then(|box_| crate::layout::get_scrollbar_geometry(box_, include_hidden_auto));
             if let Some(geometry) = geometry {
                 if x == geometry.column
-                    && y >= geometry.thumb_top
-                    && y < geometry.thumb_top + geometry.thumb_height as isize
+                    && y >= geometry.track_top
+                    && y < geometry.track_top + geometry.track_height as isize
                 {
                     return Some(ScrollbarTarget {
                         scroll_view,
@@ -2743,7 +2814,7 @@ impl TuiAltScreenInner {
         None
     }
 
-    /// `setScrollbarHover` (tui-alt-screen.ts:543-548).
+    /// `setScrollbarHover` (tui-alt-screen.ts:1039-1041).
     fn set_scrollbar_hover(&mut self, scroll_view: Option<SharedComponent>) {
         let unchanged = match (&self.scrollbar_hover, &scroll_view) {
             (None, None) => true,
@@ -2762,22 +2833,47 @@ impl TuiAltScreenInner {
         }
     }
 
-    /// `updateScrollbarHover` (tui-alt-screen.ts:550-552).
+    /// `updateScrollbarHover` (tui-alt-screen.ts:1042-1048): hover hit-test
+    /// with `includeHiddenAuto` so a pointer entering a hidden `auto` track
+    /// reveals it.
     fn update_scrollbar_hover(&mut self, x: u32, y: u32) {
         let target = self
-            .get_scrollbar_target_at(x as isize, y as isize)
+            .get_scrollbar_target_at(x as isize, y as isize, true)
             .map(|target| target.scroll_view);
         self.set_scrollbar_hover(target);
     }
 
-    /// `stopScrollbarHover` (tui-alt-screen.ts:554-556).
+    /// `stopScrollbarHover` (tui-alt-screen.ts:1050-1052).
     fn stop_scrollbar_hover(&mut self) {
         self.set_scrollbar_hover(None);
     }
 
-    /// `handleScrollbarMouseEvent` (tui-alt-screen.ts:558-599): thumb drag
-    /// (motion maps the thumb offset back to `scrollTop`) and drag start on
-    /// primary-button press over the thumb.
+    /// `scrollScrollbarToPointer` (tui-alt-screen.ts:1054-1061): map the
+    /// pointer row back to a scroll offset, keeping the thumb's grab point
+    /// under the pointer.
+    fn scroll_scrollbar_to_pointer(
+        scroll_view: &SharedComponent,
+        geometry: &ScrollbarGeometry,
+        pointer_y: u32,
+        grab_offset: isize,
+    ) {
+        let max_thumb_offset = geometry.track_height - geometry.thumb_height;
+        let thumb_offset = (pointer_y as isize - geometry.track_top - grab_offset)
+            .clamp(0, max_thumb_offset as isize);
+        let scroll_top = if max_thumb_offset == 0 {
+            0
+        } else {
+            ((thumb_offset as f64 / max_thumb_offset as f64) * geometry.max_scroll_top as f64)
+                .round() as i64
+        };
+        with_scroll_view(scroll_view, |view| view.scroll_to(scroll_top));
+    }
+
+    /// `handleScrollbarMouseEvent` (tui-alt-screen.ts:1062-1108 @ 9841914,
+    /// 457ae8c79): thumb drag AND track clicks — a press off the thumb
+    /// jumps the thumb center to the pointer (`grabOffset =
+    /// floor(thumbHeight / 2)`) and continues dragging from there; a press
+    /// on the thumb keeps the grab point under the pointer.
     fn handle_scrollbar_mouse_event(&mut self, event: SgrMouseEvent) -> bool {
         if let Some(drag) = self.scrollbar_drag.clone() {
             if event.release {
@@ -2786,20 +2882,15 @@ impl TuiAltScreenInner {
             }
             let geometry = self.current_layout.as_ref().and_then(|layout| {
                 get_scroll_view_box(layout, &drag.scroll_view)
-                    .and_then(crate::layout::get_scrollbar_geometry)
+                    .and_then(|box_| crate::layout::get_scrollbar_geometry(box_, false))
             });
             if let Some(geometry) = geometry {
-                let max_thumb_offset = geometry.track_height - geometry.thumb_height;
-                let thumb_offset = (event.y as isize - geometry.track_top - drag.grab_offset)
-                    .clamp(0, max_thumb_offset as isize);
-                let scroll_top = if max_thumb_offset == 0 {
-                    0
-                } else {
-                    ((thumb_offset as f64 / max_thumb_offset as f64)
-                        * geometry.max_scroll_top as f64)
-                        .round() as i64
-                };
-                with_scroll_view(&drag.scroll_view, |view| view.scroll_to(scroll_top));
+                Self::scroll_scrollbar_to_pointer(
+                    &drag.scroll_view,
+                    &geometry,
+                    event.y,
+                    drag.grab_offset,
+                );
             }
             return true;
         }
@@ -2807,7 +2898,8 @@ impl TuiAltScreenInner {
         if event.release || (event.button & 32) != 0 || (event.button & 3) != 0 {
             return false;
         }
-        let Some(target) = self.get_scrollbar_target_at(event.x as isize, event.y as isize) else {
+        let Some(target) = self.get_scrollbar_target_at(event.x as isize, event.y as isize, false)
+        else {
             return false;
         };
         self.stop_selection_auto_scroll();
@@ -2820,9 +2912,25 @@ impl TuiAltScreenInner {
         self.pressed_url = None;
         self.selection_dragged = false;
         self.set_scrollbar_hover(Some(target.scroll_view.clone()));
+        let pointer_y = event.y as isize;
+        let on_thumb = pointer_y >= target.geometry.thumb_top
+            && pointer_y < target.geometry.thumb_top + target.geometry.thumb_height as isize;
+        let grab_offset = if on_thumb {
+            event.y as isize - target.geometry.thumb_top
+        } else {
+            (target.geometry.thumb_height / 2) as isize
+        };
+        if !on_thumb {
+            Self::scroll_scrollbar_to_pointer(
+                &target.scroll_view,
+                &target.geometry,
+                event.y,
+                grab_offset,
+            );
+        }
         self.scrollbar_drag = Some(ScrollbarDrag {
             scroll_view: target.scroll_view,
-            grab_offset: event.y as isize - target.geometry.thumb_top,
+            grab_offset,
         });
         true
     }
@@ -3206,10 +3314,13 @@ impl TuiAltScreenInner {
                     return;
                 }
             }
-            // `copyOnSelect` arrives with V14-16; the current baseline
-            // copies the selection on release (the pre-copyOnSelect
-            // behavior, equivalent to `copyOnSelect: true`).
-            self.copy_selection_to_clipboard();
+            // `if (this.copyOnSelect) void this.copySelectionToClipboard();`
+            // (tui-alt-screen.ts:1337 @ 9841914, 4e4949299): selections
+            // only copy on release while copyOnSelect is enabled; with it
+            // off the selection stays visible for the Ctrl+X fork.
+            if self.copy_on_select {
+                self.copy_selection_to_clipboard();
+            }
             self.request_render(false);
             return;
         }
@@ -3227,6 +3338,10 @@ impl TuiAltScreenInner {
         }
         self.stop_selection_auto_scroll();
         self.selection_press_active = true;
+        eprintln!(
+            "[DBG selection press] x={} y={} anchor will be computed",
+            event.x, event.y
+        );
         let scroll_view = if !self.has_overlay() {
             self.current_layout.as_ref().and_then(|layout| {
                 get_scroll_views_at(layout, event.x as isize, event.y as isize)
@@ -3345,25 +3460,18 @@ impl TuiAltScreenInner {
         Some(screen_selection)
     }
 
-    /// `copySelectionToClipboard` (tui-alt-screen.ts:873-897): emit the
-    /// selected text as an OSC 52 clipboard write and flash "Copied!".
-    fn copy_selection_to_clipboard(&mut self) {
-        let Some(selection) = self.get_selection_bounds() else {
-            return;
-        };
-        // The scroll-content-lines source (tui-alt-screen.ts:877-882); the
-        // highlight transform does not apply to the copy path (upstream reads
-        // rows/cols in source coordinates here).
+    /// `getActiveSelectionText` (tui-alt-screen.ts:1413-1435 @ 9841914):
+    /// the selected text, or `None` for an empty/absent selection. The
+    /// highlight transform does not apply to the copy path (upstream reads
+    /// rows/cols in source coordinates here).
+    fn get_active_selection_text(&self) -> Option<String> {
+        let selection = self.get_selection_bounds()?;
+        // The scroll-content-lines source (tui-alt-screen.ts:1417-1422).
         let source_lines: Option<Arc<[String]>> = match &selection.start.scroll_view {
             Some(scroll_view) => {
-                let Some(layout) = &self.current_layout else {
-                    return;
-                };
-                let Some(lines) = get_scroll_view_box(layout, scroll_view)
-                    .and_then(|layout_box| layout_box.scroll_content_lines.clone())
-                else {
-                    return;
-                };
+                let layout = self.current_layout.as_ref()?;
+                let lines = get_scroll_view_box(layout, scroll_view)
+                    .and_then(|layout_box| layout_box.scroll_content_lines.clone())?;
                 Some(lines)
             }
             None => None,
@@ -3402,11 +3510,50 @@ impl TuiAltScreenInner {
         }
         let text = lines.join("\n");
         if text.is_empty() {
-            return;
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// `copySelectionToClipboard` (tui-alt-screen.ts:1437-1440): the
+    /// release-path copy (flash reflects the outcome).
+    fn copy_selection_to_clipboard(&mut self) -> bool {
+        let Some(text) = self.get_active_selection_text() else {
+            return false;
+        };
+        self.copy_text_to_clipboard(&text)
+    }
+
+    /// `copyActiveSelectionToClipboard` (tui-alt-screen.ts:298-302).
+    fn copy_active_selection_to_clipboard(&mut self) -> bool {
+        let Some(text) = self.get_active_selection_text() else {
+            return false;
+        };
+        self.copy_text_to_clipboard(&text)
+    }
+
+    /// `copyTextToClipboard` (tui-alt-screen.ts:1443-1456 @ 9841914,
+    /// 4caa3c440): prefer an injected clipboard implementation (native
+    /// clipboard + platform tools with a verified success path) when the
+    /// host app provides one. A bare OSC 52 write can show "Copied!" while
+    /// leaving the system clipboard untouched (e.g. macOS Terminal.app,
+    /// tmux without OSC 52 clipboard passthrough), so the flash reflects
+    /// the verified outcome of the injected hook; the default OSC 52 path
+    /// keeps the historical unconditional success.
+    fn copy_text_to_clipboard(&mut self, text: &str) -> bool {
+        if let Some(copy_selection) = &self.copy_selection {
+            let ok = copy_selection(text);
+            self.flashes.flash(
+                if ok { "Copied!" } else { "Copy failed" },
+                DEFAULT_DURATION_MS,
+            );
+            return ok;
         }
         let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
         self.terminal().write(&format!("\x1b]52;c;{payload}\x07"));
         self.flashes.flash("Copied!", DEFAULT_DURATION_MS);
+        true
     }
 
     /// `applySearchTextHighlight` (tui-alt-screen.ts:1458-1476 @ 9841914,
@@ -3462,7 +3609,7 @@ impl TuiAltScreenInner {
         let scroll_top = with_scroll_view(&scroll_view, ScrollView::scroll_top).unwrap_or(0);
         let mut ranges_by_row: std::collections::HashMap<usize, Vec<SearchHighlightRange>> =
             std::collections::HashMap::new();
-        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_)
+        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(isize::MAX);
         let min_row = box_.rect.y.max(box_.clip.y).max(0) as usize;
@@ -3595,7 +3742,7 @@ impl TuiAltScreenInner {
         if is_image_line(&screen[row as usize]) {
             return screen;
         }
-        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_)
+        let scrollbar_column = crate::layout::get_scrollbar_geometry(box_, false)
             .map(|geometry| geometry.column)
             .unwrap_or(clip.x + clip.width as isize);
         let available_width = (scrollbar_column - clip.x).max(0) as usize;
@@ -5189,9 +5336,18 @@ mod tests {
         send_input(&terminal, &tui, "\x1b[<32;10;4M");
         settle(&tui);
         assert_eq!(with_sv(&scroll_view, ScrollView::scroll_top), 15);
+        // V14-16 (457ae8c79): the viewport now overlays the full track —
+        // `│` on non-thumb rows, `█` on the thumb while active (scrollTop
+        // 15/15 → thumb rows 3-4 of 5).
         assert_eq!(
             trimmed_viewport(&terminal),
-            vec!["line 16", "line 17", "line 18", "line 19", "line 20"]
+            vec![
+                "line 16  │",
+                "line 17  │",
+                "line 18  │",
+                "line 19  █",
+                "line 20  █"
+            ]
         );
 
         // Release over the thumb keeps it hovered: still visible after 70ms.
@@ -5270,6 +5426,100 @@ mod tests {
             .events()
             .iter()
             .any(|event| matches!(event, VtEvent::Write(data) if data.contains(&expected))),);
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("reveals an auto scrollbar when the pointer enters its hidden track")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn reveals_an_auto_scrollbar_when_the_pointer_enters_its_hidden_track() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(10, 5);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (content, _) = numbered_text(20);
+        let scroll_view = shared_component(ScrollView::new(
+            content,
+            ScrollViewOptions {
+                primary: true,
+                scrollbar: ScrollbarMode::Auto,
+                scrollbar_hide_delay: Duration::from_millis(20),
+                ..ScrollViewOptions::default()
+            },
+        ));
+        tui.set_layout_root(Some(scroll_view.clone()));
+        tui.start();
+        settle(&tui);
+        assert!(!with_sv(&scroll_view, ScrollView::is_scrollbar_visible));
+
+        // Pointer motion (button 35 = no-button move) onto the hidden track
+        // column wakes it (hover hit-test with includeHiddenAuto).
+        send_input(&terminal, &tui, "\x1b[<35;10;3M");
+        settle(&tui);
+        assert!(with_sv(&scroll_view, ScrollView::is_scrollbar_visible));
+        assert!(with_sv(&scroll_view, ScrollView::is_scrollbar_active));
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains(['│', '█'])));
+
+        // Leaving the track arms the hide deadline; after it fires the
+        // scrollbar is hidden again.
+        send_input(&terminal, &tui, "\x1b[<35;9;3M");
+        let now = settle(&tui);
+        tui.tick(now + Duration::from_millis(40));
+        settle(&tui);
+        assert!(!with_sv(&scroll_view, ScrollView::is_scrollbar_visible));
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("jumps to a scrollbar track position and continues dragging from there")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn jumps_to_a_scrollbar_track_position_and_continues_dragging_from_there() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(10, 10);
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let (content, _) = numbered_text(50);
+        let scroll_view = shared_component(ScrollView::new(
+            content,
+            ScrollViewOptions {
+                primary: true,
+                scrollbar: ScrollbarMode::Always,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        tui.set_layout_root(Some(scroll_view.clone()));
+        tui.start();
+        settle(&tui);
+        assert_eq!(with_sv(&scroll_view, ScrollView::scroll_top), 0);
+
+        // Press on the track ABOVE the thumb: the thumb center jumps to the
+        // pointer row (content 50 / track 10 → thumb 2 rows; press row 6 →
+        // thumb top 5, center 6 → scrollTop 20).
+        send_input(&terminal, &tui, "\x1b[<0;10;6M");
+        settle(&tui);
+        assert_eq!(with_sv(&scroll_view, ScrollView::scroll_top), 20);
+
+        // Drag to the bottom track row: thumb center follows the pointer.
+        send_input(&terminal, &tui, "\x1b[<32;10;10M");
+        settle(&tui);
+        assert_eq!(with_sv(&scroll_view, ScrollView::scroll_top), 40);
+
+        // Track drags/presses never touch the clipboard.
+        send_input(&terminal, &tui, "\x1b[<0;10;10m");
+        settle(&tui);
+        assert!(terminal
+            .events()
+            .iter()
+            .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))));
         stop(&tui);
     }
 
@@ -5379,6 +5629,198 @@ mod tests {
             .get_viewport()
             .iter()
             .any(|line| line.contains("Copied!")));
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("uses an injected copySelection handler instead of OSC 52 and reports success")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn uses_an_injected_copy_selection_handler_instead_of_osc52_and_reports_success() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let copied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let copied_handle = Arc::clone(&copied);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_selection: Some(Arc::new(move |text: &str| {
+                    lock_shared(&copied_handle).push(text.to_string());
+                    true
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        settle(&tui);
+
+        assert_eq!(lock_shared(&copied).as_slice(), ["alpha\nbeta".to_string()]);
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))),
+            "must not emit OSC 52 when a copySelection handler is provided"
+        );
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("Copied!")));
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("leaves selections visible without copying when copyOnSelect is disabled")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn leaves_selections_visible_without_copying_when_copy_on_select_is_disabled() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let copied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let copied_handle = Arc::clone(&copied);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_on_select: Some(false),
+                copy_selection: Some(Arc::new(move |text: &str| {
+                    lock_shared(&copied_handle).push(text.to_string());
+                    true
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        settle(&tui);
+
+        assert!(lock_shared(&copied).is_empty());
+        assert!(tui.has_active_selection());
+        assert!(terminal
+            .events()
+            .iter()
+            .any(|event| matches!(event, VtEvent::Write(data) if data.contains("\x1b[7m"))));
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .all(|line| !line.contains("Copied!")));
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("copies an active selection programmatically")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn copies_an_active_selection_programmatically() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let copied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let copied_handle = Arc::clone(&copied);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_selection: Some(Arc::new(move |text: &str| {
+                    lock_shared(&copied_handle).push(text.to_string());
+                    true
+                })),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        assert!(!tui.has_active_selection());
+        assert!(!tui.copy_active_selection_to_clipboard());
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        settle(&tui);
+
+        assert_eq!(lock_shared(&copied).as_slice(), ["alpha\nbeta".to_string()]);
+        assert!(tui.has_active_selection());
+
+        lock_shared(&copied).clear();
+        assert!(tui.copy_active_selection_to_clipboard());
+        settle(&tui);
+
+        assert_eq!(lock_shared(&copied).as_slice(), ["alpha\nbeta".to_string()]);
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("Copied!")));
+
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("flashes an error when the injected copySelection handler fails")
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn flashes_an_error_when_the_injected_copy_selection_handler_fails() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = RecordingTerminal::new(20, 4);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                copy_selection: Some(Arc::new(|_text: &str| false)),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        tui.add_child(text("alpha\nbeta\ngamma\ndelta"));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<0;1;1M");
+        send_input(&terminal, &tui, "\x1b[<32;4;2M");
+        send_input(&terminal, &tui, "\x1b[<0;4;2m");
+        settle(&tui);
+
+        assert!(terminal
+            .get_viewport()
+            .iter()
+            .any(|line| line.contains("Copy failed")));
+        assert!(
+            terminal
+                .events()
+                .iter()
+                .all(|event| !matches!(event, VtEvent::Write(data) if data.contains("\x1b]52;c;"))),
+            "must not emit OSC 52 when a copySelection handler is provided"
+        );
 
         stop(&tui);
     }
@@ -7471,6 +7913,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["line 5", "line 6", "line 7", "line 8", "editor", "footer"]
         );
+        stop(&tui);
+    }
+
+    // ---------------------------------------------------------------------
+    // it("leaves the scrollbar clickable when the jump-to-end indicator spans the transcript")
+    // (tui-alt-screen.test.ts:141-169 @ 9841914; with 457ae8c79 the press
+    // lands on the scrollbar TRACK and starts a drag instead of activating
+    // the full-width indicator)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn leaves_the_scrollbar_clickable_when_the_jump_to_end_indicator_spans_the_transcript() {
+        let _caps = CapsGuard::lock_only();
+        // Upstream test layout: a follow-end transcript with `always`
+        // scrollbar + a two-line dock (tui-alt-screen.test.ts:148-158).
+        let terminal = VirtualTerminal::new(30, 6);
+        let tui = TuiAltScreen::with_options(
+            Box::new(terminal.clone()),
+            None,
+            None,
+            TuiAltScreenOptions {
+                scroll_to_end_indicator: Some(Arc::new(|| "↓".repeat(30))),
+                ..TuiAltScreenOptions::default()
+            },
+        );
+        let transcript = shared_component(ScrollView::new(
+            shared_component(TestText {
+                lines: Arc::new(Mutex::new(
+                    (1..=12).map(|i| format!("line {i}")).collect::<Vec<_>>(),
+                )),
+            }),
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                scrollbar: ScrollbarMode::Always,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        let dock = shared_component(VStack::new(
+            vec![
+                StackChild::Component(text("editor")),
+                StackChild::Component(text("footer")),
+            ],
+            StackOptions::default(),
+        ));
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Entry(
+                    transcript.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(0.0)),
+                        grow: Some(1.0),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+                StackChild::Entry(
+                    dock,
+                    StackEntryOptions {
+                        basis: Some(Basis::Auto),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.start();
+        settle(&tui);
+
+        send_input(&terminal, &tui, "\x1b[<64;1;1M");
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
+
+        // The indicator must not intercept a press on the scrollbar's last
+        // column: the track press starts a drag (jump-to-page clamps at the
+        // pointer row, which is above the end).
+        send_input(&terminal, &tui, "\x1b[<0;30;4M");
+        send_input(&terminal, &tui, "\x1b[<0;30;4m");
+        settle(&tui);
+        assert!(!with_sv(&transcript, ScrollView::is_following_end));
         stop(&tui);
     }
 

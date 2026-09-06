@@ -41,11 +41,11 @@ use crate::error::RpiError;
 
 /// Embedded `dark.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/dark.json`).
-const DARK_THEME_JSON: &str = r##"{"name":"dark","vars":{"cyan":"#00d7ff","blue":"#5f87ff","green":"#b5bd68","red":"#cc6666","yellow":"#ffff00","text":"#d4d4d4","gray":"#808080","dimGray":"#666666","darkGray":"#505050","accent":"#8abeb7","selectedBg":"#3a3a4a","userMsgBg":"#343541","toolPendingBg":"#282832","toolSuccessBg":"#283228","toolErrorBg":"#3c2828","customMsgBg":"#2d2838"},"colors":{"accent":"accent","border":"blue","borderAccent":"cyan","borderMuted":"darkGray","success":"green","error":"red","warning":"yellow","muted":"gray","dim":"dimGray","text":"text","thinkingText":"gray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#9575cd","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"gray","mdHeading":"#f0c674","mdLink":"#81a2be","mdLinkUrl":"dimGray","mdCode":"accent","mdCodeBlock":"green","mdCodeBlockBorder":"gray","mdQuote":"gray","mdQuoteBorder":"gray","mdHr":"gray","mdListBullet":"accent","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"gray","syntaxComment":"#6A9955","syntaxKeyword":"#569CD6","syntaxFunction":"#DCDCAA","syntaxVariable":"#9CDCFE","syntaxString":"#CE9178","syntaxNumber":"#B5CEA8","syntaxType":"#4EC9B0","syntaxOperator":"#D4D4D4","syntaxPunctuation":"#D4D4D4","thinkingOff":"darkGray","thinkingMinimal":"#6e6e6e","thinkingLow":"#5f87af","thinkingMedium":"#81a2be","thinkingHigh":"#b294bb","thinkingXhigh":"#d183e8","thinkingMax":"#ff5fff","bashMode":"green","scrollbarThumb":"selectedBg","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#18181e","cardBg":"#1e1e24","infoBg":"#3c3728"}}"##;
+const DARK_THEME_JSON: &str = r##"{"name":"dark","vars":{"cyan":"#00d7ff","blue":"#5f87ff","green":"#b5bd68","red":"#cc6666","yellow":"#ffff00","text":"#d4d4d4","gray":"#808080","dimGray":"#666666","darkGray":"#505050","accent":"#8abeb7","selectedBg":"#3a3a4a","userMsgBg":"#343541","toolPendingBg":"#282832","toolSuccessBg":"#283228","toolErrorBg":"#3c2828","customMsgBg":"#2d2838"},"colors":{"accent":"accent","border":"blue","borderAccent":"cyan","borderMuted":"darkGray","success":"green","error":"red","warning":"yellow","muted":"gray","dim":"dimGray","text":"text","thinkingText":"gray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#9575cd","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"gray","mdHeading":"#f0c674","mdLink":"#81a2be","mdLinkUrl":"dimGray","mdCode":"accent","mdCodeBlock":"green","mdCodeBlockBorder":"gray","mdQuote":"gray","mdQuoteBorder":"gray","mdHr":"gray","mdListBullet":"accent","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"gray","syntaxComment":"#6A9955","syntaxKeyword":"#569CD6","syntaxFunction":"#DCDCAA","syntaxVariable":"#9CDCFE","syntaxString":"#CE9178","syntaxNumber":"#B5CEA8","syntaxType":"#4EC9B0","syntaxOperator":"#D4D4D4","syntaxPunctuation":"#D4D4D4","thinkingOff":"darkGray","thinkingMinimal":"#6e6e6e","thinkingLow":"#5f87af","thinkingMedium":"#81a2be","thinkingHigh":"#b294bb","thinkingXhigh":"#d183e8","thinkingMax":"#ff5fff","bashMode":"green","scrollbarTrack":"darkGray","scrollbarThumb":"text","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#18181e","cardBg":"#1e1e24","infoBg":"#3c3728"}}"##;
 
 /// Embedded `light.json` (values ported verbatim from
 /// `packages/coding-agent/src/modes/interactive/theme/light.json`).
-const LIGHT_THEME_JSON: &str = r##"{"name":"light","vars":{"teal":"#5a8080","blue":"#547da7","green":"#588458","red":"#aa5555","yellow":"#9a7326","text":"#1f2328","mediumGray":"#6c6c6c","dimGray":"#767676","lightGray":"#b0b0b0","selectedBg":"#d0d0e0","userMsgBg":"#e8e8e8","toolPendingBg":"#e8e8f0","toolSuccessBg":"#e8f0e8","toolErrorBg":"#f0e8e8","customMsgBg":"#ede7f6"},"colors":{"accent":"teal","border":"blue","borderAccent":"teal","borderMuted":"lightGray","success":"green","error":"red","warning":"yellow","muted":"mediumGray","dim":"dimGray","text":"text","thinkingText":"mediumGray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#7e57c2","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"mediumGray","mdHeading":"yellow","mdLink":"blue","mdLinkUrl":"dimGray","mdCode":"teal","mdCodeBlock":"green","mdCodeBlockBorder":"mediumGray","mdQuote":"mediumGray","mdQuoteBorder":"mediumGray","mdHr":"mediumGray","mdListBullet":"green","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"mediumGray","syntaxComment":"#008000","syntaxKeyword":"#0000FF","syntaxFunction":"#795E26","syntaxVariable":"#001080","syntaxString":"#A31515","syntaxNumber":"#098658","syntaxType":"#267F99","syntaxOperator":"#000000","syntaxPunctuation":"#000000","thinkingOff":"lightGray","thinkingMinimal":"#767676","thinkingLow":"blue","thinkingMedium":"teal","thinkingHigh":"#875f87","thinkingXhigh":"#8b008b","thinkingMax":"#af005f","bashMode":"green","scrollbarThumb":"selectedBg","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#f8f8f8","cardBg":"#ffffff","infoBg":"#fffae6"}}"##;
+const LIGHT_THEME_JSON: &str = r##"{"name":"light","vars":{"teal":"#5a8080","blue":"#547da7","green":"#588458","red":"#aa5555","yellow":"#9a7326","text":"#1f2328","mediumGray":"#6c6c6c","dimGray":"#767676","lightGray":"#b0b0b0","selectedBg":"#d0d0e0","userMsgBg":"#e8e8e8","toolPendingBg":"#e8e8f0","toolSuccessBg":"#e8f0e8","toolErrorBg":"#f0e8e8","customMsgBg":"#ede7f6"},"colors":{"accent":"teal","border":"blue","borderAccent":"teal","borderMuted":"lightGray","success":"green","error":"red","warning":"yellow","muted":"mediumGray","dim":"dimGray","text":"text","thinkingText":"mediumGray","selectedBg":"selectedBg","userMessageBg":"userMsgBg","userMessageText":"text","customMessageBg":"customMsgBg","customMessageText":"text","customMessageLabel":"#7e57c2","toolPendingBg":"toolPendingBg","toolSuccessBg":"toolSuccessBg","toolErrorBg":"toolErrorBg","toolTitle":"text","toolOutput":"mediumGray","mdHeading":"yellow","mdLink":"blue","mdLinkUrl":"dimGray","mdCode":"teal","mdCodeBlock":"green","mdCodeBlockBorder":"mediumGray","mdQuote":"mediumGray","mdQuoteBorder":"mediumGray","mdHr":"mediumGray","mdListBullet":"green","toolDiffAdded":"green","toolDiffRemoved":"red","toolDiffContext":"mediumGray","syntaxComment":"#008000","syntaxKeyword":"#0000FF","syntaxFunction":"#795E26","syntaxVariable":"#001080","syntaxString":"#A31515","syntaxNumber":"#098658","syntaxType":"#267F99","syntaxOperator":"#000000","syntaxPunctuation":"#000000","thinkingOff":"lightGray","thinkingMinimal":"#767676","thinkingLow":"blue","thinkingMedium":"teal","thinkingHigh":"#875f87","thinkingXhigh":"#8b008b","thinkingMax":"#af005f","bashMode":"green","scrollbarTrack":"lightGray","scrollbarThumb":"text","searchMatchBg":"selectedBg","searchMatchText":"text"},"export":{"pageBg":"#f8f8f8","cardBg":"#ffffff","infoBg":"#fffae6"}}"##;
 
 // ===========================================================================
 // Constants
@@ -115,7 +115,7 @@ pub const REQUIRED_COLOR_KEYS: &[&str] = &[
 ];
 
 /// All allowed keys in the `colors` object (51 required + `thinkingMax`
-/// + `scrollbarThumb`).
+/// + `scrollbarTrack`/`scrollbarThumb` + `searchMatchBg`/`searchMatchText`).
 pub const ALLOWED_COLOR_KEYS: &[&str] = &[
     // Same 51 required keys
     "accent",
@@ -171,17 +171,21 @@ pub const ALLOWED_COLOR_KEYS: &[&str] = &[
     "bashMode",
     // Optional 52nd key
     "thinkingMax",
-    // Optional 53rd key (commit for fullscreen scrollbar, R3.2.3 / theme.ts:50)
+    // Optional 53rd key (commit for fullscreen scrollbar, R3.2.3 / theme.ts:53)
     "scrollbarThumb",
-    // Optional 54th/55th keys (transcript search, 00121ed99 /
+    // Optional 54th key (457ae8c79 scrollbar redesign: the track token,
+    // a foreground color falling back to `muted`, theme.ts:53 @ 9841914)
+    "scrollbarTrack",
+    // Optional 55th/56th keys (transcript search, 00121ed99 /
     // theme-schema.json:148-155 @ 9841914)
     "searchMatchBg",
     "searchMatchText",
 ];
 
 /// Background-colour keys — separated from foreground colours in
-/// `create_theme` (theme.ts:602-609, scrollbarThumb added in theme.ts:158-165;
-/// searchMatchBg in theme.ts:531 @ 9841914).
+/// `create_theme` (theme.ts:602-609 @ 9841914; searchMatchBg in theme.ts:531;
+/// `scrollbarThumb` moved to the FOREGROUND key set by the 457ae8c79
+/// scrollbar redesign — the thumb glyph is foreground-styled now).
 pub const BG_COLOR_KEYS: &[&str] = &[
     "selectedBg",
     "searchMatchBg",
@@ -190,7 +194,6 @@ pub const BG_COLOR_KEYS: &[&str] = &[
     "toolPendingBg",
     "toolSuccessBg",
     "toolErrorBg",
-    "scrollbarThumb",
 ];
 
 /// 6×6×6 colour cube channel values (theme.ts:186).
@@ -633,19 +636,24 @@ fn resolve_theme_colors(
     Ok(resolved)
 }
 
-/// Apply colour fallbacks: if `thinkingMax` is absent, use `thinkingXhigh`
-/// (theme.ts:322-324); if `scrollbarThumb` is absent, use `selectedBg`
-/// (theme.ts:330); if `searchMatchBg`/`searchMatchText` are absent, use
-/// `selectedBg`/`text` (theme.ts:273-274 @ 9841914, 00121ed99).
+/// Apply colour fallbacks (theme.ts:268-277 @ 9841914): `thinkingMax` →
+/// `thinkingXhigh`; `scrollbarTrack` → `muted` and `scrollbarThumb` → `text`
+/// (457ae8c79: the scrollbar tokens became optional foreground colors);
+/// `searchMatchBg`/`searchMatchText` → `selectedBg`/`text` (00121ed99).
 fn with_color_fallbacks(mut colors: HashMap<String, ColorValue>) -> HashMap<String, ColorValue> {
     if !colors.contains_key("thinkingMax") {
         if let Some(xhigh) = colors.get("thinkingXhigh") {
             colors.insert("thinkingMax".to_string(), xhigh.clone());
         }
     }
+    if !colors.contains_key("scrollbarTrack") {
+        if let Some(muted) = colors.get("muted") {
+            colors.insert("scrollbarTrack".to_string(), muted.clone());
+        }
+    }
     if !colors.contains_key("scrollbarThumb") {
-        if let Some(selected_bg) = colors.get("selectedBg") {
-            colors.insert("scrollbarThumb".to_string(), selected_bg.clone());
+        if let Some(text) = colors.get("text") {
+            colors.insert("scrollbarThumb".to_string(), text.clone());
         }
     }
     if !colors.contains_key("searchMatchBg") {
@@ -1712,7 +1720,7 @@ mod tests {
     fn test_allowed_color_keys_count() {
         // 53 → 55: searchMatchBg/searchMatchText added (theme-schema.json:148-155
         // @ 9841914, 00121ed99).
-        assert_eq!(ALLOWED_COLOR_KEYS.len(), 55); // 51 + thinkingMax + scrollbarThumb + searchMatchBg/Text
+        assert_eq!(ALLOWED_COLOR_KEYS.len(), 56); // 51 + thinkingMax + scrollbarTrack/Thumb + searchMatchBg/Text
     }
 
     #[test]
@@ -1852,6 +1860,79 @@ mod tests {
         let theme = create_theme(&theme_json, Some(ColorMode::TrueColor), None).unwrap();
         let max_ansi = theme.get_fg_ansi("thinkingMax");
         assert!(max_ansi.contains("171")); // 0xab = 171
+    }
+
+    // scrollbar-theme.test.ts:37-57 @ 9841914 (457ae8c79): the scrollbar
+    // tokens are optional FOREGROUND colors — track falls back to `muted`,
+    // thumb to `text`; explicit values pass through as truecolor.
+    #[test]
+    fn test_scrollbar_color_fallbacks() {
+        let base_colors: HashMap<String, ColorValue> = REQUIRED_COLOR_KEYS
+            .iter()
+            .map(|k| ((*k).to_string(), ColorValue::Str("#000000".to_string())))
+            .collect();
+        let make_theme = |colors: HashMap<String, ColorValue>, name: &str| {
+            let theme_json = ThemeJson {
+                name: name.to_string(),
+                vars: HashMap::new(),
+                colors,
+                export: None,
+            };
+            create_theme(&theme_json, Some(ColorMode::TrueColor), None).unwrap()
+        };
+
+        // Missing both → muted / text.
+        let mut missing = base_colors.clone();
+        missing.remove("scrollbarTrack");
+        missing.remove("scrollbarThumb");
+        let theme = make_theme(missing, "missing-scrollbar-theme");
+        assert_eq!(
+            theme.get_fg_ansi("scrollbarTrack"),
+            theme.get_fg_ansi("muted")
+        );
+        assert_eq!(
+            theme.get_fg_ansi("scrollbarThumb"),
+            theme.get_fg_ansi("text")
+        );
+        // scrollbarThumb is no longer a background key (457ae8c79).
+        assert_eq!(theme.get_bg_ansi("scrollbarThumb"), "");
+
+        // Explicit values resolve to truecolor sequences.
+        let mut explicit = base_colors;
+        explicit.insert(
+            "scrollbarTrack".to_string(),
+            ColorValue::Str("#654321".to_string()),
+        );
+        explicit.insert(
+            "scrollbarThumb".to_string(),
+            ColorValue::Str("#123456".to_string()),
+        );
+        let theme = make_theme(explicit, "custom-scrollbar-theme");
+        assert_eq!(theme.get_fg_ansi("scrollbarTrack"), "\x1b[38;2;101;67;33m");
+        assert_eq!(theme.get_fg_ansi("scrollbarThumb"), "\x1b[38;2;18;52;86m");
+    }
+
+    // dark.json:36-37 / light.json:35-36 @ 9841914: the built-in themes set
+    // both scrollbar tokens explicitly (dark: darkGray/text, light:
+    // lightGray/text).
+    #[test]
+    fn test_builtin_themes_carry_explicit_scrollbar_colors() {
+        let themes = get_builtin_themes();
+        let dark = create_theme(&themes["dark"], Some(ColorMode::TrueColor), None).unwrap();
+        assert_eq!(
+            dark.get_fg_ansi("scrollbarTrack"),
+            dark.get_fg_ansi("borderMuted")
+        ); // darkGray
+        assert_eq!(dark.get_fg_ansi("scrollbarThumb"), dark.get_fg_ansi("text"));
+        let light = create_theme(&themes["light"], Some(ColorMode::TrueColor), None).unwrap();
+        assert_eq!(
+            light.get_fg_ansi("scrollbarTrack"),
+            light.get_fg_ansi("borderMuted")
+        ); // lightGray
+        assert_eq!(
+            light.get_fg_ansi("scrollbarThumb"),
+            light.get_fg_ansi("text")
+        );
     }
 
     // --- Auto theme -------------------------------------------------------
@@ -2073,7 +2154,7 @@ mod tests {
     #[test]
     fn test_bg_color_keys_count() {
         // 7 → 8: searchMatchBg added (theme.ts:531 @ 9841914).
-        assert_eq!(BG_COLOR_KEYS.len(), 8);
+        assert_eq!(BG_COLOR_KEYS.len(), 7); // scrollbarThumb moved to fg (457ae8c79)
     }
 
     // --- Terminal introspection constants ---------------------------------

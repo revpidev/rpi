@@ -456,6 +456,16 @@ pub(crate) enum UiCommand {
     ShareCompleted(crate::core::share::GistCreateOutcome),
     /// Mode-internal: Alt+Up dequeue (deferred — restore touches the editor).
     Dequeue,
+    /// Mode-internal: `app.message.copy` (interactive-mode.ts:2895-2896 →
+    /// `void this.handleCopyCommand({ flashConfirmation: true,
+    /// preferSelection: true })` @ 9841914, 4e4949299). Deferred like the
+    /// upstream fire-and-forget promise: the prefer-selection fork reads
+    /// alt-screen selection state whose lock is held by the input dispatch
+    /// invoking this action, and `copy_active_selection_to_clipboard` must
+    /// not block on that non-reentrant mutex.
+    CopyMessage {
+        prefer_selection: bool,
+    },
     /// Mode-internal: clipboard paste (deferred — insertion touches the
     /// editor and clipboard reads block).
     PasteImage,
@@ -991,14 +1001,25 @@ fn select_list_theme(theme: &Arc<Theme>) -> Arc<SelectListTheme> {
     })
 }
 
-/// `createInteractiveTui` fullscreen branch (tui-renderer.ts:21-40 @ 9841914,
-/// 00121ed99 + 79680533c): theme-aware search styling and the clickable
-/// jump-to-end indicator. The closures capture the shared theme handle so
-/// they follow theme changes without recreating the renderer.
+/// `createInteractiveTui` fullscreen branch (tui-renderer.ts:21-42 @ 9841914,
+/// 00121ed99 + 79680533c + 4e4949299 + 4caa3c440): theme-aware search
+/// styling, the clickable jump-to-end indicator, the copyOnSelect default
+/// and the verified `copySelection` injection. The closures capture the
+/// shared theme handle so they follow theme changes without recreating the
+/// renderer.
+///
+/// The injected clipboard write reuses the commands.rs OSC 52 path
+/// (upstream injects `copyToClipboard` with its native-tool chain; rpi has
+/// no clipboard library — the write returns real success so the flash
+/// reflects the verified outcome, TODO: native tool integration).
 fn fullscreen_alt_screen_options(
     theme_handle: &Arc<Mutex<Arc<Theme>>>,
+    copy_on_select: bool,
+    terminal: &rpi_tui::tui::SharedTerminal,
 ) -> rpi_tui::tui_alt_screen::TuiAltScreenOptions {
-    use rpi_tui::tui_alt_screen::{ScrollToEndIndicatorFn, SearchTextStyleFn, TuiAltScreenOptions};
+    use rpi_tui::tui_alt_screen::{
+        CopySelectionFn, ScrollToEndIndicatorFn, SearchTextStyleFn, TuiAltScreenOptions,
+    };
     use std::sync::Arc as StdArc;
 
     let style_search_match: StdArc<dyn Fn(&str) -> String + Send + Sync> = {
@@ -1038,11 +1059,24 @@ fn fullscreen_alt_screen_options(
         })
     };
 
+    let copy_selection: CopySelectionFn = {
+        let terminal = Arc::clone(terminal);
+        StdArc::new(move |text: &str| {
+            crate::modes::interactive::commands::emit_osc52_with_cap(text)
+                .map(|osc52| {
+                    lock(&terminal).write(&osc52);
+                })
+                .is_ok()
+        })
+    };
+
     TuiAltScreenOptions {
         search_match_style: Some(search_match_style),
         search_current_match_style: Some(search_current_match_style),
         search_navigation_button_style: Some(search_navigation_button_style),
         scroll_to_end_indicator: Some(scroll_to_end_indicator),
+        copy_on_select: Some(copy_on_select),
+        copy_selection: Some(copy_selection),
         ..TuiAltScreenOptions::default()
     }
 }
@@ -1295,9 +1329,9 @@ pub(crate) struct InteractiveUi {
     /// `switch_tui_mode` on `InteractiveUi` can construct a new renderer.
     pub(crate) agent_dir: Mutex<PathBuf>,
     /// Shared theme handle for the fullscreen renderer closures — the
-    /// scrollbar style (interactive-mode.ts:874 `scrollbarStyle: (text) =>
-    /// theme.bg("scrollbarThumb", text)`) and, since V14-15, the
-    /// transcript-search styles and jump-to-end indicator
+    /// scrollbar track/thumb styles (interactive-mode.ts:884-885 @ 9841914
+    /// `scrollbarTrackStyle`/`scrollbarThumbStyle` over `theme.fg`) and,
+    /// since V14-15, the transcript-search styles and jump-to-end indicator
     /// (tui-renderer.ts:21-40 @ 9841914). Updated in `apply_theme` so every
     /// closure follows theme changes without recreating the renderer.
     pub(crate) scrollbar_theme: Arc<Mutex<Arc<Theme>>>,
@@ -1388,15 +1422,19 @@ impl InteractiveUi {
         }
 
         // 6. Build the new renderer reusing the same terminal
-        //    (interactive-mode.ts:808-814).
+        //    (interactive-mode.ts:808-814). The fresh renderer reads the
+        //    current `fullscreenCopyOnSelect` (interactive-mode.ts:825).
         let agent_dir = lock(&self.agent_dir).clone();
+        let copy_on_select = self
+            .session()
+            .settings_manager(|s| s.get_fullscreen_copy_on_select());
         let new_renderer: Renderer = match mode {
             TuiMode::Fullscreen => {
                 Renderer::Alt(rpi_tui::tui_alt_screen::TuiAltScreen::with_shared_terminal(
-                    terminal,
+                    Arc::clone(&terminal),
                     Some(show_hardware_cursor),
                     Some(agent_dir),
-                    fullscreen_alt_screen_options(&self.scrollbar_theme),
+                    fullscreen_alt_screen_options(&self.scrollbar_theme, copy_on_select, &terminal),
                 ))
             }
             TuiMode::Regular => Renderer::Main(TuiMainScreen::with_shared_terminal(
@@ -2160,6 +2198,12 @@ impl InteractiveUi {
                 // `handleDequeue` (interactive-mode.ts:3759-3766) from the
                 // drain (restore touches the editor).
                 self.handle_dequeue();
+            }
+            UiCommand::CopyMessage { prefer_selection } => {
+                // `handleCopyCommand` (interactive-mode.ts:6134-6165 @
+                // 9841914) from the drain — the prefer-selection fork needs
+                // the alt-screen inner lock (see the enum doc).
+                self.handle_copy_command(prefer_selection);
             }
             UiCommand::PasteImage => {
                 // `handleClipboardPaste` (interactive-mode.ts:2629-2652)
@@ -3561,7 +3605,7 @@ impl InteractiveUi {
     }
 
     /// `rebuildChatFromMessages` (interactive-mode.ts:3524-3527).
-    fn rebuild_chat_from_messages(&self) {
+    pub(crate) fn rebuild_chat_from_messages(&self) {
         lock(&self.chat_container).clear();
         let entries = lock(&self.session().session_manager()).build_context_entries();
         self.render_session_entries(&entries, RenderOptions::default());
@@ -3837,7 +3881,14 @@ impl InteractiveUi {
         let copy_ui = Arc::clone(ui);
         editor.on_action(
             "app.message.copy",
-            Box::new(move || copy_ui.handle_copy_command()),
+            Box::new(move || {
+                // Deferred to the drain: the prefer-selection fork reads
+                // alt-screen selection state under its inner lock, which is
+                // held by the input dispatch invoking this action.
+                copy_ui.push(UiCommand::CopyMessage {
+                    prefer_selection: true,
+                });
+            }),
         );
         // Alt+Enter follow-up: forwarded to the run loop, which owns the
         // prompt sequencing (handle_follow_up).
@@ -4031,11 +4082,16 @@ impl InteractiveMode {
         // Renderer selection (interactive-mode.ts:343-352, 540-546 @ f074efd92):
         // `tui_mode == Fullscreen` → `TuiAltScreen`; otherwise → `TuiMainScreen`.
         let ui: TuiHandle = if options.tui_mode == TuiMode::Fullscreen {
-            let alt = rpi_tui::tui_alt_screen::TuiAltScreen::with_options(
-                terminal,
+            // `fullscreenCopyOnSelect` rides the options
+            // (tui-renderer.ts:36, interactive-mode.ts:539 @ 9841914,
+            // 4e4949299).
+            let copy_on_select = session.settings_manager(|s| s.get_fullscreen_copy_on_select());
+            let terminal: rpi_tui::tui::SharedTerminal = Arc::new(std::sync::Mutex::new(terminal));
+            let alt = rpi_tui::tui_alt_screen::TuiAltScreen::with_shared_terminal(
+                Arc::clone(&terminal),
                 Some(show_hardware_cursor),
                 Some(agent_dir.clone()),
-                fullscreen_alt_screen_options(&theme_handle),
+                fullscreen_alt_screen_options(&theme_handle, copy_on_select, &terminal),
             );
             let handle = TuiHandle::from_alt(alt);
             handle.set_clear_on_shrink(clear_on_shrink);
@@ -4350,14 +4406,22 @@ impl InteractiveMode {
         // transcriptScrollView wraps the document container; dock is a VStack
         // of pending/status/widgets/editor/widgets/footer; the layout root is
         // a VStack of [scrollview(grow), dock(auto)].
-        // `scrollbarStyle: (text) => theme.bg("scrollbarThumb", text)`
-        // (interactive-mode.ts:874 @ b3ed27b3f). The closure captures a
-        // shared theme handle so it follows theme changes.
+        // `scrollbarTrackStyle: (text) => theme.fg("scrollbarTrack", text)` /
+        // `scrollbarThumbStyle: (text) => theme.fg("scrollbarThumb", text)`
+        // (interactive-mode.ts:884-885 @ 9841914, 457ae8c79 — the single
+        // bg-styled hook became two fg-styled hooks). The closures capture
+        // the shared theme handle so they follow theme changes.
         let scrollbar_theme = Arc::clone(&ui_state.scrollbar_theme);
-        let scrollbar_style: rpi_tui::components::scroll_view::ScrollbarStyleFn =
+        let scrollbar_track_theme = Arc::clone(&ui_state.scrollbar_theme);
+        let scrollbar_track_style: rpi_tui::components::scroll_view::ScrollbarStyleFn =
+            Arc::new(move |text: &str| {
+                let theme = lock(&scrollbar_track_theme);
+                theme.fg("scrollbarTrack", text)
+            });
+        let scrollbar_thumb_style: rpi_tui::components::scroll_view::ScrollbarStyleFn =
             Arc::new(move |text: &str| {
                 let theme = lock(&scrollbar_theme);
-                theme.bg("scrollbarThumb", text)
+                theme.fg("scrollbarThumb", text)
             });
         let transcript_scroll_view = shared_component_from_boxed(Box::new(
             rpi_tui::components::scroll_view::ScrollView::new(
@@ -4369,7 +4433,8 @@ impl InteractiveMode {
                     scrollbar: self
                         .session
                         .settings_manager(|s| s.get_fullscreen_scrollbar()),
-                    scrollbar_style: Some(scrollbar_style),
+                    scrollbar_track_style: Some(scrollbar_track_style),
+                    scrollbar_thumb_style: Some(scrollbar_thumb_style),
                     ..rpi_tui::components::scroll_view::ScrollViewOptions::default()
                 },
             ),
@@ -4855,7 +4920,7 @@ impl InteractiveMode {
                 Some(())
             }
             "copy" => {
-                ui.handle_copy_command();
+                ui.handle_copy_command(false);
                 Some(())
             }
             "name" => {
@@ -5498,6 +5563,7 @@ mod tests {
             UiCommand::ShareAbort => "share_abort",
             UiCommand::ShareCompleted(_) => "share_completed",
             UiCommand::Dequeue => "dequeue",
+            UiCommand::CopyMessage { .. } => "copy_message",
             UiCommand::PasteImage => "paste_image",
         }
     }
@@ -7655,6 +7721,106 @@ mod tests {
     /// Regression: the real /settings flow — switch with the selector
     /// mounted, then close it and type. Covers the editor-container content
     /// swap keeping the selector visible and focusable across the switch.
+    /// The `app.message.copy` fork matrix (interactive-mode.ts:6134-6165 @
+    /// 9841914, 4e4949299): `preferSelection` copies the active fullscreen
+    /// selection only when copyOnSelect is OFF and a selection exists;
+    /// otherwise the last assistant message. Also covers the
+    /// `fullscreenCopyOnSelect` construction wiring (tui-renderer.ts:36) and
+    /// the settings runtime toggle (interactive-mode.ts:4774-4776).
+    #[tokio::test]
+    async fn copy_command_prefer_selection_fork_matrix() {
+        use base64::Engine as _;
+
+        let (mut mode, terminal, session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        // An assistant message on the agent backs the message-copy path; the
+        // selection target is whatever the transcript renders (the header
+        // row suffices).
+        ui.session().agent().set_messages(vec![assistant_message(
+            vec![text_content("assistant-secret")],
+            StopReason::Stop,
+        )]);
+        let message_osc52 = format!(
+            "\x1b]52;c;{}\x07",
+            base64::engine::general_purpose::STANDARD.encode("assistant-secret")
+        );
+        let osc52_count = || -> usize {
+            terminal
+                .writes()
+                .split("\x1b]52;c;")
+                .count()
+                .saturating_sub(1)
+        };
+        let latest_osc52_payload = || -> String {
+            let writes = terminal.writes();
+            writes
+                .rsplit_once("\x1b]52;c;")
+                .map(|(_, rest)| rest.split('\x07').next().unwrap_or_default().to_string())
+                .unwrap_or_default()
+        };
+
+        // Switch to fullscreen (reads the default fullscreenCopyOnSelect=true
+        // at construction, interactive-mode.ts:825).
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen);
+        assert!(ui.ui.get_copy_on_select(), "default copyOnSelect is on");
+        // First frame so the fullscreen selection paths have screen content.
+        ui.ui.render_now(false);
+
+        // (copyOnSelect on, no selection) → message path.
+        ui.handle_copy_command(true);
+        assert_eq!(osc52_count(), 1);
+        assert!(terminal.writes().contains(&message_osc52));
+
+        // Runtime toggle off via the settings change
+        // (interactive-mode.ts:4774-4776).
+        crate::modes::interactive::interactive_mode::commands_selectors::apply_settings_change(
+            ui,
+            crate::modes::interactive::components::settings_selector::SettingsChange::FullscreenCopyOnSelect(false),
+        );
+        assert!(!ui.ui.get_copy_on_select());
+        assert!(!session.settings_manager(|s| s.get_fullscreen_copy_on_select()));
+
+        // (copyOnSelect off, no selection) → still the message path.
+        ui.handle_copy_command(true);
+        assert_eq!(osc52_count(), 2);
+        assert!(terminal.writes().contains(&message_osc52));
+
+        // Make a fullscreen selection over the transcript's first row
+        // (press/drag/release SGR mouse); with copyOnSelect off the release
+        // leaves it active.
+        terminal.feed("\x1b[<0;1;2M");
+        terminal.feed("\x1b[<32;40;2M");
+        terminal.feed("\x1b[<0;40;2m");
+        ui.ui.tick(std::time::Instant::now());
+        assert!(
+            ui.ui.has_active_selection(),
+            "selection must survive release with copyOnSelect disabled"
+        );
+
+        // (copyOnSelect off, selection) → SELECTION path: a new OSC 52 whose
+        // payload is not the assistant message.
+        ui.handle_copy_command(true);
+        assert_eq!(osc52_count(), 3);
+        let payload = latest_osc52_payload();
+        assert_ne!(payload, "", "selection copy emitted an OSC 52");
+        let payload_text = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload.as_bytes())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_ne!(payload_text, "assistant-secret");
+        assert!(
+            !payload_text.trim().is_empty(),
+            "selection text is a rendered screen line: {payload_text:?}"
+        );
+        mode.shutdown().await;
+    }
+
     #[tokio::test]
     async fn switch_tui_mode_with_settings_selector_mounted() {
         let (mut mode, terminal, _session) = mode_harness().await;

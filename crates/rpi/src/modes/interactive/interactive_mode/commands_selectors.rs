@@ -314,7 +314,7 @@ where
 /// Settings `on*Change` handlers (interactive-mode.ts:4171-4310). A free
 /// function (not an inline closure) so tests can drive changes without
 /// mounting the selector.
-fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
+pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
     let session = ui.session();
     match change {
         SettingsChange::AutoCompact(enabled) => {
@@ -526,6 +526,13 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
             ui.apply_fullscreen_scrollbar(scrollbar_mode);
             ui.ui.set_fullscreen_scrollbar(scrollbar_mode);
             ui.render_handle.request_render();
+        }
+        SettingsChange::FullscreenCopyOnSelect(enabled) => {
+            // onFullscreenCopyOnSelectChange (interactive-mode.ts:4774-4776
+            // @ 9841914, 4e4949299): persist + apply to the live alt-screen
+            // renderer (`setCopyOnSelect`; no-op in regular mode).
+            session.settings_manager(|s| s.set_fullscreen_copy_on_select(enabled));
+            ui.ui.set_copy_on_select(enabled);
         }
         SettingsChange::Warnings(warnings) => {
             session.settings_manager(|s| s.set_warnings(&warnings));
@@ -1182,6 +1189,8 @@ impl InteractiveUi {
             tui_mode: ui.ui.mode(),
             fullscreen_exit_output: session.settings_manager(|s| s.get_fullscreen_exit_output()),
             fullscreen_scrollbar: session.settings_manager(|s| s.get_fullscreen_scrollbar()),
+            fullscreen_copy_on_select: session
+                .settings_manager(|s| s.get_fullscreen_copy_on_select()),
             warnings: session.settings_manager(|s| s.get_warnings()),
         };
 
@@ -2424,10 +2433,15 @@ impl InteractiveMode {
 }
 
 impl InteractiveUi {
-    /// `applyRuntimeSettings` (interactive-mode.ts:1709-1730): re-apply the
-    /// (possibly new project's) settings to the footer, the data provider
-    /// and the editor after a session switch. `configureHttpDispatcher` has
-    /// no local equivalent yet (TODO(T13) at the settings selector); the `!clearOnShrink` status-container clear is
+    /// `applyRuntimeSettings` (interactive-mode.ts:1937-1961 @ 9841914):
+    /// re-apply the (possibly new project's) settings to the footer, the
+    /// data provider and the editor after a session switch. Includes the
+    /// fullscreen scrollbar + copyOnSelect refreshes
+    /// (`applyFullscreenScrollbarSetting` / `setCopyOnSelect`, :1940-1945 —
+    /// the scrollbar line predates this task but was never ported; V14-16
+    /// closes the gap alongside its own copyOnSelect line).
+    /// `configureHttpDispatcher` has no local equivalent yet (TODO(T13) at
+    /// the settings selector); the `!clearOnShrink` status-container clear is
     /// folded into the rebind's full render-state reset.
     fn apply_runtime_settings(&self, session: &AgentSession) {
         let manager = session.session_manager();
@@ -2437,6 +2451,19 @@ impl InteractiveUi {
             let mut footer = lock(&self.footer);
             footer.set_session(session.clone());
             footer.set_auto_compact_enabled(session.auto_compaction_enabled());
+        }
+        // applyFullscreenScrollbarSetting (interactive-mode.ts:1894-1896 →
+        // 1940): the transcript scroll view keeps the setting across
+        // rebinds; the TuiHandle dispatch covers a live alt-screen renderer.
+        let scrollbar = session.settings_manager(|s| s.get_fullscreen_scrollbar());
+        self.apply_fullscreen_scrollbar(scrollbar);
+        self.ui.set_fullscreen_scrollbar(scrollbar);
+        // `if (this.renderer instanceof TuiAltScreen)` (interactive-mode.ts:
+        // 1943-1945): runtime copyOnSelect refresh on the fullscreen
+        // renderer only.
+        if self.ui.mode() == rpi_tui::tui::TuiMode::Fullscreen {
+            let copy_on_select = session.settings_manager(|s| s.get_fullscreen_copy_on_select());
+            self.ui.set_copy_on_select(copy_on_select);
         }
         self.footer_data.set_cwd(&cwd);
         let hide_thinking = session.settings_manager(|s| s.get_hide_thinking_block());
