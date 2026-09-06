@@ -335,7 +335,11 @@ pub struct ModelsRefreshOptions {
 
 /// `ModelsRefreshResult` (models.ts:73-76 @ 4181f66). Provider errors are
 /// returned without rejecting; provider ids keep insertion order.
-#[derive(Debug, Default)]
+///
+/// `Clone` (rpi addition, V14-13): the interactive all-catalog refresh
+/// shares one in-flight future across concurrent callers
+/// (`futures::future::Shared`, model-catalog-refresh.ts @ 7d8c11d37).
+#[derive(Debug, Default, Clone)]
 pub struct ModelsRefreshResult {
     pub aborted: bool,
     /// Provider id → error message, in provider iteration order.

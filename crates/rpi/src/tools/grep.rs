@@ -5,6 +5,11 @@
 //! this port reproduces the same observable behavior with the `ignore` +
 //! `regex` crates and downloads no external binary (gate G4).
 //!
+//! Upstream v0.84.4+ tools-manager fixes (musl static builds `6aedd1066`,
+//! 302-redirect version parsing `57e53b0d7`, non-blocking downloads
+//! `6f707eb36`) have no counterpart here: no managed binary is ever
+//! downloaded (ADR-0003; V14-13 FR-A 核对「不适用」).
+//!
 //! rg semantics replicated (verified against ripgrep 15):
 //! - `--hidden`: hidden files are searched, including `.git` contents.
 //! - gitignore rules apply only inside git repositories (rg's implicit

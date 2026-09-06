@@ -34,6 +34,7 @@ use rpi_ai::types::{
     SimpleStreamOptions, StreamOptions,
 };
 use rpi_ai::utils::event_stream::AssistantMessageEventStream;
+use tokio_util::sync::CancellationToken;
 
 use super::client::{
     llama_inference_url, normalize_llama_server_url, LlamaClient, LlamaError, LlamaModelInfo,
@@ -90,6 +91,48 @@ async fn resolve_server_url(
 }
 
 /// `toPiModel(model, serverUrl)` (provider.ts:28-51).
+/// `modelIsSelectable` (provider.ts:29-37 @ dcd461925): loaded and sleeping
+/// presets are directly routable (requests wake sleeping models); unloaded
+/// presets are routable only when the llama.cpp router autoloads on first
+/// use (`models_autoload`).
+fn model_is_selectable(model: &LlamaModelInfo, router_autoload: bool) -> bool {
+    if model.status.value == LlamaModelStatusValue::LOADED {
+        return true;
+    }
+    // llama.cpp reports idle-slept models as "sleeping"; requests wake them
+    // automatically.
+    if model.status.value == LlamaModelStatusValue::SLEEPING {
+        return true;
+    }
+    // Unloaded presets are routable only when llama.cpp router autoload can
+    // load them on first use.
+    router_autoload
+        && model.status.value == LlamaModelStatusValue::UNLOADED
+        && !model.status.failed
+        && model.source.as_deref() == Some("preset")
+}
+
+/// `routerAutoloadEnabled` (provider.ts:39-50 @ dcd461925): probe `/props`
+/// only when the catalog has unloaded preset candidates; probe failures
+/// read as disabled.
+pub(crate) async fn router_autoload_enabled(
+    client: &crate::extensions::llama::client::LlamaClient,
+    catalog: &[LlamaModelInfo],
+    signal: &CancellationToken,
+) -> bool {
+    let has_candidates = catalog.iter().any(|model| {
+        model.status.value == LlamaModelStatusValue::UNLOADED
+            && model.source.as_deref() == Some("preset")
+    });
+    if !has_candidates {
+        return false;
+    }
+    match client.props(Some(signal)).await {
+        Ok(props) => props.models_autoload == Some(true),
+        Err(_) => false,
+    }
+}
+
 fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaError> {
     let reported_context_window = model
         .meta
@@ -138,6 +181,16 @@ fn to_pi_model(model: &LlamaModelInfo, server_url: &str) -> Result<Model, LlamaE
     })
 }
 
+/// `setCatalog(catalog, serverUrl, options?)` options bag
+/// (provider.ts:127-129).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LlamaSetCatalogOptions {
+    /// `routerAutoload` (provider.ts:44): the llama.cpp router's
+    /// `models_autoload` capability — when true, unloaded presets stay
+    /// selectable (the router loads them on first use).
+    pub router_autoload: bool,
+}
+
 /// `LlamaProvider` — the `Provider` implementation behind
 /// `createLlamaProvider` (provider.ts:58-131).
 pub struct LlamaProvider {
@@ -163,16 +216,18 @@ impl LlamaProvider {
         }
     }
 
-    /// `setCatalog` (provider.ts:61-63): only `status.value === "loaded"`
-    /// entries are published as pi models.
+    /// `setCatalog` (provider.ts:61-63 @ dcd461925): entries selectable via
+    /// [`model_is_selectable`] are published as pi models — loaded and
+    /// sleeping always; unloaded presets when the router autoloads.
     pub fn set_catalog(
         &self,
         catalog: &[LlamaModelInfo],
         server_url: &str,
+        options: LlamaSetCatalogOptions,
     ) -> Result<(), LlamaError> {
         let mut models = Vec::new();
         for model in catalog {
-            if model.status.value == LlamaModelStatusValue::LOADED {
+            if model_is_selectable(model, options.router_autoload) {
                 models.push(to_pi_model(model, server_url)?);
             }
         }
@@ -250,8 +305,13 @@ impl Provider for LlamaProvider {
                 .list(false, Some(&context.signal))
                 .await
                 .map_err(auth_error)?;
-            this.set_catalog(&catalog, &server_url)
-                .map_err(auth_error)?;
+            let router_autoload = router_autoload_enabled(&client, &catalog, &context.signal).await;
+            this.set_catalog(
+                &catalog,
+                &server_url,
+                LlamaSetCatalogOptions { router_autoload },
+            )
+            .map_err(auth_error)?;
             if !context.signal.is_cancelled() {
                 let models = lock(&this.models).clone();
                 context
@@ -432,8 +492,9 @@ impl LlamaProviderController {
         &self,
         catalog: &[LlamaModelInfo],
         server_url: &str,
+        options: LlamaSetCatalogOptions,
     ) -> Result<(), LlamaError> {
-        self.provider.set_catalog(catalog, server_url)
+        self.provider.set_catalog(catalog, server_url, options)
     }
 }
 
@@ -499,6 +560,7 @@ mod tests {
                     model_info("loading", LlamaModelStatusValue::LOADING),
                 ],
                 "http://localhost:8080",
+                LlamaSetCatalogOptions::default(),
             )
             .expect("set catalog");
 
@@ -520,6 +582,52 @@ mod tests {
         assert_eq!(compat.supports_usage_in_streaming, Some(true));
         assert_eq!(compat.supports_strict_mode, Some(false));
         assert_eq!(compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
+    }
+
+    /// V14-13 FR-F R4/R2（dcd461925）：sleeping 模型始终可选；unloaded
+    /// preset 仅在 router autoload 开启时可选；失败/非 preset 项不可选。
+    #[test]
+    fn selectable_statuses_cover_sleeping_and_autoload_presets() {
+        let controller = create_llama_provider();
+        let mut unloaded_preset = model_info("preset-a", LlamaModelStatusValue::UNLOADED);
+        unloaded_preset.source = Some("preset".to_owned());
+        let mut failed_preset = model_info("preset-bad", LlamaModelStatusValue::UNLOADED);
+        failed_preset.source = Some("preset".to_owned());
+        failed_preset.status.failed = true;
+        let mut non_preset = model_info("hf-model", LlamaModelStatusValue::UNLOADED);
+        non_preset.source = Some("huggingface".to_owned());
+        let catalog = vec![
+            model_info("sleeping", LlamaModelStatusValue::SLEEPING),
+            unloaded_preset.clone(),
+            failed_preset,
+            non_preset,
+        ];
+
+        // Without autoload: only sleeping.
+        controller
+            .set_catalog(
+                &catalog,
+                "http://localhost:8080",
+                LlamaSetCatalogOptions::default(),
+            )
+            .expect("set catalog");
+        let models = controller.provider().get_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["sleeping"]);
+
+        // With router autoload: sleeping + the clean preset.
+        controller
+            .set_catalog(
+                &catalog,
+                "http://localhost:8080",
+                LlamaSetCatalogOptions {
+                    router_autoload: true,
+                },
+            )
+            .expect("set catalog");
+        let models = controller.provider().get_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, vec!["sleeping", "preset-a"]);
     }
 
     /// `toPiModel` context fallback (provider.ts:29-30): missing/zero
@@ -648,6 +756,72 @@ mod tests {
                 .and_then(|env| env.get("LLAMA_BASE_URL"))
                 .map(String::as_str),
             Some("http://10.0.0.2:9000")
+        );
+    }
+
+    /// V14-13 FR-F R1（#8558 核对补缺）：offline/自动刷新（allow_network =
+    /// false）先恢复 stored catalog——刷新不丢已发布模型；同时证明该路径
+    /// 零网络请求（无 server 可达也不报错，R3 自动刷新 offline 门控）。
+    #[tokio::test]
+    async fn offline_refresh_restores_stored_catalog_without_network() {
+        use rpi_ai::models::{PublishHandle, PublishShared, RefreshModelsContext};
+        use rpi_ai::models_store::{InMemoryModelsStore, ModelsStore, ModelsStoreEntry};
+
+        let controller = create_llama_provider();
+        let provider = controller.provider();
+
+        // A previously published llama model in the stored snapshot.
+        let mut stored_model = model_info("kept-model", LlamaModelStatusValue::LOADED);
+        stored_model.source = Some("preset".to_owned());
+        let pi_model = to_pi_model(&stored_model, "http://localhost:8080").expect("model");
+
+        let store = Arc::new(InMemoryModelsStore::new());
+        store
+            .write(
+                LLAMA_PROVIDER_ID,
+                ModelsStoreEntry {
+                    models: vec![pi_model.clone()],
+                    last_modified: None,
+                    checked_at: None,
+                    etag: None,
+                },
+                None,
+            )
+            .await
+            .expect("seed store");
+
+        let signal = CancellationToken::new();
+        let context = RefreshModelsContext {
+            credential: None,
+            stored: store.read(LLAMA_PROVIDER_ID, None).await.unwrap_or(None),
+            publish: PublishHandle {
+                shared: Arc::new(PublishShared {
+                    provider_id: LLAMA_PROVIDER_ID.to_owned(),
+                    generation: 1,
+                    signal: signal.clone(),
+                    store,
+                    chain: Arc::new(tokio::sync::Mutex::new(None)),
+                    refresh_generations: Arc::new(std::sync::RwLock::new(
+                        [(LLAMA_PROVIDER_ID.to_owned(), 1u64)].into(),
+                    )),
+                }),
+            },
+            // Offline / automatic path: no network, no credential.
+            allow_network: false,
+            force: None,
+            signal,
+        };
+
+        // A network attempt would fail loudly (no credential → early Ok);
+        // the stored models must be restored either way.
+        let refresh = provider.refresh_models(context).expect("refreshable");
+        refresh.await.expect("offline refresh ok");
+
+        let models = provider.get_models();
+        assert!(
+            models.iter().any(|model| model.id == "kept-model"),
+            "stored catalog restored, models do not disappear: {:?}",
+            models.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
         );
     }
 }

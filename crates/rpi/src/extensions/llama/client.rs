@@ -77,6 +77,13 @@ impl LlamaModelInfo {
     }
 }
 
+/// `LlamaServerProps` (client.ts:30-33): the `/props` surface rpi consumes —
+/// just `models_autoload` (router autoload capability).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlamaServerProps {
+    pub models_autoload: Option<bool>,
+}
+
 /// `LlamaModelEvent` (client.ts:31-35).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaModelEvent {
@@ -465,6 +472,23 @@ impl LlamaClient {
             ));
         }
         Ok(data.iter().map(parse_model_info).collect())
+    }
+
+    /// `props(options)` (client.ts:192-200 @ dcd461925): read
+    /// `models_autoload` from `/props`; a non-boolean value yields the
+    /// default (empty) props.
+    pub async fn props(
+        &self,
+        signal: Option<&CancellationToken>,
+    ) -> Result<LlamaServerProps, LlamaError> {
+        let payload = self
+            .request(reqwest::Method::GET, "/props", None, signal)
+            .await?;
+        let models_autoload = payload
+            .as_ref()
+            .and_then(|payload| payload.get("models_autoload"))
+            .and_then(Value::as_bool);
+        Ok(LlamaServerProps { models_autoload })
     }
 
     /// `load` (client.ts:192-194).

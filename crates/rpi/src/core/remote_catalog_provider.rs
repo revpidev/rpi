@@ -466,15 +466,26 @@ where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = reqwest::RequestBuilder>,
 {
-    crate::utils::management_http::fetch_with_retry(build, signal, &Default::default())
-        .await
-        .map_err(|error| {
-            ModelsError::with_cause(
-                ModelsErrorCode::ModelSource,
-                "Model catalog request failed",
-                &error,
-            )
-        })
+    // `REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS = 4_000` (remote-catalog-provider.ts:7
+    // @ df018b602, #8198): a hung pi.dev request aborts after 4 s per attempt
+    // and the retry loop gets fresh attempts instead of eating the whole
+    // refresh deadline in one hang.
+    crate::utils::management_http::fetch_with_retry(
+        build,
+        signal,
+        &crate::utils::management_http::FetchRetryOptions {
+            attempt_timeout: Some(std::time::Duration::from_millis(4_000)),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|error| {
+        ModelsError::with_cause(
+            ModelsErrorCode::ModelSource,
+            "Model catalog request failed",
+            &error,
+        )
+    })
 }
 
 #[cfg(test)]

@@ -86,7 +86,8 @@ pub use huggingface::{
     find_hugging_face_token, HuggingFaceClient, HuggingFaceModel, DEFAULT_HUGGING_FACE_URL,
 };
 pub use provider::{
-    create_llama_provider, shared_llama_provider, LlamaProviderController, LLAMA_PROVIDER_ID,
+    create_llama_provider, shared_llama_provider, LlamaProviderController, LlamaSetCatalogOptions,
+    LLAMA_PROVIDER_ID,
 };
 
 /// `LlamaManagerAction` (ui.ts:25).
@@ -285,7 +286,16 @@ async fn sync_catalog(
         Some(catalog) => catalog,
         None => client.list(false, None).await?,
     };
-    controller.set_catalog(&current, client.server_url())?;
+    // `setCatalog(catalog, serverUrl, { routerAutoload })`
+    // (provider.ts:44-50 @ dcd461925): the interactive /llama manager
+    // probes the router autoload capability before publishing.
+    let router_autoload =
+        provider::router_autoload_enabled(client, &current, &CancellationToken::new()).await;
+    controller.set_catalog(
+        &current,
+        client.server_url(),
+        LlamaSetCatalogOptions { router_autoload },
+    )?;
     host.refresh_models().await;
     Ok(current)
 }

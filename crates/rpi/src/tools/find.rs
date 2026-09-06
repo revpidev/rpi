@@ -6,6 +6,11 @@
 //! behavior with the `ignore` + `globset` crates and downloads no external
 //! binary (gate G4).
 //!
+//! Upstream v0.84.4+ tools-manager fixes (musl static builds `6aedd1066`,
+//! 302-redirect version parsing `57e53b0d7`, non-blocking downloads
+//! `6f707eb36`) have no counterpart here: no managed binary is ever
+//! downloaded (ADR-0003; V14-13 FR-A 核对「不适用」).
+//!
 //! fd semantics replicated (verified against fd 10.4):
 //! - `--hidden`: hidden files are searched.
 //! - gitignore rules: inside a git repository fd applies its default

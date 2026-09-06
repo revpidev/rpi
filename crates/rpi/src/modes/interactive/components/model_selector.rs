@@ -408,7 +408,9 @@ impl ModelSelectorComponent {
                     // `ModelRuntime::refresh` takes no signal
                     // (model_runtime.rs:1089), so the timeout is not
                     // enforced here.
-                    runtime.refresh(None).await;
+                    // Shared in-flight refresh (7d8c11d37): joining a
+                    // running catalog refresh instead of restarting it.
+                    runtime.refresh_catalogs_shared().await;
                     let mut state = lock(&state);
                     if state.closed {
                         return;

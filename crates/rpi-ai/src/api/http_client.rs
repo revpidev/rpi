@@ -72,4 +72,80 @@ mod tests {
             .expect_err("socks rejected");
         assert!(error.starts_with(crate::utils::http_proxy::UNSUPPORTED_PROXY_PROTOCOL_MESSAGE));
     }
+
+    /// V14-13 FR-B 复现记录（D-094）：reqwest 对**纯 HTTP origin** 的代理
+    /// 请求使用 absolute-URI 转发（`GET http://host/... HTTP/1.1`），而非
+    /// 上游 `proxyTunnel: true` 的 CONNECT 隧道（http-dispatcher.ts:86-90 @
+    /// `23842b1e6`，#8134）。reqwest 0.12 无强制 HTTP-over-CONNECT 开关；
+    /// 该差异触发条件 = 「配置代理 + http:// provider base_url」。本测试
+    /// 钉死当前转发形状，D-094 落盘于 plan/v0.1.4/deviations/。
+    #[tokio::test]
+    async fn http_origin_uses_absolute_uri_forwarding_not_connect() {
+        use std::sync::Arc;
+
+        // A fake origin (never reached directly) and a recording proxy.
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind origin");
+        let origin_addr = origin.local_addr().expect("origin addr");
+        drop(origin); // nothing listens: any non-proxied attempt fails
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy addr");
+        let first_line: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        let recorder = first_line.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = proxy.accept().await {
+                let recorder = recorder.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&head)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    *recorder.lock().unwrap() = Some(line);
+                    let body = r#"{"proxied":true}"#;
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(out.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        let env: ProviderEnv = [("HTTP_PROXY".to_owned(), format!("http://{proxy_addr}"))]
+            .into_iter()
+            .collect();
+        let builder =
+            adapter_client_builder(Some(&env), &format!("http://{origin_addr}")).expect("builder");
+        let client = builder.build().expect("client");
+
+        let response = client
+            .get(format!("http://{origin_addr}/v1/models"))
+            .send()
+            .await
+            .expect("proxied response");
+        assert!(response.status().is_success());
+
+        let line = first_line.lock().unwrap().clone().expect("request seen");
+        assert!(
+            line.starts_with(&format!("GET http://{origin_addr}/")),
+            "absolute-URI forwarding (D-094): {line:?}"
+        );
+        assert!(!line.starts_with("CONNECT "), "no CONNECT tunnel: {line:?}");
+    }
 }

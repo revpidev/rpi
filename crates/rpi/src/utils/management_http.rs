@@ -35,6 +35,11 @@ pub struct FetchRetryOptions {
     /// management-http.ts:35). A new deadline is computed per attempt from the
     /// remaining budget.
     pub timeout: Option<Duration>,
+    /// Per-attempt timeout (`attemptTimeoutMs`, management-http.ts:16-17 @
+    /// df018b602, #8198): a NEW timeout is created for every attempt, so a
+    /// hung connection aborts only that attempt and the retry loop gets a
+    /// fresh chance — unlike `timeout`, exhausting it is NOT terminal.
+    pub attempt_timeout: Option<Duration>,
 }
 
 impl FetchRetryOptions {
@@ -89,9 +94,17 @@ where
             }
         }
 
-        // Compute the per-attempt timeout from the remaining budget.
-        let attempt_timeout =
+        // Compute the per-attempt timeout: the binding constraint of the
+        // remaining overall budget (if any) and `attempt_timeout` (which is
+        // per-attempt and non-terminal, df018b602).
+        let budget_remaining =
             deadline.map(|end| end.saturating_duration_since(tokio::time::Instant::now()));
+        let attempt_timeout = match (budget_remaining, options.attempt_timeout) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
 
         let mut request = build().await;
         if let Some(timeout) = attempt_timeout {
@@ -115,6 +128,8 @@ where
             Err(error) => {
                 // Transport failure: caller cancellation or budget exhaustion
                 // is terminal; otherwise retry (management-http.ts:57-66).
+                // An `attempt_timeout` expiry is NOT terminal — it aborts
+                // only the current attempt (df018b602).
                 let is_cancellation = cancel_token.is_some_and(|t| t.is_cancelled())
                     || deadline.is_some_and(|end| tokio::time::Instant::now() >= end);
                 if is_cancellation || attempt >= max_retries {
@@ -435,5 +450,99 @@ mod tests {
         for &code in &[200, 301, 400, 401, 403, 404, 499, 505] {
             assert!(!is_retryable_status(code), "{code} should NOT be retryable");
         }
+    }
+
+    // V14-13 FR-E R2 (df018b602, #8198): per-attempt timeout aborts only the
+    // hung attempt; the loop retries with a fresh timeout.
+
+    #[tokio::test]
+    async fn attempt_timeout_retries_a_hung_request() {
+        // First response hangs past the 50 ms attempt timeout; the second
+        // answers immediately.
+        let server = MockServer::start(vec![
+            ScriptedResponse::json(200, r#"{"ok":true}"#).with_delay(Duration::from_millis(500)),
+            ScriptedResponse::json(200, r#"{"ok":true}"#),
+        ])
+        .await;
+
+        let url = server.url.clone();
+        let response = fetch_with_retry(
+            move || {
+                let url = url.clone();
+                Box::pin(async move { reqwest::Client::new().get(url) })
+            },
+            None,
+            &FetchRetryOptions {
+                attempt_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second attempt succeeds");
+        assert!(response.status().is_success());
+        assert_eq!(server.calls(), 2, "hung attempt aborted and retried");
+    }
+
+    #[tokio::test]
+    async fn attempt_timeout_exhaustion_is_bounded_by_max_retries() {
+        // Every response hangs: the default max_retries (2) bounds the loop
+        // to 3 attempts, each with its own fresh timeout — the total wait is
+        // attempts × attempt_timeout, not a single unbounded hang.
+        let start = tokio::time::Instant::now();
+        let server = MockServer::start(vec![
+            ScriptedResponse::json(200, "x").with_delay(Duration::from_millis(500)),
+            ScriptedResponse::json(200, "x").with_delay(Duration::from_millis(500)),
+            ScriptedResponse::json(200, "x").with_delay(Duration::from_millis(500)),
+        ])
+        .await;
+
+        let url = server.url.clone();
+        let result = fetch_with_retry(
+            move || {
+                let url = url.clone();
+                Box::pin(async move { reqwest::Client::new().get(url) })
+            },
+            None,
+            &FetchRetryOptions {
+                attempt_timeout: Some(Duration::from_millis(40)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err(), "all attempts timed out");
+        assert_eq!(server.calls(), 3, "initial + 2 retries");
+        assert!(
+            start.elapsed() < Duration::from_millis(400),
+            "per-attempt timeouts, not one long hang: {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn overall_budget_still_terminal_across_attempt_timeouts() {
+        // With BOTH budgets set, exhausting the overall budget is terminal
+        // even though each attempt also has its own timeout.
+        let server = MockServer::start(vec![
+            ScriptedResponse::json(200, "x").with_delay(Duration::from_millis(300)),
+            ScriptedResponse::json(200, "x").with_delay(Duration::from_millis(300)),
+        ])
+        .await;
+
+        let url = server.url.clone();
+        let result = fetch_with_retry(
+            move || {
+                let url = url.clone();
+                Box::pin(async move { reqwest::Client::new().get(url) })
+            },
+            None,
+            &FetchRetryOptions {
+                timeout: Some(Duration::from_millis(100)),
+                attempt_timeout: Some(Duration::from_millis(80)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(server.calls() <= 2, "budget exhaustion is terminal");
     }
 }

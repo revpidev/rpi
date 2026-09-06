@@ -4717,6 +4717,39 @@ mod tests {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    /// V14-13 FR-D（`f8f03460a` 核对补缺）：glob 展开输出按**可见路径字典
+    /// 序**确定（非文件系统返回顺序）——上游 node-glob 同款。
+    #[test]
+    fn glob_expand_multi_hit_output_is_lexicographically_sorted() {
+        let dirs = TestDirs::new();
+        let root = dirs.root.join("pkg");
+        // Create files in non-lexicographic creation order.
+        write_file(&root.join("extensions/zeta.ts"), "");
+        write_file(&root.join("extensions/alpha.ts"), "");
+        write_file(&root.join("extensions/mid.ts"), "");
+        write_file(&root.join("prompts/beta.md"), "");
+
+        let matches = glob_expand(&root, "extensions/*.ts");
+        let ids: Vec<String> = matches
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .expect("absolute under root")
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/")
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "extensions/alpha.ts",
+                "extensions/mid.ts",
+                "extensions/zeta.ts"
+            ],
+            "glob expansion sorts by visible path, not walk order"
+        );
+    }
+
     #[test]
     fn command_request_display_redacts_url_userinfo() {
         let request = CommandRequest::new(

@@ -887,6 +887,19 @@ fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProv
 /// `getAvailable` failures propagate to the caller, which reports them
 /// like any login failure (upstream lets them reject out of
 /// `showApiKeyLoginDialog`'s try).
+/// `llamaCppPostLoginGuidance` (interactive-mode.ts:290-294 @ a1bc0ec79,
+/// #8203): llama.cpp has no default model — direct users to `/llama` first
+/// when nothing is loaded. The provider id matches
+/// `LLAMA_PROVIDER_ID` but stays inline (upstream keeps it decoupled from
+/// the built-in extension).
+fn llama_cpp_post_login_guidance(action_label: &str, loaded_model_count: usize) -> String {
+    if loaded_model_count == 0 {
+        format!("{action_label}. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it.")
+    } else {
+        format!("{action_label}. Use /model to select a loaded llama.cpp model, or /llama to manage models.")
+    }
+}
+
 async fn complete_provider_authentication(
     ui: &Arc<InteractiveUi>,
     provider_id: &str,
@@ -912,37 +925,62 @@ async fn complete_provider_authentication(
             .into_iter()
             .filter(|model| model.provider == provider_id)
             .collect();
-        match default_model_for_provider(provider_id) {
-            None => {
-                selection_error = Some(format!(
+        // llama.cpp has no default model: dedicated post-login guidance
+        // (a1bc0ec79, #8203) — `--no-models-autoload` servers only store
+        // the connection; /llama loads a model first.
+        if provider_id == "llama.cpp" {
+            selection_error = Some(llama_cpp_post_login_guidance(
+                &action_label,
+                provider_models.len(),
+            ));
+        } else {
+            match default_model_for_provider(provider_id) {
+                None => {
+                    selection_error = Some(format!(
                     "{action_label}, but no default model is configured for provider \"{provider_id}\". Use /model to select a model."
                 ));
-            }
-            Some(_default_model_id) if provider_models.is_empty() => {
-                selection_error = Some(format!(
+                }
+                Some(_default_model_id) if provider_models.is_empty() => {
+                    selection_error = Some(format!(
                     "{action_label}, but no models are available for that provider. Use /model to select a model."
                 ));
-            }
-            Some(default_model_id) => {
-                let candidate = provider_models
-                    .iter()
-                    .find(|model| model.id == default_model_id)
-                    .cloned();
-                match candidate {
-                    None => {
-                        selection_error = Some(format!(
+                }
+                Some(default_model_id) => {
+                    let candidate = provider_models
+                        .iter()
+                        .find(|model| model.id == default_model_id)
+                        .cloned();
+                    match candidate {
+                        None => {
+                            selection_error = Some(format!(
                             "{action_label}, but its default model \"{default_model_id}\" is not available. Use /model to select a model."
                         ));
-                    }
-                    Some(model) => match ui.session().set_model(model.clone()).await {
-                        Ok(()) => selected_model = Some(model),
-                        Err(error) => {
-                            selected_model = None;
-                            selection_error = Some(format!(
+                        }
+                        // `setModel(selectedModel, { persist: true })`
+                        // (interactive-mode.ts:5698 @ 2ff8ba622): the post-login
+                        // default selection persists (V14-13 catch-up — the
+                        // plain call silently became session-only in V14-12).
+                        Some(model) => {
+                            match ui
+                                .session()
+                                .set_model_with_options(
+                                    model.clone(),
+                                    crate::core::agent_session::ModelMutationOptions {
+                                        persist: true,
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(()) => selected_model = Some(model),
+                                Err(error) => {
+                                    selected_model = None;
+                                    selection_error = Some(format!(
                                     "{action_label}, but selecting its default model failed: {error}. Use /model to select a model."
                                 ));
+                                }
+                            }
                         }
-                    },
+                    }
                 }
             }
         }
@@ -1916,7 +1954,12 @@ impl InteractiveUi {
         // `getModelCandidates` (interactive-mode.ts:4350-4361): scoped models
         // win; otherwise refresh and list everything.
         let models: Vec<Model> = if self.session().scoped_models().is_empty() {
-            self.session().model_runtime().refresh(None).await;
+            // Shared in-flight refresh (7d8c11d37): /model does not cancel
+            // and restart a running catalog refresh.
+            self.session()
+                .model_runtime()
+                .refresh_catalogs_shared()
+                .await;
             self.session()
                 .model_runtime()
                 .get_available(None)
@@ -4017,5 +4060,18 @@ mod tests {
             tx.send(7).expect("send");
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(7));
+    }
+
+    /// V14-13 FR-F R5（a1bc0ec79，#8203）：llama.cpp 登录引导双态文案。
+    #[test]
+    fn llama_cpp_post_login_guidance_two_states() {
+        assert_eq!(
+            llama_cpp_post_login_guidance("Logged in to llama.cpp", 0),
+            "Logged in to llama.cpp. No llama.cpp models are loaded. Use /llama to load a model, then /model to select it."
+        );
+        assert_eq!(
+            llama_cpp_post_login_guidance("Logged in to llama.cpp", 2),
+            "Logged in to llama.cpp. Use /model to select a loaded llama.cpp model, or /llama to manage models."
+        );
     }
 }

@@ -339,6 +339,10 @@ mod tests {
         assert!(!is_newer_package_version("1.2.3", "1.2.3"));
         assert!(is_newer_package_version("abc", "1.2.3"));
         assert!(!is_newer_package_version(" same ", "same"));
+        // V14-13 FR-C 三态补缺 (#8226/#8239): an OLDER candidate must not
+        // read as a newer release (`semver.gt`, version-check.ts:43-49).
+        assert!(!is_newer_package_version("1.2.9", "1.3.0"));
+        assert!(!is_newer_package_version("1.2.3", "1.3.0"));
     }
 
     #[test]

@@ -387,6 +387,11 @@ pub struct CompatibilityRequestConfig {
 // ModelRuntime
 // ============================================================================
 
+/// Shared in-flight all-catalog refresh future (clone-per-caller; all
+/// awaiters observe the same result).
+type CatalogRefreshShared =
+    futures::future::Shared<futures::future::BoxFuture<'static, ModelsRefreshResult>>;
+
 /// Configured pi-ai Models collection used by coding-agent and SDK consumers
 /// (`ModelRuntime`, model-runtime.ts:94-593).
 pub struct ModelRuntime {
@@ -408,6 +413,14 @@ pub struct ModelRuntime {
     composition_errors: Mutex<OrderedMap<String>>,
     availability_error: Mutex<Option<String>>,
     snapshot: RwLock<ModelRuntimeSnapshot>,
+    /// Interactive all-catalog refresh in-flight slot
+    /// (`ModelCatalogRefreshCoordinator.activeByRuntime`,
+    /// model-catalog-refresh.ts:16-43 @ 7d8c11d37): the first caller runs
+    /// [`ModelRuntime::refresh`]; concurrent callers await the same future
+    /// instead of restarting it (opening /model while a refresh runs must
+    /// not cancel-and-restart it). Cleared by the runner on completion so
+    /// the next call starts fresh.
+    catalog_refresh_inflight: Mutex<Option<CatalogRefreshShared>>,
     // ------------------------------------------------------------------
     // Generation counters (model-runtime.ts:148-152, commits 8f9e76974 +
     // c6eb6281a + a077fff0b): seq-gating prevents stale availability passes
@@ -1059,6 +1072,7 @@ impl ModelRuntime {
             composition_errors: Mutex::new(OrderedMap::default()),
             availability_error: Mutex::new(None),
             snapshot: RwLock::new(ModelRuntimeSnapshot::default()),
+            catalog_refresh_inflight: Mutex::new(None),
             availability_refresh_seq: Mutex::new(0),
             availability_error_seq: Mutex::new(0),
             provider_availability_seq: Mutex::new(HashMap::new()),
@@ -2021,6 +2035,45 @@ impl ModelRuntime {
         options: Option<ModelsSimpleStreamOptions>,
     ) -> Option<AssistantMessage> {
         self.models.complete_simple(model, context, options).await
+    }
+
+    /// `refreshModelCatalogs` (model-catalog-refresh.ts:47-55 @ 7d8c11d37):
+    /// share concurrent interactive all-catalog refreshes — the first
+    /// caller runs [`ModelRuntime::refresh`] with default options
+    /// (`allowNetwork = model_network_enabled`, no signal); concurrent
+    /// callers join the same in-flight future and get its result. Upstream
+    /// keeps each caller's abort signal independent (detaching a waiter
+    /// does not abort the shared run unless ALL waiters leave); rpi's two
+    /// interactive call sites (the /model selector refresh and the /model
+    /// command exact-match probe) pass no signal and always run to
+    /// completion, so the waiter-abort arm has no reachable caller and is
+    /// not ported (noted in V14-13 §7).
+    pub async fn refresh_catalogs_shared(self: &Arc<Self>) -> ModelsRefreshResult {
+        let (shared, runner) = {
+            let mut slot = lock(&self.catalog_refresh_inflight);
+            match slot.take() {
+                Some(shared) => {
+                    // Already in flight: re-insert and join it.
+                    *slot = Some(shared.clone());
+                    (shared, false)
+                }
+                None => {
+                    let runtime = Arc::clone(self);
+                    let shared: CatalogRefreshShared =
+                        async move { runtime.refresh(None).await }.boxed().shared();
+                    *slot = Some(shared.clone());
+                    (shared, true)
+                }
+            }
+        };
+        let result = shared.await;
+        if runner {
+            // The run finished; drop it so the next call starts fresh
+            // (`finally { activeByRuntime.delete }`). Late joiners that
+            // already hold a clone still observe the settled result.
+            *lock(&self.catalog_refresh_inflight) = None;
+        }
+        result
     }
 
     /// `refresh(options)` (model-runtime.ts:516-537): reload models.json,
@@ -3528,5 +3581,149 @@ mod tests {
             compat: None,
             sampling_params: None,
         }
+    }
+
+    /// V14-13 FR-E R1（7d8c11d37）：并发全目录刷新共享同一 in-flight
+    /// 操作——/model 打开时跟随进行中的刷新，不重启（服务端只收到一次
+    /// 目录请求，两个调用方都拿到结果）。
+    #[tokio::test]
+    async fn concurrent_catalog_refreshes_share_one_inflight_fetch() {
+        const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_SHARED_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        // A slow-but-completing catalog server (100 ms per response) with a
+        // hit counter.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_counter = hits.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = hit_counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    // Drain the request head.
+                    let mut head = Vec::new();
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let body = r#"{"models":[{"id":"slow-1","name":"Slow One"}]}"#;
+                    let out = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(out.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let inner = create_provider(CreateProviderOptions {
+            id: "remote-catalog-test".to_owned(),
+            name: None,
+            base_url: None,
+            headers: None,
+            auth: ProviderAuth {
+                api_key: Some(Arc::new(env_api_key_auth("Test API key", &[ENV_KEY]))),
+                oauth: None,
+            },
+            models: vec![],
+            api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
+            ..Default::default()
+        });
+        runtime
+            .register_native_provider(crate::core::remote_catalog_provider::with_remote_catalog(
+                inner,
+                Some(url),
+                None,
+            ))
+            .await
+            .expect("register");
+
+        // Two concurrent shared refreshes while the first is in flight.
+        let a = runtime.refresh_catalogs_shared();
+        let b = runtime.refresh_catalogs_shared();
+        let (ra, rb) = tokio::join!(a, b);
+        assert!(!ra.aborted);
+        assert!(!rb.aborted);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the in-flight fetch is shared, not restarted"
+        );
+
+        // After completion the slot is free (the remote-catalog overlay's
+        // own interval/etag gating may skip a re-fetch, so the observable
+        // is the slot, not a second server hit).
+        assert!(
+            lock(&runtime.catalog_refresh_inflight).is_none(),
+            "in-flight slot cleared after completion"
+        );
+        let c = runtime.refresh_catalogs_shared().await;
+        assert!(!c.aborted);
+        assert!(
+            lock(&runtime.catalog_refresh_inflight).is_none(),
+            "a later run also clears its slot"
+        );
+        std::env::remove_var(ENV_KEY);
+    }
+
+    /// V14-13 FR-H（docs/sdk.md :373-378 核对）：`ModelRuntime::create` 默认
+    /// 不做联网目录刷新（`allow_model_network` 默认 false）——服务端零命中。
+    #[tokio::test]
+    async fn create_default_does_not_touch_the_network() {
+        const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_CREATE_KEY";
+        std::env::set_var(ENV_KEY, "test-key");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hit_counter = hits.clone();
+        tokio::spawn(async move {
+            let counter = hit_counter;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+            }
+        });
+
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Path(std::env::temp_dir().join(format!(
+                "rpi-create-offline-{}-models.json",
+                std::process::id()
+            ))),
+            ..Default::default()
+        })
+        .await;
+        let _ = runtime.get_available_snapshot();
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default create never refreshes catalogs over the network"
+        );
+        std::env::remove_var(ENV_KEY);
     }
 }
