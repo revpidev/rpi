@@ -75,6 +75,7 @@ use crate::modes::interactive::components::session_selector::SessionSelectorComp
 use crate::modes::interactive::components::settings_selector::{
     SettingsChange, SettingsSelectorComponent, SettingsSelectorOptions,
 };
+use crate::modes::interactive::components::thinking_selector::ThinkingSelectorComponent;
 use crate::modes::interactive::components::trust_selector::{TrustOption, TrustSelectorComponent};
 use crate::modes::interactive::theme_watcher::{auto_theme_pair, detect_terminal_theme_for_auto};
 use crate::tools::truncate::TruncationResult;
@@ -135,6 +136,20 @@ fn model_thinking_to_setting(level: ModelThinkingLevel) -> ThinkingLevel {
         ModelThinkingLevel::High => ThinkingLevel::High,
         ModelThinkingLevel::Xhigh => ThinkingLevel::Xhigh,
         ModelThinkingLevel::Max => ThinkingLevel::Max,
+    }
+}
+
+/// `level.as_str()` equivalent for the agent-side `ThinkingLevel`
+/// (`THINKING_LEVEL_OPTIONS` values, agent-session.ts:297 family).
+fn agent_thinking_level_str(level: rpi_agent::types::ThinkingLevel) -> &'static str {
+    match level {
+        rpi_agent::types::ThinkingLevel::Off => "off",
+        rpi_agent::types::ThinkingLevel::Minimal => "minimal",
+        rpi_agent::types::ThinkingLevel::Low => "low",
+        rpi_agent::types::ThinkingLevel::Medium => "medium",
+        rpi_agent::types::ThinkingLevel::High => "high",
+        rpi_agent::types::ThinkingLevel::Xhigh => "xhigh",
+        rpi_agent::types::ThinkingLevel::Max => "max",
     }
 }
 
@@ -335,6 +350,11 @@ fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsChange) {
         }
         SettingsChange::Theme(theme_setting) => {
             session.settings_manager(|s| s.set_theme(&theme_setting));
+            // `setThemeSetting` (theme-controller.ts:96-99): an explicit
+            // in-run selection replaces the session-local override (the
+            // `--use-theme` value) so later reads of
+            // `currentThemeSetting ?? getThemeSetting()` prefer it.
+            *lock(&ui.theme_setting_override) = Some(theme_setting.clone());
             // `applyFromSettings` (theme-controller.ts:37-60): automatic
             // pairs resolve against the terminal appearance (async); plain
             // names load directly. Both apply through the drain
@@ -1112,12 +1132,50 @@ impl InteractiveUi {
 
         let save_default = {
             let session = session.clone();
+            let ui = Arc::clone(ui);
             Box::new(move |model: &Model| {
-                session.settings_manager(|settings| {
-                    settings.set_default_model_and_provider(&model.provider, &model.id);
+                let session = session.clone();
+                let ui = Arc::clone(&ui);
+                let model = model.clone();
+                spawn_async(async move {
+                    // `selectModel(model, persist = true)`
+                    // (interactive-mode.ts:4992-5009 @ 2ff8ba622): the
+                    // Ctrl+S path switches the model AND persists the
+                    // global default (+ scope), then reports
+                    // `Default model: provider/id`.
+                    match session
+                        .set_model_with_options(
+                            model.clone(),
+                            crate::core::agent_session::ModelMutationOptions { persist: true },
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            ui.hide_selector();
+                            ui.update_editor_border_color();
+                            ui.show_status(&format!(
+                                "Default model: {}/{}",
+                                model.provider, model.id
+                            ));
+                        }
+                        Err(error) => {
+                            ui.hide_selector();
+                            ui.show_error(&error.raw_message());
+                        }
+                    }
                 });
             })
         };
+        // `defaultProvider && defaultModel ? { provider, id } : undefined`
+        // (interactive-mode.ts:5024, 1d3503fb9) — the ` · default` badge
+        // and "default"-search source.
+        let default_model: Option<(String, String)> =
+            session.settings_manager(
+                |s| match (s.get_default_provider(), s.get_default_model()) {
+                    (Some(provider), Some(id)) => Some((provider, id)),
+                    _ => None,
+                },
+            );
         let on_select = {
             let session = session.clone();
             let ui = Arc::clone(ui);
@@ -1125,8 +1183,9 @@ impl InteractiveUi {
                 let session = session.clone();
                 let ui = Arc::clone(&ui);
                 spawn_async(async move {
-                    // `onSelect` (interactive-mode.ts:4462-4474): hide the
-                    // selector after the model is set.
+                    // `onSelect` → `selectModel(model, false)` —
+                    // session-scoped selection, zero settings writes
+                    // (2ff8ba622, #8356).
                     match session.set_model(model.clone()).await {
                         Ok(()) => {
                             ui.hide_selector();
@@ -1156,9 +1215,116 @@ impl InteractiveUi {
             on_select,
             on_cancel,
             initial_search_input,
+            default_model,
         )));
         let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
         ui.show_selector(entry);
+    }
+
+    /// `showThinkingSelector` (interactive-mode.ts:4819-4839 @ 2ff8ba622):
+    /// session-only select + Ctrl+S persist-as-default, with the persisted
+    /// default shown as `· default`.
+    pub(crate) fn show_thinking_selector(ui: &Arc<Self>) {
+        let session = ui.session();
+        // `this.session.thinkingLevel ?? DEFAULT_THINKING_LEVEL`
+        // (interactive-mode.ts:4829).
+        let current_level = session.thinking_level();
+        let available_levels = session.get_available_thinking_levels();
+        let default_level = session
+            .settings_manager(|s| s.get_default_thinking_level())
+            .unwrap_or(crate::core::model_resolver::DEFAULT_THINKING_LEVEL);
+
+        // `selectLevel(level, false)` (interactive-mode.ts:4809-4818):
+        // session-scoped, status `Thinking level: {level}`.
+        let on_select = {
+            let ui = Arc::clone(ui);
+            Box::new(move |level: rpi_agent::types::ThinkingLevel| {
+                ui.session().set_thinking_level(level);
+                ui.update_editor_border_color();
+                ui.hide_selector();
+                ui.show_status(&format!(
+                    "Thinking level: {}",
+                    agent_thinking_level_str(level)
+                ));
+            })
+        };
+        let on_cancel = {
+            let ui = Arc::clone(ui);
+            Box::new(move || {
+                ui.hide_selector();
+                ui.render_handle.request_render();
+            })
+        };
+        // `selectLevel(level, true)`: Ctrl+S persists the default,
+        // status `Default thinking level: {level}`.
+        let on_select_as_default = {
+            let ui = Arc::clone(ui);
+            Box::new(move |level: rpi_agent::types::ThinkingLevel| {
+                ui.session().set_thinking_level_with_options(
+                    level,
+                    crate::core::agent_session::ModelMutationOptions { persist: true },
+                );
+                ui.update_editor_border_color();
+                ui.hide_selector();
+                ui.show_status(&format!(
+                    "Default thinking level: {}",
+                    agent_thinking_level_str(level)
+                ));
+            })
+        };
+
+        let selector = Arc::new(Mutex::new(ThinkingSelectorComponent::new(
+            Arc::clone(&lock(&ui.theme)),
+            current_level,
+            available_levels,
+            on_select,
+            on_cancel,
+            Some(on_select_as_default),
+            Some(default_level),
+        )));
+        let entry = shared_component_from_boxed(Box::new(FocusableRegion(selector)));
+        ui.show_selector(entry);
+    }
+
+    /// `handleThinkingCommand` (interactive-mode.ts:4791-4806 @ 496185f6e):
+    /// no argument opens the selector; an exact level name applies
+    /// session-only; anything else is an error.
+    pub(crate) fn handle_thinking_command(&self, search_term: &str) {
+        let search_term = search_term.trim();
+        let Some(ui) = self.upgrade_self() else {
+            return;
+        };
+        if search_term.is_empty() {
+            Self::show_thinking_selector(&ui);
+            return;
+        }
+
+        let normalized = search_term.to_lowercase();
+        let available = self.session().get_available_thinking_levels();
+        let level = available
+            .iter()
+            .find(|candidate| agent_thinking_level_str(**candidate) == normalized);
+        match level {
+            Some(level) => {
+                // `selectThinkingLevel(level, false)` — session-scoped.
+                self.session().set_thinking_level(*level);
+                self.update_editor_border_color();
+                self.show_status(&format!(
+                    "Thinking level: {}",
+                    agent_thinking_level_str(*level)
+                ));
+            }
+            None => {
+                let available_names: Vec<&str> = available
+                    .iter()
+                    .map(|level| agent_thinking_level_str(*level))
+                    .collect();
+                self.show_error(&format!(
+                    "Unknown thinking level \"{search_term}\". Available levels: {}.",
+                    available_names.join(", ")
+                ));
+            }
+        }
     }
 
     /// `showModelsSelector` (interactive-mode.ts:4486-4574): the

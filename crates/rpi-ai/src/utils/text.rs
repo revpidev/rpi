@@ -48,6 +48,12 @@ pub fn content_text_tool_result(content: &[ToolResultContent], separator: &str) 
         .join(separator)
 }
 
+/// `stripBom` (utils/text.ts:7-9 @ 1355cd36e): strip a leading UTF-8 BOM
+/// (`\u{FEFF}`) from a file's text before JSON parsing (#8337).
+pub fn strip_bom(content: &str) -> &str {
+    content.strip_prefix('\u{FEFF}').unwrap_or(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

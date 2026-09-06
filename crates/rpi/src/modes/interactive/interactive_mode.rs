@@ -102,7 +102,7 @@ use crate::core::agent_session_runtime::AgentSessionRuntime;
 use crate::core::compaction_runner::{CompactionEvent, CompactionReason, RetrySource};
 use crate::core::extensions::{ExtensionRunner, StreamingBehavior};
 use crate::core::settings_manager::DoubleEscapeAction;
-use crate::core::themes::{load_theme, Theme};
+use crate::core::themes::{load_theme, TerminalTheme, Theme};
 use crate::core::trust_manager::has_trust_requiring_project_resources;
 use crate::error::RpiError;
 use crate::modes::interactive::components::keybinding_hints::key_display_text;
@@ -180,6 +180,16 @@ pub struct InteractiveModeOptions {
     /// TUI layout mode (interactive-mode.ts:331 @ f074efd92). Merged
     /// CLI > settings before construction (interactive-mode.ts:530).
     pub tui_mode: TuiMode,
+    /// `initialThemeSetting` (main.ts:1062 → interactive-mode.ts:372 →
+    /// theme-controller.ts:42): the `--use-theme` value — the session-local
+    /// initial theme setting, not persisted; an explicit in-run selection
+    /// overrides it.
+    pub initial_theme_setting: Option<String>,
+    /// `startupDiagnostics` (interactive-mode.ts:356, 1075-1093): shown as
+    /// error/warning/status messages once the TUI is up (visible, with
+    /// paths, non-blocking).
+    pub startup_diagnostics:
+        Vec<crate::core::agent_session_services::AgentSessionRuntimeDiagnostic>,
 }
 
 /// Install the keybinding managers into both globals
@@ -970,9 +980,24 @@ fn select_list_theme(theme: &Arc<Theme>) -> Arc<SelectListTheme> {
 }
 
 /// Resolve the active theme from settings (default `dark`).
-fn resolve_theme(session: &AgentSession) -> Arc<Theme> {
-    let theme_name = session
-        .settings_manager(|settings| settings.get_theme())
+fn resolve_theme(session: &AgentSession, initial_theme_setting: Option<&str>) -> Arc<Theme> {
+    // ThemeController constructor (theme-controller.ts:41-46): the
+    // session-local `currentThemeSetting` (the `--use-theme` value) takes
+    // priority over the persisted settings value; automatic pairs resolve
+    // against the env-detected terminal background
+    // (`detectTerminalBackgroundFromEnv`) until the async detection in
+    // `init_auto_theme` refines it.
+    let setting = initial_theme_setting
+        .map(str::to_string)
+        .or_else(|| session.settings_manager(|settings| settings.get_theme_setting()));
+    let env_scheme = crate::modes::interactive::theme_watcher::detect_terminal_background_from_env(
+        std::env::var("COLORFGBG").ok().as_deref(),
+    );
+    let terminal_theme = match env_scheme {
+        rpi_tui::terminal_colors::TerminalColorScheme::Light => TerminalTheme::Light,
+        rpi_tui::terminal_colors::TerminalColorScheme::Dark => TerminalTheme::Dark,
+    };
+    let theme_name = crate::core::themes::resolve_theme_setting(setting.as_deref(), terminal_theme)
         .unwrap_or_else(|| "dark".to_string());
     let theme = load_theme(&theme_name, None)
         .unwrap_or_else(|_| load_theme("dark", None).expect("builtin dark theme must load"));
@@ -1006,6 +1031,15 @@ pub(crate) struct InteractiveUi {
     /// (T12-S6; the write always happens on the driver thread via
     /// [`InteractiveUi::apply_theme`]).
     pub(crate) theme: Mutex<Arc<Theme>>,
+    /// `currentThemeSetting` (theme-controller.ts:22-23): session-local
+    /// theme-setting override — set from `--use-theme`
+    /// (`initialThemeSetting`) and updated on an explicit in-run theme
+    /// selection (`setThemeSetting`). Preferred over the persisted setting
+    /// wherever the controller reads `currentThemeSetting ??
+    /// settingsManager.getThemeSetting()`. `Mutex` because settings-change
+    /// callbacks write it on the driver thread while the color-scheme
+    /// listener reads it.
+    theme_setting_override: Mutex<Option<String>>,
     /// The markdown palette derived from [`Self::theme`] (theme.ts:1230-1271);
     /// swapped together with it.
     pub(crate) markdown_theme: Mutex<Arc<MarkdownTheme>>,
@@ -1357,12 +1391,10 @@ impl InteractiveUi {
         // setting is an automatic pair, matching `init_auto_theme` and the
         // `/settings` theme-change path).
         self.bind_terminal_color_scheme_listener();
-        let auto_sync_enabled = self.session().settings_manager(|settings| {
-            crate::modes::interactive::theme_watcher::auto_theme_pair(
-                settings.get_theme_setting().as_deref(),
-            )
-            .is_some()
-        });
+        let auto_sync_enabled = crate::modes::interactive::theme_watcher::auto_theme_pair(
+            self.theme_setting().as_deref(),
+        )
+        .is_some();
         self.ui
             .set_terminal_color_scheme_notifications(auto_sync_enabled);
 
@@ -1469,9 +1501,7 @@ impl InteractiveUi {
         };
         self.ui
             .on_terminal_color_scheme_change(Box::new(move |scheme| {
-                let setting = listener_ui
-                    .session()
-                    .settings_manager(|settings| settings.get_theme_setting());
+                let setting = listener_ui.theme_setting();
                 let Some((light, dark)) =
                     crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
                 else {
@@ -1495,6 +1525,16 @@ impl InteractiveUi {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// `currentThemeSetting ?? settingsManager.getThemeSetting()`
+    /// (theme-controller.ts:59, :84): the session-local override (from
+    /// `--use-theme` or an explicit in-run selection) wins over the
+    /// persisted setting.
+    pub(crate) fn theme_setting(&self) -> Option<String> {
+        lock(&self.theme_setting_override)
+            .clone()
+            .or_else(|| self.session().settings_manager(|s| s.get_theme_setting()))
     }
 
     /// Swap the bound session (session switching; upstream
@@ -3908,7 +3948,7 @@ impl InteractiveMode {
         terminal: Box<dyn rpi_tui::terminal::Terminal + Send>,
     ) -> Self {
         let session = runtime.session().clone();
-        let theme = resolve_theme(&session);
+        let theme = resolve_theme(&session, options.initial_theme_setting.as_deref());
         let markdown_theme = markdown_theme(&theme);
         let agent_dir = runtime.services().agent_dir.clone();
         let show_hardware_cursor =
@@ -3986,6 +4026,7 @@ impl InteractiveMode {
             ui: ui.clone(),
             session: RwLock::new(session.clone()),
             theme: Mutex::new(Arc::clone(&theme)),
+            theme_setting_override: Mutex::new(options.initial_theme_setting.clone()),
             markdown_theme: Mutex::new(markdown_theme),
             render_handle,
             event_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -4529,6 +4570,23 @@ impl InteractiveMode {
             self.ui_state.show_warning(&message);
         }
 
+        // `startupDiagnostics` (interactive-mode.ts:1075-1093 @ 913bcf339):
+        // errors → showError, warnings → showWarning, info → showStatus —
+        // visible at startup, includes settings file paths, non-blocking.
+        for diagnostic in &self.options.startup_diagnostics {
+            match diagnostic.level {
+                crate::cli::diagnostics::DiagnosticLevel::Error => {
+                    self.ui_state.show_error(&diagnostic.message);
+                }
+                crate::cli::diagnostics::DiagnosticLevel::Warning => {
+                    self.ui_state.show_warning(&diagnostic.message);
+                }
+                crate::cli::diagnostics::DiagnosticLevel::Info => {
+                    self.ui_state.show_status(&diagnostic.message);
+                }
+            }
+        }
+
         // Main interactive loop (interactive-mode.ts:910-919).
         loop {
             match self.next_command().await {
@@ -4557,9 +4615,7 @@ impl InteractiveMode {
         let ui = &self.ui_state.ui;
         self.ui_state.bind_terminal_color_scheme_listener();
 
-        let setting = self
-            .session
-            .settings_manager(|settings| settings.get_theme_setting());
+        let setting = self.ui_state.theme_setting();
         let Some((light, dark)) =
             crate::modes::interactive::theme_watcher::auto_theme_pair(setting.as_deref())
         else {
@@ -4696,6 +4752,12 @@ impl InteractiveMode {
                 };
                 ui.handle_model_command(search_term.as_deref().unwrap_or(""))
                     .await;
+                Some(())
+            }
+            "thinking" => {
+                // `/thinking [level]` (496185f6e): opens the selector or
+                // applies an exact level name session-only.
+                ui.handle_thinking_command(args);
                 Some(())
             }
             "scoped-models" => {
@@ -8467,6 +8529,32 @@ mod tests {
             mode.ui.mode(),
             TuiMode::Regular,
             "default renderer is regular"
+        );
+    }
+
+    /// `--use-theme` (theme-controller.ts:42 + main.ts:780-782/1062): the
+    /// initial theme setting resolves as the session-local override — plain
+    /// name wins over the persisted setting, never writes settings.
+    #[tokio::test]
+    async fn initial_theme_setting_resolves_as_session_local_override() {
+        let harness = build_test_session().await;
+        let terminal = Arc::new(TestTerminal::new());
+        let mode = InteractiveMode::with_terminal(
+            harness.runtime,
+            InteractiveModeOptions {
+                initial_theme_setting: Some("light".to_string()),
+                ..Default::default()
+            },
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        let ui = &mode.ui_state;
+        assert_eq!(ui.theme_setting().as_deref(), Some("light"));
+        assert_eq!(ui.theme.lock().unwrap().name.as_deref(), Some("light"));
+        // Session-local only: the persisted setting stays untouched
+        // (main.ts:781 `applyOverrides` is an in-memory override).
+        assert_eq!(
+            ui.session().settings_manager(|s| s.get_theme_setting()),
+            None
         );
     }
 

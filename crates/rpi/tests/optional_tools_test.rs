@@ -1029,3 +1029,206 @@ mod optional_tool_wiring {
         assert_eq!(session.get_active_tool_names(), vec!["grep"]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// `defaultTools` setting (V14-12 FR-C; upstream default-tools-setting.test.ts)
+// ---------------------------------------------------------------------------
+
+mod default_tools_setting {
+    use super::*;
+    use rpi::core::agent_session_services::{
+        create_agent_session_services, CreateAgentSessionServicesOptions,
+    };
+    use rpi::core::model_runtime::{CreateModelRuntimeOptions, ModelRuntime, ModelsPathInput};
+    use rpi::core::session_manager::{NewSessionOptions, SessionManager};
+    use rpi::core::settings_manager::{Settings, SettingsManager, SettingsManagerCreateOptions};
+    use rpi_test_support::faux::{
+        FauxAiProvider, FauxModelDefinition, FauxProvider, FauxProviderOptions,
+    };
+    use std::sync::Mutex;
+
+    async fn default_tools_session(settings: Settings) -> rpi::core::agent_session::AgentSession {
+        let tmp = TempDir::new();
+        let cwd = tmp.path().join("cwd");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        // Leak the tempdir: the session only reads paths lazily and the
+        // test process exits right after (same shape as the wiring tests).
+        std::mem::forget(tmp);
+
+        let provider = FauxProvider::new(FauxProviderOptions {
+            models: Some(vec![FauxModelDefinition {
+                id: "faux-1".to_owned(),
+                name: Some("Faux One".to_owned()),
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(200_000),
+                max_tokens: Some(8192),
+            }]),
+            ..Default::default()
+        });
+        let model = provider.get_model(None).expect("faux model");
+
+        let model_runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
+        })
+        .await;
+        model_runtime
+            .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+            .await
+            .expect("register faux provider");
+
+        let settings_manager =
+            SettingsManager::in_memory(settings, SettingsManagerCreateOptions::default());
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: Some(settings_manager),
+            model_runtime: Some(model_runtime),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        })
+        .await
+        .expect("services");
+
+        let session_manager = Arc::new(Mutex::new(
+            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                .expect("in-memory session"),
+        ));
+        rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+            cwd: Some(cwd),
+            agent_dir: Some(agent_dir),
+            model_runtime: None,
+            model: Some(model),
+            services: Some(services),
+            session_manager: Some(session_manager),
+            ..Default::default()
+        })
+        .await
+        .expect("create session")
+        .session
+    }
+
+    fn settings_with_default_tools(names: &[&str]) -> Settings {
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "defaultTools".to_string(),
+            serde_json::Value::Array(
+                names
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.to_string()))
+                    .collect(),
+            ),
+        );
+        Settings::from_map(fields)
+    }
+
+    // "uses the configured list as the initial built-in selection"
+    // (default-tools-setting.test.ts:47-58).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_default_tools_selects_initial_builtins() {
+        let session = default_tools_session(settings_with_default_tools(&["grep", "find"])).await;
+        assert_eq!(
+            session.get_active_tool_names(),
+            vec!["grep".to_string(), "find".to_string()]
+        );
+        let prompt = session.system_prompt();
+        assert!(prompt.contains("- grep:"));
+        assert!(!prompt.contains("- read:"));
+    }
+
+    // Empty array = no built-in tools (541045ae0).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_default_tools_empty_array_disables_builtins() {
+        let session = default_tools_session(settings_with_default_tools(&[])).await;
+        assert_eq!(session.get_active_tool_names(), Vec::<String>::new());
+    }
+
+    // Unknown names (`powershell` in rpi) are ignored (V14-13 FR-G).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_default_tools_unknown_names_are_ignored() {
+        let session = default_tools_session(settings_with_default_tools(&[
+            "read",
+            "powershell",
+            "bogus",
+        ]))
+        .await;
+        assert_eq!(session.get_active_tool_names(), vec!["read".to_string()]);
+    }
+
+    // "preserves explicit tool option precedence"
+    // (default-tools-setting.test.ts:117-130): --tools allowlist wins over
+    // the setting; --no-tools empties the set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_tools_flag_overrides_default_tools_setting() {
+        // Re-create with explicit `tools`: the harness variant below shares
+        // the wiring but passes tools through CreateAgentSessionOptions.
+        let tmp = TempDir::new();
+        let cwd = tmp.path().join("cwd");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        std::mem::forget(tmp);
+
+        let provider = FauxProvider::new(FauxProviderOptions {
+            models: Some(vec![FauxModelDefinition {
+                id: "faux-1".to_owned(),
+                name: Some("Faux One".to_owned()),
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(200_000),
+                max_tokens: Some(8192),
+            }]),
+            ..Default::default()
+        });
+        let model = provider.get_model(None).expect("faux model");
+        let model_runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: Some(agent_dir.join("auth.json")),
+            models_path: ModelsPathInput::Path(agent_dir.join("models.json")),
+            ..Default::default()
+        })
+        .await;
+        model_runtime
+            .register_native_provider(Arc::new(FauxAiProvider::new(provider)))
+            .await
+            .expect("register faux provider");
+
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            settings_manager: Some(SettingsManager::in_memory(
+                settings_with_default_tools(&["grep"]),
+                SettingsManagerCreateOptions::default(),
+            )),
+            model_runtime: Some(model_runtime),
+            extension_flag_values: Vec::new(),
+            resource_loader_options: None,
+        })
+        .await
+        .expect("services");
+        let session_manager = Arc::new(Mutex::new(
+            SessionManager::in_memory(Some(&cwd), NewSessionOptions::default())
+                .expect("in-memory session"),
+        ));
+        let session = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
+            cwd: Some(cwd),
+            agent_dir: Some(agent_dir),
+            model: Some(model),
+            services: Some(services),
+            session_manager: Some(session_manager),
+            tools: Some(vec!["read".to_string()]),
+            ..Default::default()
+        })
+        .await
+        .expect("create session")
+        .session;
+        assert_eq!(session.get_active_tool_names(), vec!["read".to_string()]);
+    }
+}

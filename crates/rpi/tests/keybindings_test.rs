@@ -403,13 +403,16 @@ fn test_all_tui_alt_screen_defaults() {
     assert_eq!(mgr.get_keys("tui.altScreen.pageDown"), vec!["pageDown"]);
     assert!(mgr.get_keys("tui.altScreen.halfPageUp").is_empty());
     assert!(mgr.get_keys("tui.altScreen.halfPageDown").is_empty());
+    // 27b7a626d (#8372): non-windows default is the double binding
+    // `ctrl+shift+up` + `ctrl+up` (windows/WSL: `ctrl+up` only — covered by
+    // the platform-default unit seam in core::keybindings).
     assert_eq!(
         mgr.get_keys("tui.altScreen.previousPrompt"),
-        vec!["ctrl+shift+up"]
+        vec!["ctrl+shift+up", "ctrl+up"]
     );
     assert_eq!(
         mgr.get_keys("tui.altScreen.nextPrompt"),
-        vec!["ctrl+shift+down"]
+        vec!["ctrl+shift+down", "ctrl+down"]
     );
     assert_eq!(mgr.get_keys("tui.altScreen.top"), vec!["home"]);
     assert_eq!(mgr.get_keys("tui.altScreen.bottom"), vec!["end"]);

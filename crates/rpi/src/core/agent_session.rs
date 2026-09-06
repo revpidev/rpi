@@ -228,6 +228,15 @@ pub struct ModelCycleResult {
     pub is_scoped: bool,
 }
 
+/// `ModelMutationOptions` (agent-session.ts:254-258 @ 2ff8ba622): options
+/// for model/thinking mutations. `persist` writes the new value to global
+/// defaults (the Ctrl+S `save_default` path); the default is session-only
+/// — in-session selections never rewrite settings (2ff8ba622, #8356).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelMutationOptions {
+    pub persist: bool,
+}
+
 /// `SessionStats` (agent-session.ts:260-277).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -324,6 +333,13 @@ pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
         user_message,
     })
 }
+
+/// All built-in tool names (rpi ships 7; upstream also has `powershell`,
+/// #8512 — not adopted in rpi, V14-13 FR-G). Consumed by
+/// `build_builtin_tools` and the `defaultTools` setting filter in
+/// `sdk::create_agent_session`.
+pub(crate) const ALL_BUILTIN_TOOL_NAMES: [&str; 7] =
+    ["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 /// Standard thinking levels (agent-session.ts:297).
 const THINKING_LEVELS: [ThinkingLevel; 5] = [
@@ -1301,8 +1317,6 @@ impl AgentSession {
                 shell_path: settings.get_shell_path(),
             }
         };
-        const ALL_BUILTIN_TOOL_NAMES: [&str; 7] =
-            ["read", "bash", "edit", "write", "grep", "find", "ls"];
         crate::tools::create_builtin_tools(
             &ctx,
             &ALL_BUILTIN_TOOL_NAMES.map(str::to_owned),
@@ -2197,8 +2211,20 @@ impl AgentSession {
         self.runner().emit("model_select").await;
     }
 
-    /// `setModel` (agent-session.ts:1578-1593).
+    /// `setModel` (agent-session.ts:1658-1677 @ 2ff8ba622): session-only by
+    /// default — persists to global defaults only when
+    /// `options.persist` (the Ctrl+S `save_default` path).
     pub async fn set_model(&self, model: Model) -> Result<(), RpiError> {
+        self.set_model_with_options(model, ModelMutationOptions::default())
+            .await
+    }
+
+    /// `setModel(model, options)` — the persist-gated implementation.
+    pub async fn set_model_with_options(
+        &self,
+        model: Model,
+        options: ModelMutationOptions,
+    ) -> Result<(), RpiError> {
         if self
             .inner
             .model_runtime
@@ -2213,7 +2239,7 @@ impl AgentSession {
             )));
         }
 
-        let thinking_level = self.thinking_level_for_model_switch(None);
+        let thinking_level = self.thinking_level_for_model_switch(Some(&model), None);
         let previous_model = self.model();
         self.inner.agent.set_model(model.clone());
         self.sync_compaction_model();
@@ -2223,13 +2249,60 @@ impl AgentSession {
         if let Err(error) = result {
             tracing::warn!("session append failed: {error}");
         }
-        lock(&self.inner.resource_loader)
-            .settings_manager_mut()
-            .set_default_model_and_provider(&model.provider, &model.id);
+        if options.persist {
+            lock(&self.inner.resource_loader)
+                .settings_manager_mut()
+                .set_default_model_and_provider(&model.provider, &model.id);
+            self.add_persisted_default_to_non_empty_scope(&model);
+        }
 
+        // Apply thinking level for the new model: per-model overrides take
+        // priority over the global default. Model persistence does not
+        // implicitly rewrite the global thinking default (2ff8ba622).
         self.set_thinking_level(thinking_level);
         self.emit_model_select(previous_model, &model, "set").await;
         Ok(())
+    }
+
+    /// `_addPersistedDefaultToNonEmptyScope` (agent-session.ts:1679-1694 @
+    /// 8fa7eebd2): persisting a default while a model scope is active adds
+    /// the model to the scope and to `enabledModels` so it stays cyclable.
+    fn add_persisted_default_to_non_empty_scope(&self, model: &Model) {
+        {
+            let scoped = lock(&self.inner.scoped_models);
+            if scoped.is_empty() {
+                return;
+            }
+            if scoped
+                .iter()
+                .any(|scoped| models_are_equal(Some(&scoped.model), Some(model)))
+            {
+                return;
+            }
+        }
+        lock(&self.inner.scoped_models).push(ScopedModel {
+            model: model.clone(),
+            thinking_level: None,
+        });
+
+        let enabled: Option<Vec<String>> = lock(&self.inner.resource_loader)
+            .settings_manager()
+            .get_enabled_models();
+        let Some(enabled) = enabled.filter(|patterns| !patterns.is_empty()) else {
+            return;
+        };
+        let model_reference = format!("{}/{}", model.provider, model.id);
+        if enabled
+            .iter()
+            .any(|pattern| pattern.to_lowercase() == model_reference.to_lowercase())
+        {
+            return;
+        }
+        let mut updated = enabled;
+        updated.push(model_reference);
+        lock(&self.inner.resource_loader)
+            .settings_manager_mut()
+            .set_enabled_models(Some(updated));
     }
 
     fn sync_compaction_model(&self) {
@@ -2255,20 +2328,32 @@ impl AgentSession {
         }
     }
 
-    /// `cycleModel` (agent-session.ts:1601-1606).
+    /// `cycleModel` (agent-session.ts:1700-1712 @ 2ff8ba622): session-only by
+    /// default; persist via [`ModelMutationOptions::persist`].
     pub async fn cycle_model(
         &self,
         direction: CycleDirection,
     ) -> Result<Option<ModelCycleResult>, RpiError> {
+        self.cycle_model_with_options(direction, ModelMutationOptions::default())
+            .await
+    }
+
+    /// `cycleModel(direction, options)` — the persist-gated implementation.
+    pub async fn cycle_model_with_options(
+        &self,
+        direction: CycleDirection,
+        options: ModelMutationOptions,
+    ) -> Result<Option<ModelCycleResult>, RpiError> {
         if !lock(&self.inner.scoped_models).is_empty() {
-            return self.cycle_scoped_model(direction).await;
+            return self.cycle_scoped_model(direction, options).await;
         }
-        self.cycle_available_model(direction).await
+        self.cycle_available_model(direction, options).await
     }
 
     async fn cycle_scoped_model(
         &self,
         direction: CycleDirection,
+        options: ModelMutationOptions,
     ) -> Result<Option<ModelCycleResult>, RpiError> {
         let scoped = lock(&self.inner.scoped_models).clone();
         let mut authenticated = Vec::new();
@@ -2299,7 +2384,8 @@ impl AgentSession {
             CycleDirection::Backward => (current_index + len - 1) % len,
         };
         let next = authenticated[next_index].clone();
-        let thinking_level = self.thinking_level_for_model_switch(next.thinking_level);
+        let thinking_level =
+            self.thinking_level_for_model_switch(Some(&next.model), next.thinking_level);
         let previous_model = self.model();
 
         self.inner.agent.set_model(next.model.clone());
@@ -2310,9 +2396,14 @@ impl AgentSession {
         if let Err(error) = result {
             tracing::warn!("session append failed: {error}");
         }
-        lock(&self.inner.resource_loader)
-            .settings_manager_mut()
-            .set_default_model_and_provider(&next.model.provider, &next.model.id);
+        if options.persist {
+            lock(&self.inner.resource_loader)
+                .settings_manager_mut()
+                .set_default_model_and_provider(&next.model.provider, &next.model.id);
+            self.add_persisted_default_to_non_empty_scope(&next.model);
+        }
+        // Apply thinking level for the new model; model persistence does
+        // not implicitly rewrite the global thinking default (2ff8ba622).
         self.set_thinking_level(thinking_level);
         self.emit_model_select(previous_model, &next.model, "cycle")
             .await;
@@ -2327,6 +2418,7 @@ impl AgentSession {
     async fn cycle_available_model(
         &self,
         direction: CycleDirection,
+        options: ModelMutationOptions,
     ) -> Result<Option<ModelCycleResult>, RpiError> {
         let available = self
             .inner
@@ -2349,7 +2441,7 @@ impl AgentSession {
             CycleDirection::Backward => (current_index + len - 1) % len,
         };
         let next_model = available[next_index].clone();
-        let thinking_level = self.thinking_level_for_model_switch(None);
+        let thinking_level = self.thinking_level_for_model_switch(Some(&next_model), None);
         let previous_model = self.model();
 
         self.inner.agent.set_model(next_model.clone());
@@ -2360,9 +2452,12 @@ impl AgentSession {
         if let Err(error) = result {
             tracing::warn!("session append failed: {error}");
         }
-        lock(&self.inner.resource_loader)
-            .settings_manager_mut()
-            .set_default_model_and_provider(&next_model.provider, &next_model.id);
+        if options.persist {
+            lock(&self.inner.resource_loader)
+                .settings_manager_mut()
+                .set_default_model_and_provider(&next_model.provider, &next_model.id);
+            self.add_persisted_default_to_non_empty_scope(&next_model);
+        }
         self.set_thinking_level(thinking_level);
         self.emit_model_select(previous_model, &next_model, "cycle")
             .await;
@@ -2378,8 +2473,19 @@ impl AgentSession {
     // Thinking level management
     // ==================================================================
 
-    /// `setThinkingLevel` (agent-session.ts:1677-1699).
+    /// `setThinkingLevel` (agent-session.ts:1793-1818 @ 2ff8ba622):
+    /// session-only by default — persists the REQUESTED level to global
+    /// defaults only when `options.persist` (Ctrl+S).
     pub fn set_thinking_level(&self, level: ThinkingLevel) {
+        self.set_thinking_level_with_options(level, ModelMutationOptions::default());
+    }
+
+    /// `setThinkingLevel(level, options)` — the persist-gated implementation.
+    pub fn set_thinking_level_with_options(
+        &self,
+        level: ThinkingLevel,
+        options: ModelMutationOptions,
+    ) {
         let available_levels = self.get_available_thinking_levels();
         let effective = if available_levels.contains(&level) {
             level
@@ -2395,16 +2501,17 @@ impl AgentSession {
         self.inner.agent.set_thinking_level(effective);
         self.sync_session_env();
 
+        if options.persist {
+            lock(&self.inner.resource_loader)
+                .settings_manager_mut()
+                .set_default_thinking_level(level);
+        }
+
         if is_changing {
             let level_str = thinking_level_str(effective);
             let result = lock(&self.inner.session_manager).append_thinking_level_change(level_str);
             if let Err(error) = result {
                 tracing::warn!("session append failed: {error}");
-            }
-            if self.supports_thinking() || effective != ThinkingLevel::Off {
-                lock(&self.inner.resource_loader)
-                    .settings_manager_mut()
-                    .set_default_thinking_level(effective);
             }
             self.emit(AgentSessionEvent::Session(
                 SessionEvent::ThinkingLevelChanged { level: effective },
@@ -2441,8 +2548,18 @@ impl AgentSession {
         }
     }
 
-    /// `cycleThinkingLevel` (agent-session.ts:1705-1715).
+    /// `cycleThinkingLevel` (agent-session.ts:1825-1839 @ 2ff8ba622):
+    /// session-only by default; persist via
+    /// [`cycle_thinking_level_with_options`].
     pub fn cycle_thinking_level(&self) -> Option<ThinkingLevel> {
+        self.cycle_thinking_level_with_options(ModelMutationOptions::default())
+    }
+
+    /// `cycleThinkingLevel(options)` — the persist-gated implementation.
+    pub fn cycle_thinking_level_with_options(
+        &self,
+        options: ModelMutationOptions,
+    ) -> Option<ThinkingLevel> {
         if !self.supports_thinking() {
             return None;
         }
@@ -2453,7 +2570,7 @@ impl AgentSession {
             Some(current_index) => levels[(current_index + 1) % levels.len()],
             None => levels[0],
         };
-        self.set_thinking_level(next_level);
+        self.set_thinking_level_with_options(next_level, options);
         Some(next_level)
     }
 
@@ -2470,21 +2587,32 @@ impl AgentSession {
         self.model().map(|model| model.reasoning).unwrap_or(false)
     }
 
-    /// `_getThinkingLevelForModelSwitch` (agent-session.ts:1733-1741).
+    /// `_getThinkingLevelForModelSwitch` (agent-session.ts:1850-1864 @
+    /// 2ff8ba622 + 5133c9284): explicit scoped level > per-model override
+    /// for the TARGET model > settings default > session level > default.
     fn thinking_level_for_model_switch(
         &self,
+        target_model: Option<&Model>,
         explicit_level: Option<ThinkingLevel>,
     ) -> ThinkingLevel {
         if let Some(level) = explicit_level {
             return level;
         }
-        if !self.supports_thinking() {
-            return lock(&self.inner.resource_loader)
-                .settings_manager_mut()
-                .get_default_thinking_level()
-                .unwrap_or(crate::core::model_resolver::DEFAULT_THINKING_LEVEL);
+        // Per-model default takes priority when switching to a model that
+        // has one (2ff8ba622).
+        if let Some(model) = target_model {
+            if let Some(per_model) = lock(&self.inner.resource_loader)
+                .settings_manager()
+                .get_model_thinking_level(&model.provider, &model.id)
+            {
+                return per_model;
+            }
         }
-        self.thinking_level()
+        lock(&self.inner.resource_loader)
+            .settings_manager()
+            .get_default_thinking_level()
+            .or_else(|| Some(self.thinking_level()))
+            .unwrap_or(crate::core::model_resolver::DEFAULT_THINKING_LEVEL)
     }
 
     // ==================================================================

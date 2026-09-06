@@ -327,7 +327,7 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ),
         ("tui.editor.yank", s("ctrl+y"), "Yank"),
         ("tui.editor.yankPop", s("alt+y"), "Yank pop"),
-        ("tui.editor.undo", s("ctrl+-"), "Undo"),
+        ("tui.editor.undo", editor_undo_default(), "Undo"),
         // ---- tui.input.* (4) ----
         (
             "tui.input.newLine",
@@ -373,12 +373,12 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ),
         (
             "tui.altScreen.previousPrompt",
-            s("ctrl+shift+up"),
+            alt_screen_previous_prompt_default(),
             "Jump to previous semantic prompt",
         ),
         (
             "tui.altScreen.nextPrompt",
-            s("ctrl+shift+down"),
+            alt_screen_next_prompt_default(),
             "Jump to next semantic prompt",
         ),
         ("tui.altScreen.top", s("home"), "Scroll viewport to top"),
@@ -400,7 +400,7 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ("app.model.cycleForward", s("ctrl+p"), "Cycle to next model"),
         (
             "app.model.cycleBackward",
-            s("shift+ctrl+p"),
+            model_cycle_backward_default(),
             "Cycle to previous model",
         ),
         ("app.model.select", s("ctrl+l"), "Open model selector"),
@@ -415,12 +415,12 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
         ("app.message.copy", s("ctrl+x"), "Copy message to clipboard"),
         (
             "app.message.followUp",
-            s("alt+enter"),
+            message_follow_up_default(),
             "Queue follow-up message",
         ),
         (
             "app.message.dequeue",
-            s("alt+up"),
+            message_dequeue_default(),
             "Restore queued messages",
         ),
         (
@@ -466,6 +466,8 @@ fn build_definitions() -> Vec<(String, KeybindingDefinition)> {
             "Delete session when query is empty",
         ),
         ("app.models.save", s("ctrl+s"), "Save model selection"),
+        // `app.thinking.save` (keybindings.ts:101-104 @ 2ff8ba622).
+        ("app.thinking.save", s("ctrl+s"), "Save thinking level"),
         ("app.models.enableAll", s("ctrl+a"), "Enable all models"),
         ("app.models.clearAll", s("ctrl+x"), "Clear all models"),
         (
@@ -537,7 +539,25 @@ pub fn keybinding_definitions() -> &'static [(String, KeybindingDefinition)] {
     DEFINITIONS.get_or_init(build_definitions)
 }
 
-// Platform-specific default values (keybindings.ts:69-72, 111-113, 119-125)
+// Platform-specific default values (keybindings.ts:62-141 @ 27b7a626d)
+
+/// `useWindowsKeybindings` (keybindings.ts:62-67): win32, or Linux with
+/// `WSL_DISTRO_NAME`/`WSL_INTEROP` in the environment (WSL). Parameters
+/// are injected for the test seam; production calls read the process env.
+pub fn use_windows_keybindings(is_windows: bool, is_linux: bool, wsl_env: Option<&str>) -> bool {
+    is_windows || (is_linux && wsl_env.is_some())
+}
+
+fn production_use_windows_keybindings() -> bool {
+    use_windows_keybindings(
+        cfg!(target_os = "windows"),
+        cfg!(target_os = "linux"),
+        std::env::var("WSL_DISTRO_NAME")
+            .or_else(|_| std::env::var("WSL_INTEROP"))
+            .ok()
+            .as_deref(),
+    )
+}
 
 fn app_suspend_default() -> KeyBindingValue {
     if cfg!(target_os = "windows") {
@@ -547,11 +567,70 @@ fn app_suspend_default() -> KeyBindingValue {
     }
 }
 
-fn paste_image_default() -> KeyBindingValue {
+/// `tui.editor.undo` (keybindings.ts:78-82): win32 `ctrl+z`, WSL `alt+z`,
+/// other `ctrl+-`.
+fn editor_undo_default() -> KeyBindingValue {
     if cfg!(target_os = "windows") {
+        s("ctrl+z")
+    } else if production_use_windows_keybindings() {
+        s("alt+z")
+    } else {
+        s("ctrl+-")
+    }
+}
+
+/// `tui.altScreen.previousPrompt` (keybindings.ts:83-85): windows
+/// `ctrl+up` only; otherwise `ctrl+shift+up` + `ctrl+up`.
+fn alt_screen_previous_prompt_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("ctrl+up")
+    } else {
+        m(&["ctrl+shift+up", "ctrl+up"])
+    }
+}
+
+/// `tui.altScreen.nextPrompt` (keybindings.ts:86-88): windows `ctrl+down`
+/// only; otherwise `ctrl+shift+down` + `ctrl+down`.
+fn alt_screen_next_prompt_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("ctrl+down")
+    } else {
+        m(&["ctrl+shift+down", "ctrl+down"])
+    }
+}
+
+fn paste_image_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
         s("alt+v")
     } else {
         s("ctrl+v")
+    }
+}
+
+/// `app.model.cycleBackward` (keybindings.ts:105-108).
+fn model_cycle_backward_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("alt+p")
+    } else {
+        s("shift+ctrl+p")
+    }
+}
+
+/// `app.message.followUp` (keybindings.ts:114-117).
+fn message_follow_up_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("ctrl+q")
+    } else {
+        s("alt+enter")
+    }
+}
+
+/// `app.message.dequeue` (keybindings.ts:118-121).
+fn message_dequeue_default() -> KeyBindingValue {
+    if production_use_windows_keybindings() {
+        s("alt+q")
+    } else {
+        s("alt+up")
     }
 }
 
@@ -670,7 +749,9 @@ fn load_raw_config(path: &Path) -> Option<serde_json::Map<String, serde_json::Va
         return None;
     }
     let content = std::fs::read_to_string(path).ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    // #8337: BOM stripped before parse (keybindings.ts:363).
+    let parsed: serde_json::Value =
+        serde_json::from_str(crate::tools::edit_diff::strip_bom(&content).1.as_str()).ok()?;
     parsed.as_object().cloned()
 }
 
@@ -911,7 +992,9 @@ mod tests {
     #[test]
     fn test_definitions_count() {
         let defs = keybinding_definitions();
-        assert_eq!(defs.len(), 83, "expected 83 keybinding definitions");
+        // 83 → 84: `app.thinking.save` added (keybindings.ts:101-104 @
+        // 2ff8ba622).
+        assert_eq!(defs.len(), 84, "expected 84 keybinding definitions");
     }
 
     #[test]
@@ -1278,5 +1361,76 @@ mod tests {
         ];
         let result = normalize_keys(&input);
         assert_eq!(result, vec!["a", "b", "c"]);
+    }
+}
+
+#[cfg(test)]
+mod windows_wsl_tests {
+    //! FR-F (27b7a626d, #8372): `useWindowsKeybindings` matrix + platform
+    //! default table via the injected seam.
+
+    use super::*;
+
+    #[test]
+    fn use_windows_keybindings_matrix() {
+        // win32 → always true.
+        assert!(use_windows_keybindings(true, false, None));
+        assert!(use_windows_keybindings(true, true, None));
+        // Linux + WSL marker env → true (either variable).
+        assert!(use_windows_keybindings(false, true, Some("Ubuntu")));
+        assert!(use_windows_keybindings(
+            false,
+            true,
+            Some("/run/WSL/Interop")
+        ));
+        // Linux without WSL / macOS → false.
+        assert!(!use_windows_keybindings(false, true, None));
+        assert!(!use_windows_keybindings(false, false, Some("Ubuntu")));
+    }
+
+    #[test]
+    fn editor_undo_default_matrix() {
+        // The seam cannot cfg-switch at runtime; assert the current
+        // platform's expected value against the environment (Linux CI
+        // without WSL → ctrl+-; a WSL dev environment would yield alt+z —
+        // asserted through use_windows_keybindings instead).
+        let expected = if cfg!(target_os = "windows") {
+            "ctrl+z"
+        } else if production_use_windows_keybindings() {
+            "alt+z"
+        } else {
+            "ctrl+-"
+        };
+        assert_eq!(editor_undo_default(), s(expected));
+    }
+
+    #[test]
+    fn non_windows_defaults_on_linux_ci() {
+        // On a plain Linux runner (no WSL env) the non-windows table holds.
+        if cfg!(target_os = "windows") || production_use_windows_keybindings() {
+            return; // matrix covered by use_windows_keybindings_matrix
+        }
+        assert_eq!(paste_image_default(), s("ctrl+v"));
+        assert_eq!(model_cycle_backward_default(), s("shift+ctrl+p"));
+        assert_eq!(message_follow_up_default(), s("alt+enter"));
+        assert_eq!(message_dequeue_default(), s("alt+up"));
+        assert_eq!(
+            alt_screen_previous_prompt_default(),
+            m(&["ctrl+shift+up", "ctrl+up"])
+        );
+        assert_eq!(
+            alt_screen_next_prompt_default(),
+            m(&["ctrl+shift+down", "ctrl+down"])
+        );
+    }
+
+    #[test]
+    fn thinking_save_defaults_to_ctrl_s() {
+        let defs = keybinding_definitions();
+        let (_, definition) = defs
+            .iter()
+            .find(|(name, _)| name == "app.thinking.save")
+            .expect("app.thinking.save defined");
+        assert_eq!(definition.default_keys, s("ctrl+s"));
     }
 }

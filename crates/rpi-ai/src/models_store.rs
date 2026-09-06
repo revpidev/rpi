@@ -142,7 +142,9 @@ impl JsonFileModelsStore {
     pub async fn load(path: PathBuf) -> Result<Self, AiError> {
         let state = match tokio::fs::read_to_string(&path).await {
             Ok(content) => {
-                let file: JsonFileModelsStoreFile = serde_json::from_str(&content)?;
+                // #8337: BOM-stripped before parse (models-store.ts:63).
+                let content = crate::utils::text::strip_bom(&content);
+                let file: JsonFileModelsStoreFile = serde_json::from_str(content)?;
                 file.providers
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
@@ -188,6 +190,17 @@ impl JsonFileModelsStore {
             TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let write_result = tokio::fs::write(&tmp, content).await;
+        // #7779 (`c49906ec7`): the tmp+rename replacement must preserve the
+        // existing target file's permissions/ACLs — copy them onto the tmp
+        // file before the rename (a fresh file keeps the default mode).
+        #[cfg(unix)]
+        if write_result.is_ok() {
+            if let Ok(existing) = tokio::fs::metadata(&self.path).await {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = existing.permissions().mode();
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
+            }
+        }
         let result = match write_result {
             Ok(()) => tokio::fs::rename(&tmp, &self.path).await,
             Err(error) => Err(error),

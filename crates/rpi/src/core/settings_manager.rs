@@ -473,7 +473,7 @@ fn parse_timeout_setting(
 // ---------------------------------------------------------------------------
 
 /// `SettingsScope = "global" | "project"` (settings-manager.ts:173).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum SettingsScope {
     #[serde(rename = "global")]
     Global,
@@ -506,11 +506,18 @@ impl Default for SettingsManagerCreateOptions {
     }
 }
 
-/// `SettingsError` (settings-manager.ts:183-186).
+/// `SettingsError` (settings-manager.ts:193-198 @ 1e1a6e27b): carries the
+/// source file path when known so diagnostics can name the file.
 #[derive(Debug)]
 pub struct SettingsError {
     pub scope: SettingsScope,
+    pub path: Option<String>,
     pub error: RpiError,
+}
+
+/// `toSettingsError` (settings-manager.ts:200-207).
+fn to_settings_error(scope: SettingsScope, error: RpiError, path: Option<String>) -> SettingsError {
+    SettingsError { scope, path, error }
 }
 
 /// Callback signature for [`SettingsStorage::with_lock`]: receives the
@@ -621,7 +628,10 @@ impl SettingsStorage for FileSettingsStorage {
         let mut guard: Option<std::fs::File> = None;
         let current = if file_exists {
             guard = Some(Self::acquire_lock_with_retry(path, false)?);
-            Some(std::fs::read_to_string(path)?)
+            let raw = std::fs::read_to_string(path)?;
+            // #8337 (`1355cd36e`): strip a leading UTF-8 BOM before parsing —
+            // editors on Windows write settings.json with a BOM.
+            Some(crate::tools::edit_diff::strip_bom(&raw).1)
         } else {
             None
         };
@@ -793,9 +803,13 @@ pub struct SettingsManager {
     /// Set when the project settings file had parse errors — blocks writes.
     project_settings_load_error: Option<RpiError>,
     errors: Vec<SettingsError>,
+    /// `settingsPaths` (settings-manager.ts:194, 1e1a6e27b): source file
+    /// path per scope for error reporting.
+    settings_paths: std::collections::BTreeMap<SettingsScope, String>,
 }
 
 impl SettingsManager {
+    #[allow(clippy::too_many_arguments)] // mirrors upstream constructor (settings-manager.ts:296-312)
     fn new(
         storage: Box<dyn SettingsStorage>,
         initial_global: Settings,
@@ -804,6 +818,7 @@ impl SettingsManager {
         project_load_error: Option<RpiError>,
         initial_errors: Vec<SettingsError>,
         project_trusted: bool,
+        settings_paths: std::collections::BTreeMap<SettingsScope, String>,
     ) -> Self {
         let settings = deep_merge_settings(&initial_global, &initial_project);
         SettingsManager {
@@ -819,6 +834,7 @@ impl SettingsManager {
             global_settings_load_error: global_load_error,
             project_settings_load_error: project_load_error,
             errors: initial_errors,
+            settings_paths,
         }
     }
 
@@ -833,14 +849,42 @@ impl SettingsManager {
         let agent_dir = agent_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(crate::config::get_agent_dir);
-        Self::from_storage(FileSettingsStorage::new(cwd, &agent_dir), options)
+        let storage = FileSettingsStorage::new(cwd, &agent_dir);
+        Self::from_storage_with_paths(
+            storage,
+            options,
+            [
+                (
+                    SettingsScope::Global,
+                    agent_dir.join("settings.json").display().to_string(),
+                ),
+                (
+                    SettingsScope::Project,
+                    crate::config::get_project_settings_path(cwd)
+                        .display()
+                        .to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )
     }
 
     /// `SettingsManager.fromStorage(storage, options?)`
     /// (settings-manager.ts:319-340).
     pub fn from_storage<S: SettingsStorage + 'static>(
+        storage: S,
+        options: SettingsManagerCreateOptions,
+    ) -> Self {
+        Self::from_storage_with_paths(storage, options, Default::default())
+    }
+
+    /// `fromStorageWithPaths` (settings-manager.ts:356-365 @ 1e1a6e27b):
+    /// errors carry the per-scope source path.
+    pub fn from_storage_with_paths<S: SettingsStorage + 'static>(
         mut storage: S,
         options: SettingsManagerCreateOptions,
+        settings_paths: std::collections::BTreeMap<SettingsScope, String>,
     ) -> Self {
         let project_trusted = options.project_trusted;
         let (global_settings, global_error) =
@@ -849,16 +893,18 @@ impl SettingsManager {
             Self::try_load_from_storage(&mut storage, SettingsScope::Project, project_trusted);
         let mut initial_errors = Vec::new();
         if let Some(error) = &global_error {
-            initial_errors.push(SettingsError {
-                scope: SettingsScope::Global,
-                error: RpiError::Settings(error.to_string()),
-            });
+            initial_errors.push(to_settings_error(
+                SettingsScope::Global,
+                RpiError::Settings(error.to_string()),
+                settings_paths.get(&SettingsScope::Global).cloned(),
+            ));
         }
         if let Some(error) = &project_error {
-            initial_errors.push(SettingsError {
-                scope: SettingsScope::Project,
-                error: RpiError::Settings(error.to_string()),
-            });
+            initial_errors.push(to_settings_error(
+                SettingsScope::Project,
+                RpiError::Settings(error.to_string()),
+                settings_paths.get(&SettingsScope::Project).cloned(),
+            ));
         }
         SettingsManager::new(
             Box::new(storage),
@@ -868,6 +914,7 @@ impl SettingsManager {
             project_error,
             initial_errors,
             project_trusted,
+            settings_paths,
         )
     }
 
@@ -973,10 +1020,11 @@ impl SettingsManager {
         self.project_settings = settings;
         self.project_settings_load_error = error;
         if let Some(error) = &self.project_settings_load_error {
-            self.errors.push(SettingsError {
-                scope: SettingsScope::Project,
-                error: RpiError::Settings(error.to_string()),
-            });
+            self.errors.push(to_settings_error(
+                SettingsScope::Project,
+                RpiError::Settings(error.to_string()),
+                self.settings_paths.get(&SettingsScope::Project).cloned(),
+            ));
         }
         self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
     }
@@ -996,10 +1044,11 @@ impl SettingsManager {
                 self.global_settings_load_error = None;
             }
             Some(error) => {
-                self.errors.push(SettingsError {
-                    scope: SettingsScope::Global,
-                    error: RpiError::Settings(error.to_string()),
-                });
+                self.errors.push(to_settings_error(
+                    SettingsScope::Global,
+                    RpiError::Settings(error.to_string()),
+                    self.settings_paths.get(&SettingsScope::Global).cloned(),
+                ));
                 self.global_settings_load_error = Some(error);
             }
         }
@@ -1020,10 +1069,11 @@ impl SettingsManager {
                 self.project_settings_load_error = None;
             }
             Some(error) => {
-                self.errors.push(SettingsError {
-                    scope: SettingsScope::Project,
-                    error: RpiError::Settings(error.to_string()),
-                });
+                self.errors.push(to_settings_error(
+                    SettingsScope::Project,
+                    RpiError::Settings(error.to_string()),
+                    self.settings_paths.get(&SettingsScope::Project).cloned(),
+                ));
                 self.project_settings_load_error = Some(error);
             }
         }
@@ -1096,7 +1146,11 @@ impl SettingsManager {
     ) {
         if scope == SettingsScope::Project {
             if let Err(error) = self.assert_project_trusted_for_write() {
-                self.errors.push(SettingsError { scope, error });
+                self.errors.push(to_settings_error(
+                    scope,
+                    error,
+                    self.settings_paths.get(&scope).cloned(),
+                ));
                 return;
             }
         }
@@ -1107,7 +1161,11 @@ impl SettingsManager {
             &modified_nested_fields,
         ) {
             Ok(()) => self.clear_modified_scope(scope),
-            Err(error) => self.errors.push(SettingsError { scope, error }),
+            Err(error) => self.errors.push(to_settings_error(
+                scope,
+                error,
+                self.settings_paths.get(&scope).cloned(),
+            )),
         }
     }
 
@@ -1391,6 +1449,82 @@ impl SettingsManager {
         self.global_settings
             .set("defaultThinkingLevel", json_value(&level));
         self.mark_modified("defaultThinkingLevel", None);
+        self.save();
+    }
+
+    /// `getModelThinkingLevel` (settings-manager.ts:792-794 @ 2ff8ba622):
+    /// per-model default thinking overrides keyed `"provider/modelId"`.
+    pub fn get_model_thinking_level(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<ThinkingLevel> {
+        self.settings
+            .get("modelThinkingLevels")
+            .and_then(|v| v.as_object())
+            .and_then(|map| map.get(&format!("{provider}/{model_id}")))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+
+    /// `getAllModelThinkingLevels` (settings-manager.ts:796-798).
+    pub fn get_all_model_thinking_levels(
+        &self,
+    ) -> std::collections::BTreeMap<String, ThinkingLevel> {
+        self.settings
+            .get("modelThinkingLevels")
+            .and_then(|v| v.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        serde_json::from_value(value.clone())
+                            .ok()
+                            .map(|level| (key.clone(), level))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// `setModelThinkingLevel` (settings-manager.ts:800-806).
+    pub fn set_model_thinking_level(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        level: ThinkingLevel,
+    ) {
+        let key = format!("{provider}/{model_id}");
+        let mut map = self
+            .global_settings
+            .get("modelThinkingLevels")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        map.insert(key, json_value(&level));
+        self.global_settings
+            .set("modelThinkingLevels", Value::Object(map));
+        self.mark_modified("modelThinkingLevels", None);
+        self.save();
+    }
+
+    /// `removeModelThinkingLevel` (settings-manager.ts:808-816): deletes
+    /// the key and removes the empty object.
+    pub fn remove_model_thinking_level(&mut self, provider: &str, model_id: &str) {
+        let Some(mut map) = self
+            .global_settings
+            .get("modelThinkingLevels")
+            .and_then(|v| v.as_object())
+            .cloned()
+        else {
+            return;
+        };
+        map.remove(&format!("{provider}/{model_id}"));
+        if map.is_empty() {
+            self.global_settings.remove("modelThinkingLevels");
+        } else {
+            self.global_settings
+                .set("modelThinkingLevels", Value::Object(map));
+        }
+        self.mark_modified("modelThinkingLevels", None);
         self.save();
     }
 
@@ -2038,6 +2172,21 @@ impl SettingsManager {
         )
     }
 
+    /// `getDefaultTools` (settings-manager.ts:1273-1277 @ 4d9aa837c): the
+    /// initial built-in tool selection — `None` when unset; `Some(vec![])`
+    /// (empty array) means "no built-in tools, keep extension/SDK tools".
+    /// Project scope replaces (not merges) the global value via the normal
+    /// settings merge semantics.
+    pub fn get_default_tools(&self) -> Option<Vec<String>> {
+        let array = self.settings.get("defaultTools")?.as_array()?;
+        Some(
+            array
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        )
+    }
+
     /// `setEnabledModels` (settings-manager.ts:1153-1157). `None` drops the
     /// key.
     pub fn set_enabled_models(&mut self, patterns: Option<Vec<String>>) {
@@ -2432,6 +2581,37 @@ mod tests {
 
     fn settings(value: Value) -> Settings {
         Settings::from_map(value.as_object().unwrap().clone())
+    }
+
+    // `defaultTools` (settings-manager.ts:128 @ 4d9aa837c; docs/settings.md
+    // Tools §244): a project array replaces (not merges) the global array.
+    #[test]
+    fn default_tools_project_scope_replaces_global() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["read", "bash"]}),
+        );
+        write_json(
+            &project_path(&dirs),
+            serde_json::json!({"defaultTools": ["grep"]}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(manager.get_default_tools(), Some(vec!["grep".to_string()]));
+    }
+
+    #[test]
+    fn default_tools_global_only_when_project_unset() {
+        let dirs = test_dirs();
+        write_json(
+            &global_path(&dirs),
+            serde_json::json!({"defaultTools": ["read", "bash"]}),
+        );
+        let manager = create(&dirs);
+        assert_eq!(
+            manager.get_default_tools(),
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
     }
 
     // =======================================================================

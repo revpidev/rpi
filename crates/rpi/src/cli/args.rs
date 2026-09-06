@@ -84,6 +84,10 @@ pub struct Args {
     pub prompt_templates: Option<Vec<String>>,
     pub no_prompt_templates: bool,
     pub themes: Option<Vec<String>>,
+    /// `--use-theme <name[/name]>` (args.ts:45, :180-187 @ 9795d6023):
+    /// the initial interactive theme for this run — not persisted back to
+    /// settings; an in-run explicit theme selection overrides it.
+    pub use_theme: Option<String>,
     pub no_themes: bool,
     pub no_context_files: bool,
     pub list_models: Option<ListModels>,
@@ -147,7 +151,22 @@ pub fn parse_args(args: &[String]) -> Args {
     while i < args.len() {
         let arg = &args[i];
 
-        if arg == "--help" || arg == "-h" {
+        if arg == "--" {
+            // First bare `--` terminates option parsing (args.ts:82-92 @
+            // 74786a748): every remaining argument is a positional — `@`
+            // prefixes still become fileArgs, everything else (including
+            // `-x`/`--flag`-shaped strings) goes to messages verbatim.
+            // Only the FIRST `--` has this meaning; later ones land in
+            // messages like any other positional.
+            for positional in &args[i + 1..] {
+                if let Some(file_arg) = positional.strip_prefix('@') {
+                    result.file_args.push(file_arg.to_owned());
+                } else {
+                    result.messages.push(positional.clone());
+                }
+            }
+            break;
+        } else if arg == "--help" || arg == "-h" {
             result.help = true;
         } else if arg == "--version" || arg == "-v" {
             result.version = true;
@@ -279,6 +298,20 @@ pub fn parse_args(args: &[String]) -> Args {
                 .themes
                 .get_or_insert_with(Vec::new)
                 .push(args[i].clone());
+        } else if arg == "--use-theme" {
+            // `--use-theme <name[/name]>` (args.ts:180-187 @ 9795d6023):
+            // a missing value or a `-`-prefixed next token is a diagnostic
+            // error (the value is NOT consumed in that case).
+            let theme_name = args.get(i + 1);
+            match theme_name {
+                Some(name) if !name.starts_with('-') => {
+                    result.use_theme = Some(name.clone());
+                    i += 1;
+                }
+                _ => result
+                    .diagnostics
+                    .push(Diagnostic::error("--use-theme requires a theme name")),
+            }
         } else if arg == "--no-skills" || arg == "-ns" {
             result.no_skills = true;
         } else if arg == "--no-prompt-templates" || arg == "-np" {
@@ -491,6 +524,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
   --no-prompt-templates, -np     Disable prompt template discovery and loading
   --theme <path>                 Load a theme file or directory (can be used multiple times)
+  --use-theme <name[/name]>      Set the initial interactive theme for this run
   --no-themes                    Disable theme discovery and loading
   --no-context-files, -nc        Disable AGENTS.md and CLAUDE.md discovery and loading
   --export <file>                Export session file to HTML and exit
@@ -500,6 +534,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as RPI_OFFLINE=1)
+  --                             End option parsing; treat remaining arguments as messages/files
   --help, -h                     Show this help
   --version, -v                  Show version number
 
@@ -646,6 +681,80 @@ mod tests {
 
     fn args(input: &[&str]) -> Args {
         parse_args(&input.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    // `--` option separator (args.ts:82-92 @ 74786a748 + bcad846f9)
+
+    #[test]
+    fn test_double_dash_terminates_option_parsing() {
+        let result = args(&["--", "-x", "--flag"]);
+        assert_eq!(result.messages, vec!["-x", "--flag"]);
+        assert!(result.unknown_flags.is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_double_dash_preserves_file_args() {
+        let result = args(&["--", "@prompt.md", "hello"]);
+        assert_eq!(result.file_args, vec!["prompt.md"]);
+        assert_eq!(result.messages, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_only_first_double_dash_acts_as_separator() {
+        let result = args(&["--", "a", "--", "b"]);
+        assert_eq!(result.messages, vec!["a", "--", "b"]);
+    }
+
+    #[test]
+    fn test_double_dash_does_not_stop_preceding_option_values() {
+        let result = args(&["--model", "gpt", "--", "-p"]);
+        assert_eq!(result.model.as_deref(), Some("gpt"));
+        assert_eq!(result.messages, vec!["-p"]);
+    }
+
+    #[test]
+    fn test_bare_double_dash_alone_is_not_an_empty_long_flag() {
+        // Regression shape: the old `strip_prefix("--")` path swallowed a
+        // bare `--` as an empty-name unknown boolean flag.
+        let result = args(&["--"]);
+        assert!(result.unknown_flags.is_empty());
+        assert!(result.messages.is_empty());
+    }
+
+    // --use-theme (args.ts:180-187 @ 9795d6023)
+
+    #[test]
+    fn test_parses_use_theme() {
+        let result = args(&["--use-theme", "dark"]);
+        assert_eq!(result.use_theme.as_deref(), Some("dark"));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_parses_use_theme_dark_light_pair() {
+        let result = args(&["--use-theme", "light-theme/dark-theme"]);
+        assert_eq!(result.use_theme.as_deref(), Some("light-theme/dark-theme"));
+    }
+
+    #[test]
+    fn test_use_theme_missing_value_is_error() {
+        let result = args(&["--use-theme"]);
+        assert_eq!(result.use_theme, None);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0]
+            .message
+            .contains("--use-theme requires a theme name"));
+    }
+
+    #[test]
+    fn test_use_theme_dash_prefixed_value_is_error() {
+        let result = args(&["--use-theme", "-other-flag"]);
+        assert_eq!(result.use_theme, None);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("--use-theme requires a theme name")));
     }
 
     // --version flag

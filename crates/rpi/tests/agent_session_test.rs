@@ -80,6 +80,7 @@ struct SessionFixture {
     provider: Arc<FauxProvider>,
     ai_provider: Arc<FauxAiProvider>,
     events: Arc<Mutex<Vec<AgentSessionEvent>>>,
+    agent_dir: std::path::PathBuf,
     _tmp: TempDir,
 }
 
@@ -177,7 +178,7 @@ async fn session_fixture(
     ));
     let created = rpi::sdk::create_agent_session(rpi::sdk::CreateAgentSessionOptions {
         cwd: Some(cwd),
-        agent_dir: Some(agent_dir),
+        agent_dir: Some(agent_dir.clone()),
         model_runtime: Some(model_runtime),
         model: Some(model),
         services: Some(services),
@@ -204,6 +205,7 @@ async fn session_fixture(
         provider,
         ai_provider,
         events,
+        agent_dir,
         _tmp: tmp,
     }
 }
@@ -1193,4 +1195,195 @@ async fn in_memory_fork_waits_for_active_tool_turn() {
     assert_eq!(recorded, vec!["user".to_owned()]);
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Session-scoped model/thinking mutations (2ff8ba622, #8356; V14-12 FR-D R2)
+// ---------------------------------------------------------------------------
+
+mod session_scoped_mutations {
+    use super::*;
+    use rpi_agent::types::ThinkingLevel;
+    use rpi_test_support::faux::FauxModelDefinition;
+
+    async fn fixture(responses: Vec<FauxResponseStep>) -> SessionFixture {
+        session_fixture(responses, FauxProviderOptions::default(), None).await
+    }
+
+    async fn two_model_fixture(settings: Option<&str>) -> SessionFixture {
+        let options = FauxProviderOptions {
+            models: Some(vec![
+                FauxModelDefinition {
+                    id: "faux-1".to_owned(),
+                    name: Some("Faux One".to_owned()),
+                    reasoning: Some(true),
+                    input: None,
+                    cost: None,
+                    context_window: Some(200_000),
+                    max_tokens: Some(8192),
+                },
+                FauxModelDefinition {
+                    id: "faux-2".to_owned(),
+                    name: Some("Faux Two".to_owned()),
+                    reasoning: Some(true),
+                    input: None,
+                    cost: None,
+                    context_window: Some(200_000),
+                    max_tokens: Some(8192),
+                },
+            ]),
+            ..Default::default()
+        };
+        session_fixture(Vec::new(), options, settings).await
+    }
+
+    /// The persisted global settings.json content (raw).
+    fn persisted_settings(fixture: &SessionFixture) -> serde_json::Value {
+        let raw = std::fs::read_to_string(fixture.agent_dir.join("settings.json"))
+            .unwrap_or_else(|_| "{}".to_string());
+        serde_json::from_str(&raw).expect("settings parse")
+    }
+
+    fn second_model(fixture: &SessionFixture) -> rpi_ai::types::Model {
+        fixture
+            .provider
+            .get_model(Some("faux-2"))
+            .or_else(|| fixture.provider.get_model(None))
+            .expect("a model to switch to")
+    }
+
+    // Plain /model selection: runtime switch + session append, ZERO settings
+    // writes (2ff8ba622 — the pre-fix behavior wrote the default on every
+    // selection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_set_model_session_scoped_writes_no_settings() {
+        let fixture = two_model_fixture(None).await;
+        let target = second_model(&fixture);
+        fixture.session.set_model(target).await.expect("set_model");
+
+        assert_eq!(
+            fixture.session.model().map(|m| m.id),
+            Some("faux-2".to_string()).or(Some("faux-1".to_string()))
+        );
+        // Settings file untouched: no defaultModel/defaultProvider keys.
+        let settings = persisted_settings(&fixture);
+        assert!(
+            settings.get("defaultModel").is_none(),
+            "session-only selection must not persist defaultModel"
+        );
+        assert!(settings.get("defaultProvider").is_none());
+    }
+
+    // Ctrl+S path (`persist: true`): the ONLY persistence route — writes
+    // defaultModel + defaultProvider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_set_model_persist_writes_defaults() {
+        let fixture = two_model_fixture(None).await;
+        let target = second_model(&fixture);
+        fixture
+            .session
+            .set_model_with_options(
+                target,
+                rpi::core::agent_session::ModelMutationOptions { persist: true },
+            )
+            .await
+            .expect("set_model persist");
+
+        let settings = persisted_settings(&fixture);
+        let model_id = fixture.session.model().expect("model set").id;
+        assert_eq!(
+            settings.get("defaultModel").and_then(|v| v.as_str()),
+            Some(model_id.as_str())
+        );
+        assert_eq!(
+            settings.get("defaultProvider").and_then(|v| v.as_str()),
+            Some("faux")
+        );
+    }
+
+    // setThinkingLevel without persist: no defaultThinkingLevel write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_set_thinking_level_session_scoped_writes_no_settings() {
+        let fixture = fixture(Vec::new()).await;
+        fixture.session.set_thinking_level(ThinkingLevel::Low);
+        let settings = persisted_settings(&fixture);
+        assert!(settings.get("defaultThinkingLevel").is_none());
+    }
+
+    // setThinkingLevel with persist: writes the REQUESTED level.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_set_thinking_level_persist_writes_requested_level() {
+        let fixture = fixture(Vec::new()).await;
+        fixture.session.set_thinking_level_with_options(
+            ThinkingLevel::High,
+            rpi::core::agent_session::ModelMutationOptions { persist: true },
+        );
+        let settings = persisted_settings(&fixture);
+        assert_eq!(
+            settings
+                .get("defaultThinkingLevel")
+                .and_then(|v| v.as_str()),
+            Some("high")
+        );
+    }
+
+    // `_getThinkingLevelForModelSwitch(targetModel)`: a per-model
+    // `modelThinkingLevels` override beats the global default and the
+    // session-carried level when switching models.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_per_model_thinking_override_wins_on_model_switch() {
+        let fixture =
+            two_model_fixture(Some(r#"{"modelThinkingLevels": {"faux/faux-2": "low"}}"#)).await;
+        // Session level starts at the model default (high from clamp or
+        // DEFAULT); switching to faux-2 must pick the per-model "low".
+        let target = second_model(&fixture);
+        fixture.session.set_model(target).await.expect("set_model");
+        match fixture.session.model() {
+            Some(model) if model.id == "faux-2" => {
+                assert_eq!(fixture.session.thinking_level(), ThinkingLevel::Low);
+            }
+            _ => {
+                // Single-model faux provider: per-model override still
+                // verifiable through the same-model path.
+                assert_eq!(fixture.session.thinking_level(), ThinkingLevel::Low);
+            }
+        }
+    }
+
+    // `_addPersistedDefaultToNonEmptyScope` (8fa7eebd2): persisting a
+    // default while enabledModels pins a scope appends the model to
+    // enabledModels.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_persist_appends_to_non_empty_scope() {
+        let fixture = two_model_fixture(Some(r#"{"enabledModels": ["faux/faux-1"]}"#)).await;
+        // A non-empty session scope (as produced by --models/enabledModels
+        // resolution in app.rs): faux-1 only.
+        let scoped_model = fixture.provider.get_model(Some("faux-1")).expect("faux-1");
+        fixture
+            .session
+            .set_scoped_models(vec![rpi::core::model_resolver::ScopedModel {
+                model: scoped_model,
+                thinking_level: None,
+            }]);
+        let target = second_model(&fixture);
+        fixture
+            .session
+            .set_model_with_options(
+                target,
+                rpi::core::agent_session::ModelMutationOptions { persist: true },
+            )
+            .await
+            .expect("persist");
+
+        let enabled: Vec<String> = fixture
+            .session
+            .settings_manager(|s| s.get_enabled_models())
+            .unwrap_or_default();
+        let model_id = fixture.session.model().expect("model set").id;
+        let reference = format!("faux/{model_id}");
+        assert!(
+            enabled.iter().any(|pattern| pattern == &reference),
+            "persisted default must join enabledModels, got {enabled:?}"
+        );
+    }
 }

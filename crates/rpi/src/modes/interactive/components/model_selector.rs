@@ -49,7 +49,7 @@ use crate::core::model_runtime::ModelRuntime;
 use crate::core::themes::Theme;
 
 use super::dynamic_border::DynamicBorder;
-use super::keybinding_hints::key_hint;
+use super::keybinding_hints::{key_hint, key_text};
 use super::model_search::{get_model_selector_search_text, ModelSearchItem};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -192,7 +192,12 @@ fn load_models_from_snapshot(
 }
 
 /// `setScope` (model-selector.ts:223-233).
-fn set_scope(state: &mut SelectorState, scope: ModelScope, current_model: &Option<Model>) {
+fn set_scope(
+    state: &mut SelectorState,
+    scope: ModelScope,
+    current_model: &Option<Model>,
+    default_model: Option<&(String, String)>,
+) {
     if state.scope == scope {
         return;
     }
@@ -208,21 +213,58 @@ fn set_scope(state: &mut SelectorState, scope: ModelScope, current_model: &Optio
         .position(|item| models_are_equal(current_model.as_ref(), Some(&item.model)));
     state.selected_index = current_index.unwrap_or(0);
     let query = state.search_value.clone();
-    filter_models(state, &query);
+    filter_models(state, &query, default_model);
 }
 
 /// `filterModels` (model-selector.ts:235-243).
-fn filter_models(state: &mut SelectorState, query: &str) {
+/// `filterModels` (model-selector.ts:253-280 @ 1d3503fb9): default entries
+/// are searchable (" default startup" suffix) and a query containing the
+/// word `default`/`startup` pins them to the top.
+fn filter_models(state: &mut SelectorState, query: &str, default_model: Option<&(String, String)>) {
+    let is_default = |model: &Model| {
+        default_model.is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
+    };
     state.filtered_models = if query.is_empty() {
         state.active_models.clone()
     } else {
-        fuzzy_filter(state.active_models.clone(), query, |item: &ModelItem| {
-            get_model_selector_search_text(&ModelSearchItem {
+        let filtered = fuzzy_filter(state.active_models.clone(), query, |item: &ModelItem| {
+            let base = get_model_selector_search_text(&ModelSearchItem {
                 id: item.id.clone(),
                 provider: item.provider.clone(),
                 name: Some(item.model.name.clone()),
-            })
-        })
+            });
+            if is_default(&item.model) {
+                format!("{base} default startup")
+            } else {
+                base
+            }
+        });
+        // `/\b(default|startup)\b/iu.test(query)` — word-boundary match on
+        // the two pinning keywords (splitting on non-alphanumerics is the
+        // pragmatic Unicode word boundary).
+        let pins_default = query
+            .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+            .any(|word| {
+                word.eq_ignore_ascii_case("default") || word.eq_ignore_ascii_case("startup")
+            });
+        if pins_default {
+            let mut combined: Vec<ModelItem> = state
+                .active_models
+                .iter()
+                .filter(|item| is_default(&item.model))
+                .cloned()
+                .collect();
+            let default_keys: std::collections::HashSet<String> = combined
+                .iter()
+                .map(|item| format!("{}\0{}", item.model.provider, item.model.id))
+                .collect();
+            combined.extend(filtered.into_iter().filter(|item| {
+                !default_keys.contains(&format!("{}\0{}", item.model.provider, item.model.id))
+            }));
+            combined
+        } else {
+            filtered
+        }
     };
     state.selected_index = state
         .selected_index
@@ -268,11 +310,16 @@ pub struct ModelSelectorComponent {
     focused: bool,
     current_model: Option<Model>,
     model_runtime: Arc<ModelRuntime>,
-    /// `settingsManager.setDefaultModelAndProvider` hook
-    /// (model-selector.ts:354).
-    save_default: Box<dyn FnMut(&Model) + Send>,
+    /// `onSelectAsDefaultCallback` (model-selector.ts:61, Ctrl+S path,
+    /// 9c8070fbe): persists the selection as the default (session-side
+    /// `setModel(model, {persist: true})`).
+    on_select_as_default: Box<dyn FnMut(&Model) + Send>,
     on_select: Box<dyn FnMut(Model) + Send>,
     on_cancel: Box<dyn FnMut() + Send>,
+    /// `defaultModel` (model-selector.ts:31-34, 1d3503fb9): the persisted
+    /// default reference (`provider`, `id`) for the ` · default` badge and
+    /// "default"-search matching.
+    default_model: Option<(String, String)>,
     state: Arc<Mutex<SelectorState>>,
     top_border: DynamicBorder,
     bottom_border: DynamicBorder,
@@ -286,10 +333,11 @@ impl ModelSelectorComponent {
         scoped_models: Vec<(Model, Option<ModelThinkingLevel>)>,
         theme: Arc<Theme>,
         tui: TuiHandle,
-        save_default: Box<dyn FnMut(&Model) + Send>,
+        on_select_as_default: Box<dyn FnMut(&Model) + Send>,
         on_select: Box<dyn FnMut(Model) + Send>,
         on_cancel: Box<dyn FnMut() + Send>,
         initial_search_input: Option<String>,
+        default_model: Option<(String, String)>,
     ) -> Self {
         let border_color = {
             let theme = Arc::clone(&theme);
@@ -316,7 +364,7 @@ impl ModelSelectorComponent {
         // background (model-selector.ts:131-137).
         load_models_from_snapshot(&mut state, &model_runtime, &current_model);
         let query = state.search_value.clone();
-        filter_models(&mut state, &query);
+        filter_models(&mut state, &query, default_model.as_ref());
 
         let mut search_input = Input::new();
         if let Some(initial) = &initial_search_input {
@@ -330,9 +378,10 @@ impl ModelSelectorComponent {
             focused: false,
             current_model,
             model_runtime,
-            save_default,
+            on_select_as_default,
             on_select,
             on_cancel,
+            default_model,
             state: Arc::new(Mutex::new(state)),
             top_border: DynamicBorder::new(border_color.clone()),
             bottom_border: DynamicBorder::new(border_color),
@@ -349,6 +398,7 @@ impl ModelSelectorComponent {
         let state = self.state.clone();
         let runtime = self.model_runtime.clone();
         let current_model = self.current_model.clone();
+        let default_model = self.default_model.clone();
         let tui = self.tui.clone();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
@@ -374,7 +424,7 @@ impl ModelSelectorComponent {
                     }
                     load_models_from_snapshot(&mut state, &runtime, &current_model);
                     let query = state.search_value.clone();
-                    filter_models(&mut state, &query);
+                    filter_models(&mut state, &query, default_model.as_ref());
                     drop(state);
                     tui.request_render(false);
                 });
@@ -394,11 +444,20 @@ impl ModelSelectorComponent {
         lock(&self.state).closed = true;
     }
 
-    /// `handleSelect` (model-selector.ts:351-356).
+    /// `handleSelect` (model-selector.ts:382-385 @ 2ff8ba622 family):
+    /// Enter selects for this session only — the persist path is the
+    /// separate Ctrl+S branch (`app.models.save`), not an implicit side
+    /// effect of selection.
     fn handle_select(&mut self, model: Model) {
         self.close();
-        (self.save_default)(&model);
         (self.on_select)(model);
+    }
+
+    /// `isDefaultModel` (model-selector.ts:248-250 @ 1d3503fb9).
+    fn is_default_model(&self, model: &Model) -> bool {
+        self.default_model
+            .as_ref()
+            .is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
     }
 
     /// `getSearchInput` (model-selector.ts:358-360).
@@ -429,7 +488,12 @@ impl Component for ModelSelectorComponent {
                     } else {
                         ModelScope::All
                     };
-                    set_scope(&mut state, next_scope, &self.current_model);
+                    set_scope(
+                        &mut state,
+                        next_scope,
+                        &self.current_model,
+                        self.default_model.as_ref(),
+                    );
                 }
                 return;
             }
@@ -479,6 +543,22 @@ impl Component for ModelSelectorComponent {
                 (self.on_cancel)();
                 return;
             }
+            // Ctrl+S — select and persist as default (model-selector.ts:398-405
+            // @ 9c8070fbe + 2ff8ba622).
+            if read.matches_id(data, "app.models.save") {
+                let selected_model = {
+                    let state = lock(&self.state);
+                    state
+                        .filtered_models
+                        .get(state.selected_index)
+                        .map(|item| item.model.clone())
+                };
+                if let Some(model) = selected_model {
+                    self.close();
+                    (self.on_select_as_default)(&model);
+                }
+                return;
+            }
         }
         // Everything else goes to the search input (model-selector.ts:345-348).
         // The keybinding read guard was already dropped at the end of the
@@ -487,7 +567,7 @@ impl Component for ModelSelectorComponent {
         let query = self.search_input.get_value().to_string();
         let mut state = lock(&self.state);
         state.search_value = query.clone();
-        filter_models(&mut state, &query);
+        filter_models(&mut state, &query, self.default_model.as_ref());
     }
 
     fn render(&self, width: usize) -> Vec<String> {
@@ -537,6 +617,12 @@ impl Component for ModelSelectorComponent {
             let item = &state.filtered_models[i];
             let is_selected = i == state.selected_index;
             let is_current = models_are_equal(self.current_model.as_ref(), Some(&item.model));
+            // ` · default` badge (model-selector.ts:306-309 @ 1d3503fb9).
+            let default_badge = if self.is_default_model(&item.model) {
+                self.theme.fg("muted", " · default")
+            } else {
+                String::new()
+            };
             let line = if is_selected {
                 let prefix = self.theme.fg("accent", "→ ");
                 let model_text = self.theme.fg("accent", &item.id);
@@ -546,7 +632,7 @@ impl Component for ModelSelectorComponent {
                 } else {
                     String::new()
                 };
-                format!("{prefix}{model_text} {provider_badge}{checkmark}")
+                format!("{prefix}{model_text} {provider_badge}{default_badge}{checkmark}")
             } else {
                 let model_text = format!("  {}", item.id);
                 let provider_badge = self.theme.fg("muted", &format!("[{}]", item.provider));
@@ -555,7 +641,7 @@ impl Component for ModelSelectorComponent {
                 } else {
                     String::new()
                 };
-                format!("{model_text} {provider_badge}{checkmark}")
+                format!("{model_text} {provider_badge}{default_badge}{checkmark}")
             };
             lines.push(truncate_to_width(&line, width, "...", false));
         }
@@ -604,6 +690,21 @@ impl Component for ModelSelectorComponent {
                     .fg(color, &format!("  {}", state.refresh_status_message)),
             );
         }
+
+        // Hint (model-selector.ts:137-147 @ 9c8070fbe):
+        // `  {confirm} to select · {app.models.save} to set as default ·
+        // {cancel} to cancel` — key names resolved through the live
+        // keybinding manager (keyDisplayText), never hardcoded.
+        lines.push(String::new());
+        lines.push(self.theme.fg(
+            "dim",
+            &format!(
+                "  {} to select · {} to set as default · {} to cancel",
+                key_text("tui.select.confirm"),
+                key_text("app.models.save"),
+                key_text("tui.select.cancel"),
+            ),
+        ));
 
         lines.push(String::new());
         lines.extend(self.bottom_border.render(width));
@@ -785,6 +886,7 @@ mod tests {
         scoped: Vec<(Model, Option<ModelThinkingLevel>)>,
         initial_search: Option<String>,
         on_cancel: Option<Box<dyn FnMut() + Send>>,
+        default: Option<(&str, &str)>,
     ) -> (
         ModelSelectorComponent,
         Arc<Mutex<Vec<(String, String)>>>,
@@ -815,6 +917,7 @@ mod tests {
                 })
             }),
             initial_search,
+            default.map(|(provider, id)| (provider.to_string(), id.to_string())),
         );
         (component, selected_calls, saved_calls, cancels)
     }
@@ -824,7 +927,7 @@ mod tests {
         install_keybindings();
         let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
         let current = runtime.get_model("beta", "b1").expect("b1");
-        let (component, _, _, _) = build(Some(current), runtime, Vec::new(), None, None);
+        let (component, _, _, _) = build(Some(current), runtime, Vec::new(), None, None, None);
         let lines = plain(component.render(80));
         // Row order: current (b1) first, then providers alphabetically
         // (alpha before beta).
@@ -841,7 +944,7 @@ mod tests {
         install_keybindings();
         let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
         let (mut component, selected_calls, saved_calls, _) =
-            build(None, runtime, Vec::new(), None, None);
+            build(None, runtime, Vec::new(), None, None, None);
         // Type "b2" — matches only beta/b2 (getModelSelectorSearchText leads
         // with the provider).
         component.handle_input("b");
@@ -853,11 +956,38 @@ mod tests {
         component.handle_input("\r");
         let selected = selected_calls.lock().unwrap();
         assert_eq!(*selected, vec![("beta".to_string(), "b2".to_string())]);
-        // The default was saved through the save_default hook first.
+        // Enter is session-scoped: the persist hook must NOT fire
+        // (2ff8ba622 — old expectation "default saved through the
+        // save_default hook first" → new: Ctrl+S only; registered per G2).
+        assert!(saved_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_selects_as_default() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (mut component, selected_calls, saved_calls, _) =
+            build(None, runtime, Vec::new(), None, None, None);
+        // Ctrl+S (app.models.save) fires the persist hook only
+        // (model-selector.ts:398-405 @ 9c8070fbe).
+        component.handle_input("\x13");
         assert_eq!(
             *saved_calls.lock().unwrap(),
-            vec![("beta".to_string(), "b2".to_string())]
+            vec![("alpha".to_string(), "a1".to_string())]
         );
+        assert!(selected_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_model_badge_and_default_search() {
+        install_keybindings();
+        let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+        let (component, _selected, _saved, _) =
+            build(None, runtime, Vec::new(), None, None, Some(("beta", "b2")));
+        let rows = list_rows(&component.render(80));
+        // ` · default` badge on the persisted default (1d3503fb9).
+        assert!(rows[2].contains("b2 [beta] · default"), "got: {}", rows[2]);
+        assert!(!rows[0].contains("· default"));
     }
 
     #[tokio::test]
@@ -873,6 +1003,7 @@ mod tests {
             Vec::new(),
             Some("alpha/a1".to_string()),
             None,
+            None,
         );
         assert_eq!(component.get_search_input().get_value(), "alpha/a1");
         let rows = list_rows(&component.render(80));
@@ -884,7 +1015,7 @@ mod tests {
     async fn up_down_wrap_around() {
         install_keybindings();
         let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
-        let (mut component, _, _, _) = build(None, runtime, Vec::new(), None, None);
+        let (mut component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
         // Up at the top wraps to the last row.
         component.handle_input("\x1b[A");
         let rows = list_rows(&component.render(80));
@@ -904,6 +1035,7 @@ mod tests {
             None,
             runtime,
             vec![(scoped_model, Some(ModelThinkingLevel::Low))],
+            None,
             None,
             None,
         );
@@ -928,7 +1060,7 @@ mod tests {
     async fn escape_cancels_and_closes() {
         install_keybindings();
         let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
-        let (mut component, _, _, cancels) = build(None, runtime, Vec::new(), None, None);
+        let (mut component, _, _, cancels) = build(None, runtime, Vec::new(), None, None, None);
         component.handle_input("\x1b");
         assert_eq!(*cancels.lock().unwrap(), 1);
         // The component is closed; the in-flight refresh (if any) no longer
@@ -950,7 +1082,7 @@ mod tests {
             }}"#,
         )
         .await;
-        let (component, _, _, _) = build(None, runtime.clone(), Vec::new(), None, None);
+        let (component, _, _, _) = build(None, runtime.clone(), Vec::new(), None, None, None);
         // Add a provider while the background refresh is still queued: the
         // constructor's spawn runs on the next await, so it must observe the
         // new catalog (model-selector.ts:186 `loadModelsFromSnapshot`).
@@ -990,7 +1122,7 @@ mod tests {
         )
         .await;
         assert!(runtime.get_error().is_some(), "broken provider must error");
-        let (component, _, _, _) = build(None, runtime, Vec::new(), None, None);
+        let (component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let lines = plain(component.render(80)).join("\n");
@@ -1027,7 +1159,7 @@ mod tests {
             }}}}}}"#
         );
         let (_tmp, runtime) = runtime_with_models_json(&json).await;
-        let (component, _, _, _) = build(None, runtime, Vec::new(), None, None);
+        let (component, _, _, _) = build(None, runtime, Vec::new(), None, None, None);
         let lines = plain(component.render(40));
         let joined = lines.join("\n");
         assert!(joined.contains("(1/11)"));

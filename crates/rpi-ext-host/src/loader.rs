@@ -199,7 +199,9 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let manifest_path = dir.join("rpi-extension.json");
     if manifest_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&manifest_path) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) {
+            // #8337: BOM stripped before parse (pi-manifest.ts:19).
+            let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(content) {
                 // `wasm` wins over `native` when both are present
                 // (docs/extension-abi.md §5).
                 for field in ["wasm", "native"] {
@@ -751,7 +753,9 @@ fn wasm_capabilities_for(
     };
     let content = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("Failed to load extension: read manifest: {e}"))?;
-    let manifest: WasmManifest = serde_json::from_str(&content).map_err(|e| {
+    // #8337: BOM stripped before parse (pi-manifest.ts:19).
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    let manifest: WasmManifest = serde_json::from_str(content).map_err(|e| {
         format!(
             "Failed to load extension: parse {}: {e}",
             manifest_path.display()

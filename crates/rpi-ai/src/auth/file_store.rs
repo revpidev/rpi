@@ -63,17 +63,21 @@ struct LockResult<T> {
 fn parse_storage_data(content: Option<&str>) -> Result<AuthStorageData, ModelsError> {
     match content {
         None | Some("") => Ok(Map::new()),
-        Some(content) => match serde_json::from_str::<Value>(content) {
-            Ok(Value::Object(map)) => Ok(map),
-            Ok(_) => Err(ModelsError::new(
-                ModelsErrorCode::Auth,
-                "Failed to parse auth storage data: top level is not a JSON object",
-            )),
-            Err(error) => Err(auth_error(
-                "Failed to parse auth storage data",
-                &error.to_string(),
-            )),
-        },
+        // #8337 (`1355cd36e`): BOM stripped before parse (upstream strips at
+        // each auth-storage read site; this is the single parse chokepoint).
+        Some(content) => {
+            match serde_json::from_str::<Value>(crate::utils::text::strip_bom(content)) {
+                Ok(Value::Object(map)) => Ok(map),
+                Ok(_) => Err(ModelsError::new(
+                    ModelsErrorCode::Auth,
+                    "Failed to parse auth storage data: top level is not a JSON object",
+                )),
+                Err(error) => Err(auth_error(
+                    "Failed to parse auth storage data",
+                    &error.to_string(),
+                )),
+            }
+        }
     }
 }
 
@@ -195,11 +199,9 @@ impl FileAuthStorageBackend {
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.auth_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        // No post-write chmod: the explicit mode applies only on creation
+        // (auth-storage.ts:24-25 @ c49906ec7, #7779) — overwriting an
+        // existing file must preserve admin-configured permissions/ACLs.
         Ok(())
     }
 

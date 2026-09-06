@@ -93,21 +93,43 @@ fn resolve_app_mode(parsed: &Args, stdin_is_tty: bool, stdout_is_tty: bool) -> A
     AppMode::Interactive
 }
 
-/// `collectSettingsDiagnostics` (main.ts:77-85).
+/// `collectSettingsDiagnostics` (settings-diagnostics.ts:7-12 @ 913bcf339,
+/// #7829): warnings name the offending settings file when the path is
+/// known.
 fn collect_settings_diagnostics(
     settings_manager: &mut SettingsManager,
-    context: &str,
 ) -> Vec<AgentSessionRuntimeDiagnostic> {
     settings_manager
         .drain_errors()
         .into_iter()
         .map(|error| AgentSessionRuntimeDiagnostic {
             level: DiagnosticLevel::Warning,
-            message: format!(
-                "({context}, {} settings) {}",
-                error.scope.as_str(),
-                error.error
-            ),
+            message: match &error.path {
+                Some(path) => format!("Invalid settings file {path}: {}", error.error),
+                None => format!("Invalid {} settings: {}", error.scope.as_str(), error.error),
+            },
+        })
+        .collect()
+}
+
+/// `deduplicateDiagnostics` (settings-diagnostics.ts:17-25): drop
+/// type/message duplicates, preserving first occurrence (startup and
+/// runtime settings managers can report the same file error).
+fn deduplicate_diagnostics(
+    diagnostics: Vec<AgentSessionRuntimeDiagnostic>,
+) -> Vec<AgentSessionRuntimeDiagnostic> {
+    let mut seen = std::collections::HashSet::new();
+    diagnostics
+        .into_iter()
+        .filter(|diagnostic| {
+            let key = (
+                matches!(
+                    diagnostic.level,
+                    crate::cli::diagnostics::DiagnosticLevel::Error
+                ),
+                diagnostic.message.clone(),
+            );
+            seen.insert(key)
         })
         .collect()
 }
@@ -678,10 +700,8 @@ pub async fn run_app(args: Vec<String>) -> i32 {
         Some(&agent_dir),
         SettingsManagerCreateOptions::default(),
     );
-    report_diagnostics(
-        &collect_settings_diagnostics(&mut startup_settings_manager, "startup session lookup"),
-        &mut err,
-    );
+    let startup_settings_diagnostics = collect_settings_diagnostics(&mut startup_settings_manager);
+    report_diagnostics(&startup_settings_diagnostics, &mut err);
 
     // First-time setup is interactive-only (T12); headless modes skip it.
 
@@ -1102,10 +1122,7 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                         .resource_loader
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    diagnostics.extend(collect_settings_diagnostics(
-                        loader.settings_manager_mut(),
-                        "runtime creation",
-                    ));
+                    diagnostics.extend(collect_settings_diagnostics(loader.settings_manager_mut()));
                     for error in &loader.resources().extensions.errors {
                         diagnostics.push(AgentSessionRuntimeDiagnostic {
                             level: DiagnosticLevel::Error,
@@ -1329,7 +1346,21 @@ pub async fn run_app(args: Vec<String>) -> i32 {
             }
         };
 
-    report_diagnostics(runtime.diagnostics(), &mut err);
+    // main.ts:1014-1021 @ 913bcf339: merged startup diagnostics are shown
+    // in the TUI for interactive runs; stderr reporting only for
+    // non-interactive runs or when runtime errors demand exit-level
+    // visibility (the error path itself is unchanged here — errors were
+    // already reported above and fail the run).
+    let startup_diagnostics = deduplicate_diagnostics(
+        startup_settings_diagnostics
+            .iter()
+            .chain(runtime.diagnostics().iter())
+            .cloned()
+            .collect(),
+    );
+    if app_mode != AppMode::Interactive {
+        report_diagnostics(&startup_diagnostics, &mut err);
+    }
     if runtime
         .diagnostics()
         .iter()
@@ -1379,6 +1410,8 @@ pub async fn run_app(args: Vec<String>) -> i32 {
                     initial_messages: parsed_owned.messages,
                     verbose: parsed_owned.verbose,
                     tui_mode,
+                    initial_theme_setting: parsed_owned.use_theme,
+                    startup_diagnostics,
                 },
             )
             .await

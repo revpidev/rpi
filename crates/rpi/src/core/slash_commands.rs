@@ -1,7 +1,8 @@
 //! Built-in slash commands — port of
 //! `packages/coding-agent/src/core/slash-commands.ts` @ pi 0.82.1 (2efa728).
 //!
-//! T12-S5b: the 22 built-in commands plus the hidden `/debug`. The dispatch
+//! T12-S5b: the 23 built-in commands (22 + `/thinking`, 496185f6e) plus
+//! the hidden `/debug`. The dispatch
 //! chain lives in `modes/interactive/commands.rs` /
 //! `commands_selectors.rs`; this module is the single source for the
 //! autocomplete list and the name/description table.
@@ -44,6 +45,10 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         "Select model (opens selector UI)",
         "<provider/model>",
     ),
+    // `/tree` above `/thinking` (slash-commands.ts:23-25 @ a2f369d63).
+    command("tree", "Navigate session tree (switch branches)"),
+    // `/thinking` (slash-commands.ts:24 @ 496185f6e).
+    command_with_hint("thinking", "Set thinking level", "<level>"),
     command("scoped-models", "Enable/disable models for Ctrl+P cycling"),
     command(
         "export",
@@ -61,7 +66,6 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         "clone",
         "Duplicate the current session at the current position",
     ),
-    command("tree", "Navigate session tree (switch branches)"),
     command("trust", "Save project trust decision for future sessions"),
     command_with_hint("login", "Configure provider authentication", "<provider>"),
     command("logout", "Remove provider authentication"),
