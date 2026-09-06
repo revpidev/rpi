@@ -499,6 +499,13 @@ impl Component for AssistantMessageComponent {
         result
     }
 
+    /// `updateThinkingBlockVisibility` walk target
+    /// (interactive-mode.ts:4198-4205 @ 9841914, b07e17faa): in-place toggle
+    /// so live tool components keep their state.
+    fn set_hide_thinking_block(&mut self, hide: bool) {
+        AssistantMessageComponent::set_hide_thinking_block(self, hide);
+    }
+
     fn invalidate(&mut self) {
         self.content_container.invalidate();
         if let Some(message) = self.last_message.clone() {

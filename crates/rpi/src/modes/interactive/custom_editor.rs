@@ -20,10 +20,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rpi_tui::components::editor::{Editor, EditorOptions, EditorTheme};
+use rpi_tui::components::editor::{BorderStatusProvider, Editor, EditorOptions, EditorTheme};
 use rpi_tui::keybindings::get_keybindings;
 use rpi_tui::tui::{Component, Focusable, TuiMouseEvent, TuiMouseHandlerResult};
 use rpi_tui::tui_handle::TuiHandle;
+
+use crate::modes::interactive::components::WorkingStatusIndicator;
 
 /// App-action handler (upstream `() => void`).
 pub type ActionHandler = Box<dyn FnMut() + Send>;
@@ -33,9 +35,14 @@ pub type EscapeHandler = Box<dyn FnMut() + Send>;
 /// `onExtensionShortcut?: (data: string) => boolean`).
 pub type ExtensionShortcutHandler = Box<dyn FnMut(&str) -> bool + Send>;
 
-/// `CustomEditor` (custom-editor.ts:7-79).
+/// `CustomEditor` (custom-editor.ts:7-79 @ 9841914).
 pub struct CustomEditor {
     editor: Editor,
+    /// `embedWorkingStatus` (custom-editor.ts:16-18, 1d9787c11): render the
+    /// streaming working status in the editor's top border. Opt-in; the
+    /// default editor passes `true`, custom editors keep the standalone
+    /// status row (interactive-mode.ts:561).
+    embed_working_status: bool,
     /// App action handlers, keyed by `app.*` keybinding id
     /// (`actionHandlers`, custom-editor.ts:9).
     pub action_handlers: HashMap<&'static str, ActionHandler>,
@@ -50,15 +57,52 @@ pub struct CustomEditor {
 }
 
 impl CustomEditor {
-    pub fn new(tui: TuiHandle, theme: EditorTheme, options: EditorOptions) -> Self {
+    /// `embed_working_status` mirrors upstream's fourth constructor argument
+    /// `{ embedWorkingStatus: true }` (custom-editor.ts:31-37, 1d9787c11);
+    /// `false` keeps the standalone working-status row.
+    pub fn new(
+        tui: TuiHandle,
+        theme: EditorTheme,
+        options: EditorOptions,
+        embed_working_status: bool,
+    ) -> Self {
         Self {
             editor: Editor::new(tui, theme, options),
+            embed_working_status,
             action_handlers: HashMap::new(),
             on_escape: None,
             on_ctrl_d: None,
             on_paste_image: None,
             on_extension_shortcut: None,
         }
+    }
+
+    /// `embedWorkingStatus` (custom-editor.ts:18).
+    pub fn embed_working_status(&self) -> bool {
+        self.embed_working_status
+    }
+
+    /// `setWorkingStatusIndicator` (custom-editor.ts:24-26 @ 9841914):
+    /// install/clear the working status rendered in the top border. Editors
+    /// that did not opt in never host it (upstream gates at render time on
+    /// `embedWorkingStatus`; the port gates at set time — equivalent since
+    /// the flag never changes after construction).
+    pub fn set_working_status_indicator(
+        &mut self,
+        indicator: Option<Arc<Mutex<WorkingStatusIndicator>>>,
+    ) {
+        if !self.embed_working_status {
+            // Not opted in: never host the indicator (plain border), the
+            // set-time equivalent of upstream's render-time
+            // `!this.embedWorkingStatus` check.
+            self.editor.set_border_status(None);
+            return;
+        }
+        let provider = indicator.map(SharedWorkingStatus);
+        self.editor.set_border_status(provider.map(|shared| {
+            let provider: Arc<dyn BorderStatusProvider> = Arc::new(shared);
+            provider
+        }));
     }
 
     /// `onAction` (custom-editor.ts:26-28).
@@ -233,6 +277,28 @@ impl CustomEditor {
     }
 }
 
+/// `CustomEditorRegion` adapter: shares the working status with the inner
+/// editor's border rendering ([`BorderStatusProvider`] for the mode-owned
+/// `Arc<Mutex<WorkingStatusIndicator>>`; upstream shares the indicator
+/// object itself, custom-editor.ts:24-26).
+struct SharedWorkingStatus(Arc<Mutex<WorkingStatusIndicator>>);
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl BorderStatusProvider for SharedWorkingStatus {
+    fn render_in_border(&self, width: usize) -> String {
+        lock(&self.0).render_in_border(width)
+    }
+
+    fn render_spinner_in_border(&self, width: usize) -> String {
+        lock(&self.0).render_spinner_in_border(width)
+    }
+}
+
 /// Tree entry for a shared [`CustomEditor`]: the TUI owns this wrapper while
 /// the interactive mode keeps the concrete `Arc<Mutex<CustomEditor>>` for
 /// mutations from the event-drain (submit history, border color). The region
@@ -307,6 +373,24 @@ mod tests {
     /// runs them on parallel threads.
     static KEYBINDINGS_LOCK: Mutex<()> = Mutex::new(());
 
+    fn strip_ansi(input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     /// Install the full 83-entry keybinding table (the ids the dispatch
     /// checks are all default bindings, so the full table is equivalent to
     /// the previously-used custom manager — and identical across parallel
@@ -337,6 +421,7 @@ mod tests {
                     ),
                 },
                 EditorOptions::default(),
+                false,
             )));
             Self {
                 editor,
@@ -352,6 +437,116 @@ mod tests {
         fn set_text(&self, text: &str) {
             lock_editor(&self.editor).editor.set_text(text);
         }
+    }
+
+    // --- Working-status embedding (status-indicator.test.ts @ 9841914,
+    //     1d9787c11: "keeps the top border unchanged unless the editor opts
+    //     in" / "embeds the working indicator when the editor opts in") ----
+
+    fn dark_theme() -> Arc<crate::core::themes::Theme> {
+        Arc::new(crate::core::themes::load_theme("dark", None).expect("builtin dark theme"))
+    }
+
+    fn editor_theme_with(theme: &Arc<crate::core::themes::Theme>) -> EditorTheme {
+        EditorTheme {
+            border_color: Box::new({
+                let theme = Arc::clone(theme);
+                move |text: &str| theme.fg("borderMuted", text)
+            }),
+            select_list: Arc::new(rpi_tui::components::select_list::SelectListTheme::identity()),
+        }
+    }
+
+    #[test]
+    fn keeps_top_border_unchanged_unless_opted_in() {
+        let _guard = KEYBINDINGS_LOCK.lock().unwrap();
+        install_keybindings();
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+            super::super::test_support::TestTerminal::new(),
+        )));
+        let theme = dark_theme();
+        let editor = Arc::new(Mutex::new(CustomEditor::new(
+            tui.clone(),
+            editor_theme_with(&theme),
+            EditorOptions::default(),
+            false,
+        )));
+        assert!(!lock_editor(&editor).embed_working_status());
+
+        let indicator = Arc::new(Mutex::new(
+            crate::modes::interactive::components::WorkingStatusIndicator::new(
+                rpi_tui::tui::RenderHandle::new(|| {}),
+                "Working",
+                Arc::clone(&theme),
+            ),
+        ));
+        lock_editor(&editor).set_working_status_indicator(Some(Arc::clone(&indicator)));
+        let region = CustomEditorRegion::new(Arc::clone(&editor));
+        let lines = Component::render(&region, 20);
+        assert_eq!(strip_ansi(&lines[0]), "─".repeat(20), "plain border");
+        // The standalone row still renders with the default accent/muted
+        // colors (upstream asserts the accent and muted fg codes).
+        let standalone = Component::render(&*lock(&indicator), 20);
+        let joined = standalone.join("\n");
+        assert!(
+            joined.contains(theme.get_fg_ansi("accent")),
+            "accent spinner: {joined:?}"
+        );
+        assert!(
+            joined.contains(theme.get_fg_ansi("muted")),
+            "muted label: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn embeds_working_indicator_when_opted_in() {
+        let _guard = KEYBINDINGS_LOCK.lock().unwrap();
+        install_keybindings();
+        let tui = TuiHandle::from_main(TuiMainScreen::new(Box::new(
+            super::super::test_support::TestTerminal::new(),
+        )));
+        let theme = dark_theme();
+        let editor = Arc::new(Mutex::new(CustomEditor::new(
+            tui.clone(),
+            editor_theme_with(&theme),
+            EditorOptions::default(),
+            true,
+        )));
+        assert!(lock_editor(&editor).embed_working_status());
+        // Border color = thinkingHigh (upstream: `theme.getThinkingBorderColor("high")`).
+        lock_editor(&editor).set_border_color(Box::new({
+            let theme = Arc::clone(&theme);
+            move |text: &str| theme.fg("thinkingHigh", text)
+        }));
+        let indicator = Arc::new(Mutex::new(
+            crate::modes::interactive::components::WorkingStatusIndicator::with_color_fn(
+                rpi_tui::tui::RenderHandle::new(|| {}),
+                "Working",
+                Arc::clone(&theme),
+                None,
+                Box::new({
+                    let theme = Arc::clone(&theme);
+                    // Upstream: `(text) => editor.borderColor(text)` — here
+                    // the shared border color fn directly.
+                    move |text: &str| theme.fg("thinkingHigh", text)
+                }),
+            ),
+        ));
+        lock_editor(&editor).set_working_status_indicator(Some(indicator));
+
+        let region = CustomEditorRegion::new(Arc::clone(&editor));
+        let lines = Component::render(&region, 20);
+        let top = &lines[0];
+        assert_eq!(strip_ansi(top), "── ⠋ Working ───────");
+        assert_eq!(rpi_tui::utils::visible_width(top), 20);
+        // Four border-color applications (upstream: `topBorder.split(
+        // theme.getFgAnsi("thinkingHigh"))` has length 5).
+        let thinking_prefix = theme.get_fg_ansi("thinkingHigh");
+        assert_eq!(
+            top.matches(thinking_prefix).count(),
+            4,
+            "border runs + spinner + label"
+        );
     }
 
     #[test]
@@ -520,6 +715,7 @@ mod tests {
                 select_list: Arc::new(rpi_tui::components::select_list::SelectListTheme::identity()),
             },
             EditorOptions::default(),
+            false,
         )));
         let model_cycles = Arc::new(AtomicUsize::new(0));
         let cycles = model_cycles.clone();

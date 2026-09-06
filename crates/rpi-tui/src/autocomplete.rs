@@ -267,6 +267,7 @@ fn walk_directory_with_fd(
     query: &str,
     max_results: usize,
     abort: &AtomicBool,
+    max_depth: Option<usize>,
 ) -> Vec<(String, bool)> {
     if abort.load(Ordering::Relaxed) {
         return Vec::new();
@@ -290,6 +291,10 @@ fn walk_directory_with_fd(
         .arg(".git/*")
         .arg("--exclude")
         .arg(".git/**");
+
+    if let Some(max_depth) = max_depth {
+        command.arg("--max-depth").arg(max_depth.to_string());
+    }
 
     if to_display_path(query).contains('/') {
         command.arg("--full-path");
@@ -1033,8 +1038,32 @@ impl CombinedAutocompleteProvider {
         score
     }
 
+    /// `getBaseDirSuggestions` (autocomplete.ts:724-733 @ 9841914,
+    /// b37ebb7f2): the base directory's direct children (`--max-depth 1`),
+    /// merged ahead of the recursive results so shallow matches are not
+    /// flooded out by deep recursion hits.
+    fn get_base_dir_suggestions(
+        &self,
+        base_dir: &str,
+        query: &str,
+        abort: &AtomicBool,
+    ) -> Vec<(String, bool)> {
+        if self.fd_path.is_none() || abort.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+
+        walk_directory_with_fd(
+            base_dir,
+            self.fd_path.as_ref().expect("fd_path checked above"),
+            query,
+            100,
+            abort,
+            Some(1),
+        )
+    }
+
     /// Fuzzy file search using fd (fast, respects .gitignore)
-    /// (`getFuzzyFileSuggestions`, autocomplete.ts:720-772).
+    /// (`getFuzzyFileSuggestions`, autocomplete.ts:720-790 @ 9841914).
     fn get_fuzzy_file_suggestions(
         &self,
         query: &str,
@@ -1054,13 +1083,31 @@ impl CombinedAutocompleteProvider {
             .as_ref()
             .map(|scoped| scoped.query.clone())
             .unwrap_or_else(|| query.to_string());
-        let entries = walk_directory_with_fd(
+        // Shallow-first merge (b37ebb7f2): direct base-dir children first,
+        // then the recursive results deduplicated by path.
+        let base_dir_entries = self.get_base_dir_suggestions(&fd_base_dir, &fd_query, abort);
+        let recursive_entries = walk_directory_with_fd(
             &fd_base_dir,
             self.fd_path.as_ref().expect("fd_path checked above"),
             &fd_query,
             100,
             abort,
+            None,
         );
+        let mut seen_paths: std::collections::HashSet<String> = base_dir_entries
+            .iter()
+            .map(|entry| entry.0.clone())
+            .collect();
+        let entries: Vec<(String, bool)> = base_dir_entries
+            .into_iter()
+            .chain(recursive_entries.into_iter().filter(|entry| {
+                if seen_paths.contains(&entry.0) {
+                    return false;
+                }
+                seen_paths.insert(entry.0.clone());
+                true
+            }))
+            .collect();
         if abort.load(Ordering::Relaxed) {
             return Vec::new();
         }
@@ -1078,7 +1125,26 @@ impl CombinedAutocompleteProvider {
             .filter(|(_, _, score)| *score > 0)
             .collect();
 
-        scored_entries.sort_by_key(|entry| std::cmp::Reverse(entry.2));
+        scored_entries.sort_by(|a, b| {
+            // Same-score tie-break (b37ebb7f2, autocomplete.ts:771-785):
+            // shallower display path, then shorter path, then bytewise
+            // order (`localeCompare` → the port's bytewise `cmp` convention,
+            // see the module doc).
+            b.2.cmp(&a.2)
+                .then_with(|| {
+                    let a_depth = to_display_path(&a.0)
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .count();
+                    let b_depth = to_display_path(&b.0)
+                        .split('/')
+                        .filter(|s| !s.is_empty())
+                        .count();
+                    a_depth.cmp(&b_depth)
+                })
+                .then_with(|| a.0.len().cmp(&b.0.len()))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let top_entries: Vec<(String, bool, i32)> = scored_entries.into_iter().take(20).collect();
 
         let mut suggestions: Vec<AutocompleteItem> = Vec::new();
@@ -1640,6 +1706,90 @@ mod tests {
         assert!(!values
             .iter()
             .any(|value| value == "@../outside/nested/deeper/zzz.ts"));
+    }
+
+    /// Port of the upstream `it("ranks shallower same-score @ matches
+    /// before deeper matches")` (b37ebb7f2, #8669).
+    #[test]
+    fn ranks_shallower_same_score_at_matches_before_deeper_matches() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-root");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        temp.setup_folder(
+            "cwd",
+            &folder_structure(
+                &[
+                    "scope/aaa/venv/lib/python3.12/site-packages/pkg/core/profile",
+                    "scope/projects",
+                ],
+                &[],
+            ),
+        );
+
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), base_dir, Some(fd_path));
+        let line = "@scope/pro".to_string();
+        let result = get_suggestions(
+            &provider,
+            std::slice::from_ref(&line),
+            0,
+            line.chars().count(),
+            false,
+        );
+
+        let values = item_values(&result);
+        assert_eq!(values.first().map(String::as_str), Some("@scope/projects/"));
+        assert!(
+            values
+                .iter()
+                .any(|value| value
+                    == "@scope/aaa/venv/lib/python3.12/site-packages/pkg/core/profile/"),
+            "deep match kept: {values:?}"
+        );
+    }
+
+    /// Port of the upstream `it("includes scoped direct children when
+    /// recursive @ matches are flooded")` (b37ebb7f2).
+    #[test]
+    fn includes_scoped_direct_children_when_recursive_at_matches_are_flooded() {
+        let Some(fd_path) = fd_path() else {
+            eprintln!("skipping: fd is not installed");
+            return;
+        };
+        let temp = TempDir::new("pi-autocomplete-root");
+        let base_dir = temp.path.join("cwd").to_string_lossy().into_owned();
+        fs::create_dir_all(&base_dir).unwrap();
+        let flooded_dirs: Vec<String> = (0..250)
+            .map(|index| {
+                format!(
+                    "scope/a{:03}/venv/lib/python3.12/site-packages/pkg/core/profile",
+                    index + 1
+                )
+            })
+            .collect();
+        let mut dirs: Vec<&str> = vec!["scope/projects"];
+        dirs.extend(flooded_dirs.iter().map(String::as_str));
+        temp.setup_folder("cwd", &folder_structure(&dirs, &[]));
+
+        let provider = CombinedAutocompleteProvider::new(Vec::new(), base_dir, Some(fd_path));
+        let line = "@scope/pro".to_string();
+        let result = get_suggestions(
+            &provider,
+            std::slice::from_ref(&line),
+            0,
+            line.chars().count(),
+            false,
+        );
+
+        let values = item_values(&result);
+        assert_eq!(values.first().map(String::as_str), Some("@scope/projects/"));
+        assert!(
+            values.iter().any(|value| value.contains("/profile/")),
+            "deep fuzzy matches kept after direct children: {values:?}"
+        );
     }
 
     #[test]

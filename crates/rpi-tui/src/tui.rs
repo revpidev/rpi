@@ -214,6 +214,16 @@ pub trait Component: Send {
     /// override this and forward to their inherent `set_expanded`.)
     fn set_expanded(&mut self, _expanded: bool) {}
 
+    /// Thinking-block visibility toggle, mirroring upstream's
+    /// `child instanceof AssistantMessageComponent` walk
+    /// (`updateThinkingBlockVisibility`, interactive-mode.ts:4198-4205 @
+    /// 9841914, b07e17faa): the mode updates every assistant message in the
+    /// chat container in place instead of rebuilding the component tree.
+    /// Default: not an assistant message — a no-op, like upstream components
+    /// that are not `AssistantMessageComponent` instances. (V14-17
+    /// extension to the frozen contract; shared wrappers forward it.)
+    fn set_hide_thinking_block(&mut self, _hide: bool) {}
+
     /// Layout node for the T30 layout engine: replaces upstream's
     /// `LAYOUT_NODE` symbol protocol (`getLayoutNode`, layout-node.ts:48-51).
     /// Stack/scroll containers override this; the returned node borrows the

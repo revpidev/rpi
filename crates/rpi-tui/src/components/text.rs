@@ -90,15 +90,18 @@ impl Text {
         // Replace tabs with 3 spaces
         let normalized_text = text.replace('\t', "   ");
 
+        // Reduce margins when necessary so content and padding fit within
+        // the available width (f0c5d86d2, #8252; text.ts:63-65).
+        let padding_x = self.padding_x.min(width.saturating_sub(1) / 2);
         // Calculate content width (subtract left/right margins)
-        let content_width = width.saturating_sub(self.padding_x * 2).max(1);
+        let content_width = width.saturating_sub(padding_x * 2).max(1);
 
         // Wrap text (this preserves ANSI codes but does NOT pad)
         let wrapped_lines = wrap_text_with_ansi(&normalized_text, content_width);
 
         // Add margins and background to each line
-        let left_margin = " ".repeat(self.padding_x);
-        let right_margin = " ".repeat(self.padding_x);
+        let left_margin = " ".repeat(padding_x);
+        let right_margin = " ".repeat(padding_x);
         let mut content_lines: Vec<String> = Vec::new();
 
         for line in &wrapped_lines {
@@ -278,5 +281,26 @@ mod tests {
         let before = text.render(10);
         text.invalidate();
         assert_eq!(before, text.render(10));
+    }
+
+    /// Narrow terminals shrink padding so content and padding fit (f0c5d86d2,
+    /// #8252): effective paddingX = min(paddingX, floor((width-1)/2)).
+    #[test]
+    fn shrinks_padding_on_narrow_widths_so_content_fits() {
+        // width 3, padding 2 → effective padding 1, content width 1.
+        let text = Text::new("abcd", 2, 0, None);
+        for line in text.render(3) {
+            assert_eq!(visible_width(&line), 3, "line exceeds width: {line:?}");
+            assert!(strip_ansi(&line).starts_with(' '), "left margin kept");
+        }
+        // width 1, any padding → effective padding 0, content width 1.
+        let text = Text::new("ab", 5, 0, None);
+        for line in text.render(1) {
+            assert_eq!(visible_width(&line), 1, "line exceeds width: {line:?}");
+        }
+        // Wide widths keep the configured padding unchanged.
+        let text = Text::new("hi", 2, 0, None);
+        let lines = text.render(10);
+        assert_eq!(strip_ansi(&lines[0]), "  hi      ");
     }
 }

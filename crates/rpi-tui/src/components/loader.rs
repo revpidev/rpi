@@ -209,6 +209,23 @@ impl Loader {
         self.render_handle.request_render();
     }
 
+    /// The current frame, verbatim or spinner-colored
+    /// (`getRenderedIndicator`, loader.ts:88-91 @ 9841914, 1d9787c11).
+    /// Extracted so border-embedded status rendering can reuse the same
+    /// coloring decision as the standalone row.
+    pub fn get_rendered_indicator(&self) -> String {
+        let frame = self
+            .frames
+            .get(self.current_frame.load(Ordering::SeqCst))
+            .map(String::as_str)
+            .unwrap_or("");
+        if self.render_indicator_verbatim {
+            frame.to_string()
+        } else {
+            (self.spinner_color_fn)(frame)
+        }
+    }
+
     /// The display text for the current frame, computed on demand
     /// (upstream `updateDisplay`, loader.ts:84-87).
     fn display_text(&self) -> String {
@@ -217,11 +234,7 @@ impl Loader {
             .get(self.current_frame.load(Ordering::SeqCst))
             .map(String::as_str)
             .unwrap_or("");
-        let rendered_frame = if self.render_indicator_verbatim {
-            frame.to_string()
-        } else {
-            (self.spinner_color_fn)(frame)
-        };
+        let rendered_frame = self.get_rendered_indicator();
         let indicator = if frame.is_empty() {
             String::new()
         } else {
@@ -246,7 +259,12 @@ impl Component for Loader {
     }
 
     fn invalidate(&mut self) {
+        // Upstream `override invalidate()` (loader.ts:64-67 @ 9841914,
+        // 1d9787c11): clear the text cache, then re-evaluate the display
+        // (here: request a render; the display text is computed at render
+        // time, so spinner/message colors are re-read on the next frame).
         self.text.invalidate();
+        self.update_display();
     }
 }
 

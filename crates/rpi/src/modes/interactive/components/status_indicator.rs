@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use rpi_tui::components::loader::{Loader, LoaderIndicatorOptions};
 use rpi_tui::tui::{Component, RenderHandle};
+use rpi_tui::utils::truncate_to_width;
 
 use crate::core::themes::Theme;
 
@@ -66,6 +67,13 @@ impl StatusIndicator {
         self.loader.set_message(message);
     }
 
+    /// `Loader.getRenderedIndicator` (upstream inheritance; extracted in
+    /// 1d9787c11 so `WorkingStatusIndicator.renderSpinnerInBorder` can
+    /// reuse the spinner coloring).
+    pub fn get_rendered_indicator(&self) -> String {
+        self.loader.get_rendered_indicator()
+    }
+
     /// `dispose` (status-indicator.ts:24-26).
     pub fn dispose(&mut self) {
         self.loader.stop();
@@ -82,30 +90,20 @@ impl Component for StatusIndicator {
     }
 }
 
-/// `WorkingStatusIndicator` (status-indicator.ts:29-40): accent spinner,
-/// muted message.
+/// Shared color function type (`colorFn`, status-indicator.ts:33).
+type ColorFn = Box<dyn Fn(&str) -> String + Send + Sync>;
+
+/// `WorkingStatusIndicator` (status-indicator.ts:29-53 @ 9841914): accent
+/// spinner, muted message — or a single `colorFn` for both when the
+/// indicator is embedded in the editor border (1d9787c11: the color follows
+/// the thinking-level border color).
 pub struct WorkingStatusIndicator {
     inner: StatusIndicator,
 }
 
 impl WorkingStatusIndicator {
     pub fn new(render_handle: RenderHandle, message: impl Into<String>, theme: Arc<Theme>) -> Self {
-        Self {
-            inner: StatusIndicator::new(
-                StatusIndicatorKind::Working,
-                render_handle,
-                Box::new({
-                    let theme = Arc::clone(&theme);
-                    move |spinner: &str| theme.fg("accent", spinner)
-                }),
-                Box::new({
-                    let theme = Arc::clone(&theme);
-                    move |text: &str| theme.fg("muted", text)
-                }),
-                message,
-                None,
-            ),
-        }
+        Self::build(render_handle, message, theme, None, None)
     }
 
     /// With custom indicator frames/interval
@@ -116,28 +114,97 @@ impl WorkingStatusIndicator {
         theme: Arc<Theme>,
         indicator: Option<LoaderIndicatorOptions>,
     ) -> Self {
+        Self::build(render_handle, message, theme, indicator, None)
+    }
+
+    /// With an explicit color for BOTH spinner and message
+    /// (`colorFn`, status-indicator.ts:31-38 @ 9841914 — provided by the
+    /// interactive mode when the working indicator is embedded in the
+    /// editor border so it follows the thinking-level border color).
+    pub fn with_color_fn(
+        render_handle: RenderHandle,
+        message: impl Into<String>,
+        theme: Arc<Theme>,
+        indicator: Option<LoaderIndicatorOptions>,
+        color_fn: ColorFn,
+    ) -> Self {
+        Self::build(render_handle, message, theme, indicator, Some(color_fn))
+    }
+
+    fn build(
+        render_handle: RenderHandle,
+        message: impl Into<String>,
+        theme: Arc<Theme>,
+        indicator: Option<LoaderIndicatorOptions>,
+        color_fn: Option<ColorFn>,
+    ) -> Self {
+        let (spinner_color_fn, message_color_fn) = match color_fn {
+            Some(color_fn) => {
+                // The upstream constructor keeps the fn reference and calls
+                // it for both color slots; the port shares one `Arc` clone
+                // into both closures (same behavior for a pure color fn).
+                let color_fn: Arc<dyn Fn(&str) -> String + Send + Sync> = Arc::from(color_fn);
+                let spinner: ColorFn = {
+                    let color_fn = Arc::clone(&color_fn);
+                    Box::new(move |text: &str| color_fn(text))
+                };
+                let message: ColorFn = {
+                    let color_fn = Arc::clone(&color_fn);
+                    Box::new(move |text: &str| color_fn(text))
+                };
+                (spinner, message)
+            }
+            None => {
+                let spinner: ColorFn = {
+                    let theme = Arc::clone(&theme);
+                    Box::new(move |text: &str| theme.fg("accent", text))
+                };
+                let message: ColorFn = {
+                    let theme = Arc::clone(&theme);
+                    Box::new(move |text: &str| theme.fg("muted", text))
+                };
+                (spinner, message)
+            }
+        };
         WorkingStatusIndicator {
             inner: StatusIndicator::new(
                 StatusIndicatorKind::Working,
                 render_handle,
-                Box::new({
-                    let theme = Arc::clone(&theme);
-                    move |spinner: &str| theme.fg("accent", spinner)
-                }),
-                Box::new({
-                    let theme = Arc::clone(&theme);
-                    move |text: &str| theme.fg("muted", text)
-                }),
+                spinner_color_fn,
+                message_color_fn,
                 message,
                 indicator,
             ),
         }
     }
 
+    /// `renderInBorder` (status-indicator.ts:44-47 @ 9841914): the loader's
+    /// text line (leading margin stripped, trailing padding trimmed),
+    /// truncated to `width`.
+    pub fn render_in_border(&self, width: usize) -> String {
+        let line = self
+            .inner
+            .render(width + 2)
+            .get(1)
+            .cloned()
+            .unwrap_or_default();
+        let trimmed = line.strip_prefix(' ').unwrap_or(&line);
+        truncate_to_width(trimmed.trim_end(), width, "", false)
+    }
+
+    /// `renderSpinnerInBorder` (status-indicator.ts:49-51): spinner only.
+    pub fn render_spinner_in_border(&self, width: usize) -> String {
+        truncate_to_width(&self.inner.get_rendered_indicator(), width, "", false)
+    }
+
     pub fn dispose(&mut self) {
         self.inner.dispose();
     }
 }
+// No direct `BorderStatusProvider` impl: `Loader`'s render cache is a
+// `RefCell` (`Send` but not `Sync`); the shared form used by the editor
+// border is the `Arc<Mutex<WorkingStatusIndicator>>` adapter in
+// custom_editor.rs.
 
 impl Component for WorkingStatusIndicator {
     fn render(&self, width: usize) -> Vec<String> {
@@ -380,10 +447,54 @@ mod tests {
 
     #[test]
     fn working_indicator_renders_message() {
-        let indicator =
-            WorkingStatusIndicator::new(RenderHandle::new(|| {}), "Working...", theme());
+        let indicator = WorkingStatusIndicator::new(RenderHandle::new(|| {}), "Working", theme());
         let stripped = strip_ansi(&indicator.render(40).join("\n"));
-        assert!(stripped.contains("Working..."));
+        assert!(stripped.contains("Working"));
+    }
+
+    /// Port of the upstream `it("keeps the top border unchanged unless the
+    /// editor opts in")` / `it("embeds the working indicator when the editor
+    /// opts in")` border-slice assertions (status-indicator.test.ts @ 9841914,
+    /// 1d9787c11): `renderInBorder` returns the loader line without its
+    /// leading margin, `renderSpinnerInBorder` only the spinner.
+    #[test]
+    fn working_indicator_border_slices() {
+        let indicator = WorkingStatusIndicator::new(RenderHandle::new(|| {}), "Working", theme());
+        let in_border = indicator.render_in_border(20);
+        assert!(in_border.contains("⠋"), "spinner: {in_border:?}");
+        assert!(in_border.contains("Working"), "label: {in_border:?}");
+        assert!(!in_border.starts_with(' '), "leading margin stripped");
+        assert!(
+            in_border.contains(&theme().fg("accent", "⠋")),
+            "accent spinner"
+        );
+        assert!(
+            in_border.contains(&theme().fg("muted", "Working")),
+            "muted label"
+        );
+
+        let spinner_only = indicator.render_spinner_in_border(20);
+        assert!(spinner_only.contains("⠋"));
+        assert!(!spinner_only.contains("Working"));
+
+        // A shared color fn overrides both slots (embedded mode follows the
+        // editor border color, status-indicator.ts:31-38).
+        let shared = WorkingStatusIndicator::with_color_fn(
+            RenderHandle::new(|| {}),
+            "Working",
+            theme(),
+            None,
+            Box::new(|text: &str| format!("\x1b[35m{text}\x1b[39m")),
+        );
+        let in_border = shared.render_in_border(20);
+        assert!(
+            in_border.contains("\x1b[35m⠋"),
+            "shared color spinner: {in_border:?}"
+        );
+        assert!(
+            in_border.contains("\x1b[35mWorking"),
+            "shared color label: {in_border:?}"
+        );
     }
 
     #[test]

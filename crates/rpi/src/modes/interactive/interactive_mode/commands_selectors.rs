@@ -421,10 +421,11 @@ pub(crate) fn apply_settings_change(ui: &Arc<InteractiveUi>, change: SettingsCha
         SettingsChange::HideThinkingBlock(hidden) => {
             session.settings_manager(|s| s.set_hide_thinking_block(hidden));
             *lock(&ui.hide_thinking_block) = hidden;
-            // interactive-mode.ts:4229-4235. The upstream per-child
-            // `setHideThinkingBlock` loop is subsumed by the rebuild: new
-            // components read the flag at construction.
-            ui.rebuild_chat_from_messages();
+            // `onHideThinkingBlockChange` → `updateThinkingBlockVisibility()`
+            // (interactive-mode.ts:4668-4672 @ 9841914, b07e17faa): in-place
+            // per-child update instead of the clear+rebuild — live tool
+            // components keep their partial output.
+            ui.update_thinking_block_visibility();
         }
         SettingsChange::MermaidRenderingMode(mode) => {
             session.settings_manager(|s| s.set_mermaid_rendering_mode(mode));
@@ -3835,7 +3836,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_hide_thinking_block_change_rebuilds_chat() {
+    async fn settings_hide_thinking_block_change_updates_in_place() {
+        // G2 (b07e17faa): the setting now updates assistant messages in
+        // place (`updateThinkingBlockVisibility`) instead of rebuilding the
+        // chat container — non-entry chat children (status lines) survive.
         let (mode, _terminal, session, _tmp) = mode_harness().await;
         let ui = &mode.ui_state;
         {
@@ -3854,17 +3858,16 @@ mod tests {
         ui.render_initial_messages();
         let rendered = lock(&ui.chat_container).render(60).join("\n");
         assert!(rendered.contains("some reasoning"), "visible: {rendered}");
-        // Rebuild signal: a status line is a chat child but not a session
-        // entry, so only a rebuild removes it. (Child addresses are
-        // unreliable here — the allocator reuses them.)
-        ui.show_status("rebuild-sentinel");
+        // No-rebuild signal: a status line is a chat child but not a
+        // session entry, so only the in-place update keeps it.
+        ui.show_status("no-rebuild-sentinel");
 
         apply_settings_change(ui, SettingsChange::HideThinkingBlock(true));
         assert!(*lock(&ui.hide_thinking_block));
         assert!(session.settings_manager(|s| s.get_hide_thinking_block()));
 
         let rendered = lock(&ui.chat_container).render(60).join("\n");
-        assert!(!rendered.contains("rebuild-sentinel"), "chat rebuilt");
+        assert!(rendered.contains("no-rebuild-sentinel"), "chat NOT rebuilt");
         assert!(!rendered.contains("some reasoning"), "hidden: {rendered}");
         assert!(
             rendered.contains("Thinking..."),

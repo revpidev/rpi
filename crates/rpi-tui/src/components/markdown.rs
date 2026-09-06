@@ -204,10 +204,17 @@ impl Default for MarkdownOptions {
     }
 }
 
-/// `InlineStyleContext` (markdown.ts:105-108).
+/// `InlineStyleContext` (markdown.ts:105-108). The `wrap_style_prefix`
+/// field is an rpi addition carrying the prefix that table cell wrapping
+/// restores after each non-final fragment (`styleContext?.stylePrefix`,
+/// markdown.ts:966,989 @ 9841914): upstream's top-level `renderToken` call
+/// passes NO style context, so nothing is restored there even when a
+/// default text style is configured — the default context mirrors that
+/// with `""` while keeping its inline `style_prefix`.
 struct InlineStyleContext<'a> {
     apply_text: &'a dyn Fn(&str) -> String,
     style_prefix: &'a str,
+    wrap_style_prefix: &'a str,
 }
 
 /// Synthetic "space" block — the comrak equivalent of marked's `space`
@@ -1732,6 +1739,7 @@ impl Markdown {
                 let heading_style_context = InlineStyleContext {
                     apply_text: &heading_style_fn,
                     style_prefix: &heading_style_prefix,
+                    wrap_style_prefix: "",
                 };
 
                 let heading_text = self.render_inline_tokens(token, source, &heading_style_context);
@@ -1839,6 +1847,7 @@ impl Markdown {
                 let quote_style_context = InlineStyleContext {
                     apply_text: &|text: &str| text.to_string(),
                     style_prefix: &quote_style_prefix,
+                    wrap_style_prefix: &quote_style_prefix,
                 };
                 let source_start = node_start_offset(source, token);
                 let source_end = node_end_offset(source, token);
@@ -2214,7 +2223,11 @@ impl Markdown {
             .enumerate()
             .map(|(i, cell)| {
                 let text = self.render_inline_tokens(cell, source, style_context);
-                Self::wrap_cell_text(&text, column_widths[i] as usize)
+                Self::wrap_cell_text(
+                    &text,
+                    column_widths[i] as usize,
+                    style_context.wrap_style_prefix,
+                )
             })
             .collect();
         let header_line_count = header_cell_lines.iter().map(Vec::len).max().unwrap_or(0);
@@ -2253,7 +2266,11 @@ impl Markdown {
                 .filter(|(i, _)| *i < num_cols)
                 .map(|(i, cell)| {
                     let text = self.render_inline_tokens(cell, source, style_context);
-                    Self::wrap_cell_text(&text, column_widths[i] as usize)
+                    Self::wrap_cell_text(
+                        &text,
+                        column_widths[i] as usize,
+                        style_context.wrap_style_prefix,
+                    )
                 })
                 .collect();
             let row_line_count = row_cell_lines.iter().map(Vec::len).max().unwrap_or(0);
@@ -2294,9 +2311,26 @@ impl Markdown {
         lines
     }
 
-    /// `wrapCellText` (markdown.ts:677-679).
-    fn wrap_cell_text(text: &str, max_width: usize) -> Vec<String> {
-        wrap_text_with_ansi(text, max_width.max(1))
+    /// `wrapCellText` (markdown.ts:826-836 @ 9841914, 8f2ae3fad): after
+    /// each NON-final wrapped fragment, emit the exact style reset
+    /// `\x1b[22;23;24;25;27;28;29;39m` so link/code styles opened inside
+    /// the cell cannot leak into the borders and neighbor cells, then
+    /// restore the surrounding style prefix (byte-exact sequence — order
+    /// and semicolons are part of the contract).
+    fn wrap_cell_text(text: &str, max_width: usize, style_prefix: &str) -> Vec<String> {
+        let lines = wrap_text_with_ansi(text, max_width.max(1));
+        let last_index = lines.len().saturating_sub(1);
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if index < last_index {
+                    format!("{line}\x1b[22;23;24;25;27;28;29;39m{style_prefix}")
+                } else {
+                    format!("{line}{style_prefix}")
+                }
+            })
+            .collect()
     }
 }
 
@@ -2378,6 +2412,7 @@ impl Component for Markdown {
         let default_context = InlineStyleContext {
             apply_text: &|text: &str| self.apply_default_style(text),
             style_prefix: &default_style_prefix,
+            wrap_style_prefix: "",
         };
 
         for (index, block) in blocks.iter().enumerate() {
@@ -2891,6 +2926,114 @@ mod tests {
                 "Expected 2 borders, got {border_count}: {line:?}"
             );
         }
+    }
+
+    /// Port of the upstream `it("should not leak wrapped link styles into
+    /// table borders or plain cells")` (8f2ae3fad, #8363): byte-level
+    /// assertions on the reset the fix inserts between wrapped fragments
+    /// and the borders/neighbor cells.
+    #[test]
+    fn does_not_leak_wrapped_link_styles_into_table_borders_or_plain_cells() {
+        let markdown_text = "| Link | Plain |\n| --- | --- |\n| [**one two three four five six**](https://example.com) | normal text |";
+        for hyperlinks in [true, false] {
+            let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            set_capabilities(caps(hyperlinks));
+            let lines = md(markdown_text).render(24);
+
+            // Non-final wrapped link fragments end with the exact reset
+            // sequence before padding/borders.
+            let one_line = lines
+                .iter()
+                .find(|line| line.contains("one"))
+                .unwrap_or_else(|| panic!("missing first fragment in {lines:?}"));
+            assert!(
+                one_line.contains("\u{1b}[22;23;24;25;27;28;29;39m"),
+                "non-final fragment must reset styles: {one_line:?}"
+            );
+            // After the LAST reset on the row only padding and borders may
+            // follow (no leaked link/bold attributes on border columns).
+            let after_reset = one_line
+                .rsplit("\u{1b}[22;23;24;25;27;28;29;39m")
+                .next()
+                .unwrap_or_default();
+            assert!(
+                after_reset.chars().all(|c| c == ' ' || c == '│'),
+                "styles leaked past the reset into borders: {after_reset:?}"
+            );
+
+            // The final wrapped row (last content row above the bottom
+            // border) carries no reset: the cell content closed its styles.
+            let last_row = lines
+                .iter()
+                .rev()
+                .find(|line| line.starts_with('│'))
+                .unwrap_or_else(|| panic!("missing table rows in {lines:?}"));
+            assert!(
+                !last_row.contains("\u{1b}[22;23;24;25;27;28;29;39m"),
+                "final fragment must not reset: {last_row:?}"
+            );
+            reset_capabilities_cache();
+        }
+    }
+
+    /// Port of the upstream `it("should restore the enclosing style after a
+    /// wrapped table link")` (8f2ae3fad): inside a blockquote the reset is
+    /// followed by the quote style prefix so the table borders keep the
+    /// enclosing style.
+    #[test]
+    fn restores_the_enclosing_style_after_a_wrapped_table_link() {
+        let _guard = TEST_CAPS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_capabilities(caps(true));
+        let markdown = md(
+            "> | Link | Plain |\n> | --- | --- |\n> | [one two three four five six](https://example.com) | normal text |",
+        );
+        let lines = markdown.render(28);
+
+        let one_line = lines
+            .iter()
+            .find(|line| line.contains("one two"))
+            .unwrap_or_else(|| panic!("missing first quote fragment in {lines:?}"));
+        // Reset first, then the restored quote prefix (italic open) before
+        // the padding and border columns.
+        let restored = "\u{1b}[22;23;24;25;27;28;29;39m\u{1b}[3m\u{1b}[3m";
+        assert!(
+            one_line.contains(restored),
+            "reset must restore the quote prefix: {one_line:?}"
+        );
+        let after_restore = &one_line[one_line
+            .find(restored)
+            .map(|i| i + restored.len())
+            .unwrap_or(0)..];
+        let until_border = &after_restore[..after_border_len(after_restore)];
+        assert!(
+            until_border.chars().all(|c| c == ' ' || c == '│'),
+            "quote table border leaked styles: {after_restore:?}"
+        );
+
+        // The final fragment gets the prefix without the reset.
+        let five_line = lines
+            .iter()
+            .find(|line| line.contains("five six"))
+            .unwrap_or_else(|| panic!("missing final quote fragment in {lines:?}"));
+        assert!(
+            !five_line.contains("\u{1b}[22;23;24;25;27;28;29;39m"),
+            "final fragment must not reset: {five_line:?}"
+        );
+        reset_capabilities_cache();
+    }
+
+    /// Length of the leading run of padding/border characters (up to and
+    /// including the first border column) after a restored style prefix.
+    fn after_border_len(text: &str) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        let mut end = 0;
+        for (index, c) in chars.iter().enumerate() {
+            if *c == '│' {
+                end = index + 1;
+                break;
+            }
+        }
+        chars[..end].iter().map(|c| c.len_utf8()).sum()
     }
 
     #[test]

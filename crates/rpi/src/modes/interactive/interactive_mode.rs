@@ -626,6 +626,12 @@ impl<T: Component> Component for SharedChild<T> {
     fn set_expanded(&mut self, expanded: bool) {
         lock(&self.0).set_expanded(expanded);
     }
+
+    /// Forwards the chat-region walk's thinking-visibility toggle to the
+    /// wrapped component (upstream shares the component object itself).
+    fn set_hide_thinking_block(&mut self, hide: bool) {
+        lock(&self.0).set_hide_thinking_block(hide);
+    }
 }
 
 /// Tree entry for a shared focusable component (selectors, T12-S5a): the
@@ -755,10 +761,16 @@ struct StreamingTrack {
 }
 
 /// The status container's active indicator (upstream `activeStatusIndicator`
-/// + `idleStatus`; `Idle` renders nothing).
+/// and `idleStatus`; `Idle` renders nothing). The working variant tracks
+/// whether it is embedded in the editor border
+/// (`activeWorkingIndicatorEmbedded`, interactive-mode.ts:407 @ 9841914,
+/// 1d9787c11): embedded indicators render nothing in the status row.
 enum ActiveStatus {
     Idle,
-    Working(WorkingStatusIndicator),
+    Working {
+        indicator: Arc<Mutex<WorkingStatusIndicator>>,
+        embedded: bool,
+    },
     Retry(RetryStatusIndicator),
     Compaction(CompactionStatusIndicator),
     BranchSummary(BranchSummaryStatusIndicator),
@@ -768,7 +780,7 @@ impl ActiveStatus {
     fn kind(&self) -> Option<StatusIndicatorKind> {
         match self {
             ActiveStatus::Idle => None,
-            ActiveStatus::Working(_) => Some(StatusIndicatorKind::Working),
+            ActiveStatus::Working { .. } => Some(StatusIndicatorKind::Working),
             ActiveStatus::Retry(_) => Some(StatusIndicatorKind::Retry),
             ActiveStatus::Compaction(_) => Some(StatusIndicatorKind::Compaction),
             ActiveStatus::BranchSummary(_) => Some(StatusIndicatorKind::BranchSummary),
@@ -778,7 +790,7 @@ impl ActiveStatus {
     fn dispose(&mut self) {
         match self {
             ActiveStatus::Idle => {}
-            ActiveStatus::Working(indicator) => indicator.dispose(),
+            ActiveStatus::Working { indicator, .. } => lock(indicator).dispose(),
             ActiveStatus::Retry(indicator) => indicator.dispose(),
             ActiveStatus::Compaction(indicator) => indicator.dispose(),
             ActiveStatus::BranchSummary(indicator) => indicator.dispose(),
@@ -790,7 +802,14 @@ impl Component for ActiveStatus {
     fn render(&self, width: usize) -> Vec<String> {
         match self {
             ActiveStatus::Idle => Vec::new(),
-            ActiveStatus::Working(indicator) => indicator.render(width),
+            // The embedded indicator lives in the editor's top border; the
+            // status row stays empty (showStatusIndicator,
+            // interactive-mode.ts:2101-2106).
+            ActiveStatus::Working { embedded: true, .. } => Vec::new(),
+            ActiveStatus::Working {
+                indicator,
+                embedded: false,
+            } => lock(indicator).render(width),
             ActiveStatus::Retry(indicator) => indicator.render(width),
             ActiveStatus::Compaction(indicator) => indicator.render(width),
             ActiveStatus::BranchSummary(indicator) => indicator.render(width),
@@ -800,7 +819,7 @@ impl Component for ActiveStatus {
     fn invalidate(&mut self) {
         match self {
             ActiveStatus::Idle => {}
-            ActiveStatus::Working(indicator) => indicator.invalidate(),
+            ActiveStatus::Working { indicator, .. } => lock(indicator).invalidate(),
             ActiveStatus::Retry(indicator) => indicator.invalidate(),
             ActiveStatus::Compaction(indicator) => indicator.invalidate(),
             ActiveStatus::BranchSummary(indicator) => indicator.invalidate(),
@@ -956,6 +975,9 @@ fn tool_result_state_from_value(value: &serde_json::Value, is_error: bool) -> To
         details,
     }
 }
+
+/// Shared border-color slot type (see `InteractiveUi::border_color_slot`).
+type BorderColorSlot = Arc<Mutex<Arc<dyn Fn(&str) -> String + Send + Sync>>>;
 
 /// `getThinkingBorderColor` (theme.ts:407-425): map the thinking level to
 /// its dedicated theme color.
@@ -1234,6 +1256,13 @@ pub(crate) struct InteractiveUi {
 
     /// `isBashMode` (interactive-mode.ts:386).
     is_bash_mode: Mutex<bool>,
+    /// Shared copy of the editor border color fn (rpi seam for upstream's
+    /// `(text) => this.editor.borderColor(text)` colorFn,
+    /// interactive-mode.ts:2136-2139 @ 9841914): `update_editor_border_color`
+    /// writes it, the embedded working indicator reads it at render time so
+    /// thinking-level changes recolor the spinner without rebuilding it.
+    /// A leaf lock — nothing locks the editor while holding it (no cycles).
+    border_color_slot: BorderColorSlot,
     /// `bashComponent` (interactive-mode.ts:346) — the latest bash execution
     /// component; streaming output is appended through it (written by
     /// `handle_bash_command`, cleared on completion).
@@ -1713,14 +1742,7 @@ impl InteractiveUi {
                     lock(&self.editor).on_escape = Some(handler);
                 }
                 if self.working_visible.load(Ordering::Relaxed) {
-                    let message = lock(&self.working_message)
-                        .clone()
-                        .unwrap_or_else(|| "Working...".to_string());
-                    self.show_status_indicator(ActiveStatus::Working(WorkingStatusIndicator::new(
-                        self.render_handle.clone(),
-                        message,
-                        Arc::clone(&lock(&self.theme)),
-                    )));
+                    self.show_working_status_indicator(None);
                 } else {
                     self.clear_status_indicator(Some(StatusIndicatorKind::Working));
                 }
@@ -1757,10 +1779,17 @@ impl InteractiveUi {
                 self.render_handle.request_render();
             }
             UiCommand::ThinkingLevelChanged(level) => {
-                // thinking_level_changed (interactive-mode.ts:2900-2903).
+                // thinking_level_changed (interactive-mode.ts:2900-2903 @
+                // 9841914, 1d9787c11): refresh the footer, re-tint the editor
+                // border and invalidate the working indicator so its
+                // spinner/label re-render in the new border color.
                 let _ = level;
                 Component::invalidate(&mut *lock(&self.footer));
                 self.update_editor_border_color();
+                let mut status = lock(&self.status);
+                if status.kind() == Some(StatusIndicatorKind::Working) {
+                    status.invalidate();
+                }
             }
             UiCommand::MessageStart(message) => {
                 // message_start (interactive-mode.ts:2905-2926).
@@ -2610,14 +2639,47 @@ impl InteractiveUi {
         ui.show_selector(entry);
     }
 
-    /// `showStatusIndicator` (interactive-mode.ts:1851-1856).
+    /// `setEditorWorkingStatusIndicator` (interactive-mode.ts:2094-2099
+    /// @ 9841914): clear the default editor's slot, then install on the
+    /// active editor if it embeds the working status. The port's only
+    /// `CustomEditor` is the default editor (extension editor trees replace
+    /// the container content but are declarative, never `CustomEditor`
+    /// subclasses), so the embed decision is its `embed_working_status`
+    /// flag — mirrors upstream's `isWorkingStatusEditor(this.editor)`.
+    fn set_editor_working_status_indicator(
+        &self,
+        indicator: Option<&Arc<Mutex<WorkingStatusIndicator>>>,
+    ) -> bool {
+        lock(&self.editor).set_working_status_indicator(indicator.cloned());
+        lock(&self.editor).embed_working_status()
+    }
+
+    /// `showStatusIndicator` (interactive-mode.ts:2092-2107 @ 9841914): the
+    /// working indicator embeds into the editor border when possible; the
+    /// status row only hosts what is not embedded.
     fn show_status_indicator(&self, indicator: ActiveStatus) {
+        let indicator = match indicator {
+            ActiveStatus::Working { indicator, .. } => {
+                let embedded = self.set_editor_working_status_indicator(Some(&indicator));
+                ActiveStatus::Working {
+                    indicator,
+                    embedded,
+                }
+            }
+            other => {
+                self.set_editor_working_status_indicator(None);
+                other
+            }
+        };
         let mut status = lock(&self.status);
         status.dispose();
         *status = indicator;
     }
 
-    /// `clearStatusIndicator` (interactive-mode.ts:1858-1869).
+    /// `clearStatusIndicator` (interactive-mode.ts:2109-2126 @ 9841914):
+    /// dispose, clear the editor slot too (embedded or not), and — the
+    /// idle-status re-add branch is a no-op here because `Idle` renders
+    /// nothing (rpi reserves no status-row height; see the v0.1 baseline).
     fn clear_status_indicator(&self, kind: Option<StatusIndicatorKind>) {
         let mut status = lock(&self.status);
         if let Some(kind) = kind {
@@ -2627,6 +2689,8 @@ impl InteractiveUi {
         }
         status.dispose();
         *status = ActiveStatus::Idle;
+        drop(status);
+        self.set_editor_working_status_indicator(None);
     }
 
     // ==================================================================
@@ -2641,28 +2705,47 @@ impl InteractiveUi {
         &self,
         indicator: Option<rpi_ext_host::api::WorkingIndicatorOptions>,
     ) {
-        let active = matches!(&*lock(&self.status), ActiveStatus::Working(_));
+        let active = matches!(&*lock(&self.status), ActiveStatus::Working { .. });
         if !self.working_visible.load(Ordering::Relaxed) {
             self.clear_status_indicator(Some(StatusIndicatorKind::Working));
         } else if active {
-            let message = lock(&self.working_message)
-                .clone()
-                .unwrap_or_else(|| "Working...".to_string());
-            let theme = Arc::clone(&lock(&self.theme));
             let indicator = indicator.map(|options| LoaderIndicatorOptions {
                 frames: options.frames,
                 interval_ms: options.interval_ms,
             });
-            self.show_status_indicator(ActiveStatus::Working(
-                WorkingStatusIndicator::with_options(
-                    self.render_handle.clone(),
-                    message,
-                    theme,
-                    indicator,
-                ),
-            ));
+            self.show_working_status_indicator(indicator);
         }
         self.render_handle.request_render();
+    }
+
+    /// `showWorkingStatusIndicator` (interactive-mode.ts:2128-2143 @ 9841914,
+    /// 1d9787c11): build the working indicator with a colorFn that follows
+    /// the editor border color — the thinking-level color, or bash mode —
+    /// so spinner and label match the border; the mode's only editor embeds
+    /// it (the default `CustomEditor` opts in).
+    fn show_working_status_indicator(&self, indicator: Option<LoaderIndicatorOptions>) {
+        // `defaultWorkingMessage` (interactive-mode.ts:411 @ 9841914):
+        // "Working" (was "Working..." before 1d9787c11).
+        let message = lock(&self.working_message)
+            .clone()
+            .unwrap_or_else(|| "Working".to_string());
+        let theme = Arc::clone(&lock(&self.theme));
+        let slot = Arc::clone(&self.border_color_slot);
+        let color_fn = Box::new(move |text: &str| {
+            let color = Arc::clone(&lock(&slot));
+            color(text)
+        });
+        self.show_status_indicator(ActiveStatus::Working {
+            indicator: Arc::new(Mutex::new(WorkingStatusIndicator::with_color_fn(
+                self.render_handle.clone(),
+                message,
+                theme,
+                indicator,
+                color_fn,
+            ))),
+            // `showStatusIndicator` decides the final embed state.
+            embedded: false,
+        });
     }
 
     /// `setHeader`/`setFooter` region swap: a declarative tree replaces the
@@ -3637,13 +3720,20 @@ impl InteractiveUi {
     }
 
     fn update_editor_border_color(&self) {
-        let border_color = if *lock(&self.is_bash_mode) {
+        let border_color: Arc<dyn Fn(&str) -> String + Send + Sync> = if *lock(&self.is_bash_mode) {
             let theme = Arc::clone(&lock(&self.theme));
-            Box::new(move |text: &str| theme.fg("bashMode", text))
+            Arc::new(move |text: &str| theme.fg("bashMode", text))
         } else {
-            thinking_border_color(&lock(&self.theme), self.session().thinking_level())
+            Arc::from(thinking_border_color(
+                &lock(&self.theme),
+                self.session().thinking_level(),
+            ))
         };
-        lock(&self.editor).set_border_color(border_color);
+        // Share the current color with the embedded working indicator
+        // (upstream reads `this.editor.borderColor` live through colorFn).
+        *lock(&self.border_color_slot) = Arc::clone(&border_color);
+        let editor_color = Arc::clone(&border_color);
+        lock(&self.editor).set_border_color(Box::new(move |text: &str| editor_color(text)));
         self.render_handle.request_render();
     }
 
@@ -3714,19 +3804,40 @@ impl InteractiveUi {
         self.render_handle.request_render();
     }
 
-    /// `toggleThinkingBlockVisibility` (interactive-mode.ts:3828-3835).
+    /// `updateThinkingBlockVisibility` (interactive-mode.ts:4198-4205 @
+    /// 9841914, b07e17faa): update every assistant message in the chat
+    /// container in place — no clear/rebuild, so streaming tool components
+    /// keep their partial output and the component tree identity is
+    /// preserved.
+    fn update_thinking_block_visibility(&self) {
+        let hide = {
+            let h = lock(&self.hide_thinking_block);
+            *h
+        };
+        let mut chat = lock(&self.chat_container);
+        for child in chat.children.iter_mut() {
+            child.set_hide_thinking_block(hide);
+        }
+        drop(chat);
+        self.render_handle.request_render();
+    }
+
+    /// `toggleThinkingBlockVisibility` (interactive-mode.ts:4207-4214 @
+    /// 9841914, b07e17faa).
     fn toggle_thinking_block_visibility(&self) {
-        let mut hide = lock(&self.hide_thinking_block);
-        *hide = !*hide;
-        let hide = *hide;
+        // Scoped guard (a shadowed `drop` would drop the copy, not the lock).
+        let hide = {
+            let mut guard = lock(&self.hide_thinking_block);
+            *guard = !*guard;
+            *guard
+        };
         self.session()
             .settings_manager(|settings| settings.set_hide_thinking_block(hide));
-        if let Some(track) = lock(&self.streaming).as_ref() {
-            lock(&track.handle).set_hide_thinking_block(hide);
-        }
-        // Historical assistant messages keep their current state (matches
-        // upstream, which only updates the streaming component here).
-        self.render_handle.request_render();
+        self.update_thinking_block_visibility();
+        self.show_status(&format!(
+            "Thinking blocks: {}",
+            if hide { "hidden" } else { "visible" }
+        ));
     }
 
     /// `handleCtrlC` (interactive-mode.ts:3533-3541).
@@ -4134,6 +4245,10 @@ impl InteractiveMode {
                         .min(20) as usize,
                 ),
             },
+            // The default editor embeds the working status in its border
+            // (`embedWorkingStatus: true`, interactive-mode.ts:561 @ 9841914,
+            // 1d9787c11); custom editors keep the standalone row.
+            true,
         )));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -4197,6 +4312,14 @@ impl InteractiveMode {
             last_status_spacer: Mutex::new(None),
             last_status_text: Mutex::new(None),
             is_bash_mode: Mutex::new(false),
+            // Initial value mirrors the editor's construction-time border
+            // color (`editor_theme` → `borderMuted`); `update_editor_border_color`
+            // replaces it on init and on every thinking-level/theme change.
+            border_color_slot: Arc::new(Mutex::new({
+                let theme = Arc::clone(&theme);
+                Arc::new(move |text: &str| theme.fg("borderMuted", text))
+                    as Arc<dyn Fn(&str) -> String + Send + Sync>
+            })),
             bash_component: Mutex::new(None),
             pending_bash_components: Mutex::new(Vec::new()),
             share_runner: Mutex::new(Arc::new(crate::core::share::SystemShareRunner)),
@@ -5795,6 +5918,53 @@ mod tests {
         assert!(rendered.join("\n").contains("hi"));
     }
 
+    /// Port of the upstream regression
+    /// `8611-thinking-toggle-pending-bash-output.test.ts` (b07e17faa):
+    /// toggling thinking visibility updates assistant messages in place —
+    /// a running Bash tool's partial output stays in the chat and the
+    /// component stays mounted.
+    #[tokio::test]
+    async fn thinking_toggle_preserves_pending_bash_output() {
+        let (mode, _terminal, session) = mode_harness().await;
+        let ui = &mode.ui_state;
+
+        let mut component = ui.new_tool_execution_component(
+            "bash",
+            "tool-8611",
+            &serde_json::json!({"command": "echo first; sleep 10"}),
+        );
+        component.mark_execution_started();
+        component.update_result(
+            ToolResultState {
+                content: vec![ToolResultContentLoose::text("first")],
+                is_error: false,
+                details: None,
+            },
+            true,
+        );
+        let component = Arc::new(Mutex::new(component));
+        ui.add_chat_child(Box::new(SharedChild(Arc::clone(&component))));
+
+        let render_chat = || lock(&ui.chat_container).render(120).join("\n");
+        assert!(render_chat().contains("first"), "partial output visible");
+
+        ui.toggle_thinking_block_visibility();
+
+        // `settingsManager.setHideThinkingBlock(true)` persisted.
+        assert!(session.settings_manager(|s| s.get_hide_thinking_block()));
+        // The component is still mounted with its partial output (no
+        // clear+rebuild) — the status line ("Thinking blocks: hidden") adds
+        // its spacer/text pair on top.
+        let still_mounted = lock(&ui.chat_container)
+            .children
+            .iter()
+            .any(|child| child.render(120).join("\n").contains("first"));
+        assert!(still_mounted, "tool component still mounted");
+        let rendered = render_chat();
+        assert!(rendered.contains("first"), "partial output preserved");
+        assert!(rendered.contains("Thinking blocks: hidden"));
+    }
+
     #[tokio::test]
     async fn message_update_adds_tool_component_once_and_updates_args() {
         let (mode, _terminal, _session) = mode_harness().await;
@@ -6146,13 +6316,53 @@ mod tests {
         let ui = &mode.ui_state;
         ui.push(UiCommand::AgentStart);
         ui.drain_events();
-        assert!(matches!(*lock(&ui.status), ActiveStatus::Working(_)));
+        assert!(matches!(*lock(&ui.status), ActiveStatus::Working { .. }));
         // showTerminalProgress is off by default; the status indicator is
         // the observable part.
         ui.push(UiCommand::AgentEnd);
         ui.drain_events();
         assert!(matches!(*lock(&ui.status), ActiveStatus::Idle));
         let _ = terminal;
+    }
+
+    /// 1d9787c11 port: the working indicator embeds in the default editor's
+    /// top border ("Working" label, thinking-level border color) and the
+    /// status row renders nothing while embedded.
+    #[tokio::test]
+    async fn working_indicator_embeds_in_editor_border() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::AgentStart);
+        ui.drain_events();
+
+        let status = lock(&ui.status);
+        match &*status {
+            ActiveStatus::Working { embedded, .. } => {
+                assert!(embedded, "default editor embeds the working status");
+            }
+            _ => panic!("expected working status"),
+        }
+        drop(status);
+        // The status row renders nothing while embedded (the editor border
+        // hosts the spinner).
+        assert!(Component::render(&*lock(&ui.status), 40).is_empty());
+        // The editor top border carries the spinner and the "Working" label
+        // (default message, interactive-mode.ts:411 @ 9841914). Rendered
+        // through the mounted editor region, like the TUI does.
+        let border = |width: usize| {
+            let region = lock(&ui.editor_region);
+            let lines = (**region).render(width);
+            lines.first().cloned().unwrap_or_default()
+        };
+        let top = border(20);
+        assert!(top.contains("⠋"), "spinner in border: {top:?}");
+        assert!(top.contains("Working"), "label in border: {top:?}");
+
+        ui.push(UiCommand::AgentEnd);
+        ui.drain_events();
+        // Cleared: the editor slot is empty again.
+        assert!(matches!(*lock(&ui.status), ActiveStatus::Idle));
+        assert!(!border(20).contains("Working"));
     }
 
     // ---------------------------------------------------------------------

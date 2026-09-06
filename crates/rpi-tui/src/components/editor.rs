@@ -510,17 +510,32 @@ fn build_debounce_pattern(trigger_characters: &[char]) -> Regex {
     .expect("static debounce pattern")
 }
 
-/// `createScrollBorder` (editor.ts:259-268): `─── ↑ N more ` padded with
-/// `─`, or truncated with an ellipsis when narrower than the indicator.
+/// `createScrollBorder` (editor.ts:259-272 @ 9841914): the centered
+/// ` ↑ N more ` label when it fits with at least one `─` on each side
+/// (1d9787c11), else the left-aligned `─── ↑ N more ` padded with `─`, or
+/// truncated with an ellipsis when narrower than the indicator.
 fn create_scroll_border(direction: &str, hidden_line_count: usize, width: usize) -> String {
     let available_width = width;
+    let label = format!(" {direction} {hidden_line_count} more ");
+    let label_width = visible_width(&label);
+    if label_width + 2 <= available_width {
+        let left_width = (available_width - label_width) / 2;
+        return format!(
+            "{}{label}{}",
+            "─".repeat(left_width),
+            "─".repeat(available_width - left_width - label_width)
+        );
+    }
+
     let indicator = format!("─── {direction} {hidden_line_count} more ");
     let remaining = available_width as i64 - visible_width(&indicator) as i64;
     if remaining >= 0 {
         return format!("{indicator}{}", "─".repeat(remaining as usize));
     }
 
-    let ellipsis = "...";
+    // `"...".slice(0, availableWidth)` — the ellipsis itself shrinks on
+    // very narrow widths (editor.ts:270).
+    let ellipsis = &"..."[.."...".len().min(available_width)];
     let ellipsis_width = visible_width(ellipsis);
     let indicator_width = available_width.saturating_sub(ellipsis_width);
     format!(
@@ -528,6 +543,20 @@ fn create_scroll_border(direction: &str, hidden_line_count: usize, width: usize)
         slice_by_column(&indicator, 0, indicator_width, true),
         ellipsis
     )
+}
+
+/// Working-status rendering hooks for the editor's top border
+/// (`CustomEditor.renderTopBorder`, custom-editor.ts:39-76 @ 9841914,
+/// 1d9787c11). Upstream subclasses `Editor` and overrides the border
+/// method with a `WorkingStatusIndicator`; the Rust port composes
+/// `Editor`, so the embeddable status is injected as a trait object
+/// instead (the two methods mirror `renderInBorder`/
+/// `renderSpinnerInBorder`, status-indicator.ts:43-53).
+pub trait BorderStatusProvider: Send + Sync {
+    /// The full "spinner label" line for the border, truncated to `width`.
+    fn render_in_border(&self, width: usize) -> String;
+    /// The spinner-only fallback for narrow borders.
+    fn render_spinner_in_border(&self, width: usize) -> String;
 }
 
 /// Last editing action, for kill-ring accumulation and undo coalescing
@@ -628,6 +657,13 @@ pub struct Editor {
     /// editor.ts:291).
     pub border_color: Box<dyn Fn(&str) -> String + Send + Sync>,
 
+    /// Border-embedded working status (upstream: the `WorkingStatusIndicator`
+    /// reference `CustomEditor` holds and renders inside `renderTopBorder`,
+    /// custom-editor.ts:39-76 @ 9841914, 1d9787c11). The port composes
+    /// `Editor` instead of subclassing, so the status is injected as a
+    /// [`BorderStatusProvider`]; `None` renders plain borders.
+    border_status: Option<Arc<dyn BorderStatusProvider>>,
+
     // Autocomplete support (editor.ts:294-306)
     autocomplete_provider: Option<Arc<dyn AutocompleteProvider>>,
     autocomplete_trigger_characters: Vec<char>,
@@ -712,6 +748,7 @@ impl Editor {
             rendered_visible_line_count: Cell::new(1),
             rendered_autocomplete_height: Cell::new(0),
             border_color,
+            border_status: None,
             autocomplete_provider: None,
             autocomplete_trigger_characters: trigger_characters,
             autocomplete_trigger_pattern: trigger_pattern,
@@ -2934,6 +2971,105 @@ fn csi_u_paste_decode_regex() -> &'static Regex {
 /// Layout the text into visual lines (upstream `layoutText`,
 /// editor.ts:893-979).
 impl Editor {
+    /// `setWorkingStatusIndicator` (custom-editor.ts:24-26 @ 9841914):
+    /// install/clear the border-embedded working status. The embedding
+    /// opt-in gate lives with `CustomEditor` in the rpi crate (upstream
+    /// gates at render time on `embedWorkingStatus`).
+    pub fn set_border_status(&mut self, status: Option<Arc<dyn BorderStatusProvider>>) {
+        self.border_status = status;
+    }
+
+    /// `renderTopBorder` (editor.ts:498-501 @ 9841914): plain border with
+    /// the scroll indicator, or the embedded working-status layout
+    /// (`CustomEditor.renderTopBorder`, custom-editor.ts:39-76) when a
+    /// [`BorderStatusProvider`] is installed.
+    pub fn render_top_border(&self, width: usize, hidden_line_count: usize) -> String {
+        if let Some(embedded) = self.embedded_border_status(width, hidden_line_count) {
+            return embedded;
+        }
+        let border = if hidden_line_count > 0 {
+            create_scroll_border("↑", hidden_line_count, width)
+        } else {
+            "─".repeat(width)
+        };
+        (self.border_color)(&border)
+    }
+
+    /// `renderBottomBorder` (editor.ts:503-505 @ 9841914): plain border
+    /// with the scroll indicator when content continues below.
+    pub fn render_bottom_border(&self, width: usize, hidden_line_count: usize) -> String {
+        let border = if hidden_line_count > 0 {
+            create_scroll_border("↓", hidden_line_count, width)
+        } else {
+            "─".repeat(width)
+        };
+        (self.border_color)(&border)
+    }
+
+    /// The embedded-status top border (`CustomEditor.renderTopBorder`
+    /// override, custom-editor.ts:39-76 @ 9841914, byte-for-byte layout);
+    /// `None` = plain border (no status, zero-width status, or `width == 0`).
+    fn embedded_border_status(&self, width: usize, hidden_line_count: usize) -> Option<String> {
+        let status_provider = self.border_status.as_ref()?;
+        if width == 0 {
+            return None;
+        }
+        let mut status = status_provider.render_in_border(width.saturating_sub(5).max(1));
+        let mut status_width = visible_width(&status);
+        if status_width == 0 {
+            return None;
+        }
+
+        let overflow_label =
+            (hidden_line_count > 0).then(|| format!(" ↑ {hidden_line_count} more "));
+        let overflow_label_width = overflow_label.as_deref().map_or(0, visible_width);
+        let overflow_start = (width - overflow_label_width) / 2;
+        // `canFitOverflow` is re-evaluated with the CURRENT status width
+        // after each refit (upstream's closure reads the live variable).
+        let can_fit_overflow = |status_width: usize| {
+            overflow_label.is_some()
+                && overflow_label_width + 2 <= width
+                && overflow_start > 3 + status_width + 1
+        };
+
+        if overflow_label.is_some() && !can_fit_overflow(status_width) {
+            status = status_provider.render_spinner_in_border(width);
+            status_width = visible_width(&status);
+        }
+
+        if can_fit_overflow(status_width) {
+            let overflow_label = overflow_label.as_deref().unwrap_or("");
+            let left_block_width = 3 + status_width + 1;
+            return Some(format!(
+                "{}{status}{}",
+                (self.border_color)("── "),
+                (self.border_color)(&format!(
+                    " {}{overflow_label}{}",
+                    "─".repeat(overflow_start - left_block_width),
+                    "─".repeat(width - overflow_start - overflow_label_width)
+                ))
+            ));
+        }
+
+        if width >= status_width + 5 {
+            return Some(format!(
+                "{}{status}{}",
+                (self.border_color)("── "),
+                (self.border_color)(&format!(" {}", "─".repeat(width - status_width - 4)))
+            ));
+        }
+
+        status = status_provider.render_spinner_in_border(width);
+        status_width = visible_width(&status);
+        let prefix_width = 3.min(width.saturating_sub(status_width));
+        let suffix_width = width.saturating_sub(prefix_width + status_width);
+        Some(format!(
+            "{}{status}{}",
+            (self.border_color)(&"─".repeat(prefix_width)),
+            (self.border_color)(&"─".repeat(suffix_width))
+        ))
+    }
+
     fn layout_text(&self, content_width: usize) -> Vec<LayoutLine> {
         let mut layout_lines: Vec<LayoutLine> = Vec::new();
 
@@ -3052,8 +3188,6 @@ impl Component for Editor {
         // Store for cursor navigation (must match wrapping width).
         self.last_width.set(layout_width);
 
-        let horizontal = (self.border_color)("─");
-
         // Layout the text.
         let layout_lines = self.layout_text(layout_width);
 
@@ -3092,13 +3226,10 @@ impl Component for Editor {
         let left_padding = " ".repeat(padding_x);
         let right_padding = left_padding.clone();
 
-        // Render top border (with scroll indicator if scrolled down).
-        if scroll_offset > 0 {
-            let border = create_scroll_border("↑", scroll_offset, width);
-            result.push((self.border_color)(&border));
-        } else {
-            result.push(horizontal.repeat(width));
-        }
+        // Render top border (with scroll indicator if scrolled down);
+        // `renderTopBorder` also hosts the embedded working status
+        // (1d9787c11).
+        result.push(self.render_top_border(width, scroll_offset));
 
         // Render each visible layout line.
         // Emit hardware cursor marker when focused so TUI can position the
@@ -3170,12 +3301,7 @@ impl Component for Editor {
 
         // Render bottom border (with scroll indicator if more content below).
         let lines_below = layout_lines.len() - (scroll_offset + visible_lines.len());
-        if lines_below > 0 {
-            let border = create_scroll_border("↓", lines_below, width);
-            result.push((self.border_color)(&border));
-        } else {
-            result.push(horizontal.repeat(width));
-        }
+        result.push(self.render_bottom_border(width, lines_below));
 
         // Add autocomplete list if active.
         // `this.renderedAutocompleteHeight = autocompleteResult.length`
@@ -4703,6 +4829,130 @@ mod tests {
 
         editor.handle_input("\x1b[1;5C"); // Ctrl+Right
         assert_cursor(&editor, 0, 15); // end
+    }
+
+    // --- Scroll indicators (editor.test.ts:702-725 @ 9841914) --------------
+
+    /// Port of the upstream `it("centers scroll indicators on wide borders")`
+    /// (1d9787c11).
+    #[test]
+    fn centers_scroll_indicators_on_wide_borders() {
+        let width = 40;
+        let mut editor = Editor::new(
+            test_tui(width, 24),
+            EditorTheme {
+                border_color: Box::new(|text: &str| text.to_string()),
+                select_list: Arc::new(SelectListTheme::identity()),
+            },
+            EditorOptions::default(),
+        );
+        editor.set_text(
+            &(0..20)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+
+        editor.render(width);
+        for _ in 0..10 {
+            editor.handle_input("\x1b[A");
+        }
+
+        let lines = editor.render(width);
+        assert_eq!(
+            strip_ansi(&lines[0]),
+            format!("{} ↑ 9 more {}", "─".repeat(15), "─".repeat(15))
+        );
+        assert_eq!(
+            strip_ansi(lines.last().unwrap()),
+            format!("{} ↓ 4 more {}", "─".repeat(15), "─".repeat(15))
+        );
+    }
+
+    /// A stub [`BorderStatusProvider`] standing in for the rpi crate's
+    /// `WorkingStatusIndicator` (its colors come from the provider itself;
+    /// the layout below only wraps the runs with the editor border color).
+    struct StubStatus {
+        line: &'static str,
+        spinner: &'static str,
+    }
+
+    impl super::BorderStatusProvider for StubStatus {
+        fn render_in_border(&self, width: usize) -> String {
+            self.line.chars().take(width).collect()
+        }
+        fn render_spinner_in_border(&self, width: usize) -> String {
+            self.spinner.chars().take(width).collect()
+        }
+    }
+
+    /// The embedded working-status top border layout
+    /// (`CustomEditor.renderTopBorder`, custom-editor.ts:39-76 @ 9841914 —
+    /// upstream-tested at the CustomEditor level; asserted here at the
+    /// Editor level with the status injected through the same provider
+    /// seam).
+    #[test]
+    fn embeds_border_status_in_top_border_when_installed() {
+        let width = 20;
+        let border_color = |text: &str| format!("\x1b[35m{text}\x1b[39m");
+        let mut editor = Editor::new(
+            test_tui(width, 24),
+            EditorTheme {
+                border_color: Box::new(border_color),
+                select_list: Arc::new(SelectListTheme::identity()),
+            },
+            EditorOptions::default(),
+        );
+        // No status: plain border.
+        assert_eq!(
+            strip_ansi(&editor.render_top_border(width, 0)),
+            "─".repeat(20)
+        );
+
+        editor.set_border_status(Some(Arc::new(StubStatus {
+            line: "⠋ Working",
+            spinner: "⠋",
+        })));
+        // No overflow label: `borderColor("── ") + status +
+        // borderColor(" " + "─" * (width - statusWidth - 4))`.
+        let top = editor.render_top_border(width, 0);
+        assert_eq!(strip_ansi(&top), format!("── ⠋ Working {}", "─".repeat(7)));
+        assert_eq!(visible_width(&top), width);
+        // With an overflow label that cannot fit next to the full status,
+        // the spinner-only refit applies (still no room for the label at
+        // width 20: the " ↑ 5 more " branch requires the centered label to
+        // clear the left status block).
+        let top = editor.render_top_border(width, 5);
+        assert_eq!(strip_ansi(&top), format!("── ⠋ {}", "─".repeat(15)));
+        assert_eq!(visible_width(&top), width);
+
+        // Wider border: spinner + centered overflow label share the line
+        // (left block 3 + spinner 1 + 1, label centered at column 6).
+        let mut wide = Editor::new(
+            test_tui(22, 24),
+            EditorTheme {
+                border_color: Box::new(|text: &str| text.to_string()),
+                select_list: Arc::new(SelectListTheme::identity()),
+            },
+            EditorOptions::default(),
+        );
+        wide.set_border_status(Some(Arc::new(StubStatus {
+            line: "⠋ Working",
+            spinner: "⠋",
+        })));
+        let top = wide.render_top_border(22, 5);
+        assert_eq!(strip_ansi(&top), "── ⠋ ─ ↑ 5 more ──────");
+        assert_eq!(visible_width(&top), 22);
+
+        // Zero-width status falls back to the plain border.
+        editor.set_border_status(Some(Arc::new(StubStatus {
+            line: "",
+            spinner: "",
+        })));
+        assert_eq!(
+            strip_ansi(&editor.render_top_border(width, 0)),
+            "─".repeat(20)
+        );
     }
 
     // --- Scroll indicators (editor.test.ts:702-725) ------------------------

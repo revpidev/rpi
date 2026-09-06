@@ -116,6 +116,15 @@ const SYMBOLS: &[(&str, &str)] = &[
     ("uplus", "⊎"),
     ("sqcap", "⊓"),
     ("sqcup", "⊔"),
+    // Relational algebra join family (latex.ts:66-72 @ 9841914,
+    // f0592205f).
+    ("bowtie", "⋈"),
+    ("Join", "⋈"),
+    ("ltimes", "⋉"),
+    ("rtimes", "⋊"),
+    ("leftouterjoin", "⟕"),
+    ("rightouterjoin", "⟖"),
+    ("fullouterjoin", "⟗"),
     ("triangleleft", "◁"),
     ("triangleright", "▷"),
     ("wr", "≀"),
@@ -530,12 +539,15 @@ const RELATION_COMMANDS: &[&str] = &[
     "Longleftrightarrow",
     "Longrightarrow",
     "Rightarrow",
+    "Join",
     "Vdash",
     "Vvdash",
     "approx",
     "asymp",
+    "bowtie",
     "cong",
     "dashv",
+    "fullouterjoin",
     "doteq",
     "downarrow",
     "equiv",
@@ -556,6 +568,7 @@ const RELATION_COMMANDS: &[&str] = &[
     "leftharpoonup",
     "leftrightarrow",
     "leftrightharpoons",
+    "leftouterjoin",
     "leq",
     "leqslant",
     "ll",
@@ -563,6 +576,7 @@ const RELATION_COMMANDS: &[&str] = &[
     "longleftrightarrow",
     "longmapsto",
     "longrightarrow",
+    "ltimes",
     "mapsto",
     "mid",
     "models",
@@ -582,8 +596,10 @@ const RELATION_COMMANDS: &[&str] = &[
     "rightharpoondown",
     "rightharpoonup",
     "rightleftharpoons",
+    "rightouterjoin",
     "rightarrow",
     "rightsquigarrow",
+    "rtimes",
     "searrow",
     "sim",
     "simeq",
@@ -1406,6 +1422,16 @@ impl<'a> LatexParser<'a> {
         }
 
         let first = self.char_at(self.position).unwrap_or('\u{fffd}');
+        // A backslash followed by a line ending is a control space (534bcbffb,
+        // latex.ts:923-929): consume the newline (CRLF as one unit) and emit a
+        // single space instead of failing the whole expression.
+        if first == '\n' || first == '\r' {
+            self.position += 1;
+            if first == '\r' && self.char_at(self.position) == Some('\n') {
+                self.position += 1;
+            }
+            return " ".to_string();
+        }
         let command: String;
         if first.is_ascii_alphabetic() {
             let start = self.position;
@@ -1750,12 +1776,10 @@ impl<'a> LatexParser<'a> {
         value
     }
 
-    /// `parseRequiredArgumentValue` (latex.ts:1147-1165).
+    /// `parseRequiredArgumentValue` (latex.ts:1147-1165; the whitespace skip
+    /// is `/\s/` since 452923b54 so arguments may start on a new line).
     fn parse_required_argument_value(&mut self) -> String {
-        while self
-            .char_at(self.position)
-            .is_some_and(|c| c == ' ' || c == '\t')
-        {
+        while self.char_at(self.position).is_some_and(is_ecma_space) {
             self.position += 1;
         }
         if self.position >= self.source.len() {
@@ -2368,6 +2392,52 @@ mod tests {
         );
     }
 
+    /// Port of the upstream `it("renders relational algebra join operators")`
+    /// (f0592205f, #9050).
+    #[test]
+    fn renders_relational_algebra_join_operators() {
+        assert_eq!(
+            render("R\\bowtie S,\\quad R\\Join S").as_deref(),
+            Some("R ⋈ S, R ⋈ S"),
+            "source: {:?}",
+            "R\\bowtie S,\\quad R\\Join S"
+        );
+        assert_eq!(
+            render("R\\ltimes S,\\quad R\\rtimes S").as_deref(),
+            Some("R ⋉ S, R ⋊ S"),
+            "source: {:?}",
+            "R\\ltimes S,\\quad R\\rtimes S"
+        );
+        assert_eq!(
+            render("R\\leftouterjoin S,\\quad R\\rightouterjoin S,\\quad R\\fullouterjoin S")
+                .as_deref(),
+            Some("R ⟕ S, R ⟖ S, R ⟗ S"),
+            "source: {:?}",
+            "R\\leftouterjoin S,\\quad R\\rightouterjoin S,\\quad R\\fullouterjoin S"
+        );
+    }
+
+    /// Port of the upstream `it("treats a backslash followed by a line
+    /// ending as control space")` (534bcbffb).
+    #[test]
+    fn treats_a_backslash_followed_by_a_line_ending_as_control_space() {
+        let source = "\\boxed{
+(1,1,1),\\ (1,1,2),\\ (1,2,5),\\ (1,5,13),\\ (2,5,29),\\
+(1,13,34),\\ (1,34,89)
+}.";
+        assert_eq!(
+            render_latex(source, true).as_deref(),
+            Some("[(1,1,1), (1,1,2), (1,2,5), (1,5,13), (2,5,29), (1,13,34), (1,34,89)]."),
+            "source: {source:?}"
+        );
+        assert_eq!(
+            render("a\\\r\nb").as_deref(),
+            Some("a b"),
+            "source: {:?}",
+            "a\\<CR><LF>b"
+        );
+    }
+
     /// rpi-only (D-087): none of the commands asserted here exist in the
     /// upstream symbol table — upstream fails the whole expression and echoes
     /// the raw source. rpi renders them (mappings follow KaTeX).
@@ -2788,6 +2858,13 @@ mod tests {
             Some("x²+1\n────\nx-1"),
             "source: {:?}",
             "\\frac{x^2+1}{x-1}"
+        );
+        // Required arguments may start on a new line (452923b54, #7760).
+        assert_eq!(
+            render_latex("\\frac{1}\n{2}", true).as_deref(),
+            Some("1\n─\n2"),
+            "source: {:?}",
+            "\\frac{1}\n{2}"
         );
     }
 
