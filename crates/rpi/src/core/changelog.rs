@@ -193,17 +193,20 @@ mod tests {
 
     /// The embedded asset parses and its top section matches VERSION
     /// (the display path is only useful while the asset tracks releases).
+    /// V14-19：预发布构建（`0.1.4-rc.1`）比对**基线版本**——CHANGELOG.md
+    /// 顶段对应候选目标版本，rc 序号不入 changelog。
     #[test]
     fn embedded_changelog_parses_and_tracks_version() {
         let entries = parse_changelog(CHANGELOG_MD);
         assert!(!entries.is_empty(), "embedded CHANGELOG.md has sections");
         let version = crate::config::VERSION;
+        let base = version.split('-').next().unwrap_or(version);
         let parsed =
-            parse_version_string(version).unwrap_or_else(|| panic!("VERSION is x.y.z: {version}"));
+            parse_version_string(base).unwrap_or_else(|| panic!("VERSION is x.y.z: {version}"));
         assert_eq!(
             entries[0].version_tuple(),
             parsed,
-            "CHANGELOG.md top section must match VERSION {version}"
+            "CHANGELOG.md top section must match VERSION {version} (base {base})"
         );
     }
 }
