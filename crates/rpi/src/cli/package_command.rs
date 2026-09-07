@@ -46,8 +46,9 @@ use crate::core::trust_manager::{
     ProjectTrustStore,
 };
 use crate::core::version_check::{
-    get_latest_rpi_release_with, is_newer_package_version, version_check_endpoint,
-    LatestVersionTransport, ReqwestLatestVersionTransport, DEFAULT_VERSION_CHECK_TIMEOUT,
+    channel_probe_url, get_latest_rpi_release_with, is_newer_package_version,
+    version_check_endpoint, LatestVersionTransport, ReqwestLatestVersionTransport, UpdateChannel,
+    DEFAULT_VERSION_CHECK_TIMEOUT,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -57,7 +58,7 @@ use std::sync::Arc;
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
 pub const UPDATE_USAGE: &str =
-    "rpi update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force] [--yes]";
+    "rpi update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
 
 /// `UpdateTarget` (package-manager-cli.ts:35).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,10 @@ pub struct ParsedUpdate {
     /// Bare `rpi update` prints the extensions-skipped note
     /// (package-manager-cli.ts:368-369).
     pub show_extensions_skipped_note: bool,
+    /// `--rc` — V14-19（rpi 自有，无上游对照）：更新通道选预发布
+    /// （RC）。与全部 target 旗标正交组合，不新增互斥（R6.1.2）；
+    /// 对 `--models` 无效果（模型目录无通道概念，R6.5.4）。
+    pub rc: bool,
 }
 
 /// `parsePackageCommand` restricted to `update` (package-manager-cli.ts:
@@ -132,6 +137,11 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             // Rpi-specific: consumed by registry/`github:` extension
             // updates (the L0 confirmation gate).
             parsed.yes = true;
+        } else if arg == "--rc" {
+            // V14-19 (rpi-specific): pre-release channel selector for the
+            // self and extensions targets; orthogonal to every target
+            // flag — no new conflicts (FR-A R1).
+            parsed.rc = true;
         } else if arg == "--extension" {
             let value = rest.get(index + 1);
             match value {
@@ -248,6 +258,9 @@ Options:
   --models                Refresh model catalogs only
   --all                   Update pi and installed packages
   --extension <source>    Update one package only
+  --rc                    Update to the latest pre-release (RC) version;
+                          applies to --self/--extensions/--all, no effect on
+                          --models
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
   --force                 Reinstall pi even if the current version is latest
@@ -257,6 +270,7 @@ Options:
 Short forms:
   {APP_NAME} update                Update pi only
   {APP_NAME} update --all          Update pi and all extensions
+  {APP_NAME} update --rc           Update pi to the latest RC version
   {APP_NAME} update --models       Refresh model catalogs only
   {APP_NAME} update <source>       Update one package
   {APP_NAME} update pi             Update pi only (self works as alias to pi)
@@ -320,19 +334,23 @@ pub struct SelfUpdatePlan {
 /// `getSelfUpdatePlan` (package-manager-cli.ts:475-501). `endpoint` is the
 /// resolved version-check URL (T14-W6a, ADR-0002 §8): `None` disables the
 /// probe entirely (no request), surfacing the same error as an
-/// unreachable/empty upstream response.
+/// unreachable/empty upstream response. `channel` (V14-19, rpi-specific)
+/// selects which endpoint the probe hits: [`UpdateChannel::PreRelease`]
+/// derives the RC endpoint from the same `endpoint` resolution
+/// ([`channel_probe_url`]) — no separate RC configuration (R6.2.3).
 async fn get_self_update_plan(
     force: bool,
     transport: &dyn LatestVersionTransport,
     endpoint: Option<&str>,
+    channel: UpdateChannel,
 ) -> Result<SelfUpdatePlan, String> {
-    let Some(url) = endpoint else {
+    let Some(url) = channel_probe_url(channel, endpoint) else {
         return Err(format!("Could not determine latest {APP_NAME} version."));
     };
     let latest_release = get_latest_rpi_release_with(
         VERSION,
         transport,
-        url,
+        &url,
         DEFAULT_VERSION_CHECK_TIMEOUT,
         crate::core::package_manager::is_offline_mode_enabled(),
         // The update path retries (package-manager-cli.ts:479 passes
@@ -360,7 +378,14 @@ async fn get_self_update_plan(
         });
     }
 
-    println!("{APP_NAME} is already up to date (v{VERSION})");
+    match channel {
+        UpdateChannel::Stable => println!("{APP_NAME} is already up to date (v{VERSION})"),
+        // V14-19 (FR-B R2): RC 通道 no-op 文案追加通道标注；stable 路径
+        // 文案逐字节不变（零回归红线）。
+        UpdateChannel::PreRelease => {
+            println!("{APP_NAME} is already up to date (v{VERSION}) (pre-release channel)")
+        }
+    }
     Ok(SelfUpdatePlan {
         package_name,
         version: latest_release.version,
@@ -631,6 +656,13 @@ pub async fn run_update_in(
     // settings manager moves into the package manager below.
     let version_check_endpoint =
         version_check_endpoint(settings_manager.get_version_check_url().as_deref());
+    // V14-19：`--rc` 通道选择（rpi 自有）——self/extensions 两路共用；
+    // `--models` 无通道概念（照常刷新，R6.5.4）。
+    let update_channel = if parsed.rc {
+        UpdateChannel::PreRelease
+    } else {
+        UpdateChannel::Stable
+    };
 
     let runner = runner.unwrap_or_else(|| Arc::new(SystemPackageCommandRunner));
     let transport = transport.unwrap_or_else(|| Arc::new(ReqwestLatestVersionTransport));
@@ -674,7 +706,8 @@ pub async fn run_update_in(
             }
         })));
         manager.set_install_confirm_callback(build_install_confirm(parsed.yes));
-        if let Err(message) = manager.update(update_source.as_deref()) {
+        if let Err(message) = manager.update_with_channel(update_source.as_deref(), update_channel)
+        {
             eprintln!("Error: {message}");
             return 1;
         }
@@ -689,6 +722,7 @@ pub async fn run_update_in(
             parsed.force,
             transport.as_ref(),
             version_check_endpoint.as_deref(),
+            update_channel,
         )
         .await
         {
@@ -2008,6 +2042,125 @@ mod update_cli_tests {
 
     fn parse(input: &[&str]) -> ParsedUpdate {
         parse_update_args(&args(input))
+    }
+
+    // ---- V14-19: `--rc` 通道旗标（rpi 自有，无上游对照）----
+
+    /// `--rc` 与全部 target 旗标正交：不改变 target 解析、不新增互斥
+    /// （FR-A R1/R3）。
+    #[test]
+    fn update_rc_flag_is_orthogonal_to_targets() {
+        // bare `--rc` → 仍是默认 self target + extensions-skipped 提示。
+        let parsed = parse(&["update", "--rc"]);
+        assert_eq!(parsed.target, Some(UpdateTarget::Self_));
+        assert!(parsed.show_extensions_skipped_note);
+        assert!(parsed.rc);
+        assert!(parsed.conflicting_options.is_none());
+        // 与每个 target 旗标组合：target 不变，无冲突。
+        for (args, expected) in [
+            (vec!["--self"], UpdateTarget::Self_),
+            (
+                vec!["--extensions"],
+                UpdateTarget::Extensions { source: None },
+            ),
+            (vec!["--all"], UpdateTarget::All),
+            (vec!["--models"], UpdateTarget::Models),
+        ] {
+            let mut input = vec!["update"];
+            input.extend(args.iter().copied());
+            input.push("--rc");
+            let parsed = parse(&input);
+            assert_eq!(parsed.target, Some(expected), "--rc + {args:?}");
+            assert!(parsed.rc, "--rc + {args:?}");
+            assert!(parsed.conflicting_options.is_none(), "--rc + {args:?}");
+        }
+        // 与 --force/--yes 叠加；与 `--extension <source>` 组合。
+        let parsed = parse(&["update", "--rc", "--force", "--yes"]);
+        assert!(parsed.rc && parsed.force && parsed.yes);
+        let parsed = parse(&["update", "--extension", "foo", "--rc"]);
+        assert_eq!(
+            parsed.target,
+            Some(UpdateTarget::Extensions {
+                source: Some("foo".to_string())
+            })
+        );
+        assert!(parsed.rc);
+        // 无 `--rc` 时通道位缺省 false（现状路径零变化）。
+        assert!(!parse(&["update"]).rc);
+        assert!(!parse(&["update", "--all"]).rc);
+    }
+
+    /// RC 通道的 self 更新计划（FR-B/FR-C）：探测推导端点；force 重装。
+    #[tokio::test]
+    async fn self_update_plan_pre_release_channel_probes_rc_endpoint() {
+        let transport =
+            StubTransport::responds(Ok(Some(r#"{"version": "99.0.0-rc.2"}"#.to_string())));
+        let plan = get_self_update_plan(
+            false,
+            transport.as_ref(),
+            Some("https://revpi.dev/api/latest-version"),
+            UpdateChannel::PreRelease,
+        )
+        .await
+        .unwrap();
+        assert!(plan.should_run);
+        assert_eq!(plan.version, "99.0.0-rc.2");
+        assert_eq!(
+            transport.urls(),
+            vec!["https://revpi.dev/api/latest-rc-version.json"]
+        );
+    }
+
+    /// 通道选择矩阵：stable 通道探测 stable 端点（现状零回归）；RC
+    /// 通道同版本 no-op；端点禁用两通道同样报错。
+    #[tokio::test]
+    async fn self_update_plan_channel_selection_matrix() {
+        // stable 通道 → stable 端点（现状 URL，零回归钉死）。
+        let transport = StubTransport::newer_version();
+        get_self_update_plan(
+            false,
+            transport.as_ref(),
+            Some("https://revpi.dev/api/latest-version"),
+            UpdateChannel::Stable,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transport.urls(),
+            vec!["https://revpi.dev/api/latest-version"]
+        );
+        // RC 通道 + 端点同版本 → no-op（semver 判定不新；用运行版本常量
+        // 避免随 workspace bump 漂移）。
+        let body = format!("{{\"version\": \"{VERSION}\"}}");
+        let transport = StubTransport::responds(Ok(Some(body)));
+        let plan = get_self_update_plan(
+            false,
+            transport.as_ref(),
+            Some("https://revpi.dev/api/latest-version"),
+            UpdateChannel::PreRelease,
+        )
+        .await
+        .unwrap();
+        assert!(!plan.should_run);
+        // RC 通道 + force → 重装。
+        let plan = get_self_update_plan(
+            true,
+            transport.as_ref(),
+            Some("https://revpi.dev/api/latest-version"),
+            UpdateChannel::PreRelease,
+        )
+        .await
+        .unwrap();
+        assert!(plan.should_run);
+        // 端点禁用（off/None）→ 两通道同样报「无法确定」。
+        for channel in [UpdateChannel::Stable, UpdateChannel::PreRelease] {
+            let transport = StubTransport::newer_version();
+            let error = get_self_update_plan(false, transport.as_ref(), None, channel)
+                .await
+                .unwrap_err();
+            assert!(error.contains("Could not determine"), "{channel:?}");
+            assert_eq!(transport.call_count(), 0);
+        }
     }
 
     #[test]

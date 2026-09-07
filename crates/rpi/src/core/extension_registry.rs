@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::config;
 use crate::core::self_update::sha256_hex;
-use crate::core::version_check::rpi_user_agent;
+use crate::core::version_check::{rpi_user_agent, UpdateChannel};
 
 /// Registry index / metadata requests (design §7.2 step 1).
 pub const REGISTRY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -291,9 +291,24 @@ pub struct RegistryArtifact {
 
 /// Select the highest non-yanked version satisfying `range` (design §7.2
 /// step 2; `None` range = `*`).
+///
+/// V14-19（rpi 自有，无上游对照）`channel` 语义（R6.3.1/R6.3.2）：
+/// - [`UpdateChannel::Stable`] 且 range 缺省（req=None）时**跳过预发布
+///   版本**（`version.pre` 非空）——修正现状缺口：rc 入索引后 stable
+///   用户会被静默拉到；
+/// - [`UpdateChannel::PreRelease`]（`--rc`）且 range 缺省时**仅在预发布
+///   版本中取最高**（stable 不经 RC 通道获取）——与本体 RC 端点「最新
+///   RC tag」语义对齐（R6.2.2），rc 毕业窗口（stable 已发、无新 rc）
+///   自然落到「已是最新」而非 lockstep 预检报错；
+/// - range 显式给出（req=Some）时不做任何额外过滤——Rust `semver`
+///   `VersionReq` 预发布语义天然给出 `=0.1.5-rc.1` 精确命中、
+///   `*`/`^`/`~` 不命中（精确安装逃生舱，R6.3.2 后半）；
+/// - 错误文案的 available 列表**含**被通道过滤的版本（信息完整，
+///   帮助用户发现需切 `--rc`、切 stable 或用精确范围）。
 pub fn select_registry_version<'a>(
     index: &'a RegistryIndex,
     range: Option<&str>,
+    channel: UpdateChannel,
 ) -> Result<&'a RegistryVersionEntry, String> {
     let req = match range {
         None => None,
@@ -315,6 +330,15 @@ pub fn select_registry_version<'a>(
         let Ok(version) = semver::Version::parse(&entry.version) else {
             continue;
         };
+        // V14-19：缺省 range 的通道过滤（req=Some 路径由 VersionReq
+        // 语义决定，不在此处重复）——stable 跳过预发布；PreRelease 仅
+        // 取预发布（与本体 RC 端点「最新 RC tag」对齐）。
+        if req.is_none() {
+            match (channel, version.pre.is_empty()) {
+                (UpdateChannel::Stable, false) | (UpdateChannel::PreRelease, true) => continue,
+                _ => {}
+            }
+        }
         if let Some(req) = &req {
             if !req.matches(&version) {
                 continue;
@@ -1184,46 +1208,176 @@ mod tests {
         let index = index_fixture();
         // Highest non-yanked.
         assert_eq!(
-            select_registry_version(&index, None).unwrap().version,
+            select_registry_version(&index, None, UpdateChannel::Stable)
+                .unwrap()
+                .version,
             "0.2.1"
         );
         // Range excludes 0.2.x.
         assert_eq!(
-            select_registry_version(&index, Some("~0.1.0"))
+            select_registry_version(&index, Some("~0.1.0"), UpdateChannel::Stable)
                 .unwrap()
                 .version,
             "0.1.0"
         );
         // The yanked 0.2.0 is skipped even when it would be the max match.
         assert_eq!(
-            select_registry_version(&index, Some("^0.2"))
+            select_registry_version(&index, Some("^0.2"), UpdateChannel::Stable)
                 .unwrap()
                 .version,
             "0.2.1"
         );
         // Nothing matches.
-        let error = select_registry_version(&index, Some("1.0.0")).unwrap_err();
+        let error =
+            select_registry_version(&index, Some("1.0.0"), UpdateChannel::Stable).unwrap_err();
         assert!(error.contains("available: 0.1.0, 0.2.1"), "{error}");
+    }
+
+    /// V14-19（rpi 自有）：RC 通道的 registry 版本解析语义矩阵
+    /// （R6.3.1/R6.3.2）——stable 过滤预发布（缺口修正）、RC 仅取预发布
+    /// （与本体 RC 端点「最新 RC tag」对齐）、显式 range 不受通道过滤。
+    #[test]
+    fn test_select_registry_version_channel_matrix() {
+        let json = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "statusline",
+            "repository": "revpidev/rpi",
+            "author": "rpi authors",
+            "kind": "native",
+            "versions": [
+                {"version": "0.1.4", "artifacts": []},
+                {"version": "0.1.5-rc.1", "artifacts": []},
+                {"version": "0.1.5-rc.2", "artifacts": []},
+                {"version": "0.1.5", "artifacts": []},
+                {"version": "0.1.6-rc.1", "artifacts": []}
+            ]
+        });
+        let index: RegistryIndex = serde_json::from_value(json).unwrap();
+
+        // stable + 无 range → 最新 stable（rc 被过滤；现状缺口修正）。
+        assert_eq!(
+            select_registry_version(&index, None, UpdateChannel::Stable)
+                .unwrap()
+                .version,
+            "0.1.5"
+        );
+        // RC + 无 range → 仅预发布中取最高（stable 0.1.5 不经 RC 通道）。
+        assert_eq!(
+            select_registry_version(&index, None, UpdateChannel::PreRelease)
+                .unwrap()
+                .version,
+            "0.1.6-rc.1"
+        );
+        // rc 毕业窗口（stable 0.1.5 已发、无新 rc）：只剩 0.1.5 以下的 rc 时
+        // 取最新 rc——已是最新 rc 的用户自然 no-op。
+        let graduated = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "statusline",
+            "repository": "revpidev/rpi",
+            "author": "rpi authors",
+            "kind": "native",
+            "versions": [
+                {"version": "0.1.5-rc.2", "artifacts": []},
+                {"version": "0.1.5", "artifacts": []}
+            ]
+        });
+        let graduated: RegistryIndex = serde_json::from_value(graduated).unwrap();
+        assert_eq!(
+            select_registry_version(&graduated, None, UpdateChannel::PreRelease)
+                .unwrap()
+                .version,
+            "0.1.5-rc.2"
+        );
+
+        // 显式 range 不受通道过滤：精确 rc 命中（逃生舱），stable 精确
+        // 命中在 RC 通道也成立（req=Some 路径无通道分支）。
+        assert_eq!(
+            select_registry_version(&index, Some("0.1.5-rc.1"), UpdateChannel::Stable)
+                .unwrap()
+                .version,
+            "0.1.5-rc.1"
+        );
+        assert_eq!(
+            select_registry_version(&index, Some("0.1.5"), UpdateChannel::PreRelease)
+                .unwrap()
+                .version,
+            "0.1.5"
+        );
+        // `*` 与 `^` 按 semver 惯例不匹配预发布（两通道一致）。
+        for range in ["*", "^0.1"] {
+            assert_eq!(
+                select_registry_version(&index, Some(range), UpdateChannel::Stable)
+                    .unwrap()
+                    .version,
+                "0.1.5",
+                "{range}"
+            );
+            assert_eq!(
+                select_registry_version(&index, Some(range), UpdateChannel::PreRelease)
+                    .unwrap()
+                    .version,
+                "0.1.5",
+                "{range}"
+            );
+        }
+
+        // 全 stable 索引 + RC 通道 → 无可装版本；错误 available 列表
+        // 含被过滤的版本（信息完整）。
+        let stable_only = serde_json::json!({
+            "schemaVersion": 1,
+            "name": "statusline",
+            "repository": "revpidev/rpi",
+            "author": "rpi authors",
+            "kind": "native",
+            "versions": [{"version": "0.1.4", "artifacts": []}]
+        });
+        let stable_only: RegistryIndex = serde_json::from_value(stable_only).unwrap();
+        let error =
+            select_registry_version(&stable_only, None, UpdateChannel::PreRelease).unwrap_err();
+        assert!(error.contains("available: 0.1.4"), "{error}");
+    }
+
+    /// V14-19：lockstep `minHostVersion` 预检的预发布感知
+    /// （R6.3.3）——`0.1.5-rc.1` 扩展要求宿主 ≥ `0.1.5-rc.1`。
+    #[test]
+    fn test_precheck_min_host_version_prerelease_aware() {
+        let entry = RegistryVersionEntry {
+            version: "0.1.5-rc.1".to_string(),
+            rpi_abi: Some(1),
+            min_host_version: Some("0.1.5-rc.1".to_string()),
+            capabilities: Vec::new(),
+            yanked: false,
+            unavailable: false,
+            artifacts: Vec::new(),
+        };
+        // stable 0.1.4 宿主 < rc 要求 → 拒。
+        assert!(precheck_version_compatibility(&entry, 1, "0.1.4").is_err());
+        // 同 rc 宿主 → 放。
+        assert!(precheck_version_compatibility(&entry, 1, "0.1.5-rc.1").is_ok());
+        // 已毕业 stable 宿主（0.1.5 > 0.1.5-rc.1）→ 放。
+        assert!(precheck_version_compatibility(&entry, 1, "0.1.5").is_ok());
+        // 更高 rc 宿主（0.1.5-rc.2 > 0.1.5-rc.1）→ 放。
+        assert!(precheck_version_compatibility(&entry, 1, "0.1.5-rc.2").is_ok());
     }
 
     #[test]
     fn test_precheck_abi_and_min_host_version() {
         let index = index_fixture();
-        let entry = select_registry_version(&index, Some("0.2.1")).unwrap();
+        let entry = select_registry_version(&index, Some("0.2.1"), UpdateChannel::Stable).unwrap();
         assert!(precheck_version_compatibility(entry, 1, "0.11.0").is_ok());
         let error = precheck_version_compatibility(entry, 2, "0.11.0").unwrap_err();
         assert!(error.contains("rpiAbi 1"), "{error}");
         let error = precheck_version_compatibility(entry, 1, "0.10.0").unwrap_err();
         assert!(error.contains("requires rpi ≥ 0.11.0"), "{error}");
         // Absent fields impose no constraint.
-        let entry = select_registry_version(&index, Some("0.1.0")).unwrap();
+        let entry = select_registry_version(&index, Some("0.1.0"), UpdateChannel::Stable).unwrap();
         assert!(precheck_version_compatibility(entry, 1, "0.1.0").is_ok());
     }
 
     #[test]
     fn test_select_artifact_native_target_and_wasm() {
         let index = index_fixture();
-        let entry = select_registry_version(&index, Some("0.2.1")).unwrap();
+        let entry = select_registry_version(&index, Some("0.2.1"), UpdateChannel::Stable).unwrap();
         let artifact =
             select_artifact(entry, ExtensionKind::Native, Some("aarch64-apple-darwin")).unwrap();
         assert_eq!(artifact.file, "subagents-0.2.1-aarch64-apple-darwin.rpix");

@@ -3187,11 +3187,23 @@ impl InteractiveUi {
         // `rpi update --self` when this install can self-update, the
         // download URL when it cannot (binary build without a target
         // triple).
-        let action = theme.fg("accent", &crate::config::self_update_instruction());
-        let update_instruction = theme.fg(
-            "muted",
-            &format!("New version {} is available. ", release.version),
-        ) + &action;
+        //
+        // V14-19（rpi 自有，R6.4.1）：预发布版本的横幅标注 pre-release，
+        // 动作指引同步换 `rpi update --rc`（RC 端点的候选版本只有经
+        // `--rc` 才能拉到）；stable 版本文案不变。
+        let is_pre_release = crate::core::version_check::is_prerelease_version(&release.version);
+        let instruction = if is_pre_release {
+            format!("Run {APP_NAME} update --rc")
+        } else {
+            crate::config::self_update_instruction()
+        };
+        let action = theme.fg("accent", &instruction);
+        let availability_line = if is_pre_release {
+            format!("New pre-release version {} is available. ", release.version)
+        } else {
+            format!("New version {} is available. ", release.version)
+        };
+        let update_instruction = theme.fg("muted", &availability_line) + &action;
         let changelog_url = "https://revpi.dev/changelog";
         let styled_url = theme.fg("accent", changelog_url);
         let changelog_link = if rpi_tui::terminal_image::get_capabilities().hyperlinks {
@@ -6508,6 +6520,35 @@ mod tests {
             rendered.contains("https://revpi.dev/changelog"),
             "rendered: {rendered}"
         );
+    }
+
+    /// V14-19（rpi 自有，R6.4.1）：预发布版本的横幅标注 pre-release，
+    /// 动作指引换 `rpi update --rc`（RC 端点候选只有经 `--rc` 才能拉到）；
+    /// stable 版本文案见上一个测试（零回归钉死）。
+    #[tokio::test]
+    async fn pre_release_version_banner_labels_channel_and_action() {
+        let (mode, _terminal, _session) = mode_harness().await;
+        let ui = &mode.ui_state;
+        ui.push(UiCommand::NewVersionAvailable(
+            crate::core::version_check::LatestRpiRelease {
+                version: "99.1.0-rc.2".to_string(),
+                package_name: None,
+                note: None,
+            },
+        ));
+        ui.drain_events();
+        let rendered = lock(&ui.chat_container).render(80).join("\n");
+        assert!(
+            rendered.contains("New pre-release version 99.1.0-rc.2 is available."),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("Run rpi update --rc"),
+            "rendered: {rendered}"
+        );
+        // stable 文案不在场（避免两条版本线混淆）。
+        assert!(!rendered.contains("New version "), "rendered: {rendered}");
+        assert!(!rendered.contains("--self"), "rendered: {rendered}");
     }
 
     #[tokio::test]

@@ -278,6 +278,11 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          # V14-19（rpi 自有）：`v*-rc*` 形态 tag 的 Release 标记
+          # prerelease——`releases/latest` 与 install.sh 的 GitHub 回退
+          # 路径保持指向 stable，RC 只能经 `rpi update --rc` 获得
+          # （R6.5.1；版本号规范见 rpi-docs v0.1.4 需求基线 R6.1.1）。
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
           # Tag re-push (release rebuild) must replace existing assets
           # instead of failing on "asset already exists".
           overwrite_files: true

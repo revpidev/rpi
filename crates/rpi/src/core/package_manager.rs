@@ -75,6 +75,7 @@ use crate::core::skills::{
     lexical_relative, match_candidates, matches_any_exact_pattern, matches_any_pattern,
     split_patterns, SkillDiscoveryMode, SourceOrigin, SourceScope,
 };
+use crate::core::version_check::UpdateChannel;
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -2141,6 +2142,18 @@ impl DefaultPackageManager {
         &self,
         source: &RegistrySource,
     ) -> Result<ResolvedArtifactInstall, String> {
+        self.resolve_registry_install_with_channel(source, UpdateChannel::Stable)
+    }
+
+    /// [`Self::resolve_registry_install`] 带 V14-19 更新通道（rpi 自有）：
+    /// registry/`github:` 的安装路径恒为 [`UpdateChannel::Stable`]（安装
+    /// 不引入 `--rc`，非目标），仅 `rpi update --extensions [--rc]` 走
+    /// [`UpdateChannel::PreRelease`]（R6.3.1/R6.3.2）。
+    fn resolve_registry_install_with_channel(
+        &self,
+        source: &RegistrySource,
+        channel: UpdateChannel,
+    ) -> Result<ResolvedArtifactInstall, String> {
         let base = self.registry_base()?;
         let index_url = extension_registry::registry_index_url(base, &source.name);
         let body = self
@@ -2171,7 +2184,8 @@ impl DefaultPackageManager {
         }
         let kind = ExtensionKind::parse(&index.kind)
             .ok_or_else(|| format!("Invalid registry index: unknown kind \"{}\"", index.kind))?;
-        let entry = extension_registry::select_registry_version(&index, source.range.as_deref())?;
+        let entry =
+            extension_registry::select_registry_version(&index, source.range.as_deref(), channel)?;
         extension_registry::precheck_version_compatibility(
             entry,
             rpi_ext_host::wasm::RPI_ABI_VERSION,
@@ -2597,10 +2611,12 @@ impl DefaultPackageManager {
         source: &str,
         scope: SourceScope,
         untracked: bool,
+        channel: UpdateChannel,
     ) -> Result<(), String> {
         match parse_source(source) {
             ParsedSource::Registry(registry) => {
-                let resolved = match self.resolve_registry_install(&registry) {
+                let resolved = match self.resolve_registry_install_with_channel(&registry, channel)
+                {
                     Ok(resolved) => resolved,
                     Err(error) if untracked && Self::is_registry_not_found(&error) => {
                         self.emit_progress(&ProgressEvent {
@@ -2855,6 +2871,19 @@ impl DefaultPackageManager {
     /// dev builds, orphaned `github:` directories); a single-source
     /// update matches them by identity too.
     pub fn update(&self, source: Option<&str>) -> Result<(), String> {
+        self.update_with_channel(source, UpdateChannel::Stable)
+    }
+
+    /// [`Self::update`] 带 V14-19 更新通道（rpi 自有，无上游对照）：
+    /// [`UpdateChannel::PreRelease`]（`rpi update --extensions --rc`）让
+    /// 预发布版本参与 registry 最高版本竞选；缺省 [`UpdateChannel::Stable`]
+    /// 与旧行为一致（预发布被 [`extension_registry::select_registry_version`]
+    /// 过滤）。`github:`/npm/git 源不感知通道（R6.3.4）。
+    pub fn update_with_channel(
+        &self,
+        source: Option<&str>,
+        channel: UpdateChannel,
+    ) -> Result<(), String> {
         let global_settings = self.settings_manager.get_global_settings();
         let project_settings = self.settings_manager.get_project_settings();
         let identity = source.map(|source| self.get_package_identity(source, None));
@@ -2908,7 +2937,7 @@ impl DefaultPackageManager {
             }
         }
 
-        self.update_configured_sources(&update_sources)
+        self.update_configured_sources(&update_sources, channel)
     }
 
     /// Installed-but-untracked extension sources (rpi-specific; design
@@ -2972,7 +3001,11 @@ impl DefaultPackageManager {
     /// npm batches and the git updates (own concurrency-4 pool) run in
     /// parallel. Pinned npm versions are skipped; pinned git refs still
     /// reconcile. Offline / empty input is a no-op.
-    fn update_configured_sources(&self, sources: &[ConfiguredUpdateSource]) -> Result<(), String> {
+    fn update_configured_sources(
+        &self,
+        sources: &[ConfiguredUpdateSource],
+        channel: UpdateChannel,
+    ) -> Result<(), String> {
         if self.offline || sources.is_empty() {
             return Ok(());
         }
@@ -3080,9 +3113,12 @@ impl DefaultPackageManager {
                 handles.push(scope.spawn(|| {
                     let mut first_error: Option<String> = None;
                     for entry in &registry_candidates {
-                        if let Err(error) =
-                            self.update_registry_entry(&entry.source, entry.scope, !entry.tracked)
-                        {
+                        if let Err(error) = self.update_registry_entry(
+                            &entry.source,
+                            entry.scope,
+                            !entry.tracked,
+                            channel,
+                        ) {
                             if first_error.is_none() {
                                 first_error = Some(error);
                             }
@@ -7676,6 +7712,87 @@ mod registry_tests {
             .as_deref(),
             Some("0.2.0"),
             "ext-b must be updated too"
+        );
+    }
+
+    /// V14-19（rpi 自有，R6.3.1/R6.3.2）：`update --extensions --rc` 经
+    /// manager 全链路解析 RC——同一索引上 stable 通道跳过 rc（缺口修正
+    /// 钉死）、RC 通道拉到最新 rc。
+    #[test]
+    fn test_update_extensions_channel_resolves_rc_only_with_rc_flag() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let target = config::build_target().unwrap();
+        let name = "ext-rc";
+        let stable_version = "0.1.4";
+        let rc_version = "0.1.5-rc.1";
+        let stable_archive = build_rpix(name, stable_version, true, &[]);
+        let rc_archive = build_rpix(name, rc_version, true, &[]);
+        // 双版本索引：stable 0.1.4 + rc 0.1.5-rc.1（不设 minHostVersion，
+        // 避开宿主版本耦合；lockstep 预检语义已由
+        // extension_registry::tests::test_precheck_min_host_version_prerelease_aware 钉死）。
+        let index = serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": format!("acme/{name}"),
+            "author": "acme",
+            "kind": "native",
+            "versions": [
+                {"version": stable_version, "rpiAbi": 1, "capabilities": ["tools"],
+                 "artifacts": [{
+                     "target": target,
+                     "file": format!("{name}-{stable_version}-{target}.rpix"),
+                     "sha256": sha256_hex(&stable_archive),
+                     "release": format!("v{stable_version}")}]},
+                {"version": rc_version, "rpiAbi": 1, "capabilities": ["tools"],
+                 "artifacts": [{
+                     "target": target,
+                     "file": format!("{name}-{rc_version}-{target}.rpix"),
+                     "sha256": sha256_hex(&rc_archive),
+                     "release": format!("v{rc_version}")}]}
+            ]
+        })
+        .to_string();
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            index.into_bytes(),
+        );
+        for (version, archive) in [(stable_version, stable_archive), (rc_version, rc_archive)] {
+            let file = format!("{name}-{version}-{target}.rpix");
+            let download = extension_registry::github_download_url(
+                "acme",
+                name,
+                &format!("v{version}"),
+                &file,
+            );
+            transport.insert(&download, archive);
+        }
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist(name, false).unwrap();
+        let installed = || {
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-rc"),
+            )
+        };
+        assert_eq!(installed().as_deref(), Some(stable_version));
+
+        // stable 通道（现状）：索引里的 rc 不被拉到——已最新，no-op。
+        manager.update(None).unwrap();
+        assert_eq!(
+            installed().as_deref(),
+            Some(stable_version),
+            "stable channel must not silently pick up an indexed rc"
+        );
+
+        // RC 通道（`--rc`）：拉到 0.1.5-rc.1。
+        manager
+            .update_with_channel(None, UpdateChannel::PreRelease)
+            .unwrap();
+        assert_eq!(
+            installed().as_deref(),
+            Some(rc_version),
+            "--rc must resolve the indexed rc version"
         );
     }
 
