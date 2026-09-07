@@ -4286,6 +4286,23 @@ impl InteractiveMode {
         let editor_container_entry =
             shared_component_from_boxed(Box::new(SharedChild(editor_container.clone())));
 
+        // `widgetContainerAbove` starts with (and always keeps) a leading
+        // `Spacer(1)` — upstream `renderWidgetContainer(…, spacerWhenEmpty:
+        // true, leadingSpacer: true)` (interactive-mode.ts:2281-2303 @
+        // 9841914, introduced by abb1775ff / PR #850). The blank line
+        // separates the transcript / status area from the editor's top
+        // border — most visibly the embedded `⠋ Working` indicator (#8799,
+        // V14-17): without it the streamed output sits flush against the
+        // border line. `widgets_below` gets no spacer (upstream passes
+        // `false, false`). The spacer is permanent: widget mount/remove
+        // ([`ui_bridge`] address book) only ever touches widget children,
+        // and `Spacer` renders exactly one empty line.
+        let widgets_above = {
+            let mut container = Container::new();
+            container.add_child(Box::new(Spacer::new(1)));
+            Arc::new(Mutex::new(container))
+        };
+
         let ui_state = Arc::new(InteractiveUi {
             ui: ui.clone(),
             session: RwLock::new(session.clone()),
@@ -4299,7 +4316,7 @@ impl InteractiveMode {
             chat_container: Arc::new(Mutex::new(Container::new())),
             pending_messages_container: Arc::new(Mutex::new(Container::new())),
             status: Arc::new(Mutex::new(ActiveStatus::Idle)),
-            widgets_above: Arc::new(Mutex::new(Container::new())),
+            widgets_above,
             widgets_below: Arc::new(Mutex::new(Container::new())),
             editor,
             footer,
@@ -8461,20 +8478,31 @@ mod tests {
         );
         {
             let container = lock(&ui.widgets_above);
-            let rendered = container
-                .children
-                .iter()
-                .flat_map(|c| c.render(80))
-                .collect::<Vec<_>>()
-                .join("\n");
+            assert_eq!(container.children.len(), 2, "leading spacer + one widget");
+            let rendered = container.render(80);
+            assert_eq!(rendered.len(), 2, "spacer line + widget line");
+            assert_eq!(rendered[0], "", "spacer renders the leading blank line");
             assert!(
-                rpi_test_support::vt::strip_ansi(&rendered).contains("WIDGET-LINE"),
+                rpi_test_support::vt::strip_ansi(&rendered[1]).contains("WIDGET-LINE"),
                 "widget rendered: {rendered:?}"
             );
         }
-        // Clear → the container is empty.
+        // Clear → the widget is gone; the leading Spacer(1) stays (upstream
+        // renderWidgetContainer spacerWhenEmpty, abb1775ff / PR #850).
         bridge.set_widget("w1", None, None);
-        assert!(lock(&ui.widgets_above).children.is_empty());
+        {
+            let container = lock(&ui.widgets_above);
+            assert_eq!(
+                container.children.len(),
+                1,
+                "leading spacer survives widget removal"
+            );
+            assert_eq!(
+                container.render(80),
+                vec![String::new()],
+                "empty widget dock renders exactly one blank line"
+            );
+        }
 
         // setHeader replaces the header area with the component description; None
         // restores the built-in.
@@ -8566,11 +8594,11 @@ mod tests {
         assert_ne!(dark, replayed, "widget rebuilt with the new theme");
 
         // Removal clears the archive: a later theme switch re-mounts
-        // nothing.
+        // nothing — only the permanent leading spacer remains.
         bridge.set_widget("k", None, None);
         let dark_theme = crate::core::themes::load_theme("dark", None).unwrap();
         ui.apply_theme(Arc::new(dark_theme));
-        assert!(lock(&ui.widgets_above).children.is_empty());
+        assert_eq!(lock(&ui.widgets_above).children.len(), 1);
         mode.shutdown().await;
     }
 
@@ -8607,7 +8635,13 @@ mod tests {
             ])),
             None,
         );
-        assert_eq!(lock(&above).children.len(), 1, "seeded widget mounted");
+        // children[0] is the permanent leading spacer (PR #850 port) — the
+        // seeded widget is the second child.
+        assert_eq!(
+            lock(&above).children.len(),
+            2,
+            "leading spacer + seeded widget"
+        );
 
         let stop = Arc::new(AtomicBool::new(false));
         let render_handle = ui.render_handle.clone();
@@ -8663,8 +8697,8 @@ mod tests {
         let (final_above, final_below) = (lock(&above).children.len(), lock(&below).children.len());
         assert_eq!(
             (final_above, final_below),
-            (1, 0),
-            "exactly one widget, above (last write i=119): {final_above}/{final_below}"
+            (2, 0),
+            "spacer + exactly one widget, above (last write i=119): {final_above}/{final_below}"
         );
         mode.shutdown().await;
     }
@@ -8699,22 +8733,32 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let before = render_lines();
-        assert_eq!(before.len(), 3, "three widget lines: {before:?}");
+        // spacer blank line + three widget lines (children[0] = Spacer(1)).
+        assert_eq!(before.len(), 4, "spacer + three widget lines: {before:?}");
 
         ui.apply_theme(Arc::new(
             crate::core::themes::load_theme("light", None).unwrap(),
         ));
         let after = render_lines();
-        assert_eq!(after.len(), 3, "replay keeps all three lines: {after:?}");
+        assert_eq!(
+            after.len(),
+            4,
+            "replay keeps spacer + all three lines: {after:?}"
+        );
         assert!(
             after
                 .iter()
+                .skip(1) // children[0] is the permanent leading spacer
                 .all(|l| rpi_test_support::vt::strip_ansi(l).contains("LINE-")),
             "{after:?}"
         );
 
         bridge.set_widget("w", None, None);
-        assert!(lock(&ui.widgets_above).children.is_empty());
+        assert_eq!(
+            lock(&ui.widgets_above).children.len(),
+            1,
+            "removal leaves the permanent leading spacer"
+        );
         mode.shutdown().await;
     }
 
@@ -8859,8 +8903,13 @@ mod tests {
             }),
         );
 
+        // above carries its permanent leading spacer + one widget; below has
+        // no spacer (spacerWhenEmpty=false) + one widget.
         let total = lock(&ui.widgets_above).children.len() + lock(&ui.widgets_below).children.len();
-        assert_eq!(total, 2, "exactly one child per key (no leaked widgets)");
+        assert_eq!(
+            total, 3,
+            "spacer + exactly one child per key (no leaked widgets)"
+        );
         let mut rendered: Vec<String> = Vec::new();
         for container in [&ui.widgets_above, &ui.widgets_below] {
             let guard = lock(container);
