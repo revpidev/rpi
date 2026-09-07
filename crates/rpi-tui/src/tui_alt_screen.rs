@@ -4472,6 +4472,120 @@ mod tests {
         stop(&tui);
     }
 
+    /// rc.1 实测回归（用户报告二）：已有会话（transcript 超视口）从主屏
+    /// 渲染器**热切换**到全屏后，屏幕必须干净——滚动条只出现在最后一列、
+    /// 内容与 dock（编辑器/页脚）不被轨道覆写、无撕裂；切换后的鼠标事件
+    /// 风暴不改变任何屏幕字节。钉死 rpi `switch_tui_mode` 的渲染面
+    /// （stop[preserve_screen] → 同终端 AltScreen → 同组件重挂载）。
+    #[test]
+    fn hot_switch_from_main_screen_with_tall_content_paints_a_clean_screen() {
+        // Serialized with the other global-state tests (capabilities,
+        // kitty metadata/image caches are process globals).
+        let _caps = CapsGuard::lock_only();
+        let terminal = VirtualTerminal::new(40, 10);
+
+        // 1. Regular renderer with the "existing session" content
+        //    (switch_tui_mode step 5: stop with preserve_screen).
+        let main = crate::tui_main_screen::TuiMainScreen::new(Box::new(terminal.clone()));
+        let (transcript_text, _transcript_handle) = numbered_text(50);
+        main.add_child(transcript_text.clone());
+        main.start();
+        settle(&main);
+        main.stop(crate::tui::TuiStopOptions {
+            preserve_screen: true,
+        });
+
+        // 2. Fullscreen renderer over the same terminal, same content
+        //    (steps 6/9: new AltScreen + remount; layout root mirrors the
+        //    rpi chat viewport: transcript ScrollView + fixed dock).
+        let tui = TuiAltScreen::new(Box::new(terminal.clone()));
+        let transcript = shared_component(ScrollView::new(
+            transcript_text,
+            ScrollViewOptions {
+                follow: Follow::End,
+                primary: true,
+                scrollbar: ScrollbarMode::Always,
+                ..ScrollViewOptions::default()
+            },
+        ));
+        let dock = shared_component(VStack::new(
+            vec![
+                StackChild::Component(text("editor")),
+                StackChild::Component(text("footer")),
+            ],
+            StackOptions::default(),
+        ));
+        tui.set_layout_root(Some(shared_component(VStack::new(
+            vec![
+                StackChild::Entry(
+                    transcript.clone(),
+                    StackEntryOptions {
+                        basis: Some(Basis::Fixed(0.0)),
+                        grow: Some(1.0),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+                StackChild::Entry(
+                    dock,
+                    StackEntryOptions {
+                        basis: Some(Basis::Auto),
+                        min_size: Some(1.0),
+                        ..StackEntryOptions::default()
+                    },
+                ),
+            ],
+            StackOptions::default(),
+        ))));
+        tui.start();
+        settle(&tui);
+
+        // 3. Screen shape: follow-end shows the last content lines; the
+        //    track lives ONLY in the last column of transcript rows.
+        let screen = terminal.get_viewport();
+        assert_eq!(screen.len(), 10, "viewport rows");
+        for (row, line) in screen.iter().take(8).enumerate() {
+            let chars: Vec<char> = line.chars().collect();
+            assert_eq!(chars.len(), 40, "row {row} width: {line:?}");
+            let last = chars[39];
+            assert!(
+                last == '\u{2502}' || last == '\u{2503}' || last == '\u{2588}',
+                "row {row} last cell must be a track/thumb glyph, got {last:?}: {line:?}"
+            );
+            let body: String = chars[..39].iter().collect();
+            let body = body.trim_end();
+            assert!(
+                !body.contains(['\u{2502}', '\u{2503}', '\u{2588}']),
+                "track glyphs leaked into the content area at row {row}: {line:?}"
+            );
+            assert!(
+                body.starts_with("line "),
+                "content intact at row {row}: {line:?}"
+            );
+        }
+        // Dock rows: editor + footer, no track.
+        assert!(screen[8].starts_with("editor"), "dock row: {:?}", screen[8]);
+        assert!(screen[9].starts_with("footer"), "dock row: {:?}", screen[9]);
+        assert!(
+            !screen[8].contains(['\u{2502}', '\u{2503}', '\u{2588}']),
+            "no track over the dock: {:?}",
+            screen[8]
+        );
+
+        // 4. Mouse storm over the switched screen: every row/col move (the
+        //    rc.1 DBG trigger sequence) must leave the screen unchanged.
+        let before = terminal.get_viewport();
+        for y in 1..=10 {
+            for x in [1, 20, 40] {
+                send_input(&terminal, &tui, &format!("\x1b[<35;{x};{y}M"));
+            }
+        }
+        settle(&tui);
+        let after = terminal.get_viewport();
+        assert_eq!(before, after, "mouse storm must not change the screen");
+        stop(&tui);
+    }
+
     // ---------------------------------------------------------------------
     // it("keeps an explicit dock fixed while the transcript scrolls")
     // ---------------------------------------------------------------------
