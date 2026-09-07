@@ -2671,12 +2671,6 @@ impl TuiAltScreenInner {
                 self.dispatch_mouse_to_layout(&event)
             }
         });
-        eprintln!(
-            "[DBG layout dispatch] x={} y={} consumed={}",
-            event.x,
-            event.y,
-            result.is_some()
-        );
         if let Some(result) = result {
             let render = self.apply_mouse_dispatch_result(&event, result.clone());
             if event_type == TuiMouseEventType::Press {
@@ -3338,10 +3332,6 @@ impl TuiAltScreenInner {
         }
         self.stop_selection_auto_scroll();
         self.selection_press_active = true;
-        eprintln!(
-            "[DBG selection press] x={} y={} anchor will be computed",
-            event.x, event.y
-        );
         let scroll_view = if !self.has_overlay() {
             self.current_layout.as_ref().and_then(|layout| {
                 get_scroll_views_at(layout, event.x as isize, event.y as isize)
