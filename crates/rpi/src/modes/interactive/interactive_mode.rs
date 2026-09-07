@@ -9044,6 +9044,77 @@ mod tests {
         mode.shutdown().await;
     }
 
+    /// rc.1 实测回归：已有会话热切换全屏后，鼠标分发路径不得向
+    /// stdout/stderr 直写（v0.1.4-rc.1 遗留的 `[DBG layout dispatch]` /
+    /// `[DBG selection press]` eprintln 在 raw mode + alt screen 下逐事件
+    /// 落在光标处——右下角多行乱字、进度条被冲、输入区被覆写；根治 =
+    /// 移除两处调试行 + rpi-tui 库 crate `deny(print_stdout/print_stderr/
+    /// dbg_macro)`）。本测试钉死触发序列：内容超视口 → 热切换 → 鼠标
+    /// 移动/点击全屏布局 → 渲染/tick 不崩溃、输入仍达编辑器。
+    #[tokio::test]
+    async fn rc1_repro_existing_session_hot_switch_to_fullscreen_renders() {
+        use rpi_tui::components::text::Text;
+
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        // 已有会话：50 行内容（视口 24 行 → 滚动条必然出现）。
+        for i in 0..50 {
+            ui.add_chat_child(Box::new(Text::new(format!("LINE-{i:02}"), 0, 0, None)));
+        }
+
+        // /settings 选择器挂载中热切换（用户真实路径）。
+        InteractiveUi::show_settings_selector(ui);
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen);
+        ui.ui.render_now(false);
+
+        ui.ui.render_now(false);
+
+        // 鼠标序列（用户触发 DBG 输出的路径）：全屏布局上的移动 + 点击 +
+        // 释放 + 右键——逐事件走 handle_mouse_event 的 layout dispatch 与
+        // selection press 分支。
+        for (x, y) in [(1, 1), (40, 5), (40, 20), (79, 23)] {
+            terminal.feed(&format!("\x1b[<35;{x};{y}M")); // motion (no button)
+            terminal.feed(&format!("\x1b[<0;{x};{y}M")); // left press
+            terminal.feed(&format!("\x1b[<0;{x};{y}m")); // release
+            ui.ui.tick(std::time::Instant::now());
+            ui.ui.render_now(false);
+        }
+        terminal.feed("\x1b[<2;40;10M");
+        terminal.feed("\x1b[<2;40;10m"); // right click (paste branch)
+        ui.ui.tick(std::time::Instant::now());
+        ui.ui.render_now(false);
+
+        // 关闭 selector（Esc）后输入（用户真实序列）。
+        terminal.feed("\u{1b}");
+        ui.ui.tick(std::time::Instant::now());
+        ui.ui.render_now(false);
+        for _ in 0..5 {
+            terminal.feed("e");
+            ui.ui.tick(std::time::Instant::now());
+            ui.ui.render_now(false);
+        }
+
+        // 输入区仍在：编辑器收到字符（无崩溃 + 焦点存活）。
+        let editor_text = lock(&ui.editor).get_text();
+        assert_eq!(
+            editor_text, "eeeee",
+            "editor consumed the input after the switch"
+        );
+
+        // 写出的字节流本身是合法 UTF-8（滚动条多字节字符无撕裂）。
+        let writes = terminal.writes();
+        assert!(
+            std::str::from_utf8(writes.as_bytes()).is_ok(),
+            "terminal byte stream must stay valid utf-8"
+        );
+        assert!(writes.contains("LINE-"), "transcript rendered");
+        mode.shutdown().await;
+    }
+
     #[tokio::test]
     async fn stop_interactive_tui_fullscreen_resume_hint_preserves_screen() {
         let (mut mode, _terminal, _session) = mode_harness().await;

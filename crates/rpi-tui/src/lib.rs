@@ -12,6 +12,16 @@
 //! terminal_* modules first, then components, the TUI core and terminal
 //! state recovery (`recovery`, coding-standards §8.5).
 
+// TUI 库进程内禁止 stdout/stderr 直写（rc.1 缺口根治）：raw mode + alt
+// screen 下任何裸 print 都会落在光标处硬伤终端显示（v0.1.4-rc.1 的
+// `[DBG layout dispatch]` 遗留调试行即此类缺陷——全屏鼠标分发路径逐事件
+// 打印，覆写右下角并破坏进度条/输入区）。组件错误一律经
+// [`crate::tui::TuiHandle::on_debug`] / Result 上报；测试代码豁免。
+#![cfg_attr(
+    not(test),
+    deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)
+)]
+
 pub mod alt_screen_search;
 pub mod autocomplete;
 pub mod components;
