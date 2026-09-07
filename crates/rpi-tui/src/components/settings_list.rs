@@ -342,14 +342,18 @@ impl SettingsList {
         let (start_index, end_index) = self.get_visible_range();
 
         // Calculate max label width for alignment (over ALL items, matching
-        // upstream `this.items.map(...)`).
+        // upstream `this.items.map(...)`). `Math.min(36, ...)`
+        // (settings-list.ts:120): the cap only guards against pathological
+        // labels — the longest real label ("Default thinking level per
+        // model", 32 columns) must stay under it, or that row's value column
+        // shifts right relative to every other row.
         let max_label_width = self
             .items
             .iter()
             .map(|item| visible_width(&item.label))
             .max()
             .unwrap_or(0)
-            .min(30);
+            .min(36);
 
         // Render visible items.
         for index in start_index..end_index {
@@ -672,6 +676,38 @@ mod tests {
         settings.handle_input("\x1b[B");
         let lines = plain(settings.render(40));
         assert!(lines[1].starts_with("→ beta"));
+    }
+
+    /// Upstream caps the label column at `Math.min(36, ...)`
+    /// (settings-list.ts:120). The longest real label — "Default thinking
+    /// level per model", 32 columns — must stay UNDER the cap so its value
+    /// aligns with every other row; a 30-column cap (the old port) let it
+    /// escape and pushed that row's value 2 columns right.
+    #[test]
+    fn aligns_values_for_labels_between_30_and_36_columns() {
+        let settings = list(
+            vec![
+                item("a", "TUI mode", "regular"),
+                item("b", "Default thinking level per model", "not set"),
+            ],
+            None,
+        );
+        let lines = plain(settings.render(60));
+        // Both values start at the same CHARACTER column (the cursor "→" is
+        // one column but three UTF-8 bytes, so measure in chars):
+        // prefix(2) + label column(32) + separator(2) = 36.
+        let column = |line: &str, needle: &str| {
+            let byte = line.find(needle).expect("value rendered");
+            line[..byte].chars().count()
+        };
+        let regular = column(&lines[0], "regular");
+        let not_set = column(&lines[1], "not set");
+        assert_eq!(
+            regular, not_set,
+            "value columns must align:\n{}\n{}",
+            lines[0], lines[1]
+        );
+        assert_eq!(regular, 36);
     }
 
     #[test]
