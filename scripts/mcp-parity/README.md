@@ -16,6 +16,10 @@ node scripts/mcp-parity/run-mcp-parity.mjs     # 全场景，非零退出码 = �
 - 依赖装在 `/tmp/rpi-mcp-parity-deps`（`setup-deps.sh` 复制上游
   `package.json` + `package-lock.json` 后 `npm ci`——完整传递闭包钉死
   为上游测试过的版本；含 tsx 与官方 conformance referee）。
+  **绝不写入 `rpi/external/`**。
+- 报告落 `rpi/fixtures/generated/mcp-parity/`（`parity-report.md` +
+  每场景两侧 `parity-<scenario>-{upstream,rpi}.json`），**进 git 作为
+  证据链**（归一化剔除运行期易变值，复跑不产生 churn）。
 
 ## 目标轨（TE13 骨架，ADR-0025）
 
@@ -33,10 +37,6 @@ node scripts/mcp-parity/run-mcp-parity.mjs --out-dir /tmp/mcp-target-parity
 均读 `RPI_MCP_PARITY_UPSTREAM`，缺省即旧 pin，回归轨行为逐字节不变。目标轨的
 golden/conformance 重录清单与承接任务见 [`TARGET-TRACK.md`](./TARGET-TRACK.md)
 （命名类 golden → TE23、conformance/纯函数向量 → TE24）；TE13 只交骨架，不重录。
-  **绝不写入 `rpi/external/`**。
-- 报告落 `rpi/fixtures/generated/mcp-parity/`（`parity-report.md` +
-  每场景两侧 `parity-<scenario>-{upstream,rpi}.json`），**进 git 作为
-  证据链**（归一化剔除运行期易变值，复跑不产生 churn）。
 
 ## 场景
 
