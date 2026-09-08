@@ -408,6 +408,78 @@ async fn api_flag_defaults_and_per_extension_visibility() {
 }
 
 // ---------------------------------------------------------------------------
+// #8423: getFlag reads the pending buffer while the factory runs
+// (loader.ts:353-357 @ 9841914)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn api_get_flag_sees_pending_default_inside_factory() {
+    // `pi.getFlag` inside the factory reads the just-registered default
+    // through the pending buffer — the runtime has no value yet, and the
+    // load has not committed.
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let recorder = seen.clone();
+    let host = host_with(vec![inline_ext("ext-a", move |api| {
+        api.register_flag(
+            "failed-flag",
+            None,
+            FlagType::Boolean,
+            Some(FlagValue::Boolean(true)),
+        )
+        .unwrap();
+        *recorder.lock().unwrap() = api.get_flag("failed-flag").unwrap();
+    })])
+    .await;
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(FlagValue::Boolean(true)),
+        "getFlag inside the factory must see the pending default"
+    );
+    // After commit the default is materialized into the runtime as well.
+    assert_eq!(
+        host.runtime().get_flag_value("failed-flag"),
+        Some(FlagValue::Boolean(true))
+    );
+}
+
+#[tokio::test]
+async fn api_get_flag_pending_default_respects_cli_override() {
+    // The pending fallback only applies where the runtime has no value:
+    // a CLI-set value (runtime.setFlagValue) stays visible inside the
+    // factory (same "only where the runtime has no value yet" guard as
+    // the commit path, loader.ts:280-282).
+    let host = NativeExtensionHost::new("/test-cwd");
+    host.runtime()
+        .set_flag_value("mine", FlagValue::Boolean(false));
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let recorder = seen.clone();
+    let errors = host
+        .load_inline(&[inline_ext("ext-a", move |api| {
+            api.register_flag(
+                "mine",
+                None,
+                FlagType::Boolean,
+                Some(FlagValue::Boolean(true)),
+            )
+            .unwrap();
+            *recorder.lock().unwrap() = api.get_flag("mine").unwrap();
+        })])
+        .await;
+    assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(FlagValue::Boolean(false)),
+        "CLI-set runtime value wins over the pending default inside the factory"
+    );
+    assert_eq!(
+        host.runtime().get_flag_value("mine"),
+        Some(FlagValue::Boolean(false))
+    );
+}
+
+// ---------------------------------------------------------------------------
 // V14-11 FR-E: registerFlag default/type validation (f47faf459,
 // loader.ts:316-322)
 // ---------------------------------------------------------------------------

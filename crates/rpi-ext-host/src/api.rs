@@ -264,6 +264,16 @@ impl LoadTransaction {
         }
     }
 
+    /// Read side of the pending buffer for `pi.getFlag` during loading
+    /// (`pendingFlagValues.get(name)`, loader.ts:353-357 @ 9841914, #8423).
+    pub(crate) fn pending_flag_value(&self, name: &str) -> Option<FlagValue> {
+        self.pending_flag_values
+            .lock_inner()
+            .iter()
+            .find(|(existing, _)| existing == name)
+            .map(|(_, value)| value.clone())
+    }
+
     pub(crate) fn push_runtime_change(&self, change: PendingRuntimeChange) {
         self.pending_runtime_changes.lock_inner().push(change);
     }
@@ -2179,13 +2189,23 @@ impl ExtensionApi {
     }
 
     /// `pi.getFlag(name)` (loader.ts:297-301): only flags registered by
-    /// *this* extension are visible through its API.
+    /// *this* extension are visible through its API. During loading, a
+    /// default registered moments ago is visible through the pending
+    /// buffer (`runtime.flagValues.has(name) ? … : pendingFlagValues
+    /// .get(name)`, loader.ts:353-357 @ 9841914) — upstream regression
+    /// 8423 pins `pi.getFlag(...) === default` inside the factory itself.
     pub fn get_flag(&self, name: &str) -> Result<Option<FlagValue>, ExtError> {
         self.runtime.assert_active()?;
         if !self.extension.flags().contains(name) {
             return Ok(None);
         }
-        Ok(self.runtime.get_flag_value(name))
+        if let Some(value) = self.runtime.get_flag_value(name) {
+            return Ok(Some(value));
+        }
+        if self.load.is_loading() {
+            return Ok(self.load.pending_flag_value(name));
+        }
+        Ok(None)
     }
 
     /// `pi.registerMessageRenderer(customType, renderer)` (loader.ts:285-288).
