@@ -700,7 +700,21 @@ impl Component for SharedEntry {
     }
 
     fn handle_mouse(&mut self, event: &TuiMouseEvent) -> Option<TuiMouseHandlerResult> {
-        lock(&self.0).handle_mouse(event)
+        // Upstream: the editor container forwards clicks through
+        // `dispatchMouseEvent(child)` and passes the child's dispatch
+        // result through verbatim (tui.ts:355-358 — a plain Container
+        // defines no `handleInput`, so the result's `focusTarget` stays the
+        // CHILD). The port's bare `Event` result carries no target, so the
+        // outer dispatcher would attach the container ENTRY as the focus
+        // target — a keyboard-dead wrapper (`Container::handle_input` is a
+        // no-op): a left click on the editor/selector rows moved keyboard
+        // focus off the editor and every following keystroke died (the
+        // fullscreen "input frozen after first interaction" report).
+        // Re-resolve through `dispatch_mouse_event` so the entry's inner
+        // shared component stays both the gesture target and the focus
+        // target, exactly like the upstream child dispatch
+        // (mouse-region.ts:26 pass-through pattern).
+        rpi_tui::tui::dispatch_mouse_event(&self.0, event).map(TuiMouseHandlerResult::Forwarded)
     }
 
     fn invalidate(&mut self) {
@@ -9112,6 +9126,50 @@ mod tests {
             "terminal byte stream must stay valid utf-8"
         );
         assert!(writes.contains("LINE-"), "transcript rendered");
+        mode.shutdown().await;
+    }
+
+    /// 排查定论测试（另一 agent PTY 疑点，单测级断言）：全屏下对
+    /// dock/编辑器区域逐行逐列左键 click（press+release），焦点
+    /// 不得丢失、按键必须继续送达编辑器——定论 `apply_mouse_dispatch_
+    /// result` 的 `set_focus` 路径不会把键盘焦点引离编辑器。若未来
+    /// 复现「点击后输入卡死」，此测试应是最小复现点。
+    #[tokio::test]
+    async fn fullscreen_left_click_across_dock_keeps_editor_focus_and_input() {
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        // 首帧，让 layout 生成（鼠标分发依赖 current_layout）。
+        ui.ui.render_now(false);
+
+        // 24 行终端：转录区在上，dock（editor/footer）在下。覆盖整个
+        // dock 及转录底部若干行，多列点击。
+        for row in 12..=24u32 {
+            for col in [1u32, 5, 40, 78] {
+                terminal.feed(&format!("\x1b[<0;{col};{row}M"));
+                terminal.feed(&format!("\x1b[<0;{col};{row}m"));
+                ui.ui.tick(std::time::Instant::now());
+
+                let focused = ui.ui.get_focused_component();
+                assert!(
+                    focused.is_some(),
+                    "row {row} col {col}: keyboard focus lost entirely"
+                );
+
+                let before = lock(&ui.editor).get_text();
+                terminal.feed("k");
+                ui.ui.tick(std::time::Instant::now());
+                let after = lock(&ui.editor).get_text();
+                assert_eq!(
+                    after,
+                    format!("{before}k"),
+                    "row {row} col {col}: keystroke lost after click"
+                );
+            }
+        }
         mode.shutdown().await;
     }
 
