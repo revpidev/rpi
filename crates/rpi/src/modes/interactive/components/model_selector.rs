@@ -216,10 +216,12 @@ fn set_scope(
     filter_models(state, &query, default_model);
 }
 
-/// `filterModels` (model-selector.ts:235-243).
-/// `filterModels` (model-selector.ts:253-280 @ 1d3503fb9): default entries
-/// are searchable (" default startup" suffix) and a query containing the
-/// word `default`/`startup` pins them to the top.
+/// `filterModels` (model-selector.ts:274-292 @ 9841914, 768184923): the
+/// default entry carries a `" default"` search suffix, and a query that
+/// is a prefix of `"default"` (trim + lowercase, non-empty) pins it to
+/// the top (`isDefaultSearch`, model-selector.ts:262-266). rpi previously
+/// ported the older 1d3503fb9 shape (`" default startup"` suffix +
+/// whole-word `default`/`startup` match) and missed this upstream fix.
 fn filter_models(state: &mut SelectorState, query: &str, default_model: Option<&(String, String)>) {
     let is_default = |model: &Model| {
         default_model.is_some_and(|(provider, id)| *provider == model.provider && *id == model.id)
@@ -234,19 +236,17 @@ fn filter_models(state: &mut SelectorState, query: &str, default_model: Option<&
                 name: Some(item.model.name.clone()),
             });
             if is_default(&item.model) {
-                format!("{base} default startup")
+                format!("{base} default")
             } else {
                 base
             }
         });
-        // `/\b(default|startup)\b/iu.test(query)` — word-boundary match on
-        // the two pinning keywords (splitting on non-alphanumerics is the
-        // pragmatic Unicode word boundary).
-        let pins_default = query
-            .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-            .any(|word| {
-                word.eq_ignore_ascii_case("default") || word.eq_ignore_ascii_case("startup")
-            });
+        // `isDefaultSearch(query)` (model-selector.ts:262-266): the trimmed,
+        // lowercased query is a non-empty prefix of "default" — `d`, `de`,
+        // …, `default` pin the default entry; `startup` or any other word
+        // does not.
+        let normalized = query.trim().to_lowercase();
+        let pins_default = !normalized.is_empty() && "default".starts_with(&normalized);
         if pins_default {
             let mut combined: Vec<ModelItem> = state
                 .active_models
@@ -990,6 +990,62 @@ mod tests {
         // ` · default` badge on the persisted default (1d3503fb9).
         assert!(rows[2].contains("b2 [beta] · default"), "got: {}", rows[2]);
         assert!(!rows[0].contains("· default"));
+    }
+
+    /// rpi#37 (upstream 768184923, model-selector.ts:262-266/274-292 @
+    /// 9841914): a query that is a non-empty prefix of "default"
+    /// (trim + lowercase) pins the default entry to the top; the older
+    /// whole-word `default`/`startup` shape is gone — `startup` neither
+    /// pins nor matches the default entry's search text.
+    #[tokio::test]
+    async fn default_search_pins_on_prefix_queries_only() {
+        install_keybindings();
+
+        async fn rows_for(query: &str) -> Vec<String> {
+            // Drive the search input through the component's input path
+            // (chars reach the search input, then filterModels runs).
+            let (_tmp, runtime) = runtime_with_models_json(MODELS_JSON).await;
+            let (mut component, _, _, _) =
+                build(None, runtime, Vec::new(), None, None, Some(("beta", "b2")));
+            for ch in query.chars() {
+                component.handle_input(&ch.to_string());
+            }
+            list_rows(&component.render(80))
+        }
+
+        // "d" / "de" / "DEFAULT" / " default " — prefix queries pin the
+        // default entry (b2) to the top even though "d" fuzzy-matches
+        // other rows too.
+        for query in ["d", "de", "DEFAULT", " default "] {
+            let rows = rows_for(query).await;
+            assert!(
+                rows.first().is_some_and(|row| row.contains("b2 [beta]")),
+                "query {query:?} must pin the default entry first; rows: {rows:?}"
+            );
+        }
+
+        // "startup": the default entry's search text no longer carries the
+        // word — no match at all (the only rows left, if any, are fuzzy
+        // matches on other models), and the default is never pinned.
+        let rows = rows_for("startup").await;
+        assert!(
+            rows.iter().all(|row| !row.contains("b2 [beta]")),
+            "query \"startup\" must not match or pin the default entry; rows: {rows:?}"
+        );
+
+        // A phrase containing "default" as a whole word is not a prefix
+        // query and does NOT pin under the prefix semantics — but the
+        // bare "default" query does.
+        let rows = rows_for("my default pick").await;
+        assert!(
+            !rows.first().is_some_and(|row| row.contains("b2 [beta]")),
+            "phrase queries are not prefix queries; rows: {rows:?}"
+        );
+        let rows = rows_for("default").await;
+        assert!(
+            rows.first().is_some_and(|row| row.contains("b2 [beta]")),
+            "the exact \"default\" query pins; rows: {rows:?}"
+        );
     }
 
     #[tokio::test]
