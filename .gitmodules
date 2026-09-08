@@ -10,3 +10,6 @@
 [submodule "external/agent-smart-fetch"]
 	path = external/agent-smart-fetch
 	url = https://github.com/Thinkscape/agent-smart-fetch.git
+[submodule "external/rpiv-mono"]
+	path = external/rpiv-mono
+	url = https://github.com/juicesharp/rpiv-mono.git
