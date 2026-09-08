@@ -929,6 +929,112 @@ async fn abort_cancels_in_flight_manual_compaction() {
     assert!(fixture.session.is_idle());
 }
 
+/// rpi#33: an `abort()` concurrent with an in-flight manual compaction
+/// (the RPC `compact` → `abort` sequence — each command runs on its own
+/// task) must return once the compaction settles. V14-02 tightened
+/// `isIdle` to cover the compaction runner, but only the agent-run settle
+/// woke `waitForIdle`, so the aborted-compaction lock release left the
+/// waiter asleep forever (upstream resolves in `_clearManualCompactionState`,
+/// agent-session.ts:1926-1929).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_concurrent_with_inflight_compaction_returns_after_settle() {
+    use rpi::core::compaction_runner::CompactionEvent;
+
+    fn user_msg(text: &str) -> AgentMessage {
+        AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole::User,
+            content: rpi_ai::types::UserContent::Text(text.to_owned()),
+            timestamp: 1,
+        })
+    }
+
+    let settings = r#"{"compaction": {"reserveTokens": 100, "keepRecentTokens": 10}}"#;
+    let fixture = session_fixture(vec![], FauxProviderOptions::default(), Some(settings)).await;
+    {
+        let manager = fixture.session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        manager
+            .append_message(user_msg(&format!("q {}", "x".repeat(200))))
+            .expect("append");
+        manager
+            .append_message(AgentMessage::Assistant(faux_assistant_message(
+                format!("a {}", "y".repeat(200)),
+                FauxAssistantOptions::default(),
+            )))
+            .expect("append");
+        manager
+            .append_message(user_msg(&format!("q2 {}", "x".repeat(200))))
+            .expect("append");
+    }
+    fixture.provider.set_responses(vec![faux_assistant_message(
+        "SUMMARY",
+        FauxAssistantOptions::default(),
+    )
+    .into()]);
+
+    // Fire the RPC Abort the instant the compaction is observably in
+    // flight — CompactionStart fires inside compact() before the
+    // summarization stream completes, so the spawned abort() overlaps the
+    // in-flight window (deterministic race).
+    let abort_outcome: Arc<Mutex<Option<Result<(), tokio::time::error::Elapsed>>>> =
+        Arc::new(Mutex::new(None));
+    let abort_session = fixture.session.clone();
+    let slot = abort_outcome.clone();
+    let unsubscribe = fixture.session.subscribe(Arc::new(move |event| {
+        if let rpi::core::agent_session::AgentSessionEvent::Compaction(inner) = event {
+            if matches!(*inner, CompactionEvent::CompactionStart { .. }) {
+                let session = abort_session.clone();
+                let slot = slot.clone();
+                tokio::spawn(async move {
+                    let outcome =
+                        tokio::time::timeout(std::time::Duration::from_secs(10), session.abort())
+                            .await;
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+                });
+            }
+        }
+    }));
+
+    // The RPC Compact command task — not awaited before the abort lands.
+    let compact_session = fixture.session.clone();
+    let compact_task = tokio::spawn(async move { compact_session.compact(None).await });
+
+    // The compaction must settle on its own (its token is cancelled by the
+    // concurrent abort) and release the runner.
+    let compact_result = tokio::time::timeout(std::time::Duration::from_secs(10), compact_task)
+        .await
+        .expect("compact task finished")
+        .expect("compact join ok")
+        .expect_err("cancelled compaction errors");
+    assert!(
+        compact_result.to_string().contains("cancelled"),
+        "error: {compact_result}"
+    );
+
+    // The concurrent abort() must resolve after the compaction settled —
+    // pre-fix this slept forever (no wake on runner release).
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(outcome) = abort_outcome
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return outcome;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("abort outcome reported");
+    assert!(
+        outcome.is_ok(),
+        "abort() timed out — wait_for_idle was never woken after the compaction settled"
+    );
+    assert!(fixture.session.is_idle());
+    let _ = unsubscribe;
+}
+
 /// `AgentSession::abort` walks the full chain (retry → compaction → branch
 /// summary → agent.abort → waitForIdle) and returns on an idle session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

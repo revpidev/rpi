@@ -2664,10 +2664,18 @@ impl AgentSession {
             let mut runner = self.inner.compaction.lock().await;
             runner.compact(custom_instructions).await
         };
+        // `_clearManualCompactionState` (agent-session.ts:1926-1929
+        // @ 9841914): resolve a pending `waitForIdle` when the manual
+        // compaction releases the runner — `isIdle` covers the compaction
+        // lock (#8920), so without this wake an abort() concurrent with
+        // the compaction would sleep forever.
+        self.resolve_idle_wait_if_idle();
         result
     }
 
-    /// `_checkCompaction` trigger (agent-session.ts:1953-2042).
+    /// `_checkCompaction` trigger (agent-session.ts:1953-2042). The
+    /// `finally` block (agent-session.ts:2427-2430 @ 9841914) resolves a
+    /// pending `waitForIdle` once the auto compaction releases the runner.
     async fn check_compaction(
         &self,
         assistant_message: &AssistantMessage,
@@ -2675,9 +2683,12 @@ impl AgentSession {
     ) -> bool {
         self.sync_compaction_model();
         let mut runner = self.inner.compaction.lock().await;
-        runner
+        let outcome = runner
             .check_compaction(assistant_message, skip_aborted_check)
-            .await
+            .await;
+        drop(runner);
+        self.resolve_idle_wait_if_idle();
+        outcome
     }
 
     /// `abortCompaction` (agent-session.ts:1938-1941). Cancels both the
@@ -2994,6 +3005,10 @@ impl AgentSession {
         // exit path — the wrapper guarantees the clear (bea67d90d/#8920).
         let result = self.navigate_tree_inner(target_id, options).await;
         *lock(&self.inner.branch_summary_abort) = None;
+        // `navigateTree` finally (agent-session.ts:3300-3303 @ 9841914):
+        // clearing the branch-summary cell can flip `isIdle` to true —
+        // resolve a pending `waitForIdle` (e.g. a concurrent abort()).
+        self.resolve_idle_wait_if_idle();
         result
     }
 
