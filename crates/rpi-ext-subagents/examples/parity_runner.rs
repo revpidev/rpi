@@ -2,8 +2,10 @@
 //!
 //! Reads the shared fixture JSON (same file the upstream tsx runner reads),
 //! produces normalized outputs for `args` (build_rpi_args), `frontmatter`
-//! (parse_frontmatter + parse_frontmatter_list) and `final-output`
-//! (get_final_output), prints one JSON document per line. Invoked by
+//! (parse_frontmatter + parse_frontmatter_list), `final-output`
+//! (get_final_output) and `fallback` (is_retryable_model_failure; the
+//! context-overflow/attempt functions are TE14 and emit null for now),
+//! prints one JSON document per line. Invoked by
 //! `scripts/subagents-parity/run-parity.mjs`; never part of `cargo test`.
 //!
 //! Normalization whitelist (documented in scripts/subagents-parity/README.md):
@@ -137,6 +139,26 @@ fn run_final_output_case(messages: &Value) -> Value {
     ))
 }
 
+/// Fallback/replay vectors (target track only, TE13).
+///
+/// `retryable` drives the ported `isRetryableModelFailure`. `context-overflow`
+/// (R7.1.2.2) and `attempt` (R7.1.2.3) have no Rust function until TE14, so the
+/// runner emits JSON `null`; the orchestrator turns that into an attributed
+/// diff via `expected-target-diffs.json` instead of failing silently.
+fn run_fallback_case(case: &Value) -> Value {
+    let kind = case.get("kind").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "retryable" => json!({
+            "retryable": rpi_ext_subagents::parity::is_retryable_model_failure_public(
+                case.get("error").and_then(Value::as_str),
+            ),
+        }),
+        "context-overflow" => json!({ "contextOverflow": Value::Null }),
+        "attempt" => json!({ "attempt": Value::Null }),
+        other => json!({ "error": format!("unknown fallback fixture kind: {other}") }),
+    }
+}
+
 fn main() {
     let mut raw = String::new();
     let mut args = std::env::args().skip(1);
@@ -164,6 +186,7 @@ fn main() {
                 run_frontmatter_case(case.get("content").and_then(Value::as_str).unwrap_or(""))
             }
             "final-output" => run_final_output_case(case.get("messages").unwrap_or(&Value::Null)),
+            "fallback" => run_fallback_case(&case),
             other => {
                 eprintln!("parity_runner: unknown mode {other}");
                 std::process::exit(2);

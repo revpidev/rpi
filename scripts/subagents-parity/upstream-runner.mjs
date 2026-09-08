@@ -1,16 +1,29 @@
-// Upstream leg of the subagents parity harness (TE04 G3).
+// Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13).
 //
-// Executes the pinned pi-subagents modules directly (tsx, no build step)
-// against the shared fixture files and prints normalized JSON lines that the
-// orchestrator diffs against the Rust parity_runner example.
+// Track `regression` (default): executes the pinned v0.48 modules directly
+// (tsx, no build step) from `external/pi-subagents` — the pre-TE13 behavior.
 //
-// Run from rpi/scripts/subagents-parity via run-parity.mjs — never run inside
-// external/ (the submodule stays read-only; nothing here writes to it).
+// Track `target` (pi-subagents v0.66.0, ADR-0025):
+//   - argv/env: the frozen v0.48 golden (upstream deleted `pi-args.ts` /
+//     `buildPiArgs` in v0.65, so this surface is [RPI-OWN], ADR-0025 §4);
+//   - frontmatter / final-output / fallback: the v0.66 snapshot extracted by
+//     `setup-target-source.sh` (never a checkout of `external/`).
+//
+// Prints normalized JSON lines that the orchestrator diffs against the Rust
+// parity_runner example.
+//
+// Run via run-parity.mjs — never run inside external/ (the submodule stays
+// read-only; nothing here writes to it).
 import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const require = createRequire(import.meta.url);
-const UPSTREAM_ROOT = new URL("../../external/pi-subagents/", import.meta.url).pathname;
+const HERE = dirname(fileURLToPath(import.meta.url));
+const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
+const REGRESSION_ROOT = resolve(HERE, "../../external/pi-subagents");
+const TARGET_ROOT =
+	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v066";
+const ARGS_GOLDEN = resolve(HERE, "args-golden-v048.json");
 
 // Normalize an argv array the same way the Rust runner does.
 function normalizeArgv(args) {
@@ -55,15 +68,24 @@ function normalizeEnv(env) {
 	return out;
 }
 
+function moduleUrl(root, relative) {
+	return pathToFileURL(resolve(root, relative)).href;
+}
+
 async function loadUpstream() {
-	const { pathToFileURL } = await import("node:url");
-	const piArgsUrl = pathToFileURL(UPSTREAM_ROOT + "src/runs/shared/pi-args.ts").href;
-	const frontmatterUrl = pathToFileURL(UPSTREAM_ROOT + "src/agents/frontmatter.ts").href;
-	const utilsUrl = pathToFileURL(UPSTREAM_ROOT + "src/shared/utils.ts").href;
-	const piArgs = await import(piArgsUrl);
-	const frontmatter = await import(frontmatterUrl);
-	const utils = await import(utilsUrl);
-	return { piArgs, frontmatter, utils };
+	const root = TRACK === "target" ? TARGET_ROOT : REGRESSION_ROOT;
+	const frontmatter = await import(moduleUrl(root, "src/agents/frontmatter.ts"));
+	const utils = await import(moduleUrl(root, "src/shared/utils.ts"));
+	const modelFallback =
+		TRACK === "target"
+			? await import(moduleUrl(root, "src/runs/shared/model-fallback.ts"))
+			: undefined;
+	// v0.48 only: argv/env source. Absent at v0.66 (ADR-0025 §4).
+	const piArgs =
+		TRACK === "target"
+			? undefined
+			: await import(moduleUrl(root, "src/runs/shared/pi-args.ts"));
+	return { piArgs, frontmatter, utils, modelFallback };
 }
 
 function buildArgsCase(piArgs, input) {
@@ -119,23 +141,62 @@ function frontmatterCase(frontmatter, content) {
 	};
 }
 
+function fallbackCase(modelFallback, fixture) {
+	switch (fixture.kind) {
+		case "retryable":
+			return { retryable: modelFallback.isRetryableModelFailure(fixture.error) };
+		case "context-overflow":
+			return { contextOverflow: modelFallback.isContextOverflow(fixture.error) };
+		case "attempt":
+			return {
+				attempt: modelFallback.isRetryableModelFailureAttempt({
+					error: fixture.error,
+					messages: fixture.messages,
+					toolCount: fixture.toolCount,
+				}),
+			};
+		default:
+			throw new Error(`unknown fallback fixture kind: ${fixture.kind}`);
+	}
+}
+
+function loadArgsGolden() {
+	const golden = JSON.parse(readFileSync(ARGS_GOLDEN, "utf-8"));
+	const byName = new Map();
+	for (const entry of golden.cases ?? []) byName.set(entry.name, entry.output);
+	return byName;
+}
+
 async function main() {
 	const mode = process.argv[2];
 	const fixturePath = process.argv[3];
 	if (!mode || !fixturePath) {
-		console.error("usage: upstream-runner.mjs <args|frontmatter|final-output> <fixture.json>");
+		console.error(
+			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback> <fixture.json>",
+		);
 		process.exit(2);
 	}
-	const { piArgs, frontmatter, utils } = await loadUpstream();
+	const { piArgs, frontmatter, utils, modelFallback } = await loadUpstream();
 	const fixtures = JSON.parse(readFileSync(fixturePath, "utf-8"));
+	const golden = mode === "args" && TRACK === "target" ? loadArgsGolden() : null;
 	for (const fixture of fixtures.cases ?? []) {
 		let output;
 		if (mode === "args") {
-			output = buildArgsCase(piArgs, fixture.input ?? {});
+			output = golden
+				? golden.get(fixture.name)
+				: buildArgsCase(piArgs, fixture.input ?? {});
+			if (output === undefined) {
+				throw new Error(`args golden missing case ${fixture.name}`);
+			}
 		} else if (mode === "frontmatter") {
 			output = frontmatterCase(frontmatter, fixture.content ?? "");
-		} else {
+		} else if (mode === "final-output") {
 			output = utils.getFinalOutput(fixture.messages ?? []);
+		} else if (mode === "fallback") {
+			output = fallbackCase(modelFallback, fixture);
+		} else {
+			console.error(`upstream-runner: unknown mode ${mode}`);
+			process.exit(2);
 		}
 		process.stdout.write(JSON.stringify({ name: fixture.name, output }) + "\n");
 	}

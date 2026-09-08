@@ -1,0 +1,57 @@
+{
+  "//": "Expected terminal outcome per event-stream group (R7.1.1.3, TE14). Derived by reading pi-subagents v0.66.0 @ 0fc0eebb (anchors below); TE14 replays each JSONL through ChildRunState and asserts these fields. currentRpiAtM0 records the pre-fix behavior the target-track report attributes.",
+  "pin": "0fc0eebb9604970c506708b7508d6aa38921fde2",
+  "groups": [
+    {
+      "file": "will-retry-then-success.jsonl",
+      "r": ["R7.1.1.1"],
+      "anchors": [
+        "src/shared/utils.ts:249-281 getFinalOutput (skips messages with errorMessage/stopReason=error)",
+        "src/runs/foreground/execution.ts:1450-1468 (empty/error terminal classification)"
+      ],
+      "expected": {
+        "finalOutput": "recovered after retry",
+        "error": null,
+        "exitCode": 0,
+        "assistantErrorCleared": true
+      },
+      "currentRpiAtM0": {
+        "assistantErrorCleared": false,
+        "anchor": "crates/rpi-ext-subagents/src/runner/events.rs:1000-1006 (assistant_error is only written)"
+      }
+    },
+    {
+      "file": "empty-terminal-text.jsonl",
+      "r": ["R7.1.1.2"],
+      "anchors": [
+        "src/shared/utils.ts:456-467 hasEmptyTerminalAssistantResponse (v0.66 empty-text terminal arm)",
+        "src/shared/utils.ts:469-481 formatEmptyTerminalAssistantResponseError",
+        "src/runs/foreground/execution.ts:1461-1465 (missingOutput/terminalEmptyAfterUsefulWork -> exitCode 1 + error)"
+      ],
+      "expected": {
+        "finalOutput": "",
+        "error": "Subagent produced no output (possible model cold-start or empty response).",
+        "exitCode": 1
+      },
+      "currentRpiAtM0": {
+        "note": "empty terminal text is not classified as empty-output before TE14"
+      }
+    },
+    {
+      "file": "tool-error-empty-reply.jsonl",
+      "r": ["R7.1.1.2"],
+      "anchors": [
+        "src/runs/foreground/execution.ts:1461-1465 (`!errInfo.hasError || hasEmptyTerminalAssistantResponse(messages)` lets the empty-output diagnostic win over an earlier tool error)"
+      ],
+      "expected": {
+        "finalOutput": "",
+        "error": "Subagent produced no output (possible model cold-start or empty response).",
+        "exitCode": 1,
+        "note": "empty-output diagnostic takes priority over the earlier `bash failed (exit 1)` tool error"
+      },
+      "currentRpiAtM0": {
+        "note": "runner/foreground.rs:998-1032 checks tool_diagnostic/assistant_error before empty output (R7.1.1.2)"
+      }
+    }
+  ]
+}

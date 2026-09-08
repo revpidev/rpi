@@ -26,10 +26,13 @@ import { createServer } from "node:net";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
-const UPSTREAM = join(REPO, "external", "pi-mcp-adapter");
+const UPSTREAM =
+  process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi-mcp-adapter");
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "3d953f90";
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
-const OUT_DIR = join(REPO, "fixtures", "generated", "mcp-parity");
+const OUT_DIR =
+  process.env.RPI_MCP_PARITY_OUT_DIR ?? join(REPO, "fixtures", "generated", "mcp-parity");
 
 if (!existsSync(join(DEPS, "node_modules"))) {
   console.error(`Missing out-of-tree deps at ${DEPS}; run scripts/mcp-parity/setup-deps.sh first`);
@@ -140,7 +143,7 @@ const report = [
   "# OAuth cross-implementation parity report (TE02 item 5 / TE03 groundwork)",
   "",
   `Generated: ${new Date().toISOString()} (rerun: \`node scripts/mcp-parity/run-oauth-parity.mjs\`)`,
-  `Upstream: pi-mcp-adapter @ 3d953f90 (mcp-auth-flow.ts via SDK 2.0 auth)`,
+  `Upstream: pi-mcp-adapter @ ${UPSTREAM_PIN} (mcp-auth-flow.ts via SDK 2.0 auth)`,
   `rpi: crates/rpi-ext-mcp-adapter oauth.rs`,
   "",
   "Stub AS transcript (authorization URL params + token form params),",

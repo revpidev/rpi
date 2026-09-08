@@ -1,0 +1,50 @@
+{
+  "//": "Completion-notice field shape (R7.1.7.2 #1629/#1938). Upstream anchor: pi-subagents v0.66.0 src/runs/background/notify.ts:213-232 (formatChildOutputBlock). rpi's current notice carries agent/status/preview/handoff/session but no run id or saved-output line (crates/rpi-ext-subagents/src/messages.rs:26-82); TE17 ports the fields.",
+  "pin": "0fc0eebb9604970c506708b7508d6aa38921fde2",
+  "line_format": {
+    "child_header": "- key=<workflowKey> run=<runId> status=<status>",
+    "saved_output": "  Saved output: <savedOutputPath|unavailable>",
+    "preview_header": "  Preview:",
+    "preview_line": "    | <line>",
+    "preview_unavailable": "  Preview: unavailable (<reason>)"
+  },
+  "fields": [
+    "workflowKey",
+    "runId",
+    "status",
+    "savedOutputPath",
+    "preview",
+    "previewUnavailableReason"
+  ],
+  "cases": [
+    {
+      "name": "single-child-with-output",
+      "child": {
+        "workflowKey": "0",
+        "runId": "01a00000-0000-7000-8000-000000000004",
+        "status": "completed",
+        "savedOutputPath": "/tmp/rpi-subagents-v066-fixture/output.md",
+        "output": "done\n"
+      },
+      "expected_lines": [
+        "Child outputs:",
+        "- key=0 run=01a00000-0000-7000-8000-000000000004 status=completed",
+        "  Saved output: /tmp/rpi-subagents-v066-fixture/output.md",
+        "  Preview:",
+        "    | done"
+      ]
+    },
+    {
+      "name": "missing-saved-output",
+      "child": {
+        "runId": "01a00000-0000-7000-8000-000000000005",
+        "status": "failed",
+        "output": "boom\n"
+      },
+      "expected_contains": [
+        "- key=unavailable run=01a00000-0000-7000-8000-000000000005 status=failed",
+        "  Saved output: unavailable"
+      ]
+    }
+  ]
+}

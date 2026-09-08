@@ -1,0 +1,4 @@
+# Materialized per-run parity fixture copies are written to an out-of-repo
+# temp dir by run-parity.mjs (their /tmp session paths are run-volatile).
+# Historic copies were tracked once; never re-add them.
+.cases-*.json

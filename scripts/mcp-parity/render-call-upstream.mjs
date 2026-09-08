@@ -11,8 +11,16 @@
 // pi-tui to a minimal value stub (the render functions construct Text).
 import { readFileSync } from "node:fs";
 import { register } from "node:module";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 register(new URL("./render-call-hooks.mjs", import.meta.url));
+
+// Default = regression track (old pin); the target track points
+// RPI_MCP_PARITY_UPSTREAM at the v2.32.1 snapshot (ADR-0025 §9).
+const UPSTREAM_ROOT =
+	process.env.RPI_MCP_PARITY_UPSTREAM ??
+	new URL("../../external/pi-mcp-adapter/", import.meta.url).pathname;
 
 // Dynamic import: the hooks must be registered before the pinned upstream
 // module resolves its bare imports (same ordering as upstream-runner.mjs).
@@ -21,7 +29,7 @@ const {
 	formatMcpProxyToolCallLines,
 	renderMcpProxyToolCall,
 	createMcpDirectToolCallRenderer,
-} = await import("../../external/pi-mcp-adapter/tool-result-renderer.ts");
+} = await import(pathToFileURL(resolve(UPSTREAM_ROOT, "tool-result-renderer.ts")).href);
 
 const fixturesPath = process.argv[2] ?? new URL("./render-call-fixtures.json", import.meta.url).pathname;
 const cases = JSON.parse(readFileSync(fixturesPath, "utf-8")).cases;

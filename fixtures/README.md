@@ -10,11 +10,19 @@
 fixtures/
 ├── README.md                # This file: runbook + itemized parity baseline list
 ├── generate-fixtures.mjs    # Generation script (pinned commit + fixed prompt scripts)
+├── subagents-v066/          # TE13 目标轨录制 fixture（目标轨，pin 未切换；见该目录 README）
 └── generated/
-    └── <scenario>/
-        ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
-        └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
+    ├── <scenario>/
+    │   ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
+    │   └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
+    └── subagents-parity-v066/  # TE13 目标轨对拍报告（回归轨报告在 subagents-parity/）
 ```
+
+> **插件重定基目标轨（TE13，目标轨、pin 未切换）**：`fixtures/subagents-v066/` 与
+> `fixtures/generated/subagents-parity-v066/` 的锚点取自 `external/pi-subagents` @
+> `0fc0eebb`（v0.66.0）；`external/` 未被写入，submodule HEAD 仍为 `56f97234`（v0.48.0），
+> pin 切换属 TE27（ADR-0025 状态「提议」）。mcp 侧目标轨骨架与重录清单见
+> `scripts/mcp-parity/TARGET-TRACK.md`（实际重录归 TE23/TE24）。
 
 ## 2. Runbook (repeatable generation)
 

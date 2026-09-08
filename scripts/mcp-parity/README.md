@@ -16,6 +16,23 @@ node scripts/mcp-parity/run-mcp-parity.mjs     # 全场景，非零退出码 = �
 - 依赖装在 `/tmp/rpi-mcp-parity-deps`（`setup-deps.sh` 复制上游
   `package.json` + `package-lock.json` 后 `npm ci`——完整传递闭包钉死
   为上游测试过的版本；含 tsx 与官方 conformance referee）。
+
+## 目标轨（TE13 骨架，ADR-0025）
+
+默认 = 回归轨（旧 pin `3d953f90` / v2.24.0）。目标轨把上游根切到 v2.32.1
+仓库外快照（`external/` 零写入）：
+
+```bash
+bash scripts/mcp-parity/setup-target-source.sh   # git archive v2.32.1 + 其 lockfile npm ci
+export RPI_MCP_PARITY_UPSTREAM=/tmp/rpi-mcp-parity-target-v2321
+export RPI_MCP_PARITY_DEPS=/tmp/rpi-mcp-parity-target-v2321
+node scripts/mcp-parity/run-mcp-parity.mjs --out-dir /tmp/mcp-target-parity
+```
+
+三个驱动（`run-mcp-parity.mjs` / `run-oauth-parity.mjs` / `render-call-upstream.mjs`）
+均读 `RPI_MCP_PARITY_UPSTREAM`，缺省即旧 pin，回归轨行为逐字节不变。目标轨的
+golden/conformance 重录清单与承接任务见 [`TARGET-TRACK.md`](./TARGET-TRACK.md)
+（命名类 golden → TE23、conformance/纯函数向量 → TE24）；TE13 只交骨架，不重录。
   **绝不写入 `rpi/external/`**。
 - 报告落 `rpi/fixtures/generated/mcp-parity/`（`parity-report.md` +
   每场景两侧 `parity-<scenario>-{upstream,rpi}.json`），**进 git 作为

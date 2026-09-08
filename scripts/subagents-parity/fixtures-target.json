@@ -1,0 +1,153 @@
+{
+  "//": "Target-track fixtures (TE13, ADR-0025 §9). Base cases live in fixtures.json; the target track concatenates both files. args has no extra cases here (argv/env is [RPI-OWN] and compared against args-golden-v048.json). frontmatter/final-output run against the v0.66 snapshot; fallback drives src/runs/shared/model-fallback.ts (v0.66) vs the Rust equivalents. Diffs are attributed through expected-target-diffs.json.",
+  "frontmatter": {
+    "//": "R7.1.4.1/.2 parse-surface cases (launch semantics land in TE18): tools inherit/false, excludeTools, thinking, and an invalid frontmatter line.",
+    "cases": [
+      {
+        "name": "tools-inherit",
+        "content": "---\nname: inheritor\ntools: inherit\n---\n\nBody.\n"
+      },
+      {
+        "name": "tools-false",
+        "content": "---\nname: no-tools\ntools: false\n---\n\nBody.\n"
+      },
+      {
+        "name": "exclude-tools",
+        "content": "---\nname: excluder\ntools: read, bash\nexcludeTools: write, edit\n---\n\nBody.\n"
+      },
+      {
+        "name": "bad-frontmatter-invalid-line",
+        "content": "---\nname: broken\nthis line has no colon\ntools: read\n---\n\nBody.\n"
+      },
+      {
+        "name": "thinking-field",
+        "content": "---\nname: thinker\nthinking: high\nmodel: anthropic/claude\n---\n\nBody.\n"
+      }
+    ]
+  },
+  "final-output": {
+    "//": "R7.1.1 result-text cases without the #1792 turn-timing footer ([N/A], 03 附录 C.3): both pins join non-empty text parts with \\n.",
+    "cases": [
+      {
+        "name": "multi-text-parts-join",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "line one" },
+              { "type": "text", "text": "line two" }
+            ],
+            "stopReason": "stop"
+          }
+        ]
+      },
+      {
+        "name": "blank-text-part-skipped",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "   " },
+              { "type": "text", "text": "kept" }
+            ],
+            "stopReason": "stop"
+          }
+        ]
+      }
+    ]
+  },
+  "fallback": {
+    "//": "R7.1.2 fallback/replay vectors. kind=retryable -> isRetryableModelFailure(error); kind=context-overflow -> isContextOverflow(error); kind=attempt -> isRetryableModelFailureAttempt({error,messages,toolCount}). Rust returns null for functions absent at M0 (TE14 implements).",
+    "cases": [
+      {
+        "name": "retry-request-limit-exceeded",
+        "kind": "retryable",
+        "error": "REQUEST_LIMIT_EXCEEDED"
+      },
+      {
+        "name": "retry-usage-limit",
+        "kind": "retryable",
+        "error": "usage limit reached for this account"
+      },
+      {
+        "name": "retry-connection-reset",
+        "kind": "retryable",
+        "error": "connection reset by peer"
+      },
+      {
+        "name": "retry-http-500",
+        "kind": "retryable",
+        "error": "HTTP 500 Internal Server Error"
+      },
+      {
+        "name": "retry-internal-server-error",
+        "kind": "retryable",
+        "error": "Internal Server Error"
+      },
+      {
+        "name": "retry-rate-limit-control",
+        "kind": "retryable",
+        "error": "rate limit exceeded"
+      },
+      {
+        "name": "retry-quota-control",
+        "kind": "retryable",
+        "error": "quota exceeded"
+      },
+      {
+        "name": "retry-tool-failure-not-retryable",
+        "kind": "retryable",
+        "error": "bash failed (exit 1): rate limit exceeded"
+      },
+      {
+        "name": "overflow-context-length-exceeded",
+        "kind": "context-overflow",
+        "error": "context_length_exceeded"
+      },
+      {
+        "name": "overflow-maximum-context-length",
+        "kind": "context-overflow",
+        "error": "maximum context length is 200000 tokens"
+      },
+      {
+        "name": "overflow-plain-error-control",
+        "kind": "context-overflow",
+        "error": "plain provider failure without overflow wording"
+      },
+      {
+        "name": "overflow-tool-failure-not-overflow",
+        "kind": "context-overflow",
+        "error": "write failed (exit 1): token limit exceeded"
+      },
+      {
+        "name": "attempt-tool-count-blocks-replay",
+        "kind": "attempt",
+        "error": "rate limit exceeded",
+        "toolCount": 1
+      },
+      {
+        "name": "attempt-no-tools-empty-messages",
+        "kind": "attempt",
+        "error": "rate limit exceeded",
+        "toolCount": 0,
+        "messages": []
+      },
+      {
+        "name": "attempt-empty-output-cold-start",
+        "kind": "attempt",
+        "error": "Subagent produced no output (possible model cold-start or empty response).",
+        "toolCount": 0,
+        "messages": []
+      },
+      {
+        "name": "attempt-matching-message-error",
+        "kind": "attempt",
+        "error": "rate limit exceeded",
+        "toolCount": 0,
+        "messages": [
+          { "role": "assistant", "errorMessage": "rate limit exceeded" }
+        ]
+      }
+    ]
+  }
+}

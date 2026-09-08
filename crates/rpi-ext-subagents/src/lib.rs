@@ -1392,6 +1392,15 @@ pub mod parity {
             body: parsed.body,
         }
     }
+
+    /// `isRetryableModelFailure` parity facade (TE13 target-track fallback
+    /// leg). The pattern table is still the v0.48 one; R7.1.2.1's new patterns
+    /// land in TE14 and are attributed in `expected-target-diffs.json` until
+    /// then. `isContextOverflow`/`isRetryableModelFailureAttempt` (R7.1.2.2/.3)
+    /// are intentionally absent until TE14.
+    pub fn is_retryable_model_failure_public(error: Option<&str>) -> bool {
+        crate::launch::model::is_retryable_model_failure(error)
+    }
 }
 
 /// Replay surface for the recorded child stream fixture

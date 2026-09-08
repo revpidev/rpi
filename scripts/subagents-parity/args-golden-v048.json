@@ -1,0 +1,359 @@
+{
+  "//": "Frozen argv/env baseline for the subagents target track ([RPI-OWN], ADR-0025 §4): recorded from the pinned v0.48.0 upstream leg (pi-args.ts) before the v0.65 deletion. Regenerate with `node scripts/subagents-parity/run-parity.mjs --record-args-golden`.",
+  "cases": [
+    {
+      "name": "minimal-fresh",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "--system-prompt",
+          "<PROMPT_FILE>",
+          "Task: map the codebase"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "scout",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_RUN_ID": "ab12cd34"
+        }
+      }
+    },
+    {
+      "name": "fork-session-file",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session",
+          "<SESSION_BASE>/fork.jsonl",
+          "--model",
+          "anthropic/claude-x:high",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "--system-prompt",
+          "<PROMPT_FILE>",
+          "Task: continue from the fork"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "oracle",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_ORCHESTRATOR_SESSION_ID": "parent-1",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "parent-1",
+          "RPI_SUBAGENT_RUN_ID": "ff001122"
+        }
+      }
+    },
+    {
+      "name": "tools-allowlist-with-read-autoprep",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--model",
+          "faux/faux-1:low",
+          "--tools",
+          "read,bash,write",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "--system-prompt",
+          "<PROMPT_FILE>",
+          "Task: grep around"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "scout",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_REQUIRED_TOOLS": "[\"read\",\"bash\",\"write\"]",
+          "RPI_SUBAGENT_RUN_ID": "0000aaaa",
+          "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH": "<TMPDIR>/tool-diagnostic.json"
+        }
+      }
+    },
+    {
+      "name": "tools-empty-no-tools",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--no-tools",
+          "--extension",
+          "<EXT>",
+          "--no-context-files",
+          "--no-skills",
+          "--append-system-prompt",
+          "<PROMPT_FILE>",
+          "Task: answer only"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "reviewer",
+          "RPI_SUBAGENT_CHILD_INDEX": "2",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "0",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_RUN_ID": "1111bbbb"
+        }
+      }
+    },
+    {
+      "name": "extensions-declared-disables-ambient",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--tools",
+          "read",
+          "--no-extensions",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "--system-prompt",
+          "<PROMPT_FILE>",
+          "Task: use the extension"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "worker",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_REQUIRED_TOOLS": "[\"read\"]",
+          "RPI_SUBAGENT_RUN_ID": "2222cccc",
+          "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH": "<TMPDIR>/tool-diagnostic.json"
+        }
+      }
+    },
+    {
+      "name": "subagentOnly-extensions-ambient",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--tools",
+          "read,subagent",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "--system-prompt",
+          "<PROMPT_FILE>",
+          "Task: delegate inside"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_AGENT": "worker",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "1",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "1",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "[{\"runId\":\"3333dddd\",\"stepIndex\":0,\"agent\":\"worker\"}]",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "3333dddd",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "3333dddd",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_REQUIRED_TOOLS": "[\"read\",\"subagent\"]",
+          "RPI_SUBAGENT_RUN_ID": "3333dddd",
+          "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH": "<TMPDIR>/tool-diagnostic.json"
+        }
+      }
+    },
+    {
+      "name": "no-session",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--no-session",
+          "--extension",
+          "<EXT>",
+          "--no-context-files",
+          "Task: quick one"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "0",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "1",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_RUN_ID": "4444eeee"
+        }
+      }
+    },
+    {
+      "name": "long-task-file-delivery",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "@<TASK_FILE>"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_RUN_ID": "5555ffff"
+        }
+      }
+    },
+    {
+      "name": "thinking-suffix-preserved",
+      "output": {
+        "ok": true,
+        "argv": [
+          "--mode",
+          "json",
+          "-p",
+          "--session-dir",
+          "<SESSION_BASE>/run-0",
+          "--model",
+          "openai/gpt-x:low",
+          "--extension",
+          "<EXT>",
+          "--no-skills",
+          "Task: already suffixed"
+        ],
+        "env": {
+          "MCP_DIRECT_TOOLS": "__none__",
+          "RPI_SUBAGENT_CHILD": "1",
+          "RPI_SUBAGENT_CHILD_INDEX": "0",
+          "RPI_SUBAGENT_FANOUT_CHILD": "0",
+          "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+          "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+          "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+          "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+          "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+          "RPI_SUBAGENT_PARENT_DEPTH": "",
+          "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+          "RPI_SUBAGENT_PARENT_PATH": "",
+          "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_RUN_ID": "",
+          "RPI_SUBAGENT_PARENT_SESSION": "",
+          "RPI_SUBAGENT_RUN_ID": "6666a1b2"
+        }
+      }
+    }
+  ]
+}

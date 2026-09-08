@@ -1,0 +1,44 @@
+{
+  "//": "Terminal-classification vectors (R7.1.6.1 #1060/#1474, R7.1.6.2 #1823). Shapes pinned by TE13 for TE16 consumption; TE16 owns the full vector set. Anchors: pi-subagents v0.66.0 src/runs/foreground/subagent-executor.ts:4228-4237 (stopped/timedOut/interrupted aggregation), src/shared/types.ts:398 (SubagentResultStatus), src/shared/types.ts:537 (ExecutionProjectionStatus).",
+  "pin": "0fc0eebb9604970c506708b7508d6aa38921fde2",
+  "child_status_union": ["completed", "failed", "paused", "stopped", "detached"],
+  "projection_status_union": ["completed", "failed", "partial", "paused", "stopped", "detached"],
+  "cases": [
+    {
+      "name": "single-child-completed",
+      "children": [{ "status": "completed" }],
+      "expected": { "ok": true, "terminalOutcome": null, "stepStatus": "complete" }
+    },
+    {
+      "name": "single-child-failed",
+      "children": [{ "status": "failed", "error": "boom" }],
+      "expected": { "ok": false, "terminalOutcome": null, "stepStatus": "failed" }
+    },
+    {
+      "name": "stopped-child-is-not-failed",
+      "children": [{ "status": "completed" }, { "status": "stopped" }],
+      "expected": { "ok": false, "stopped": true, "stepStatus": "stopped" },
+      "note": "R7.1.6.1: a stop-requested sub-step must not render as failed"
+    },
+    {
+      "name": "timed-out-child-is-partial",
+      "children": [{ "status": "completed" }, { "status": "timedOut" }],
+      "expected": { "ok": false, "terminalOutcome": { "state": "partial", "reason": "timeout" } }
+    },
+    {
+      "name": "paused-child",
+      "children": [{ "status": "paused" }],
+      "expected": { "ok": false, "stepStatus": "paused" }
+    }
+  ],
+  "thinking": {
+    "//": "R7.1.6.2 (#1823): async step records the effective thinking level. `thinking` already exists on ForegroundRunResult; TE16 persists it into step JSON.",
+    "cases": [
+      {
+        "name": "async-step-records-effective-thinking",
+        "input": { "thinking": "high", "model": "anthropic/claude-sonnet-4" },
+        "expected": { "step.thinking": "high" }
+      }
+    ]
+  }
+}

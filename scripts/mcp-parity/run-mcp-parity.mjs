@@ -21,6 +21,9 @@
 //   RPI_MCP_PARITY_DEPS   out-of-tree npm install root
 //                         (default /tmp/rpi-mcp-parity-deps; created by
 //                         scripts/mcp-parity/setup-deps.sh)
+//   RPI_MCP_PARITY_UPSTREAM  upstream source root (default
+//                         external/pi-mcp-adapter @ v2.24.0; target track:
+//                         the v2.32.1 snapshot from setup-target-source.sh)
 //   RPI_MCP_PARITY_CARGO  cargo binary (default `cargo`)
 //
 // Exits non-zero when any scenario's documents differ. Reports are written
@@ -36,7 +39,11 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
-const UPSTREAM = join(REPO, "external", "pi-mcp-adapter");
+// Default = regression track (old pin). The target track sets
+// RPI_MCP_PARITY_UPSTREAM to the v2.32.1 snapshot from setup-target-source.sh
+// (ADR-0025 §9); the driver files already receive it via env.
+const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi-mcp-adapter");
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "3d953f90";
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 
@@ -269,7 +276,7 @@ const lines = [
   "# MCP adapter cross-implementation parity report (design §5.2)",
   "",
   `Generated: ${new Date().toISOString()} (rerun: \`node scripts/mcp-parity/run-mcp-parity.mjs\`)`,
-  `Upstream: pi-mcp-adapter @ 3d953f90 (server-manager.ts, McpServerManager)`,
+  `Upstream: pi-mcp-adapter @ ${UPSTREAM_PIN} (server-manager.ts, McpServerManager)`,
   `rpi: crates/rpi-ext-mcp-adapter @ ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()} (uncommitted working tree)`,
   "",
   "Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server.",

@@ -9,6 +9,11 @@
 // 4. Writes fixtures/generated/mcp-parity/render-call-parity-{upstream,rpi}.json
 //    and render-call-parity.md (git evidence).
 //
+// Target track (TE13 skeleton, ADR-0025): set RPI_MCP_PARITY_UPSTREAM to the
+// v2.32.1 snapshot, RPI_MCP_PARITY_DEPS to its dependency root and
+// RPI_MCP_PARITY_OUT_DIR to a scratch dir so the regression evidence under
+// fixtures/generated/mcp-parity/ is not overwritten.
+//
 // Non-zero exit = any case mismatched.
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -17,9 +22,12 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
-const OUT_DIR = resolve(REPO, "fixtures/generated/mcp-parity");
+const OUT_DIR = resolve(
+	process.env.RPI_MCP_PARITY_OUT_DIR ?? join(REPO, "fixtures/generated/mcp-parity"),
+);
 const FIXTURES = resolve(HERE, "render-call-fixtures.json");
-const DEPS = "/tmp/rpi-mcp-parity-deps";
+const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "3d953f90";
 const tsxLoader = join(DEPS, "node_modules", "tsx", "dist", "loader.mjs");
 if (!existsSync(tsxLoader)) {
 	console.error(`tsx not installed under ${DEPS}; run scripts/mcp-parity/setup-deps.sh first`);
@@ -84,7 +92,7 @@ writeFileSync(
 const report = [
 	"# renderCall parity (TE09 FR-E)",
 	"",
-	`Upstream: pi-mcp-adapter tool-result-renderer.ts @ 3d953f90 (exported pure functions, tsx leg)`,
+	`Upstream: pi-mcp-adapter tool-result-renderer.ts @ ${UPSTREAM_PIN} (exported pure functions, tsx leg)`,
 	`rpi: crates/rpi-ext-mcp-adapter/src/render.rs (render_call_parity example leg)`,
 	`Fixtures: scripts/mcp-parity/render-call-fixtures.json (${names.length} cases)`,
 	"",

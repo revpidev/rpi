@@ -1,31 +1,89 @@
-# subagents 对拍 harness（TE04 G3）
+# subagents 对拍 harness（TE04 G3；双轨重定基 TE13）
 
-驱动钉死版上游 pi-subagents（`external/pi-subagents` @ v0.48.0 /
-56f97234，只读）与本 crate 的 `build_rpi_args` / frontmatter 解析器 /
-`getFinalOutput` 跑同一组 fixture，归一化后逐项 diff。
+驱动钉死版上游 pi-subagents 与本 crate 的 `build_rpi_args` / frontmatter 解析器 /
+`get_finalOutput` / fallback 模式表跑同一组 fixture，归一化后逐项 diff。
+
+## 双轨
+
+| 轨 | 上游 | 用途 | 报告目录 |
+|----|------|------|----------|
+| `regression`（默认） | 旧 pin v0.48.0（`external/pi-subagents` @ `56f97234`，只读） | 保证现有实现行为不回归 | `fixtures/generated/subagents-parity/` |
+| `target` | 新 pin v0.66.0（`0fc0eebb`，仓库外快照） | 新语义对拍与 golden 重录（ADR-0025） | `fixtures/generated/subagents-parity-v066/` |
+
+旧轨保留至 pin 切换完成（TE27，ADR-0025 §8/§9）；两轨 fixture 输入分离：基线用例在
+`fixtures.json`，目标轨新增用例在 `fixtures-target.json`（目标轨按模式拼接两者）。
 
 ## 运行
 
 ```bash
-# 一次性准备（tsx 外置安装，绝不写入 external/）
+# 一次性准备：tsx 外置安装，绝不写入 external/
 mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
   && npm init -y && npm install tsx@4 --no-save
 
-cargo build -p rpi-ext-subagents --example parity_runner
+cd <repo-root>
+
+# 回归轨（默认；与 TE13 前的 harness 逐项一致，零回归红线）
 node scripts/subagents-parity/run-parity.mjs
+# 等价写法：node scripts/subagents-parity/run-parity.mjs --track=regression
+
+# 目标轨（v0.66.0）
+bash scripts/subagents-parity/setup-target-source.sh   # 抽取仓库外快照 + 其 prod 依赖
+node scripts/subagents-parity/run-parity.mjs --track=target
+
+# 重录 argv/env 冻结基线（[RPI-OWN]，ADR-0025 §4）
+node scripts/subagents-parity/run-parity.mjs --record-args-golden
 ```
 
-退出码非 0 = 有差异。报告与两侧原始输出落
-`fixtures/generated/subagents-parity/parity-report.md`。
+Rust 腿由 `run-parity.mjs` 自己构建（cargo 缓存命中时近零开销）并**拷贝到私有路径后执行**：
+两个插件 crate 都有名为 `parity_runner` 的 example，`target/debug/examples/parity_runner`
+归最后构建的 crate 所有，mcp harness 会把它覆盖掉（TE13 实测发现的 harness 缺陷）。
+私有拷贝使两套 harness 互不干扰，example 名称与既有文档保持兼容。
+
+退出码：回归轨非 0 = 有差异；目标轨非 0 = 存在**未归因**差异。
+
+## 目标轨上游来源（仓库外，external/ 零写入）
+
+`setup-target-source.sh` 用 `git -C external/pi-subagents archive <pin>` 把 v0.66 源码抽取到
+`/tmp/rpi-subagents-parity-target-v066`（`RPI_SUBAGENTS_TARGET_SRC` 可覆盖），不 checkout、
+不 `git worktree add`、不改 submodule HEAD——`git -C external/pi-subagents status --porcelain`
+保持为空。快照内 `npm install --omit=dev` 装的是快照自带 `package.json` 的 prod 依赖
+（v0.66 `utils.ts → formatters.ts → settings.ts → agents/agents.ts` 在运行时 import `yaml`；
+v0.48 的链路止于 settings.ts，因此回归轨不需要依赖）。fetch 区间只需一次
+`git -C external/pi-subagents fetch --deepen=700 origin`（只读）。
+
+## argv/env 的 [RPI-OWN] 基线
+
+上游 v0.65+ 删除了 `src/runs/shared/pi-args.ts` / `buildPiArgs`（子 agent 改进程内
+AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物（R7.1.0.4、ADR-0025 §4）：
+
+- 回归轨仍跑 v0.48 `pi-args.ts`（旧轨即现状）；
+- 目标轨改为对**冻结黄金文件** `args-golden-v048.json` 比较——该文件由
+  `--record-args-golden` 从 v0.48 上游腿录制（session 基座占位化为 `<SESSION_BASE>`）；
+- M2/M3 因 R7.1.4 系列改动 argv/env 时，由对应任务更新黄金文件并按 G2 登记
+  「旧期望 → 新期望 + 依据」。
+
+## 归因规则（目标轨）
+
+目标轨的每条差异必须命中 `expected-target-diffs.json`，否则报告落 `### unattributed` 且退出码非 0：
+
+- `upstream-semantics`：新 tag 行为、rpi 尚未采纳（挂 R 条目 + 承接任务）；
+- `rpi-deviation`：rpi 既有实现与两个 pin 都不一致的偏差；
+- 每条含 `mode/case`、`section`、`r`、`owner`；报告按两节汇总。
+- 差异字段为 `null` 表示 Rust 侧函数尚未实现（如 M0 的 `isContextOverflow` /
+  `isRetryableModelFailureAttempt`），同样按上述两节归因，不静默跳过。
 
 ## 组成
 
 | 文件 | 职责 |
 |------|------|
-| `fixtures.json` | 共享用例：9 组 argv/env 输入、6 组 frontmatter 内容、5 组 message 数组 |
-| `upstream-runner.mjs` | tsx 直跑钉死上游模块（`pi-args.ts` / `frontmatter.ts` / `utils.ts`），归一化输出 |
-| `examples/parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`） |
-| `run-parity.mjs` | 编排 + 归一化 diff + 报告落盘 |
+| `fixtures.json` | 基线共享用例：9 组 argv/env 输入、6 组 frontmatter 内容、5 组 message 数组 |
+| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量 |
+| `args-golden-v048.json` | argv/env 冻结黄金文件（[RPI-OWN]） |
+| `expected-target-diffs.json` | 目标轨差异归因清单（R + 承接任务） |
+| `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件 |
+| `setup-target-source.sh` | 仓库外抽取 v0.66 快照 + 安装其 prod 依赖（external/ 零写入） |
+| `examples/parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`）；由编排器构建并私有拷贝后执行 |
+| `run-parity.mjs` | 编排 + 归一化 diff + 归因 + 报告落盘；物化 fixture 与 Rust 二进制拷贝落仓库外临时目录 |
 
 `PI_CODING_AGENT_PACKAGE_ROOT=/tmp` 短路上游 `resolvePiPackageRoot` 的
 `import.meta.resolve`（包未安装时该函数抛错，上游以 env 优先）。
@@ -33,8 +91,10 @@ node scripts/subagents-parity/run-parity.mjs
 ## 归一化白名单（豁免与依据）
 
 1. **session 路径具象化**：fixture 中 `/sess/root` 由编排器重写为共享
-   temp 目录（两侧同值原样比较，`--session-dir`/`--session` 值逐字节一致）。
-2. **temp 目录名**：mkdtemp 前缀 `pi-subagent-*` / `rpi-subagent-*
+   temp 目录（两侧同值原样比较，`--session-dir`/`--session` 值逐字节一致）；
+   比较时 `${SESSION_BASE}/sess/root` → `<SESSION_BASE>`，使跨运行录制的
+   冻结黄金文件可直接比较。
+2. **temp 目录名**：mkdtemp 前缀 `pi-subagent-*` / `rpi-subagent-*`
    （ADR-0001 改名）→ `<TMPDIR>`。
 3. **`--extension` 值**：上游注入自身源文件（prompt-runtime.ts /
    fanout-child.ts / 权限系统），rpi 注入本插件 cdylib（一个库承担
@@ -51,13 +111,21 @@ node scripts/subagents-parity/run-parity.mjs
    supervisor 通道目录槽位（FR-P1-04/10），上游等价物在 prompt-runtime
    扩展内部且 fixture 从不设置；两键在 rpi 侧恒为清空值，逐 case 豁免
    改为统一从 diff 中剔除。
-6. **prompt 临时文件内容不比较**：rpi 在文件头额外前置边界指令块
+7. **prompt 临时文件内容不比较**：rpi 在文件头额外前置边界指令块
    （`<active_agent>` 之后、正文之前，TE-D17 机制等价替代）；argv/env
    层面的路径与 flag 一致即可。
 
-对拍结论留档 `fixtures/generated/subagents-parity/parity-report.md`
-（当前 9+6+5 用例全 MATCH；其中 fanout 变量真值、orchestrator
-session-id 等两处实现缺口即由对拍发现并修复）。
+## v0.66 共享面变化（目标轨实读，ADR-0025 附录 D）
+
+- `src/runs/shared/pi-args.ts` **已删除** → argv/env 转 [RPI-OWN]（上节）；
+- `src/agents/frontmatter.ts` v0.48→v0.66 **逐字节不变**（frontmatter 用例两轨同形）；
+- `src/shared/utils.ts`：`getFinalOutput` 增 `stripPiTurnTimingFooter`（#1792，rpi 无该输出、
+  [N/A]，故不设 footer 用例）；`hasEmptyTerminalAssistantResponse` 扩「空文本终态」语义
+  （R7.1.1.2，TE14）；
+- `src/runs/shared/model-fallback.ts`：新增 `REQUEST_LIMIT_EXCEEDED`/`usage limit`/
+  `connection (error|reset|closed|aborted)`/`500`/`internal server error` 模式与
+  `isRetryableModelFailureAttempt`/`isContextOverflow`/`recordRetryableModelFailure`
+  （R7.1.2.1–.3，TE14）；`isRetryableModelFailure` 与 `formatModelAttemptNote` 语义未变。
 
 ## 环境隔离（运行前须知）
 
@@ -75,3 +143,5 @@ session-id 等两处实现缺口即由对拍发现并修复）。
   文案必然不同；custom 模板机制与 SAFETY 段结构由 crate 单测覆盖。
 - 会话条目过滤：上游在子进程 context 事件内过滤，rpi 在 fork 分支文件
   上过滤（设计 §3.4），结果等价但层不同（e2e 场景 3 覆盖）。
+- turn-timing footer（#1792）：rpi 无该输出，按 [N/A] 不设对拍用例
+  （03 附录 C.3）。
