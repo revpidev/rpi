@@ -894,6 +894,66 @@ fn e2e_fixed_child_full_pipeline() {
         assert!(events.contains("run.finished"));
     }
 
+    // ---- Scenario 12b (rpi#29): tasks steps go live mid-batch ----
+    {
+        let dump = sandbox.dump("step-live");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "slow");
+        std::env::set_var("RPI_E2E_SLOW_MS", "2000");
+        // Children 0/2 sleep 2s; child 1 (fast) finishes immediately.
+        std::env::set_var("RPI_E2E_SLOW_INDICES", "0,2");
+        let result = execute(json!({
+            "tasks": [
+                { "key": "slow-a", "agent": "scout", "task": "slow A" },
+                { "key": "fast", "agent": "scout", "task": "fast B" },
+                { "key": "slow-b", "agent": "scout", "task": "slow C" }
+            ],
+            "concurrency": 3,
+            "async": true
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        // Settle any trailing frames from earlier scenarios, then drain the
+        // baseline so the frames below are this scenario's own.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        take_tool_updates();
+        // The wait pushes an async_wait_update snapshot every 250ms tick.
+        // Phase 1: while the batch runs, steps must show `running` (pre-fix
+        // every step hung on `queued` for the whole batch). Phase 2: the
+        // fast child reaches `complete` while the slow ones are still
+        // `running` (pre-fix terminal states were only written after the
+        // ENTIRE batch finished).
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 15000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let frames = take_tool_updates();
+        let texts: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| {
+                frame["update"]["content"]
+                    .as_array()
+                    .and_then(|content| content.first())
+                    .and_then(|part| part["text"].as_str())
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("scout | running")),
+            "steps must show running mid-batch (rpi#29); frames: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| {
+                text.contains("scout | complete") && text.contains("scout | running")
+            }),
+            "a child must reach complete while the batch still runs (rpi#29); frames: {texts:?}"
+        );
+        assert_eq!(
+            wait["details"]["runs"][0]["state"],
+            json!("complete"),
+            "{wait}"
+        );
+    }
+
     // ---- Scenario 13 (TE09): foreground streaming snapshots (FR-A) ----
     {
         let dump = sandbox.dump("streaming");

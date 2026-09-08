@@ -733,9 +733,14 @@ pub async fn drive_run(
     // TE09 FR-C: single/chain runs mirror each child's currentTool/currentPath
     // into their status steps so `subagent_wait` shows live tool lines
     // (upstream asyncWaitUpdate reads step.currentTool, subagent-wait.ts:327).
+    // rpi#29: tasks batches join them — the per-child `child_index` IS the
+    // step index, so the same sink serves the parallel path.
     // The dispatch-owned frame sink never crosses into the background task.
     ctx.frame_sink = None;
-    if matches!(body, AsyncBody::Single { .. } | AsyncBody::Steps { .. }) {
+    if matches!(
+        body,
+        AsyncBody::Single { .. } | AsyncBody::Steps { .. } | AsyncBody::Tasks { .. }
+    ) {
         let status_handle = handle.clone();
         ctx.step_status = Some(std::sync::Arc::new(move |index: u32, activity: &Value| {
             set_step_field(&status_handle, index as usize, |step| {
@@ -811,12 +816,53 @@ pub async fn drive_run(
             for (index, _) in entries.iter().enumerate() {
                 mark_step(&handle, index, "queued");
             }
+            // rpi#29: per-child live transitions — `running` at launch,
+            // terminal (status/exitCode/error + live-field drop) as each
+            // child settles while the batch keeps running (upstream writes
+            // the step terminal inside each task, subagent-runner.ts:
+            // 3740-3755; pre-fix every step hung on `queued` until the
+            // whole batch finished, misleading subagent_wait readers).
+            let event_handle = handle.clone();
+            let on_step: crate::p1::parallel::ParallelStepSink =
+                std::sync::Arc::new(move |index, event| {
+                    match event {
+                        crate::p1::parallel::ParallelStepEvent::Started => {
+                            mark_step(&event_handle, index, "running");
+                        }
+                        crate::p1::parallel::ParallelStepEvent::Finished { exit_code, error } => {
+                            mark_step(
+                                &event_handle,
+                                index,
+                                if exit_code == 0 { "complete" } else { "failed" },
+                            );
+                            set_step_field(&event_handle, index, |step| {
+                                step["exitCode"] = json!(exit_code);
+                                if let Some(error) = &error {
+                                    step["error"] = json!(error);
+                                }
+                                // Terminal steps drop the live-activity
+                                // fields (same rule as record_step_result).
+                                if let Some(object) = step.as_object_mut() {
+                                    for key in [
+                                        "currentTool",
+                                        "currentToolArgs",
+                                        "currentToolStartedAt",
+                                        "currentPath",
+                                    ] {
+                                        object.remove(key);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
             let outcome = crate::p1::parallel::run_parallel_async(
                 &entries,
                 &agents,
                 &ctx,
                 concurrency,
                 worktree_plan.clone(),
+                Some(on_step),
             )
             .await;
             // Parallel handoff manifest path rides the completion
@@ -827,19 +873,7 @@ pub async fn drive_run(
             match outcome {
                 Ok(outcomes) => {
                     let mut aggregate = String::new();
-                    for (index, outcome) in outcomes.iter().enumerate() {
-                        let state = if outcome.exit_code == 0 {
-                            "complete"
-                        } else {
-                            "failed"
-                        };
-                        mark_step(&handle, index, state);
-                        set_step_field(&handle, index, |step| {
-                            step["exitCode"] = json!(outcome.exit_code);
-                            if let Some(error) = &outcome.error {
-                                step["error"] = json!(error);
-                            }
-                        });
+                    for outcome in outcomes.iter() {
                         aggregate.push_str(outcome.details["finalOutput"].as_str().unwrap_or(""));
                         aggregate.push('\n');
                     }
