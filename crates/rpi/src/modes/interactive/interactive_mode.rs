@@ -765,6 +765,18 @@ fn remove_child_by_address(container: &mut Container, address: usize) {
         .retain(|child| child_address(&**child) != address);
 }
 
+/// The index of the child whose address matches, if any (upstream
+/// `indexOf` reference-equality lookup without holding a reference).
+/// Same-key widget re-mounts swap **in place** at this index — upstream
+/// `Map.set` on an existing key keeps its insertion position, so a
+/// re-mount must not sink to the container end (rpi#27).
+fn child_index_by_address(container: &Container, address: usize) -> Option<usize> {
+    container
+        .children
+        .iter()
+        .position(|child| child_address(&**child) == address)
+}
+
 /// The streaming assistant message currently being rendered
 /// (interactive-mode.ts:365-366).
 struct StreamingTrack {
@@ -8557,6 +8569,93 @@ mod tests {
         assert!(!bridge.get_tools_expanded());
         bridge.set_tools_expanded(true);
         assert!(bridge.get_tools_expanded());
+        mode.shutdown().await;
+    }
+
+    /// rpi#27: a same-key widget re-mount must keep the widget's slot among
+    /// the container's children — upstream `Map.set` on an existing key
+    /// keeps its insertion position, while the port's remove+append sank
+    /// every re-mount to the container end. Two belowEditor widgets that
+    /// re-mount frequently (rpi-statusline pushes a fresh tree on every
+    /// script success; the subagents fleet re-mounts on each 500ms dirty
+    /// tick) therefore swapped order back and forth — the bottom widget
+    /// block visibly flickered. The regression assertions pin the order
+    /// across re-mounts, removal still compacts, and a later re-add
+    /// appends (first-mount semantics, matching upstream Map delete+set).
+    #[tokio::test]
+    async fn rpi27_widget_remount_keeps_container_order() {
+        use rpi_ext_host::api::{ExtensionWidgetOptions, UiBridge, WidgetContent, WidgetPlacement};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+        let below = Some(ExtensionWidgetOptions {
+            placement: Some(WidgetPlacement::BelowEditor),
+        });
+
+        let rendered = |ui: &Arc<InteractiveUi>| {
+            lock(&ui.widgets_below)
+                .children
+                .iter()
+                .flat_map(|child| child.render(80))
+                .map(|line| {
+                    rpi_test_support::vt::strip_ansi(&line)
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Production mount order: the statusline widget first, the fleet
+        // widget after it.
+        bridge.set_widget(
+            "statusline",
+            Some(WidgetContent::Lines(vec![
+                "SL-1".to_owned(),
+                "SL-2".to_owned(),
+            ])),
+            below,
+        );
+        bridge.set_widget(
+            "fleet",
+            Some(WidgetContent::Lines(vec!["FLEET".to_owned()])),
+            below,
+        );
+        assert_eq!(rendered(ui), vec!["SL-1", "SL-2", "FLEET"]);
+
+        // The statusline re-mounting (every script success) must replace
+        // in place — not sink below the fleet widget (the rpi#27 flicker).
+        bridge.set_widget(
+            "statusline",
+            Some(WidgetContent::Lines(vec![
+                "SL-1'".to_owned(),
+                "SL-2'".to_owned(),
+            ])),
+            below,
+        );
+        assert_eq!(
+            rendered(ui),
+            vec!["SL-1'", "SL-2'", "FLEET"],
+            "same-key re-mount keeps the widget's slot (rpi#27)"
+        );
+
+        // The fleet re-mounting likewise keeps its slot at the end.
+        bridge.set_widget(
+            "fleet",
+            Some(WidgetContent::Lines(vec!["FLEET'".to_owned()])),
+            below,
+        );
+        assert_eq!(rendered(ui), vec!["SL-1'", "SL-2'", "FLEET'"]);
+
+        // Removal compacts the order; a later re-add appends.
+        bridge.set_widget("fleet", None, below);
+        assert_eq!(rendered(ui), vec!["SL-1'", "SL-2'"]);
+        bridge.set_widget(
+            "fleet",
+            Some(WidgetContent::Lines(vec!["FLEET-NEW".to_owned()])),
+            below,
+        );
+        assert_eq!(rendered(ui), vec!["SL-1'", "SL-2'", "FLEET-NEW"]);
         mode.shutdown().await;
     }
 
