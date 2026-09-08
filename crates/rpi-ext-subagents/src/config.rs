@@ -253,8 +253,8 @@ impl ExtensionConfig {
     }
 
     /// `globalConcurrencyLimit` with the upstream default 20
-    /// (DEFAULT_GLOBAL_CONCURRENCY_LIMIT, parallel-utils.ts:131).
-    #[allow(dead_code)]
+    /// (DEFAULT_GLOBAL_CONCURRENCY_LIMIT, parallel-utils.ts:131). Enforced as
+    /// the run-wide child semaphore in `run_parallel_async` (rpi#30).
     pub fn global_concurrency_limit(&self) -> u64 {
         match &self.global_concurrency_limit {
             Some(Value::Number(n)) => n.as_u64().filter(|v| *v >= 1).unwrap_or(20),
@@ -1061,6 +1061,34 @@ mod tests {
         assert_eq!(config.cleanup_days_or_default(), 7);
         assert!(config.resolve_async_by_default());
         assert_eq!(config.resolve_default_timeout_ms(), None);
+    }
+
+    /// rpi#30: the run-wide child cap resolves with the upstream default 20
+    /// (DEFAULT_GLOBAL_CONCURRENCY_LIMIT) and honors explicit values; the
+    /// caller (`run_parallel_async`) clamps to ≥ 1 permit.
+    #[test]
+    fn global_concurrency_limit_defaults_to_20_and_honors_values() {
+        assert_eq!(parse("{}").unwrap().global_concurrency_limit(), 20);
+        assert_eq!(
+            parse(r#"{"globalConcurrencyLimit": 3}"#)
+                .unwrap()
+                .global_concurrency_limit(),
+            3
+        );
+        // Invalid numbers fall back to the default (the semaphore site
+        // clamps ≥ 1).
+        assert_eq!(
+            parse(r#"{"globalConcurrencyLimit": 0}"#)
+                .unwrap()
+                .global_concurrency_limit(),
+            20
+        );
+        assert_eq!(
+            parse(r#"{"globalConcurrencyLimit": "not-a-number"}"#)
+                .unwrap()
+                .global_concurrency_limit(),
+            20
+        );
     }
 
     #[test]

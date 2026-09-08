@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 
 use crate::agents::discover::{self, AgentConfig};
 use crate::p1::launch_child::{self, ChildOutcome, ChildSpec, OutputOverride, RunCtx};
@@ -283,6 +284,17 @@ pub async fn run_parallel_async(
     on_step: Option<ParallelStepSink>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
     let concurrency = concurrency.max(1);
+    // rpi#30: the run-wide global child cap (upstream per-run Semaphore,
+    // subagent-runner.ts:1932 + parallel-utils.ts:167-226): every child
+    // holds one permit for its whole execution, bounding the TOTAL
+    // concurrently running children regardless of the per-batch
+    // concurrency (default 20, `globalConcurrencyLimit` config) — a
+    // `concurrency: 50` batch is still capped at 20 simultaneous children.
+    let global_permits = Arc::new(Semaphore::new(
+        ctx.config
+            .global_concurrency_limit()
+            .clamp(1, u32::MAX as u64) as usize,
+    ));
     let outcomes: Vec<Option<Result<ParallelTaskOutcome, String>>> = async {
         // Owned entries: the stream closure must not borrow the items —
         // `map` over `&(index, &TaskEntry)` trips the HRTB bound (rust#89937).
@@ -293,7 +305,16 @@ pub async fn run_parallel_async(
                 let agents = Arc::clone(&agents);
                 let plan = worktree.clone();
                 let on_step = on_step.clone();
+                let permits = Arc::clone(&global_permits);
                 async move {
+                    // Upstream worker shape (parallel-utils.ts:210-219):
+                    // acquire the global permit, run the whole task, drop
+                    // it. `Started` fires only after the slot is taken, so
+                    // the mirrored step `running` count tracks the cap.
+                    let _global_permit = permits
+                        .acquire()
+                        .await
+                        .expect("global semaphore is never closed");
                     if let Some(sink) = &on_step {
                         sink(index, ParallelStepEvent::Started);
                     }
