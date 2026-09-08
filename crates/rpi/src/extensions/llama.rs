@@ -204,8 +204,34 @@ pub trait LlamaHost: Send + Sync {
     /// `ctx.modelRegistry.getProviderAuth(LLAMA_PROVIDER_ID)`.
     async fn provider_auth(&self) -> Result<Option<AuthResult>, ModelsError>;
 
-    /// `ctx.modelRegistry.refresh()`.
-    async fn refresh_models(&self);
+    /// `ctx.modelRegistry.refresh(options)` — hosts implement the live
+    /// refresh (llama-only, `allowNetwork: true`; see
+    /// [`llama_refresh_options`]).
+    async fn refresh_models(
+        &self,
+        options: rpi_ai::models::ModelsRefreshOptions,
+    ) -> rpi_ai::models::ModelsRefreshResult;
+}
+
+/// `AbortSignal.timeout(15_000)` (index.ts:51) — the /llama refresh
+/// deadline.
+pub(crate) const LLAMA_REFRESH_TIMEOUT_MS: u64 = 15_000;
+
+/// The `/llama` post-publish catalog refresh options (index.ts:51-56
+/// @ 9841914): llama-only, network always allowed — `/llama` already
+/// contacted the configured llama.cpp server, so the refresh stays live
+/// even in offline mode (`RPI_OFFLINE`); without the explicit
+/// `allow_network: true` the provider's stored-snapshot restore phase
+/// would overwrite the just-published live catalog.
+pub(crate) fn llama_refresh_options(
+    signal: CancellationToken,
+) -> rpi_ai::models::ModelsRefreshOptions {
+    rpi_ai::models::ModelsRefreshOptions {
+        allow_network: Some(true),
+        providers: Some(vec![LLAMA_PROVIDER_ID.to_owned()]),
+        force: None,
+        signal: Some(signal),
+    }
 }
 
 /// `isConnectionError` (index.ts:11-15). The reqwest transport
@@ -296,7 +322,28 @@ async fn sync_catalog(
         client.server_url(),
         LlamaSetCatalogOptions { router_autoload },
     )?;
-    host.refresh_models().await;
+    // `ctx.modelRegistry.refresh({ providers: [LLAMA_PROVIDER_ID],
+    // allowNetwork: true, signal })` (index.ts:51-56 @ 9841914): /llama
+    // already contacted the configured llama.cpp server, so this refresh
+    // stays live even in offline mode — otherwise the provider's
+    // stored-snapshot restore phase (the first arm of `refreshModels`,
+    // provider.ts) would clobber the just-published live catalog under
+    // `RPI_OFFLINE`.
+    let signal = CancellationToken::new();
+    let timeout = {
+        let signal = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(LLAMA_REFRESH_TIMEOUT_MS)).await;
+            signal.cancel();
+        })
+    };
+    let result = host.refresh_models(llama_refresh_options(signal)).await;
+    timeout.abort();
+    // `if (result.aborted) throw new Error("Model catalog refresh
+    // timed out.")` (index.ts:57-58).
+    if result.aborted {
+        return Err(LlamaError::new("Model catalog refresh timed out."));
+    }
     Ok(current)
 }
 
@@ -715,5 +762,21 @@ pub async fn run_llama_manager(
                 host.notify(&error.message, NotifyLevel::Error);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rpi#36: the /llama refresh options mirror index.ts:51-56 — llama
+    /// only, network always allowed (live even in `RPI_OFFLINE`).
+    #[test]
+    fn llama_refresh_options_are_live_and_llama_scoped() {
+        let options = llama_refresh_options(CancellationToken::new());
+        assert_eq!(options.allow_network, Some(true));
+        assert_eq!(options.providers, Some(vec![LLAMA_PROVIDER_ID.to_owned()]));
+        assert!(options.signal.is_some(), "15s AbortSignal.timeout passed");
+        assert_eq!(options.force, None);
     }
 }

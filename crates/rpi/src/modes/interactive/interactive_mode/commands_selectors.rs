@@ -570,8 +570,18 @@ impl LlamaHost for InteractiveLlamaHost {
             .await
     }
 
-    async fn refresh_models(&self) {
-        self.ui.session().model_runtime().refresh(None).await;
+    async fn refresh_models(
+        &self,
+        options: rpi_ai::models::ModelsRefreshOptions,
+    ) -> rpi_ai::models::ModelsRefreshResult {
+        // The host-side `ctx.modelRegistry.refresh(options)` — the options
+        // come from `llama_refresh_options` (live even in offline mode,
+        // llama-only, 15s signal; index.ts:51-56).
+        self.ui
+            .session()
+            .model_runtime()
+            .refresh(Some(options))
+            .await
     }
 }
 

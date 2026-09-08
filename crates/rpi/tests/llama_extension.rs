@@ -688,6 +688,9 @@ struct FakeHost {
     notifications: Mutex<Vec<(String, NotifyLevel)>>,
     auth: Option<AuthResult>,
     refreshes: AtomicUsize,
+    /// Options of the last `refresh_models` call — pins the /llama live
+    /// refresh contract (rpi#36).
+    last_refresh: Mutex<Option<rpi_ai::models::ModelsRefreshOptions>>,
 }
 
 impl FakeHost {
@@ -707,6 +710,7 @@ impl FakeHost {
                 source: Some("stored credential".to_owned()),
             }),
             refreshes: AtomicUsize::new(0),
+            last_refresh: Mutex::new(None),
         }
     }
 
@@ -715,6 +719,7 @@ impl FakeHost {
             notifications: Mutex::new(Vec::new()),
             auth: None,
             refreshes: AtomicUsize::new(0),
+            last_refresh: Mutex::new(None),
         }
     }
 
@@ -743,8 +748,13 @@ impl LlamaHost for FakeHost {
         Ok(self.auth.clone())
     }
 
-    async fn refresh_models(&self) {
+    async fn refresh_models(
+        &self,
+        options: rpi_ai::models::ModelsRefreshOptions,
+    ) -> rpi_ai::models::ModelsRefreshResult {
         self.refreshes.fetch_add(1, Ordering::Relaxed);
+        *self.last_refresh.lock().unwrap_or_else(|e| e.into_inner()) = Some(options);
+        rpi_ai::models::ModelsRefreshResult::default()
     }
 }
 
@@ -962,7 +972,12 @@ async fn non_tui_mode_only_warns() {
         async fn provider_auth(&self) -> Result<Option<AuthResult>, ModelsError> {
             self.0.provider_auth().await
         }
-        async fn refresh_models(&self) {}
+        async fn refresh_models(
+            &self,
+            _options: rpi_ai::models::ModelsRefreshOptions,
+        ) -> rpi_ai::models::ModelsRefreshResult {
+            rpi_ai::models::ModelsRefreshResult::default()
+        }
     }
     let host = HeadlessHost(FakeHost::unconfigured());
     let controller = create_llama_provider();
@@ -1045,6 +1060,25 @@ async fn selecting_unloaded_model_loads_it() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "m1");
     assert!(host.refreshes.load(Ordering::Relaxed) >= 2);
+    // rpi#36: the /llama post-publish refresh is live even in offline mode
+    // and scoped to the llama provider (index.ts:51-56) — without the
+    // explicit `allow_network: true`, `RPI_OFFLINE` runs would restore the
+    // stored snapshot over the just-published live catalog.
+    let options = host
+        .last_refresh
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("refresh happened");
+    assert_eq!(options.allow_network, Some(true));
+    assert_eq!(
+        options.providers,
+        Some(vec![rpi::extensions::llama::LLAMA_PROVIDER_ID.to_owned()])
+    );
+    assert!(
+        options.signal.is_some(),
+        "15s AbortSignal.timeout is passed"
+    );
 }
 
 /// Unload requires an explicit confirmation; declining never touches the
