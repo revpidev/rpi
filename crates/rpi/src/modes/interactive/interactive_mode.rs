@@ -9044,6 +9044,63 @@ mod tests {
         mode.shutdown().await;
     }
 
+    /// rc.4 实测回归（"切换显示模式后刷新卡死——按一次键刷一帧"）：
+    /// 热切换后，事件驱动的 request_render 必须达当前渲染器的调度器。
+    /// 根因：TuiHandle::render_handle 冻结了创建时渲染器的 schedule
+    /// Weak——swap_renderer 后旧渲染器被丢弃，upgrade 失败 → 每次事件
+    /// 驱动的 request_render 静默 no-op，驱动线程 next_deadline 永远
+    /// None，只有按键路径（输入分发即时渲染）能刷帧。修复 = 对齐上游
+    /// Proxy 语义（createInteractiveTuiReference）：调用时解析当前渲染器。
+    #[tokio::test]
+    async fn switch_tui_mode_render_requests_reach_swapped_renderer() {
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let ui = &mode.ui_state;
+
+        // The subscription callback's request_render path (the one that
+        // paints agent updates) must arm the driver's wake deadline after a
+        // hot-switch, in BOTH directions.
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Fullscreen));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Fullscreen);
+        ui.ui.tick(std::time::Instant::now());
+        // Drain any pending render request left by the switch itself.
+        ui.ui
+            .tick(std::time::Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!ui.ui.has_pending_work(), "switch settled");
+
+        ui.render_handle.request_render();
+        assert!(
+            ui.ui.has_pending_work(),
+            "request_render after switching to fullscreen must mark the live renderer"
+        );
+        assert!(
+            ui.ui.next_deadline().is_some(),
+            "driver wake deadline armed after switching to fullscreen"
+        );
+        ui.ui
+            .tick(std::time::Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!ui.ui.has_pending_work());
+
+        ui.push(UiCommand::SwitchTuiMode(TuiMode::Regular));
+        ui.drain_events();
+        assert_eq!(ui.ui.mode(), TuiMode::Regular);
+        ui.ui
+            .tick(std::time::Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!ui.ui.has_pending_work(), "switch settled");
+
+        ui.render_handle.request_render();
+        assert!(
+            ui.ui.has_pending_work(),
+            "request_render after switching back to regular must mark the live renderer"
+        );
+        assert!(
+            ui.ui.next_deadline().is_some(),
+            "driver wake deadline armed after switching back to regular"
+        );
+        mode.shutdown().await;
+    }
+
     /// rc.1 实测回归：已有会话热切换全屏后，鼠标分发路径不得向
     /// stdout/stderr 直写（v0.1.4-rc.1 遗留的 `[DBG layout dispatch]` /
     /// `[DBG selection press]` eprintln 在 raw mode + alt screen 下逐事件

@@ -424,11 +424,32 @@ impl TuiHandle {
     }
 
     /// Cloneable capability handle for timer-driven components.
+    ///
+    /// Proxy semantics (tui-renderer.ts `createInteractiveTuiReference`):
+    /// upstream's `this.ui` is a `Proxy` whose method calls always resolve
+    /// to the renderer that is live AT CALL TIME, so `requestRender` keeps
+    /// working after `switchTuiMode` replaces the renderer. The handle here
+    /// must do the same: freezing the schedule of the renderer present at
+    /// creation would leave every event-driven `request_render` (agent
+    /// message updates, spinner timer, footer tick, subscription callback)
+    /// silently marking the DISCARDED renderer's schedule after a swap —
+    /// `next_deadline` of the live renderer stays `None`, the driver stops
+    /// painting, and the screen only refreshes on keystrokes (each input
+    /// dispatch requests an immediate render on the live renderer). The
+    /// closure therefore resolves the current renderer through the handle's
+    /// inner slot on every call; the `Weak` keeps the frozen-contract
+    /// no-keep-alive behavior (a handle outliving the TUI is a no-op).
     pub fn render_handle(&self) -> RenderHandle {
-        match self.renderer_clone() {
-            RendererClone::Main(tui) => tui.render_handle(),
-            RendererClone::Alt(tui) => tui.render_handle(),
-        }
+        let inner = Arc::downgrade(&self.inner);
+        RenderHandle::new(move || {
+            let Some(inner) = inner.upgrade() else { return };
+            let guard = lock_inner(&inner);
+            match &*guard {
+                Renderer::Main(tui) => tui.request_render(false),
+                Renderer::Alt(tui) => tui.request_render(false),
+            }
+            drop(guard);
+        })
     }
 
     /// Terminal row count (lock-free cache read).
@@ -567,4 +588,86 @@ fn lock_inner(inner: &Mutex<Renderer>) -> std::sync::MutexGuard<'_, Renderer> {
     inner
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::test_vt::VirtualTerminal;
+
+    /// Regression (rc.3 report): a render handle taken from the TuiHandle
+    /// must keep working after `swap_renderer` (the `/settings` TUI-mode hot
+    /// switch). Upstream's `this.ui` is a `Proxy` that resolves the CURRENT
+    /// renderer on every call (`createInteractiveTuiReference`,
+    /// tui-renderer.ts:66-96); a handle frozen to the swapped-out
+    /// renderer's schedule silently no-ops, so after the switch the driver's
+    /// `next_deadline` stays `None` and the screen only repaints on
+    /// keystrokes (input dispatch requests an immediate render on the live
+    /// renderer) — "one keypress, one frame".
+    #[test]
+    fn render_handle_reaches_the_renderer_swapped_in_later() {
+        let terminal: crate::tui::SharedTerminal =
+            Arc::new(Mutex::new(Box::new(VirtualTerminal::new(80, 24))));
+
+        let main = TuiMainScreen::with_shared_terminal(Arc::clone(&terminal), None, None);
+        let handle = TuiHandle::from_main(main);
+        // The handle the interactive mode captures once at init (and hands
+        // to every component: editor, spinner, footer, subscription).
+        let render_handle = handle.render_handle();
+
+        // Sanity: before the swap the request reaches the live renderer.
+        assert!(!handle.has_pending_work());
+        render_handle.request_render();
+        assert!(
+            handle.has_pending_work(),
+            "pre-swap request_render must mark the schedule"
+        );
+        handle.tick(Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!handle.has_pending_work(), "deadline fired and rendered");
+
+        // Hot-switch to fullscreen, then back (both directions).
+        let alt = TuiAltScreen::with_shared_terminal(
+            Arc::clone(&terminal),
+            None,
+            None,
+            crate::tui_alt_screen::TuiAltScreenOptions::default(),
+        );
+        handle.swap_renderer(TuiHandle::renderer_from_alt(alt));
+        render_handle.request_render();
+        assert!(
+            handle.has_pending_work(),
+            "post-swap request_render must reach the NEW renderer's schedule"
+        );
+        assert!(
+            handle.next_deadline().is_some(),
+            "driver wake deadline must be armed after the swap"
+        );
+        handle.tick(Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!handle.has_pending_work());
+
+        let main = TuiMainScreen::with_shared_terminal(Arc::clone(&terminal), None, None);
+        handle.swap_renderer(TuiHandle::renderer_from_main(main));
+        render_handle.request_render();
+        assert!(
+            handle.has_pending_work(),
+            "request after switching back to the main screen must reach it"
+        );
+        handle.tick(Instant::now() + std::time::Duration::from_millis(20));
+        assert!(!handle.has_pending_work());
+    }
+
+    /// The frozen-contract half: a handle outliving the TuiHandle is a no-op
+    /// (no panic, no keep-alive — the `Weak` upgrade fails).
+    #[test]
+    fn render_handle_after_handle_drop_is_a_no_op() {
+        let terminal: crate::tui::SharedTerminal =
+            Arc::new(Mutex::new(Box::new(VirtualTerminal::new(80, 24))));
+        let main = TuiMainScreen::with_shared_terminal(Arc::clone(&terminal), None, None);
+        let handle = TuiHandle::from_main(main);
+        let render_handle = handle.render_handle();
+        drop(handle);
+        // Must not panic (and must not resurrect anything).
+        render_handle.request_render();
+    }
 }
