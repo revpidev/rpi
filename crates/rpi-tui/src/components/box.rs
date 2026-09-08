@@ -205,10 +205,14 @@ impl Component for Box {
     }
 
     /// `Box.prototype.handleMouse` (box.ts:75-97 @ 9841914, 71026970a):
-    /// hit-test over the children at the content offset — coordinates are
-    /// translated to the child's local frame (`x` clamped to the content
-    /// origin, `y` relative to the child's row window, `width`/`height` the
-    /// content width and the child's height). Heights come from the
+    /// hit-test over the children at the content offset — a click on the
+    /// padding (content x/y negative, or x at/beyond the content width)
+    /// never reaches the children (`if (contentY < 0 || contentX < 0 ||
+    /// contentX >= contentWidth) return undefined`, box.ts:79; rpi#38);
+    /// in-content coordinates are translated to the child's local frame
+    /// (`x` relative to the content origin, `y` relative to the child's
+    /// row window, `width`/`height` the content width and the child's
+    /// height). Heights come from the
     /// `mouseLayout` cache when the content width matches, else a
     /// measure-only render (not cached, like upstream). Upstream `Box`
     /// defines no `handleInput`, so no focus bubbling (see the `Container`
@@ -217,6 +221,14 @@ impl Component for Box {
         let content_width = (event.width - (self.padding_x * 2) as isize).max(1) as usize;
         let content_y = event.y - self.padding_y as isize;
         let content_x = event.x - self.padding_x as isize;
+        // Padding clicks stay with the screen-level dispatch (box.ts:79) —
+        // without the x guard a click on the left/right padding column
+        // still hit-tested into the child at a negative/overflowing local
+        // x (children that ignore coordinates, e.g. MouseRegion wrappers,
+        // fired on padding).
+        if content_y < 0 || content_x < 0 || content_x >= content_width as isize {
+            return None;
+        }
         let cached_width_matches = self
             .mouse_layout
             .borrow()
@@ -454,5 +466,57 @@ mod tests {
         assert_eq!(seen.load(Ordering::SeqCst), 1);
         assert_eq!(*seen_x.lock().unwrap(), 3);
         assert_eq!(*seen_y.lock().unwrap(), 0);
+    }
+
+    /// rpi#38 (box.ts:79 @ 9841914): clicks on the padding columns never
+    /// reach the children — the box returns `None` so the dispatcher keeps
+    /// them for screen-level handling. Content width here is 20 − 2·2 = 16,
+    /// so content x spans screen x 2..=17.
+    #[test]
+    fn handle_mouse_padding_columns_never_reach_children() {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_x = Arc::new(Mutex::new(0));
+        let seen_y = Arc::new(Mutex::new(0));
+        let mut b = Box::new(2, 1, None);
+        b.add_child(StdBox::new(ClickSpy {
+            seen: Arc::clone(&seen),
+            x: Arc::clone(&seen_x),
+            y: Arc::clone(&seen_y),
+        }));
+        b.render(20);
+
+        // The spy row (contentY 0 → screen y 1): clicks on the LEFT padding
+        // columns (screen x 0/1 → contentX −2/−1) must not hit the child.
+        for x in [0, 1] {
+            assert!(
+                b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, x, 1))
+                    .is_none(),
+                "left padding column x={x} must not reach children"
+            );
+        }
+        // RIGHT padding columns (screen x 18/19 → contentX 16/17 ≥ 16).
+        for x in [18, 19] {
+            assert!(
+                b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, x, 1))
+                    .is_none(),
+                "right padding column x={x} must not reach children"
+            );
+        }
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            0,
+            "padding clicks must not fire the child handler"
+        );
+
+        // In-content columns still dispatch (content x 0 and the last
+        // column 15).
+        for x in [2, 17] {
+            assert!(
+                b.handle_mouse(&box_mouse_event(TuiMouseEventType::Click, x, 1))
+                    .is_some(),
+                "in-content column x={x} must reach the child"
+            );
+        }
+        assert_eq!(seen.load(Ordering::SeqCst), 2);
     }
 }
