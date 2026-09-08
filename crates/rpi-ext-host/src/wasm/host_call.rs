@@ -50,6 +50,18 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         "registerMessageRenderer" | "registerEntryRenderer" | "registerMarkdownTransformer" => {
             Requires(Capability::Ui)
         }
+        // v0.1.4 C0 (ADR-0024): the seven interactive custom UI host-calls
+        // are frozen in the method table but not implemented yet. They are
+        // listed explicitly (before the `ui.` prefix arm) so the capability
+        // classification is independent of the prefix rule; the dispatch arm
+        // in `ui_dispatch` answers `unknownMethod` until C1/C2 land.
+        "ui.mountComponent"
+        | "ui.pollComponent"
+        | "ui.renderComponent"
+        | "ui.setComponentHidden"
+        | "ui.wakeComponent"
+        | "ui.disposeComponent"
+        | "ui.editExternal" => Requires(Capability::Ui),
         "exec" => Requires(Capability::Exec),
         "registerProvider" | "unregisterProvider" => Requires(Capability::Provider),
         "events.emit" | "events.on" => Requires(Capability::Events),
@@ -1165,5 +1177,12 @@ mod tests {
             required_capability("ctx.sessionFile"),
             Requires(Capability::Session)
         ));
+        // v0.1.4 C0 interactive UI additions are all `ui`-gated, additive.
+        for method in crate::interactive_ui::INTERACTIVE_UI_METHODS {
+            assert!(
+                matches!(required_capability(method), Requires(Capability::Ui)),
+                "{method}"
+            );
+        }
     }
 }

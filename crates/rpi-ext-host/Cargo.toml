@@ -27,3 +27,6 @@ abi_stable = "0.11"
 
 [dev-dependencies]
 serde_json.workspace = true
+# V14-20 C0 parity: the native interactive-UI mirror must match the wasm
+# SDK's serde shapes (tests/interactive_ui_parity.rs).
+rpi-ext-sdk.workspace = true

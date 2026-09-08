@@ -12,11 +12,15 @@
 //! driving [`api::ExtensionApi`]. L1 (wasm): [`wasm`] — ABI v1 host
 //! (docs/extension-abi.md). The T02 spike was removed in W6 (its protocol
 //! conclusions became the ABI).
+//!
+//! [`interactive_ui`] is the native guest-side mirror of the wasm SDK's
+//! interactive custom UI ABI (ADR-0024, C0 protocol freeze).
 
 pub mod api;
 pub mod bridges;
 pub mod error;
 pub mod host;
+pub mod interactive_ui;
 pub mod loader;
 pub mod native;
 pub mod runner;

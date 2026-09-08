@@ -5,10 +5,13 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-
-# Standalone crate: built for wasm32-unknown-unknown, not the host
-# workspace's default target set.
-[workspace]
+# Workspace member since v0.1.4/V14-20: the protocol-shape tests
+# (`interactive_ui`) run on the host target under `cargo test --workspace`
+# and the SDK/native type parity test (`rpi-ext-host/tests`) links the
+# crate's serde definitions. The wasm ABI exports stay `no_mangle`; the
+# host target only gates the `rpi_host_call` import (see `src/lib.rs`).
+# Release profile comes from the workspace root (the standalone
+# `examples/wasm-extension` workspace keeps its own `opt-level = "s"`).
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -16,7 +19,3 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-
-[profile.release]
-opt-level = "s"
-strip = true

@@ -14,6 +14,9 @@
 
 use serde_json::{json, Value};
 
+pub mod interactive_ui;
+
+#[cfg(target_arch = "wasm32")]
 #[link(wasm_import_module = "rpi")]
 extern "C" {
     fn rpi_host_call(ptr: *const u8, len: usize) -> u64;
@@ -66,29 +69,62 @@ fn pack_json(value: &Value) -> u64 {
 
 /// Raw `rpi_host_call`: `{"call": method, "args": {...}, "seq": N}` →
 /// `{"ok": ...} | {"error": {"kind", "message"}}`.
+///
+/// String-error wrapper over [`host_call_typed`] (pre-v0.1.4 contract kept
+/// for existing callers).
+#[cfg(target_arch = "wasm32")]
 pub fn host_call(method: &str, args: Value) -> Result<Value, String> {
+    host_call_typed(method, args).map_err(|error| error.to_string())
+}
+
+/// Host call with the structured error kind preserved (V14-20 C0: the
+/// interactive UI probe needs `unknownMethod` vs other kinds; `Display` of
+/// the error is message-only, so existing string contracts do not change).
+#[cfg(target_arch = "wasm32")]
+pub fn host_call_typed(
+    method: &str,
+    args: Value,
+) -> Result<Value, interactive_ui::InteractiveUiError> {
+    use interactive_ui::InteractiveUiError;
     let request = json!({
         "call": method,
         "args": args,
         "seq": next_seq(),
     });
-    let bytes = serde_json::to_vec(&request).unwrap_or_default();
+    let bytes = serde_json::to_vec(&request)
+        .map_err(|error| InteractiveUiError::protocol(format!("host request JSON: {error}")))?;
     let packed = unsafe { rpi_host_call(bytes.as_ptr(), bytes.len()) };
     let ptr = (packed >> 32) as u32 as *mut u8;
     let len = (packed & 0xffff_ffff) as usize;
     let response: Value = serde_json::from_slice(&unpack(ptr, len))
-        .map_err(|e| format!("host response JSON: {e}"))?;
+        .map_err(|error| InteractiveUiError::protocol(format!("host response JSON: {error}")))?;
     unsafe { rpi_dealloc(ptr, len) };
-    match response.get("error") {
-        Some(error) => Err(error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("host error")
-            .to_owned()),
+    match InteractiveUiError::from_envelope(&response) {
+        Some(error) => Err(error),
         None => Ok(response.get("ok").cloned().unwrap_or(Value::Null)),
     }
 }
 
+/// Host target: the ABI import does not exist, so the guest transport is
+/// unavailable. Returning a structured error (instead of a link failure)
+/// keeps the crate testable on the host under `cargo test --workspace`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_call(method: &str, args: Value) -> Result<Value, String> {
+    host_call_typed(method, args).map_err(|error| error.to_string())
+}
+
+/// Host target stub of [`host_call_typed`] (see the wasm32 version).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_call_typed(
+    _method: &str,
+    _args: Value,
+) -> Result<Value, interactive_ui::InteractiveUiError> {
+    Err(interactive_ui::InteractiveUiError::protocol(
+        "rpi host calls are only available on wasm32 guests",
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn next_seq() -> u64 {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
