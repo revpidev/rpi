@@ -145,13 +145,19 @@ impl InteractiveUiBridge {
     /// entry under the same key.
     ///
     /// V13-05 (FR-A): the swap is atomic per container — the component tree
-    /// is built BEFORE touching any container lock, and the remove-old /
-    /// add-new pair happens inside one critical section, so no render
-    /// deadline can capture a frame with the widget missing. Cross-container
-    /// placement changes go **add-then-remove** (the widget appears in the
-    /// new container before it leaves the old one): a duplicate for one
-    /// frame is imperceptible, a missing frame is not. `remove_child_by_
-    /// address` is a retain-filter, a no-op for an already-vacated address.
+    /// is built BEFORE touching any container lock, and the swap happens
+    /// inside one critical section, so no render deadline can capture a
+    /// frame with the widget missing. Cross-container placement changes go
+    /// **add-then-remove** (the widget appears in the new container before
+    /// it leaves the old one): a duplicate for one frame is imperceptible,
+    /// a missing frame is not. A same-container re-mount replaces the old
+    /// child **in place** (rpi#27): upstream `Map.set` on an existing key
+    /// keeps its insertion position, so the widget's render order among
+    /// the container's children must not change — remove+append made two
+    /// belowEditor widgets swap order on every re-mount (the last setter
+    /// sank below the others). `remove_child_by_address` is a retain-filter
+    /// and `child_index_by_address` returns `None` for an already-vacated
+    /// address — both no-ops for stale entries.
     /// Lock order: `widgets` (address book) take → container lock(s) →
     /// `widgets` write; the two are never held simultaneously.
     fn mount_widget(
@@ -212,10 +218,14 @@ impl InteractiveUiBridge {
             .map(|(old_below, _)| *old_below == below)
             .unwrap_or(false);
         let new_address = match (previous, same_placement) {
-            // Same-container path — STRICT atomicity (FR-A R2): remove old +
-            // add new inside ONE container lock scope, so no render deadline
-            // can capture a frame with the widget missing; request_render
-            // fires once after the swap.
+            // Same-container path — STRICT atomicity (FR-A R2) + position
+            // preservation (rpi#27): swap the old child out at ITS index
+            // inside ONE container lock scope, so no render deadline can
+            // capture a frame with the widget missing, and a same-key
+            // re-mount does not sink to the container end (upstream
+            // `Map.set` keeps the key's insertion position). A stale
+            // address (concurrently vacated) falls back to append —
+            // identical to a first mount.
             (Some((_old_below, address)), true) => {
                 let container = if below {
                     &ui.widgets_below
@@ -223,11 +233,19 @@ impl InteractiveUiBridge {
                     &ui.widgets_above
                 };
                 let mut container = lock(container);
-                super::remove_child_by_address(&mut container, address);
-                container.add_child(built);
-                let address =
-                    super::child_address(&**container.children.last().expect("just pushed"));
-                (below, address)
+                let new_address = match super::child_index_by_address(&container, address) {
+                    Some(index) => {
+                        container.children[index] = built;
+                        super::child_address(&*container.children[index])
+                    }
+                    // Stale address (vacated by a concurrent removal):
+                    // fall back to append — identical to a first mount.
+                    None => {
+                        container.add_child(built);
+                        super::child_address(&**container.children.last().expect("just pushed"))
+                    }
+                };
+                (below, new_address)
             }
             // Cross-container placement change — ADD-THEN-REMOVE (FR-A R3):
             // the widget lands in the new container before it leaves the
