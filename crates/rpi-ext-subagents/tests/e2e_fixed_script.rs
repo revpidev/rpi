@@ -954,6 +954,75 @@ fn e2e_fixed_child_full_pipeline() {
         );
     }
 
+    // ---- Scenario 12c (rpi#30): globalConcurrencyLimit caps the batch ----
+    {
+        let dump = sandbox.dump("global-cap");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "slow");
+        std::env::set_var("RPI_E2E_SLOW_MS", "1500");
+        std::env::remove_var("RPI_E2E_SLOW_INDICES");
+        // Cap the run-wide child concurrency at 2 while the per-batch
+        // concurrency is 4 — without the global semaphore all four children
+        // would run at once (pre-fix: dead code, no enforcement point).
+        let agent_dir = std::path::PathBuf::from(
+            std::env::var("RPI_CODING_AGENT_DIR").expect("sandbox sets the agent dir"),
+        );
+        let config_path = agent_dir
+            .join("extensions")
+            .join("subagent")
+            .join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"{"asyncByDefault": false, "globalConcurrencyLimit": 2}"#,
+        )
+        .unwrap();
+        let result = execute(json!({
+            "tasks": [
+                { "key": "a", "agent": "scout", "task": "capped 1" },
+                { "key": "b", "agent": "scout", "task": "capped 2" },
+                { "key": "c", "agent": "scout", "task": "capped 3" },
+                { "key": "d", "agent": "scout", "task": "capped 4" }
+            ],
+            "concurrency": 4,
+            "async": true
+        }));
+        // Restore the sandbox config for later scenarios.
+        std::fs::write(&config_path, r#"{"asyncByDefault": false}"#).unwrap();
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        take_tool_updates();
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 30000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let frames = take_tool_updates();
+        let running_counts: Vec<usize> = frames
+            .iter()
+            .filter_map(|frame| {
+                frame["update"]["content"]
+                    .as_array()
+                    .and_then(|content| content.first())
+                    .and_then(|part| part["text"].as_str())
+            })
+            .map(|text| text.matches("scout | running").count())
+            .collect();
+        assert!(
+            running_counts.iter().all(|count| *count <= 2),
+            "global cap of 2 breached (rpi#30); per-frame running counts: {running_counts:?}"
+        );
+        assert_eq!(
+            running_counts.iter().copied().max(),
+            Some(2),
+            "two children must run concurrently under the cap (not over-restricted): {running_counts:?}"
+        );
+        assert_eq!(
+            wait["details"]["runs"][0]["state"],
+            json!("complete"),
+            "{wait}"
+        );
+    }
+
     // ---- Scenario 13 (TE09): foreground streaming snapshots (FR-A) ----
     {
         let dump = sandbox.dump("streaming");
