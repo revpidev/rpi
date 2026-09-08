@@ -2091,9 +2091,15 @@ impl ModelRuntime {
                     .and_then(|o| o.allow_network)
                     .unwrap_or(self.model_network_enabled),
             ),
+            // `options.providers` must pass through (models.ts:391): a
+            // caller-scoped refresh (e.g. the /llama live refresh,
+            // index.ts:51-56 — `providers: [LLAMA_PROVIDER_ID]`) stays
+            // provider-scoped; dropping the filter would force network
+            // refreshes for EVERY dynamic provider under `RPI_OFFLINE`
+            // (rpi#36).
+            providers: options.as_ref().and_then(|o| o.providers.clone()),
             force: options.as_ref().and_then(|o| o.force),
             signal: options.as_ref().and_then(|o| o.signal.clone()),
-            ..Default::default()
         };
         let result = self.models.refresh(Some(refresh_options)).await;
         self.update_model_snapshot();
@@ -3725,5 +3731,161 @@ mod tests {
             "default create never refreshes catalogs over the network"
         );
         std::env::remove_var(ENV_KEY);
+    }
+
+    /// PR#42 复审（rpi#36 follow-up）：`ModelRuntime::refresh` 必须把调用方的
+    /// `providers` 过滤透传给 `Models::refresh`（models.ts:391）——/llama 的
+    /// live 刷新是 llama-only（index.ts:51-56）；丢过滤会把
+    /// `allow_network: true` 扩散到全部动态 provider（RPI_OFFLINE 下尤甚）。
+    #[tokio::test]
+    async fn refresh_passes_provider_filter_through_to_models() {
+        std::env::set_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY", "test-key");
+        use futures::future::BoxFuture;
+        use rpi_ai::auth::{ModelsError, ProviderAuth};
+        use rpi_ai::models::{Provider, RefreshModelsContext};
+        use rpi_ai::types::{Context, ProviderHeaders, SimpleStreamOptions, StreamOptions};
+        use rpi_ai::utils::event_stream::AssistantMessageEventStream;
+
+        /// Minimal dynamic provider: records each `refresh_models` call's
+        /// `allow_network`.
+        struct RecordingProvider {
+            id: String,
+            auth: ProviderAuth,
+            refreshes: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+        }
+
+        impl Provider for RecordingProvider {
+            fn id(&self) -> &str {
+                &self.id
+            }
+            fn name(&self) -> &str {
+                &self.id
+            }
+            fn base_url(&self) -> Option<&str> {
+                None
+            }
+            fn headers(&self) -> Option<&ProviderHeaders> {
+                None
+            }
+            fn auth(&self) -> &ProviderAuth {
+                &self.auth
+            }
+            fn get_models(&self) -> Vec<rpi_ai::types::Model> {
+                Vec::new()
+            }
+            fn refresh_models(
+                &self,
+                context: RefreshModelsContext,
+            ) -> Option<BoxFuture<'_, Result<(), ModelsError>>> {
+                let refreshes = self.refreshes.clone();
+                let allow_network = context.allow_network;
+                Some(Box::pin(async move {
+                    refreshes
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(allow_network);
+                    Ok(())
+                }))
+            }
+            fn stream(
+                &self,
+                _model: &rpi_ai::types::Model,
+                _context: &Context,
+                _options: Option<StreamOptions>,
+            ) -> AssistantMessageEventStream {
+                unreachable!("not used in refresh tests")
+            }
+            fn stream_simple(
+                &self,
+                _model: &rpi_ai::types::Model,
+                _context: &Context,
+                _options: Option<SimpleStreamOptions>,
+            ) -> Result<AssistantMessageEventStream, String> {
+                unreachable!("not used in refresh tests")
+            }
+        }
+
+        const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY";
+
+        fn recording(id: &str) -> Arc<RecordingProvider> {
+            Arc::new(RecordingProvider {
+                id: id.to_owned(),
+                auth: ProviderAuth {
+                    api_key: Some(Arc::new(env_api_key_auth(
+                        "Providers filter test API key",
+                        &[ENV_KEY],
+                    ))),
+                    oauth: None,
+                },
+                refreshes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            })
+        }
+
+        let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: None,
+            auth_path: None,
+            models_path: ModelsPathInput::Disabled,
+            ..Default::default()
+        })
+        .await;
+        let llama = recording("llama-probe");
+        let other = recording("other-probe");
+        runtime
+            .register_native_provider(llama.clone())
+            .await
+            .expect("register llama");
+        runtime
+            .register_native_provider(other.clone())
+            .await
+            .expect("register other");
+
+        // Registration itself runs an unfiltered no-network refresh — reset
+        // the recordings before the filtered call.
+        llama
+            .refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        other
+            .refreshes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
+        let result = runtime
+            .refresh(Some(ModelsRefreshOptions {
+                allow_network: Some(true),
+                providers: Some(vec!["llama-probe".to_owned()]),
+                force: None,
+                signal: None,
+            }))
+            .await;
+        assert!(!result.aborted, "refresh completed");
+        assert!(
+            result.errors.is_empty(),
+            "provider errors: {:?}",
+            result.errors
+        );
+
+        // The selected provider ran BOTH refresh phases (models.ts:401-418:
+        // phase 1 is the unconditional stored restore with allow_network =
+        // false; phase 2 — the live fetch — only runs when the caller
+        // allowed network), while the unselected provider was filtered out
+        // entirely and never ran.
+        assert_eq!(
+            *llama.refreshes.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![false, true],
+            "llama-probe ran the stored restore (false) then the live fetch (true)"
+        );
+        assert_eq!(
+            other
+                .refreshes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len(),
+            0,
+            "providers filter must drop unselected providers at the Models layer"
+        );
+        std::env::remove_var("RPI_TEST_MODEL_RUNTIME_PROVIDERS_FILTER_KEY");
     }
 }
