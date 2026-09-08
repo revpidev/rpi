@@ -9,6 +9,36 @@ use std::io::Write;
 
 fn main() {
     let mode = std::env::var("RPI_E2E_MODE").unwrap_or_else(|_| "ok".to_string());
+    // rpi#29/rpi#30 e2e: "slow" stays running long enough to be observed
+    // mid-flight (duration via RPI_E2E_SLOW_MS, default 1200ms), then emits
+    // the plain ok transcript. RPI_E2E_SLOW_INDICES (comma list of child
+    // indexes, e.g. "0,2") narrows the sleep to specific children so a
+    // batch can mix fast and slow members; unset = every child sleeps.
+    let mode = if mode == "slow" {
+        let index = std::env::var("RPI_SUBAGENT_CHILD_INDEX")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok());
+        let selected = std::env::var("RPI_E2E_SLOW_INDICES").ok().map(|raw| {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        });
+        let sleeps = match (index, &selected) {
+            (Some(index), Some(list)) => list.contains(&index),
+            _ => true,
+        };
+        if sleeps {
+            std::thread::sleep(std::time::Duration::from_millis(
+                std::env::var("RPI_E2E_SLOW_MS")
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+                    .unwrap_or(1200),
+            ));
+        }
+        "ok".to_string()
+    } else {
+        mode
+    };
     if let Ok(dump_dir) = std::env::var("RPI_E2E_DUMP_DIR") {
         // TE05: parallel children dump into `child-<index>/` alongside the
         // flat files (flat keeps the P0 single-run assertions stable;

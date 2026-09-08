@@ -228,6 +228,26 @@ pub struct ParallelTaskOutcome {
     pub details: Value,
 }
 
+/// Per-child lifecycle events for the parallel batch (rpi#29). `Started`
+/// fires when the child's launch slot is taken (before agent resolution
+/// and child spawn — upstream sets the step `running` inside the task fn,
+/// subagent-runner.ts:4061); `Finished` fires when the child's outcome is
+/// known, while the rest of the batch keeps running (upstream writes the
+/// step terminal inside each task, subagent-runner.ts:3740-3755).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParallelStepEvent {
+    Started,
+    Finished {
+        exit_code: i32,
+        error: Option<String>,
+    },
+}
+
+/// Sink receiving `(submission index, event)`. The async runner mirrors
+/// these into the run status document as they happen so `subagent_wait`
+/// shows live per-child states instead of a batch-long `queued`.
+pub type ParallelStepSink = std::sync::Arc<dyn Fn(usize, ParallelStepEvent) + Send + Sync>;
+
 /// Run the task batch with bounded concurrency (`mapConcurrent`,
 /// parallel-utils.ts:167-198): worker-pool shape, results written back to
 /// their submission index, one failure never aborts the others
@@ -246,17 +266,21 @@ pub fn run_parallel(
         ctx,
         concurrency,
         worktree,
+        None,
     ))
 }
 
 /// Async core (see [`run_parallel`]) — call directly from runtime tasks
-/// (background runner); never wrap in a nested `block_on`.
+/// (background runner); never wrap in a nested `block_on`. `on_step`
+/// receives per-child lifecycle events as they happen (rpi#29); the
+/// foreground path passes `None` (it streams live frames instead).
 pub async fn run_parallel_async(
     entries: &[TaskEntry],
     agents: &[AgentConfig],
     ctx: &RunCtx,
     concurrency: usize,
     worktree: Option<std::sync::Arc<WorktreePlan>>,
+    on_step: Option<ParallelStepSink>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
     let concurrency = concurrency.max(1);
     let outcomes: Vec<Option<Result<ParallelTaskOutcome, String>>> = async {
@@ -268,8 +292,20 @@ pub async fn run_parallel_async(
             .map(|(index, entry)| {
                 let agents = Arc::clone(&agents);
                 let plan = worktree.clone();
+                let on_step = on_step.clone();
                 async move {
+                    if let Some(sink) = &on_step {
+                        sink(index, ParallelStepEvent::Started);
+                    }
                     let outcome = launch_one(&entry, &agents, ctx, plan.as_deref()).await;
+                    if let Some(sink) = &on_step {
+                        let (exit_code, error) = match &outcome {
+                            Some(Ok(result)) => (result.exit_code, result.error.clone()),
+                            Some(Err(reason)) => (-1, Some(reason.clone())),
+                            None => (-1, Some("launch failed without a reason".to_owned())),
+                        };
+                        sink(index, ParallelStepEvent::Finished { exit_code, error });
+                    }
                     (index, outcome)
                 }
             })
