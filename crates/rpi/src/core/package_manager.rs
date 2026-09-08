@@ -75,7 +75,7 @@ use crate::core::skills::{
     lexical_relative, match_candidates, matches_any_exact_pattern, matches_any_pattern,
     split_patterns, SkillDiscoveryMode, SourceOrigin, SourceScope,
 };
-use crate::core::version_check::UpdateChannel;
+use crate::core::version_check::{is_newer_package_version, UpdateChannel};
 use crate::tools::path_utils::resolve_path;
 
 /// `NETWORK_TIMEOUT_MS` (package-manager.ts:38).
@@ -2601,7 +2601,12 @@ impl DefaultPackageManager {
 
     /// Registry/`github:` update (design §7.2: re-resolve by range and run
     /// install steps 5–7). A source already at the resolved version is
-    /// skipped. `untracked` marks a source discovered in the install
+    /// skipped; a resolution that is not *newer* than the installed one is
+    /// a no-op as well (R6.1.3 — no automatic downgrade on any channel:
+    /// `0.1.4-rc.4 < 0.1.4` in the semver total order, so `--rc` must not
+    /// pull an indexed rc over an installed stable, and the stable channel
+    /// must not pull an older stable over an installed rc). `untracked`
+    /// marks a source discovered in the install
     /// roots without a settings entry: a registry that never listed it
     /// downgrades to a skip note instead of a hard error (design §7.3 —
     /// loading is local; an unmanaged directory must not break `rpi
@@ -2639,14 +2644,16 @@ impl DefaultPackageManager {
                     .ok()
                     .map(|root| root.join(&resolved.info.name))
                     .and_then(|dir| extension_registry::installed_extension_version(&dir));
-                if installed.as_deref() == Some(resolved.info.version.as_str()) {
+                if installed.as_deref().is_some_and(|installed| {
+                    !is_newer_package_version(&resolved.info.version, installed)
+                }) {
                     self.emit_progress(&ProgressEvent {
                         kind: ProgressKind::Start,
                         action: ProgressAction::Update,
                         source: source.to_string(),
                         message: Some(format!(
                             "{source} is already up to date ({})",
-                            resolved.info.version
+                            installed.as_deref().unwrap_or(&resolved.info.version)
                         )),
                     });
                     return Ok(());
@@ -2663,14 +2670,17 @@ impl DefaultPackageManager {
                 let installed = self
                     .find_github_install_dir(&github, scope)
                     .and_then(|dir| extension_registry::installed_extension_version(&dir));
-                if installed.as_deref() == Some(resolved.info.version.as_str()) {
+                // Same no-downgrade rule as the registry arm (R6.1.3).
+                if installed.as_deref().is_some_and(|installed| {
+                    !is_newer_package_version(&resolved.info.version, installed)
+                }) {
                     self.emit_progress(&ProgressEvent {
                         kind: ProgressKind::Start,
                         action: ProgressAction::Update,
                         source: source.to_string(),
                         message: Some(format!(
                             "{source} is already up to date ({})",
-                            resolved.info.version
+                            installed.as_deref().unwrap_or(&resolved.info.version)
                         )),
                     });
                     return Ok(());
@@ -7793,6 +7803,162 @@ mod registry_tests {
             installed().as_deref(),
             Some(rc_version),
             "--rc must resolve the indexed rc version"
+        );
+    }
+
+    /// rpi#34（R6.1.3 任何通道不降级）：stable 毕业后索引同时含
+    /// `0.1.4`（stable）与 `0.1.4-rc.4`，已装 stable 的用户跑
+    /// `update --extensions --rc` 解析到 `0.1.4-rc.4` —— semver 全序下
+    /// **旧于**已装，必须 no-op（不得用 rc 覆盖 stable）。
+    #[test]
+    fn test_update_rc_channel_does_not_downgrade_graduated_stable() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let target = config::build_target().unwrap();
+        let name = "ext-grad";
+        let stable_version = "0.1.4";
+        let rc_version = "0.1.4-rc.4";
+        let stable_archive = build_rpix(name, stable_version, true, &[]);
+        let rc_archive = build_rpix(name, rc_version, true, &[]);
+        // 毕业后的索引形态：同基线 stable + rc 并存。
+        let index = serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": format!("acme/{name}"),
+            "author": "acme",
+            "kind": "native",
+            "versions": [
+                {"version": stable_version, "rpiAbi": 1, "capabilities": ["tools"],
+                 "artifacts": [{
+                     "target": target,
+                     "file": format!("{name}-{stable_version}-{target}.rpix"),
+                     "sha256": sha256_hex(&stable_archive),
+                     "release": format!("v{stable_version}")}]},
+                {"version": rc_version, "rpiAbi": 1, "capabilities": ["tools"],
+                 "artifacts": [{
+                     "target": target,
+                     "file": format!("{name}-{rc_version}-{target}.rpix"),
+                     "sha256": sha256_hex(&rc_archive),
+                     "release": format!("v{rc_version}")} ]}
+            ]
+        })
+        .to_string();
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            index.into_bytes(),
+        );
+        for (version, archive) in [(stable_version, stable_archive), (rc_version, rc_archive)] {
+            let file = format!("{name}-{version}-{target}.rpix");
+            let download = extension_registry::github_download_url(
+                "acme",
+                name,
+                &format!("v{version}"),
+                &file,
+            );
+            transport.insert(&download, archive);
+        }
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        // 安装恒 stable 通道 → 装 0.1.4。
+        manager.install_and_persist(name, false).unwrap();
+        let installed = || {
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-grad"),
+            )
+        };
+        assert_eq!(installed().as_deref(), Some(stable_version));
+
+        // `--rc` 解析 0.1.4-rc.4 —— 不新于已装 0.1.4，必须 no-op（仅索引
+        // 重取，无下载）。修复前：等值跳过不命中 → 用 rc 覆盖 stable。
+        let calls_before = transport.calls().len();
+        manager
+            .update_with_channel(None, UpdateChannel::PreRelease)
+            .unwrap();
+        assert_eq!(
+            installed().as_deref(),
+            Some(stable_version),
+            "--rc must not downgrade an installed stable to an older indexed rc"
+        );
+        assert_eq!(
+            transport.calls().len(),
+            calls_before + 1,
+            "no-op: index re-fetch only, no artifact download"
+        );
+    }
+
+    /// rpi#34 反向：已装 rc（0.1.4-rc.4）+ 索引仅含更旧 stable（0.1.3）
+    /// 时，stable 通道不得把 rc 降级到旧 stable。
+    #[test]
+    fn test_update_stable_channel_does_not_downgrade_installed_rc() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let name = "ext-rcpinned";
+        // 阶段 1：索引含 stable 0.1.3 + rc 0.1.4-rc.4。
+        serve_registry_extension(&transport, name, "0.1.3", true);
+        let rc_version = "0.1.4-rc.4";
+        let target = config::build_target().unwrap();
+        let rc_archive = build_rpix(name, rc_version, true, &[]);
+        let dual_index = {
+            let (stable_archive, _) = serve_registry_extension(&transport, name, "0.1.3", true);
+            let file = format!("{name}-{rc_version}-{target}.rpix");
+            let download = extension_registry::github_download_url(
+                "acme",
+                name,
+                &format!("v{rc_version}"),
+                &file,
+            );
+            transport.insert(&download, rc_archive.clone());
+            let stable_file = format!("{name}-0.1.3-{target}.rpix");
+            let stable_download =
+                extension_registry::github_download_url("acme", name, "v0.1.3", &stable_file);
+            transport.insert(&stable_download, stable_archive.clone());
+            serde_json::json!({
+                "schemaVersion": 1,
+                "name": name,
+                "repository": format!("acme/{name}"),
+                "author": "acme",
+                "kind": "native",
+                "versions": [
+                    {"version": "0.1.3", "rpiAbi": 1, "capabilities": ["tools"],
+                     "artifacts": [{
+                         "target": target,
+                         "file": stable_file,
+                         "sha256": sha256_hex(&stable_archive),
+                         "release": "v0.1.3"}]},
+                    {"version": rc_version, "rpiAbi": 1, "capabilities": ["tools"],
+                     "artifacts": [{
+                         "target": target,
+                         "file": file,
+                         "sha256": sha256_hex(&rc_archive),
+                         "release": format!("v{rc_version}")} ]}
+                ]
+            })
+            .to_string()
+        };
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            dual_index.into_bytes(),
+        );
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist(name, false).unwrap();
+        manager
+            .update_with_channel(None, UpdateChannel::PreRelease)
+            .unwrap();
+        let installed = || {
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-rcpinned"),
+            )
+        };
+        assert_eq!(installed().as_deref(), Some(rc_version));
+
+        // 阶段 2：索引回退到仅含旧 stable 0.1.3（如 rc 撤库/离线窗口）。
+        serve_registry_extension(&transport, name, "0.1.3", true);
+        manager.update(None).unwrap();
+        assert_eq!(
+            installed().as_deref(),
+            Some(rc_version),
+            "stable channel must not downgrade an installed rc to an older stable"
         );
     }
 
