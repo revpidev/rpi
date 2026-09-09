@@ -253,7 +253,12 @@ async fn resume_rebinds_second_host_and_republishes_status() {
     events.sort();
     assert_eq!(
         events,
-        vec!["session_shutdown", "session_start", "tool_result"],
+        vec![
+            "session_shutdown",
+            "session_start",
+            "session_tree",
+            "tool_result"
+        ],
         "event handlers must be re-registered on host B"
     );
     assert!(

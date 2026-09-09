@@ -593,8 +593,9 @@ pub fn build_proxy_description(
 }
 
 /// The direct tool executor (direct-tools.ts:300-557 `createDirectToolExecutor`),
-/// P1-wave cut: no approval gate (FR-P1-07), no UI sessions (P2). Auto-auth
-/// (FR-P1-04) and session recovery (FR-P1-08) are wired in (TE-D09/TE-D11).
+/// with the approveTools approval gate wired (FR-P1-07 / R7.2.2, TE21).
+/// MCP UI sessions are P2 and absent. Auto-auth (FR-P1-04) and session
+/// recovery (FR-P1-08) are wired in (TE-D09/TE-D11).
 pub async fn execute_direct_tool(
     runtime: &crate::proxy::McpRuntime,
     spec: &DirectToolSpec,
@@ -687,6 +688,58 @@ pub async fn execute_direct_tool(
             "content": [{ "type": "text", "text": message }],
             "details": { "error": "not_connected", "server": spec.server_name },
         });
+    }
+
+    // R7.2.2.1–.4 / FR-P1-07: approval gate (direct-tools.ts:423-445 @
+    // 10a45367). The definition/argument identity and the session grant
+    // persistence live in `crate::approval`.
+    let tool_meta = crate::metadata::ToolMetadata {
+        name: spec.prefixed_name.clone(),
+        original_name: spec.original_name.clone(),
+        description: spec.description.clone(),
+        resource_uri: spec.resource_uri.clone(),
+        input_schema: spec.input_schema.clone(),
+    };
+    let approval_origin = if spec.resource_uri.is_some() {
+        crate::approval::ApprovalOrigin::Resource
+    } else {
+        crate::approval::ApprovalOrigin::Direct
+    };
+    let approval_ui = runtime
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let approval_result = crate::approval::ensure_tool_call_approved(
+        config,
+        &runtime.approval,
+        &spec.server_name,
+        &tool_meta,
+        params,
+        approval_origin,
+        None,
+        approval_ui.as_deref(),
+        || {
+            let metadata = runtime
+                .tool_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::approval::approval_candidate_context(
+                config,
+                &metadata,
+                &spec.server_name,
+                &spec.original_name,
+            )
+        },
+    );
+    if approval_result != crate::approval::ToolCallApprovalResult::Ok {
+        let (content, details) = crate::approval::approval_rejection_details(
+            &approval_result,
+            &spec.server_name,
+            &spec.original_name,
+            None,
+        );
+        return json!({ "content": content, "details": details });
     }
 
     let guard_options = crate::guard::resolve_guard_options(config.settings.as_ref());

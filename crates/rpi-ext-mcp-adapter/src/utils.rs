@@ -312,6 +312,88 @@ pub fn truncate_at_word(text: &str, target: usize) -> String {
 /// exponent notation carries an explicit `+` (JS `"1e+21"`). String escaping
 /// matches `serde_json` (control chars, `"`, `\`; raw UTF-8 otherwise), which
 /// is also `JSON.stringify`'s behavior for all non-lone-surrogate input.
+/// `stripOscSequences` (utils.ts:206-227 @ 10a45367): drop OSC control
+/// strings, including payloads that never terminate.
+pub fn strip_osc_sequences(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        let is_esc_osc = chars[index] == '\u{1b}' && chars.get(index + 1) == Some(&']');
+        let is_c1_osc = chars[index] == '\u{9d}';
+        if !is_esc_osc && !is_c1_osc {
+            result.push(chars[index]);
+            index += 1;
+            continue;
+        }
+        index += if is_esc_osc { 2 } else { 1 };
+        while index < chars.len() {
+            let code = chars[index];
+            index += 1;
+            if code == '\u{7}' || code == '\u{9c}' {
+                break;
+            }
+            if code == '\u{1b}' && chars.get(index) == Some(&'\\') {
+                index += 1;
+                break;
+            }
+        }
+    }
+    result
+}
+
+/// `sanitizeTerminalText` (utils.ts:232-238 @ 10a45367): strip OSC + CSI
+/// escapes, collapse control characters/whitespace (approval dialog title and
+/// argument preview).
+pub fn sanitize_terminal_text(text: &str) -> String {
+    let stripped = strip_osc_sequences(text);
+    let mut without_escapes = String::with_capacity(stripped.len());
+    let mut chars = stripped.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            without_escapes.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                while let Some(&next) = chars.peek() {
+                    if ('\u{20}'..='\u{3f}').contains(&next) {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&next) = chars.peek() {
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        chars.next();
+                    }
+                }
+            }
+            Some(&next) if ('\u{40}'..='\u{5f}').contains(&next) => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    let mut collapsed = String::with_capacity(without_escapes.len());
+    let mut in_whitespace = false;
+    for ch in without_escapes.chars() {
+        let code = ch as u32;
+        let is_control = code <= 0x1f || (0x7f..=0x9f).contains(&code);
+        if is_control || ch.is_whitespace() {
+            if !in_whitespace {
+                collapsed.push(' ');
+                in_whitespace = true;
+            }
+        } else {
+            collapsed.push(ch);
+            in_whitespace = false;
+        }
+    }
+    collapsed.trim().to_string()
+}
+
 pub fn js_json_stringify(value: &Value) -> String {
     match value {
         Value::Number(n) => js_number_to_string(n),
@@ -520,6 +602,24 @@ mod tests {
     fn secret_expression_bang_semantics() {
         assert_eq!(interpolate_secret_expression("!!literal"), "!literal");
         assert_eq!(interpolate_secret_expression("!cmd arg"), "!cmd arg");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_osc_csi_and_controls() {
+        // OSC with BEL terminator + C1 OSC + unterminated OSC.
+        assert_eq!(sanitize_terminal_text("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(sanitize_terminal_text("a\u{9d}0;title\u{9c}b"), "ab");
+        assert_eq!(sanitize_terminal_text("a\u{1b}]0;never"), "a");
+        // CSI color + two-character escape + C0/DEL/C1 controls collapse.
+        assert_eq!(
+            sanitize_terminal_text("\u{1b}[31mred\u{1b}[0m\u{1b}M\u{7}x\u{9b}y"),
+            "red x y"
+        );
+        assert_eq!(sanitize_terminal_text("  a\n\tb  "), "a b");
+        assert_eq!(
+            sanitize_terminal_text("caf\u{e9} \u{4e2d}"),
+            "caf\u{e9} \u{4e2d}"
+        );
     }
 
     #[test]

@@ -14,7 +14,8 @@
 //!   `not_supported` text guidance; `ui-messages` is P2. Auto-auth
 //!   (`settings.autoAuth`) and Streamable HTTP session recovery are wired
 //!   into the connect/call paths (TE-D09/TE-D11).
-//! - Tool approval gates and MCP UI sessions (P2) are absent.
+//! - MCP UI sessions (P2) are absent; the approveTools approval gate
+//!   (FR-P1-07 / R7.2.2) is wired in `execute_call` and `execute_direct_tool`.
 //! - [ABI] Upstream *throws* on invalid `args` JSON; the native ABI has no
 //!   toolExecute throw channel, so the same message is returned as a normal
 //!   tool result with `details.error: "invalid_args"` and re-flagged via the
@@ -92,6 +93,12 @@ pub struct McpRuntime {
     /// `lazyConnect`): set by the plugin after init; fired just before a
     /// lazy `manager.connect` attempt so the footer can show progress.
     pub on_connecting: Mutex<Option<ConnectingHook>>,
+    /// Session-scoped approval cache (R7.2.2.1–.4): argument/definition-keyed
+    /// grants restored from the active session branch and persisted through
+    /// the bound sink.
+    pub approval: crate::approval::ApprovalCache,
+    /// TUI approval dialog handler (R7.2.2.3); `None` = headless fail-closed.
+    pub approval_ui: Mutex<Option<Arc<dyn crate::approval::ApprovalHandler>>>,
 }
 
 /// Callback fired before a lazy connect attempt (init.ts:588-591).
@@ -210,6 +217,8 @@ pub async fn initialize_mcp(
         cache_path: cache_path.clone(),
         on_metadata_updated: Mutex::new(None),
         on_connecting: Mutex::new(None),
+        approval: crate::approval::ApprovalCache::new(),
+        approval_ui: Mutex::new(None),
     });
 
     let enabled: Vec<(&String, &ServerEntry)> = config
@@ -1738,9 +1747,9 @@ pub fn no_native_tools() -> NativeToolsResolver {
     Arc::new(Vec::new)
 }
 
-/// `executeCall` (proxy-modes.ts:768-1253), P0 cut: no approval gate, no UI
-/// sessions; guard-disabled content path. Session recovery (FR-P1-08) and
-/// auto-auth (FR-P1-04) are wired in (TE-D09/TE-D11).
+/// `executeCall` (proxy-modes.ts:768-1253), guard-disabled content path.
+/// Session recovery (FR-P1-08), auto-auth (FR-P1-04) and the approveTools
+/// approval gate (FR-P1-07 / R7.2.2) are wired in (TE-D09/TE-D11/TE21).
 pub async fn execute_call(
     state: &McpRuntime,
     tool_name: &str,
@@ -2178,6 +2187,52 @@ pub async fn execute_call(
                 );
             }
         }
+    }
+
+    // R7.2.2.1–.4 / FR-P1-07: approval gate (proxy-modes.ts:1262-1286 @
+    // 10a45367). Argument/definition-scoped key, legacy-candidate exclusion
+    // and session-branch persistence all live in `crate::approval`.
+    let args_value = Value::Object(args.clone().unwrap_or_default());
+    let approval_origin = if tool_meta.resource_uri.is_some() {
+        crate::approval::ApprovalOrigin::Resource
+    } else {
+        crate::approval::ApprovalOrigin::Proxy
+    };
+    let approval_ui = state
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let approval_result = crate::approval::ensure_tool_call_approved(
+        &state.config,
+        &state.approval,
+        &server_name,
+        &tool_meta,
+        &args_value,
+        approval_origin,
+        None,
+        approval_ui.as_deref(),
+        || {
+            let metadata = state
+                .tool_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::approval::approval_candidate_context(
+                &state.config,
+                &metadata,
+                &server_name,
+                &tool_meta.original_name,
+            )
+        },
+    );
+    if approval_result != crate::approval::ToolCallApprovalResult::Ok {
+        let (content, details) = crate::approval::approval_rejection_details(
+            &approval_result,
+            &server_name,
+            &tool_meta.original_name,
+            Some("call"),
+        );
+        return json!({ "content": content, "details": details });
     }
 
     let request_timeout = state
