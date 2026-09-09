@@ -98,6 +98,16 @@ fn tool_surface_integration() {
     });
     install(host);
 
+    // TE15 (R7.1.3.1 / A-R4): a fatal user definition is isolated and
+    // surfaced by list/doctor instead of hiding the rest of the catalog.
+    let user_agents = dir.join("agent").join("agents");
+    std::fs::create_dir_all(&user_agents).unwrap();
+    std::fs::write(
+        user_agents.join("broken-invalid-async.md"),
+        "---\nname: broken-async\ndescription: d\nasync: maybe\n---\nb\n",
+    )
+    .unwrap();
+
     // list: six builtins under an isolated agent dir.
     let result = execute(json!({ "action": "list" }));
     assert_eq!(result["isError"], Value::Bool(false), "{result}");
@@ -113,6 +123,13 @@ fn tool_surface_integration() {
         assert!(text.contains(&format!("- {name} (builtin")), "{text}");
     }
     assert!(text.contains("aliases: advisor"));
+    assert!(text.contains("Invalid agent definitions:"), "{text}");
+    assert!(
+        text.contains(
+            "broken-invalid-async.md (user): Agent 'broken-async' has invalid async frontmatter; expected true or false."
+        ),
+        "{text}"
+    );
 
     // get with alias resolution.
     let result = execute(json!({ "action": "get", "agent": "advisor" }));
@@ -132,6 +149,7 @@ fn tool_surface_integration() {
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Runtime:"));
     assert!(text.contains("Discovery:"));
+    assert!(text.contains("- invalid agent "), "{text}");
     assert!(text.contains("Depth / budget:"));
 
     // workflowScript placeholder fails loudly (ADR-0016).

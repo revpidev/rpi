@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
@@ -171,6 +171,104 @@ fn run_fallback_case(case: &Value) -> Value {
     }
 }
 
+/// Discovery-tree case (target track, TE15 R7.1.3): materialize the case tree
+/// under a sandbox user-agent dir with the rpi config-dir name, run the real
+/// discovery entry point and emit normalized agents + diagnostics. The
+/// upstream leg materializes the same tree with `.pi` and drives v0.66
+/// `discoverAgents`; both sides map their config dir to `<CFGDIR>`.
+fn run_discovery_case(case: &Value) -> Value {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let root = std::env::temp_dir().join(format!(
+        "rpi-sub-discovery-parity-{}-{nonce}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let user_dir = root.join("agentdir").join("agents");
+    let result = (|| -> Result<Value, String> {
+        std::fs::create_dir_all(&user_dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(root.join("proj")).map_err(|e| e.to_string())?;
+        if let Some(files) = case.pointer("/tree/files").and_then(Value::as_object) {
+            for (raw_path, content) in files {
+                let relative = raw_path.replace("<CFGDIR>", ".rpi");
+                let target = user_dir.join(&relative);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&target, content.as_str().unwrap_or_default())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if let Some(symlinks) = case.pointer("/tree/symlinks").and_then(Value::as_array) {
+            #[cfg(unix)]
+            for symlink in symlinks {
+                let path = symlink.get("path").and_then(Value::as_str).unwrap_or("");
+                let target = symlink.get("target").and_then(Value::as_str).unwrap_or("");
+                let link = user_dir.join(path);
+                if let Some(parent) = link.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::os::unix::fs::symlink(target, &link).map_err(|e| e.to_string())?;
+            }
+            #[cfg(not(unix))]
+            let _ = symlinks;
+        }
+        let input = rpi_ext_subagents::parity::DiscoveryInputPublic {
+            cwd: root.join("proj"),
+            scope: "user".to_string(),
+            user_dirs: vec![user_dir.clone()],
+            builtin_dir: None,
+        };
+        let (agents, diagnostics) = rpi_ext_subagents::parity::discover_public(&input);
+        let relativize = |path: &Path| -> String {
+            let relative = path
+                .strip_prefix(&user_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            match relative.strip_prefix(".rpi/") {
+                Some(rest) => format!("<CFGDIR>/{rest}"),
+                None => relative,
+            }
+        };
+        let mut agents: Vec<Value> = agents
+            .into_iter()
+            // Builtins (embedded `builtin:*` pseudo-paths) are not part of the
+            // user-tree parity case; upstream filters its own builtin catalog
+            // the same way.
+            .filter(|agent| agent.file_path.starts_with(&user_dir))
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "source": agent.source,
+                    "path": relativize(&agent.file_path),
+                })
+            })
+            .collect();
+        agents.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        let mut diagnostics: Vec<Value> = diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.path.starts_with(&user_dir))
+            .map(|diagnostic| {
+                json!({
+                    "path": relativize(&diagnostic.path),
+                    "source": diagnostic.scope,
+                    "error": diagnostic.error,
+                })
+            })
+            .collect();
+        diagnostics.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
+        Ok(json!({ "agents": agents, "diagnostics": diagnostics }))
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+    match result {
+        Ok(output) => output,
+        Err(error) => json!({ "error": format!("discovery case setup failed: {error}") }),
+    }
+}
+
 fn main() {
     let mut raw = String::new();
     let mut args = std::env::args().skip(1);
@@ -199,6 +297,7 @@ fn main() {
             }
             "final-output" => run_final_output_case(case.get("messages").unwrap_or(&Value::Null)),
             "fallback" => run_fallback_case(&case),
+            "discovery" => run_discovery_case(&case),
             other => {
                 eprintln!("parity_runner: unknown mode {other}");
                 std::process::exit(2);

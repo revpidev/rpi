@@ -43,12 +43,20 @@
 ## 发现目录（`discovery/`）
 
 - `agents-tree/` 提交的文件覆盖：合法 agent、未闭合 frontmatter、
-  无冒号行、嵌套 agent、`sync-backups/`（应剪枝）。
+  无冒号行、**fatal frontmatter 两例**（`async: maybe` / `timeoutMs: not-a-number`）、
+  嵌套 agent、`sync-backups/`（应剪枝）。
 - `.rpi/` 与符号链接**不提交**，由 `materialize.json` 在测试临时目录重建：
   `.rpi/` 被仓库 `.gitignore` 全局忽略（`.rpi/`），符号链接在 Windows
   checkout 不可靠。`materialize.json` 钉死路径、目标、环与期望
-  （可见 agent 集合、剪枝路径、诊断集合）。
-- TE15 按 `materialize.json` 物化后与上游 `list`/`get` 输出对拍。
+  （可见 agent 集合、剪枝路径、静默跳过集合、诊断集合）。
+- **TE15 复核修正（2026-09-09）**：TE13 初版把 `broken-frontmatter.md` /
+  `broken-no-colon.md` 列为诊断，与上游 v0.66.0 实读不符——两文件在
+  `loadAgentsFromDefinitionFiles` 里因缺 name/description 走 `continue`
+  （静默跳过，无诊断）；TE15 新增两例 fatal frontmatter 作为真正的诊断
+  来源，并把原两例改列 `expected_silent_skips`。
+- 消费方式：crate 单测按 `materialize.json` 物化后断言；目标轨 harness 的
+  `discovery` 模式用同一树用例与上游 `discoverAgents` 逐字段对拍
+  （`scripts/subagents-parity/README.md`「目标轨 discovery 腿」）。
 
 ## 终态分类与通知
 

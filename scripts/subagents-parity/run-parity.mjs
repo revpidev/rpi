@@ -20,7 +20,10 @@
 //      upstream deleted `pi-args.ts` in v0.65).
 //   2. frontmatter/final-output/fallback: Rust vs the v0.66 snapshot modules
 //      extracted by setup-target-source.sh.
-//   3. Diffs are attributed through expected-target-diffs.json
+//   3. discovery (TE15): the case tree is materialized per side (`.pi`
+//      upstream / `.rpi` rpi, both normalized to `<CFGDIR>`) and both legs
+//      run their real discovery entry point; agents + diagnostics are diffed.
+//   4. Diffs are attributed through expected-target-diffs.json
 //      (`upstream-semantics` vs `rpi-deviation`, each with R + owner task);
 //      writes fixtures/generated/subagents-parity-v066/parity-report.md.
 //   Non-zero exit = any UNATTRIBUTED diff.
@@ -51,7 +54,7 @@ const GENERATED = resolve(
 );
 const MODES =
 	TRACK === "target"
-		? ["args", "frontmatter", "final-output", "fallback"]
+		? ["args", "frontmatter", "final-output", "fallback", "discovery"]
 		: ["args", "frontmatter", "final-output"];
 
 // Session paths in fixtures.json use the /sess/root placeholder; both legs
@@ -92,26 +95,32 @@ function materialize(mode) {
 	return modeFile;
 }
 
-// Both legs run with the ambient parent-session env keys cleared: the
-// upstream runner falls back to PI_SUBAGENT_PARENT_SESSION from the shell
-// while the rust runner reads RPI_SUBAGENT_PARENT_SESSION (the bridge renames
-// PI_SUBAGENT_* → RPI_*), so a value exported in the surrounding shell
-// reaches exactly one leg and eight args cases mismatch spuriously.
+// Both legs run with the ambient subagent/parent-session env cleared. pi
+// forwards parent env into subagent children under the `PI_SUBAGENTS_` prefix
+// (e.g. `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`, the package-root key
+// `pi-args.ts:641` copies into the child env) and exports `PI_SUBAGENT_*`
+// keys; the Rust leg has no matching ambient keys, so a value exported in the
+// surrounding shell reaches exactly one leg and the args cases mismatch
+// spuriously (2026-09-09: running inside a pi subagent session produced eight
+// false MISMATCHes). The harness's own keys are added by the caller *after*
+// cleaning, so they survive.
 function cleanSessionEnv(env) {
-	const cleaned = { ...env };
-	delete cleaned.PI_SUBAGENT_PARENT_SESSION;
-	delete cleaned.RPI_SUBAGENT_PARENT_SESSION;
+	const cleaned = {};
+	for (const [key, value] of Object.entries(env)) {
+		if (key.startsWith("PI_SUBAGENT") || key.startsWith("RPI_SUBAGENT")) continue;
+		cleaned[key] = value;
+	}
 	return cleaned;
 }
 
 function runUpstream(mode, modeFile) {
 	const result = spawnSync(TSX, [`${HERE}/upstream-runner.mjs`, mode, modeFile], {
 		encoding: "utf-8",
-		env: cleanSessionEnv({
-			...process.env,
+		env: {
+			...cleanSessionEnv(process.env),
 			PI_CODING_AGENT_PACKAGE_ROOT: "/tmp",
 			RPI_SUBAGENTS_PARITY_TRACK: TRACK,
-		}),
+		},
 	});
 	if (result.status !== 0) {
 		throw new Error(`upstream runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);

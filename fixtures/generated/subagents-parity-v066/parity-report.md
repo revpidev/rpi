@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-09T02:40:02.355Z
+generated: 2026-09-09T03:31:54.798Z
 
 ## args
 
@@ -56,6 +56,10 @@ generated: 2026-09-09T02:40:02.355Z
 - attempt-no-tools-empty-messages: MATCH
 - attempt-empty-output-cold-start: MATCH
 - attempt-matching-message-error: MATCH
+
+## discovery
+
+- user-tree-robustness: MATCH
 
 ## Attribution summary
 

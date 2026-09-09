@@ -147,6 +147,12 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
     std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
     let saved_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &dir);
+    // MCP_DIRECT_TOOLS 隔离（对齐上游 `__tests__/lifecycle-lazy-keep-alive-init.test.ts:90-95`）：
+    // 子代理环境会注入 `MCP_DIRECT_TOOLS=__none__`（pi-subagents
+    // child-launch.ts:159），本用例断言 direct 工具定义带 renderResult，
+    // 必须清空该变量后恢复。
+    let saved_direct_tools = std::env::var_os("MCP_DIRECT_TOOLS");
+    std::env::remove_var("MCP_DIRECT_TOOLS");
 
     let host = FakeHost::new(&dir.to_string_lossy());
     let host_ptr = Arc::into_raw(host.clone()) as PluginCookie;
@@ -259,6 +265,10 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
     match saved_home {
         Some(home) => std::env::set_var("HOME", home),
         None => std::env::remove_var("HOME"),
+    }
+    match saved_direct_tools {
+        Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
+        None => std::env::remove_var("MCP_DIRECT_TOOLS"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

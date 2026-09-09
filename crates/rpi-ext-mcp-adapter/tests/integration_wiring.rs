@@ -931,6 +931,12 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     // 其余用例不读这两个变量。
     let saved_home = std::env::var_os("HOME");
     std::env::set_var("HOME", &dir);
+    // MCP_DIRECT_TOOLS 隔离（对齐上游 `__tests__/index-lifecycle.test.ts:159-192`）：
+    // pi 的 subagents 扩展给子代理注入 `MCP_DIRECT_TOOLS=__none__`
+    //（pi-subagents child-launch.ts:159），会按设计关闭 direct 工具面；本用例
+    // 断言 direct 工具来自 metadata cache，必须清空该变量后恢复。
+    let saved_direct_tools = std::env::var_os("MCP_DIRECT_TOOLS");
+    std::env::remove_var("MCP_DIRECT_TOOLS");
     let host_ptr = Arc::into_raw(host.clone()) as PluginCookie;
     let calls = RpiHostCalls {
         call: fake_host_call,
@@ -1012,6 +1018,10 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     match saved_home {
         Some(home) => std::env::set_var("HOME", home),
         None => std::env::remove_var("HOME"),
+    }
+    match saved_direct_tools {
+        Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
+        None => std::env::remove_var("MCP_DIRECT_TOOLS"),
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
