@@ -115,8 +115,9 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
    rpi 单 cdylib 的已知差）。
 4. **env 键序**：JS 插入序 vs Rust BTreeMap 序 → 两侧按键排序比较。
 5. **上游专属 env 键丢弃**：`PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS`
-   （runtime-ack 扩展回执，P1）、`PI_CODING_AGENT_PACKAGE_ROOT`（node 包
-   根传播，rpi 无对应物）。其余键含 `PI_SUBAGENT_*` → `RPI_SUBAGENT_*`
+   （runtime-ack 扩展回执，P1）、`PI_CODING_AGENT_PACKAGE_ROOT` /
+   `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`（node 包根传播，rpi 无对应物，
+   两个历史名都丢弃）。其余键含 `PI_SUBAGENT_*` → `RPI_SUBAGENT_*`
    改名对齐。
 6. **rpi 专属 env 键丢弃（TE05 新增）**：`RPI_SUBAGENT_STEER_INBOX`、
    `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR`——rpi 原生的 steer 收件箱与
@@ -145,13 +146,20 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
 
 ## 环境隔离（运行前须知）
 
-`run-parity.mjs` 两条腿都以**清除后的环境**启动子进程：`PI_SUBAGENT_PARENT_SESSION`
-与 `RPI_SUBAGENT_PARENT_SESSION` 一律删除（`cleanSessionEnv`）。原因：上游腿的
-`pi-args.ts` 会回退读取 shell 里的 `PI_*` 值，rust 腿读 `RPI_*`（桥接层把
-`PI_SUBAGENT_*` 改名为 `RPI_SUBAGENT_*`）——若在外层 shell 导出过其中任一键，
-它的值只到达一条腿，args 模式会有 8 例假 MISMATCH（`fork-session-file` 之外的
-用例都走环境回退）。2026-08-15 前的 harness 未做此隔离；如需复现旧行为可手动
-导出该键并观察误报。
+`run-parity.mjs` 两条腿都以**清除后的环境**启动子进程：所有 `PI_SUBAGENT*` /
+`RPI_SUBAGENT*` 前缀的环境键一律删除（`cleanSessionEnv`，harness 自己的
+`RPI_SUBAGENTS_PARITY_TRACK` 在清除之后再加）。原因：
+
+- 上游腿的 `pi-args.ts` 会回退读取 shell 里的 `PI_*` 值，rust 腿读 `RPI_*`
+  （桥接层把 `PI_SUBAGENT_*` 改名为 `RPI_SUBAGENT_*`）——若在外层 shell 导出过
+  其中任一键，它的值只到达一条腿，args 模式会有假 MISMATCH（`fork-session-file`
+  之外的用例都走环境回退）。2026-08-15 前的 harness 未做此隔离；如需复现旧行为
+  可手动导出该键并观察误报。
+- **pi 子代理会话**会把父进程环境以 `PI_SUBAGENTS_` 前缀转发给子代理（实见
+  `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`，即 `pi-args.ts:641` 复制进子
+  进程 env 的包根键），因此只清 `PI_SUBAGENT_PARENT_SESSION` 不够——在 pi 子
+  代理会话里跑对拍会出现 8 个 args 假 MISMATCH。2026-09-09 修复后前缀键全清，
+  两种环境（普通 shell / pi 子代理）均 `MATCH`。
 
 ## 已知不适用面
 

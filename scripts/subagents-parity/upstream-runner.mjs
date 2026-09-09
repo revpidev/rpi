@@ -56,7 +56,10 @@ function normalizeArgv(args) {
 // comparison (documented in README.md).
 const DROPPED_ENV_KEYS = new Set([
 	"PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS",
+	// Package-root propagation has two historical names (utils.ts:19 uses the
+	// prefixed one); either side may carry it when the package is resolvable.
 	"PI_CODING_AGENT_PACKAGE_ROOT",
+	"PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT",
 ]);
 
 function normalizeEnv(env) {
