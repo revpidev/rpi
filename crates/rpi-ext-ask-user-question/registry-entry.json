@@ -1,0 +1,10 @@
+{
+  "name": "rpiv-ask-user-question",
+  "repository": "revpidev/rpi",
+  "description": "Structured ask_user_question tool: a questionnaire the model can put to you (1-4 questions, 2-4 described options each, optional markdown preview, multi-select, notes), rendered as an interactive overlay with an RPC dialog fallback.",
+  "author": "revpidev",
+  "license": "MIT",
+  "official": true,
+  "lockstepHost": true,
+  "descriptionZh": "结构化 ask_user_question 工具:模型在需求不清时向你发起的问卷(1-4 题、每题 2-4 个带描述选项、可选 markdown 预览、多选、备注),以交互式 overlay 渲染并提供 RPC 对话框降级。"
+}
