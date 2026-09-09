@@ -52,7 +52,7 @@ fn include_exclude_glob_matches_upstream_is_tool_allowed() {
         let include = case.get("include");
         let exclude = case.get("exclude");
 
-        let actual = is_tool_allowed(tool_name, server, prefix, include, exclude);
+        let actual = is_tool_allowed(tool_name, server, prefix, include, exclude, None);
         let expected = case["expected"].as_bool().unwrap_or(false);
         assert_eq!(actual, expected, "isToolAllowed diverged: {case}");
     }
@@ -105,7 +105,15 @@ fn search_keywords_do_not_appear_in_tool_metadata() {
         description: Some("Search records".to_string()),
         input_schema: Some(json!({"type": "object"})),
     }];
-    let result = build_tool_metadata(&tools, &[], &definition, "demo", ToolPrefix::Server);
+    let result = build_tool_metadata(
+        &tools,
+        &[],
+        &definition,
+        "demo",
+        ToolPrefix::Server,
+        None,
+        None,
+    );
     assert_eq!(result.metadata.len(), 1);
     let desc = &result.metadata[0].description;
     assert!(!desc.contains("secret-alias"));

@@ -8,6 +8,20 @@
 // Upstream: `rpi/external/pi-mcp-adapter` @ v2.24.0
 // (3d953f9096bf8af05783a740c6608663a2c3180a) — read-only, never modified.
 //
+// The source root is overridable so the v0.1.4 rebase target track can
+// re-record against the pinned v2.32.1 snapshot without touching the
+// submodule (TE13 `scripts/mcp-parity/setup-target-source.sh` extracts it
+// out of tree):
+//
+//   RPI_MCP_FIXTURE_UPSTREAM=/tmp/rpi-mcp-parity-target-v2321 \
+//   RPI_MCP_FIXTURE_PIN=10a45367 \
+//   RPI_MCP_FIXTURE_ONLY=names node rpi/scripts/gen-mcp-adapter-fixtures.mjs
+//
+// `RPI_MCP_FIXTURE_ONLY` is a comma-separated subset of
+// `tsshape,names,search,config-merge,config-hash,glob` (default: all) so a
+// task can re-record only the fixtures its upstream face owns; the other
+// tasks keep their own re-record scope (TE24 owns the remaining faces).
+//
 // Prerequisite (kept out of the repo on purpose; the submodule must stay
 // pristine):
 //
@@ -15,7 +29,9 @@
 //
 // If that install is missing, generation continues with a passthrough strip
 // and every fixture input stays comment-free EXCEPT the JSONC cases, which
-// are then skipped with a warning.
+// are then skipped with a warning. A target-track snapshot that ships its
+// own `node_modules/strip-json-comments` is used when the out-of-tree
+// install is absent.
 //
 // Usage: node rpi/scripts/gen-mcp-adapter-fixtures.mjs
 // Output: crates/rpi-ext-mcp-adapter/tests/fixtures/*.json (committed).
@@ -27,11 +43,18 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const UPSTREAM = join(REPO, "external", "pi-mcp-adapter");
+const UPSTREAM = process.env.RPI_MCP_FIXTURE_UPSTREAM
+  ? resolve(process.env.RPI_MCP_FIXTURE_UPSTREAM)
+  : join(REPO, "external", "pi-mcp-adapter");
+const PIN = process.env.RPI_MCP_FIXTURE_PIN ?? "3d953f90";
 const OUT_DIR = join(REPO, "crates", "rpi-ext-mcp-adapter", "tests", "fixtures");
 
-const STRIP_PKG = "/tmp/mcp-fixture-deps/node_modules/strip-json-comments/index.js";
-const haveRealStrip = existsSync(STRIP_PKG);
+const STRIP_CANDIDATES = [
+  "/tmp/mcp-fixture-deps/node_modules/strip-json-comments/index.js",
+  join(UPSTREAM, "node_modules", "strip-json-comments", "index.js"),
+];
+const STRIP_PKG = STRIP_CANDIDATES.find((candidate) => existsSync(candidate));
+const haveRealStrip = STRIP_PKG !== undefined;
 process.env.RPI_MCP_FIXTURE_STRIP_JSON_COMMENTS_URL = haveRealStrip
   ? pathToFileURL(STRIP_PKG).href
   : new URL("./mcp-fixture-stub-strip-json-comments.mjs", import.meta.url).href;
@@ -40,6 +63,13 @@ if (!haveRealStrip) {
 }
 
 register(new URL("./mcp-fixture-hooks.mjs", import.meta.url));
+
+const ONLY = (process.env.RPI_MCP_FIXTURE_ONLY ?? "")
+  .split(",")
+  .map((part) => part.trim())
+  .filter(Boolean);
+const shouldRun = (name) => ONLY.length === 0 || ONLY.includes(name);
+console.log(`[gen-fixtures] upstream=${UPSTREAM} pin=${PIN} only=${ONLY.join(",") || "all"}`);
 
 function writeFixture(name, data) {
   const path = join(OUT_DIR, name);
@@ -193,7 +223,7 @@ async function genTsShape() {
     expected: renderTsShape(input),
   }));
   writeFixture("tsshape_cases.json", {
-    provenance: "external/pi-mcp-adapter/ts-shape.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/ts-shape.ts @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     cases: out,
   });
 }
@@ -304,7 +334,7 @@ async function genNames() {
   }));
 
   writeFixture("name_format_cases.json", {
-    provenance: "external/pi-mcp-adapter/types.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/types.ts @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     formatToolName: formatToolNameCases,
     getServerPrefix: serverPrefixCases,
     getToolNameCandidates: candidateCases,
@@ -423,7 +453,7 @@ async function genSearch() {
   ].map(({ name, limit }) => ({ name, limit, expected: rankSuggestions(state, name, limit) }));
 
   writeFixture("search_cases.json", {
-    provenance: "external/pi-mcp-adapter/search-ranking.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/search-ranking.ts @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     state: {
       servers: servers.map((s) => ({
         name: s.name,
@@ -626,7 +656,7 @@ async function genConfigMerge() {
     rmSync(sandbox, { recursive: true, force: true });
   }
   writeFixture("config_merge_cases.json", {
-    provenance: "external/pi-mcp-adapter/config.ts loadMcpConfig @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/config.ts loadMcpConfig @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     note: "imports are expanded by upstream loadMcpConfig but NOT by the P0 rpi port [VARIANT]; no fixture case uses imports-dependent servers.",
     cases,
   });
@@ -747,7 +777,7 @@ async function genConfigHash() {
     process.env = savedEnv;
   }
   writeFixture("config_hash_cases.json", {
-    provenance: "external/pi-mcp-adapter/metadata-cache.ts computeServerHash @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/metadata-cache.ts computeServerHash @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     cases: out,
   });
 }
@@ -839,17 +869,17 @@ async function genGlob() {
   }
 
   writeFixture("glob_cases.json", {
-    provenance: "external/pi-mcp-adapter/types.ts matchesToolPattern/isToolAllowed/getToolNameCandidates + search-ranking.ts resolveSearchKeywords @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+    provenance: `external/pi-mcp-adapter/types.ts matchesToolPattern/isToolAllowed/getToolNameCandidates + search-ranking.ts resolveSearchKeywords @ ${PIN}, executed by gen-mcp-adapter-fixtures.mjs`,
     matches: matchCases,
     allowed: allowedCases,
     keywords: keywordCases,
   });
 }
 
-await genTsShape();
-await genNames();
-await genSearch();
-await genConfigMerge();
-await genConfigHash();
-await genGlob();
+if (shouldRun("tsshape")) await genTsShape();
+if (shouldRun("names")) await genNames();
+if (shouldRun("search")) await genSearch();
+if (shouldRun("config-merge")) await genConfigMerge();
+if (shouldRun("config-hash")) await genConfigHash();
+if (shouldRun("glob")) await genGlob();
 console.log("[gen-fixtures] done");

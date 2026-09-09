@@ -31,8 +31,9 @@ use sha2::Digest;
 
 use crate::error::AdapterError;
 use crate::metadata::{
-    format_prompt_command_name, format_tool_name, is_tool_allowed, resolve_tool_prefix,
-    resource_name_to_tool_name, McpResource, McpTool, ServerEntry, ToolMetadata, ToolPrefix,
+    format_prompt_command_name, format_tool_name, get_tool_name_candidates_with, has_tool_filters,
+    is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name, McpResource, McpTool,
+    ServerEntry, ToolMetadata, ToolPrefix, ToolSelectorCandidateIndex,
 };
 
 /// `CACHE_VERSION` (metadata-cache.ts:33).
@@ -361,18 +362,36 @@ pub fn serialize_resources(resources: &[McpResource]) -> Vec<CachedResource> {
         .collect()
 }
 
-/// `reconstructToolMetadata` (metadata-cache.ts:176-236): rebuild the tool
-/// metadata of an unconnected server from its cache entry. The P2
+/// `reconstructToolMetadata` (metadata-cache.ts:193-256 @ 10a45367): rebuild
+/// the tool metadata of an unconnected server from its cache entry. The P2
 /// `isUiToolVisibleToModel` filter is a no-op here (no `_meta` is cached).
+///
+/// `configured_servers` + `cache` feed
+/// [`create_cached_tool_selector_candidate_index`] when this server declares
+/// `includeTools`/`excludeTools`; a caller that already built the shared
+/// index (upstream `init.ts:280`) passes it as
+/// `shared_selector_candidate_index`.
 pub fn reconstruct_tool_metadata(
     server_name: &str,
     entry: &ServerCacheEntry,
     prefix: ToolPrefix,
     definition: &ServerEntry,
+    configured_servers: Option<&IndexMap<String, ServerEntry>>,
+    cache: Option<&MetadataCache>,
+    shared_selector_candidate_index: Option<&ToolSelectorCandidateIndex>,
 ) -> Vec<ToolMetadata> {
     let mut metadata = Vec::new();
     let mut seen_names: Vec<String> = Vec::new();
     let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
+    let selector_candidate_index = if has_tool_filters(definition) {
+        shared_selector_candidate_index.cloned().or_else(|| {
+            configured_servers.zip(cache).map(|(servers, cache)| {
+                create_cached_tool_selector_candidate_index(servers, cache, prefix)
+            })
+        })
+    } else {
+        None
+    };
 
     for tool in &entry.tools {
         if tool.name.is_empty() {
@@ -384,6 +403,7 @@ pub fn reconstruct_tool_metadata(
             effective_prefix,
             definition.include_tools(),
             definition.exclude_tools(),
+            selector_candidate_index.as_ref(),
         ) {
             continue;
         }
@@ -413,6 +433,7 @@ pub fn reconstruct_tool_metadata(
                 effective_prefix,
                 definition.include_tools(),
                 definition.exclude_tools(),
+                selector_candidate_index.as_ref(),
             ) {
                 continue;
             }
@@ -435,6 +456,61 @@ pub fn reconstruct_tool_metadata(
     }
 
     metadata
+}
+
+/// `Date.now()` equivalent (module-local, mirrors the other modules' helper).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `createCachedToolSelectorCandidateIndex` (metadata-cache.ts:258-281
+/// @ 10a45367): current (non-legacy) candidates of every configured server
+/// with a valid cache, so a legacy-only include/exclude selector cannot
+/// sweep another tool's current name.
+pub fn create_cached_tool_selector_candidate_index(
+    configured_servers: &IndexMap<String, ServerEntry>,
+    cache: &MetadataCache,
+    prefix: ToolPrefix,
+) -> ToolSelectorCandidateIndex {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !candidates.contains(&value) {
+            candidates.push(value);
+        }
+    };
+    for (server_name, definition) in configured_servers {
+        if definition.is_disabled() {
+            continue;
+        }
+        let Some(entry) = cache.servers.get(server_name) else {
+            continue;
+        };
+        if !is_server_cache_valid(entry, definition, CACHE_MAX_AGE_MS, now_ms()) {
+            continue;
+        }
+        let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
+        for tool in &entry.tools {
+            for candidate in
+                get_tool_name_candidates_with(&tool.name, server_name, effective_prefix, false)
+            {
+                push(candidate);
+            }
+        }
+        if definition.exposes_resources() {
+            for resource in &entry.resources {
+                let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
+                for candidate in
+                    get_tool_name_candidates_with(&base_name, server_name, effective_prefix, false)
+                {
+                    push(candidate);
+                }
+            }
+        }
+    }
+    ToolSelectorCandidateIndex::from_candidates(candidates)
 }
 
 /// `PromptMetadata` (types.ts:561-568).
@@ -814,8 +890,15 @@ mod tests {
             cached_at: 0,
             ..Default::default()
         };
-        let metadata =
-            reconstruct_tool_metadata("xcodebuild", &cache_entry, ToolPrefix::Server, &definition);
+        let metadata = reconstruct_tool_metadata(
+            "xcodebuild",
+            &cache_entry,
+            ToolPrefix::Server,
+            &definition,
+            None,
+            None,
+            None,
+        );
         let names: Vec<&str> = metadata.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["xcodebuild_list_sims", "xcodebuild_read_y"]);
     }

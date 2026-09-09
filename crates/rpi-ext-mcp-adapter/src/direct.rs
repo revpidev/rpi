@@ -29,8 +29,9 @@ use tracing::warn;
 
 use crate::cache::{is_server_cache_valid, MetadataCache};
 use crate::metadata::{
-    format_tool_name, is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name, McpConfig,
-    ToolPrefix,
+    format_tool_name, get_tool_name_candidates_with, has_tool_filters, is_tool_allowed,
+    resolve_tool_prefix, resource_name_to_tool_name, McpConfig, ToolPrefix,
+    ToolSelectorCandidateIndex,
 };
 use crate::utils::truncate_at_word;
 
@@ -74,6 +75,61 @@ pub fn parse_direct_tool_selectors(
         }
     }
     (servers, tools)
+}
+
+/// `createToolSelectorCandidateIndex` inside `resolveDirectTools`
+/// (direct-tools.ts:211-228 @ 10a45367): current (non-legacy) candidates of
+/// every configured server with a valid cache, so a legacy-only
+/// include/exclude selector cannot sweep another tool's current name.
+fn direct_selector_candidate_index(
+    config: &McpConfig,
+    cache: &MetadataCache,
+    prefix: ToolPrefix,
+) -> ToolSelectorCandidateIndex {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !candidates.contains(&value) {
+            candidates.push(value);
+        }
+    };
+    for (other_server_name, other_definition) in &config.mcp_servers {
+        if other_definition.is_disabled() {
+            continue;
+        }
+        let Some(other_cache) = cache.servers.get(other_server_name) else {
+            continue;
+        };
+        if !is_server_cache_valid(
+            other_cache,
+            other_definition,
+            crate::cache::CACHE_MAX_AGE_MS,
+            now_ms(),
+        ) {
+            continue;
+        }
+        let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
+        for tool in &other_cache.tools {
+            for candidate in
+                get_tool_name_candidates_with(&tool.name, other_server_name, other_prefix, false)
+            {
+                push(candidate);
+            }
+        }
+        if other_definition.exposes_resources() {
+            for resource in &other_cache.resources {
+                let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
+                for candidate in get_tool_name_candidates_with(
+                    &base_name,
+                    other_server_name,
+                    other_prefix,
+                    false,
+                ) {
+                    push(candidate);
+                }
+            }
+        }
+    }
+    ToolSelectorCandidateIndex::from_candidates(candidates)
 }
 
 /// `resolveDirectTools` (direct-tools.ts:114-208).
@@ -141,6 +197,8 @@ pub fn resolve_direct_tools(
         }
 
         let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
+        let selector_candidate_index = has_tool_filters(definition)
+            .then(|| direct_selector_candidate_index(config, cache, prefix));
 
         for tool in &server_cache.tools {
             if !tool_filter.allows(&tool.name) {
@@ -152,6 +210,7 @@ pub fn resolve_direct_tools(
                 effective_prefix,
                 definition.include_tools(),
                 definition.exclude_tools(),
+                selector_candidate_index.as_ref(),
             ) {
                 continue;
             }
@@ -186,6 +245,7 @@ pub fn resolve_direct_tools(
                     effective_prefix,
                     definition.include_tools(),
                     definition.exclude_tools(),
+                    selector_candidate_index.as_ref(),
                 ) {
                     continue;
                 }

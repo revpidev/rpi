@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/types.ts matchesToolPattern/isToolAllowed/getToolNameCandidates + search-ranking.ts resolveSearchKeywords @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/types.ts matchesToolPattern/isToolAllowed/getToolNameCandidates + search-ranking.ts resolveSearchKeywords @ 10a45367, executed by gen-mcp-adapter-fixtures.mjs",
   "matches": [
     {
       "server": "github",
@@ -285,8 +285,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -299,8 +303,12 @@
       "expected": true,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -313,8 +321,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -327,8 +339,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -341,8 +357,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -355,8 +375,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -369,8 +393,12 @@
       "expected": true,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -383,8 +411,12 @@
       "expected": false,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -397,8 +429,12 @@
       "expected": true,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     },
     {
@@ -411,8 +447,12 @@
       "expected": true,
       "candidates": [
         "advanced.query",
+        "mcp__demo-server_advanced_query",
+        "demo-server_advanced_query",
         "mcp__demo_2d_server_advanced_query",
-        "demo_2d_server_advanced_query"
+        "demo_2d_server_advanced_query",
+        "mcp__demo_server_advanced_query",
+        "demo_server_advanced_query"
       ]
     }
   ],

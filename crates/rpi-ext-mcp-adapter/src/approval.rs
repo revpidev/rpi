@@ -16,7 +16,7 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
 use crate::metadata::{
-    get_tool_name_candidates_with, matches_tool_pattern_exact, resolve_tool_prefix, McpConfig,
+    get_tool_name_candidates_with, matches_tool_pattern, resolve_tool_prefix, McpConfig,
     ToolMetadata,
 };
 use crate::session_approvals::{
@@ -263,13 +263,13 @@ pub fn is_tool_call_approval_required(
 
     let prefix = resolve_tool_prefix(definition, config.global_tool_prefix());
     let current = get_tool_name_candidates_with(original_tool_name, server_name, prefix, false);
-    if matches_tool_pattern_exact(&current, Some(&approval)) {
+    if matches_tool_pattern(&current, Some(&approval)) {
         return true;
     }
 
     // Upstream per-server no-metadata fallback: legacy candidates still gate.
     if server_approval.is_some() && context.is_none() {
-        return matches_tool_pattern_exact(
+        return matches_tool_pattern(
             &get_tool_name_candidates_with(original_tool_name, server_name, prefix, true),
             Some(&approval),
         );
@@ -293,8 +293,8 @@ pub fn is_tool_call_approval_required(
 
     patterns.iter().any(|pattern| {
         let single = Value::Array(vec![pattern.clone()]);
-        matches_tool_pattern_exact(&legacy, Some(&single))
-            && !matches_tool_pattern_exact(&context.other_current_candidates, Some(&single))
+        matches_tool_pattern(&legacy, Some(&single))
+            && !matches_tool_pattern(&context.other_current_candidates, Some(&single))
     })
 }
 

@@ -33,9 +33,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::cache::{
-    compute_server_hash, get_metadata_cache_path, is_server_cache_valid, load_metadata_cache,
-    reconstruct_prompt_metadata, reconstruct_tool_metadata, save_metadata_cache,
-    serialize_resources, serialize_tools, MetadataCache, PromptMetadata, ServerCacheEntry,
+    compute_server_hash, create_cached_tool_selector_candidate_index, get_metadata_cache_path,
+    is_server_cache_valid, load_metadata_cache, reconstruct_prompt_metadata,
+    reconstruct_tool_metadata, save_metadata_cache, serialize_resources, serialize_tools,
+    MetadataCache, PromptMetadata, ServerCacheEntry,
 };
 use crate::config::load_mcp_config;
 use crate::lifecycle::{
@@ -43,8 +44,8 @@ use crate::lifecycle::{
 };
 use crate::manager::{ConnectionStatus, McpServerManager, ServerConnection};
 use crate::metadata::{
-    build_tool_metadata, find_tool_by_name, format_schema, get_server_prefix, McpConfig,
-    McpResource, McpTool, ServerEntry, ToolMetadata,
+    build_tool_metadata, find_tool_by_name, format_schema, get_server_prefix, has_tool_filters,
+    McpConfig, McpResource, McpTool, ServerEntry, ToolMetadata, ToolSelectorCandidateIndex,
 };
 use crate::search::{
     paginate, rank_suggestions, rank_tool_matches, resolve_search_keywords, SearchState,
@@ -283,6 +284,9 @@ pub async fn initialize_mcp(
     };
 
     let prefix = config.global_tool_prefix();
+    // `cachedSelectorCandidateIndex` (init.ts:274-282 @ 10a45367): built
+    // once, lazily, for the first filtered server.
+    let mut cached_selector_candidate_index: Option<ToolSelectorCandidateIndex> = None;
     for (name, definition) in &enabled {
         let mode = LifecycleMode::of(definition);
         let idle_override = match definition.get("idleTimeout").and_then(Value::as_u64) {
@@ -302,7 +306,25 @@ pub async fn initialize_mcp(
                 is_server_cache_valid(entry, definition, crate::cache::CACHE_MAX_AGE_MS, now_ms())
             });
         if let Some(cached) = cached {
-            let metadata = reconstruct_tool_metadata(name, cached, prefix, definition);
+            if has_tool_filters(definition) && cached_selector_candidate_index.is_none() {
+                if let Some(cache_ref) = cache.as_ref() {
+                    cached_selector_candidate_index =
+                        Some(create_cached_tool_selector_candidate_index(
+                            &config.mcp_servers,
+                            cache_ref,
+                            prefix,
+                        ));
+                }
+            }
+            let metadata = reconstruct_tool_metadata(
+                name,
+                cached,
+                prefix,
+                definition,
+                Some(&config.mcp_servers),
+                cache.as_ref(),
+                cached_selector_candidate_index.as_ref(),
+            );
             state
                 .tool_metadata
                 .lock()
@@ -485,7 +507,21 @@ pub fn update_server_metadata(state: &McpRuntime, server_name: &str) {
     let prefix = state.config.global_tool_prefix();
     let tools = wire_tools(&connection.tools);
     let resources = wire_resources(&connection.resources);
-    let result = build_tool_metadata(&tools, &resources, definition, server_name, prefix);
+    let result = {
+        let known_metadata = state
+            .tool_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        build_tool_metadata(
+            &tools,
+            &resources,
+            definition,
+            server_name,
+            prefix,
+            Some(&state.config.mcp_servers),
+            Some(&known_metadata),
+        )
+    };
     state
         .tool_metadata
         .lock()
@@ -1504,6 +1540,121 @@ fn tool_requires_approval(state: &McpRuntime, server_name: &str, original_tool_n
     )
 }
 
+/// Result of a server-scoped tool lookup (`getServerScopedToolMatch` /
+/// `getSingleToolMatch`, proxy-modes.ts:91-113 @ 10a45367).
+enum ToolMatch<'a> {
+    Found(&'a ToolMetadata),
+    Ambiguous,
+}
+
+/// `getToolMatches` (proxy-modes.ts:66-71 @ 10a45367): exact prefixed-name
+/// match or the `-`→`_` normalized fallback.
+fn get_tool_matches<'a>(
+    metadata: &'a [ToolMetadata],
+    tool_name: &str,
+    exact: bool,
+) -> Vec<&'a ToolMetadata> {
+    if exact {
+        metadata
+            .iter()
+            .filter(|tool| tool.name == tool_name)
+            .collect()
+    } else {
+        let normalized = tool_name.replace('-', "_");
+        metadata
+            .iter()
+            .filter(|tool| tool.name.replace('-', "_") == normalized)
+            .collect()
+    }
+}
+
+/// `getServerScopedToolMatch` (proxy-modes.ts:99-113 @ 10a45367): the raw
+/// upstream tool name (`originalName`) resolves before normalized
+/// fallbacks; a tie at the winning precedence level is fail-closed.
+fn get_server_scoped_tool_match<'a>(
+    metadata: &'a [ToolMetadata],
+    tool_name: &str,
+) -> Option<ToolMatch<'a>> {
+    let normalized = tool_name.replace('-', "_");
+    let by_precedence: [Vec<&ToolMetadata>; 4] = [
+        metadata
+            .iter()
+            .filter(|tool| tool.name == tool_name)
+            .collect(),
+        metadata
+            .iter()
+            .filter(|tool| tool.original_name == tool_name)
+            .collect(),
+        metadata
+            .iter()
+            .filter(|tool| tool.name.replace('-', "_") == normalized)
+            .collect(),
+        metadata
+            .iter()
+            .filter(|tool| tool.original_name.replace('-', "_") == normalized)
+            .collect(),
+    ];
+    for matches in by_precedence {
+        match matches.len() {
+            0 => {}
+            1 => return Some(ToolMatch::Found(matches[0])),
+            _ => return Some(ToolMatch::Ambiguous),
+        }
+    }
+    None
+}
+
+/// `getSingleToolMatch` (proxy-modes.ts:91-95 @ 10a45367): exact prefixed
+/// name first, then the normalized fallback; a tie is fail-closed.
+fn get_single_tool_match<'a>(
+    metadata: &'a [ToolMetadata],
+    tool_name: &str,
+) -> Option<ToolMatch<'a>> {
+    let exact = get_tool_matches(metadata, tool_name, true);
+    let matches = if exact.is_empty() {
+        get_tool_matches(metadata, tool_name, false)
+    } else {
+        exact
+    };
+    match matches.len() {
+        0 => None,
+        1 => Some(ToolMatch::Found(matches[0])),
+        _ => Some(ToolMatch::Ambiguous),
+    }
+}
+
+/// `getEnabledToolMatches` (proxy-modes.ts:73-81 @ 10a45367): disabled
+/// servers never participate in the cross-server ambiguity scan.
+fn get_enabled_tool_matches<'a>(
+    state: &McpRuntime,
+    metadata: &'a IndexMap<String, Vec<ToolMetadata>>,
+    tool_name: &str,
+    exact: bool,
+) -> Vec<(String, &'a ToolMetadata)> {
+    let mut matches = Vec::new();
+    for (server, tools) in metadata {
+        if state.config.is_server_disabled(server) {
+            continue;
+        }
+        for tool in get_tool_matches(tools, tool_name, exact) {
+            matches.push((server.clone(), tool));
+        }
+    }
+    matches
+}
+
+/// `ambiguousToolResult` (proxy-modes.ts:115-121 @ 10a45367).
+fn ambiguous_tool_result(mode: &str, tool_name: &str) -> Value {
+    let message = format!("Tool \"{tool_name}\" matches multiple servers. Specify a server.");
+    text_result(
+        message.clone(),
+        json!({
+            "mode": mode, "error": "ambiguous_tool",
+            "requestedTool": tool_name, "message": message,
+        }),
+    )
+}
+
 /// `executeDescribe` (proxy-modes.ts:406-456) with the P1 approval marker
 /// (proxy-modes.ts:567 @ 10a45367).
 pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
@@ -1511,31 +1662,54 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
         .tool_metadata
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut server_name: Option<String> = None;
-    let mut tool_meta: Option<ToolMetadata> = None;
+    // proxy-modes.ts:526-531 @ 10a45367 (#346): cross-server ambiguity is
+    // checked before any first-match selection; backoff servers are not
+    // matches for this surface (TE22).
+    let exact_matches: Vec<(String, &ToolMetadata)> =
+        get_enabled_tool_matches(state, &tool_metadata, tool_name, true)
+            .into_iter()
+            .filter(|(server, _)| !state.is_server_in_active_failure_backoff(server))
+            .collect();
+    if exact_matches.len() > 1 {
+        return ambiguous_tool_result("describe", tool_name);
+    }
+    if exact_matches.is_empty()
+        && get_enabled_tool_matches(state, &tool_metadata, tool_name, false)
+            .into_iter()
+            .filter(|(server, _)| !state.is_server_in_active_failure_backoff(server))
+            .count()
+            > 1
+    {
+        return ambiguous_tool_result("describe", tool_name);
+    }
+    let mut server_name: Option<String> = exact_matches.first().map(|(server, _)| server.clone());
+    let mut tool_meta: Option<ToolMetadata> =
+        exact_matches.first().map(|(_, tool)| (*tool).clone());
     let mut disabled_match: Option<String> = None;
     let mut failed_match: Option<String> = None;
-    for (server, metadata) in tool_metadata.iter() {
-        let Some(found) = find_tool_by_name(metadata, tool_name) else {
-            continue;
-        };
-        if state.config.is_server_disabled(server) {
-            if disabled_match.is_none() {
-                disabled_match = Some(server.clone());
+    if tool_meta.is_none() {
+        for (server, metadata) in tool_metadata.iter() {
+            let Some(found) = find_tool_by_name(metadata, tool_name) else {
+                continue;
+            };
+            if state.config.is_server_disabled(server) {
+                if disabled_match.is_none() {
+                    disabled_match = Some(server.clone());
+                }
+                continue;
             }
-            continue;
-        }
-        // proxy-modes.ts:527/547 @ 10a45367: a backoff server is not a match;
-        // remember it so the not-found path can report the backoff.
-        if state.is_server_in_active_failure_backoff(server) {
-            if failed_match.is_none() {
-                failed_match = Some(server.clone());
+            // proxy-modes.ts:527/547 @ 10a45367: a backoff server is not a match;
+            // remember it so the not-found path can report the backoff.
+            if state.is_server_in_active_failure_backoff(server) {
+                if failed_match.is_none() {
+                    failed_match = Some(server.clone());
+                }
+                continue;
             }
-            continue;
+            server_name = Some(server.clone());
+            tool_meta = Some(found.clone());
+            break;
         }
-        server_name = Some(server.clone());
-        tool_meta = Some(found.clone());
-        break;
     }
     drop(tool_metadata);
 
@@ -1966,24 +2140,49 @@ pub async fn execute_call(
                 }),
             );
         }
-        tool_meta = state
-            .tool_metadata
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(server)
-            .and_then(|m| find_tool_by_name(m, tool_name))
-            .cloned();
+        // proxy-modes.ts:961-965 @ 10a45367: server-scoped lookups resolve
+        // the raw upstream tool name before normalized fallbacks (#455).
+        let matched = {
+            let metadata = state
+                .tool_metadata
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            metadata
+                .get(server)
+                .and_then(|m| get_server_scoped_tool_match(m, tool_name))
+                .map(|matched| match matched {
+                    ToolMatch::Found(tool) => Ok(tool.clone()),
+                    ToolMatch::Ambiguous => Err(()),
+                })
+        };
+        match matched {
+            Some(Err(())) => return ambiguous_tool_result("call", tool_name),
+            Some(Ok(found)) => tool_meta = Some(found),
+            None => {}
+        }
         if state.config.is_server_disabled(server) {
             return disabled_call_result(server, tool_meta.as_ref());
         }
     } else {
-        let mut disabled_match: Option<(String, ToolMetadata)> = None;
         let metadata = state
             .tool_metadata
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // proxy-modes.ts:968-974 @ 10a45367 (#346): cross-server ambiguity is
+        // fail-closed before first-match selection.
+        let exact_matches = get_enabled_tool_matches(state, &metadata, tool_name, true);
+        if exact_matches.len() > 1 {
+            return ambiguous_tool_result("call", tool_name);
+        }
+        if exact_matches.is_empty()
+            && get_enabled_tool_matches(state, &metadata, tool_name, false).len() > 1
+        {
+            return ambiguous_tool_result("call", tool_name);
+        }
+        let mut disabled_match: Option<(String, ToolMetadata)> = None;
+        // Pass 1 — exact prefixed name (proxy-modes.ts:981-995 @ 10a45367).
         for (server, tools) in metadata.iter() {
-            let Some(found) = find_tool_by_name(tools, tool_name) else {
+            let Some(found) = tools.iter().find(|tool| tool.name == tool_name) else {
                 continue;
             };
             if state.config.is_server_disabled(server) {
@@ -1995,6 +2194,23 @@ pub async fn execute_call(
             server_name = Some(server.clone());
             tool_meta = Some(found.clone());
             break;
+        }
+        // Pass 2 — normalized fallback (proxy-modes.ts:996-1010 @ 10a45367).
+        if tool_meta.is_none() && disabled_match.is_none() {
+            for (server, tools) in metadata.iter() {
+                let Some(found) = find_tool_by_name(tools, tool_name) else {
+                    continue;
+                };
+                if state.config.is_server_disabled(server) {
+                    if disabled_match.is_none() {
+                        disabled_match = Some((server.clone(), found.clone()));
+                    }
+                    continue;
+                }
+                server_name = Some(server.clone());
+                tool_meta = Some(found.clone());
+                break;
+            }
         }
         drop(metadata);
         if tool_meta.is_none() {
@@ -2008,13 +2224,30 @@ pub async fn execute_call(
     if server_name.is_some() && tool_meta.is_none() {
         let server = server_name.clone().unwrap_or_default();
         if lazy_connect(state, &server).await {
-            tool_meta = state
-                .tool_metadata
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&server)
-                .and_then(|m| find_tool_by_name(m, tool_name))
-                .cloned();
+            let matched = {
+                let metadata = state
+                    .tool_metadata
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let matched = if server_override.is_some() {
+                    metadata
+                        .get(&server)
+                        .and_then(|m| get_server_scoped_tool_match(m, tool_name))
+                } else {
+                    metadata
+                        .get(&server)
+                        .and_then(|m| get_single_tool_match(m, tool_name))
+                };
+                matched.map(|matched| match matched {
+                    ToolMatch::Found(tool) => Ok(tool.clone()),
+                    ToolMatch::Ambiguous => Err(()),
+                })
+            };
+            match matched {
+                Some(Err(())) => return ambiguous_tool_result("call", tool_name),
+                Some(Ok(found)) => tool_meta = Some(found),
+                None => {}
+            }
         } else {
             // TE-D09 (proxy-modes.ts:832-869): needs-auth → one auto-auth
             // attempt → lazy_connect again; tool_not_found_after_reconnect
@@ -2038,13 +2271,30 @@ pub async fn execute_call(
                     }
                     Ok(true) => {
                         if lazy_connect(state, &server).await {
-                            tool_meta = state
-                                .tool_metadata
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&server)
-                                .and_then(|m| find_tool_by_name(m, tool_name))
-                                .cloned();
+                            let matched = {
+                                let metadata = state
+                                    .tool_metadata
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let matched = if server_override.is_some() {
+                                    metadata
+                                        .get(&server)
+                                        .and_then(|m| get_server_scoped_tool_match(m, tool_name))
+                                } else {
+                                    metadata
+                                        .get(&server)
+                                        .and_then(|m| get_single_tool_match(m, tool_name))
+                                };
+                                matched.map(|matched| match matched {
+                                    ToolMatch::Found(tool) => Ok(tool.clone()),
+                                    ToolMatch::Ambiguous => Err(()),
+                                })
+                            };
+                            match matched {
+                                Some(Err(())) => return ambiguous_tool_result("call", tool_name),
+                                Some(Ok(found)) => tool_meta = Some(found),
+                                None => {}
+                            }
                             if tool_meta.is_none() {
                                 let (config, snapshot, unavailable) = search_state_snapshot(state);
                                 let search_state = SearchState {
@@ -2122,6 +2372,10 @@ pub async fn execute_call(
             .collect();
         candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));
 
+        // proxy-modes.ts:1108-1130 @ 10a45367 (#346): collect exact matches
+        // first, then normalized fallbacks, and fail closed on ties.
+        let mut lazy_exact_matches: Vec<(String, ToolMetadata)> = Vec::new();
+        let mut lazy_fallback_matches: Vec<(String, ToolMetadata)> = Vec::new();
         for (configured_server, _) in candidates {
             let existing = state.manager.get_connection(&configured_server);
             let failed_ago = state.failures.failure_age_seconds(&configured_server);
@@ -2180,17 +2434,42 @@ pub async fn execute_call(
             if prefix_matched_server.is_none() {
                 prefix_matched_server = Some(configured_server.clone());
             }
-            tool_meta = state
-                .tool_metadata
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&configured_server)
-                .and_then(|m| find_tool_by_name(m, tool_name))
-                .cloned();
-            if tool_meta.is_some() {
-                server_name = Some(configured_server);
-                break;
+            {
+                let metadata = state
+                    .tool_metadata
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let Some(tools) = metadata.get(&configured_server) else {
+                    continue;
+                };
+                let exact = get_tool_matches(tools, tool_name, true);
+                if exact.len() > 1 {
+                    return ambiguous_tool_result("call", tool_name);
+                }
+                if exact.len() == 1 {
+                    lazy_exact_matches.push((configured_server, exact[0].clone()));
+                    continue;
+                }
+                let fallback = get_tool_matches(tools, tool_name, false);
+                if fallback.len() > 1 {
+                    return ambiguous_tool_result("call", tool_name);
+                }
+                if fallback.len() == 1 {
+                    lazy_fallback_matches.push((configured_server, fallback[0].clone()));
+                }
             }
+        }
+        let lazy_matches = if lazy_exact_matches.is_empty() {
+            lazy_fallback_matches
+        } else {
+            lazy_exact_matches
+        };
+        if lazy_matches.len() > 1 {
+            return ambiguous_tool_result("call", tool_name);
+        }
+        if let Some((matched_server, matched_tool)) = lazy_matches.into_iter().next() {
+            server_name = Some(matched_server);
+            tool_meta = Some(matched_tool);
         }
     }
 
@@ -3103,5 +3382,68 @@ mod tests {
             "demo",
         );
         assert_eq!(custom, "Reconnect demo from the host app.");
+    }
+
+    // #455 (proxy-modes.ts:99-113 @ 10a45367): server-scoped raw upstream
+    // name resolution and fail-closed ambiguity.
+    fn tool(name: &str, original: &str) -> ToolMetadata {
+        ToolMetadata {
+            name: name.to_string(),
+            original_name: original.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_scoped_match_resolves_raw_upstream_tool_name() {
+        let metadata = vec![tool("codegraph_codegraph_explore", "codegraph_explore")];
+        let Some(ToolMatch::Found(found)) =
+            get_server_scoped_tool_match(&metadata, "codegraph_explore")
+        else {
+            panic!("expected raw upstream name match");
+        };
+        assert_eq!(found.name, "codegraph_codegraph_explore");
+    }
+
+    #[test]
+    fn server_scoped_match_prefers_exact_prefixed_name() {
+        let metadata = vec![tool("demo_x", "foo"), tool("demo_y", "demo_x")];
+        let Some(ToolMatch::Found(found)) = get_server_scoped_tool_match(&metadata, "demo_x")
+        else {
+            panic!("expected exact prefixed match");
+        };
+        assert_eq!(found.name, "demo_x");
+    }
+
+    #[test]
+    fn server_scoped_match_fails_closed_on_normalized_original_name_collision() {
+        let metadata = vec![
+            tool("demo_first", "search--one"),
+            tool("demo_second", "search-_one"),
+        ];
+        assert!(matches!(
+            get_server_scoped_tool_match(&metadata, "search__one"),
+            Some(ToolMatch::Ambiguous)
+        ));
+    }
+
+    #[test]
+    fn server_scoped_match_falls_back_to_normalized_name() {
+        let metadata = vec![tool("demo_search_records", "search_records")];
+        let Some(ToolMatch::Found(found)) =
+            get_server_scoped_tool_match(&metadata, "demo-search-records")
+        else {
+            panic!("expected normalized fallback match");
+        };
+        assert_eq!(found.name, "demo_search_records");
+    }
+
+    #[test]
+    fn single_tool_match_fails_closed_on_exact_tie() {
+        let metadata = vec![tool("demo_search", "a"), tool("demo_search", "b")];
+        assert!(matches!(
+            get_single_tool_match(&metadata, "demo_search"),
+            Some(ToolMatch::Ambiguous)
+        ));
     }
 }

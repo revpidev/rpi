@@ -51,11 +51,16 @@ node scripts/mcp-parity/run-render-call-parity.mjs
 
 ## 3. 重录清单：命名类 golden（D-R6，承接 **TE23**，先重录后改实现）
 
+> **TE23 落地（2026-09-09）**：3.1/3.2 已按目标轨重录（`RPI_MCP_FIXTURE_UPSTREAM` /
+> `RPI_MCP_FIXTURE_PIN=10a45367` / `RPI_MCP_FIXTURE_ONLY=names,glob`）；`glob_cases.json`
+> 因候选集语义属 FR-B，同批重录（期望布尔值零变化、候选列表扩展）。
+> `golden_names.rs`/`golden_glob.rs` 未改断言形状，仅补齐新签名的 `other_current_candidates` 参数。
+
 | # | 对象 | 动作 | 依据 |
 |---|------|------|------|
-| 3.1 | `crates/rpi-ext-mcp-adapter/tests/fixtures/name_format_cases.json` | 按 v2.32.1 命名规则重录（BREAKING：server 前缀保留 `-`/`_`，`a-b` 不再编码为 `a_2d_b`） | R7.2.4、需求附录 A |
-| 3.2 | `crates/rpi-ext-mcp-adapter/tests/golden_names.rs` | 期望按 3.1 重录；「旧期望 → 新期望 + 上游 commit」逐条登记（G2） | R7.2.4.4 |
-| 3.3 | `changes/` 单列 | BREAKING 条目 + `toolPrefix:"none"` 兼容指引；不做新旧双注册 | G10 |
+| 3.1 | `crates/rpi-ext-mcp-adapter/tests/fixtures/name_format_cases.json` | **已完成**（TE23）：按 v2.32.1 命名规则重录（BREAKING：server 前缀保留 `-`/`_`，`a-b` 不再编码为 `a_2d_b`） | R7.2.4、需求附录 A |
+| 3.2 | `crates/rpi-ext-mcp-adapter/tests/golden_names.rs` | **已完成**（TE23）：期望由 3.1 驱动；「旧期望 → 新期望 + 上游 commit」在 TE23 §7 逐类登记（G2） | R7.2.4.4 |
+| 3.3 | `changes/` 单列 | **已完成**（TE23）：BREAKING 条目 + `toolPrefix:"none"` 兼容指引；不做新旧双注册 | G10 |
 
 ## 4. 重录清单：conformance 与 golden 向量（D-R7，承接 **TE24**）
 

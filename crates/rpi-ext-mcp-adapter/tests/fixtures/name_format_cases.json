@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/types.ts @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/types.ts @ 10a45367, executed by gen-mcp-adapter-fixtures.mjs",
   "formatToolName": [
     {
       "server": "searxng",
@@ -293,7 +293,7 @@
       "server": "my_server",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "my_5f_server_web_search"
+      "expected": "my_server_web_search"
     },
     {
       "server": "my_server",
@@ -305,19 +305,19 @@
       "server": "my_server",
       "tool": "web_search",
       "prefix": "short",
-      "expected": "my_5f_server_web_search"
+      "expected": "my_server_web_search"
     },
     {
       "server": "my_server",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_web_search"
+      "expected": "mcp__my_server_web_search"
     },
     {
       "server": "my_server",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "my_5f_server_list_sims"
+      "expected": "my_server_list_sims"
     },
     {
       "server": "my_server",
@@ -329,19 +329,19 @@
       "server": "my_server",
       "tool": "list.sims",
       "prefix": "short",
-      "expected": "my_5f_server_list_sims"
+      "expected": "my_server_list_sims"
     },
     {
       "server": "my_server",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_list_sims"
+      "expected": "mcp__my_server_list_sims"
     },
     {
       "server": "my_server",
       "tool": "simple",
       "prefix": "server",
-      "expected": "my_5f_server_simple"
+      "expected": "my_server_simple"
     },
     {
       "server": "my_server",
@@ -353,19 +353,19 @@
       "server": "my_server",
       "tool": "simple",
       "prefix": "short",
-      "expected": "my_5f_server_simple"
+      "expected": "my_server_simple"
     },
     {
       "server": "my_server",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_simple"
+      "expected": "mcp__my_server_simple"
     },
     {
       "server": "my_server",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "my_5f_server_with-dash"
+      "expected": "my_server_with-dash"
     },
     {
       "server": "my_server",
@@ -377,19 +377,19 @@
       "server": "my_server",
       "tool": "with-dash",
       "prefix": "short",
-      "expected": "my_5f_server_with-dash"
+      "expected": "my_server_with-dash"
     },
     {
       "server": "my_server",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_with-dash"
+      "expected": "mcp__my_server_with-dash"
     },
     {
       "server": "my_server",
       "tool": "with space",
       "prefix": "server",
-      "expected": "my_5f_server_with space"
+      "expected": "my_server_with space"
     },
     {
       "server": "my_server",
@@ -401,19 +401,19 @@
       "server": "my_server",
       "tool": "with space",
       "prefix": "short",
-      "expected": "my_5f_server_with space"
+      "expected": "my_server_with space"
     },
     {
       "server": "my_server",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_with space"
+      "expected": "mcp__my_server_with space"
     },
     {
       "server": "my_server",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "my_5f_server_日本語tool"
+      "expected": "my_server_日本語tool"
     },
     {
       "server": "my_server",
@@ -425,19 +425,19 @@
       "server": "my_server",
       "tool": "日本語tool",
       "prefix": "short",
-      "expected": "my_5f_server_日本語tool"
+      "expected": "my_server_日本語tool"
     },
     {
       "server": "my_server",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server_日本語tool"
+      "expected": "mcp__my_server_日本語tool"
     },
     {
       "server": "my-server",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "my_2d_server_web_search"
+      "expected": "my-server_web_search"
     },
     {
       "server": "my-server",
@@ -449,19 +449,19 @@
       "server": "my-server",
       "tool": "web_search",
       "prefix": "short",
-      "expected": "my_2d_server_web_search"
+      "expected": "my-server_web_search"
     },
     {
       "server": "my-server",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_web_search"
+      "expected": "mcp__my-server_web_search"
     },
     {
       "server": "my-server",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "my_2d_server_list_sims"
+      "expected": "my-server_list_sims"
     },
     {
       "server": "my-server",
@@ -473,19 +473,19 @@
       "server": "my-server",
       "tool": "list.sims",
       "prefix": "short",
-      "expected": "my_2d_server_list_sims"
+      "expected": "my-server_list_sims"
     },
     {
       "server": "my-server",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_list_sims"
+      "expected": "mcp__my-server_list_sims"
     },
     {
       "server": "my-server",
       "tool": "simple",
       "prefix": "server",
-      "expected": "my_2d_server_simple"
+      "expected": "my-server_simple"
     },
     {
       "server": "my-server",
@@ -497,19 +497,19 @@
       "server": "my-server",
       "tool": "simple",
       "prefix": "short",
-      "expected": "my_2d_server_simple"
+      "expected": "my-server_simple"
     },
     {
       "server": "my-server",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_simple"
+      "expected": "mcp__my-server_simple"
     },
     {
       "server": "my-server",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "my_2d_server_with-dash"
+      "expected": "my-server_with-dash"
     },
     {
       "server": "my-server",
@@ -521,19 +521,19 @@
       "server": "my-server",
       "tool": "with-dash",
       "prefix": "short",
-      "expected": "my_2d_server_with-dash"
+      "expected": "my-server_with-dash"
     },
     {
       "server": "my-server",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_with-dash"
+      "expected": "mcp__my-server_with-dash"
     },
     {
       "server": "my-server",
       "tool": "with space",
       "prefix": "server",
-      "expected": "my_2d_server_with space"
+      "expected": "my-server_with space"
     },
     {
       "server": "my-server",
@@ -545,19 +545,19 @@
       "server": "my-server",
       "tool": "with space",
       "prefix": "short",
-      "expected": "my_2d_server_with space"
+      "expected": "my-server_with space"
     },
     {
       "server": "my-server",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_with space"
+      "expected": "mcp__my-server_with space"
     },
     {
       "server": "my-server",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "my_2d_server_日本語tool"
+      "expected": "my-server_日本語tool"
     },
     {
       "server": "my-server",
@@ -569,19 +569,19 @@
       "server": "my-server",
       "tool": "日本語tool",
       "prefix": "short",
-      "expected": "my_2d_server_日本語tool"
+      "expected": "my-server_日本語tool"
     },
     {
       "server": "my-server",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server_日本語tool"
+      "expected": "mcp__my-server_日本語tool"
     },
     {
       "server": "filesystem-mcp",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_web_search"
+      "expected": "filesystem-mcp_web_search"
     },
     {
       "server": "filesystem-mcp",
@@ -599,13 +599,13 @@
       "server": "filesystem-mcp",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_web_search"
+      "expected": "mcp__filesystem-mcp_web_search"
     },
     {
       "server": "filesystem-mcp",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_list_sims"
+      "expected": "filesystem-mcp_list_sims"
     },
     {
       "server": "filesystem-mcp",
@@ -623,13 +623,13 @@
       "server": "filesystem-mcp",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_list_sims"
+      "expected": "mcp__filesystem-mcp_list_sims"
     },
     {
       "server": "filesystem-mcp",
       "tool": "simple",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_simple"
+      "expected": "filesystem-mcp_simple"
     },
     {
       "server": "filesystem-mcp",
@@ -647,13 +647,13 @@
       "server": "filesystem-mcp",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_simple"
+      "expected": "mcp__filesystem-mcp_simple"
     },
     {
       "server": "filesystem-mcp",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_with-dash"
+      "expected": "filesystem-mcp_with-dash"
     },
     {
       "server": "filesystem-mcp",
@@ -671,13 +671,13 @@
       "server": "filesystem-mcp",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_with-dash"
+      "expected": "mcp__filesystem-mcp_with-dash"
     },
     {
       "server": "filesystem-mcp",
       "tool": "with space",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_with space"
+      "expected": "filesystem-mcp_with space"
     },
     {
       "server": "filesystem-mcp",
@@ -695,13 +695,13 @@
       "server": "filesystem-mcp",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_with space"
+      "expected": "mcp__filesystem-mcp_with space"
     },
     {
       "server": "filesystem-mcp",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp_日本語tool"
+      "expected": "filesystem-mcp_日本語tool"
     },
     {
       "server": "filesystem-mcp",
@@ -719,13 +719,13 @@
       "server": "filesystem-mcp",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp_日本語tool"
+      "expected": "mcp__filesystem-mcp_日本語tool"
     },
     {
       "server": "-mcp",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "_2d_mcp_web_search"
+      "expected": "-mcp_web_search"
     },
     {
       "server": "-mcp",
@@ -743,13 +743,13 @@
       "server": "-mcp",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_web_search"
+      "expected": "mcp__-mcp_web_search"
     },
     {
       "server": "-mcp",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "_2d_mcp_list_sims"
+      "expected": "-mcp_list_sims"
     },
     {
       "server": "-mcp",
@@ -767,13 +767,13 @@
       "server": "-mcp",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_list_sims"
+      "expected": "mcp__-mcp_list_sims"
     },
     {
       "server": "-mcp",
       "tool": "simple",
       "prefix": "server",
-      "expected": "_2d_mcp_simple"
+      "expected": "-mcp_simple"
     },
     {
       "server": "-mcp",
@@ -791,13 +791,13 @@
       "server": "-mcp",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_simple"
+      "expected": "mcp__-mcp_simple"
     },
     {
       "server": "-mcp",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "_2d_mcp_with-dash"
+      "expected": "-mcp_with-dash"
     },
     {
       "server": "-mcp",
@@ -815,13 +815,13 @@
       "server": "-mcp",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_with-dash"
+      "expected": "mcp__-mcp_with-dash"
     },
     {
       "server": "-mcp",
       "tool": "with space",
       "prefix": "server",
-      "expected": "_2d_mcp_with space"
+      "expected": "-mcp_with space"
     },
     {
       "server": "-mcp",
@@ -839,13 +839,13 @@
       "server": "-mcp",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_with space"
+      "expected": "mcp__-mcp_with space"
     },
     {
       "server": "-mcp",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "_2d_mcp_日本語tool"
+      "expected": "-mcp_日本語tool"
     },
     {
       "server": "-mcp",
@@ -863,7 +863,7 @@
       "server": "-mcp",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp_日本語tool"
+      "expected": "mcp__-mcp_日本語tool"
     },
     {
       "server": "FooMCP",
@@ -1445,7 +1445,7 @@
       "server": "a-20-b",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_web_search"
+      "expected": "a-20-b_web_search"
     },
     {
       "server": "a-20-b",
@@ -1457,19 +1457,19 @@
       "server": "a-20-b",
       "tool": "web_search",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_web_search"
+      "expected": "a-20-b_web_search"
     },
     {
       "server": "a-20-b",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_web_search"
+      "expected": "mcp__a-20-b_web_search"
     },
     {
       "server": "a-20-b",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_list_sims"
+      "expected": "a-20-b_list_sims"
     },
     {
       "server": "a-20-b",
@@ -1481,19 +1481,19 @@
       "server": "a-20-b",
       "tool": "list.sims",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_list_sims"
+      "expected": "a-20-b_list_sims"
     },
     {
       "server": "a-20-b",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_list_sims"
+      "expected": "mcp__a-20-b_list_sims"
     },
     {
       "server": "a-20-b",
       "tool": "simple",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_simple"
+      "expected": "a-20-b_simple"
     },
     {
       "server": "a-20-b",
@@ -1505,19 +1505,19 @@
       "server": "a-20-b",
       "tool": "simple",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_simple"
+      "expected": "a-20-b_simple"
     },
     {
       "server": "a-20-b",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_simple"
+      "expected": "mcp__a-20-b_simple"
     },
     {
       "server": "a-20-b",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_with-dash"
+      "expected": "a-20-b_with-dash"
     },
     {
       "server": "a-20-b",
@@ -1529,19 +1529,19 @@
       "server": "a-20-b",
       "tool": "with-dash",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_with-dash"
+      "expected": "a-20-b_with-dash"
     },
     {
       "server": "a-20-b",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_with-dash"
+      "expected": "mcp__a-20-b_with-dash"
     },
     {
       "server": "a-20-b",
       "tool": "with space",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_with space"
+      "expected": "a-20-b_with space"
     },
     {
       "server": "a-20-b",
@@ -1553,19 +1553,19 @@
       "server": "a-20-b",
       "tool": "with space",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_with space"
+      "expected": "a-20-b_with space"
     },
     {
       "server": "a-20-b",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_with space"
+      "expected": "mcp__a-20-b_with space"
     },
     {
       "server": "a-20-b",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b_日本語tool"
+      "expected": "a-20-b_日本語tool"
     },
     {
       "server": "a-20-b",
@@ -1577,19 +1577,19 @@
       "server": "a-20-b",
       "tool": "日本語tool",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b_日本語tool"
+      "expected": "a-20-b_日本語tool"
     },
     {
       "server": "a-20-b",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b_日本語tool"
+      "expected": "mcp__a-20-b_日本語tool"
     },
     {
       "server": "with_underscore",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "with_5f_underscore_web_search"
+      "expected": "with_underscore_web_search"
     },
     {
       "server": "with_underscore",
@@ -1601,19 +1601,19 @@
       "server": "with_underscore",
       "tool": "web_search",
       "prefix": "short",
-      "expected": "with_5f_underscore_web_search"
+      "expected": "with_underscore_web_search"
     },
     {
       "server": "with_underscore",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_web_search"
+      "expected": "mcp__with_underscore_web_search"
     },
     {
       "server": "with_underscore",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "with_5f_underscore_list_sims"
+      "expected": "with_underscore_list_sims"
     },
     {
       "server": "with_underscore",
@@ -1625,19 +1625,19 @@
       "server": "with_underscore",
       "tool": "list.sims",
       "prefix": "short",
-      "expected": "with_5f_underscore_list_sims"
+      "expected": "with_underscore_list_sims"
     },
     {
       "server": "with_underscore",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_list_sims"
+      "expected": "mcp__with_underscore_list_sims"
     },
     {
       "server": "with_underscore",
       "tool": "simple",
       "prefix": "server",
-      "expected": "with_5f_underscore_simple"
+      "expected": "with_underscore_simple"
     },
     {
       "server": "with_underscore",
@@ -1649,19 +1649,19 @@
       "server": "with_underscore",
       "tool": "simple",
       "prefix": "short",
-      "expected": "with_5f_underscore_simple"
+      "expected": "with_underscore_simple"
     },
     {
       "server": "with_underscore",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_simple"
+      "expected": "mcp__with_underscore_simple"
     },
     {
       "server": "with_underscore",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "with_5f_underscore_with-dash"
+      "expected": "with_underscore_with-dash"
     },
     {
       "server": "with_underscore",
@@ -1673,19 +1673,19 @@
       "server": "with_underscore",
       "tool": "with-dash",
       "prefix": "short",
-      "expected": "with_5f_underscore_with-dash"
+      "expected": "with_underscore_with-dash"
     },
     {
       "server": "with_underscore",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_with-dash"
+      "expected": "mcp__with_underscore_with-dash"
     },
     {
       "server": "with_underscore",
       "tool": "with space",
       "prefix": "server",
-      "expected": "with_5f_underscore_with space"
+      "expected": "with_underscore_with space"
     },
     {
       "server": "with_underscore",
@@ -1697,19 +1697,19 @@
       "server": "with_underscore",
       "tool": "with space",
       "prefix": "short",
-      "expected": "with_5f_underscore_with space"
+      "expected": "with_underscore_with space"
     },
     {
       "server": "with_underscore",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_with space"
+      "expected": "mcp__with_underscore_with space"
     },
     {
       "server": "with_underscore",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "with_5f_underscore_日本語tool"
+      "expected": "with_underscore_日本語tool"
     },
     {
       "server": "with_underscore",
@@ -1721,19 +1721,19 @@
       "server": "with_underscore",
       "tool": "日本語tool",
       "prefix": "short",
-      "expected": "with_5f_underscore_日本語tool"
+      "expected": "with_underscore_日本語tool"
     },
     {
       "server": "with_underscore",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore_日本語tool"
+      "expected": "mcp__with_underscore_日本語tool"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "web_search",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_web_search"
+      "expected": "trailing-mcp-MCP_web_search"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1745,19 +1745,19 @@
       "server": "trailing-mcp-MCP",
       "tool": "web_search",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_web_search"
+      "expected": "trailing-mcp_web_search"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "web_search",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_web_search"
+      "expected": "mcp__trailing-mcp-MCP_web_search"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "list.sims",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_list_sims"
+      "expected": "trailing-mcp-MCP_list_sims"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1769,19 +1769,19 @@
       "server": "trailing-mcp-MCP",
       "tool": "list.sims",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_list_sims"
+      "expected": "trailing-mcp_list_sims"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "list.sims",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_list_sims"
+      "expected": "mcp__trailing-mcp-MCP_list_sims"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "simple",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_simple"
+      "expected": "trailing-mcp-MCP_simple"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1793,19 +1793,19 @@
       "server": "trailing-mcp-MCP",
       "tool": "simple",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_simple"
+      "expected": "trailing-mcp_simple"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "simple",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_simple"
+      "expected": "mcp__trailing-mcp-MCP_simple"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "with-dash",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_with-dash"
+      "expected": "trailing-mcp-MCP_with-dash"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1817,19 +1817,19 @@
       "server": "trailing-mcp-MCP",
       "tool": "with-dash",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_with-dash"
+      "expected": "trailing-mcp_with-dash"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "with-dash",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_with-dash"
+      "expected": "mcp__trailing-mcp-MCP_with-dash"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "with space",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_with space"
+      "expected": "trailing-mcp-MCP_with space"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1841,19 +1841,19 @@
       "server": "trailing-mcp-MCP",
       "tool": "with space",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_with space"
+      "expected": "trailing-mcp_with space"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "with space",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_with space"
+      "expected": "mcp__trailing-mcp-MCP_with space"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "日本語tool",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP_日本語tool"
+      "expected": "trailing-mcp-MCP_日本語tool"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -1865,13 +1865,13 @@
       "server": "trailing-mcp-MCP",
       "tool": "日本語tool",
       "prefix": "short",
-      "expected": "trailing_2d_mcp_日本語tool"
+      "expected": "trailing-mcp_日本語tool"
     },
     {
       "server": "trailing-mcp-MCP",
       "tool": "日本語tool",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP_日本語tool"
+      "expected": "mcp__trailing-mcp-MCP_日本語tool"
     }
   ],
   "getServerPrefix": [
@@ -1918,7 +1918,7 @@
     {
       "server": "my_server",
       "prefix": "server",
-      "expected": "my_5f_server"
+      "expected": "my_server"
     },
     {
       "server": "my_server",
@@ -1928,17 +1928,17 @@
     {
       "server": "my_server",
       "prefix": "short",
-      "expected": "my_5f_server"
+      "expected": "my_server"
     },
     {
       "server": "my_server",
       "prefix": "mcp",
-      "expected": "mcp__my_5f_server"
+      "expected": "mcp__my_server"
     },
     {
       "server": "my-server",
       "prefix": "server",
-      "expected": "my_2d_server"
+      "expected": "my-server"
     },
     {
       "server": "my-server",
@@ -1948,17 +1948,17 @@
     {
       "server": "my-server",
       "prefix": "short",
-      "expected": "my_2d_server"
+      "expected": "my-server"
     },
     {
       "server": "my-server",
       "prefix": "mcp",
-      "expected": "mcp__my_2d_server"
+      "expected": "mcp__my-server"
     },
     {
       "server": "filesystem-mcp",
       "prefix": "server",
-      "expected": "filesystem_2d_mcp"
+      "expected": "filesystem-mcp"
     },
     {
       "server": "filesystem-mcp",
@@ -1973,12 +1973,12 @@
     {
       "server": "filesystem-mcp",
       "prefix": "mcp",
-      "expected": "mcp__filesystem_2d_mcp"
+      "expected": "mcp__filesystem-mcp"
     },
     {
       "server": "-mcp",
       "prefix": "server",
-      "expected": "_2d_mcp"
+      "expected": "-mcp"
     },
     {
       "server": "-mcp",
@@ -1993,7 +1993,7 @@
     {
       "server": "-mcp",
       "prefix": "mcp",
-      "expected": "mcp___2d_mcp"
+      "expected": "mcp__-mcp"
     },
     {
       "server": "FooMCP",
@@ -2078,7 +2078,7 @@
     {
       "server": "a-20-b",
       "prefix": "server",
-      "expected": "a_2d_20_2d_b"
+      "expected": "a-20-b"
     },
     {
       "server": "a-20-b",
@@ -2088,17 +2088,17 @@
     {
       "server": "a-20-b",
       "prefix": "short",
-      "expected": "a_2d_20_2d_b"
+      "expected": "a-20-b"
     },
     {
       "server": "a-20-b",
       "prefix": "mcp",
-      "expected": "mcp__a_2d_20_2d_b"
+      "expected": "mcp__a-20-b"
     },
     {
       "server": "with_underscore",
       "prefix": "server",
-      "expected": "with_5f_underscore"
+      "expected": "with_underscore"
     },
     {
       "server": "with_underscore",
@@ -2108,17 +2108,17 @@
     {
       "server": "with_underscore",
       "prefix": "short",
-      "expected": "with_5f_underscore"
+      "expected": "with_underscore"
     },
     {
       "server": "with_underscore",
       "prefix": "mcp",
-      "expected": "mcp__with_5f_underscore"
+      "expected": "mcp__with_underscore"
     },
     {
       "server": "trailing-mcp-MCP",
       "prefix": "server",
-      "expected": "trailing_2d_mcp_2d_MCP"
+      "expected": "trailing-mcp-MCP"
     },
     {
       "server": "trailing-mcp-MCP",
@@ -2128,12 +2128,12 @@
     {
       "server": "trailing-mcp-MCP",
       "prefix": "short",
-      "expected": "trailing_2d_mcp"
+      "expected": "trailing-mcp"
     },
     {
       "server": "trailing-mcp-MCP",
       "prefix": "mcp",
-      "expected": "mcp__trailing_2d_mcp_2d_MCP"
+      "expected": "mcp__trailing-mcp-MCP"
     }
   ],
   "getToolNameCandidates": [
@@ -2325,7 +2325,7 @@
         "my_server"
       ],
       "prefix": "server",
-      "expected": "my_server"
+      "expected": null
     },
     {
       "tool": "github_create_issue",
@@ -2343,7 +2343,7 @@
         "searxng-extra"
       ],
       "prefix": "server",
-      "expected": "searxng-extra"
+      "expected": "searxng"
     },
     {
       "tool": "filesystem_read_file",
@@ -2376,7 +2376,7 @@
         "my-server"
       ],
       "prefix": "mcp",
-      "expected": "my-server"
+      "expected": null
     },
     {
       "tool": "searxng_web_search",
@@ -2450,7 +2450,7 @@
         "a-20-b"
       ],
       "prefix": "server",
-      "expected": "a-20-b"
+      "expected": null
     },
     {
       "tool": "mcp__my_2d_server_run",
@@ -2459,7 +2459,7 @@
         "my_server"
       ],
       "prefix": "mcp",
-      "expected": "my-server"
+      "expected": null
     },
     {
       "tool": "mcp__my_5f_server_run",
@@ -2468,7 +2468,7 @@
         "my_server"
       ],
       "prefix": "mcp",
-      "expected": "my_server"
+      "expected": null
     }
   ],
   "sanitizePromptName": [
@@ -2512,7 +2512,7 @@
       "prompt": "plan",
       "server": "my_server",
       "prefix": "server",
-      "expected": "mcp__my_5f_server__plan"
+      "expected": "mcp__my_server__plan"
     },
     {
       "prompt": "Do Thing!",
@@ -2577,7 +2577,7 @@
       "include": [
         "search-records"
       ],
-      "expected": true
+      "expected": false
     },
     {
       "tool": "list.sims",
