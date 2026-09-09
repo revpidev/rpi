@@ -117,7 +117,7 @@ impl McpRuntime {
     }
 
     /// The failure set consumed by the direct-tool resolver and the pure
-    /// ranking layer (`activeFailureServers`, index.ts:251-255 @ `26527c5`).
+    /// ranking layer (`activeFailureServers`, index.ts:288-292 @ 10a45367).
     pub fn active_failure_servers(&self) -> HashSet<String> {
         self.config
             .mcp_servers
@@ -371,7 +371,7 @@ pub async fn initialize_mcp(
                 }
                 update_server_metadata(&state, &name);
                 update_metadata_cache(&state, &name);
-                // init.ts:417-421 @ `26527c5`: clearFailure with a reason
+                // init.ts:417-421 @ 10a45367: clearFailure with a reason
                 // fires the metadata hook only when a window was active;
                 // otherwise the plain notify keeps the surface fresh.
                 if !state
@@ -410,7 +410,7 @@ pub async fn initialize_mcp(
             .record(name, message, failure_cancel.clone());
     }));
 
-    // init.ts:80-87 @ `26527c5`: failure-window start/expiry repaints the
+    // init.ts:83/90 @ 10a45367: failure-window start/expiry repaints the
     // tool surface and the status bar through the same metadata hook.
     let failure_change_state = state.clone();
     state
@@ -921,7 +921,7 @@ fn disabled_result(mode: &str, server_name: &str) -> Value {
     )
 }
 
-/// `serverBackoffResult` (proxy-modes.ts:82-90 @ `26527c5`): the server is
+/// `serverBackoffResult` (proxy-modes.ts:82-90 @ 10a45367, #434): the server is
 /// inside its failure window — the tool surface must not advertise it.
 fn server_backoff_result(state: &McpRuntime, mode: &str, server_name: &str) -> Value {
     let failed_ago = state.failures.failure_age_seconds(server_name).unwrap_or(0);
@@ -1127,7 +1127,7 @@ pub fn execute_status(state: &McpRuntime) -> Value {
         } else if !disabled && metadata.is_some() {
             status = "cached";
         }
-        // proxy-modes.ts:306 @ `26527c5`: a failed server reports 0 tools so
+        // proxy-modes.ts:362 @ 10a45367: a failed server reports 0 tools so
         // the status text and details never advertise its cached catalog.
         let tool_count = if status == "failed" {
             0
@@ -1222,7 +1222,7 @@ pub fn execute_search(
         if state.config.is_server_disabled(server) {
             return disabled_result("search", server);
         }
-        // proxy-modes.ts:603 @ `26527c5`: a server-scoped search against a
+        // proxy-modes.ts:603 @ 10a45367: a server-scoped search against a
         // server in backoff reports the backoff instead of cached tools.
         if state.is_server_in_active_failure_backoff(server) {
             return server_backoff_result(state, "search", server);
@@ -1280,7 +1280,7 @@ pub fn execute_search(
             if definition.is_some_and(ServerEntry::is_disabled) {
                 continue;
             }
-            // proxy-modes.ts:645 @ `26527c5`: regex search skips backoff.
+            // proxy-modes.ts:645 @ 10a45367: regex search skips backoff.
             if unavailable.contains(server_name) {
                 continue;
             }
@@ -1525,7 +1525,7 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
             }
             continue;
         }
-        // proxy-modes.ts:546 @ `26527c5`: a backoff server is not a match;
+        // proxy-modes.ts:527/547 @ 10a45367: a backoff server is not a match;
         // remember it so the not-found path can report the backoff.
         if state.is_server_in_active_failure_backoff(server) {
             if failed_match.is_none() {
@@ -1639,7 +1639,7 @@ pub fn execute_list(state: &McpRuntime, server: &str) -> Value {
         .map(|m| m.iter().map(|t| t.name.clone()).collect())
         .unwrap_or_default();
     let connection = state.manager.get_connection(server);
-    // proxy-modes.ts:664 @ `26527c5`: backoff short-circuits the per-server
+    // proxy-modes.ts:747 @ 10a45367: backoff short-circuits the per-server
     // list with the upstream `server_backoff` details shape.
     if state.is_server_in_active_failure_backoff(server) {
         let mut result = server_backoff_result(state, "list", server);
@@ -1704,7 +1704,7 @@ pub fn execute_list(state: &McpRuntime, server: &str) -> Value {
     // "not connected" alone reads as an outage while the tools listed below
     // are real and the connection is simply lazy. Distinguish auth from plain
     // laziness so the caller knows which remedy applies (#474,
-    // proxy-modes.ts:688-696 @ `26527c5`).
+    // proxy-modes.ts:781-791 @ 10a45367, #474 = 824b137).
     let cached_note = if connection
         .as_ref()
         .is_some_and(|c| c.status() == ConnectionStatus::Connected)
@@ -1762,7 +1762,7 @@ pub fn execute_instructions(state: &McpRuntime, server: &str) -> Value {
     if state.config.is_server_disabled(server) {
         return disabled_result("instructions", server);
     }
-    // proxy-modes.ts:825 @ `26527c5`: instructions for a server in backoff
+    // proxy-modes.ts:825 @ 10a45367: instructions for a server in backoff
     // report the backoff rather than cached text.
     if state.is_server_in_active_failure_backoff(server) {
         return server_backoff_result(state, "instructions", server);

@@ -298,7 +298,7 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
     Ok(hex)
 }
 
-/// `isServerCacheValid` (metadata-cache.ts:114-136 @ `34de8e3`, #446): hash
+/// `isServerCacheValid` (metadata-cache.ts:114-136 @ 10a45367, #446): hash
 /// match + freshness. A declared `ttlMs` caps the effective max age
 /// (`min(maxAge, ttlMs)`), `ttlMs == 0` always expires, and `maxAgeMs == 0`
 /// still means "no age limit" (an old entry without `ttlMs` keeps the

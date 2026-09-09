@@ -213,7 +213,7 @@ pub fn resolve_direct_tools(
         }
     }
 
-    // direct-tools.ts:282-293 @ `26527c5` (#434): the emitted set drops
+    // direct-tools.ts:284-292 @ 10a45367 (#434): the emitted set drops
     // servers in active failure backoff; the advisory threshold counts the
     // emitted set.
     let emitted: Vec<DirectToolSpec> = if unavailable_servers.is_empty() {
@@ -455,7 +455,7 @@ pub fn should_register_proxy_tool(
     !disable_proxy || direct_specs.is_empty() || !missing_direct_servers.is_empty()
 }
 
-/// `buildProxyDescription` (direct-tools.ts:302-330 @ `5f07874`, #432):
+/// `buildProxyDescription` (direct-tools.ts:302-330 @ 10a45367, #432):
 /// pure function of config. Live counts/instructions/connection state are
 /// deliberately absent so re-registering the proxy tool never rewrites the
 /// cached prompt prefix; `mcp({ })` carries the runtime counts.

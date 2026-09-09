@@ -59,7 +59,7 @@ pub struct ServerConnection {
     pub status: Mutex<ConnectionStatus>,
     pub credentials_invalidated: AtomicBool,
     /// Cache hints from the server's `tools/list` (server-manager.ts:138 @
-    /// `34de8e3`, #446); written into the metadata cache entry.
+    /// 10a45367, #446); written into the metadata cache entry.
     pub tool_list_hints: Option<crate::protocol::ToolListHints>,
 }
 

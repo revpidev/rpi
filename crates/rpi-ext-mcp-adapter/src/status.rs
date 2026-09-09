@@ -40,7 +40,7 @@ pub struct ServerStatusSnapshot {
     pub status: ServerRuntimeStatus,
     pub tool_count: u64,
     /// Per-server direct-tool count from the last active sync
-    /// (types.ts:41 @ `e32bb08`, #484); `0` when disabled.
+    /// (types.ts:41 @ e32bb08, #484); `0` when disabled.
     pub direct_tool_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_count: Option<u64>,
@@ -270,7 +270,7 @@ pub fn create_mcp_status_snapshot(
         // `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23):
         // connected/needs-auth connections are never "failed"; everything
         // else inside the 60s window hides its cached catalog (mcp-status.ts
-        // :20-38 @ `26527c5`, R7.2.3.1/#434).
+        // :24-38 @ 10a45367, R7.2.3.1/#434).
         let active_failure = !disabled && !connected && !needs_auth && failed_ago.is_some();
 
         let tool_count = if disabled || active_failure {

@@ -300,13 +300,21 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
     let specs = direct_specs(&runtime, &cache_path);
     assert!(specs.is_empty(), "specs: {specs:?}");
 
-    // 快照：failed + toolCount 0 + directToolCount 0（#484）。direct 计数
-    // 来自最近一次实际 sync（退避后为空），不是快照自行推导的。
+    // 快照：failed + toolCount 0 + directToolCount 0（#484）。direct 计数由
+    // 调用方喂入实际 sync 结果（上游 `state.directToolCounts`），这里用真实
+    // 解析结果构造，断言「快照读数 == 实际暴露数」。
+    let counts = |specs: &[DirectToolSpec]| -> Vec<(String, usize)> {
+        let mut map: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for spec in specs {
+            *map.entry(spec.server_name.clone()).or_insert(0) += 1;
+        }
+        map.into_iter().collect()
+    };
     let snapshot = status::create_mcp_status_snapshot(
         &runtime.config,
         &runtime.manager,
         &[("demo".to_string(), 1)],
-        &[],
+        &counts(&specs),
         &[],
         &[("demo".to_string(), now_ms() - 1_000)],
     );
@@ -336,6 +344,20 @@ async fn backoff_hides_failed_server_from_every_tool_surface() {
         .contains("lazy: tools from cache"));
     let restored_specs = direct_specs(&runtime, &cache_path);
     assert_eq!(restored_specs.len(), 1, "specs: {restored_specs:?}");
+    let restored_snapshot = status::create_mcp_status_snapshot(
+        &runtime.config,
+        &runtime.manager,
+        &[("demo".to_string(), 1)],
+        &counts(&restored_specs),
+        &[],
+        &[],
+    );
+    let restored_row = restored_snapshot
+        .servers
+        .iter()
+        .find(|s| s.name == "demo")
+        .expect("restored snapshot row");
+    assert_eq!(restored_row.direct_tool_count, 1);
     let restored_status = proxy::execute_status(&runtime);
     assert_eq!(
         restored_status["details"]["servers"][0]["status"],

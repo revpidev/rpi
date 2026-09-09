@@ -582,7 +582,7 @@ pub async fn authenticate_with_store(
                                 .as_ref()
                                 .and_then(|c| c.client_secret.clone())
                         });
-                        if let Ok(new_tokens) = refresh_token(
+                        match refresh_token(
                             &metadata.token_endpoint,
                             &refresh_client_id,
                             refresh,
@@ -590,14 +590,20 @@ pub async fn authenticate_with_store(
                         )
                         .await
                         {
-                            store.update_tokens(server_name, new_tokens, Some(server_url))?;
-                            return Ok(AuthStatus::Authenticated);
-                        } else {
-                            // #503: an `invalid_grant` refresh rejection means
-                            // the stored dynamic client is stale; drop the
+                            Ok(new_tokens) => {
+                                store.update_tokens(server_name, new_tokens, Some(server_url))?;
+                                return Ok(AuthStatus::Authenticated);
+                            }
+                            // #503: only an `invalid_grant` rejection means the
+                            // stored dynamic client is stale — drop the
                             // registration so the interactive leg below
                             // re-registers with the current callback URI.
-                            let _ = store.clear_client_info(server_name);
+                            // Transient failures (network/parse/other error
+                            // codes) keep the registration for a later retry.
+                            Err(AdapterError::OAuthInvalidGrant) => {
+                                let _ = store.clear_client_info(server_name);
+                            }
+                            Err(_) => {}
                         }
                     }
                     let _ = issuer;

@@ -576,7 +576,7 @@ impl OAuthCredentialStore {
         Ok(())
     }
 
-    /// `clearClientInfo` (mcp-auth.ts:846-851): drop the stored dynamic
+    /// `clearClientInfo` (mcp-auth.ts:983-989 @ 10a45367): drop the stored dynamic
     /// client registration while keeping tokens — a refresh-capable
     /// credential may still be usable, and the next interactive flow
     /// registers a fresh client (#503).

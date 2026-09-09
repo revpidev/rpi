@@ -38,7 +38,6 @@ pub mod status;
 pub mod tsshape;
 pub mod utils;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable::prefix_type::PrefixTypeTrait;
@@ -104,13 +103,10 @@ struct DirectSurface {
     env_override: Option<Vec<String>>,
     early_config: metadata::McpConfig,
     proxy_registered: bool,
-    /// Last description passed to `registerTool` (index.ts:1189
+    /// Last description passed to `registerTool` (index.ts:233/1189/1205
     /// `proxyToolDescription`): `syncProxyTool` re-registers when the pure
     /// description changes (R7.2.5.1/#432).
     proxy_description: Option<String>,
-    /// Per-server count of the last emitted direct-tool sync
-    /// (`state.directToolCounts`, index.ts:383-390 @ `e32bb08`, #484).
-    direct_tool_counts: HashMap<String, usize>,
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
@@ -184,7 +180,7 @@ fn sync_tool_surface(state: &PluginState) {
     } else {
         env_override
     };
-    // `activeFailureServers` (index.ts:251-255 @ `26527c5`): the resolver
+    // `activeFailureServers` (index.ts:288-292 @ 10a45367): the resolver
     // drops a server's direct tools while it is inside the failure window
     // (R7.2.3.1/#434).
     let unavailable: std::collections::HashSet<String> = state
@@ -222,16 +218,7 @@ fn sync_tool_surface(state: &PluginState) {
         registry.sync(&specs, &mut surface)
     };
 
-    // index.ts:383-390 @ `e32bb08` (#484): record the emitted per-server
-    // direct-tool counts alongside the sync.
-    let mut direct_tool_counts: HashMap<String, usize> = HashMap::new();
-    for spec in &specs {
-        *direct_tool_counts
-            .entry(spec.server_name.clone())
-            .or_insert(0) += 1;
-    }
-
-    // syncProxyTool (index.ts:1191-1219): register on first use and
+    // syncProxyTool (index.ts:1192-1219 @ 10a45367): register on first use and
     // re-register when the pure config description changes.
     let should_register = direct::should_register_proxy_tool(&config, &specs, &missing);
     let (mut proxy_registered, mut proxy_description) = {
@@ -286,7 +273,6 @@ fn sync_tool_surface(state: &PluginState) {
     surface.registry = registry;
     surface.proxy_registered = proxy_registered;
     surface.proxy_description = proxy_description;
-    surface.direct_tool_counts = direct_tool_counts;
 }
 
 fn now_ms() -> u64 {
@@ -439,7 +425,6 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 early_config,
                 proxy_registered: false,
                 proxy_description: None,
-                direct_tool_counts: HashMap::new(),
             };
         }
         // Config discovery from the new session's cwd (ctx.cwd through the
@@ -500,7 +485,6 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             early_config,
             proxy_registered: false,
             proxy_description: None,
-            direct_tool_counts: HashMap::new(),
         })),
         pending_leaf: Mutex::new(None),
     };
@@ -1319,7 +1303,7 @@ fn reconnect_server(
             crate::manager::ConnectionStatus::Connected => {
                 proxy::update_server_metadata(runtime, name);
                 proxy::update_metadata_cache(runtime, name);
-                // commands.ts:198-204 @ `26527c5`: a reconnect clears the
+                // commands.ts:198-204 @ 10a45367: a reconnect clears the
                 // failure window with a reason; the plain notify covers the
                 // no-active-window case.
                 if !runtime

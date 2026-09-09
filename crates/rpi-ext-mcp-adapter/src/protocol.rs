@@ -129,7 +129,7 @@ pub trait McpTransport: Send + Sync {
 }
 
 /// Cache hints from the server's first `tools/list` page
-/// (server-manager.ts:1348-1358 @ `34de8e3`, #446).
+/// (server-manager.ts:1348-1358 @ 10a45367, #446).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ToolListHints {
     pub ttl_ms: Option<u64>,
@@ -500,7 +500,7 @@ impl McpClient {
         Ok(result)
     }
 
-    /// `fetchAllTools` (server-manager.ts:1338-1367 @ `34de8e3`): the first
+    /// `fetchAllTools` (server-manager.ts:1338-1367 @ 10a45367): the first
     /// page's `ttlMs`/`cacheScope` are captured as cache hints (#446);
     /// invalid types are dropped (`ttlMs` must be a non-negative safe
     /// integer, `cacheScope` one of `public`/`private`).

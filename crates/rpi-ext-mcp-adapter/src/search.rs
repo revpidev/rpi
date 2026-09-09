@@ -45,7 +45,7 @@ pub struct SearchState<'a> {
     pub tool_metadata: &'a [(String, Vec<ToolMetadata>)],
     /// Servers in active failure backoff (failure-backoff.ts:18-23): their
     /// tools are skipped by ranking so a failed server is never advertised
-    /// (search-ranking.ts:246 @ `26527c5`, R7.2.3.1/#434).
+    /// (search-ranking.ts:246 @ 10a45367, R7.2.3.1/#434).
     pub unavailable_servers: &'a HashSet<String>,
 }
 

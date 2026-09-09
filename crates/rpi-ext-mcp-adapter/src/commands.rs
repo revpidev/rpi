@@ -285,7 +285,8 @@ pub fn format_status_text(
             .find(|(n, _)| n == name)
             .map(|(_, m)| m.len())
             .unwrap_or(0);
-        // showStatus (commands.ts:70-95 @ 3d953f90): a server inside its
+        // showStatus (commands.ts:46-59 @ 3d953f90, the v2.24.0 baseline the TE20
+        // port came from): a server inside its
         // failure window is reported as failed — never as a cached catalog
         // (R7.2.3.1/#434).
         let failed_ago = failures.failure_age_seconds(name);
@@ -350,7 +351,7 @@ pub fn format_tools_text(
     let all_tools: Vec<&str> = tool_metadata
         .iter()
         .filter(|(name, _)| !config.is_server_disabled(name))
-        // showTools (commands.ts:132-135 @ `26527c5`): servers in active
+        // showTools (commands.ts:158 @ 10a45367, #434): servers in active
         // failure backoff are not advertised.
         .filter(|(name, _)| !unavailable_servers.iter().any(|server| server == name))
         .flat_map(|(_, tools)| tools.iter().map(|t| t.name.as_str()))
@@ -529,7 +530,7 @@ mod tests {
         assert_eq!(text, "No MCP tools available");
     }
 
-    /// #434 / R7.2.3.1（`commands.ts:132-135 @ 26527c5`）：`/mcp tools`
+    /// #434 / R7.2.3.1（`commands.ts:158 @ 10a45367`）：`/mcp tools`
     /// 不宣传退避中的 server；`/mcp status` 标 failed 并带原因。
     #[test]
     fn command_surfaces_hide_backoff_servers() {

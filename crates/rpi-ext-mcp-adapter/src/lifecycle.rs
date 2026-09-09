@@ -323,14 +323,14 @@ impl LifecycleManager {
 
 /// Fired when a failure window opens or expires (upstream `recordFailure` /
 /// `clearFailure` / the expiry timer all call
-/// `notifyToolMetadataUpdated`; init.ts:55-89 @ `26527c5`). The hook carries
+/// `notifyToolMetadataUpdated`; init.ts:55/70/83/90 @ 10a45367). The hook carries
 /// the upstream reason strings verbatim (`failure-backoff-started` /
 /// `failure-backoff-expired`) so the caller can re-sync the tool surface.
 pub type FailureChangeHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 /// The failure tracker half of init.ts: `recordFailure` / `clearFailure` /
 /// `getFailureAgeSeconds` with the 60s self-expiry (init.ts:39-80, 556-567),
-/// plus `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23, #434).
+/// plus `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23 @ 10a45367, #434).
 pub struct FailureTracker {
     failed_at: Mutex<HashMap<String, u64>>,
     messages: Mutex<HashMap<String, String>>,
@@ -370,7 +370,7 @@ impl FailureTracker {
         }
     }
 
-    /// `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23): the
+    /// `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23 @ 10a45367): the
     /// server is neither connected nor needs-auth and a failure was recorded
     /// inside the 60s window. Consumers hide its tools (R7.2.3.1/#434).
     pub fn is_server_in_active_failure_backoff(
