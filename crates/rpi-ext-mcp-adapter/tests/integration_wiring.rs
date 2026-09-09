@@ -172,7 +172,12 @@ async fn build_runtime(dir: &Path, port: u16, auto_auth: bool) -> Arc<proxy::Mcp
         .expect("json"),
     )
     .expect("write config");
-    proxy::initialize_mcp(dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await
+    proxy::initialize_mcp(
+        dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await
 }
 
 /// 上游 "fails fast for non-ui browser auth when autoAuth is enabled" +
@@ -254,8 +259,12 @@ async fn proxy_modes_auto_auth_custom_auth_required_message() {
         .expect("json"),
     )
     .expect("write config");
-    let runtime =
-        proxy::initialize_mcp(&dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await;
+    let runtime = proxy::initialize_mcp(
+        &dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await;
 
     let result = proxy::execute_connect(&runtime, "demo").await;
     assert_eq!(
@@ -307,8 +316,12 @@ async fn proxy_modes_auto_auth_failed_message_wrapped() {
         .expect("json"),
     )
     .expect("write config");
-    let runtime =
-        proxy::initialize_mcp(&dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await;
+    let runtime = proxy::initialize_mcp(
+        &dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await;
 
     let result = proxy::execute_connect(&runtime, "demo").await;
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -1023,5 +1036,355 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
         Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
         None => std::env::remove_var("MCP_DIRECT_TOOLS"),
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TE21 / R7.2.2: approveTools 审批门接入（proxy + direct）
+// 上游对应：`__tests__/tool-approval.test.ts` @ 10a45367（#367 参数作用域）
+// ============================================================================
+
+use rpi_ext_mcp_adapter::approval::{ApprovalDecision, ApprovalHandler, ApprovalOrigin};
+use rpi_ext_mcp_adapter::metadata::ToolMetadata;
+
+/// 记录调用次数的三态 UI handler（模拟 `ui.select`）。
+struct StubApprovalUi {
+    decision: ApprovalDecision,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ApprovalHandler for StubApprovalUi {
+    fn decide(
+        &self,
+        _server: &str,
+        _tool: &ToolMetadata,
+        _args: &Value,
+        _origin: ApprovalOrigin,
+    ) -> ApprovalDecision {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.decision
+    }
+}
+
+/// stub MCP 服务器：initialize + tools/list（echo）+ tools/call 计数。
+async fn spawn_approval_stub(
+    stop: CancellationToken,
+) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = call_count.clone();
+    tokio::spawn(run_stub(
+        listener,
+        Arc::new(move |request: &StubRequest| {
+            let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            match method {
+                "initialize" => (
+                    200,
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                    rpc_result(&request.body, initialize_result("2025-03-26")),
+                ),
+                "tools/list" => (
+                    200,
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                    rpc_result(
+                        &request.body,
+                        json!({ "tools": [{
+                            "name": "echo",
+                            "description": "echo tool",
+                            "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } },
+                        }] }),
+                    ),
+                ),
+                "tools/call" => {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        200,
+                        vec![("content-type".to_string(), "application/json".to_string())],
+                        rpc_result(
+                            &request.body,
+                            json!({ "content": [{ "type": "text", "text": "ok" }] }),
+                        ),
+                    )
+                }
+                _ => (
+                    200,
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                    rpc_result(&request.body, json!({})),
+                ),
+            }
+        }),
+        stop,
+    ));
+    (port, call_count)
+}
+
+async fn build_approval_runtime(dir: &Path, port: u16) -> Arc<proxy::McpRuntime> {
+    std::fs::write(
+        dir.join(".mcp.json"),
+        serde_json::to_string_pretty(&json!({
+            "settings": { "approveTools": true },
+            "mcpServers": {
+                "demo": {
+                    "url": format!("http://127.0.0.1:{port}/mcp"),
+                    "lifecycle": "eager"
+                }
+            }
+        }))
+        .expect("json"),
+    )
+    .expect("write config");
+    // Explicit per-test cache path: the default derives from
+    // `RPI_CODING_AGENT_DIR`, which `freeze_direct_tools_metadata_hook_*`
+    // mutates for the whole process — concurrent tests must not share it.
+    proxy::initialize_mcp(
+        dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await
+}
+
+fn args(query: &str) -> Option<serde_json::Map<String, Value>> {
+    json!({ "query": query }).as_object().cloned()
+}
+
+/// A1/A2：同一工具不同参数分别确认，相同参数命中缓存（handler 只被调用两次）。
+#[tokio::test]
+async fn proxy_call_approval_scopes_by_argument_payload() {
+    let dir = temp_dir("approval-scope");
+    let stop = CancellationToken::new();
+    let (port, call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+
+    let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *runtime
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(StubApprovalUi {
+        decision: ApprovalDecision::AllowForSession,
+        calls: handler_calls.clone(),
+    }));
+
+    let first = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        args("a"),
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(
+        first["details"]["error"],
+        Value::Null,
+        "first call runs: {first}"
+    );
+    let cached = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        args("a"),
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(
+        cached["details"]["error"],
+        Value::Null,
+        "same args cached: {cached}"
+    );
+    assert_eq!(
+        handler_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "same payload must not re-prompt"
+    );
+
+    let other = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        args("b"),
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(
+        other["details"]["error"],
+        Value::Null,
+        "new args runs after approval"
+    );
+    assert_eq!(
+        handler_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "different payload must re-prompt"
+    );
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "all three calls reached the server"
+    );
+    assert_eq!(runtime.approval.len(), 2, "two argument-scoped grants");
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A10：headless（无 UI handler）匹配调用 fail-closed，且不触达服务器。
+#[tokio::test]
+async fn proxy_call_approval_headless_fails_closed_before_transport() {
+    let dir = temp_dir("approval-headless");
+    let stop = CancellationToken::new();
+    let (port, call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+
+    let result = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        args("a"),
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(result["details"]["mode"], json!("call"));
+    assert_eq!(result["details"]["error"], json!("approval_required"));
+    assert_eq!(result["details"]["server"], json!("demo"));
+    assert_eq!(result["details"]["tool"], json!("echo"));
+    let keys: Vec<&str> = result["details"]
+        .as_object()
+        .expect("details")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, vec!["mode", "error", "server", "tool"]);
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "fail-closed must not call the tool"
+    );
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 拒绝分支：details.error=approval_denied，同样不触达服务器。
+#[tokio::test]
+async fn proxy_call_approval_denied_returns_denial_details() {
+    let dir = temp_dir("approval-denied");
+    let stop = CancellationToken::new();
+    let (port, call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+    *runtime
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(StubApprovalUi {
+        decision: ApprovalDecision::Deny,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+
+    let result = proxy::execute_call(
+        &runtime,
+        "demo_echo",
+        args("a"),
+        None,
+        proxy::no_native_tools(),
+    )
+    .await;
+    assert_eq!(result["details"]["error"], json!("approval_denied"));
+    assert!(result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("declined approval"));
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// direct 工具同样过审批门（direct-tools.ts:423-445 @ 10a45367）。
+#[tokio::test]
+async fn direct_tool_approval_gate_applies() {
+    let dir = temp_dir("approval-direct");
+    let stop = CancellationToken::new();
+    let (port, call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+    let spec = rpi_ext_mcp_adapter::direct::DirectToolSpec {
+        server_name: "demo".to_string(),
+        original_name: "echo".to_string(),
+        prefixed_name: "demo_echo".to_string(),
+        description: "echo tool".to_string(),
+        input_schema: Some(
+            json!({ "type": "object", "properties": { "query": { "type": "string" } } }),
+        ),
+        resource_uri: None,
+    };
+
+    let denied =
+        rpi_ext_mcp_adapter::direct::execute_direct_tool(&runtime, &spec, &json!({ "query": "a" }))
+            .await;
+    assert_eq!(denied["details"]["error"], json!("approval_required"));
+    assert_eq!(
+        call_count.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "headless direct call fails closed"
+    );
+
+    let handler_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    *runtime
+        .approval_ui
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(StubApprovalUi {
+        decision: ApprovalDecision::AllowForSession,
+        calls: handler_calls.clone(),
+    }));
+    let allowed =
+        rpi_ext_mcp_adapter::direct::execute_direct_tool(&runtime, &spec, &json!({ "query": "a" }))
+            .await;
+    assert_eq!(
+        allowed["content"][0]["text"],
+        json!("ok"),
+        "allowed: {allowed}"
+    );
+    assert_eq!(handler_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TE21 I-2（独立复核）：describe/search 对 `approveTools` 命中工具追加
+/// ` (requires approval)` 标记（proxy-modes.ts:567/696/712 @ 10a45367）。
+/// 未配置 `approveTools` 时无标记——既有 golden_search 4 用例与 mcp-parity
+/// 回归轨覆盖该分支。
+#[tokio::test]
+async fn describe_and_search_show_approval_marker() {
+    let dir = temp_dir("approval-marker");
+    let stop = CancellationToken::new();
+    let (port, _call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+
+    let describe = proxy::execute_describe(&runtime, "demo_echo");
+    let text = describe["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("demo_echo (requires approval)\n"),
+        "describe marker: {text}"
+    );
+
+    let search = proxy::execute_search(&runtime, "echo", false, None, Some(false), None, None);
+    let text = search["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("- demo_echo (requires approval)"),
+        "search marker: {text}"
+    );
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
     let _ = std::fs::remove_dir_all(&dir);
 }

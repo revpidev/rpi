@@ -178,11 +178,26 @@ pub struct ToolMetadata {
 }
 
 /// `sanitizeServerPrefix` (types.ts:645-649): every non-ASCII-alphanumeric
-/// code point becomes `_x{hex}_` (lowercase hex, no padding).
+/// code point becomes `_x{hex}_` (lowercase hex, no padding). Legacy naming
+/// mode; the v2.32.1 `preserveProviderValid=true` variant is
+/// [`sanitize_server_prefix_with`].
 fn sanitize_server_prefix(server_name: &str) -> String {
+    sanitize_server_prefix_with(server_name, false)
+}
+
+/// `sanitizeServerPrefix(serverName, preserveProviderValid)`
+/// (types.ts:733-739 @ 10a45367): `true` keeps the provider-valid `-`/`_`
+/// characters (the v2.32.1 naming rules consumed by the approval glob
+/// candidates), `false` is the legacy `_x{hex}_` encoder.
+fn sanitize_server_prefix_with(server_name: &str, preserve_provider_valid: bool) -> String {
     let mut out = String::with_capacity(server_name.len());
     for ch in server_name.chars() {
-        if ch.is_ascii_alphanumeric() {
+        let valid = if preserve_provider_valid {
+            ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'
+        } else {
+            ch.is_ascii_alphanumeric()
+        };
+        if valid {
             out.push(ch);
         } else {
             out.push_str(&format!("_{:x}_", ch as u32));
@@ -210,30 +225,80 @@ fn strip_short_suffix(name: &str) -> &str {
 
 /// `getServerPrefix` (types.ts:651-663).
 pub fn get_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
+    get_server_prefix_with(server_name, mode, false)
+}
+
+/// `getServerPrefix` with the v2.32.1 `preserveProviderValid` switch
+/// (types.ts:735-753 @ 10a45367).
+fn get_server_prefix_with(server_name: &str, mode: ToolPrefix, preserve: bool) -> String {
     match mode {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
-            let short = sanitize_server_prefix(strip_short_suffix(server_name));
+            let short = sanitize_server_prefix_with(strip_short_suffix(server_name), preserve);
             if short.is_empty() {
                 "mcp".to_string()
             } else {
                 short
             }
         }
-        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name)),
-        ToolPrefix::Server => sanitize_server_prefix(server_name),
+        ToolPrefix::Mcp => format!(
+            "mcp__{}",
+            sanitize_server_prefix_with(server_name, preserve)
+        ),
+        ToolPrefix::Server => sanitize_server_prefix_with(server_name, preserve),
     }
 }
 
 /// `formatToolName` (types.ts:668-676): dots in tool names become `_`, then
 /// the server prefix is prepended with a `_` separator.
 pub fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
-    let p = get_server_prefix(server_name, prefix);
+    format_tool_name_with(tool_name, server_name, prefix, false)
+}
+
+/// `formatToolName` with the v2.32.1 `preserveProviderValid` prefix mode
+/// (types.ts:755-762 @ 10a45367).
+fn format_tool_name_with(
+    tool_name: &str,
+    server_name: &str,
+    prefix: ToolPrefix,
+    preserve_provider_valid: bool,
+) -> String {
+    let p = get_server_prefix_with(server_name, prefix, preserve_provider_valid);
     let sanitized = tool_name.replace('.', "_");
     if p.is_empty() {
         sanitized
     } else {
         format!("{p}_{sanitized}")
+    }
+}
+
+/// `getLegacyServerPrefix` (types.ts:817-823 @ 10a45367): the legacy
+/// `_x{hex}_` server prefix per tool-prefix mode.
+fn get_legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
+    match mode {
+        ToolPrefix::None => String::new(),
+        ToolPrefix::Short => {
+            let short = sanitize_server_prefix_with(strip_short_suffix(server_name), false);
+            if short.is_empty() {
+                "mcp".to_string()
+            } else {
+                short
+            }
+        }
+        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix_with(server_name, false)),
+        ToolPrefix::Server => sanitize_server_prefix_with(server_name, false),
+    }
+}
+
+/// `formatLegacyToolName` (types.ts:825-829 @ 10a45367): legacy server
+/// prefix + `[.-]` → `_` in the tool name.
+fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
+    let server_prefix = get_legacy_server_prefix(server_name, prefix);
+    let sanitized = tool_name.replace(['.', '-'], "_");
+    if server_prefix.is_empty() {
+        sanitized
+    } else {
+        format!("{server_prefix}_{sanitized}")
     }
 }
 
@@ -349,6 +414,106 @@ pub fn get_tool_name_candidates(
     candidates
 }
 
+/// `getToolNameCandidates(toolName, serverName, prefix, includeLegacy)`
+/// (types.ts:843-868 @ 10a45367): insertion-ordered candidate set.
+///
+/// `include_legacy == false` returns the *current* candidates only — the
+/// v2.32.1 naming rules (`-`/`_` preserved in the server prefix).
+/// `include_legacy == true` adds the legacy `_x{hex}_`/normalized forms.
+/// TE21's approval glob consumes this split (R7.2.2.2); the include/exclude
+/// selectors keep [`get_tool_name_candidates`] until TE23 flips the emitted
+/// names.
+pub fn get_tool_name_candidates_with(
+    tool_name: &str,
+    server_name: &str,
+    prefix: ToolPrefix,
+    include_legacy: bool,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    let mut push = |value: String| {
+        if !candidates.contains(&value) {
+            candidates.push(value);
+        }
+    };
+    push(tool_name.to_string());
+    push(format_tool_name_with(tool_name, server_name, prefix, true));
+    push(format_tool_name_with(
+        tool_name,
+        server_name,
+        ToolPrefix::Server,
+        true,
+    ));
+    push(format_tool_name_with(
+        tool_name,
+        server_name,
+        ToolPrefix::Short,
+        true,
+    ));
+    push(format_tool_name_with(
+        tool_name,
+        server_name,
+        ToolPrefix::Mcp,
+        true,
+    ));
+    if include_legacy {
+        let legacy_tool_name = tool_name.replace('-', "_");
+        push(legacy_tool_name.clone());
+        push(format_tool_name_with(
+            &legacy_tool_name,
+            server_name,
+            prefix,
+            true,
+        ));
+        push(format_tool_name_with(
+            &legacy_tool_name,
+            server_name,
+            ToolPrefix::Server,
+            true,
+        ));
+        push(format_tool_name_with(
+            &legacy_tool_name,
+            server_name,
+            ToolPrefix::Short,
+            true,
+        ));
+        push(format_tool_name_with(
+            &legacy_tool_name,
+            server_name,
+            ToolPrefix::Mcp,
+            true,
+        ));
+        push(format_legacy_tool_name(tool_name, server_name, prefix));
+        push(format_legacy_tool_name(
+            tool_name,
+            server_name,
+            ToolPrefix::Server,
+        ));
+        push(format_legacy_tool_name(
+            tool_name,
+            server_name,
+            ToolPrefix::Short,
+        ));
+        push(format_legacy_tool_name(
+            tool_name,
+            server_name,
+            ToolPrefix::Mcp,
+        ));
+        push(format_tool_name_with(tool_name, server_name, prefix, true).replace('-', "_"));
+        push(
+            format_tool_name_with(tool_name, server_name, ToolPrefix::Server, true)
+                .replace('-', "_"),
+        );
+        push(
+            format_tool_name_with(tool_name, server_name, ToolPrefix::Short, true)
+                .replace('-', "_"),
+        );
+        push(
+            format_tool_name_with(tool_name, server_name, ToolPrefix::Mcp, true).replace('-', "_"),
+        );
+    }
+    candidates
+}
+
 /// Glob match for patterns whose only metacharacters are `*` (any run,
 /// including empty) and `?` (exactly one char). Equivalent to the anchored
 /// regex upstream builds in `globToRegExp` (types.ts:754-757); JS `.` does
@@ -400,6 +565,30 @@ pub fn matches_tool_pattern(candidates: &[String], patterns: Option<&Value>) -> 
         if normalized.contains(['*', '?'])
             && candidates.iter().any(|c| glob_matches(&normalized, c))
         {
+            return true;
+        }
+    }
+    false
+}
+
+/// `matchesToolPattern` (types.ts:896-910 @ 10a45367) without the legacy
+/// `-`→`_` pattern normalization of [`matches_tool_pattern`]: exact
+/// candidate/pattern matching as the approval glob consumes it.
+pub fn matches_tool_pattern_exact(candidates: &[String], patterns: Option<&Value>) -> bool {
+    let Some(Value::Array(patterns)) = patterns else {
+        return false;
+    };
+    if patterns.is_empty() {
+        return false;
+    }
+    for pattern in patterns {
+        let Some(pattern) = pattern.as_str() else {
+            continue;
+        };
+        if !pattern.contains(['*', '?']) && candidates.iter().any(|c| c == pattern) {
+            return true;
+        }
+        if pattern.contains(['*', '?']) && candidates.iter().any(|c| glob_matches(pattern, c)) {
             return true;
         }
     }

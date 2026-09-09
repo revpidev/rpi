@@ -3205,7 +3205,30 @@ impl AgentSession {
         let session_context = lock(&self.inner.session_manager).build_session_context();
         self.inner.agent.set_messages(session_context.messages);
 
-        self.runner().emit("session_tree").await;
+        // `session_tree` payload (agent-session.ts:3288-3295 @ 9841914): the
+        // post-navigation leaf, the pre-navigation leaf, and — only when a
+        // branch summary was written — the saved summary entry plus
+        // `fromExtension`. TE21 consumes `newLeafId` to rebuild the active
+        // branch for session-scoped approvals.
+        let (new_leaf_id, summary_entry) = {
+            let session = lock(&self.inner.session_manager);
+            let new_leaf_id = session.get_leaf_id().map(str::to_owned);
+            let summary_entry = summary_entry_id
+                .as_deref()
+                .and_then(|id| session.get_entry(id))
+                .map(|entry| entry.raw_value().clone());
+            (new_leaf_id, summary_entry)
+        };
+        let mut payload = serde_json::json!({
+            "type": "session_tree",
+            "newLeafId": new_leaf_id,
+            "oldLeafId": old_leaf_id,
+        });
+        if let Some(entry) = summary_entry {
+            payload["summaryEntry"] = entry;
+            payload["fromExtension"] = serde_json::Value::Bool(from_extension);
+        }
+        self.runner().emit_event("session_tree", payload).await;
 
         Ok(NavigateTreeResult {
             editor_text,

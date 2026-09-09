@@ -32,6 +32,7 @@ pub mod proxy;
 pub mod render;
 pub mod runtime;
 pub mod search;
+pub mod session_approvals;
 pub mod session_recovery;
 pub mod status;
 pub mod tsshape;
@@ -74,6 +75,10 @@ struct PluginState {
     runtime: runtime::PluginRuntime,
     dispatcher: Arc<ProxyDispatcher>,
     direct: Arc<Mutex<DirectSurface>>,
+    /// `session_tree` leaf awaiting the next runtime init: outer `None` = no
+    /// navigation recorded (restore from the file tip), `Some(None)` = the
+    /// event reported a null leaf (empty branch), `Some(Some(id))` = target.
+    pending_leaf: Mutex<Option<Option<String>>>,
 }
 
 impl PluginState {
@@ -360,7 +365,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             return json!({"error": err});
         }
     }
-    for event in ["session_start", "session_shutdown", "tool_result"] {
+    for event in [
+        "session_start",
+        "session_shutdown",
+        "session_tree",
+        "tool_result",
+    ] {
         if let Err(err) = register("on", json!({"event": event})) {
             return json!({"error": err});
         }
@@ -451,6 +461,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             early_config,
             proxy_registered: false,
         })),
+        pending_leaf: Mutex::new(None),
     };
 
     // Config discovery runs from the session cwd (`ctx.cwd` host call;
@@ -535,6 +546,35 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                             set_status(plugin, text);
                         }
                     }));
+                    // R7.2.2.3: bind the session-approval sink/dialog and
+                    // restore the active branch's grants (index.ts:214-227
+                    // `restoreCurrentSessionApprovals` + init.ts:181-243).
+                    runtime.approval.set_sink(Arc::new(HostSessionApprovalSink));
+                    let approval_ui: Option<Arc<dyn approval::ApprovalHandler>> =
+                        if ui_can_render_panel(plugin) {
+                            Some(Arc::new(TuiApprovalHandler))
+                        } else {
+                            None
+                        };
+                    *runtime
+                        .approval_ui
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = approval_ui;
+                    let pending_leaf = plugin
+                        .pending_leaf
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    match pending_leaf {
+                        // No navigation recorded → session-load semantics
+                        // (branch from the file tip).
+                        None => restore_session_approvals(plugin, &runtime, None),
+                        // Explicit null leaf → empty branch.
+                        Some(None) => runtime.approval.restore(&[]),
+                        Some(Some(leaf_id)) => {
+                            restore_session_approvals(plugin, &runtime, Some(&leaf_id))
+                        }
+                    }
                 }
             }
         })),
@@ -732,7 +772,11 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
         Some("event") => match message.get("event").and_then(Value::as_str) {
             Some("session_start") => {
                 // index.ts:376-414: stop the previous runtime, then
-                // re-initialize against the new session.
+                // re-initialize against the new session. A fresh session has
+                // no recorded tree navigation; restore from the file tip
+                // (`buildSessionPath` default) unless a `session_tree` event
+                // arrives before init completes.
+                *state.pending_leaf.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 state
                     .runtime
                     .block_on(state.dispatcher.clone().shutdown_owned());
@@ -761,6 +805,36 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                     "ui.setStatus",
                     json!({ "key": "mcp", "text": null }),
                 );
+                pack(&Value::Null)
+            }
+            Some("session_tree") => {
+                // R7.2.2.3: branch navigation → rebuild the approval set for
+                // the target branch (index.ts:728-745 @ 928c30c). The leaf id
+                // rides the `session_tree` payload (TE21 host parity fix);
+                // `newLeafId: null` means an empty branch. When the runtime is
+                // still initializing, the leaf is kept for the on_ready
+                // restore.
+                let payload = message.get("payload");
+                let explicit_null = payload
+                    .and_then(|payload| payload.get("newLeafId"))
+                    .is_some_and(Value::is_null);
+                let new_leaf = payload
+                    .and_then(|payload| payload.get("newLeafId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                *state.pending_leaf.lock().unwrap_or_else(|e| e.into_inner()) =
+                    match (new_leaf.clone(), explicit_null) {
+                        (Some(leaf_id), _) => Some(Some(leaf_id)),
+                        (None, true) => Some(None),
+                        (None, false) => None,
+                    };
+                if let Some(runtime) = state.dispatcher.try_runtime() {
+                    if explicit_null {
+                        runtime.approval.restore(&[]);
+                    } else {
+                        restore_session_approvals(state, &runtime, new_leaf.as_deref());
+                    }
+                }
                 pack(&Value::Null)
             }
             Some("tool_result") => {
@@ -802,6 +876,131 @@ fn current_config_path(state: &PluginState) -> Option<String> {
     .and_then(|v| v.as_str().map(str::to_string))
     .filter(|s| !s.is_empty())
 }
+
+// ============================================================================
+// Session approval persistence + TUI dialog (R7.2.2.3/.4, TE21)
+// ============================================================================
+
+/// `canRenderPanel`-equivalent gate for the approval dialog: a blocking
+/// `ui.select` only settles on a real TUI bridge (same rule as the `/mcp`
+/// panel, upstream #365 / `commands.ts`:38-47 @ `10a45367`).
+fn ui_can_render_panel(state: &PluginState) -> bool {
+    let channel = state.channel();
+    let calls = RpiHostCalls { call: channel.call };
+    let host = CommandHost {
+        calls: &calls,
+        cookie: channel.cookie,
+    };
+    host.can_render_panel()
+}
+
+/// Active-branch approval restore (index.ts:214-227
+/// `restoreCurrentSessionApprovals` @ 928c30c): read the authoritative
+/// `ctx.sessionFile` path and replay the `mcp-approval-v1` entries of the
+/// branch (04-design §6.1 transitional path — no branch-read ABI). Fail-soft:
+/// an in-memory/unreadable session clears the set (upstream catch → empty
+/// branch).
+fn restore_session_approvals(
+    state: &PluginState,
+    runtime: &proxy::McpRuntime,
+    leaf_id: Option<&str>,
+) {
+    let channel = state.channel();
+    let info = host_call_ok(
+        &channel.calls(),
+        channel.cookie,
+        "ctx.sessionFile",
+        json!({}),
+    );
+    let path = info
+        .as_ref()
+        .and_then(|info| info.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty());
+    let Some(path) = path else {
+        runtime.approval.restore(&[]);
+        return;
+    };
+    match session_approvals::read_session_approval_entries(std::path::Path::new(path), leaf_id) {
+        Ok(entries) => runtime.approval.restore(&entries),
+        Err(error) => {
+            tracing::debug!("MCP: could not read session approvals: {error}");
+            runtime.approval.restore(&[]);
+        }
+    }
+}
+
+/// Host `appendEntry` sink (session-approvals.ts:89 `createSessionApprovalWriter`
+/// @ 928c30c): fail-soft, never propagates into the approval decision.
+struct HostSessionApprovalSink;
+
+impl session_approvals::SessionApprovalSink for HostSessionApprovalSink {
+    fn append(&self, entry: &session_approvals::SessionApprovalEntry) {
+        let Some(state) = STATE.get() else {
+            return;
+        };
+        let channel = state.channel();
+        let reply = host_call(
+            &channel.calls(),
+            channel.cookie,
+            "appendEntry",
+            json!({
+                "customType": session_approvals::MCP_APPROVAL_CUSTOM_TYPE,
+                "data": session_approvals::entry_to_value(entry),
+            }),
+        );
+        if let Some(error) = reply.get("error") {
+            tracing::debug!("MCP: failed to persist session approval: {error}");
+        }
+    }
+}
+
+/// Built-in three-choice dialog (tool-approval.ts:150-165 @ 928c30c):
+/// sanitized server/tool title + bounded pretty-printed argument preview.
+struct TuiApprovalHandler;
+
+impl approval::ApprovalHandler for TuiApprovalHandler {
+    fn decide(
+        &self,
+        server_name: &str,
+        tool: &metadata::ToolMetadata,
+        args: &Value,
+        _origin: approval::ApprovalOrigin,
+    ) -> approval::ApprovalDecision {
+        let Some(state) = STATE.get() else {
+            return approval::ApprovalDecision::Deny;
+        };
+        let channel = state.channel();
+        let preview = approval::dialog_preview(args);
+        let title = format!(
+            "MCP: {} wants to run {}",
+            utils::sanitize_terminal_text(server_name),
+            utils::sanitize_terminal_text(&tool.original_name)
+        );
+        let options = vec![
+            "Allow once".to_string(),
+            "Allow for session".to_string(),
+            "Deny".to_string(),
+        ];
+        let selected = host_call_ok(
+            &channel.calls(),
+            channel.cookie,
+            "ui.select",
+            json!({"title": format!("{title}\n\nArguments:\n{preview}"), "options": options}),
+        );
+        match selected
+            .and_then(|value| value.as_str().map(str::to_string))
+            .as_deref()
+        {
+            Some("Allow once") => approval::ApprovalDecision::AllowOnce,
+            Some("Allow for session") => approval::ApprovalDecision::AllowForSession,
+            _ => approval::ApprovalDecision::Deny,
+        }
+    }
+}
+
+// `sanitizeTerminalText` / `stripOscSequences` live in `utils` (upstream
+// `utils.ts:206-238 @ 10a45367`).
 
 // ============================================================================
 // Slash commands (`/mcp`, `/mcp-auth`) — R7.2.1.1/.3/.4, [RPI-OWN]
