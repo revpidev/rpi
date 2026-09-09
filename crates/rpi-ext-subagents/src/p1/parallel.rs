@@ -302,6 +302,12 @@ pub type RunControlProbe = Arc<dyn Fn() -> RunControlFlags + Send + Sync>;
 
 /// Classify one settled child (upstream run-history.ts:141-152 precedence:
 /// stopped > interrupted > timedOut > unexplained signal > exit 0 > failed).
+///
+/// Approximation: upstream's `isUnexplainedProcessSignal` (process-signal.ts:
+/// 19-28) also treats `turnBudgetExceeded`/`forcedDrainAfterFinalSuccess` as
+/// *explained* (→ failed); the rpi subprocess result carries no such flags
+/// (budget enforcement lives in the child prompt/acceptance layer), so a
+/// non-zero signal exit classifies as stopped.
 pub fn classify_terminal(
     exit_code: i32,
     timed_out: bool,
@@ -330,6 +336,38 @@ pub fn classify_terminal(
 pub struct OutputClaim {
     pub owner: String,
     pub path: PathBuf,
+}
+
+/// Build one output claim from a task/step override plus the agent's
+/// frontmatter default.
+///
+/// Inherited **relative** defaults are excluded: upstream isolates them per
+/// task in a parallel namespace (`child-launch-plan.ts:129-146`), so they are
+/// not a launch-time collision. Inherited **absolute** defaults have no
+/// namespace and stay shared, so upstream's check sees them and so does this
+/// one (observation 2 of the TE16 independent review, 2026-09-09).
+pub fn output_claim(
+    owner: String,
+    output: &crate::p1::launch_child::OutputOverride,
+    agent_output: Option<&str>,
+) -> Option<OutputClaim> {
+    match output {
+        crate::p1::launch_child::OutputOverride::Path(path) => Some(OutputClaim {
+            owner,
+            path: path.clone(),
+        }),
+        crate::p1::launch_child::OutputOverride::Disabled => None,
+        crate::p1::launch_child::OutputOverride::Inherit => {
+            let raw = agent_output?;
+            if !Path::new(raw).is_absolute() {
+                return None;
+            }
+            Some(OutputClaim {
+                owner,
+                path: crate::paths::expand_tilde_and_resolve(raw),
+            })
+        }
+    }
 }
 
 /// `resolveSingleOutputClaimPath` (single-output.ts:175-185): realpath the
@@ -1015,6 +1053,63 @@ mod tests {
         validate_output_collisions(&no_collision).expect("distinct paths launch");
         assert!(find_output_collisions(&no_collision).is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn output_claim_inherited_defaults_follow_upstream() {
+        // Independent-review observation 2: inherited RELATIVE defaults are
+        // isolated upstream and excluded here; inherited ABSOLUTE defaults
+        // have no namespace and still participate.
+        use crate::p1::launch_child::OutputOverride;
+        let explicit = output_claim(
+            "tasks[0] (scout)".to_string(),
+            &OutputOverride::Path(PathBuf::from("/tmp/a.md")),
+            None,
+        )
+        .expect("explicit path");
+        assert_eq!(explicit.path, PathBuf::from("/tmp/a.md"));
+        assert!(output_claim("x".to_string(), &OutputOverride::Disabled, None).is_none());
+        assert!(
+            output_claim(
+                "tasks[1] (scout)".to_string(),
+                &OutputOverride::Inherit,
+                Some("context.md")
+            )
+            .is_none(),
+            "inherited relative defaults are isolated upstream"
+        );
+        let inherited_absolute = output_claim(
+            "tasks[2] (scout)".to_string(),
+            &OutputOverride::Inherit,
+            Some("/tmp/shared-report.md"),
+        )
+        .expect("inherited absolute default");
+        assert_eq!(
+            inherited_absolute.path,
+            PathBuf::from("/tmp/shared-report.md")
+        );
+        assert!(
+            output_claim(
+                "tasks[3] (scout)".to_string(),
+                &OutputOverride::Inherit,
+                None
+            )
+            .is_none(),
+            "no agent default → no claim"
+        );
+        let colliding = vec![
+            inherited_absolute,
+            output_claim(
+                "tasks[4] (worker)".to_string(),
+                &OutputOverride::Inherit,
+                Some("/tmp/shared-report.md"),
+            )
+            .expect("second inherited absolute default"),
+        ];
+        assert!(
+            validate_output_collisions(&colliding).is_err(),
+            "two inherited absolute defaults collide"
+        );
     }
 
     #[test]

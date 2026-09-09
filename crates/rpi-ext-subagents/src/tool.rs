@@ -564,47 +564,52 @@ fn build_worktree_plan(
     )))
 }
 
-/// Explicit output claims for a tasks batch (R7.1.6.3). Inherited agent
-/// defaults are excluded: upstream isolates colliding inherited workflow
-/// output defaults (child-launch-plan.ts:130-146) while rpi keeps its
-/// inherited-output semantics, so rejecting them would be a false positive
-/// (TE16 §7; upstream keeps explicit collision checks, #1253).
+/// Output claims for a tasks batch (R7.1.6.3). Explicit overrides and
+/// inherited **absolute** agent defaults participate; inherited **relative**
+/// defaults are isolated upstream (`child-launch-plan.ts:129-146`) and would
+/// be false positives here (TE16 §7.3-4, independent-review observation 2).
 fn task_output_claims(
     entries: &[crate::p1::parallel::TaskEntry],
+    agents: &[discover::AgentConfig],
 ) -> Vec<crate::p1::parallel::OutputClaim> {
     entries
         .iter()
-        .filter_map(|entry| match &entry.spec.output {
-            crate::p1::launch_child::OutputOverride::Path(path) => {
-                Some(crate::p1::parallel::OutputClaim {
-                    owner: format!(
-                        "tasks[{}] ({})",
-                        entry.spec.child_index, entry.spec.agent_name
-                    ),
-                    path: path.clone(),
-                })
-            }
-            _ => None,
+        .filter_map(|entry| {
+            let agent_output = discover::resolve_agent_name(agents, &entry.spec.agent_name)
+                .ok()
+                .flatten()
+                .and_then(|agent| agent.output.as_deref());
+            crate::p1::parallel::output_claim(
+                format!(
+                    "tasks[{}] ({})",
+                    entry.spec.child_index, entry.spec.agent_name
+                ),
+                &entry.spec.output,
+                agent_output,
+            )
         })
         .collect()
 }
 
-/// Explicit output claims for a chain (R7.1.6.3; same inherited-default
-/// exclusion as [`task_output_claims`]).
+/// Output claims for a chain (R7.1.6.3; same inherited-default rule as
+/// [`task_output_claims`]).
 fn step_output_claims(
     steps: &[crate::p1::chain::StepSpec],
+    agents: &[discover::AgentConfig],
 ) -> Vec<crate::p1::parallel::OutputClaim> {
     steps
         .iter()
         .enumerate()
-        .filter_map(|(index, step)| match &step.output {
-            crate::p1::launch_child::OutputOverride::Path(path) => {
-                Some(crate::p1::parallel::OutputClaim {
-                    owner: format!("steps[{index}] ({})", step.agent_name),
-                    path: path.clone(),
-                })
-            }
-            _ => None,
+        .filter_map(|(index, step)| {
+            let agent_output = discover::resolve_agent_name(agents, &step.agent_name)
+                .ok()
+                .flatten()
+                .and_then(|agent| agent.output.as_deref());
+            crate::p1::parallel::output_claim(
+                format!("steps[{index}] ({})", step.agent_name),
+                &step.output,
+                agent_output,
+            )
         })
         .collect()
 }
@@ -631,7 +636,7 @@ fn dispatch_tasks(
     };
     // R7.1.6.3: reject explicit output collisions before any spawn.
     if let Err(error) =
-        crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries))
+        crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
     {
         return ToolOutcome::error(error);
     }
@@ -695,7 +700,8 @@ fn dispatch_steps(
         Err(error) => return ToolOutcome::error(error),
     };
     // R7.1.6.3: reject explicit output collisions before any spawn.
-    if let Err(error) = crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps))
+    if let Err(error) =
+        crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
     {
         return ToolOutcome::error(error);
     }
@@ -780,7 +786,7 @@ fn dispatch_async(
         };
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
-            crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries))
+            crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
         {
             return ToolOutcome::error(error);
         }
@@ -804,7 +810,7 @@ fn dispatch_async(
         };
         // R7.1.6.3: fail closed before the receipt is returned.
         if let Err(error) =
-            crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps))
+            crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
         {
             return ToolOutcome::error(error);
         }

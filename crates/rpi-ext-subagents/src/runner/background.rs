@@ -774,7 +774,7 @@ pub async fn drive_run(
     // R7.1.6.3 defence in depth: the dispatch paths already reject explicit
     // output collisions before the receipt, but a programmatically built
     // AsyncBody must not spawn either.
-    if let Some(error) = async_body_output_collision(&body) {
+    if let Some(error) = async_body_output_collision(&body, &agents) {
         finish_failed(&handle, &error, &notify).await;
         return;
     }
@@ -1057,36 +1057,42 @@ fn run_control_flags(handle: &Arc<AsyncRunHandle>) -> crate::p1::parallel::RunCo
     }
 }
 
-/// Explicit output collisions for a composite async body (R7.1.6.3).
-fn async_body_output_collision(body: &AsyncBody) -> Option<String> {
+/// Output collisions for a composite async body (R7.1.6.3; explicit and
+/// inherited-absolute claims, same rule as the dispatch paths).
+fn async_body_output_collision(
+    body: &AsyncBody,
+    agents: &[crate::agents::discover::AgentConfig],
+) -> Option<String> {
+    let agent_output = |agent_name: &str| {
+        crate::agents::discover::resolve_agent_name(agents, agent_name)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.output.as_deref())
+    };
     let claims = match body {
         AsyncBody::Single { .. } => return None,
         AsyncBody::Tasks { entries, .. } => entries
             .iter()
-            .filter_map(|entry| match &entry.spec.output {
-                crate::p1::launch_child::OutputOverride::Path(path) => {
-                    Some(crate::p1::parallel::OutputClaim {
-                        owner: format!(
-                            "tasks[{}] ({})",
-                            entry.spec.child_index, entry.spec.agent_name
-                        ),
-                        path: path.clone(),
-                    })
-                }
-                _ => None,
+            .filter_map(|entry| {
+                crate::p1::parallel::output_claim(
+                    format!(
+                        "tasks[{}] ({})",
+                        entry.spec.child_index, entry.spec.agent_name
+                    ),
+                    &entry.spec.output,
+                    agent_output(&entry.spec.agent_name),
+                )
             })
             .collect::<Vec<_>>(),
         AsyncBody::Steps { steps, .. } => steps
             .iter()
             .enumerate()
-            .filter_map(|(index, step)| match &step.output {
-                crate::p1::launch_child::OutputOverride::Path(path) => {
-                    Some(crate::p1::parallel::OutputClaim {
-                        owner: format!("steps[{index}] ({})", step.agent_name),
-                        path: path.clone(),
-                    })
-                }
-                _ => None,
+            .filter_map(|(index, step)| {
+                crate::p1::parallel::output_claim(
+                    format!("steps[{index}] ({})", step.agent_name),
+                    &step.output,
+                    agent_output(&step.agent_name),
+                )
             })
             .collect::<Vec<_>>(),
     };
@@ -2372,7 +2378,7 @@ pub(crate) mod tests {
             concurrency: 2,
             worktree_plan: None,
         };
-        let error = async_body_output_collision(&body).expect("duplicate explicit output");
+        let error = async_body_output_collision(&body, &[]).expect("duplicate explicit output");
         assert!(error.contains("tasks[0] (scout)"), "{error}");
         assert!(error.contains("tasks[2] (scout)"), "{error}");
         let clean = AsyncBody::Tasks {
@@ -2380,10 +2386,13 @@ pub(crate) mod tests {
             concurrency: 2,
             worktree_plan: None,
         };
-        assert!(async_body_output_collision(&clean).is_none());
-        assert!(async_body_output_collision(&AsyncBody::Single {
-            spec: Box::new(entry(0, json!("a.md")).spec),
-        })
+        assert!(async_body_output_collision(&clean, &[]).is_none());
+        assert!(async_body_output_collision(
+            &AsyncBody::Single {
+                spec: Box::new(entry(0, json!("a.md")).spec),
+            },
+            &[]
+        )
         .is_none());
     }
 

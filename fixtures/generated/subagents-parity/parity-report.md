@@ -1,6 +1,6 @@
 # subagents parity report (TE04 G3)
 
-generated: 2026-09-09T04:15:23.952Z
+generated: 2026-09-09T04:29:34.391Z
 
 ## args
 

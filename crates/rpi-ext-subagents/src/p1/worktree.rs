@@ -63,6 +63,40 @@ fn build_worktree_branch(run_id: &str, index: usize) -> String {
 /// `normalizeWorktreeBaseRef` rejection text (worktree.ts:455).
 pub const BASE_REF_ERROR: &str = "baseRef must be a valid Git ref: use HEAD or a supported named ref (for example, refs/heads/main). Full 40/64-character commit IDs and revision expressions are unsupported.";
 
+/// Handoff diagnostics are bounded and never embed captured output
+/// (upstream `writeWorktreeSetupHandoff` comment, parallel-handoff.ts:628-630:
+/// "Never copy argv, environment, Error objects or captured stdout/stderr
+/// into artifacts"; `diagnostic = text.slice(0, 512)`).
+const HANDOFF_DIAGNOSTIC_MAX_CHARS: usize = 512;
+
+fn bounded_handoff_diagnostic(text: &str) -> String {
+    if text.chars().count() <= HANDOFF_DIAGNOSTIC_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut bounded: String = text.chars().take(HANDOFF_DIAGNOSTIC_MAX_CHARS).collect();
+    bounded.push('…');
+    bounded
+}
+
+/// Setup failure split into the artifact-safe summary and the full
+/// caller-facing detail. Only [`reason`](Self::reason) reaches the handoff
+/// file; the hook's captured stderr stays in [`detail`](Self::detail).
+#[derive(Debug, Clone)]
+struct SetupFailure {
+    reason: String,
+    detail: String,
+}
+
+impl SetupFailure {
+    /// A failure whose message already contains no captured output.
+    fn safe(message: String) -> Self {
+        Self {
+            detail: message.clone(),
+            reason: message,
+        }
+    }
+}
+
 /// `validGitRef` (worktree.ts:445-452) plus the rpi fail-closed leading-dash
 /// rule (TE16 §8-3): reject empty/`@`/oversized refs, path escapes, Git
 /// revision syntax (`..`/`@{`/`~`/`^`/`:`/`?`/`*`/`[`/`]`/`\\`), control
@@ -235,13 +269,13 @@ pub fn create_worktree(
         worktree_path.join(cwd_relative)
     };
     let mut synthetic_paths = Vec::new();
-    let result = (|| -> Result<WorktreeInfo, String> {
+    let result = (|| -> Result<WorktreeInfo, SetupFailure> {
         let node_modules_linked = link_node_modules_if_present(toplevel, &worktree_path);
         if node_modules_linked {
             synthetic_paths.push("node_modules".to_string());
         }
         if let Some((hook, timeout_ms)) = config.worktree_setup_hook() {
-            let hook = resolve_worktree_setup_hook(&hook, toplevel)?;
+            let hook = resolve_worktree_setup_hook(&hook, toplevel).map_err(SetupFailure::safe)?;
             let hook_synthetic = run_worktree_setup_hook(
                 &hook,
                 timeout_ms,
@@ -268,25 +302,27 @@ pub fn create_worktree(
 
     match result {
         Ok(info) => Ok(info),
-        Err(error) => {
+        Err(failure) => {
             // R7.1.5.2 (#1902): preserve the uncertain allocation. The branch
-            // and worktree stay on disk for manual recovery; the diagnostic
-            // and the handoff record carry their paths.
+            // and worktree stay on disk for manual recovery; the handoff
+            // records only the artifact-safe reason (no captured stderr),
+            // while the caller receives the full detail.
             let handoff = write_preserved_worktree_handoff(
                 base_dir,
                 run_id,
                 index,
                 &worktree_path,
                 &branch,
-                &error,
+                &failure.reason,
             );
             let handoff_note = handoff
                 .as_ref()
                 .map(|path| format!("; handoff: {}", path.to_string_lossy()))
                 .unwrap_or_default();
             Err(format!(
-                "worktree setup failed for {} (branch {branch}): {error}. Preserved for manual recovery{handoff_note}",
-                worktree_path.to_string_lossy()
+                "worktree setup failed for {} (branch {branch}): {}. Preserved for manual recovery{handoff_note}",
+                worktree_path.to_string_lossy(),
+                failure.detail
             ))
         }
     }
@@ -363,7 +399,7 @@ fn run_worktree_setup_hook(
     run_id: &str,
     base_commit: &str,
     agent: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, SetupFailure> {
     let stdin = json!({
         "version": 1,
         "repoRoot": toplevel.to_string_lossy(),
@@ -382,7 +418,7 @@ fn run_worktree_setup_hook(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("worktree setup hook failed to start: {e}"))?;
+        .map_err(|e| SetupFailure::safe(format!("worktree setup hook failed to start: {e}")))?;
     // Timeout via a watchdog thread (spawnSync-equivalent): the waiter runs
     // on its own thread, the watchdog polls it. On timeout the hook process
     // is killed (Node spawnSync {timeout} sends its killSignal) — a runaway
@@ -399,19 +435,29 @@ fn run_worktree_setup_hook(
         std::time::Duration::from_millis(timeout_ms),
         hook_pid,
     )
-    .map_err(|_| format!("worktree setup hook timed out after {timeout_ms}ms"))?;
+    .map_err(|_| {
+        SetupFailure::safe(format!(
+            "worktree setup hook timed out after {timeout_ms}ms"
+        ))
+    })?;
     if !output.status.success() {
-        return Err(format!(
-            "worktree setup hook failed (exit {:?}): {}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        let exit = output.status.code();
+        return Err(SetupFailure {
+            reason: format!("worktree setup hook failed (exit {exit:?})"),
+            detail: format!(
+                "worktree setup hook failed (exit {exit:?}): {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Value = serde_json::from_str(stdout.trim())
-        .map_err(|_| "worktree setup hook stdout must be a JSON object".to_string())?;
+    let parsed: Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        SetupFailure::safe("worktree setup hook stdout must be a JSON object".to_string())
+    })?;
     if !parsed.is_object() {
-        return Err("worktree setup hook stdout must be a JSON object".to_string());
+        return Err(SetupFailure::safe(
+            "worktree setup hook stdout must be a JSON object".to_string(),
+        ));
     }
     Ok(parsed
         .get("syntheticPaths")
@@ -686,7 +732,8 @@ impl WorktreeCleanupTask {
             "preserved": self.preserved,
         });
         if let Some(reason) = &self.reason {
-            value["reason"] = json!(reason);
+            // Handoff artifacts never carry unbounded diagnostics.
+            value["reason"] = json!(bounded_handoff_diagnostic(reason));
         }
         value
     }
@@ -1279,7 +1326,14 @@ mod tests {
         // T-4: a failing setup hook must not roll the worktree/branch back.
         let (dir, toplevel, base_commit) = test_repo("setupfail");
         let hook = toplevel.join("failing-hook.sh");
-        std::fs::write(&hook, "#!/bin/sh\nexit 3\n").unwrap();
+        // The stderr carries a secret-shaped token: it must reach the caller
+        // diagnostic but never the persisted handoff artifact (G4 red line;
+        // upstream never copies captured stderr into artifacts).
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'token=super-secret-hook-token' >&2\nexit 3\n",
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1306,6 +1360,10 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("Preserved for manual recovery"), "{error}");
+        assert!(
+            error.contains("super-secret-hook-token"),
+            "caller keeps the full hook diagnostic: {error}"
+        );
         assert!(worktree_path.exists(), "allocation preserved");
         assert!(branch_exists(&toplevel, &branch), "branch preserved");
         let handoff = base_dir.join("handoffs").join("runsetup-preserved-0.json");
@@ -1315,10 +1373,68 @@ mod tests {
         assert_eq!(task["preserved"], json!(true), "{manifest}");
         assert_eq!(task["worktreeRemoved"], json!(false));
         assert_eq!(task["branchRemoved"], json!(false));
+        let reason = task["reason"].as_str().unwrap();
+        assert!(reason.contains("hook"), "{manifest}");
         assert!(
-            task["reason"].as_str().unwrap().contains("hook"),
-            "{manifest}"
+            !reason.contains("super-secret-hook-token"),
+            "handoff must not persist captured stderr: {manifest}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clean_worktree_without_changes_is_reclaimed() {
+        if !git_available() {
+            return;
+        }
+        // T-2 (upstream `hasWork`): an empty patch with no work is reclaimed,
+        // not preserved — otherwise every no-change child would leak an
+        // allocation.
+        let (dir, toplevel, base_commit) = test_repo("clean");
+        let config = test_config(&dir);
+        let base_dir = resolve_worktree_base_dir(&config, &toplevel).unwrap();
+        let worktree = create_worktree(
+            &toplevel,
+            "",
+            "runclean",
+            0,
+            &base_commit,
+            &base_dir,
+            Some("worker"),
+            &config,
+        )
+        .unwrap();
+        let patch_dir = dir.join("patches");
+        let diff = capture_worktree_diff(&worktree, "worker", &base_commit, &patch_dir).unwrap();
+        assert_eq!(diff.files_changed, 0);
+        let manifest = write_handoff_manifest(
+            &base_dir,
+            "runclean",
+            "parallel",
+            &toplevel,
+            &base_commit,
+            &[(
+                0,
+                "worker".to_string(),
+                "complete".to_string(),
+                diff.clone(),
+            )],
+            &[WorktreeCleanupTask::pending(
+                0,
+                &worktree.path,
+                &worktree.branch,
+            )],
+        );
+        cleanup_worktree(
+            &toplevel,
+            &worktree,
+            &base_commit,
+            Some(&diff.patch_path),
+            Some(&manifest),
+        )
+        .expect("clean worktree is reclaimed");
+        assert!(!worktree.path.exists());
+        assert!(!branch_exists(&toplevel, &worktree.branch));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
