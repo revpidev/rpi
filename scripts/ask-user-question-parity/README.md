@@ -76,3 +76,6 @@ leg pins `I18n::for_locale("en")` to match).
   the final `QuestionnaireResult` verbatim — titles (header prefix, preview folding, ≤600 UTF-16-unit
   truncation incl. a clean astral boundary), option lines + sentinel row, multi-select token parsing
   (indices/dedup/space/period/out-of-range/empty commit/custom), cancels and mid-walk partial answers.
+  The astral fixture pins a *clean* boundary on purpose — a cut that would split a surrogate pair
+  cannot be byte-pinned (JS `slice` keeps a lone surrogate, which is invalid UTF-8 in Rust; the
+  walker stops at the previous char instead, see `rpc_fallback.rs::truncate_utf16`).
