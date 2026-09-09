@@ -352,6 +352,12 @@ pub struct StepOutcome {
     pub output: String,
     pub exit_code: i32,
     pub error: Option<String>,
+    /// Terminal fields projected into the async step document
+    /// (R7.1.6.1/.2): effective thinking, timeout flag, and the process
+    /// signal that ended the child (additive to the v0.1.3 shape).
+    pub thinking: Option<String>,
+    pub timed_out: bool,
+    pub process_signal: Option<String>,
     pub details: Value,
 }
 
@@ -575,6 +581,12 @@ pub async fn run_chain_async(
         if let Some(error) = &outcome.result.error {
             details["error"] = json!(error);
         }
+        if let Some(signal) = &outcome.result.process_signal {
+            details["processSignal"] = json!(signal);
+        }
+        if let Some(thinking) = &outcome.result.thinking {
+            details["thinking"] = json!(thinking);
+        }
         if let Some(paths) = &outcome.result.artifact_paths {
             details["artifactPaths"] = paths.to_json();
         }
@@ -588,6 +600,9 @@ pub async fn run_chain_async(
             output: outcome.result.final_output.clone(),
             exit_code: outcome.result.exit_code,
             error: outcome.result.error.clone(),
+            thinking: outcome.result.thinking.clone(),
+            timed_out: outcome.result.timed_out,
+            process_signal: outcome.result.process_signal.clone(),
             details,
         };
         // Terminal projection into the chain accumulator (FR-B): the next

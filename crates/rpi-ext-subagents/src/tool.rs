@@ -173,6 +173,14 @@ pub fn tool_parameters_schema() -> Value {
                 "type": "string",
                 "minLength": 1,
                 "description": "Reserved for compatibility with the upstream pi-subagents description. NOT SUPPORTED in rpi (see ADR-0016); use {agent, task} for direct delegation."
+            },
+            "worktree": {
+                "type": "boolean",
+                "description": "Managed worktree isolation (FR-P1-06): top-level default for tasks; each task may override with its own worktree flag."
+            },
+            "baseRef": {
+                "type": "string",
+                "description": "Git ref the managed worktrees branch from (default HEAD). Named refs only (for example refs/heads/main); full commit IDs and revision expressions are rejected before launch."
             }
         }
     })
@@ -274,6 +282,20 @@ fn execute_subagent_tool_inner(
     // (resolveForegroundTimeout, executor 2272-2289).
     if let Err(error) = check_timeout_aliases(&object) {
         return ToolOutcome::error(error);
+    }
+
+    // R7.1.5.3 (#1934/#1937): baseRef is validated up front for every shape
+    // (upstream scripted-workflow.ts:648), so an invalid ref fails closed
+    // before any spawn or worktree creation.
+    if let Some(value) = object.get("baseRef") {
+        match value.as_str() {
+            Some(reference) => {
+                if let Err(error) = crate::p1::worktree::validate_base_ref(reference) {
+                    return ToolOutcome::error(error);
+                }
+            }
+            None => return ToolOutcome::error("baseRef must be a string Git ref.".to_string()),
+        }
     }
 
     if !has_tasks && !has_steps && !has_single {
@@ -523,7 +545,11 @@ fn build_worktree_plan(
     let Some(enabled) = worktree_enabled_flags(entries, top_worktree) else {
         return Ok(None);
     };
-    let (toplevel, base_commit) = crate::p1::worktree::resolve_repo_base(&ctx.base_cwd)?;
+    // R7.1.5.3: the validated baseRef decides the worktree base and the patch
+    // base commit (default HEAD).
+    let base_ref = object.get("baseRef").and_then(Value::as_str);
+    let (toplevel, base_commit) =
+        crate::p1::worktree::resolve_repo_base_with_ref(&ctx.base_cwd, base_ref)?;
     let base_dir = crate::p1::worktree::resolve_worktree_base_dir(&ctx.config, &toplevel)?;
     Ok(Some(std::sync::Arc::new(
         crate::p1::parallel::WorktreePlan {
@@ -532,11 +558,60 @@ fn build_worktree_plan(
             base_dir,
             enabled,
             config: ctx.config.clone(),
-            manifest_path: None,
             diffs: std::sync::Mutex::new(Vec::new()),
-            kept: std::sync::Mutex::new(Vec::new()),
+            pending: std::sync::Mutex::new(Vec::new()),
         },
     )))
+}
+
+/// Output claims for a tasks batch (R7.1.6.3). Explicit overrides and
+/// inherited **absolute** agent defaults participate; inherited **relative**
+/// defaults are isolated upstream (`child-launch-plan.ts:129-146`) and would
+/// be false positives here (TE16 §7.3-4, independent-review observation 2).
+fn task_output_claims(
+    entries: &[crate::p1::parallel::TaskEntry],
+    agents: &[discover::AgentConfig],
+) -> Vec<crate::p1::parallel::OutputClaim> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let agent_output = discover::resolve_agent_name(agents, &entry.spec.agent_name)
+                .ok()
+                .flatten()
+                .and_then(|agent| agent.output.as_deref());
+            crate::p1::parallel::output_claim(
+                format!(
+                    "tasks[{}] ({})",
+                    entry.spec.child_index, entry.spec.agent_name
+                ),
+                &entry.spec.output,
+                agent_output,
+            )
+        })
+        .collect()
+}
+
+/// Output claims for a chain (R7.1.6.3; same inherited-default rule as
+/// [`task_output_claims`]).
+fn step_output_claims(
+    steps: &[crate::p1::chain::StepSpec],
+    agents: &[discover::AgentConfig],
+) -> Vec<crate::p1::parallel::OutputClaim> {
+    steps
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let agent_output = discover::resolve_agent_name(agents, &step.agent_name)
+                .ok()
+                .flatten()
+                .and_then(|agent| agent.output.as_deref());
+            crate::p1::parallel::output_claim(
+                format!("steps[{index}] ({})", step.agent_name),
+                &step.output,
+                agent_output,
+            )
+        })
+        .collect()
 }
 
 /// `tasks` composition dispatch (FR-P1-01, ADR-0018).
@@ -559,6 +634,12 @@ fn dispatch_tasks(
         Ok(entries) => entries,
         Err(error) => return ToolOutcome::error(error),
     };
+    // R7.1.6.3: reject explicit output collisions before any spawn.
+    if let Err(error) =
+        crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
+    {
+        return ToolOutcome::error(error);
+    }
     let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
     // Worktree isolation (FR-P1-06): top-level `worktree: true` defaults
     // every task in (per-task `worktree: false` opts out) and a per-task
@@ -618,6 +699,12 @@ fn dispatch_steps(
         Ok(steps) => steps,
         Err(error) => return ToolOutcome::error(error),
     };
+    // R7.1.6.3: reject explicit output collisions before any spawn.
+    if let Err(error) =
+        crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
+    {
+        return ToolOutcome::error(error);
+    }
     let original_task = object
         .get("task")
         .and_then(Value::as_str)
@@ -697,6 +784,12 @@ fn dispatch_async(
             Ok(entries) => entries,
             Err(error) => return ToolOutcome::error(error),
         };
+        // R7.1.6.3: fail closed before the receipt is returned.
+        if let Err(error) =
+            crate::p1::parallel::validate_output_collisions(&task_output_claims(&entries, agents))
+        {
+            return ToolOutcome::error(error);
+        }
         let concurrency = ctx.config.parallel_concurrency(object.get("concurrency")) as usize;
         // Same worktree opt-in as the foreground path (FR-P1-06): top-level
         // or per-task `worktree: true`.
@@ -715,6 +808,12 @@ fn dispatch_async(
             Ok(steps) => steps,
             Err(error) => return ToolOutcome::error(error),
         };
+        // R7.1.6.3: fail closed before the receipt is returned.
+        if let Err(error) =
+            crate::p1::parallel::validate_output_collisions(&step_output_claims(&steps, agents))
+        {
+            return ToolOutcome::error(error);
+        }
         let original_task = object
             .get("task")
             .and_then(Value::as_str)

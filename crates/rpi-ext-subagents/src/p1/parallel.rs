@@ -7,6 +7,7 @@
 //! `runs.all` admission semantics (scripted-workflow.ts:178-194: batch
 //! admitted at once, each child collects failure instead of rejecting).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{self, StreamExt};
@@ -208,12 +209,20 @@ pub struct WorktreePlan {
     pub base_dir: std::path::PathBuf,
     pub enabled: Vec<bool>,
     pub config: crate::config::ExtensionConfig,
-    /// Patches + manifest land beside the base dir (upstream handoffs/).
-    pub manifest_path: Option<std::path::PathBuf>,
     pub diffs: std::sync::Mutex<Vec<(usize, String, String, crate::p1::worktree::WorktreeDiff)>>,
-    /// Worktrees kept dirty (patch capture failed) — `finalize` retries
-    /// their cleanup once the handoff manifest exists.
-    pub kept: std::sync::Mutex<Vec<crate::p1::worktree::WorktreeInfo>>,
+    /// Worktrees awaiting cleanup — `finalize` publishes the patch records
+    /// first, then attempts removal (upstream two-pass handoff ordering).
+    pub pending: std::sync::Mutex<Vec<PendingWorktreeCleanup>>,
+}
+
+/// One worktree whose cleanup is deferred until the handoff manifest has
+/// journaled its patch (R7.1.5.1). `reason` records a capture failure so the
+/// preserved cleanup task carries the original diagnostic.
+#[derive(Debug, Clone)]
+pub struct PendingWorktreeCleanup {
+    pub info: crate::p1::worktree::WorktreeInfo,
+    pub patch_path: Option<std::path::PathBuf>,
+    pub reason: Option<String>,
 }
 
 /// One aggregated task result (`ParallelTaskResult`).
@@ -235,13 +244,186 @@ pub struct ParallelTaskOutcome {
 /// subagent-runner.ts:4061); `Finished` fires when the child's outcome is
 /// known, while the rest of the batch keeps running (upstream writes the
 /// step terminal inside each task, subagent-runner.ts:3740-3755).
+///
+/// v0.66 #1060/#1474 (R7.1.6.1): `Finished` carries the child's
+/// [`StepTerminal`] so a stop-requested child is recorded `stopped`, never
+/// `failed` (04 §3.3.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParallelStepEvent {
     Started,
     Finished {
         exit_code: i32,
         error: Option<String>,
+        terminal: StepTerminal,
     },
+}
+
+/// Terminal classification for one settled child (R7.1.6.1; 04 §3.3.5).
+/// Upstream keeps the same five-way distinction in
+/// `SubagentResultStatus`/`ExecutionProjectionStatus` (v0.66 types.ts:398/537)
+/// and derives run outcomes in the same precedence order (run-history.ts:141-152:
+/// stopped > interrupted > timed-out > unexplained signal > exit 0 > failed);
+/// rpi names the interrupt face `Paused` because `interrupt` is its pause
+/// marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepTerminal {
+    Complete,
+    Failed,
+    Stopped,
+    Paused,
+    TimedOut,
+}
+
+impl StepTerminal {
+    /// Step-status string written into `status.json` / result documents
+    /// (`complete`/`failed`/`stopped`/`paused`/`timed_out`, R7.1.6.1).
+    pub fn as_status(self) -> &'static str {
+        match self {
+            StepTerminal::Complete => "complete",
+            StepTerminal::Failed => "failed",
+            StepTerminal::Stopped => "stopped",
+            StepTerminal::Paused => "paused",
+            StepTerminal::TimedOut => "timed_out",
+        }
+    }
+}
+
+/// Run-level control snapshot used by [`classify_terminal`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunControlFlags {
+    pub stop_requested: bool,
+    pub interrupt_requested: bool,
+}
+
+/// Live control probe, read when a child settles (a stop can arrive
+/// mid-batch). Background runs wire it to the handle's control flags;
+/// foreground batches have no run handle and pass `None`.
+pub type RunControlProbe = Arc<dyn Fn() -> RunControlFlags + Send + Sync>;
+
+/// Classify one settled child (upstream run-history.ts:141-152 precedence:
+/// stopped > interrupted > timedOut > unexplained signal > exit 0 > failed).
+///
+/// Approximation: upstream's `isUnexplainedProcessSignal` (process-signal.ts:
+/// 19-28) also treats `turnBudgetExceeded`/`forcedDrainAfterFinalSuccess` as
+/// *explained* (→ failed); the rpi subprocess result carries no such flags
+/// (budget enforcement lives in the child prompt/acceptance layer), so a
+/// non-zero signal exit classifies as stopped.
+pub fn classify_terminal(
+    exit_code: i32,
+    timed_out: bool,
+    process_signal: Option<&str>,
+    control: RunControlFlags,
+) -> StepTerminal {
+    if control.stop_requested {
+        StepTerminal::Stopped
+    } else if control.interrupt_requested {
+        StepTerminal::Paused
+    } else if timed_out {
+        StepTerminal::TimedOut
+    } else if exit_code != 0 && process_signal.is_some() {
+        // Unexplained signal (`isUnexplainedProcessSignal`, process-signal.ts:
+        // 19-28): killed by a signal nobody ordered reads as stopped.
+        StepTerminal::Stopped
+    } else if exit_code == 0 {
+        StepTerminal::Complete
+    } else {
+        StepTerminal::Failed
+    }
+}
+
+/// One explicit output claim (R7.1.6.3): resolved path + task/step label.
+#[derive(Debug, Clone)]
+pub struct OutputClaim {
+    pub owner: String,
+    pub path: PathBuf,
+}
+
+/// Build one output claim from a task/step override plus the agent's
+/// frontmatter default.
+///
+/// Inherited **relative** defaults are excluded: upstream isolates them per
+/// task in a parallel namespace (`child-launch-plan.ts:129-146`), so they are
+/// not a launch-time collision. Inherited **absolute** defaults have no
+/// namespace and stay shared, so upstream's check sees them and so does this
+/// one (observation 2 of the TE16 independent review, 2026-09-09).
+pub fn output_claim(
+    owner: String,
+    output: &crate::p1::launch_child::OutputOverride,
+    agent_output: Option<&str>,
+) -> Option<OutputClaim> {
+    match output {
+        crate::p1::launch_child::OutputOverride::Path(path) => Some(OutputClaim {
+            owner,
+            path: path.clone(),
+        }),
+        crate::p1::launch_child::OutputOverride::Disabled => None,
+        crate::p1::launch_child::OutputOverride::Inherit => {
+            let raw = agent_output?;
+            if !Path::new(raw).is_absolute() {
+                return None;
+            }
+            Some(OutputClaim {
+                owner,
+                path: crate::paths::expand_tilde_and_resolve(raw),
+            })
+        }
+    }
+}
+
+/// `resolveSingleOutputClaimPath` (single-output.ts:175-185): realpath the
+/// deepest existing ancestor and append the still-missing segments, so
+/// symlinked parents compare equal without requiring the leaf to exist.
+pub fn resolve_output_claim_path(path: &Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) if parent != existing => {
+                missing.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for segment in missing.iter().rev() {
+        resolved.push(segment);
+    }
+    resolved
+}
+
+/// Every collision group (claim path -> all owners), stable by first claim.
+pub fn find_output_collisions(claims: &[OutputClaim]) -> Vec<(PathBuf, Vec<String>)> {
+    let mut groups: Vec<(PathBuf, Vec<String>)> = Vec::new();
+    for claim in claims {
+        let resolved = resolve_output_claim_path(&claim.path);
+        match groups.iter_mut().find(|(path, _)| *path == resolved) {
+            Some((_, owners)) => owners.push(claim.owner.clone()),
+            None => groups.push((resolved, vec![claim.owner.clone()])),
+        }
+    }
+    groups.retain(|(_, owners)| owners.len() > 1);
+    groups
+}
+
+/// Fail-closed pre-flight for explicit output paths (upstream
+/// async-execution.ts:1189-1200: `Parallel tasks N (agent) and M (agent)
+/// resolve output to the same path: <path>. Use distinct output paths.`).
+/// The rpi message lists every conflicting path and all its claimants
+/// (FR-F R2), not just the first pair.
+pub fn validate_output_collisions(claims: &[OutputClaim]) -> Result<(), String> {
+    let collisions = find_output_collisions(claims);
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    let detail = collisions
+        .iter()
+        .map(|(path, owners)| format!("{} <- {}", path.to_string_lossy(), owners.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "Output path collision before launch: {detail}. Use distinct output paths."
+    ))
 }
 
 /// Sink receiving `(submission index, event)`. The async runner mirrors
@@ -268,6 +450,7 @@ pub fn run_parallel(
         concurrency,
         worktree,
         None,
+        None,
     ))
 }
 
@@ -282,6 +465,7 @@ pub async fn run_parallel_async(
     concurrency: usize,
     worktree: Option<std::sync::Arc<WorktreePlan>>,
     on_step: Option<ParallelStepSink>,
+    control_probe: Option<RunControlProbe>,
 ) -> Result<Vec<ParallelTaskOutcome>, String> {
     let concurrency = concurrency.max(1);
     // rpi#30: the run-wide global child cap (upstream per-run Semaphore,
@@ -305,6 +489,7 @@ pub async fn run_parallel_async(
                 let agents = Arc::clone(&agents);
                 let plan = worktree.clone();
                 let on_step = on_step.clone();
+                let control_probe = control_probe.clone();
                 let permits = Arc::clone(&global_permits);
                 async move {
                     // Upstream worker shape (parallel-utils.ts:210-219):
@@ -318,14 +503,49 @@ pub async fn run_parallel_async(
                     if let Some(sink) = &on_step {
                         sink(index, ParallelStepEvent::Started);
                     }
-                    let outcome = launch_one(&entry, &agents, ctx, plan.as_deref()).await;
+                    let outcome = launch_one(
+                        &entry,
+                        &agents,
+                        ctx,
+                        plan.as_deref(),
+                        control_probe.as_ref(),
+                    )
+                    .await;
                     if let Some(sink) = &on_step {
-                        let (exit_code, error) = match &outcome {
-                            Some(Ok(result)) => (result.exit_code, result.error.clone()),
-                            Some(Err(reason)) => (-1, Some(reason.clone())),
-                            None => (-1, Some("launch failed without a reason".to_owned())),
+                        let control = control_probe
+                            .as_ref()
+                            .map(|probe| probe())
+                            .unwrap_or_default();
+                        let (exit_code, error, terminal) = match &outcome {
+                            Some(Ok(result)) => (
+                                result.exit_code,
+                                result.error.clone(),
+                                classify_terminal(
+                                    result.exit_code,
+                                    result.timed_out,
+                                    result.details["processSignal"].as_str(),
+                                    control,
+                                ),
+                            ),
+                            Some(Err(reason)) => (
+                                -1,
+                                Some(reason.clone()),
+                                classify_terminal(-1, false, None, control),
+                            ),
+                            None => (
+                                -1,
+                                Some("launch failed without a reason".to_owned()),
+                                classify_terminal(-1, false, None, control),
+                            ),
                         };
-                        sink(index, ParallelStepEvent::Finished { exit_code, error });
+                        sink(
+                            index,
+                            ParallelStepEvent::Finished {
+                                exit_code,
+                                error,
+                                terminal,
+                            },
+                        );
                     }
                     (index, outcome)
                 }
@@ -374,6 +594,7 @@ async fn launch_one(
     agents: &[AgentConfig],
     ctx: &RunCtx,
     worktree: Option<&WorktreePlan>,
+    control_probe: Option<&RunControlProbe>,
 ) -> Option<Result<ParallelTaskOutcome, String>> {
     let agent = match discover::resolve_agent_name(agents, &entry.spec.agent_name) {
         Ok(Some(agent)) => agent.clone(),
@@ -421,77 +642,129 @@ async fn launch_one(
     };
     if let (Some(plan), Some(info)) = (worktree, prepared) {
         let patch_dir = plan.base_dir.join("patches");
-        if let Ok(diff) = crate::p1::worktree::capture_worktree_diff(
+        match crate::p1::worktree::capture_worktree_diff(
             &info,
             &outcome.agent_name,
             &plan.base_commit,
             &patch_dir,
         ) {
-            let status = if outcome.result.exit_code == 0 {
-                "complete"
-            } else {
-                "failed"
-            };
-            let _ = crate::p1::worktree::cleanup_worktree(
-                &plan.toplevel,
-                &info,
-                plan.manifest_path.as_deref(),
-            );
-            plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).push((
-                entry.spec.child_index as usize,
-                outcome.agent_name.clone(),
-                status.to_string(),
-                diff,
-            ));
-        } else {
-            // Dirty worktree without a recorded patch: keep it for
-            // inspection (cleanup_worktree refuses) — remember it so
-            // `finalize_worktree_handoff` can retry once the manifest
-            // journals the surviving patches.
-            let _ = crate::p1::worktree::cleanup_worktree(
-                &plan.toplevel,
-                &info,
-                plan.manifest_path.as_deref(),
-            );
-            plan.kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(info);
+            Ok(diff) => {
+                let control = control_probe.map(|probe| probe()).unwrap_or_default();
+                let status = classify_terminal(
+                    outcome.result.exit_code,
+                    outcome.result.timed_out,
+                    outcome.result.process_signal.as_deref(),
+                    control,
+                )
+                .as_status()
+                .to_string();
+                plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    entry.spec.child_index as usize,
+                    outcome.agent_name.clone(),
+                    status,
+                    diff.clone(),
+                ));
+                // Cleanup is deferred: `finalize_worktree_handoff` publishes
+                // the patch record first so cleanup can verify it.
+                plan.pending.lock().unwrap_or_else(|e| e.into_inner()).push(
+                    PendingWorktreeCleanup {
+                        info,
+                        patch_path: Some(diff.patch_path),
+                        reason: None,
+                    },
+                );
+            }
+            Err(reason) => {
+                // R7.1.5.1: a worktree whose patch could not be captured and
+                // validated is preserved — finalize records the reason.
+                plan.pending.lock().unwrap_or_else(|e| e.into_inner()).push(
+                    PendingWorktreeCleanup {
+                        info,
+                        patch_path: None,
+                        reason: Some(reason),
+                    },
+                );
+            }
         }
     }
     Some(Ok(project_outcome(entry, &outcome, &ctx.run_id)))
 }
 
-/// Write the handoff manifest after a worktree batch finishes (upstream
-/// writes it before cleanup so `handoffRecordsPatch` passes), then retry the
-/// cleanup of worktrees kept dirty earlier — now that the manifest journals
-/// the surviving patches, `cleanup_worktree` accepts them.
+/// Write the handoff manifest after a worktree batch finishes, then clean up
+/// the pending worktrees — the first manifest pass journals the patches so
+/// `cleanup_worktree` can verify them, the second records the cleanup report
+/// (upstream writes the manifest twice, subagent-executor.ts:3647-3649).
 pub fn finalize_worktree_handoff(
     plan: &WorktreePlan,
     run_id: &str,
     cwd: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     let diffs = plan.diffs.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let path = (!diffs.is_empty()).then(|| {
-        crate::p1::worktree::write_handoff_manifest(
-            &plan.base_dir,
-            run_id,
-            "parallel",
-            cwd,
-            &plan.base_commit,
-            &diffs,
-        )
-    });
-    let kept: Vec<_> = plan
-        .kept
+    let pending: Vec<_> = plan
+        .pending
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .drain(..)
         .collect();
-    for info in kept {
-        let _ = crate::p1::worktree::cleanup_worktree(&plan.toplevel, &info, path.as_deref());
+    if diffs.is_empty() && pending.is_empty() {
+        return None;
     }
-    path
+    let pending_tasks: Vec<crate::p1::worktree::WorktreeCleanupTask> = pending
+        .iter()
+        .map(|entry| {
+            crate::p1::worktree::WorktreeCleanupTask::pending(
+                entry.info.index,
+                &entry.info.path,
+                &entry.info.branch,
+            )
+        })
+        .collect();
+    let manifest = crate::p1::worktree::write_handoff_manifest(
+        &plan.base_dir,
+        run_id,
+        "parallel",
+        cwd,
+        &plan.base_commit,
+        &diffs,
+        &pending_tasks,
+    );
+    let mut cleanup_tasks: Vec<crate::p1::worktree::WorktreeCleanupTask> = Vec::new();
+    for entry in pending {
+        match crate::p1::worktree::cleanup_worktree(
+            &plan.toplevel,
+            &entry.info,
+            &plan.base_commit,
+            entry.patch_path.as_deref(),
+            Some(&manifest),
+        ) {
+            Ok(()) => cleanup_tasks.push(crate::p1::worktree::WorktreeCleanupTask::removed(
+                entry.info.index,
+                &entry.info.path,
+                &entry.info.branch,
+            )),
+            Err(reason) => {
+                let reason = match &entry.reason {
+                    Some(capture_error) => format!("{reason}; capture error: {capture_error}"),
+                    None => reason,
+                };
+                cleanup_tasks.push(crate::p1::worktree::WorktreeCleanupTask::preserved(
+                    entry.info.index,
+                    &entry.info.path,
+                    &entry.info.branch,
+                    &reason,
+                ));
+            }
+        }
+    }
+    Some(crate::p1::worktree::write_handoff_manifest(
+        &plan.base_dir,
+        run_id,
+        "parallel",
+        cwd,
+        &plan.base_commit,
+        &diffs,
+        &cleanup_tasks,
+    ))
 }
 
 /// `ParallelTaskResult` projection off the shared child outcome.
@@ -667,6 +940,176 @@ mod tests {
         let entries = parse_tasks(&many, 8).unwrap();
         assert_eq!(entries[0].key, "task-0");
         assert_eq!(entries[2].key, "task-2");
+    }
+
+    #[test]
+    fn terminal_classification_matches_fixture_vectors() {
+        // R7.1.6.1: the target-track fixture owns the vector set; the
+        // classifier and its persisted status strings must match every case.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/subagents-v066/terminal-classification.json");
+        let raw = std::fs::read_to_string(&path).expect("TE13 fixture is present");
+        let fixture: Value = serde_json::from_str(&raw).unwrap();
+        let cases = fixture["terminal_vectors"]["cases"]
+            .as_array()
+            .expect("TE16 extends terminal-classification.json");
+        for case in cases {
+            let input = &case["input"];
+            let control = RunControlFlags {
+                stop_requested: input["stopRequested"].as_bool().unwrap_or(false),
+                interrupt_requested: input["interruptRequested"].as_bool().unwrap_or(false),
+            };
+            let terminal = classify_terminal(
+                input["exitCode"].as_i64().unwrap_or(0) as i32,
+                input["timedOut"].as_bool().unwrap_or(false),
+                input["processSignal"].as_str(),
+                control,
+            );
+            assert_eq!(
+                terminal.as_status(),
+                case["expected"]["stepStatus"].as_str().unwrap(),
+                "case {}",
+                case["name"]
+            );
+        }
+        // Precedence spot-checks independent of the fixture file.
+        let stopped = RunControlFlags {
+            stop_requested: true,
+            ..RunControlFlags::default()
+        };
+        assert_eq!(
+            classify_terminal(0, false, None, stopped),
+            StepTerminal::Stopped
+        );
+        let paused = RunControlFlags {
+            interrupt_requested: true,
+            ..RunControlFlags::default()
+        };
+        assert_eq!(
+            classify_terminal(0, false, None, paused),
+            StepTerminal::Paused
+        );
+    }
+
+    #[test]
+    fn explicit_output_collisions_are_rejected_before_launch() {
+        // T-12/T-13: explicit output paths are normalized (realpath of the
+        // existing ancestor) and every conflicting claim is listed; distinct
+        // paths and missing leaves do not false-positive.
+        let base = std::env::temp_dir().join(format!(
+            "rpi-sub-collide-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let same = base.join("report.md");
+        let claims = vec![
+            OutputClaim {
+                owner: "tasks[0] (scout)".to_string(),
+                path: same.clone(),
+            },
+            OutputClaim {
+                owner: "tasks[1] (worker)".to_string(),
+                path: base.join(".").join("report.md"),
+            },
+            OutputClaim {
+                owner: "tasks[2] (reviewer)".to_string(),
+                path: same.clone(),
+            },
+        ];
+        let error = validate_output_collisions(&claims).expect_err("duplicate output");
+        assert!(error.contains("tasks[0] (scout)"), "{error}");
+        assert!(error.contains("tasks[1] (worker)"), "{error}");
+        assert!(error.contains("tasks[2] (reviewer)"), "{error}");
+        assert!(error.contains("report.md"), "{error}");
+        assert!(error.contains("Use distinct output paths."), "{error}");
+
+        let distinct = vec![
+            OutputClaim {
+                owner: "tasks[0] (scout)".to_string(),
+                path: base.join("a.md"),
+            },
+            OutputClaim {
+                owner: "tasks[1] (worker)".to_string(),
+                path: base.join("b.md"),
+            },
+            OutputClaim {
+                owner: "steps[0] (scout)".to_string(),
+                path: base.join("a.md"),
+            },
+        ];
+        assert!(validate_output_collisions(&distinct).is_err());
+        let no_collision = vec![
+            OutputClaim {
+                owner: "tasks[0] (scout)".to_string(),
+                path: base.join("a.md"),
+            },
+            OutputClaim {
+                owner: "tasks[1] (worker)".to_string(),
+                path: base.join("b.md"),
+            },
+        ];
+        validate_output_collisions(&no_collision).expect("distinct paths launch");
+        assert!(find_output_collisions(&no_collision).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn output_claim_inherited_defaults_follow_upstream() {
+        // Independent-review observation 2: inherited RELATIVE defaults are
+        // isolated upstream and excluded here; inherited ABSOLUTE defaults
+        // have no namespace and still participate.
+        use crate::p1::launch_child::OutputOverride;
+        let explicit = output_claim(
+            "tasks[0] (scout)".to_string(),
+            &OutputOverride::Path(PathBuf::from("/tmp/a.md")),
+            None,
+        )
+        .expect("explicit path");
+        assert_eq!(explicit.path, PathBuf::from("/tmp/a.md"));
+        assert!(output_claim("x".to_string(), &OutputOverride::Disabled, None).is_none());
+        assert!(
+            output_claim(
+                "tasks[1] (scout)".to_string(),
+                &OutputOverride::Inherit,
+                Some("context.md")
+            )
+            .is_none(),
+            "inherited relative defaults are isolated upstream"
+        );
+        let inherited_absolute = output_claim(
+            "tasks[2] (scout)".to_string(),
+            &OutputOverride::Inherit,
+            Some("/tmp/shared-report.md"),
+        )
+        .expect("inherited absolute default");
+        assert_eq!(
+            inherited_absolute.path,
+            PathBuf::from("/tmp/shared-report.md")
+        );
+        assert!(
+            output_claim(
+                "tasks[3] (scout)".to_string(),
+                &OutputOverride::Inherit,
+                None
+            )
+            .is_none(),
+            "no agent default → no claim"
+        );
+        let colliding = vec![
+            inherited_absolute,
+            output_claim(
+                "tasks[4] (worker)".to_string(),
+                &OutputOverride::Inherit,
+                Some("/tmp/shared-report.md"),
+            )
+            .expect("second inherited absolute default"),
+        ];
+        assert!(
+            validate_output_collisions(&colliding).is_err(),
+            "two inherited absolute defaults collide"
+        );
     }
 
     #[test]

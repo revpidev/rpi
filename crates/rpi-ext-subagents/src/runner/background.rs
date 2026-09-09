@@ -92,6 +92,12 @@ impl AsyncControl {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = true;
     }
+    pub fn interrupt_requested(&self) -> bool {
+        *self
+            .interrupt_requested
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Registry of live and recently finished async runs (process-wide; one host
@@ -765,6 +771,13 @@ pub async fn drive_run(
             return;
         }
     };
+    // R7.1.6.3 defence in depth: the dispatch paths already reject explicit
+    // output collisions before the receipt, but a programmatically built
+    // AsyncBody must not spawn either.
+    if let Some(error) = async_body_output_collision(&body, &agents) {
+        finish_failed(&handle, &error, &notify).await;
+        return;
+    }
     match body {
         AsyncBody::Single { mut spec } => {
             let agent = match crate::agents::discover::resolve_agent_name(&agents, &spec.agent_name)
@@ -829,14 +842,15 @@ pub async fn drive_run(
                         crate::p1::parallel::ParallelStepEvent::Started => {
                             mark_step(&event_handle, index, "running");
                         }
-                        crate::p1::parallel::ParallelStepEvent::Finished { exit_code, error } => {
-                            mark_step(
-                                &event_handle,
-                                index,
-                                if exit_code == 0 { "complete" } else { "failed" },
-                            );
+                        crate::p1::parallel::ParallelStepEvent::Finished {
+                            exit_code,
+                            error,
+                            terminal,
+                        } => {
+                            mark_step(&event_handle, index, terminal.as_status());
                             set_step_field(&event_handle, index, |step| {
                                 step["exitCode"] = json!(exit_code);
+                                step["terminal"] = json!(terminal.as_status());
                                 if let Some(error) = &error {
                                     step["error"] = json!(error);
                                 }
@@ -856,6 +870,12 @@ pub async fn drive_run(
                         }
                     }
                 });
+            let control_handle = handle.clone();
+            let control_probe: crate::p1::parallel::RunControlProbe =
+                std::sync::Arc::new(move || crate::p1::parallel::RunControlFlags {
+                    stop_requested: control_handle.control.stop_requested(),
+                    interrupt_requested: control_handle.control.interrupt_requested(),
+                });
             let outcome = crate::p1::parallel::run_parallel_async(
                 &entries,
                 &agents,
@@ -863,6 +883,7 @@ pub async fn drive_run(
                 concurrency,
                 worktree_plan.clone(),
                 Some(on_step),
+                Some(control_probe),
             )
             .await;
             // Parallel handoff manifest path rides the completion
@@ -902,17 +923,22 @@ pub async fn drive_run(
             match crate::p1::chain::run_chain_async(&steps, &agents, &ctx, &original_task).await {
                 Ok((completed, failed)) => {
                     for step in &completed {
-                        mark_step(
-                            &handle,
-                            step.index,
-                            if step.exit_code == 0 {
-                                "complete"
-                            } else {
-                                "failed"
-                            },
+                        // R7.1.6.1: the same terminal classifier as single
+                        // and parallel runs (a stopped/timed-out step must
+                        // not render as failed).
+                        let terminal = crate::p1::parallel::classify_terminal(
+                            step.exit_code,
+                            step.timed_out,
+                            step.process_signal.as_deref(),
+                            run_control_flags(&handle),
                         );
+                        mark_step(&handle, step.index, terminal.as_status());
                         set_step_field(&handle, step.index, |target| {
                             target["exitCode"] = json!(step.exit_code);
+                            target["terminal"] = json!(terminal.as_status());
+                            if let Some(thinking) = &step.thinking {
+                                target["thinking"] = json!(thinking);
+                            }
                             if let Some(error) = &step.error {
                                 target["error"] = json!(error);
                             }
@@ -924,7 +950,23 @@ pub async fn drive_run(
                         .unwrap_or_default();
                     match failed {
                         Some(failure) => {
-                            mark_step(&handle, failure.index, "failed");
+                            let terminal = crate::p1::parallel::classify_terminal(
+                                failure.exit_code,
+                                failure.timed_out,
+                                failure.process_signal.as_deref(),
+                                run_control_flags(&handle),
+                            );
+                            mark_step(&handle, failure.index, terminal.as_status());
+                            set_step_field(&handle, failure.index, |target| {
+                                target["exitCode"] = json!(failure.exit_code);
+                                target["terminal"] = json!(terminal.as_status());
+                                if let Some(thinking) = &failure.thinking {
+                                    target["thinking"] = json!(thinking);
+                                }
+                                if let Some(error) = &failure.error {
+                                    target["error"] = json!(error);
+                                }
+                            });
                             finish_failed(
                                 &handle,
                                 failure.error.as_deref().unwrap_or("chain step failed"),
@@ -966,15 +1008,24 @@ fn record_step_result(
     index: usize,
     result: &crate::runner::foreground::ForegroundRunResult,
 ) {
+    // R7.1.6.1/.2: classify the terminal from the child result + run control
+    // state, and persist the effective thinking alongside the other terminal
+    // fields (04 §3.3.5, upstream subagent-runner.ts:1601).
+    let terminal = crate::p1::parallel::classify_terminal(
+        result.exit_code,
+        result.timed_out,
+        result.process_signal.as_deref(),
+        run_control_flags(handle),
+    );
     set_step_field(handle, index, |step| {
-        step["status"] = if result.exit_code == 0 {
-            json!("complete")
-        } else {
-            json!("failed")
-        };
+        step["status"] = json!(terminal.as_status());
+        step["terminal"] = json!(terminal.as_status());
         step["exitCode"] = json!(result.exit_code);
         if let Some(model) = &result.model {
             step["model"] = json!(model);
+        }
+        if let Some(thinking) = &result.thinking {
+            step["thinking"] = json!(thinking);
         }
         if !result.attempted_models.is_empty() {
             step["attemptedModels"] = json!(result.attempted_models);
@@ -995,6 +1046,57 @@ fn record_step_result(
             }
         }
     });
+}
+
+/// Run-level control snapshot for terminal classification (a stop/interrupt
+/// can arrive mid-run; the flags are read when the child settles).
+fn run_control_flags(handle: &Arc<AsyncRunHandle>) -> crate::p1::parallel::RunControlFlags {
+    crate::p1::parallel::RunControlFlags {
+        stop_requested: handle.control.stop_requested(),
+        interrupt_requested: handle.control.interrupt_requested(),
+    }
+}
+
+/// Output collisions for a composite async body (R7.1.6.3; explicit and
+/// inherited-absolute claims, same rule as the dispatch paths).
+fn async_body_output_collision(
+    body: &AsyncBody,
+    agents: &[crate::agents::discover::AgentConfig],
+) -> Option<String> {
+    let agent_output = |agent_name: &str| {
+        crate::agents::discover::resolve_agent_name(agents, agent_name)
+            .ok()
+            .flatten()
+            .and_then(|agent| agent.output.as_deref())
+    };
+    let claims = match body {
+        AsyncBody::Single { .. } => return None,
+        AsyncBody::Tasks { entries, .. } => entries
+            .iter()
+            .filter_map(|entry| {
+                crate::p1::parallel::output_claim(
+                    format!(
+                        "tasks[{}] ({})",
+                        entry.spec.child_index, entry.spec.agent_name
+                    ),
+                    &entry.spec.output,
+                    agent_output(&entry.spec.agent_name),
+                )
+            })
+            .collect::<Vec<_>>(),
+        AsyncBody::Steps { steps, .. } => steps
+            .iter()
+            .enumerate()
+            .filter_map(|(index, step)| {
+                crate::p1::parallel::output_claim(
+                    format!("steps[{index}] ({})", step.agent_name),
+                    &step.output,
+                    agent_output(&step.agent_name),
+                )
+            })
+            .collect::<Vec<_>>(),
+    };
+    crate::p1::parallel::validate_output_collisions(&claims).err()
 }
 
 /// Drive a run and release its capacity slot on any terminal path — named
@@ -2171,6 +2273,129 @@ pub(crate) mod tests {
         std::fs::read_to_string(handle.run_dir.join("status.json")).unwrap_or_default()
     }
 
+    fn foreground_result(
+        exit_code: i32,
+        thinking: Option<&str>,
+    ) -> crate::runner::foreground::ForegroundRunResult {
+        crate::runner::foreground::ForegroundRunResult {
+            exit_code,
+            error: (exit_code != 0).then(|| "boom".to_string()),
+            final_output: "out".to_string(),
+            usage: json!({}),
+            model: Some("faux/1".to_string()),
+            thinking: thinking.map(str::to_string),
+            timed_out: false,
+            process_signal: None,
+            tool_count: 0,
+            turns: 1,
+            duration_ms: 1,
+            artifact_paths: None,
+            session_file: None,
+            messages: Vec::new(),
+            truncation: None,
+            attempted_models: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_step_result_persists_terminal_and_thinking() {
+        // T-9 (R7.1.6.2): the effective thinking lands in the same batched
+        // write as status/exitCode/model/attemptedModels/error.
+        let handle = gate_test_handle("thinking");
+        record_step_result(&handle, 0, &foreground_result(0, Some("high")));
+        let status = status_snapshot(&handle);
+        let step = &status["steps"][0];
+        assert_eq!(step["status"], json!("complete"));
+        assert_eq!(step["terminal"], json!("complete"));
+        assert_eq!(step["thinking"], json!("high"));
+        assert_eq!(step["model"], json!("faux/1"));
+        assert_eq!(step["exitCode"], json!(0));
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+
+        // D-R4: a stop-requested child is stopped, never failed.
+        let handle = gate_test_handle("stopped");
+        handle.control.request_stop();
+        record_step_result(&handle, 0, &foreground_result(1, None));
+        let status = status_snapshot(&handle);
+        assert_eq!(status["steps"][0]["status"], json!("stopped"));
+        assert_eq!(status["steps"][0]["terminal"], json!("stopped"));
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+
+        // Interrupt-requested runs settle as paused (D-R1).
+        let handle = gate_test_handle("paused");
+        handle.control.request_interrupt();
+        record_step_result(&handle, 0, &foreground_result(0, None));
+        assert_eq!(
+            status_snapshot(&handle)["steps"][0]["status"],
+            json!("paused")
+        );
+        let _ = std::fs::remove_dir_all(&handle.run_dir);
+        remove_status_gate(&handle.run_id);
+    }
+
+    #[test]
+    fn async_body_output_collision_is_rejected() {
+        // T-12/T-13 (R7.1.6.3): a programmatically built body with duplicate
+        // explicit outputs fails before spawning; distinct/absent outputs
+        // pass.
+        let entry = |index: u32, output: Value| crate::p1::parallel::TaskEntry {
+            key: format!("task-{index}"),
+            worktree_override: None,
+            spec: crate::p1::launch_child::ChildSpec {
+                agent_name: "scout".to_string(),
+                task: "t".to_string(),
+                model: None,
+                thinking: None,
+                context: None,
+                cwd: None,
+                output: match output {
+                    Value::String(path) => crate::p1::launch_child::OutputOverride::Path(
+                        std::path::PathBuf::from(path),
+                    ),
+                    Value::Bool(false) => crate::p1::launch_child::OutputOverride::Disabled,
+                    _ => crate::p1::launch_child::OutputOverride::Inherit,
+                },
+                timeout_ms: None,
+                child_index: index,
+                skills: None,
+                gate: None,
+                turn_budget: None,
+                tool_budget: None,
+                session_file: None,
+                steer_inbox: None,
+                skill_fallback_cwd: None,
+                skill_primary_cwd: None,
+            },
+        };
+        let body = AsyncBody::Tasks {
+            entries: vec![
+                entry(0, json!("report.md")),
+                entry(1, json!("other.md")),
+                entry(2, json!("report.md")),
+            ],
+            concurrency: 2,
+            worktree_plan: None,
+        };
+        let error = async_body_output_collision(&body, &[]).expect("duplicate explicit output");
+        assert!(error.contains("tasks[0] (scout)"), "{error}");
+        assert!(error.contains("tasks[2] (scout)"), "{error}");
+        let clean = AsyncBody::Tasks {
+            entries: vec![entry(0, json!("a.md")), entry(1, Value::Null)],
+            concurrency: 2,
+            worktree_plan: None,
+        };
+        assert!(async_body_output_collision(&clean, &[]).is_none());
+        assert!(async_body_output_collision(
+            &AsyncBody::Single {
+                spec: Box::new(entry(0, json!("a.md")).spec),
+            },
+            &[]
+        )
+        .is_none());
+    }
+
     #[test]
     fn status_writes_coalesce_at_gate_and_terminal_flushes() {
         use std::io::Read;
@@ -2275,23 +2500,23 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // The registry guard serializes tests against the process-global run
+    // registry and must span the awaits below; every test here runs on the
+    // current-thread runtime, so the std guard cannot deadlock.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_poll_dirty_check_suppresses_unchanged_frames() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let handled = {
-            let _guard = REGISTRY_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            let handle = wait_test_handle("steady", STATE_RUNNING);
-            register_run(handle.clone());
-            handle
-        };
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let handle = wait_test_handle("steady", STATE_RUNNING);
+        register_run(handle.clone());
 
         let pushes = AtomicUsize::new(0);
         let on_update = |_text: &str| {
             pushes.fetch_add(1, Ordering::Relaxed);
         };
-        let handle = handled;
         let result = wait_for_runs(None, true, 1100, Some(&on_update), None)
             .await
             .unwrap();
@@ -2310,22 +2535,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    // Same registry-guard discipline as the other wait tests: the global
+    // registry must stay owned for the whole await window, otherwise a
+    // parallel test's clear() can unregister this run mid-wait.
+    #[allow(clippy::await_holding_lock)]
     async fn wait_poll_pushes_on_terminal_change_next_round() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let handled = {
-            let _guard = REGISTRY_TEST_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            let handle = wait_test_handle("flip", STATE_RUNNING);
-            register_run(handle.clone());
-            handle
-        };
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let handle = wait_test_handle("flip", STATE_RUNNING);
+        register_run(handle.clone());
 
         // A state change lands 300ms into the wait → the next poll (≤250ms
         // later) must push and return (FR-B: state change → next round
         // push; first + terminal frames always push).
-        let handle = handled;
         let flip = handle.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
