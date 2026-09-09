@@ -383,7 +383,8 @@ pub struct DiscoverDiagnostic {
     pub error: String,
 }
 
-/// Frontmatter → AgentConfig (`loadAgentsFromDir` body, agents.ts:1510-1656).
+/// Frontmatter → AgentConfig (`loadAgentsFromDefinitionFiles` try-block body,
+/// agents.ts:1969-2157 @ v0.66.0).
 /// `Err` mirrors the upstream throws (invalid async/timeoutMs/package); the
 /// caller records it as a [`DiscoverDiagnostic`] and continues.
 /// `Ok(None)` = file skipped (missing name/description) exactly like the
@@ -481,7 +482,7 @@ pub fn agent_from_content(
     };
     let max_subagent_depth = match fm.get("maxSubagentDepth").map(String::as_str) {
         // `Number.isInteger(parsed) && parsed >= 0` — invalid values are
-        // ignored (undefined), not fatal (agents.ts:1592, 1614-1616).
+        // ignored (undefined), not fatal (agents.ts:2102 @ v0.66.0).
         Some(value) => value
             .parse::<i64>()
             .ok()
