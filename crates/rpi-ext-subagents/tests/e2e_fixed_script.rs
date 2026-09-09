@@ -1375,6 +1375,33 @@ fn e2e_fixed_child_full_pipeline() {
             "{content}"
         );
         assert!(content.contains("Fixed child result: analysis complete"));
+        // TE17 (R7.1.7.2): the notice carries the run id (`Child runs:`
+        // line, upstream notify.ts:252-256/306 @ v0.66) and — because this
+        // scenario's agent declares an output path — the saved output
+        // artifact path too (`Saved output:` line, additive, value-gated).
+        let run_id = content
+            .lines()
+            .find_map(|line| line.strip_prefix("Child runs: scout="))
+            .map(|rest| {
+                rest.split([' ', '('])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_default();
+        assert!(!run_id.is_empty(), "run id rides the notice: {content}");
+        assert!(
+            content.contains(&format!("Child runs: scout={run_id}")),
+            "run id rides the notice: {content}"
+        );
+        let saved_line = content
+            .lines()
+            .find_map(|line| line.strip_prefix("Saved output: "))
+            .unwrap_or_default();
+        assert!(
+            saved_line.ends_with(&format!("{run_id}_scout_0_output.md")),
+            "saved output artifact path rides the notice: {content}"
+        );
 
         // The registered renderer maps the message onto a ComponentTree
         // (host render dispatch).
@@ -1393,6 +1420,17 @@ fn e2e_fixed_child_full_pipeline() {
             .as_str()
             .unwrap()
             .starts_with("  ⎿  Fixed child result"));
+        // TE17: the muted run-id correlation line is visible in the
+        // collapsed state (upstream extension/index.ts:690-694 pattern).
+        let run_line = children
+            .iter()
+            .find(|child| {
+                child["props"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("  run: "))
+            })
+            .expect("run id line rendered in the collapsed notice");
+        assert_eq!(run_line["props"]["fg"], json!("muted"));
         // The old self-made type is gone.
         assert!(
             !messages

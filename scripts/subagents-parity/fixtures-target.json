@@ -34,8 +34,14 @@
           {
             "role": "assistant",
             "content": [
-              { "type": "text", "text": "line one" },
-              { "type": "text", "text": "line two" }
+              {
+                "type": "text",
+                "text": "line one"
+              },
+              {
+                "type": "text",
+                "text": "line two"
+              }
             ],
             "stopReason": "stop"
           }
@@ -47,8 +53,14 @@
           {
             "role": "assistant",
             "content": [
-              { "type": "text", "text": "   " },
-              { "type": "text", "text": "kept" }
+              {
+                "type": "text",
+                "text": "   "
+              },
+              {
+                "type": "text",
+                "text": "kept"
+              }
             ],
             "stopReason": "stop"
           }
@@ -145,39 +157,123 @@
         "error": "rate limit exceeded",
         "toolCount": 0,
         "messages": [
-          { "role": "assistant", "errorMessage": "rate limit exceeded" }
+          {
+            "role": "assistant",
+            "errorMessage": "rate limit exceeded"
+          }
         ]
       }
     ]
   },
   "discovery": {
-      "//": "TE15 R7.1.3 discovery-tree parity. Each leg materializes the same tree into its own sandbox user-agent dir: upstream substitutes `<CFGDIR>` with `.pi`, rpi with `.rpi`, and both normalize the config-dir segment back to `<CFGDIR>`. `linked-nested`/`cycle` symlinks are created on both legs on non-Windows platforms only (materialize.json records the same limitation). Scope is `user` on both sides so builtin catalogs do not participate.",
-      "cases": [
-          {
-              "name": "user-tree-robustness",
-              "tree": {
-                  "files": {
-                      "good.md": "---\nname: good-agent\ndescription: Valid fixture agent used by the discovery parity tree (R7.1.3, TE15).\ntools: read, bash\n---\n\nYou are a valid fixture agent. Reply with the requested text only.\n",
-                      "nested/good-nested.md": "---\nname: good-nested\ndescription: Valid nested fixture agent (recursive discovery).\ntools: read\n---\n\nNested fixture body.\n",
-                      "broken-frontmatter.md": "---\nname: broken-unterminated\ndescription: Frontmatter never closes (R7.1.3.1 malformed-definition fixture).\n\nBody without a closing delimiter.\n",
-                      "broken-no-colon.md": "---\nname: broken-no-colon\nthis line has no colon\ntools: read\n---\n\nBody after a malformed frontmatter line.\n",
-                      "broken-invalid-async.md": "---\nname: broken-async\ndescription: Fatal frontmatter (invalid async) - discovery must isolate it (R7.1.3.1 #1200).\nasync: maybe\ntools: read\n---\n\nThis file exists only to produce one discovery diagnostic.\n",
-                      "broken-invalid-timeout.md": "---\nname: broken-timeout\ndescription: Fatal frontmatter (invalid timeoutMs) - discovery must isolate it (R7.1.3.1 #1200).\ntimeoutMs: not-a-number\ntools: read\n---\n\nThis file exists only to produce one discovery diagnostic.\n",
-                      "sync-backups/pruned.md": "---\nname: sync-backup-agent\ndescription: Must be pruned by discovery (R7.1.3.2 `sync-backups`).\ntools: read\n---\n\nThis file exists only to prove the `sync-backups` directory is pruned.\n",
-                      "<CFGDIR>/pruned.md": "---\nname: hidden-rpi-agent\ndescription: Must be pruned by discovery (R7.1.3.2 `.rpi`).\ntools: read\n---\n\nThis file exists only to prove the `.rpi` directory is pruned.\n"
-                  },
-                  "symlinks": [
-                      {
-                          "path": "linked-nested",
-                          "target": "nested"
-                      },
-                      {
-                          "path": "cycle",
-                          "target": "."
-                      }
-                  ]
-              }
-          }
-      ]
+    "//": "TE15 R7.1.3 discovery-tree parity. Each leg materializes the same tree into its own sandbox user-agent dir: upstream substitutes `<CFGDIR>` with `.pi`, rpi with `.rpi`, and both normalize the config-dir segment back to `<CFGDIR>`. `linked-nested`/`cycle` symlinks are created on both legs on non-Windows platforms only (materialize.json records the same limitation). Scope is `user` on both sides so builtin catalogs do not participate.",
+    "cases": [
+      {
+        "name": "user-tree-robustness",
+        "tree": {
+          "files": {
+            "good.md": "---\nname: good-agent\ndescription: Valid fixture agent used by the discovery parity tree (R7.1.3, TE15).\ntools: read, bash\n---\n\nYou are a valid fixture agent. Reply with the requested text only.\n",
+            "nested/good-nested.md": "---\nname: good-nested\ndescription: Valid nested fixture agent (recursive discovery).\ntools: read\n---\n\nNested fixture body.\n",
+            "broken-frontmatter.md": "---\nname: broken-unterminated\ndescription: Frontmatter never closes (R7.1.3.1 malformed-definition fixture).\n\nBody without a closing delimiter.\n",
+            "broken-no-colon.md": "---\nname: broken-no-colon\nthis line has no colon\ntools: read\n---\n\nBody after a malformed frontmatter line.\n",
+            "broken-invalid-async.md": "---\nname: broken-async\ndescription: Fatal frontmatter (invalid async) - discovery must isolate it (R7.1.3.1 #1200).\nasync: maybe\ntools: read\n---\n\nThis file exists only to produce one discovery diagnostic.\n",
+            "broken-invalid-timeout.md": "---\nname: broken-timeout\ndescription: Fatal frontmatter (invalid timeoutMs) - discovery must isolate it (R7.1.3.1 #1200).\ntimeoutMs: not-a-number\ntools: read\n---\n\nThis file exists only to produce one discovery diagnostic.\n",
+            "sync-backups/pruned.md": "---\nname: sync-backup-agent\ndescription: Must be pruned by discovery (R7.1.3.2 `sync-backups`).\ntools: read\n---\n\nThis file exists only to prove the `sync-backups` directory is pruned.\n",
+            "<CFGDIR>/pruned.md": "---\nname: hidden-rpi-agent\ndescription: Must be pruned by discovery (R7.1.3.2 `.rpi`).\ntools: read\n---\n\nThis file exists only to prove the `.rpi` directory is pruned.\n"
+          },
+          "symlinks": [
+            {
+              "path": "linked-nested",
+              "target": "nested"
+            },
+            {
+              "path": "cycle",
+              "target": "."
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "notify": {
+    "//": "TE17 (R7.1.7.2) completion-notice cases. `format` feeds the upstream-shaped details to formatSingleCompletion on both legs; the Rust leg maps childRuns[0].runId to its single-run run_id. The `Saved output:` line is an rpi-only addition (upstream carries saved paths inside childOutputs blocks / preview text) and therefore NOT part of the byte-comparable slice - it is covered by crate unit tests. `parse` cases assert the shared parse projection (runId from childRuns[0]).",
+    "cases": [
+      {
+        "name": "single-basic",
+        "kind": "format",
+        "details": {
+          "agent": "scout",
+          "status": "completed",
+          "resultPreview": "all mapped",
+          "sessionLabel": "Session file",
+          "sessionValue": "/home/user/sessions/abc.jsonl"
+        }
+      },
+      {
+        "name": "run-id-with-handoff",
+        "kind": "format",
+        "details": {
+          "agent": "writer",
+          "status": "completed",
+          "resultPreview": "patch applied",
+          "handoffPath": "/tmp/handoff.md",
+          "childRuns": [
+            {
+              "agent": "writer",
+              "runId": "run-42",
+              "status": "completed"
+            }
+          ]
+        }
+      },
+      {
+        "name": "run-id-alone",
+        "kind": "format",
+        "details": {
+          "agent": "worker",
+          "status": "failed",
+          "resultPreview": "boom",
+          "childRuns": [
+            {
+              "agent": "worker",
+              "runId": "run-9",
+              "status": "failed"
+            }
+          ]
+        }
+      },
+      {
+        "name": "task-info-with-run-id",
+        "kind": "format",
+        "details": {
+          "agent": "scout",
+          "status": "completed",
+          "taskInfo": " (1/2)",
+          "resultPreview": "done",
+          "childRuns": [
+            {
+              "agent": "scout",
+              "runId": "run-7",
+              "status": "completed"
+            }
+          ]
+        }
+      },
+      {
+        "name": "parse-legacy-no-run-id",
+        "kind": "parse",
+        "content": "Background task completed: **scout**\n\nall mapped\n\nSession file: /home/user/sessions/abc.jsonl"
+      },
+      {
+        "name": "parse-roundtrip-run-id",
+        "kind": "parse",
+        "content": "Background task failed: **worker**\n\nboom\n\nChild runs: worker=run-9 (failed)"
+      },
+      {
+        "name": "parse-non-notify-text",
+        "kind": "parse",
+        "content": "random text without a completion header"
+      }
+    ]
   }
 }

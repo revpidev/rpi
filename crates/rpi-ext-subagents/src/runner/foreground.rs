@@ -949,7 +949,15 @@ fn persist_artifacts(
         "error": result.error,
         "timestamp": artifacts::format_iso8601(artifacts::now_millis()),
     });
-    let _ = artifacts::write_metadata(&paths.metadata_path, &metadata);
+    // TE17 R7.1.7.1: foreground child metadata is an auxiliary artifact —
+    // an exhausted write logs instead of dropping silently.
+    if let Err(error) = artifacts::write_metadata(&paths.metadata_path, &metadata) {
+        tracing::warn!(
+            path = %paths.metadata_path.display(),
+            error = %error,
+            "foreground child metadata write failed after retrying"
+        );
+    }
 }
 
 /// Exit-code and error synthesis (execution.ts:1085-1121, 1204-1247,

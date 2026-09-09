@@ -164,6 +164,32 @@ function fallbackCase(modelFallback, fixture) {
 	}
 }
 
+// TE17 notify leg (R7.1.7.2): drive the real v0.66 formatSingleCompletion /
+// parseSubagentNotifyContent. The parse projection mirrors the Rust leg's
+// notify_projection (undefined-dropping serializer == null-stripping).
+function notifyCase(notify, fixture) {
+	const kind = fixture.kind ?? "format";
+	if (kind === "format") {
+		return { text: notify.formatSingleCompletion(fixture.details ?? {}) };
+	}
+	if (kind === "parse") {
+		const parsed = notify.parseSubagentNotifyContent(fixture.content ?? "");
+		if (!parsed) return null;
+		return {
+			agent: parsed.agent,
+			status: parsed.status,
+			source: parsed.source,
+			taskInfo: parsed.taskInfo,
+			resultPreview: parsed.resultPreview,
+			runId: parsed.childRuns?.[0]?.runId ?? parsed.workflowRunId,
+			handoffPath: parsed.handoffPath,
+			sessionLabel: parsed.sessionLabel,
+			sessionValue: parsed.sessionValue,
+		};
+	}
+	throw new Error(`unknown notify fixture kind: ${kind}`);
+}
+
 function loadArgsGolden() {
 	const golden = JSON.parse(readFileSync(ARGS_GOLDEN, "utf-8"));
 	const byName = new Map();
@@ -246,11 +272,16 @@ async function main() {
 	const fixturePath = process.argv[3];
 	if (!mode || !fixturePath) {
 		console.error(
-			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback|discovery> <fixture.json>",
+			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback|discovery|notify> <fixture.json>",
 		);
 		process.exit(2);
 	}
 	const { piArgs, frontmatter, utils, modelFallback } = await loadUpstream();
+	// TE17: the notify modules only exist in the v0.66 snapshot (v0.48 has
+	// no childRuns face), so the notify mode is target-track only.
+	const notify = mode === "notify"
+		? await import(moduleUrl(TARGET_ROOT, "src/runs/background/notify.ts"))
+		: undefined;
 	const fixtures = JSON.parse(readFileSync(fixturePath, "utf-8"));
 	const golden = mode === "args" && TRACK === "target" ? loadArgsGolden() : null;
 	for (const fixture of fixtures.cases ?? []) {
@@ -270,6 +301,8 @@ async function main() {
 			output = fallbackCase(modelFallback, fixture);
 		} else if (mode === "discovery") {
 			output = await discoveryCase(fixture);
+		} else if (mode === "notify") {
+			output = notifyCase(notify, fixture);
 		} else {
 			console.error(`upstream-runner: unknown mode ${mode}`);
 			process.exit(2);

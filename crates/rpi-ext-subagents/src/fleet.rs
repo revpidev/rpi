@@ -581,6 +581,8 @@ mod tests {
             control: Arc::new(crate::runner::background::AsyncControl::default()),
             run_dir: std::path::PathBuf::from("/tmp/fleet-test"),
             started_ms,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
         });
         ASYNC_RUNS
             .lock()

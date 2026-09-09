@@ -812,7 +812,16 @@ pub fn write_handoff_manifest(
         }],
     });
     let path = handoff_dir.join(format!("{run_id}.json"));
-    let _ = crate::artifacts::write_metadata(&path, &manifest);
+    // TE17 R7.1.7.1: the handoff manifest is an auxiliary artifact — an
+    // exhausted write logs (and the caller keeps the path it was given)
+    // instead of dropping the failure silently.
+    if let Err(error) = crate::artifacts::write_metadata(&path, &manifest) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %error,
+            "worktree handoff manifest write failed after retrying"
+        );
+    }
     path
 }
 

@@ -18,10 +18,14 @@ use serde_json::{json, Value};
 
 use crate::runner::display::{format_duration, shorten_path};
 
-/// `SubagentNotifyDetails` (notify.ts:20-30) — the parsed projection of one
-/// completion. `source` is always async in rpi (no detached foreground
-/// face), so the foreground variant of `task_kind` is unreachable but kept
-/// for parse parity.
+/// `SubagentNotifyDetails` (notify.ts:20-30 @ v0.48; v0.66 :23-47) — the
+/// parsed projection of one completion. `source` is always async in rpi
+/// (no detached foreground face), so the foreground variant of `task_kind`
+/// is unreachable but kept for parse parity. `run_id`/`output_path` are
+/// the v0.7.2 completion-notice additions (R7.1.7.2, #1629/#1938): upstream
+/// carries them as `childRuns[0].runId` and the child's saved-output
+/// reference; older messages and third-party notices simply lack them
+/// (both parse to `None`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentNotifyDetails {
     pub agent: String,
@@ -30,6 +34,8 @@ pub struct SubagentNotifyDetails {
     pub task_info: Option<String>,
     pub result_preview: String,
     pub duration_ms: Option<u64>,
+    pub run_id: Option<String>,
+    pub output_path: Option<String>,
     pub handoff_path: Option<String>,
     pub session_label: Option<String>,
     pub session_value: Option<String>,
@@ -44,9 +50,29 @@ fn format_session_line(details: &SubagentNotifyDetails) -> Option<String> {
     }
 }
 
-/// `formatSingleCompletion` (notify.ts:93-107): the single-completion
-/// content text. `taskKind` is "Background task" (async) or "Detached
-/// foreground task" (:95).
+/// `formatChildRun` (notify.ts:252-256 @ v0.66) for the single-run
+/// projection: `` `${label}=${runId}${status ? ` (${status})` : ""}` `` —
+/// prefixed with the upstream `Child runs:` marker (notify.ts:306).
+fn format_child_runs_line(details: &SubagentNotifyDetails) -> Option<String> {
+    let run_id = details.run_id.as_deref()?;
+    if run_id.trim().is_empty() {
+        return None;
+    }
+    let base = format!("{}={}", details.agent, run_id);
+    Some(if details.status.is_empty() {
+        format!("Child runs: {base}")
+    } else {
+        format!("Child runs: {base} ({})", details.status)
+    })
+}
+
+/// `formatSingleCompletion` (notify.ts:93-107 @ v0.48; v0.66 :284-309 — the
+/// rpi slice keeps the shared fields): the single-completion content text.
+/// `taskKind` is "Background task" (async) or "Detached foreground task"
+/// (:95). Line order follows v0.66: header → preview → saved-output →
+/// handoff → correlation (`Child runs:`) → session, with the upstream
+/// blank-line rule (the correlation block skips its blank line when a
+/// handoff line already opened the metadata area, notify.ts:300).
 pub fn format_single_completion(details: &SubagentNotifyDetails) -> String {
     let task_kind = if details.source == Some("foreground") {
         "Detached foreground task"
@@ -66,11 +92,24 @@ pub fn format_single_completion(details: &SubagentNotifyDetails) -> String {
     } else {
         preview.to_string()
     });
+    if details.output_path.is_some() {
+        lines.push(String::new());
+    }
+    if let Some(output) = &details.output_path {
+        lines.push(format!("Saved output: {output}"));
+    }
     if details.handoff_path.is_some() {
         lines.push(String::new());
     }
     if let Some(handoff) = &details.handoff_path {
         lines.push(format!("Parallel handoff: {handoff}"));
+    }
+    let run_line = format_child_runs_line(details);
+    if run_line.is_some() && details.output_path.is_none() && details.handoff_path.is_none() {
+        lines.push(String::new());
+    }
+    if let Some(run_line) = run_line {
+        lines.push(run_line);
     }
     if format_session_line(details).is_some() {
         lines.push(String::new());
@@ -81,9 +120,12 @@ pub fn format_single_completion(details: &SubagentNotifyDetails) -> String {
     lines.join("\n")
 }
 
-/// `parseSubagentNotifyContent` (notify.ts:109-144): re-derive the details
-/// from the content text. Returns None when the first line does not match
-/// the completion header.
+/// `parseSubagentNotifyContent` (notify.ts:109-144 @ v0.48; v0.66
+/// :311-382): re-derive the details from the content text. Returns None
+/// when the first line does not match the completion header. The v0.66
+/// additions parse back with the same tolerance: a `Child runs:` line
+/// yields `run_id` (first entry, notify.ts:336-353) and a `Saved output:`
+/// line yields `output_path`; older messages without them keep both None.
 pub fn parse_subagent_notify_content(content: &str) -> Option<SubagentNotifyDetails> {
     let lines: Vec<&str> = content.split('\n').collect();
     let first = lines.first().copied().unwrap_or_default();
@@ -131,14 +173,25 @@ pub fn parse_subagent_notify_content(content: &str) -> Option<SubagentNotifyDeta
     let handoff_index = body
         .iter()
         .position(|line| line.starts_with("Parallel handoff: "));
+    let child_runs_index = body
+        .iter()
+        .position(|line| line.starts_with("Child runs: "));
+    let saved_output_index = body
+        .iter()
+        .position(|line| line.starts_with("Saved output: "));
 
     // resultPreview: body up to the first metadata block (trailing blank
     // line before it dropped).
-    let first_metadata = [session_index, handoff_index]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(body.len());
+    let first_metadata = [
+        session_index,
+        handoff_index,
+        child_runs_index,
+        saved_output_index,
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(body.len());
     let result_end = if first_metadata > 0
         && body
             .get(first_metadata - 1)
@@ -162,6 +215,31 @@ pub fn parse_subagent_notify_content(content: &str) -> Option<SubagentNotifyDeta
             .trim()
             .to_string()
     });
+    // `Child runs: label=runId (status), …` → the single-run projection
+    // takes the first entry's runId (upstream parses every entry,
+    // notify.ts:336-353; a single-run notice only ever carries one).
+    let run_id = child_runs_index.and_then(|i| {
+        let entries = body[i].strip_prefix("Child runs: ")?;
+        let first_entry = entries.split(", ").next()?;
+        // `${label}=${runId}${status}` — strip the optional trailing status.
+        let raw = match first_entry.find(" (") {
+            Some(open) => &first_entry[..open],
+            None => first_entry,
+        };
+        let run_id = match raw.split_once('=') {
+            Some((_, run_id)) => run_id,
+            None => raw,
+        };
+        let run_id = run_id.trim();
+        (!run_id.is_empty()).then(|| run_id.to_string())
+    });
+    let output_path = saved_output_index.map(|i| {
+        body[i]
+            .strip_prefix("Saved output: ")
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    });
     let (session_label, session_value) = match session_line {
         Some(line) => match line.find(':') {
             Some(separator) => (
@@ -180,6 +258,8 @@ pub fn parse_subagent_notify_content(content: &str) -> Option<SubagentNotifyDeta
         task_info,
         result_preview,
         duration_ms: None,
+        run_id,
+        output_path,
         handoff_path,
         session_label,
         session_value,
@@ -216,6 +296,14 @@ fn details_from_message(message: &Value) -> Option<SubagentNotifyDetails> {
             .unwrap_or_default()
             .to_string(),
         duration_ms: details.get("durationMs").and_then(Value::as_u64),
+        run_id: details
+            .get("runId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        output_path: details
+            .get("outputPath")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         handoff_path: details
             .get("handoffPath")
             .and_then(Value::as_str)
@@ -321,6 +409,22 @@ pub fn render_subagent_notify(message: &Value, options: &Value) -> Value {
             "props": { "text": "  Ctrl+O full notification", "dim": true },
         }));
     }
+    // v0.66 muted correlation lines (extension/index.ts:690-694 @ 0fc0eebb
+    // — `workflow:`/`children:`): rpi surfaces the single run id the same
+    // way, unconditionally in BOTH collapse states (it is the actionable
+    // `status {id}` handle), plus the saved output path when present.
+    if let Some(run_id) = &details.run_id {
+        children.push(json!({
+            "type": "text",
+            "props": { "text": format!("  run: {run_id}"), "fg": "muted" },
+        }));
+    }
+    if let Some(output) = &details.output_path {
+        children.push(json!({
+            "type": "text",
+            "props": { "text": format!("  output: {}", shorten_path(output)), "fg": "muted" },
+        }));
+    }
     if let (Some(_), Some(value)) = (&details.session_label, &details.session_value) {
         children.push(json!({
             "type": "text",
@@ -410,6 +514,8 @@ mod tests {
             task_info: None,
             result_preview: preview.to_string(),
             duration_ms: Some(185_000),
+            run_id: None,
+            output_path: None,
             handoff_path: None,
             session_label: Some("Session file".to_string()),
             session_value: Some("/home/user/sessions/abc.jsonl".to_string()),
@@ -536,5 +642,142 @@ mod tests {
             "details": { "event": { "type": "needs_attention", "agent": "scout" } },
         }));
         assert_eq!(tree["props"]["text"], json!("control notice"));
+    }
+
+    // ---- TE17 (R7.1.7.2): runId + saved output path in the notice ----
+
+    #[test]
+    fn completion_text_carries_run_id_and_saved_output() {
+        // The v0.66 single-run slice: saved output and handoff open the
+        // metadata area, the `Child runs:` line follows the upstream
+        // blank-line rule (no blank after a handoff line, notify.ts:300).
+        let mut d = details("scout", "completed", "all mapped");
+        d.run_id = Some("run-123".to_string());
+        d.output_path = Some("/tmp/artifacts/run-123_scout_output.md".to_string());
+        d.handoff_path = Some("/tmp/handoff.md".to_string());
+        let text = format_single_completion(&d);
+        let expected = [
+            "Background task completed: **scout**",
+            "",
+            "all mapped",
+            "",
+            "Saved output: /tmp/artifacts/run-123_scout_output.md",
+            "",
+            "Parallel handoff: /tmp/handoff.md",
+            "Child runs: scout=run-123 (completed)",
+            "",
+            "Session file: /home/user/sessions/abc.jsonl",
+        ]
+        .join("\n");
+        assert_eq!(
+            text, expected,
+            "line order + blank-line rule match upstream v0.66"
+        );
+        // Round trip: parse re-derives every new field.
+        let parsed = parse_subagent_notify_content(&text).unwrap();
+        assert_eq!(parsed.run_id.as_deref(), Some("run-123"));
+        assert_eq!(
+            parsed.output_path.as_deref(),
+            Some("/tmp/artifacts/run-123_scout_output.md")
+        );
+        assert_eq!(parsed.handoff_path.as_deref(), Some("/tmp/handoff.md"));
+        assert_eq!(parsed.result_preview, "all mapped");
+    }
+
+    #[test]
+    fn completion_text_run_id_without_handoff_gets_blank_line() {
+        // Correlation-first notices (no handoff, no saved output) prepend
+        // the blank line themselves (upstream: `correlationLines.length &&
+        // !details.handoffPath ? "" : undefined`).
+        let mut d = details("worker", "failed", "boom");
+        d.run_id = Some("run-9".to_string());
+        d.session_label = None;
+        d.session_value = None;
+        let text = format_single_completion(&d);
+        assert_eq!(
+            text,
+            "Background task failed: **worker**\n\nboom\n\nChild runs: worker=run-9 (failed)"
+        );
+        assert_eq!(
+            parse_subagent_notify_content(&text).unwrap().run_id,
+            Some("run-9".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_notice_without_new_keys_still_parses() {
+        // A v0.48-shaped notice (the pre-TE17 rpi output): parse yields
+        // None for both new fields and never errors.
+        let d = details("scout", "completed", "line one");
+        let text = format_single_completion(&d);
+        assert!(!text.contains("Child runs:"));
+        assert!(!text.contains("Saved output:"));
+        let parsed = parse_subagent_notify_content(&text).unwrap();
+        assert_eq!(parsed.run_id, None);
+        assert_eq!(parsed.output_path, None);
+        // Third-party text with a Child runs line but no header → None.
+        assert!(parse_subagent_notify_content("Child runs: a=b").is_none());
+    }
+
+    #[test]
+    fn renderer_shows_run_id_in_both_collapse_states() {
+        let mut d = details("scout", "completed", "line one\nline two");
+        d.run_id = Some("run-123".to_string());
+        d.output_path =
+            Some("/home/user/.rpi/subagents/artifacts/run-123_scout_output.md".to_string());
+        let message = json!({
+            "customType": "subagent-notify",
+            "content": format_single_completion(&d),
+        });
+        for expanded in [false, true] {
+            let tree = render_subagent_notify(&message, &json!({ "expanded": expanded }));
+            let texts: Vec<&str> = tree["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|child| child["props"]["text"].as_str().unwrap_or_default())
+                .collect();
+            assert!(
+                texts.contains(&"  run: run-123"),
+                "run id visible when expanded={expanded}: {texts:?}"
+            );
+            assert!(
+                texts.iter().any(|text| text.starts_with("  output: ")),
+                "saved output visible when expanded={expanded}: {texts:?}"
+            );
+        }
+        // An injected-details message renders them too (details-carrying
+        // wire shape).
+        let tree = render_subagent_notify(
+            &json!({
+                "content": "x",
+                "details": {
+                    "agent": "scout",
+                    "status": "completed",
+                    "resultPreview": "p",
+                    "runId": "run-77",
+                    "outputPath": "/tmp/o.md",
+                }
+            }),
+            &json!({ "expanded": false }),
+        );
+        let texts: Vec<&str> = tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["props"]["text"].as_str().unwrap_or_default())
+            .collect();
+        assert!(texts.contains(&"  run: run-77"));
+    }
+
+    #[test]
+    fn multi_entry_child_runs_line_parses_first_run() {
+        // Upstream notices from real workflows may carry several entries;
+        // the single-run projection takes the first runId.
+        let text = "Background task completed: **workflow**\n\nok\n\nChild runs: a=run-1 (completed), b=run-2 (failed)\n\nSession file: /s.jsonl";
+        let parsed = parse_subagent_notify_content(text).unwrap();
+        assert_eq!(parsed.run_id.as_deref(), Some("run-1"));
+        assert_eq!(parsed.result_preview, "ok");
+        assert_eq!(parsed.session_value.as_deref(), Some("/s.jsonl"));
     }
 }

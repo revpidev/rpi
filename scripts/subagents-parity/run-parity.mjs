@@ -54,7 +54,7 @@ const GENERATED = resolve(
 );
 const MODES =
 	TRACK === "target"
-		? ["args", "frontmatter", "final-output", "fallback", "discovery"]
+		? ["args", "frontmatter", "final-output", "fallback", "discovery", "notify"]
 		: ["args", "frontmatter", "final-output"];
 
 // Session paths in fixtures.json use the /sess/root placeholder; both legs

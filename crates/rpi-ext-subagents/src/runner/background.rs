@@ -65,6 +65,15 @@ pub struct AsyncRunHandle {
     /// Wall-clock start (epoch ms) for the completion-notification
     /// `durationMs` (notify.ts buildCompletionDetails).
     pub started_ms: u64,
+    /// R7.1.7.1: latched once a non-terminal status write exhausts the
+    /// retry ladder (dedupes `run.status_write_failed` events until a
+    /// write succeeds again — upstream `statusPersistenceDegraded`,
+    /// subagent-executor.ts:5130-5164 @ 0fc0eebb).
+    pub status_write_degraded: std::sync::atomic::AtomicBool,
+    /// R7.1.7.1: a terminal status-write failure deferred until after the
+    /// terminal event line, so consumers see the terminal state first and
+    /// the diagnostic second (task TE17 §3.2). Flushed by the finish paths.
+    pub pending_status_write_failure: std::sync::Mutex<Option<Value>>,
 }
 
 #[derive(Debug, Default)]
@@ -273,8 +282,14 @@ fn update_status(handle: &AsyncRunHandle, mutate: impl FnOnce(&mut Value)) {
             .as_ref()
             .and_then(Value::as_str)
             .is_some_and(is_terminal_state);
+    // A terminal document defers its write-failure diagnostic until after
+    // the terminal event line (TE17 §3.2); the run is ending either way.
+    let terminal_doc = state_after
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(is_terminal_state);
     if immediate {
-        let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
+        persist_status(handle, &status, terminal_doc);
         with_status_gate(&handle.run_id, |gate| {
             gate.last_write = Some(std::time::Instant::now());
             gate.dirty = false;
@@ -289,7 +304,7 @@ fn update_status(handle: &AsyncRunHandle, mutate: impl FnOnce(&mut Value)) {
             .last_write
             .is_none_or(|last| last.elapsed() >= STATUS_WRITE_GATE_MS);
         if due {
-            let _ = crate::artifacts::write_metadata(&handle.run_dir.join("status.json"), &status);
+            persist_status(handle, &status, false);
             gate.last_write = Some(std::time::Instant::now());
             gate.dirty = false;
         } else {
@@ -298,6 +313,60 @@ fn update_status(handle: &AsyncRunHandle, mutate: impl FnOnce(&mut Value)) {
             gate.dirty = true;
         }
     });
+}
+
+/// Diagnostic payload for an exhausted status/result write (R7.1.7.1;
+/// minimal set per task TE17 §3.2 — `{runId, path, kind, attempts}` plus the
+/// error text, mirroring upstream's message-bearing event,
+/// subagent-executor.ts:5110-5115 @ 0fc0eebb).
+fn write_failure_payload(run_id: &str, path: &Path, error: &std::io::Error) -> Value {
+    json!({
+        "runId": run_id,
+        "path": path.to_string_lossy(),
+        "kind": format!("{:?}", error.kind()),
+        "attempts": crate::artifacts::write_attempts_for(error),
+        "error": error.to_string(),
+    })
+}
+
+/// Persist one status document, classifying an exhausted write (TE17
+/// R7.1.7.1): terminal documents defer their diagnostic until the terminal
+/// event line has been appended (consumers see the state first); non-terminal
+/// writes emit `run.status_write_failed` immediately, deduped by the
+/// degraded latch until a write succeeds again.
+fn persist_status(handle: &AsyncRunHandle, status: &Value, terminal_doc: bool) {
+    use std::sync::atomic::Ordering;
+    let path = handle.run_dir.join("status.json");
+    match crate::artifacts::write_metadata(&path, status) {
+        Ok(()) => {
+            handle.status_write_degraded.store(false, Ordering::Relaxed);
+        }
+        Err(error) => {
+            let payload = write_failure_payload(&handle.run_id, &path, &error);
+            if terminal_doc {
+                *handle
+                    .pending_status_write_failure
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(payload);
+            } else if !handle.status_write_degraded.swap(true, Ordering::Relaxed) {
+                append_event(handle.run_dir.as_path(), "run.status_write_failed", payload);
+            }
+        }
+    }
+}
+
+/// Flush a terminal status-write failure after the terminal event line
+/// (finish paths call this between `run.finished`/`run.failed`/`control.stop`
+/// and the completion notification).
+fn flush_pending_status_write_failure(handle: &AsyncRunHandle) {
+    if let Some(payload) = handle
+        .pending_status_write_failure
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        append_event(handle.run_dir.as_path(), "run.status_write_failed", payload);
+    }
 }
 
 fn append_event(run_dir: &Path, event: &str, data: Value) {
@@ -348,7 +417,16 @@ impl SpawnBudgetLedger {
     }
 
     fn write(&self, value: &Value) {
-        let _ = crate::artifacts::write_metadata(&self.path, value);
+        // TE17 R7.1.7.1: the ledger is a cross-process advisory file with no
+        // run-scoped event channel — an exhausted write logs instead of
+        // being silently dropped (`let _ =` is banned crate-wide).
+        if let Err(error) = crate::artifacts::write_metadata(&self.path, value) {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %error,
+                "spawn-budget ledger write failed after retrying"
+            );
+        }
     }
 
     /// Run `body` under the ledger's advisory cross-process lock (flock on a
@@ -513,16 +591,24 @@ impl ActiveAsyncCapacity {
             if claimed.is_err() {
                 continue;
             }
-            let _ = crate::artifacts::write_metadata(
-                &owner,
-                &json!({
-                    "reservationToken": run_id,
-                    "runId": run_id,
-                    "reservedAt": iso8601(now_millis()),
-                    "ownerPid": std::process::id(),
-                    "kind": "runner",
-                }),
-            );
+            let owner_payload = json!({
+                "reservationToken": run_id,
+                "runId": run_id,
+                "reservedAt": iso8601(now_millis()),
+                "ownerPid": std::process::id(),
+                "kind": "runner",
+            });
+            if let Err(error) = crate::artifacts::write_metadata(&owner, &owner_payload) {
+                // TE17 R7.1.7.1: capacity-slot owner files are advisory
+                // cross-process markers (no run event channel) — log the
+                // exhausted write instead of dropping it silently.
+                tracing::warn!(
+                    run_id,
+                    path = %owner.display(),
+                    error = %error,
+                    "capacity slot owner write failed after retrying"
+                );
+            }
             return Ok(slot_dir);
         }
         Err(format!(
@@ -697,6 +783,8 @@ pub fn start_run(run_id: &str, session_id: Option<&str>, body: &AsyncBody) -> Ar
         control: Arc::new(AsyncControl::default()),
         run_dir: run_dir.clone(),
         started_ms: now_millis(),
+        status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+        pending_status_write_failure: std::sync::Mutex::new(None),
     });
     {
         let mut current = status.write().unwrap_or_else(|e| e.into_inner());
@@ -807,6 +895,20 @@ pub async fn drive_run(
                     if let Some(session_file) = &outcome.result.session_file {
                         set_step_field(&handle, 0, |step| {
                             step["sessionFile"] = json!(session_file.to_string_lossy());
+                        });
+                    }
+                    // Same step fields as the parallel/chain paths so the
+                    // completion notice can resolve the saved output path
+                    // (R7.1.7.2: `artifactPaths.outputPath` →
+                    // `savedOutputPath`, parallel.rs/chain.rs parity).
+                    if let Some(paths) = &outcome.result.artifact_paths {
+                        set_step_field(&handle, 0, |step| {
+                            step["artifactPaths"] = paths.to_json();
+                        });
+                    }
+                    if let Some(saved) = &outcome.saved_output_path {
+                        set_step_field(&handle, 0, |step| {
+                            step["savedOutputPath"] = json!(saved.to_string_lossy());
                         });
                     }
                     let ok = outcome.result.exit_code == 0;
@@ -1147,17 +1249,26 @@ impl AsyncNotify {
             "output": output,
             "completedAt": iso8601(now_millis()),
         });
-        let _ = crate::artifacts::write_metadata(&result_path, &result);
+        // R7.1.7.3 (#1981): the result file is persisted BEFORE
+        // sendMessage — save first, report success after. An exhausted
+        // write (R7.1.7.1) flips the notice to failure semantics with the
+        // upstream message (subagent-runner.ts:4981-4988 @ 0fc0eebb) and
+        // never advertises a saved-output path that does not exist.
+        let result_write = crate::artifacts::write_metadata(&result_path, &result);
+        if let Err(error) = &result_write {
+            append_event(
+                handle.run_dir.as_path(),
+                "run.result_write_failed",
+                write_failure_payload(run_id, &result_path, error),
+            );
+        }
 
-        let notify_status: &'static str = match state {
-            STATE_COMPLETE => "completed",
-            STATE_STOPPED => "stopped",
-            _ => "failed",
-        };
         // agent: the run's last declared step agent (single/chain carry the
         // child agents; a parallel batch reports its mode — upstream's
         // CompletionNotification.agent comes from the run record).
         let steps = status["steps"].as_array().cloned().unwrap_or_default();
+        let (notify_status, notice_output, output_path) =
+            resolve_notice(state, output, &steps, &result_write, &result_path);
         let agent = steps
             .iter()
             .rev()
@@ -1166,13 +1277,18 @@ impl AsyncNotify {
         let session_file = steps
             .iter()
             .find_map(|step| step["sessionFile"].as_str().map(str::to_string));
+        // R7.1.7.2 (#1629/#1938): the notice carries the run id (parent can
+        // `status {id}` immediately) and the saved output artifact path when
+        // one exists.
         let details = crate::messages::SubagentNotifyDetails {
             agent,
             status: notify_status,
             source: None,
             task_info: None,
-            result_preview: output.to_string(),
+            result_preview: notice_output,
             duration_ms: Some(now_millis().saturating_sub(handle.started_ms)),
+            run_id: Some(run_id.clone()),
+            output_path,
             handoff_path: handoff_path.map(|p| p.to_string_lossy().to_string()),
             session_label: session_file.as_deref().map(|_| "Session file".to_string()),
             session_value: session_file,
@@ -1215,6 +1331,57 @@ impl AsyncNotify {
     }
 }
 
+/// Saved output artifact path from the run's step records (R7.1.7.2):
+/// `artifactPaths.outputPath` first, `savedOutputPath` as fallback — same
+/// resolution as render.rs `artifact_output_path` / upstream
+/// `childSavedOutputPath` (notify.ts:160-163 @ 0fc0eebb).
+fn saved_output_path(steps: &[Value]) -> Option<String> {
+    steps.iter().rev().find_map(|step| {
+        step.get("artifactPaths")
+            .and_then(|paths| paths.get("outputPath"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .or_else(|| {
+                step.get("savedOutputPath")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+            })
+            .map(str::to_string)
+    })
+}
+
+/// Notice resolution for one completion (TE17 R7.1.7.2/.3): how the result
+/// write outcome shapes the notice. `Ok` keeps the run's real terminal
+/// status and may advertise the saved output path; `Err` (retry ladder
+/// exhausted, R7.1.7.1) flips the notice to failure semantics with the
+/// upstream message (subagent-runner.ts:4981-4988 @ 0fc0eebb) and never
+/// advertises an output path. Pure — unit-tested with injected failures.
+fn resolve_notice(
+    state: &str,
+    output: &str,
+    steps: &[Value],
+    result_write: &std::io::Result<()>,
+    result_path: &Path,
+) -> (&'static str, String, Option<String>) {
+    let status: &'static str = match state {
+        STATE_COMPLETE => "completed",
+        STATE_STOPPED => "stopped",
+        _ => "failed",
+    };
+    match result_write {
+        Ok(()) => (status, output.to_string(), saved_output_path(steps)),
+        Err(error) => (
+            "failed",
+            format!(
+                "Failed to write result file {}: {}",
+                result_path.display(),
+                error
+            ),
+            None,
+        ),
+    }
+}
+
 /// `finish` without a handoff manifest (single/chain paths).
 async fn finish(handle: &Arc<AsyncRunHandle>, state: &str, output: &str, notify: &AsyncNotify) {
     finish_with_handoff(handle, state, output, None, notify).await;
@@ -1245,6 +1412,9 @@ async fn finish_with_handoff(
         "run.finished",
         json!({ "runId": handle.run_id, "state": state }),
     );
+    // Terminal status-write failures surface after the terminal event line
+    // (TE17 R7.1.7.1: state first, diagnostic second).
+    flush_pending_status_write_failure(handle);
     notify.send(handle, state, output, handoff_path).await;
     // Terminal handle stays registered (see prune_terminal_runs): wait/stop
     // poll this table for the terminal transition.
@@ -1261,6 +1431,7 @@ async fn finish_failed(handle: &Arc<AsyncRunHandle>, error: &str, notify: &Async
         "run.failed",
         json!({ "runId": handle.run_id, "error": error }),
     );
+    flush_pending_status_write_failure(handle);
     notify.send(handle, STATE_FAILED, error, None).await;
     prune_terminal_runs();
 }
@@ -1409,6 +1580,9 @@ pub async fn harvest_for_shutdown() {
             "control.stop",
             json!({ "runId": handle.run_id, "reason": "host-shutdown" }),
         );
+        // The host-shutdown stop is terminal too: surface a deferred
+        // status-write failure after the terminal event (TE17 R7.1.7.1).
+        flush_pending_status_write_failure(handle);
         unregister_run(&handle.run_id);
     }
 }
@@ -1458,12 +1632,23 @@ pub fn reconcile_stale_runs() {
         status["state"] = json!(STATE_FAILED);
         status["error"] = json!("stale: owning host process exited before the run finished");
         status["updatedAt"] = json!(iso8601(now_millis()));
-        let _ = crate::artifacts::write_metadata(&status_path, &status);
+        let write_result = crate::artifacts::write_metadata(&status_path, &status);
         append_event(
             &run_dir,
             "run.reconciled",
             json!({ "reason": "owner-dead", "reapedChildPids": reaped }),
         );
+        // The reconciled write is terminal: a failure surfaces after
+        // run.reconciled (TE17 R7.1.7.1 — no run handle exists here, so the
+        // event carries the runId from the status document).
+        if let Err(error) = write_result {
+            let run_id = status["runId"].as_str().unwrap_or("unknown");
+            append_event(
+                &run_dir,
+                "run.status_write_failed",
+                write_failure_payload(run_id, &status_path, &error),
+            );
+        }
     }
 }
 
@@ -2002,6 +2187,8 @@ pub(crate) mod tests {
             control: Arc::new(AsyncControl::default()),
             run_dir: std::env::temp_dir(),
             started_ms,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
         });
         register_run(handle.clone());
         handle
@@ -2047,9 +2234,213 @@ pub(crate) mod tests {
             control: Arc::new(AsyncControl::default()),
             run_dir: std::env::temp_dir(),
             started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
         });
         register_run(handle.clone());
         handle
+    }
+
+    // ---- TE17 (R7.1.7.1/.2/.3): write retry, diagnostics, notice v2 ----
+
+    fn te17_handle(tag: &str) -> (Arc<AsyncRunHandle>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-te17-{tag}-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: format!("te17-{tag}"),
+            status: Arc::new(RwLock::new(
+                json!({ "runId": "te17", "state": STATE_RUNNING }),
+            )),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        (handle, dir)
+    }
+
+    /// Deterministic write failure: a DIRECTORY parked on the target path
+    /// makes the atomic rename fail (EISDIR — not retryable) without any
+    /// disk-full or permission orchestration (task §8.5 seam choice).
+    fn block_target(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn write_failure_payload_carries_the_minimal_set() {
+        let error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let payload = write_failure_payload("run-1", Path::new("/x/status.json"), &error);
+        assert_eq!(payload["runId"], json!("run-1"));
+        assert_eq!(payload["path"], json!("/x/status.json"));
+        assert_eq!(
+            payload["attempts"],
+            json!(crate::artifacts::WRITE_METADATA_MAX_ATTEMPTS)
+        );
+        assert!(payload["kind"].is_string());
+        assert!(payload["error"].is_string());
+        // Non-retryable errors attribute a single attempt.
+        let error = std::io::Error::from_raw_os_error(libc::EACCES);
+        let payload = write_failure_payload("run-1", Path::new("/x/status.json"), &error);
+        assert_eq!(payload["attempts"], json!(1));
+    }
+
+    #[test]
+    fn terminal_status_write_failure_defers_until_after_terminal_event() {
+        let (handle, dir) = te17_handle("terminal-defer");
+        block_target(&dir.join("status.json"));
+        // A terminal document: the failure parks on the handle instead of
+        // emitting immediately.
+        persist_status(
+            &handle,
+            &json!({ "runId": "te17-terminal-defer", "state": STATE_COMPLETE }),
+            true,
+        );
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+        assert!(
+            !events.contains("run.status_write_failed"),
+            "deferred, not immediate"
+        );
+        // The finish path appends the terminal event line FIRST, then flushes.
+        append_event(
+            &dir,
+            "run.finished",
+            json!({ "runId": "te17-terminal-defer", "state": "complete" }),
+        );
+        flush_pending_status_write_failure(&handle);
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let finished = events
+            .lines()
+            .position(|line| line.contains("run.finished"))
+            .expect("terminal event present");
+        let failed = events
+            .lines()
+            .position(|line| line.contains("run.status_write_failed"))
+            .expect("diagnostic flushed after the terminal event");
+        assert!(finished < failed, "terminal state first, diagnostic second");
+        let diagnostic: Value = serde_json::from_str(events.lines().nth(failed).unwrap()).unwrap();
+        assert_eq!(diagnostic["runId"], json!("te17-terminal-defer"));
+        assert!(diagnostic["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("status.json"));
+        assert!(diagnostic["attempts"].is_u64());
+        // Flushing is idempotent.
+        flush_pending_status_write_failure(&handle);
+        let again = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert_eq!(again.matches("run.status_write_failed").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nonterminal_status_write_failure_dedupes_until_recovery() {
+        let (handle, dir) = te17_handle("dedupe");
+        block_target(&dir.join("status.json"));
+        let status = json!({ "runId": "te17-dedupe", "state": STATE_RUNNING });
+        persist_status(&handle, &status, false);
+        persist_status(&handle, &status, false);
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert_eq!(
+            events.matches("run.status_write_failed").count(),
+            1,
+            "degraded latch dedupes repeated failures"
+        );
+        // Recovery: a succeeding write resets the latch (unblock the path).
+        std::fs::remove_dir(dir.join("status.json")).unwrap();
+        persist_status(&handle, &status, false);
+        std::fs::remove_file(dir.join("status.json")).unwrap();
+        block_target(&dir.join("status.json"));
+        persist_status(&handle, &status, false);
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        assert_eq!(
+            events.matches("run.status_write_failed").count(),
+            2,
+            "a new degradation after recovery emits again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_notice_keeps_real_terminal_on_success() {
+        let steps = vec![json!({
+            "agent": "scout",
+            "artifactPaths": { "outputPath": "/artifacts/run-1_scout_output.md" },
+        })];
+        let (status, output, path) = resolve_notice(
+            STATE_COMPLETE,
+            "all mapped",
+            &steps,
+            &Ok(()),
+            Path::new("/r/run-1.json"),
+        );
+        assert_eq!(status, "completed");
+        assert_eq!(output, "all mapped");
+        assert_eq!(path.as_deref(), Some("/artifacts/run-1_scout_output.md"));
+        // savedOutputPath fallback + artifactPaths precedence.
+        let steps = vec![json!({
+            "savedOutputPath": "/artifacts/fallback.md",
+            "artifactPaths": { "outputPath": "" },
+        })];
+        let (_, _, path) = resolve_notice(
+            STATE_FAILED,
+            "x",
+            &steps,
+            &Ok(()),
+            Path::new("/r/run-1.json"),
+        );
+        assert_eq!(path.as_deref(), Some("/artifacts/fallback.md"));
+    }
+
+    #[test]
+    fn resolve_notice_flips_to_failure_on_write_error() {
+        // R7.1.7.3 anchor: a failed result publication reports failure —
+        // never "completed" with an unopenable output reference.
+        let steps = vec![json!({
+            "agent": "scout",
+            "artifactPaths": { "outputPath": "/artifacts/gone.md" },
+        })];
+        let error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let (status, output, path) = resolve_notice(
+            STATE_COMPLETE,
+            "all mapped",
+            &steps,
+            &Err(error),
+            Path::new("/r/run-1.json"),
+        );
+        assert_eq!(status, "failed");
+        assert!(output.starts_with("Failed to write result file /r/run-1.json:"));
+        assert_eq!(path, None, "no saved-output line for a missing file");
+    }
+
+    #[tokio::test]
+    async fn notify_send_records_result_write_failure_event() {
+        let (handle, dir) = te17_handle("send-fail");
+        let run_id = handle.run_id.clone();
+        let result_dir = async_results_dir().join(format!("{run_id}.json"));
+        let _ = std::fs::remove_dir_all(&result_dir);
+        let _ = std::fs::remove_file(&result_dir);
+        block_target(&result_dir);
+        let notify = AsyncNotify { calls: None };
+        notify.send(&handle, STATE_COMPLETE, "done", None).await;
+        let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
+        let failure_line = events
+            .lines()
+            .find(|line| line.contains("run.result_write_failed"))
+            .expect("result write failure recorded in the run event log");
+        let diagnostic: Value = serde_json::from_str(failure_line).unwrap();
+        assert_eq!(diagnostic["runId"], json!(run_id));
+        assert!(diagnostic["path"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("{run_id}.json")));
+        assert!(diagnostic["attempts"].is_u64());
+        let _ = std::fs::remove_dir_all(&result_dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2266,6 +2657,8 @@ pub(crate) mod tests {
             control: Arc::new(AsyncControl::default()),
             run_dir: dir,
             started_ms: crate::artifacts::now_millis(),
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
         })
     }
 
@@ -2496,6 +2889,8 @@ pub(crate) mod tests {
             control: Arc::new(AsyncControl::default()),
             run_dir: std::env::temp_dir().join("rpi-sub-wait-test"),
             started_ms: crate::artifacts::now_millis(),
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
         })
     }
 

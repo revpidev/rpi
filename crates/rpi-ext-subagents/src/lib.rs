@@ -1469,6 +1469,78 @@ pub mod parity {
                 .collect(),
         )
     }
+
+    /// Completion-notice parity facade (TE17 target-track notify leg,
+    /// R7.1.7.2): plain-data mirror of `messages::SubagentNotifyDetails`
+    /// plus format/parse entry points. The harness feeds the same fixture
+    /// to the upstream v0.66 `formatSingleCompletion` /
+    /// `parseSubagentNotifyContent`; `run_id` maps to the first upstream
+    /// `childRuns` entry (single-run projection).
+    #[derive(Debug, Clone, Default)]
+    pub struct NotifyDetailsPublic {
+        pub agent: String,
+        pub status: String,
+        pub source: Option<String>,
+        pub task_info: Option<String>,
+        pub result_preview: String,
+        pub duration_ms: Option<u64>,
+        pub run_id: Option<String>,
+        pub output_path: Option<String>,
+        pub handoff_path: Option<String>,
+        pub session_label: Option<String>,
+        pub session_value: Option<String>,
+    }
+
+    fn notify_status(status: &str) -> Option<&'static str> {
+        match status {
+            "completed" => Some("completed"),
+            "failed" => Some("failed"),
+            "paused" => Some("paused"),
+            "stopped" => Some("stopped"),
+            _ => None,
+        }
+    }
+
+    pub fn format_single_completion_public(details: &NotifyDetailsPublic) -> String {
+        let internal = crate::messages::SubagentNotifyDetails {
+            agent: details.agent.clone(),
+            status: notify_status(&details.status).unwrap_or("failed"),
+            source: details.source.as_deref().map(|source| match source {
+                "foreground" => "foreground",
+                _ => "async",
+            }),
+            task_info: details.task_info.clone(),
+            result_preview: details.result_preview.clone(),
+            duration_ms: details.duration_ms,
+            run_id: details.run_id.clone(),
+            output_path: details.output_path.clone(),
+            handoff_path: details.handoff_path.clone(),
+            session_label: details.session_label.clone(),
+            session_value: details.session_value.clone(),
+        };
+        crate::messages::format_single_completion(&internal)
+    }
+
+    /// Parse one notice text; the returned projection mirrors the upstream
+    /// leg (`agent/status/source?/taskInfo?/resultPreview/handoffPath?/
+    /// runId?/sessionLabel?/sessionValue?`, `None`-valued fields stripped by
+    /// the harness comparison).
+    pub fn parse_subagent_notify_public(content: &str) -> Option<NotifyDetailsPublic> {
+        let parsed = crate::messages::parse_subagent_notify_content(content)?;
+        Some(NotifyDetailsPublic {
+            agent: parsed.agent,
+            status: parsed.status.to_string(),
+            source: parsed.source.map(str::to_string),
+            task_info: parsed.task_info,
+            result_preview: parsed.result_preview,
+            duration_ms: parsed.duration_ms,
+            run_id: parsed.run_id,
+            output_path: parsed.output_path,
+            handoff_path: parsed.handoff_path,
+            session_label: parsed.session_label,
+            session_value: parsed.session_value,
+        })
+    }
 }
 
 /// Replay surface for the recorded child stream fixture

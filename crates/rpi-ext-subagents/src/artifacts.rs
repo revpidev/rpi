@@ -148,29 +148,118 @@ pub fn format_output_artifact_content(
     lines.join("\n")
 }
 
-/// `writeMetadata` (artifacts.ts:221-224) — two-space indented JSON, written
-/// atomically (tmp file + rename, upstream `writeAtomicJson`): concurrent
-/// readers never observe a torn document and multi-writer races resolve to
-/// one whole file.
+/// Retryable errno classes for artifact metadata writes (R7.1.7.1, #1227/
+/// #1272): storage capacity (`ENOSPC`/`EDQUOT`, fd exhaustion `EMFILE`/
+/// `ENFILE`) plus transient locks (`EBUSY`/`EAGAIN`). Permission errors
+/// (`EACCES`/`EPERM`) and missing paths (`ENOENT`) never retry — retrying
+/// cannot fix them and would only stall the terminal path. This splits the
+/// upstream classes (file-system-retry.ts:3-4 @ 0fc0eebb retriess
+/// lock-class synchronously, defers capacity-class via a pending queue)
+/// into one bounded synchronous ladder, per design 04 §3.3.6.
+#[cfg(unix)]
+pub fn is_retryable_write_error(error: &std::io::Error) -> bool {
+    match error.raw_os_error() {
+        Some(code) => matches!(
+            code,
+            libc::ENOSPC | libc::EDQUOT | libc::EMFILE | libc::ENFILE | libc::EBUSY | libc::EAGAIN
+        ),
+        None => false,
+    }
+}
+
+/// Non-unix targets have no errno mapping to match — treat every write
+/// failure as terminal (conservative: no retry, callers see the error).
+#[cfg(not(unix))]
+pub fn is_retryable_write_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+/// Total attempts of the bounded write retry (attempt 1 + 4 retries).
+pub const WRITE_METADATA_MAX_ATTEMPTS: u32 = 5;
+/// Exponential backoff base: sleep `base << (attempt - 1)` before retry
+/// attempt N+1 → 20/40/80/160 ms, ≤ 300 ms total sleep per call.
+pub const WRITE_METADATA_BACKOFF_BASE_MS: u64 = 20;
+
+/// Backoff before retry attempt `attempt + 1` (attempt is 1-based).
+pub(crate) fn write_retry_backoff_ms(attempt: u32) -> u64 {
+    const MAX_SHIFT: u32 = 8;
+    WRITE_METADATA_BACKOFF_BASE_MS << (attempt - 1).min(MAX_SHIFT)
+}
+
+/// Attempt count a caller may attribute to a failed write: retryable
+/// errors ran the full ladder, everything else failed on the first try.
+pub(crate) fn write_attempts_for(error: &std::io::Error) -> u32 {
+    if is_retryable_write_error(error) {
+        WRITE_METADATA_MAX_ATTEMPTS
+    } else {
+        1
+    }
+}
+
+/// `writeMetadata` (artifacts.ts:221-224; v0.66 atomic-json.ts:59-77) —
+/// two-space indented JSON, written atomically (tmp file + rename,
+/// upstream `writeAtomicJson`): concurrent readers never observe a torn
+/// document and multi-writer races resolve to one whole file. Retryable
+/// failures (capacity/transient lock) retry with exponential backoff up to
+/// [`WRITE_METADATA_MAX_ATTEMPTS`] total attempts (R7.1.7.1); the final
+/// error propagates so callers can surface a diagnostic event.
 pub fn write_metadata(file_path: &Path, metadata: &Value) -> std::io::Result<()> {
     if let Some(parent) = file_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let body = serde_json::to_string_pretty(metadata).unwrap_or_default();
-    let tmp = file_path.with_extension(format!("tmp-{}", std::process::id() as u64 ^ nanos_now()));
-    std::fs::write(&tmp, body)?;
-    // Same-directory rename is atomic on unix; propagate its error after
-    // cleaning the leftover tmp file.
-    let result = std::fs::rename(&tmp, file_path);
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
+    let result = write_metadata_retrying(file_path, &body, |tmp, target, body| {
+        std::fs::write(tmp, body).and_then(|()| std::fs::rename(tmp, target))
+    });
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering;
         WRITE_METADATA_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     result
+}
+
+/// The bounded retry ladder behind [`write_metadata`] (R7.1.7.1). The
+/// `attempt_io` closure performs one whole tmp-write + rename attempt;
+/// production passes the real filesystem calls, tests inject deterministic
+/// failures (no disk-full or lock orchestration needed). Each failed
+/// attempt removes its tmp file; a retryable error with attempts left logs
+/// a warning (path, error kind, attempt) and backs off before the next try.
+pub(crate) fn write_metadata_retrying<F>(
+    file_path: &Path,
+    body: &str,
+    attempt_io: F,
+) -> std::io::Result<()>
+where
+    F: Fn(&Path, &Path, &str) -> std::io::Result<()>,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let tmp =
+            file_path.with_extension(format!("tmp-{}", std::process::id() as u64 ^ nanos_now()));
+        // Same-directory rename is atomic on unix; a failed attempt (write
+        // or rename) cleans its tmp file and either retries or propagates.
+        match attempt_io(&tmp, file_path, body) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = std::fs::remove_file(&tmp);
+                if attempt >= WRITE_METADATA_MAX_ATTEMPTS || !is_retryable_write_error(&error) {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    path = %file_path.display(),
+                    kind = ?error.kind(),
+                    attempt,
+                    error = %error,
+                    "metadata write failed with a retryable error; backing off"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(write_retry_backoff_ms(
+                    attempt,
+                )));
+            }
+        }
+    }
 }
 
 /// Test-only counter of `write_metadata` calls (V13-01 FR-C quantitative
@@ -570,5 +659,121 @@ mod tests {
         drop(writer);
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- TE17 (R7.1.7.1): bounded write retry + error classification ----
+
+    #[cfg(unix)]
+    #[test]
+    fn retryable_error_classification() {
+        for code in [
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::EBUSY,
+            libc::EAGAIN,
+        ] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_retryable_write_error(&error),
+                "errno {code} must be retryable"
+            );
+            assert_eq!(write_attempts_for(&error), WRITE_METADATA_MAX_ATTEMPTS);
+        }
+        for code in [libc::ENOENT, libc::EACCES, libc::EPERM, libc::EISDIR] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(
+                !is_retryable_write_error(&error),
+                "errno {code} must not be retryable"
+            );
+            assert_eq!(write_attempts_for(&error), 1);
+        }
+        // Errors without an errno code never retry.
+        assert!(!is_retryable_write_error(&std::io::Error::other("boom")));
+    }
+
+    #[test]
+    fn write_retry_backoff_is_bounded_and_exponential() {
+        assert_eq!(write_retry_backoff_ms(1), WRITE_METADATA_BACKOFF_BASE_MS);
+        assert_eq!(
+            write_retry_backoff_ms(2),
+            WRITE_METADATA_BACKOFF_BASE_MS * 2
+        );
+        assert_eq!(
+            write_retry_backoff_ms(3),
+            WRITE_METADATA_BACKOFF_BASE_MS * 4
+        );
+        assert_eq!(
+            write_retry_backoff_ms(4),
+            WRITE_METADATA_BACKOFF_BASE_MS * 8
+        );
+        let total: u64 = (1..WRITE_METADATA_MAX_ATTEMPTS as u64)
+            .map(|attempt| write_retry_backoff_ms(attempt as u32))
+            .sum();
+        assert!(total <= 1_000, "whole ladder sleeps at most 1s: {total}ms");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_metadata_retries_then_succeeds() {
+        // First attempt hits a synthetic ENOSPC, later attempts write for
+        // real: the caller sees Ok and the file holds the full body.
+        let dir = std::env::temp_dir().join(format!("rpi-sub-retry-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("meta.json");
+        let attempts = std::cell::Cell::new(0u32);
+        let result = write_metadata_retrying(&path, "{\"a\":1}\n", |tmp, target, body| {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+            }
+            std::fs::write(tmp, body).and_then(|()| std::fs::rename(tmp, target))
+        });
+        assert!(result.is_ok());
+        assert_eq!(attempts.get(), 2, "one failure then success");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":1}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_metadata_exhausts_retry_ladder() {
+        // A permanently-full disk: every attempt fails with ENOSPC, the
+        // ladder runs out after WRITE_METADATA_MAX_ATTEMPTS tries and the
+        // final error propagates.
+        let path = Path::new("/tmp/definitely-not-used-here.json");
+        let attempts = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let result = write_metadata_retrying(path, "x", |_, _, _| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+        });
+        assert_eq!(attempts.get(), WRITE_METADATA_MAX_ATTEMPTS);
+        let error = result.expect_err("ladder exhausted");
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(write_attempts_for(&error), WRITE_METADATA_MAX_ATTEMPTS);
+        // Bounded: 20+40+80+160 = 300ms of sleep plus slack.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "total retry budget stays bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn write_metadata_does_not_retry_terminal_errors() {
+        // EACCES fails the write immediately: one attempt, no backoff.
+        let attempts = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let result = write_metadata_retrying(Path::new("/nowhere/meta.json"), "x", |_, _, _| {
+            attempts.set(attempts.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        });
+        assert_eq!(attempts.get(), 1, "permission errors never retry");
+        let error = result.expect_err("EACCES propagates");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 }

@@ -3,10 +3,11 @@
 //! Reads the shared fixture JSON (same file the upstream tsx runner reads),
 //! produces normalized outputs for `args` (build_rpi_args), `frontmatter`
 //! (parse_frontmatter + parse_frontmatter_list), `final-output`
-//! (get_final_output) and `fallback` (is_retryable_model_failure; the
+//! (get_final_output), `fallback` (is_retryable_model_failure; the
 //! context-overflow/attempt functions are TE14 and emit null for now),
-//! prints one JSON document per line. Invoked by
-//! `scripts/subagents-parity/run-parity.mjs`; never part of `cargo test`.
+//! `discovery` (TE15) and `notify` (TE17 formatSingleCompletion /
+//! parseSubagentNotifyContent), prints one JSON document per line. Invoked
+//! by `scripts/subagents-parity/run-parity.mjs`; never part of `cargo test`.
 //!
 //! Normalization whitelist (documented in scripts/subagents-parity/README.md):
 //! prompt/task temp-file paths and `--extension` values become placeholders;
@@ -269,6 +270,98 @@ fn run_discovery_case(case: &Value) -> Value {
     }
 }
 
+/// Notify-format/-parse cases (target track, TE17 R7.1.7.2): the fixture
+/// carries the upstream `SubagentNotifyDetails` shape; `run_id` maps to the
+/// first `childRuns` entry (single-run projection). The upstream leg drives
+/// v0.66 `formatSingleCompletion` / `parseSubagentNotifyContent`.
+fn run_notify_case(case: &Value) -> Value {
+    use rpi_ext_subagents::parity::NotifyDetailsPublic;
+    let kind = case.get("kind").and_then(Value::as_str).unwrap_or("format");
+    match kind {
+        "format" => {
+            let input = case.get("details").cloned().unwrap_or_else(|| json!({}));
+            let details = NotifyDetailsPublic {
+                agent: input
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                status: input
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed")
+                    .to_string(),
+                source: input
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                task_info: input
+                    .get("taskInfo")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                result_preview: input
+                    .get("resultPreview")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                duration_ms: input.get("durationMs").and_then(Value::as_u64),
+                run_id: input
+                    .pointer("/childRuns/0/runId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                output_path: input
+                    .get("outputPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                handoff_path: input
+                    .get("handoffPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                session_label: input
+                    .get("sessionLabel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                session_value: input
+                    .get("sessionValue")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            };
+            json!({
+                "text": rpi_ext_subagents::parity::format_single_completion_public(&details),
+            })
+        }
+        "parse" => {
+            let content = case.get("content").and_then(Value::as_str).unwrap_or("");
+            match rpi_ext_subagents::parity::parse_subagent_notify_public(content) {
+                Some(details) => notify_projection(details),
+                None => Value::Null,
+            }
+        }
+        other => json!({ "error": format!("unknown notify fixture kind: {other}") }),
+    }
+}
+
+/// Shared parse projection (same shape the upstream leg emits): null-valued
+/// optional fields are stripped so the harness JSON compare matches the
+/// upstream `undefined`-dropping serializer.
+fn notify_projection(details: rpi_ext_subagents::parity::NotifyDetailsPublic) -> Value {
+    let mut value = json!({
+        "agent": details.agent,
+        "status": details.status,
+        "source": details.source,
+        "taskInfo": details.task_info,
+        "resultPreview": details.result_preview,
+        "runId": details.run_id,
+        "handoffPath": details.handoff_path,
+        "sessionLabel": details.session_label,
+        "sessionValue": details.session_value,
+    });
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|_, field| !field.is_null());
+    }
+    value
+}
+
 fn main() {
     let mut raw = String::new();
     let mut args = std::env::args().skip(1);
@@ -298,6 +391,7 @@ fn main() {
             "final-output" => run_final_output_case(case.get("messages").unwrap_or(&Value::Null)),
             "fallback" => run_fallback_case(&case),
             "discovery" => run_discovery_case(&case),
+            "notify" => run_notify_case(&case),
             other => {
                 eprintln!("parity_runner: unknown mode {other}");
                 std::process::exit(2);

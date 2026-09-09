@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-09T04:42:48.729Z
+generated: 2026-09-09T15:48:32.707Z
 
 ## args
 
@@ -60,6 +60,16 @@ generated: 2026-09-09T04:42:48.729Z
 ## discovery
 
 - user-tree-robustness: MATCH
+
+## notify
+
+- single-basic: MATCH
+- run-id-with-handoff: MATCH
+- run-id-alone: MATCH
+- task-info-with-run-id: MATCH
+- parse-legacy-no-run-id: MATCH
+- parse-roundtrip-run-id: MATCH
+- parse-non-notify-text: MATCH
 
 ## Attribution summary
 

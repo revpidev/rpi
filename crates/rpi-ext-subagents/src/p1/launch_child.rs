@@ -747,7 +747,17 @@ pub async fn run_child_async(
                     if let Some(target) = metadata.as_object_mut() {
                         target.insert("acceptance".to_string(), ledger);
                     }
-                    let _ = crate::artifacts::write_metadata(&paths.metadata_path, &metadata);
+                    // TE17 R7.1.7.1: child metadata is an auxiliary artifact
+                    // — an exhausted write logs instead of dropping silently.
+                    if let Err(error) =
+                        crate::artifacts::write_metadata(&paths.metadata_path, &metadata)
+                    {
+                        tracing::warn!(
+                            path = %paths.metadata_path.display(),
+                            error = %error,
+                            "child metadata write failed after retrying"
+                        );
+                    }
                 }
             }
         }
