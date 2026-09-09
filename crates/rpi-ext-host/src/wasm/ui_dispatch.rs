@@ -3,6 +3,8 @@
 //! (`select`/`confirm`/`input`/`editor`/`custom`) spawn onto the ambient
 //! runtime and block the guest thread.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 
 use super::host_call::{block_on, str_arg};
@@ -42,6 +44,21 @@ fn widget_content(args: &Value) -> Option<WidgetContent> {
 }
 
 pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> CallResult {
+    // v0.1.4 C0 (ADR-0024): the seven interactive custom UI host-calls are
+    // frozen in the method table but not implemented yet. They answer
+    // `unknownMethod` (the R-U9.2 probe signal) **before** the UI-bridge
+    // lookup, so the answer does not depend on the bridge being bound — a
+    // guest probing during load sees the same "unsupported" result as one
+    // probing later. Capability `ui` was already enforced by the caller.
+    if crate::interactive_ui::is_interactive_ui_method(method) {
+        return err(
+            "unknownMethod",
+            format!(
+                "{method}: interactive UI ABI is not implemented in this host build \
+                 (C0 protocol freeze; implementation lands with C1/C2)"
+            ),
+        );
+    }
     let ui = state
         .api
         .context()
@@ -223,4 +240,92 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
     }
 }
 
-use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::wasm::{Capability, DispatchTarget, HostState, NativeForward};
+
+    extern "C" fn dummy_dispatch(
+        _cookie: crate::native::PluginCookie,
+        _message: abi_stable::std_types::RVec<u8>,
+    ) -> abi_stable::std_types::RVec<u8> {
+        abi_stable::std_types::RVec::from(Vec::new())
+    }
+
+    fn host_state(capabilities: HashSet<Capability>) -> (HostState, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:c0>", "<inline:c0>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let state = HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Native(NativeForward {
+                dispatch_fn: dummy_dispatch,
+                cookie: 0,
+            }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+        };
+        (state, runtime)
+    }
+
+    /// V14-20 FR-E (R-U9.2): all seven C0-frozen methods answer
+    /// `unknownMethod` — the guest probe signal — without touching the UI
+    /// bridge (so an unbound bridge cannot turn the probe into `stale`).
+    #[test]
+    fn interactive_ui_methods_answer_unknown_method_in_c0() {
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        for method in crate::interactive_ui::INTERACTIVE_UI_METHODS {
+            match dispatch(&mut state, method, serde_json::json!({})) {
+                Err((kind, message)) => {
+                    assert_eq!(kind, "unknownMethod", "{method}");
+                    assert!(
+                        message.contains("C0 protocol freeze"),
+                        "{method}: {message}"
+                    );
+                }
+                Ok(value) => panic!("{method} unexpectedly succeeded: {value}"),
+            }
+        }
+    }
+
+    /// V14-20 FR-E (R-U8.1): the capability gate runs before the empty
+    /// implementation, and the pre-existing `ui.custom` path is untouched
+    /// (G2: it still reaches its own arm instead of the C0 answer).
+    #[test]
+    fn interactive_ui_capability_gate_precedes_c0_and_ui_custom_is_untouched() {
+        let request = serde_json::to_vec(&serde_json::json!({
+            "call": "ui.mountComponent",
+            "args": {},
+            "seq": 1,
+        }))
+        .expect("request json");
+        let (mut state, _runtime) = host_state(HashSet::new());
+        let response: Value =
+            serde_json::from_slice(&crate::wasm::handle_host_call(&mut state, &request))
+                .expect("response json");
+        assert_eq!(response["error"]["kind"], "capabilityDenied", "{response}");
+
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        // `ui.custom` keeps its own arm: an unbound slot resolves through the
+        // upstream `noOpUIContext` equivalent (NullUiBridge) and returns null,
+        // exactly as before C0 — it is not intercepted by the C0 answer.
+        match dispatch(
+            &mut state,
+            "ui.custom",
+            serde_json::json!({"component": null}),
+        ) {
+            Ok(value) => assert_eq!(value, Value::Null),
+            Err((kind, message)) => panic!("ui.custom must keep its own arm: {kind}: {message}"),
+        }
+    }
+}

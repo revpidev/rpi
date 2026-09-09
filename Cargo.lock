@@ -3104,6 +3104,7 @@ dependencies = [
  "async-trait",
  "rpi-agent",
  "rpi-ai",
+ "rpi-ext-sdk",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -3135,6 +3136,14 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rpi-ext-sdk"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

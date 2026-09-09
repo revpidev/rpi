@@ -1,5 +1,5 @@
-# Standalone crate (wasm32 target set) — build artifacts are not committed; by library-crate
-# convention this crate does not commit its own Cargo.lock (serde/serde_json versions are
-# pinned in Cargo.toml).
+# Workspace member since v0.1.4/V14-20: the root workspace target dir and
+# Cargo.lock apply when building from the repo root. These entries keep a
+# stray in-crate `cargo` invocation from adding untracked artifacts.
 /target/
 /Cargo.lock
