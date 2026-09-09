@@ -1655,6 +1655,58 @@ fn ambiguous_tool_result(mode: &str, tool_name: &str) -> Value {
     )
 }
 
+/// `tool_not_found_after_reconnect` (proxy-modes.ts:1015-1023 lazy path /
+/// :1240-1247 connect path @ 10a45367): the connect path appends the
+/// available-tools hint, the lazy-connect path does not.
+fn tool_not_found_after_reconnect_result(
+    state: &McpRuntime,
+    server_name: &str,
+    tool_name: &str,
+    include_hint: bool,
+) -> Value {
+    let available: Vec<String> = state
+        .tool_metadata
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(server_name)
+        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect())
+        .unwrap_or_default();
+    let hint = if include_hint {
+        if available.is_empty() {
+            format!(" Server \"{server_name}\" has no tools.")
+        } else {
+            format!(
+                " Available tools on \"{server_name}\": {}",
+                available.join(", ")
+            )
+        }
+    } else {
+        String::new()
+    };
+    let (config, snapshot, unavailable) = search_state_snapshot(state);
+    let search_state = SearchState {
+        config: &config,
+        tool_metadata: &snapshot,
+        unavailable_servers: &unavailable,
+    };
+    let suggestions = rank_suggestions(&search_state, tool_name, 5);
+    let suggestion_text = if suggestions.is_empty() {
+        String::new()
+    } else {
+        format!(" Did you mean: {}", suggestions.join(", "))
+    };
+    text_result(
+        format!(
+            "Tool \"{tool_name}\" not found on \"{server_name}\" after reconnect.{hint}{suggestion_text}"
+        ),
+        json!({
+            "mode": "call", "error": "tool_not_found_after_reconnect",
+            "server": server_name, "requestedTool": tool_name,
+            "suggestions": suggestions,
+        }),
+    )
+}
+
 /// `executeDescribe` (proxy-modes.ts:406-456) with the P1 approval marker
 /// (proxy-modes.ts:567 @ 10a45367).
 pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
@@ -2296,27 +2348,8 @@ pub async fn execute_call(
                                 None => {}
                             }
                             if tool_meta.is_none() {
-                                let (config, snapshot, unavailable) = search_state_snapshot(state);
-                                let search_state = SearchState {
-                                    config: &config,
-                                    tool_metadata: &snapshot,
-                                    unavailable_servers: &unavailable,
-                                };
-                                let suggestions = rank_suggestions(&search_state, tool_name, 5);
-                                let suggestion_text = if suggestions.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" Did you mean: {}", suggestions.join(", "))
-                                };
-                                return text_result(
-                                    format!(
-                                        "Tool \"{tool_name}\" not found on \"{server}\" after reconnect.{suggestion_text}"
-                                    ),
-                                    json!({
-                                        "mode": "call", "error": "tool_not_found_after_reconnect",
-                                        "server": server, "requestedTool": tool_name,
-                                        "suggestions": suggestions,
-                                    }),
+                                return tool_not_found_after_reconnect_result(
+                                    state, &server, tool_name, false,
                                 );
                             }
                         }
@@ -2473,7 +2506,7 @@ pub async fn execute_call(
         }
     }
 
-    let (Some(server_name), Some(tool_meta)) = (server_name.clone(), tool_meta.clone()) else {
+    let (Some(server_name), Some(mut tool_meta)) = (server_name.clone(), tool_meta.clone()) else {
         if server_override.is_none() && native_tools().iter().any(|t| t == tool_name && t != "mcp")
         {
             return text_result(
@@ -2624,6 +2657,40 @@ pub async fn execute_call(
                 }
                 mark_keep_alive_after_connect(state, &server_name);
                 connection = Some(new_connection);
+                // proxy-modes.ts:1231-1247 @ 10a45367: the fresh catalog may
+                // resolve the tool differently (or not at all); re-resolve
+                // with the server-scoped/single matcher before calling.
+                let matched = {
+                    let metadata = state
+                        .tool_metadata
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let matched = if server_override.is_some() {
+                        metadata
+                            .get(&server_name)
+                            .and_then(|m| get_server_scoped_tool_match(m, tool_name))
+                    } else {
+                        metadata
+                            .get(&server_name)
+                            .and_then(|m| get_single_tool_match(m, tool_name))
+                    };
+                    matched.map(|matched| match matched {
+                        ToolMatch::Found(tool) => Ok(tool.clone()),
+                        ToolMatch::Ambiguous => Err(()),
+                    })
+                };
+                match matched {
+                    Some(Err(())) => return ambiguous_tool_result("call", tool_name),
+                    Some(Ok(found)) => tool_meta = found,
+                    None => {
+                        return tool_not_found_after_reconnect_result(
+                            state,
+                            &server_name,
+                            tool_name,
+                            true,
+                        )
+                    }
+                }
             }
             Err(error) => {
                 let message = error.to_string();

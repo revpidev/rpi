@@ -902,4 +902,68 @@ mod tests {
         let names: Vec<&str> = metadata.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["xcodebuild_list_sims", "xcodebuild_read_y"]);
     }
+
+    /// #346 (metadata-cache.ts:258-281 @ 10a45367): the cached cross-server
+    /// selector index suppresses a legacy-only include selector that would
+    /// sweep another server's current name.
+    #[test]
+    fn reconstruct_tool_metadata_uses_cached_selector_index() {
+        let definition = entry(json!({ "includeTools": ["my_server_do_thing"] }));
+        let other_definition = entry(json!({}));
+        let cache_entry = ServerCacheEntry {
+            config_hash: compute_server_hash(&definition).expect("hash"),
+            tools: vec![CachedTool {
+                name: "do_thing".to_string(),
+                ..Default::default()
+            }],
+            cached_at: now_ms(),
+            ..Default::default()
+        };
+        let mut configured: IndexMap<String, ServerEntry> = IndexMap::new();
+        configured.insert("my-server".to_string(), definition.clone());
+        configured.insert("my_server".to_string(), other_definition.clone());
+        let mut cache = MetadataCache {
+            version: CACHE_VERSION,
+            servers: Default::default(),
+        };
+        cache
+            .servers
+            .insert("my-server".to_string(), cache_entry.clone());
+        cache.servers.insert(
+            "my_server".to_string(),
+            ServerCacheEntry {
+                config_hash: compute_server_hash(&other_definition).expect("hash"),
+                tools: vec![CachedTool {
+                    name: "do_thing".to_string(),
+                    ..Default::default()
+                }],
+                cached_at: now_ms(),
+                ..Default::default()
+            },
+        );
+
+        // Other server's current name collides → tool dropped.
+        let metadata = reconstruct_tool_metadata(
+            "my-server",
+            &cache_entry,
+            ToolPrefix::Server,
+            &definition,
+            Some(&configured),
+            Some(&cache),
+            None,
+        );
+        assert!(metadata.is_empty());
+
+        // No configured/cache context → legacy selector applies.
+        let metadata = reconstruct_tool_metadata(
+            "my-server",
+            &cache_entry,
+            ToolPrefix::Server,
+            &definition,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(metadata.len(), 1);
+    }
 }

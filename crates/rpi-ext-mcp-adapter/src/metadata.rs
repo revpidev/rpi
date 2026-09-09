@@ -1,7 +1,10 @@
 //! Core config/metadata types and tool-name formatting.
 //!
 //! Port of `types.ts` + `tool-metadata.ts` (+ `resourceNameToToolName` from
-//! `resource-tools.ts`) @ pi-mcp-adapter v2.24.0 (3d953f90).
+//! `resource-tools.ts`) @ pi-mcp-adapter v2.24.0 (3d953f90); functions rebased
+//! onto v2.32.1 (`10a45367`) by TE21–TE23 carry an explicit `@ 10a45367`
+//! anchor, the remaining comments keep the v2.24.0 anchor from the original
+//! port.
 //!
 //! Intentional differences:
 //! - `ServerEntry` / `McpSettings` are kept as order-preserving JSON maps
@@ -178,7 +181,7 @@ pub struct ToolMetadata {
     pub input_schema: Option<Value>,
 }
 
-/// `sanitizeServerPrefix` (types.ts:734-739 @ 10a45367): provider-valid
+/// `sanitizeServerPrefix` (types.ts:734-740 @ 10a45367): provider-valid
 /// `-`/`_` are preserved; every other non-alphanumeric code point becomes
 /// `_x{hex}_` (lowercase hex, no padding). This is the v2.32.1 default
 /// (`preserveProviderValid = true`); the legacy encoder is
@@ -188,7 +191,7 @@ fn sanitize_server_prefix(server_name: &str) -> String {
 }
 
 /// `sanitizeServerPrefix(serverName, preserveProviderValid)`
-/// (types.ts:733-739 @ 10a45367): `true` keeps the provider-valid `-`/`_`
+/// (types.ts:734-740 @ 10a45367): `true` keeps the provider-valid `-`/`_`
 /// characters (the v2.32.1 naming rules consumed by the approval glob
 /// candidates), `false` is the legacy `_x{hex}_` encoder.
 fn sanitize_server_prefix_with(server_name: &str, preserve_provider_valid: bool) -> String {
@@ -227,13 +230,13 @@ fn strip_short_suffix(name: &str) -> &str {
 
 /// `getServerPrefix` (types.ts:741-753 @ 10a45367): provider-valid `-`/`_`
 /// preserved. The legacy `_x{hex}_` encoder is only used for the legacy
-/// candidate forms ([`get_legacy_server_prefix`]).
+/// candidate forms (`get_legacy_server_prefix`).
 pub fn get_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
     get_server_prefix_with(server_name, mode, true)
 }
 
 /// `getServerPrefix` with the v2.32.1 `preserveProviderValid` switch
-/// (types.ts:735-753 @ 10a45367).
+/// (types.ts:741-753 @ 10a45367).
 fn get_server_prefix_with(server_name: &str, mode: ToolPrefix, preserve: bool) -> String {
     match mode {
         ToolPrefix::None => String::new(),
@@ -261,7 +264,7 @@ pub fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) 
 }
 
 /// `formatToolName` with the v2.32.1 `preserveProviderValid` prefix mode
-/// (types.ts:755-762 @ 10a45367).
+/// (types.ts:758-766 @ 10a45367).
 fn format_tool_name_with(
     tool_name: &str,
     server_name: &str,
@@ -277,7 +280,7 @@ fn format_tool_name_with(
     }
 }
 
-/// `getLegacyServerPrefix` (types.ts:817-823 @ 10a45367): the legacy
+/// `getLegacyServerPrefix` (types.ts:830-836 @ 10a45367): the legacy
 /// `_x{hex}_` server prefix per tool-prefix mode.
 fn get_legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
     match mode {
@@ -295,7 +298,7 @@ fn get_legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
     }
 }
 
-/// `formatLegacyToolName` (types.ts:825-829 @ 10a45367): legacy server
+/// `formatLegacyToolName` (types.ts:837-841 @ 10a45367): legacy server
 /// prefix + `[.-]` → `_` in the tool name.
 fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
     let server_prefix = get_legacy_server_prefix(server_name, prefix);
@@ -406,9 +409,8 @@ pub fn get_tool_name_candidates(
 /// `include_legacy == false` returns the *current* candidates only — the
 /// v2.32.1 naming rules (`-`/`_` preserved in the server prefix).
 /// `include_legacy == true` adds the legacy `_x{hex}_`/normalized forms.
-/// TE21's approval glob consumes this split (R7.2.2.2); the include/exclude
-/// selectors keep [`get_tool_name_candidates`] until TE23 flips the emitted
-/// names.
+/// TE21's approval glob and TE23's include/exclude selectors both consume
+/// this split via `matches_tool_selector`.
 pub fn get_tool_name_candidates_with(
     tool_name: &str,
     server_name: &str,
@@ -531,7 +533,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     pi == p.len()
 }
 
-/// `matchesToolPattern` (types.ts:894-910 @ 10a45367): exact candidate
+/// `matchesToolPattern` (types.ts:894-908 @ 10a45367): exact candidate
 /// matching with `*`/`?` glob support. Patterns are NOT `-`→`_` normalized
 /// (the legacy normalization was removed upstream in #346); legacy shapes
 /// are covered by [`get_tool_name_candidates`] instead.
@@ -558,23 +560,35 @@ fn matches_single_pattern(candidates: &[String], pattern: &str) -> bool {
         .any(|candidate| glob_matches(pattern, candidate))
 }
 
-/// `ToolSelectorCandidateIndex` (types.ts:877-889 @ 10a45367): the current
+/// `ToolSelectorCandidateIndex` (types.ts:875-880 @ 10a45367): the current
 /// (non-legacy) candidate names of every tool in the selector's scope.
 ///
-/// The upstream `additionalCurrentCandidatesByToolName` variant is only
-/// built when the startup path asks for
-/// `includeMissingConfiguredCandidates = true` (init.ts:370 @ 10a45367);
-/// rpi always passes the known metadata map (proxy/commands/connect), so the
-/// index is a plain candidate set.
+/// `additional_current_candidates_by_tool_name` mirrors upstream's
+/// `additionalCurrentCandidatesByToolName`: when no metadata is known for a
+/// configured server, `buildToolMetadata` derives that server's candidates
+/// per evaluated tool name (types.ts:912-953 / tool-metadata.ts:60-72
+/// @ 10a45367).
 #[derive(Debug, Default, Clone)]
 pub struct ToolSelectorCandidateIndex {
     all_current_candidates: HashSet<String>,
+    additional_current_candidates_by_tool_name: IndexMap<String, Vec<String>>,
 }
 
 impl ToolSelectorCandidateIndex {
     pub fn from_candidates(candidates: impl IntoIterator<Item = String>) -> Self {
         Self {
             all_current_candidates: candidates.into_iter().collect(),
+            additional_current_candidates_by_tool_name: IndexMap::new(),
+        }
+    }
+
+    pub fn from_candidates_with_additional(
+        candidates: impl IntoIterator<Item = String>,
+        additional_current_candidates_by_tool_name: IndexMap<String, Vec<String>>,
+    ) -> Self {
+        Self {
+            all_current_candidates: candidates.into_iter().collect(),
+            additional_current_candidates_by_tool_name,
         }
     }
 
@@ -582,38 +596,64 @@ impl ToolSelectorCandidateIndex {
         self.all_current_candidates.contains(candidate)
     }
 
+    /// `hasCandidate` (types.ts:916-918 @ 10a45367): the global set or the
+    /// per-tool-name additional set.
+    fn has_candidate(&self, tool_name: &str, candidate: &str) -> bool {
+        self.contains(candidate)
+            || self
+                .additional_current_candidates_by_tool_name
+                .get(tool_name)
+                .is_some_and(|candidates| candidates.iter().any(|value| value == candidate))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.all_current_candidates.is_empty()
+            && self.additional_current_candidates_by_tool_name.is_empty()
     }
 }
 
-/// `indexHasOtherCurrentMatch` (types.ts:912-948 @ 10a45367) with the empty
-/// additional-candidates map: does `pattern` match any indexed candidate
-/// outside `current_candidates`?
+/// `indexHasOtherCurrentMatch` (types.ts:912-953 @ 10a45367): does `pattern`
+/// match any indexed candidate outside `current_candidates`?
 fn index_has_other_current_match(
     index: &ToolSelectorCandidateIndex,
+    tool_name: &str,
     current_candidates: &[String],
     pattern: &str,
 ) -> bool {
     if !pattern.contains(['*', '?']) {
-        return index.contains(pattern) && !current_candidates.iter().any(|c| c == pattern);
+        return index.has_candidate(tool_name, pattern)
+            && !current_candidates.iter().any(|c| c == pattern);
     }
-    let total = index
+    let additional = index
+        .additional_current_candidates_by_tool_name
+        .get(tool_name);
+    let mut total = index
         .all_current_candidates
         .iter()
         .filter(|candidate| glob_matches(pattern, candidate))
         .count();
+    if let Some(additional) = additional {
+        total += additional
+            .iter()
+            .filter(|candidate| {
+                !index.all_current_candidates.contains(*candidate)
+                    && glob_matches(pattern, candidate)
+            })
+            .count();
+    }
     if total == 0 {
         return false;
     }
     let current_matching = current_candidates
         .iter()
-        .filter(|candidate| index.contains(candidate) && glob_matches(pattern, candidate))
+        .filter(|candidate| {
+            index.has_candidate(tool_name, candidate) && glob_matches(pattern, candidate)
+        })
         .count();
     total > current_matching
 }
 
-/// `matchesToolSelector` (types.ts:950-971 @ 10a45367): current candidates
+/// `matchesToolSelector` (types.ts:955-975 @ 10a45367): current candidates
 /// first; without a cross-server index the full legacy candidate set is the
 /// fallback; with an index a legacy-only candidate must not collide with
 /// another tool's current name (the #346 collision suppression).
@@ -647,12 +687,12 @@ fn matches_tool_selector(
     list.iter().any(|pattern| {
         pattern.as_str().is_some_and(|pattern| {
             matches_single_pattern(&legacy, pattern)
-                && !index_has_other_current_match(index, &current, pattern)
+                && !index_has_other_current_match(index, tool_name, &current, pattern)
         })
     })
 }
 
-/// `isToolIncluded` (types.ts:973-980 @ 10a45367).
+/// `isToolIncluded` (types.ts:977-986 @ 10a45367).
 pub fn is_tool_included(
     tool_name: &str,
     server_name: &str,
@@ -672,7 +712,7 @@ pub fn is_tool_included(
     }
 }
 
-/// `isToolExcluded` (types.ts:982-989 @ 10a45367).
+/// `isToolExcluded` (types.ts:988-996 @ 10a45367).
 pub fn is_tool_excluded(
     tool_name: &str,
     server_name: &str,
@@ -689,7 +729,7 @@ pub fn is_tool_excluded(
     )
 }
 
-/// `isToolAllowed` (types.ts:991-999 @ 10a45367): exclude wins over include.
+/// `isToolAllowed` (types.ts:998-1008 @ 10a45367): exclude wins over include.
 pub fn is_tool_allowed(
     tool_name: &str,
     server_name: &str,
@@ -745,7 +785,7 @@ pub struct BuildToolMetadataResult {
     pub failed_tools: Vec<String>,
 }
 
-/// `hasToolFilters` (tool-metadata.ts:20-22 @ 10a45367): a non-empty
+/// `hasToolFilters` (tool-metadata.ts:23-25 @ 10a45367): a non-empty
 /// `includeTools`/`excludeTools` array enables the cross-server selector
 /// candidate scan.
 pub fn has_tool_filters(definition: &ServerEntry) -> bool {
@@ -859,7 +899,7 @@ pub fn build_tool_metadata(
 }
 
 /// `createToolSelectorCandidateIndex` construction inside
-/// `buildToolMetadata` (tool-metadata.ts:23-74 @ 10a45367): this server's
+/// `buildToolMetadata` (tool-metadata.ts:23-76 @ 10a45367): this server's
 /// evaluated candidates plus every *other* configured server's known current
 /// candidates.
 #[allow(clippy::too_many_arguments)] // upstream-shaped index builder: the
@@ -881,10 +921,12 @@ fn build_selector_candidate_index(
             candidates.push(value);
         }
     };
+    let mut evaluated_tool_names: Vec<String> = Vec::new();
     for tool in tools {
         if tool.name.is_empty() {
             continue;
         }
+        evaluated_tool_names.push(tool.name.clone());
         for candidate in
             get_tool_name_candidates_with(&tool.name, server_name, effective_prefix, false)
         {
@@ -893,10 +935,11 @@ fn build_selector_candidate_index(
     }
     if definition.exposes_resources() {
         for resource in resources {
+            let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
+            evaluated_tool_names.push(base_name.clone());
             if resource.name.is_empty() || resource.uri.is_empty() {
                 continue;
             }
-            let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
             for candidate in
                 get_tool_name_candidates_with(&base_name, server_name, effective_prefix, false)
             {
@@ -904,35 +947,54 @@ fn build_selector_candidate_index(
             }
         }
     }
+    // Upstream `additionalCurrentCandidatesByToolName`
+    // (tool-metadata.ts:60-72 @ 10a45367): when no metadata map is provided,
+    // every configured server without known tools contributes its current
+    // candidates for each evaluated tool name.
+    let mut additional: IndexMap<String, Vec<String>> = IndexMap::new();
     for (other_server_name, other_definition) in configured_servers {
         if other_server_name == server_name {
             continue;
         }
         let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
-        let Some(known_tools) = known_metadata.and_then(|map| map.get(other_server_name)) else {
-            // Upstream `else if (!knownMetadata || includeMissingConfiguredCandidates)`
-            // branch; rpi call sites always pass the known map.
+        let known_tools = known_metadata.and_then(|map| map.get(other_server_name));
+        if let Some(known_tools) = known_tools {
+            for tool in known_tools {
+                push(tool.name.clone());
+                for candidate in get_tool_name_candidates_with(
+                    &tool.original_name,
+                    other_server_name,
+                    other_prefix,
+                    false,
+                ) {
+                    push(candidate);
+                }
+            }
             continue;
-        };
-        for tool in known_tools {
-            push(tool.name.clone());
-            for candidate in get_tool_name_candidates_with(
-                &tool.original_name,
-                other_server_name,
-                other_prefix,
-                false,
-            ) {
-                push(candidate);
+        }
+        if known_metadata.is_some() {
+            // `includeMissingConfiguredCandidates = false` and a known map:
+            // upstream adds nothing for a server without known tools.
+            continue;
+        }
+        for tool_name in &evaluated_tool_names {
+            let entry = additional.entry(tool_name.clone()).or_default();
+            for candidate in
+                get_tool_name_candidates_with(tool_name, other_server_name, other_prefix, false)
+            {
+                if !entry.contains(&candidate) {
+                    entry.push(candidate);
+                }
             }
         }
     }
-    ToolSelectorCandidateIndex::from_candidates(candidates)
+    ToolSelectorCandidateIndex::from_candidates_with_additional(candidates, additional)
 }
 
 /// `findToolByName` (tool-metadata.ts:154-160 @ 10a45367): exact match
 /// first, then a `-` → `_` normalized comparison. Server-scoped call
 /// resolution additionally matches `originalName` via
-/// [`crate::proxy::server_scoped_tool_match`].
+/// `crate::proxy::get_server_scoped_tool_match`.
 pub fn find_tool_by_name<'a>(
     metadata: &'a [ToolMetadata],
     tool_name: &str,
@@ -1396,6 +1458,92 @@ mod tests {
             Some(&json!(["my_server_do_thing"])),
             Some(&collision)
         ));
+    }
+
+    /// #346 (tool-metadata.ts:23-76 @ 10a45367): the cross-server selector
+    /// candidate index suppresses a legacy-only include selector that would
+    /// sweep another server's current name.
+    #[test]
+    fn build_tool_metadata_cross_server_selector_index() {
+        let tools = vec![McpTool {
+            name: "do_thing".to_string(),
+            ..Default::default()
+        }];
+        let definition = entry(Map::from_iter([(
+            "includeTools".to_string(),
+            json!(["my_server_do_thing"]),
+        )]));
+        let mut configured: IndexMap<String, ServerEntry> = IndexMap::new();
+        configured.insert("my-server".to_string(), definition.clone());
+        configured.insert("my_server".to_string(), entry(Map::new()));
+
+        // Known metadata for the other server → its current name collides
+        // with the legacy selector → selector suppressed.
+        let mut known: IndexMap<String, Vec<ToolMetadata>> = IndexMap::new();
+        known.insert(
+            "my_server".to_string(),
+            vec![ToolMetadata {
+                name: "my_server_do_thing".to_string(),
+                original_name: "do_thing".to_string(),
+                ..Default::default()
+            }],
+        );
+        let result = build_tool_metadata(
+            &tools,
+            &[],
+            &definition,
+            "my-server",
+            ToolPrefix::Server,
+            Some(&configured),
+            Some(&known),
+        );
+        assert!(result.metadata.is_empty());
+
+        // No known map → upstream derives the other server's candidates per
+        // evaluated tool name (types.ts:912-953) → same collision.
+        let result = build_tool_metadata(
+            &tools,
+            &[],
+            &definition,
+            "my-server",
+            ToolPrefix::Server,
+            Some(&configured),
+            None,
+        );
+        assert!(result.metadata.is_empty());
+
+        // Other server renamed → no collision → legacy selector applies.
+        let mut known: IndexMap<String, Vec<ToolMetadata>> = IndexMap::new();
+        known.insert(
+            "my_server".to_string(),
+            vec![ToolMetadata {
+                name: "my_server_do_other".to_string(),
+                original_name: "do_other".to_string(),
+                ..Default::default()
+            }],
+        );
+        let result = build_tool_metadata(
+            &tools,
+            &[],
+            &definition,
+            "my-server",
+            ToolPrefix::Server,
+            Some(&configured),
+            Some(&known),
+        );
+        assert_eq!(result.metadata.len(), 1);
+
+        // No filters → no index → every tool included.
+        let result = build_tool_metadata(
+            &tools,
+            &[],
+            &entry(Map::new()),
+            "my-server",
+            ToolPrefix::Server,
+            Some(&configured),
+            Some(&known),
+        );
+        assert_eq!(result.metadata.len(), 1);
     }
 
     #[test]

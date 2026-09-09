@@ -37,7 +37,7 @@
 // Output: crates/rpi-ext-mcp-adapter/tests/fixtures/*.json (committed).
 
 import { register } from "node:module";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -77,6 +77,39 @@ function writeFixture(name, data) {
   writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
   console.log(`[gen-fixtures] wrote ${name}`);
 }
+
+// Pin-mismatch guard (v0.1.4 TE23): the default submodule run must not
+// silently rewrite a fixture recorded from another pinned upstream. During
+// the staged rebase the committed fixtures are mixed (TE23 re-recorded
+// `name_format`/`glob` against v2.32.1), so a default `pin=3d953f90` run
+// would downgrade them. Re-record intentionally by setting
+// `RPI_MCP_FIXTURE_UPSTREAM` (target snapshot) + `RPI_MCP_FIXTURE_PIN`, or
+// override with `RPI_MCP_FIXTURE_ALLOW_DOWNGRADE=1`.
+function assertNoSilentPinDowngrade() {
+  if (process.env.RPI_MCP_FIXTURE_UPSTREAM || process.env.RPI_MCP_FIXTURE_ALLOW_DOWNGRADE) {
+    return;
+  }
+  for (const file of readdirSync(OUT_DIR)) {
+    if (!file.endsWith(".json")) continue;
+    let provenance;
+    try {
+      provenance = JSON.parse(readFileSync(join(OUT_DIR, file), "utf-8")).provenance;
+    } catch {
+      continue;
+    }
+    const existingPin = /@ ([0-9a-f]{7,40})/.exec(provenance ?? "")?.[1];
+    if (existingPin && existingPin !== PIN) {
+      throw new Error(
+        `[gen-fixtures] refusing to rewrite ${file}: committed provenance is @ ${existingPin} ` +
+          `but this run targets @ ${PIN} (default submodule pin). Re-run with ` +
+          `RPI_MCP_FIXTURE_UPSTREAM=<target snapshot> RPI_MCP_FIXTURE_PIN=<pin> to re-record ` +
+          `intentionally, or set RPI_MCP_FIXTURE_ALLOW_DOWNGRADE=1.`,
+      );
+    }
+  }
+}
+
+assertNoSilentPinDowngrade();
 
 // ---------------------------------------------------------------- ts-shape
 

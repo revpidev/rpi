@@ -1133,6 +1133,88 @@ mod tests {
         assert_eq!(specs.len(), 1);
     }
 
+    /// #346 (direct-tools.ts:211-228 @ 10a45367): the cross-server selector
+    /// candidate index suppresses a legacy-only include selector that would
+    /// sweep another server's current name.
+    #[test]
+    fn direct_selector_index_suppresses_legacy_collisions() {
+        let filtered = ServerEntry(
+            json!({ "command": "node", "directTools": true, "includeTools": ["my_server_do_thing"] })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let other = ServerEntry(
+            json!({ "command": "node", "directTools": true })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        );
+        let mut config = McpConfig::default();
+        config
+            .mcp_servers
+            .insert("my-server".to_string(), filtered.clone());
+        config
+            .mcp_servers
+            .insert("my_server".to_string(), other.clone());
+        let mut cache = MetadataCache {
+            version: crate::cache::CACHE_VERSION,
+            servers: Default::default(),
+        };
+        for (name, definition, tool_name) in [
+            ("my-server", &filtered, "do_thing"),
+            ("my_server", &other, "do_thing"),
+        ] {
+            cache.servers.insert(
+                name.to_string(),
+                ServerCacheEntry {
+                    config_hash: crate::cache::compute_server_hash(definition).expect("hash"),
+                    tools: vec![CachedTool {
+                        name: tool_name.to_string(),
+                        ..Default::default()
+                    }],
+                    cached_at: now_ms(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // `my_server` owns the current name `my_server_do_thing` → the legacy
+        // include selector on `my-server` is suppressed.
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
+        assert_eq!(names, ["my_server_do_thing"]);
+
+        // Rename the other server's tool → no collision → legacy selector applies.
+        cache.servers.insert(
+            "my_server".to_string(),
+            ServerCacheEntry {
+                config_hash: crate::cache::compute_server_hash(&other).expect("hash"),
+                tools: vec![CachedTool {
+                    name: "do_other".to_string(),
+                    ..Default::default()
+                }],
+                cached_at: now_ms(),
+                ..Default::default()
+            },
+        );
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
+        assert_eq!(names, ["my-server_do_thing", "my_server_do_other"]);
+    }
+
     /// #434：退避中的 server 不出现在 direct 面（#A4）。
     #[test]
     fn unavailable_servers_are_filtered_from_direct_tools() {
