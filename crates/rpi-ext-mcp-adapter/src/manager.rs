@@ -58,6 +58,9 @@ pub struct ServerConnection {
     pub in_flight: AtomicUsize,
     pub status: Mutex<ConnectionStatus>,
     pub credentials_invalidated: AtomicBool,
+    /// Cache hints from the server's `tools/list` (server-manager.ts:138 @
+    /// `34de8e3`, #446); written into the metadata cache entry.
+    pub tool_list_hints: Option<crate::protocol::ToolListHints>,
 }
 
 impl ServerConnection {
@@ -106,6 +109,11 @@ pub struct McpServerManager {
     default_request_timeout: Mutex<Option<Duration>>,
     runtime_cancel: Mutex<CancellationToken>,
     stopped: AtomicBool,
+    /// Test hook: credential store used by the HTTP connect path
+    /// (production builds the OS-keyring store per attempt). Integration
+    /// tests inject a `MemorySecretStore`-backed store to assert the
+    /// #422/#423 compare-and-delete wiring without touching the keyring.
+    auth_store_override: Mutex<Option<Arc<OAuthCredentialStore>>>,
 }
 
 impl McpServerManager {
@@ -117,7 +125,24 @@ impl McpServerManager {
             default_request_timeout: Mutex::new(None),
             runtime_cancel: Mutex::new(CancellationToken::new()),
             stopped: AtomicBool::new(false),
+            auth_store_override: Mutex::new(None),
         })
+    }
+
+    /// Test hook (see `auth_store_override`).
+    pub fn set_auth_store_override(&self, store: Arc<OAuthCredentialStore>) {
+        *self
+            .auth_store_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(store);
+    }
+
+    fn auth_store(&self) -> Arc<OAuthCredentialStore> {
+        self.auth_store_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| Arc::new(OAuthCredentialStore::new(AuthStorageOptions::default())))
     }
 
     pub fn set_runtime_cancel(&self, cancel: CancellationToken) {
@@ -351,8 +376,8 @@ impl McpServerManager {
         definition: &ServerEntry,
         request_timeout: Duration,
     ) -> Result<ServerConnection, ProtocolError> {
-        let store = OAuthCredentialStore::new(AuthStorageOptions::default());
-        let config = http_config_with_auth(&store, name, definition).await?;
+        let store = self.auth_store();
+        let (config, injected_token) = http_config_with_auth(&store, name, definition).await?;
         let supports_oauth = supports_oauth(definition);
         let mode = crate::protocol::parse_protocol_version_mode(definition.get("protocolVersion"));
 
@@ -363,6 +388,15 @@ impl McpServerManager {
             Ok(connection) => Ok(connection),
             Err(error @ ProtocolError::Unauthorized) => {
                 if supports_oauth {
+                    // #422/#423: compare-and-delete the credential that just
+                    // failed — never a token another process wrote in the
+                    // meantime.
+                    invalidate_stored_oauth_token(
+                        &store,
+                        name,
+                        definition,
+                        injected_token.as_deref(),
+                    );
                     Ok(needs_auth_connection(definition))
                 } else {
                     Err(error)
@@ -378,7 +412,7 @@ impl McpServerManager {
                 if mode == ProtocolVersionMode::Pinned2026 {
                     return Err(enrich_http_connection_error(definition, error).await);
                 }
-                let config = http_config_with_auth(&store, name, definition).await?;
+                let (config, sse_token) = http_config_with_auth(&store, name, definition).await?;
                 match self
                     .try_sse(name, definition, config, request_timeout)
                     .await
@@ -386,6 +420,12 @@ impl McpServerManager {
                     Ok(connection) => Ok(connection),
                     Err(error @ ProtocolError::Unauthorized) => {
                         if supports_oauth {
+                            invalidate_stored_oauth_token(
+                                &store,
+                                name,
+                                definition,
+                                sse_token.as_deref(),
+                            );
                             Ok(needs_auth_connection(definition))
                         } else {
                             Err(error)
@@ -525,46 +565,48 @@ async fn http_config_with_auth(
     store: &OAuthCredentialStore,
     name: &str,
     definition: &ServerEntry,
-) -> Result<HttpConfig, ProtocolError> {
+) -> Result<(HttpConfig, Option<String>), ProtocolError> {
     let mut config = resolve_http_config_with_server(definition, name)?;
+    let mut injected = None;
     if supports_oauth(definition) {
-        inject_oauth_authorization(store, name, definition, &mut config).await;
+        injected = inject_oauth_authorization(store, name, definition, &mut config).await;
     }
-    Ok(config)
+    Ok((config, injected))
 }
 
 /// Inject `Authorization: Bearer <token>` into `config.headers` when the
 /// store holds a usable access token for this server+URL. Store failures
 /// degrade to an unauthenticated connect — the 401 → needs-auth flow
-/// surfaces the auth requirement to the caller.
+/// surfaces the auth requirement to the caller. Returns the injected token
+/// (compare-and-delete identity for #422/#423); the value never reaches
+/// logs (G4 red line).
 async fn inject_oauth_authorization(
     store: &OAuthCredentialStore,
     name: &str,
     definition: &ServerEntry,
     config: &mut HttpConfig,
-) {
+) -> Option<String> {
     if config
         .headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("authorization"))
     {
-        return; // an explicit Authorization header always wins
+        return None; // an explicit Authorization header always wins
     }
-    let Some(server_url) = crate::utils::resolve_server_url(definition.get("url"))
+    let server_url = crate::utils::resolve_server_url(definition.get("url"))
         .ok()
-        .flatten()
-    else {
-        return;
-    };
+        .flatten()?;
     match crate::oauth::resolve_access_token(store, name, &server_url, definition).await {
         Ok(Some(token)) => {
             config
                 .headers
                 .push(("Authorization".to_string(), format!("Bearer {token}")));
+            Some(token)
         }
-        Ok(None) => {}
+        Ok(None) => None,
         Err(error) => {
             tracing::debug!(server = name, %error, "OAuth credential resolution failed");
+            None
         }
     }
 }
@@ -586,6 +628,7 @@ fn build_connection(
         in_flight: AtomicUsize::new(0),
         status: Mutex::new(ConnectionStatus::Connected),
         credentials_invalidated: AtomicBool::new(false),
+        tool_list_hints: metadata.tool_list_hints,
     }
 }
 
@@ -603,6 +646,37 @@ fn needs_auth_connection(definition: &ServerEntry) -> ServerConnection {
         in_flight: AtomicUsize::new(0),
         status: Mutex::new(ConnectionStatus::NeedsAuth),
         credentials_invalidated: AtomicBool::new(true),
+        tool_list_hints: None,
+    }
+}
+
+/// #422/#423 compare-and-delete: read the stored entry and delete it only
+/// when its access token equals the credential that just failed. A token
+/// another process wrote after our request is preserved. Token values never
+/// reach logs (G4 red line).
+fn invalidate_stored_oauth_token(
+    store: &OAuthCredentialStore,
+    server_name: &str,
+    definition: &ServerEntry,
+    invalidated_token: Option<&str>,
+) {
+    let Some(invalidated_token) = invalidated_token else {
+        return;
+    };
+    let server_url = match crate::utils::resolve_server_url(definition.get("url")) {
+        Ok(Some(url)) => url,
+        _ => return,
+    };
+    match crate::oauth::remove_auth_if_token_matches(
+        store,
+        server_name,
+        &server_url,
+        invalidated_token,
+    ) {
+        Ok(_) => {}
+        Err(error) => {
+            tracing::debug!(server = server_name, %error, "OAuth credential invalidation failed");
+        }
     }
 }
 
@@ -919,7 +993,7 @@ mod tests {
             )
             .unwrap();
 
-        let config = http_config_with_auth(&store, "srv", &definition)
+        let (config, _) = http_config_with_auth(&store, "srv", &definition)
             .await
             .expect("config");
         let auth = config
@@ -956,7 +1030,7 @@ mod tests {
 
         // resolve_access_token returns None (no refresh token → no
         // metadata discovery for a fake host) → no header injected.
-        let config = http_config_with_auth(&store, "srv", &definition)
+        let (config, _) = http_config_with_auth(&store, "srv", &definition)
             .await
             .expect("config");
         assert!(!config
@@ -977,7 +1051,7 @@ mod tests {
             Box::new(crate::oauth::store::MemorySecretStore::new()),
             AuthStorageOptions::default(),
         );
-        let config = http_config_with_auth(&store, "srv", &definition)
+        let (config, _) = http_config_with_auth(&store, "srv", &definition)
             .await
             .expect("config");
         let auth: Vec<_> = config

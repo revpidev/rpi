@@ -24,7 +24,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tracing::warn;
 
@@ -39,9 +38,6 @@ use crate::utils::truncate_at_word;
 const BUILTIN_NAMES: [&str; 8] = ["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"];
 /// `DIRECT_TOOLS_ADVISORY_THRESHOLD` (direct-tools.ts:27).
 pub const DIRECT_TOOLS_ADVISORY_THRESHOLD: usize = 75;
-/// `INSTRUCTIONS_SNIPPET_LENGTH` (direct-tools.ts:26) — used by the proxy
-/// description builder.
-pub const INSTRUCTIONS_SNIPPET_LENGTH: usize = 150;
 
 /// `DirectToolSpec` (types.ts:570-579, minus P2 UI fields).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -86,6 +82,7 @@ pub fn resolve_direct_tools(
     cache: Option<&MetadataCache>,
     prefix: ToolPrefix,
     env_override: Option<&[String]>,
+    unavailable_servers: &HashSet<String>,
 ) -> Vec<DirectToolSpec> {
     let mut specs = Vec::new();
     let Some(cache) = cache else { return specs };
@@ -216,13 +213,25 @@ pub fn resolve_direct_tools(
         }
     }
 
-    if specs.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
+    // direct-tools.ts:282-293 @ `26527c5` (#434): the emitted set drops
+    // servers in active failure backoff; the advisory threshold counts the
+    // emitted set.
+    let emitted: Vec<DirectToolSpec> = if unavailable_servers.is_empty() {
+        specs
+    } else {
+        specs
+            .into_iter()
+            .filter(|spec| !unavailable_servers.contains(&spec.server_name))
+            .collect()
+    };
+
+    if emitted.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
         warn!(
-            count = specs.len(),
+            count = emitted.len(),
             "MCP: many direct tools resolved; each direct tool adds prompt context — prefer targeted sets of 5-20 tools"
         );
     }
-    specs
+    emitted
 }
 
 enum ToolFilter {
@@ -446,98 +455,27 @@ pub fn should_register_proxy_tool(
     !disable_proxy || direct_specs.is_empty() || !missing_direct_servers.is_empty()
 }
 
-/// `buildProxyDescription` (direct-tools.ts:210-290), full fidelity.
-pub fn build_proxy_description(
-    config: &McpConfig,
-    cache: Option<&MetadataCache>,
-    direct_specs: &[DirectToolSpec],
-) -> String {
-    let prefix = config.global_tool_prefix();
+/// `buildProxyDescription` (direct-tools.ts:302-330 @ `5f07874`, #432):
+/// pure function of config. Live counts/instructions/connection state are
+/// deliberately absent so re-registering the proxy tool never rewrites the
+/// cached prompt prefix; `mcp({ })` carries the runtime counts.
+pub fn build_proxy_description(config: &McpConfig) -> String {
     let mut desc = "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcpScript. Non-MCP Pi tools should be called directly, not through mcp.\n".to_string();
 
-    let mut direct_by_server: IndexMap<&str, usize> = IndexMap::new();
-    for spec in direct_specs {
-        *direct_by_server
-            .entry(spec.server_name.as_str())
-            .or_insert(0) += 1;
-    }
-    if !direct_by_server.is_empty() {
-        let parts: Vec<String> = direct_by_server
-            .iter()
-            .map(|(server, count)| format!("{server} ({count})"))
-            .collect();
-        desc.push_str(&format!(
-            "\nDirect tools available (call as normal tools): {}\n",
-            parts.join(", ")
-        ));
-    }
-
-    let mut server_summaries: Vec<String> = Vec::new();
-    for (server_name, definition) in &config.mcp_servers {
-        if definition.is_disabled() {
-            continue;
-        }
-        let entry = cache.and_then(|c| c.servers.get(server_name));
-        let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
-        let tool_count = entry
-            .map(|e| {
-                e.tools
-                    .iter()
-                    .filter(|tool| {
-                        is_tool_allowed(
-                            &tool.name,
-                            server_name,
-                            effective_prefix,
-                            definition.include_tools(),
-                            definition.exclude_tools(),
-                        )
-                    })
-                    .count()
-            })
-            .unwrap_or(0);
-        let resource_count = if definition.exposes_resources() {
-            entry
-                .map(|e| {
-                    e.resources
-                        .iter()
-                        .filter(|resource| {
-                            let base_name =
-                                format!("read_{}", resource_name_to_tool_name(&resource.name));
-                            is_tool_allowed(
-                                &base_name,
-                                server_name,
-                                effective_prefix,
-                                definition.include_tools(),
-                                definition.exclude_tools(),
-                            )
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let total_items = tool_count + resource_count;
-        if total_items == 0 {
-            continue;
-        }
-        let direct_count = direct_by_server
-            .get(server_name.as_str())
-            .copied()
-            .unwrap_or(0);
-        let proxy_count = total_items.saturating_sub(direct_count);
-        if proxy_count > 0 {
-            server_summaries.push(format!("{server_name} ({proxy_count} tools)"));
-        }
-    }
-    if !server_summaries.is_empty() {
-        desc.push_str(&format!("\nServers: {}\n", server_summaries.join(", ")));
+    let server_names: Vec<&str> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, definition)| !definition.is_disabled())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !server_names.is_empty() {
+        desc.push_str(&format!("\nServers: {}\n", server_names.join(", ")));
     }
 
     let disabled: Vec<&str> = config
         .mcp_servers
         .iter()
-        .filter(|(_, d)| d.is_disabled())
+        .filter(|(_, definition)| definition.is_disabled())
         .map(|(name, _)| name.as_str())
         .collect();
     if !disabled.is_empty() {
@@ -547,33 +485,8 @@ pub fn build_proxy_description(
         ));
     }
 
-    let mut instruction_summaries: Vec<String> = Vec::new();
-    for (server_name, definition) in &config.mcp_servers {
-        if definition.is_disabled() {
-            continue;
-        }
-        let instructions = cache
-            .and_then(|c| c.servers.get(server_name))
-            .and_then(|e| e.instructions.as_deref());
-        let Some(instructions) = instructions else {
-            continue;
-        };
-        let collapsed: String = instructions
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let snippet = truncate_at_word(&collapsed, INSTRUCTIONS_SNIPPET_LENGTH);
-        instruction_summaries.push(format!("  {server_name}: {snippet}"));
-    }
-    if !instruction_summaries.is_empty() {
-        desc.push_str(&format!(
-            "\nServer instructions (truncated - full text via mcp({{ instructions: \"name\" }})):\n{}\n",
-            instruction_summaries.join("\n")
-        ));
-    }
-
     desc.push_str("\nUsage:\n");
-    desc.push_str("  mcp({ })                              → Show server status\n");
+    desc.push_str("  mcp({ })                              → Show server status and tool counts\n");
     desc.push_str("  mcp({ server: \"name\" })               → List tools from server\n");
     desc.push_str(
         "  mcp({ search: \"query\" })              → Search MCP tools by name/description\n",
@@ -1134,7 +1047,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, ["demo_search", "demo_read_doc"]);
         assert_eq!(specs[1].resource_uri.as_deref(), Some("mcp://demo/doc"));
@@ -1144,8 +1063,142 @@ mod tests {
             d.as_map_mut()
                 .insert("directTools".to_string(), json!(["search"]))
         });
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
         assert_eq!(specs.len(), 1);
+    }
+
+    /// #434：退避中的 server 不出现在 direct 面（#A4）。
+    #[test]
+    fn unavailable_servers_are_filtered_from_direct_tools() {
+        let mut config = McpConfig::default();
+        for name in ["alpha", "beta"] {
+            config.mcp_servers.insert(
+                name.to_string(),
+                ServerEntry(
+                    json!({ "command": "node", "directTools": true })
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        let mut cache = MetadataCache {
+            version: crate::cache::CACHE_VERSION,
+            servers: Default::default(),
+        };
+        for name in ["alpha", "beta"] {
+            let hash = crate::cache::compute_server_hash(&config.mcp_servers[name]).expect("hash");
+            cache.servers.insert(
+                name.to_string(),
+                ServerCacheEntry {
+                    config_hash: hash,
+                    tools: vec![CachedTool {
+                        name: "search".to_string(),
+                        description: None,
+                        input_schema: None,
+                        ..Default::default()
+                    }],
+                    cached_at: now_ms(),
+                    ..Default::default()
+                },
+            );
+        }
+        let all = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(all.len(), 2);
+        let filtered = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::from(["alpha".to_string()]),
+        );
+        let names: Vec<&str> = filtered.iter().map(|s| s.prefixed_name.as_str()).collect();
+        assert_eq!(names, ["beta_search"]);
+    }
+
+    /// #432 / R7.2.5.1：描述与上游 `buildProxyDescription` @ v2.32.1
+    /// (`10a45367`) 逐字节一致（golden 由上游函数直接生成）。
+    #[test]
+    fn proxy_description_matches_upstream_bytes() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/proxy_description_cases.json"
+        ))
+        .expect("fixture parses");
+        for case in fixture["cases"].as_array().expect("cases") {
+            let config_value = case["config"].clone();
+            let mut config = McpConfig::default();
+            if let Some(servers) = config_value.get("mcpServers").and_then(Value::as_object) {
+                for (name, value) in servers {
+                    config.mcp_servers.insert(
+                        name.clone(),
+                        ServerEntry(value.as_object().cloned().unwrap_or_default()),
+                    );
+                }
+            }
+            assert_eq!(
+                build_proxy_description(&config),
+                case["description"].as_str().unwrap_or_default(),
+                "case {}",
+                case["name"]
+            );
+        }
+    }
+
+    /// #432 / R7.2.5.1（`__tests__/direct-tools.test.ts`）：描述是 config 的
+    /// 纯函数——同一 config 反复调用逐字节相同，且不含工具数/instructions。
+    #[test]
+    fn proxy_description_is_pure_config_function() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "alpha".to_string(),
+            ServerEntry(
+                json!({ "command": "node" })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        config.mcp_servers.insert(
+            "beta".to_string(),
+            ServerEntry(
+                json!({ "command": "node", "disabled": true })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        );
+        let first = build_proxy_description(&config);
+        let second = build_proxy_description(&config);
+        assert_eq!(first, second);
+        assert!(first.contains("\nServers: alpha\n"), "desc: {first}");
+        assert!(
+            !first.contains("alpha ("),
+            "no per-server tool counts: {first}"
+        );
+        assert!(
+            first.contains("Disabled servers (enable with /mcp enable <server> and /reload): beta"),
+            "desc: {first}"
+        );
+        assert!(!first.contains("Direct tools available"), "desc: {first}");
+        assert!(!first.contains("Server instructions"), "desc: {first}");
+
+        // Config change is the only input that may change the bytes.
+        config.mcp_servers.shift_remove("beta");
+        let third = build_proxy_description(&config);
+        assert_ne!(first, third);
+        assert!(!third.contains("Disabled servers"));
     }
 
     #[test]
@@ -1234,6 +1287,7 @@ mod tests {
             Some(&cache),
             ToolPrefix::Server,
             Some(&["alpha".to_string()]),
+            &HashSet::new(),
         );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, ["alpha_search", "alpha_create"]);
@@ -1265,6 +1319,7 @@ mod tests {
             Some(&cache),
             ToolPrefix::Server,
             Some(&["demo/search".to_string()]),
+            &HashSet::new(),
         );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, ["demo_search"]);
@@ -1298,7 +1353,13 @@ mod tests {
             .servers
             .insert("demo".to_string(), cache_for_server(&config, "demo"));
 
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
         assert_eq!(specs.len(), 2);
     }
 
@@ -1318,7 +1379,13 @@ mod tests {
             version: crate::cache::CACHE_VERSION,
             servers: Default::default(),
         };
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
         assert!(specs.is_empty());
     }
 
@@ -1346,7 +1413,13 @@ mod tests {
             version: crate::cache::CACHE_VERSION,
             servers: Default::default(),
         };
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
         assert!(specs.is_empty());
     }
 
@@ -1396,7 +1469,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::None, None);
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::None,
+            None,
+            &HashSet::new(),
+        );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, ["safe"]);
     }

@@ -321,11 +321,20 @@ impl LifecycleManager {
     }
 }
 
+/// Fired when a failure window opens or expires (upstream `recordFailure` /
+/// `clearFailure` / the expiry timer all call
+/// `notifyToolMetadataUpdated`; init.ts:55-89 @ `26527c5`). The hook carries
+/// the upstream reason strings verbatim (`failure-backoff-started` /
+/// `failure-backoff-expired`) so the caller can re-sync the tool surface.
+pub type FailureChangeHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// The failure tracker half of init.ts: `recordFailure` / `clearFailure` /
-/// `getFailureAgeSeconds` with the 60s self-expiry (init.ts:39-80, 556-567).
+/// `getFailureAgeSeconds` with the 60s self-expiry (init.ts:39-80, 556-567),
+/// plus `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23, #434).
 pub struct FailureTracker {
     failed_at: Mutex<HashMap<String, u64>>,
     messages: Mutex<HashMap<String, String>>,
+    on_change: Mutex<Option<FailureChangeHook>>,
 }
 
 impl Default for FailureTracker {
@@ -339,7 +348,43 @@ impl FailureTracker {
         Self {
             failed_at: Mutex::new(HashMap::new()),
             messages: Mutex::new(HashMap::new()),
+            on_change: Mutex::new(None),
         }
+    }
+
+    /// Bind the metadata-updated hook fired on failure start/expiry
+    /// (upstream `notifyToolMetadataUpdated` calls in `recordFailure` and
+    /// the expiry timer). Set by `proxy::initialize_mcp`.
+    pub fn set_change_callback(&self, callback: FailureChangeHook) {
+        *self.on_change.lock().unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    }
+
+    fn notify_change(&self, server_name: &str, reason: &str) {
+        let callback = self
+            .on_change
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback(server_name, reason);
+        }
+    }
+
+    /// `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23): the
+    /// server is neither connected nor needs-auth and a failure was recorded
+    /// inside the 60s window. Consumers hide its tools (R7.2.3.1/#434).
+    pub fn is_server_in_active_failure_backoff(
+        &self,
+        manager: &McpServerManager,
+        server_name: &str,
+    ) -> bool {
+        let connected_or_auth = manager.get_connection(server_name).is_some_and(|c| {
+            matches!(
+                c.status(),
+                ConnectionStatus::Connected | ConnectionStatus::NeedsAuth
+            )
+        });
+        !connected_or_auth && self.failure_age_seconds(server_name).is_some()
     }
 
     /// `recordFailure` (init.ts:61-80): remember the failure; a 60s timer
@@ -366,20 +411,34 @@ impl FailureTracker {
             tokio::select! {
                 _ = owner.cancelled() => {}
                 _ = tokio::time::sleep(FAILURE_BACKOFF) => {
-                    let mut failed = this.failed_at.lock().unwrap_or_else(|e| e.into_inner());
-                    if failed.get(&name) == Some(&failed_at) {
-                        failed.remove(&name);
-                        this.messages
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&name);
+                    let expired = {
+                        let mut failed = this.failed_at.lock().unwrap_or_else(|e| e.into_inner());
+                        if failed.get(&name) == Some(&failed_at) {
+                            failed.remove(&name);
+                            this.messages
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .remove(&name);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    // init.ts:80-87: the expiry timer notifies before
+                    // publishing the status snapshot so the tool surface
+                    // becomes visible again.
+                    if expired {
+                        this.notify_change(&name, "failure-backoff-expired");
                     }
                 }
             }
         });
+        self.notify_change(server_name, "failure-backoff-started");
     }
 
-    /// `clearFailure` (init.ts:52-59).
+    /// `clearFailure` (init.ts:52-59): drop the failure without firing the
+    /// change hook (callers that need the upstream `restoredReason` notify
+    /// use [`Self::clear_with_reason`]).
     pub fn clear(&self, server_name: &str) {
         self.failed_at
             .lock()
@@ -389,6 +448,35 @@ impl FailureTracker {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(server_name);
+    }
+
+    /// `clearFailure(state, name, restoredReason)` (init.ts:55-69): clears
+    /// the failure and, when a window was actually active, fires the change
+    /// hook with `reason`. Returns whether a window was active so callers
+    /// can mirror the upstream `if (!restored) notifyToolMetadataUpdated`
+    /// fallback.
+    pub fn clear_with_reason(&self, server_name: &str, reason: &str) -> bool {
+        let was_active = self.failure_age_seconds(server_name).is_some();
+        self.clear(server_name);
+        if was_active {
+            self.notify_change(server_name, reason);
+        }
+        was_active
+    }
+
+    /// Test hook: record a failure with an explicit timestamp so expiry can
+    /// be exercised without waiting out [`FAILURE_BACKOFF`]. `failure_age_seconds`
+    /// returns `None` for a stale timestamp; the expiry task is not armed.
+    #[doc(hidden)]
+    pub fn record_failure_at(&self, server_name: &str, failed_at_ms: u64, message: &str) {
+        self.failed_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server_name.to_string(), failed_at_ms);
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server_name.to_string(), message.to_string());
     }
 
     /// `getFailureAgeSeconds` (init.ts:556-562): `None` once the backoff
@@ -447,5 +535,49 @@ mod tests {
         assert_eq!(tracker.failure_message("srv").as_deref(), Some("boom"));
         tracker.clear("srv");
         assert_eq!(tracker.failure_age_seconds("srv"), None);
+    }
+
+    #[tokio::test]
+    async fn active_failure_backoff_truth_table() {
+        let manager = McpServerManager::new(None);
+        let tracker = Arc::new(FailureTracker::new());
+        // No failure recorded → never in backoff.
+        assert!(!tracker.is_server_in_active_failure_backoff(&manager, "srv"));
+        // Failure recorded, no connection → in backoff.
+        tracker.record("srv", "boom", CancellationToken::new());
+        assert!(tracker.is_server_in_active_failure_backoff(&manager, "srv"));
+        // needs-auth is not a failure (failure-backoff.ts:18-23).
+        tracker.clear("srv");
+        assert!(!tracker.is_server_in_active_failure_backoff(&manager, "srv"));
+    }
+
+    #[tokio::test]
+    async fn failure_change_hook_reports_start_and_reason_clear() {
+        let tracker = Arc::new(FailureTracker::new());
+        let events = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let sink = events.clone();
+        tracker.set_change_callback(Arc::new(move |server: &str, reason: &str| {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((server.to_string(), reason.to_string()));
+        }));
+        tracker.record("srv", "boom", CancellationToken::new());
+        assert_eq!(
+            events.lock().unwrap_or_else(|e| e.into_inner()).as_slice(),
+            &[("srv".to_string(), "failure-backoff-started".to_string())]
+        );
+        // `clear` stays silent (upstream clearFailure without reason).
+        tracker.clear("srv");
+        assert_eq!(events.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+        // `clear_with_reason` reports only when a window was active.
+        tracker.record("srv", "boom", CancellationToken::new());
+        assert!(tracker.clear_with_reason("srv", "lazy-connect"));
+        assert!(!tracker.clear_with_reason("srv", "lazy-connect"));
+        let recorded = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            recorded.last().map(|(_, r)| r.as_str()),
+            Some("lazy-connect")
+        );
+        assert_eq!(recorded.len(), 3);
     }
 }

@@ -996,6 +996,7 @@ async fn direct_tools_resolve_execute_and_sync() {
             Some(&cache),
             rpi_ext_mcp_adapter::metadata::ToolPrefix::Server,
             None,
+            &std::collections::HashSet::new(),
         );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(

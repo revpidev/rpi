@@ -128,6 +128,14 @@ pub trait McpTransport: Send + Sync {
     fn set_protocol_version(&self, _version: &str) {}
 }
 
+/// Cache hints from the server's first `tools/list` page
+/// (server-manager.ts:1348-1358 @ `34de8e3`, #446).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolListHints {
+    pub ttl_ms: Option<u64>,
+    pub cache_scope: Option<String>,
+}
+
 /// Result of the metadata discovery phase (`server-manager.ts`
 /// `fetchAllTools`/`fetchAllResources`/`fetchAllPrompts`).
 #[derive(Debug, Clone, Default)]
@@ -137,6 +145,8 @@ pub struct DiscoveredMetadata {
     pub prompts: Vec<Value>,
     /// True when prompts were advertised but `prompts/list` failed.
     pub prompt_discovery_failed: bool,
+    /// `tools/list` cache hints (absent when the server declares neither).
+    pub tool_list_hints: Option<ToolListHints>,
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ProtocolError>>>>>;
@@ -413,7 +423,7 @@ impl McpClient {
                 .unwrap_or(offered_version),
         );
 
-        let tools = self.fetch_all_tools(request_timeout).await?;
+        let (tools, tool_list_hints) = self.fetch_all_tools(request_timeout).await?;
         let resources = self.fetch_all_resources(request_timeout).await?;
         let (prompts, prompt_discovery_failed) = self.fetch_all_prompts(request_timeout).await?;
         Ok(DiscoveredMetadata {
@@ -421,6 +431,7 @@ impl McpClient {
             resources,
             prompts,
             prompt_discovery_failed,
+            tool_list_hints,
         })
     }
 
@@ -489,24 +500,47 @@ impl McpClient {
         Ok(result)
     }
 
-    /// `fetchAllTools` (server-manager.ts:849-860) + SDK `Client.listTools`
-    /// capability guard: when the server does not advertise `tools`, the SDK
-    /// returns an empty list WITHOUT issuing a request (console warning on
-    /// the Node side; tracing here). Parity-verified frame-level by
-    /// scripts/mcp-parity (design §5.2).
-    async fn fetch_all_tools(&self, timeout: Duration) -> Result<Vec<Value>, ProtocolError> {
+    /// `fetchAllTools` (server-manager.ts:1338-1367 @ `34de8e3`): the first
+    /// page's `ttlMs`/`cacheScope` are captured as cache hints (#446);
+    /// invalid types are dropped (`ttlMs` must be a non-negative safe
+    /// integer, `cacheScope` one of `public`/`private`).
+    async fn fetch_all_tools(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Vec<Value>, Option<ToolListHints>), ProtocolError> {
         if !self.advertises("tools") {
             debug!(
                 "Client.listTools() called but server does not advertise tools capability - \
                  returning empty list"
             );
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         }
         let mut all = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut hints: Option<ToolListHints> = None;
+        let mut first_page = true;
         loop {
             let params = cursor.map(|c| json!({ "cursor": c }));
             let result = self.call("tools/list", params, timeout).await?;
+            if first_page {
+                let ttl_ms = result
+                    .get("ttlMs")
+                    .and_then(Value::as_u64)
+                    // JS `Number.isSafeInteger`: reject values beyond 2^53-1.
+                    .filter(|value| *value < (1u64 << 53));
+                let cache_scope = result
+                    .get("cacheScope")
+                    .and_then(Value::as_str)
+                    .filter(|scope| matches!(*scope, "public" | "private"))
+                    .map(str::to_string);
+                if ttl_ms.is_some() || cache_scope.is_some() {
+                    hints = Some(ToolListHints {
+                        ttl_ms,
+                        cache_scope,
+                    });
+                }
+                first_page = false;
+            }
             if let Some(tools) = result.get("tools").and_then(Value::as_array) {
                 all.extend(tools.iter().cloned());
             }
@@ -515,7 +549,7 @@ impl McpClient {
                 _ => break,
             }
         }
-        Ok(all)
+        Ok((all, hints))
     }
 
     /// `fetchAllResources` (server-manager.ts:887-910): capability-gated;

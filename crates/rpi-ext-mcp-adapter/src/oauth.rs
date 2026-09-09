@@ -524,7 +524,9 @@ fn percent_decode(s: &str) -> String {
 const MAX_ERROR_DESCRIPTION_CHARS: usize = 200;
 
 /// `authenticate` (mcp-auth-flow.ts): high-level entry point. Dispatches to
-/// `client_credentials` or `authorization_code` based on config.
+/// `client_credentials` or `authorization_code` based on config. Builds the
+/// production (OS-keyring) credential store; tests/parity drive
+/// [`authenticate_with_store`] with an injected backend.
 pub async fn authenticate(
     server_name: &str,
     server_url: &str,
@@ -532,6 +534,17 @@ pub async fn authenticate(
     options: &AuthenticateOptions,
 ) -> Result<AuthStatus, AdapterError> {
     let store = OAuthCredentialStore::new(options.auth_storage_options.clone());
+    authenticate_with_store(&store, server_name, server_url, definition, options).await
+}
+
+/// Store-injecting `authenticate` body (test/parity hook; same semantics).
+pub async fn authenticate_with_store(
+    store: &OAuthCredentialStore,
+    server_name: &str,
+    server_url: &str,
+    definition: &ServerEntry,
+    options: &AuthenticateOptions,
+) -> Result<AuthStatus, AdapterError> {
     let config = parse_oauth_config(definition);
 
     // Check existing credentials first.
@@ -579,6 +592,12 @@ pub async fn authenticate(
                         {
                             store.update_tokens(server_name, new_tokens, Some(server_url))?;
                             return Ok(AuthStatus::Authenticated);
+                        } else {
+                            // #503: an `invalid_grant` refresh rejection means
+                            // the stored dynamic client is stale; drop the
+                            // registration so the interactive leg below
+                            // re-registers with the current callback URI.
+                            let _ = store.clear_client_info(server_name);
                         }
                     }
                     let _ = issuer;
@@ -592,7 +611,7 @@ pub async fn authenticate(
 
     if config.grant_type == "client_credentials" {
         return authenticate_client_credentials(
-            &store,
+            store,
             server_name,
             server_url,
             definition,
@@ -809,10 +828,23 @@ async fn refresh_token(
         .map_err(|e| AdapterError::InvalidConfigValue(format!("token refresh: {e}")))?;
 
     if !response.status().is_success() {
-        return Err(AdapterError::InvalidConfigValue(format!(
-            "token refresh failed ({})",
-            response.status()
-        )));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        // RFC 6749 §5.2 error object: `invalid_grant` means the refresh token
+        // (or its bound dynamic client registration) is stale (#503).
+        let error_code = serde_json::from_str::<Value>(&body).ok().and_then(|value| {
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if error_code.as_deref() == Some("invalid_grant") {
+            return Err(AdapterError::OAuthInvalidGrant);
+        }
+        return Err(AdapterError::InvalidConfigValue(match error_code {
+            Some(code) => format!("token refresh failed ({status}): {code}"),
+            None => format!("token refresh failed ({status})"),
+        }));
     }
 
     let token_response: Value = response
@@ -995,6 +1027,29 @@ pub fn remove_auth(server_name: &str, options: &AuthStorageOptions) -> Result<()
     store.remove_entry(server_name)
 }
 
+/// #422/#423 compare-and-delete: remove the stored credential only when its
+/// access token equals the one that just failed. A token another process
+/// wrote after our request is preserved. Returns whether the entry was
+/// removed. Token values never reach logs (G4 red line).
+pub fn remove_auth_if_token_matches(
+    store: &OAuthCredentialStore,
+    server_name: &str,
+    server_url: &str,
+    invalidated_token: &str,
+) -> Result<bool, AdapterError> {
+    let Some(entry) = store.get_for_url(server_name, server_url)? else {
+        return Ok(false);
+    };
+    let Some(tokens) = entry.tokens else {
+        return Ok(false);
+    };
+    if tokens.access_token != invalidated_token {
+        return Ok(false);
+    }
+    store.remove_entry(server_name)?;
+    Ok(true)
+}
+
 /// Resolve a usable access token for a server (FR-P1-04, connect-path
 /// injection): the stored token when still valid, or a refresh-token
 /// exchange when expired. Mirrors the SDK `auth()` semantics on the
@@ -1066,6 +1121,14 @@ pub async fn resolve_access_token(
             let access_token = new_tokens.access_token.clone();
             store.update_tokens(server_name, new_tokens, Some(server_url))?;
             Ok((!access_token.is_empty()).then_some(access_token))
+        }
+        Err(error @ AdapterError::OAuthInvalidGrant) => {
+            // #503: the refresh token is dead and the dynamic client bound to
+            // it may be stale — drop the registration so the next
+            // interactive flow re-registers against the current callback.
+            tracing::debug!(server = server_name, %error, "OAuth token refresh rejected; dropping stale client registration");
+            let _ = store.clear_client_info(server_name);
+            Ok(None)
         }
         Err(error) => {
             tracing::debug!(server = server_name, %error, "OAuth token refresh failed");

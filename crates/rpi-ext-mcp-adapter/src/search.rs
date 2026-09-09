@@ -11,6 +11,8 @@
 //! - The regex search mode itself lives in `proxy.rs` (upstream
 //!   `executeSearch`); this module is the pure scoring/pagination layer.
 
+use std::collections::HashSet;
+
 use crate::metadata::{
     get_server_prefix, get_tool_name_candidates, matches_tool_pattern, resolve_tool_prefix,
     McpConfig, ServerEntry, ToolMetadata, ToolPrefix,
@@ -41,6 +43,10 @@ pub struct RankedToolMatch {
 pub struct SearchState<'a> {
     pub config: &'a McpConfig,
     pub tool_metadata: &'a [(String, Vec<ToolMetadata>)],
+    /// Servers in active failure backoff (failure-backoff.ts:18-23): their
+    /// tools are skipped by ranking so a failed server is never advertised
+    /// (search-ranking.ts:246 @ `26527c5`, R7.2.3.1/#434).
+    pub unavailable_servers: &'a HashSet<String>,
 }
 
 /// `normalizeSearchText` (search-ranking.ts:56-60): split camelCase
@@ -278,6 +284,10 @@ pub fn rank_tool_matches(
             if server_name != server {
                 continue;
             }
+        }
+        // search-ranking.ts:246: skip servers in active failure backoff.
+        if state.unavailable_servers.contains(server_name) {
+            continue;
         }
         let definition = state.config.mcp_servers.get(server_name);
         if definition.is_some_and(ServerEntry::is_disabled) {

@@ -268,6 +268,7 @@ pub fn format_status_text(
     config: &McpConfig,
     manager: &crate::manager::McpServerManager,
     tool_metadata: &[(String, Vec<crate::metadata::ToolMetadata>)],
+    failures: &crate::lifecycle::FailureTracker,
 ) -> String {
     let mut lines = vec!["MCP Server Status:".to_string(), String::new()];
 
@@ -284,8 +285,13 @@ pub fn format_status_text(
             .find(|(n, _)| n == name)
             .map(|(_, m)| m.len())
             .unwrap_or(0);
+        // showStatus (commands.ts:70-95 @ 3d953f90): a server inside its
+        // failure window is reported as failed — never as a cached catalog
+        // (R7.2.3.1/#434).
+        let failed_ago = failures.failure_age_seconds(name);
         let status_text;
         let icon;
+        let mut failed = false;
         match connection.as_ref().map(|c| c.status()) {
             Some(crate::manager::ConnectionStatus::Connected) => {
                 status_text = "connected".to_string();
@@ -296,7 +302,18 @@ pub fn format_status_text(
                 icon = "⚠";
             }
             _ => {
-                if meta > 0 {
+                if let Some(failed_ago) = failed_ago {
+                    let reason = crate::utils::sanitize_terminal_text(
+                        failures.failure_message(name).unwrap_or_default().as_str(),
+                    );
+                    status_text = if reason.is_empty() {
+                        format!("failed {failed_ago}s ago")
+                    } else {
+                        format!("failed {failed_ago}s ago — {reason}")
+                    };
+                    icon = "✗";
+                    failed = true;
+                } else if meta > 0 {
                     status_text = "cached".to_string();
                     icon = "○";
                 } else {
@@ -305,7 +322,9 @@ pub fn format_status_text(
                 }
             }
         }
-        let suffix = if status_text == "cached" {
+        let suffix = if failed {
+            String::new()
+        } else if status_text == "cached" {
             format!(" ({meta} tools, cached)")
         } else if status_text == "connected" {
             format!(" ({meta} tools)")
@@ -326,10 +345,14 @@ pub fn format_status_text(
 pub fn format_tools_text(
     config: &McpConfig,
     tool_metadata: &[(String, Vec<crate::metadata::ToolMetadata>)],
+    unavailable_servers: &[String],
 ) -> String {
     let all_tools: Vec<&str> = tool_metadata
         .iter()
         .filter(|(name, _)| !config.is_server_disabled(name))
+        // showTools (commands.ts:132-135 @ `26527c5`): servers in active
+        // failure backoff are not advertised.
+        .filter(|(name, _)| !unavailable_servers.iter().any(|server| server == name))
         .flat_map(|(_, tools)| tools.iter().map(|t| t.name.as_str()))
         .collect();
 
@@ -494,15 +517,59 @@ mod tests {
     fn format_status_text_empty_config() {
         let config = McpConfig::default();
         let manager = McpServerManager::new(None);
-        let text = format_status_text(&config, &manager, &[]);
+        let failures = crate::lifecycle::FailureTracker::new();
+        let text = format_status_text(&config, &manager, &[], &failures);
         assert!(text.contains("No MCP servers configured"));
     }
 
     #[test]
     fn format_tools_text_empty() {
         let config = McpConfig::default();
-        let text = format_tools_text(&config, &[]);
+        let text = format_tools_text(&config, &[], &[]);
         assert_eq!(text, "No MCP tools available");
+    }
+
+    /// #434 / R7.2.3.1（`commands.ts:132-135 @ 26527c5`）：`/mcp tools`
+    /// 不宣传退避中的 server；`/mcp status` 标 failed 并带原因。
+    #[test]
+    fn command_surfaces_hide_backoff_servers() {
+        use crate::lifecycle::FailureTracker;
+        use crate::metadata::{ServerEntry, ToolMetadata};
+        use indexmap::IndexMap;
+
+        fn entry(value: Value) -> ServerEntry {
+            ServerEntry(value.as_object().cloned().unwrap_or_default())
+        }
+
+        let mut mcp_servers = IndexMap::new();
+        mcp_servers.insert("demo".to_string(), entry(json!({ "command": "node" })));
+        let config = McpConfig {
+            mcp_servers,
+            ..Default::default()
+        };
+        let metadata = vec![(
+            "demo".to_string(),
+            vec![ToolMetadata {
+                name: "demo_echo".to_string(),
+                original_name: "echo".to_string(),
+                ..Default::default()
+            }],
+        )];
+        assert!(format_tools_text(&config, &metadata, &[]).contains("demo_echo"));
+        let hidden = format_tools_text(&config, &metadata, &["demo".to_string()]);
+        assert!(!hidden.contains("demo_echo"), "text: {hidden}");
+
+        let manager = McpServerManager::new(None);
+        let failures = FailureTracker::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        failures.record_failure_at("demo", now.saturating_sub(1_000), "boom");
+        let text = format_status_text(&config, &manager, &metadata, &failures);
+        assert!(text.contains("✗ demo: failed"), "text: {text}");
+        assert!(text.contains("— boom"), "text: {text}");
+        assert!(!text.contains("cached"), "text: {text}");
     }
 
     /// A1 baseline: the integration dispatch test
@@ -536,8 +603,9 @@ mod tests {
             settings: None,
         };
         let manager = McpServerManager::new(None);
+        let failures = crate::lifecycle::FailureTracker::new();
         assert_eq!(
-            format_status_text(&config, &manager, &[]),
+            format_status_text(&config, &manager, &[], &failures),
             "MCP Server Status:\n\n○ demo: not connected\n⊘ off: disabled (run /mcp enable off, then /reload)\n○ oauth-demo: not connected"
         );
     }

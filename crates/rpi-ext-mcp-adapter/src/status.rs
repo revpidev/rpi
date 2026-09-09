@@ -39,6 +39,9 @@ pub struct ServerStatusSnapshot {
     pub name: String,
     pub status: ServerRuntimeStatus,
     pub tool_count: u64,
+    /// Per-server direct-tool count from the last active sync
+    /// (types.ts:41 @ `e32bb08`, #484); `0` when disabled.
+    pub direct_tool_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +211,7 @@ pub fn create_mcp_status_snapshot(
     config: &McpConfig,
     manager: &McpServerManager,
     tool_metadata: &[(String, usize)],
+    direct_tool_counts: &[(String, usize)],
     resource_counts: &[(String, usize)],
     failure_tracker: &[(String, u64)],
 ) -> McpStatusSnapshot {
@@ -219,6 +223,13 @@ pub fn create_mcp_status_snapshot(
 
     let tool_meta_count = |name: &str| -> usize {
         tool_metadata
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or(0)
+    };
+    let direct_tool_count = |name: &str| -> usize {
+        direct_tool_counts
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, c)| *c)
@@ -249,56 +260,54 @@ pub fn create_mcp_status_snapshot(
         } else {
             manager.get_connection(name)
         };
+        let connected = connection
+            .as_ref()
+            .is_some_and(|c| c.status() == ConnectionStatus::Connected);
+        let needs_auth = connection
+            .as_ref()
+            .is_some_and(|c| c.status() == ConnectionStatus::NeedsAuth);
+        let failed_ago = if disabled { None } else { failure_age(name) };
+        // `isServerInActiveFailureBackoff` (failure-backoff.ts:18-23):
+        // connected/needs-auth connections are never "failed"; everything
+        // else inside the 60s window hides its cached catalog (mcp-status.ts
+        // :20-38 @ `26527c5`, R7.2.3.1/#434).
+        let active_failure = !disabled && !connected && !needs_auth && failed_ago.is_some();
 
-        let tool_count = if disabled {
+        let tool_count = if disabled || active_failure {
             0
         } else {
             let meta = tool_meta_count(name);
             if meta > 0 {
                 meta
-            } else if connection
-                .as_ref()
-                .is_some_and(|c| c.status() == ConnectionStatus::Connected)
-            {
+            } else if connected {
                 connection.as_ref().map(|c| c.tools.len()).unwrap_or(0)
             } else {
                 0
             }
         };
 
-        let res_count = if disabled {
+        let res_count = if disabled || active_failure {
             None
         } else {
             let rc = resource_count(name);
             if rc.is_some() {
                 rc
-            } else if connection
-                .as_ref()
-                .is_some_and(|c| c.status() == ConnectionStatus::Connected)
-            {
+            } else if connected {
                 Some(connection.as_ref().map(|c| c.resources.len()).unwrap_or(0))
             } else {
                 None
             }
         };
 
-        let failed_ago = if disabled { None } else { failure_age(name) };
-
         let status = if disabled {
             disabled_count += 1;
             ServerRuntimeStatus::Disabled
-        } else if connection
-            .as_ref()
-            .is_some_and(|c| c.status() == ConnectionStatus::Connected)
-        {
+        } else if connected {
             connected_count += 1;
             ServerRuntimeStatus::Connected
-        } else if connection
-            .as_ref()
-            .is_some_and(|c| c.status() == ConnectionStatus::NeedsAuth)
-        {
+        } else if needs_auth {
             ServerRuntimeStatus::NeedsAuth
-        } else if failed_ago.is_some() {
+        } else if active_failure {
             ServerRuntimeStatus::Failed
         } else if tool_count > 0 {
             ServerRuntimeStatus::Cached
@@ -315,8 +324,17 @@ pub fn create_mcp_status_snapshot(
             name: name.clone(),
             status,
             tool_count: tool_count as u64,
+            direct_tool_count: if disabled {
+                0
+            } else {
+                direct_tool_count(name) as u64
+            },
             resource_count: res_count.map(|c| c as u64),
-            failed_ago_seconds: failed_ago,
+            failed_ago_seconds: if status == ServerRuntimeStatus::Failed {
+                failed_ago
+            } else {
+                None
+            },
             disabled,
         });
     }
@@ -354,6 +372,55 @@ mod tests {
     use indexmap::IndexMap;
     use serde_json::json;
 
+    fn entry(value: Value) -> ServerEntry {
+        ServerEntry(value.as_object().cloned().unwrap_or_default())
+    }
+
+    /// #434 / R7.2.3.1（`__tests__/mcp-status.test.ts`）：活动失败窗口内
+    /// 快照标 `failed`、toolCount/resourceCount 不宣传、failedAgoSeconds 保留；
+    /// #484：`directToolCount` 透传最近一次 sync 结果。
+    #[test]
+    fn snapshot_hides_backoff_catalog_and_reports_direct_counts() {
+        let mut servers = IndexMap::new();
+        servers.insert("demo".to_string(), entry(json!({ "command": "node" })));
+        let config = McpConfig {
+            mcp_servers: servers,
+            ..Default::default()
+        };
+        let manager = McpServerManager::new(None);
+        let snapshot = create_mcp_status_snapshot(
+            &config,
+            &manager,
+            &[("demo".to_string(), 7)],
+            &[("demo".to_string(), 3)],
+            &[("demo".to_string(), 2)],
+            &[("demo".to_string(), now_secs().saturating_mul(1000) - 1_000)],
+        );
+        let row = snapshot.servers.first().expect("row");
+        assert_eq!(row.status, ServerRuntimeStatus::Failed);
+        assert_eq!(row.tool_count, 0);
+        assert_eq!(row.resource_count, None);
+        assert_eq!(row.direct_tool_count, 3);
+        assert!(row.failed_ago_seconds.is_some());
+        assert_eq!(snapshot.total_tools, 0);
+        assert_eq!(snapshot.total_resources, 0);
+
+        // 窗口过期 → cached，计数恢复。
+        let restored = create_mcp_status_snapshot(
+            &config,
+            &manager,
+            &[("demo".to_string(), 7)],
+            &[],
+            &[("demo".to_string(), 2)],
+            &[("demo".to_string(), now_secs().saturating_mul(1000) - 61_000)],
+        );
+        let row = restored.servers.first().expect("row");
+        assert_eq!(row.status, ServerRuntimeStatus::Cached);
+        assert_eq!(row.tool_count, 7);
+        assert_eq!(row.resource_count, Some(2));
+        assert_eq!(row.failed_ago_seconds, None);
+    }
+
     #[test]
     fn snapshot_shape_is_versioned() {
         let snapshot = shutdown_snapshot();
@@ -370,6 +437,7 @@ mod tests {
                 name: "demo".to_string(),
                 status: ServerRuntimeStatus::Connected,
                 tool_count: 5,
+                direct_tool_count: 2,
                 resource_count: Some(2),
                 failed_ago_seconds: None,
                 disabled: false,
