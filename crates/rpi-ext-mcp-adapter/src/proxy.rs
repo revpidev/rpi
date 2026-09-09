@@ -1321,8 +1321,14 @@ pub fn execute_search(
         if page.total == 1 { "" } else { "s" }
     );
     for item in &page.items {
+        let approval_marker =
+            if tool_requires_approval(state, &item.server, &item.tool.original_name) {
+                " (requires approval)"
+            } else {
+                ""
+            };
         if show_schemas {
-            text.push_str(&format!("{}\n", item.tool.name));
+            text.push_str(&format!("{}{}\n", item.tool.name, approval_marker));
             let description = if item.tool.description.is_empty() {
                 "(no description)"
             } else {
@@ -1350,7 +1356,7 @@ pub fn execute_search(
             }
             text.push('\n');
         } else {
-            text.push_str(&format!("- {}", item.tool.name));
+            text.push_str(&format!("- {}{}", item.tool.name, approval_marker));
             if !item.tool.description.is_empty() {
                 text.push_str(&format!(
                     " - {}",
@@ -1386,7 +1392,30 @@ pub fn execute_search(
     })
 }
 
-/// `executeDescribe` (proxy-modes.ts:406-456), minus the P1 approval marker.
+/// `isToolCallApprovalRequired(..., state.toolMetadata)` against the live
+/// metadata index (proxy-modes.ts:567/696/712 @ 10a45367): the describe /
+/// search surfaces mark gated tools with ` (requires approval)`.
+fn tool_requires_approval(state: &McpRuntime, server_name: &str, original_tool_name: &str) -> bool {
+    let metadata = state
+        .tool_metadata
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let context = crate::approval::approval_candidate_context(
+        &state.config,
+        &metadata,
+        server_name,
+        original_tool_name,
+    );
+    crate::approval::is_tool_call_approval_required(
+        &state.config,
+        server_name,
+        original_tool_name,
+        Some(&context),
+    )
+}
+
+/// `executeDescribe` (proxy-modes.ts:406-456) with the P1 approval marker
+/// (proxy-modes.ts:567 @ 10a45367).
 pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
     let tool_metadata = state
         .tool_metadata
@@ -1439,7 +1468,12 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
         );
     };
 
-    let mut text = format!("{}\n", tool_meta.name);
+    let approval_marker = if tool_requires_approval(state, &server_name, &tool_meta.original_name) {
+        " (requires approval)"
+    } else {
+        ""
+    };
+    let mut text = format!("{}{}\n", tool_meta.name, approval_marker);
     text.push_str(&format!("Server: {server_name}\n"));
     if let Some(uri) = &tool_meta.resource_uri {
         text.push_str(&format!("Type: Resource (reads from {uri})\n"));

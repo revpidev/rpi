@@ -172,7 +172,12 @@ async fn build_runtime(dir: &Path, port: u16, auto_auth: bool) -> Arc<proxy::Mcp
         .expect("json"),
     )
     .expect("write config");
-    proxy::initialize_mcp(dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await
+    proxy::initialize_mcp(
+        dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await
 }
 
 /// 上游 "fails fast for non-ui browser auth when autoAuth is enabled" +
@@ -254,8 +259,12 @@ async fn proxy_modes_auto_auth_custom_auth_required_message() {
         .expect("json"),
     )
     .expect("write config");
-    let runtime =
-        proxy::initialize_mcp(&dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await;
+    let runtime = proxy::initialize_mcp(
+        &dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await;
 
     let result = proxy::execute_connect(&runtime, "demo").await;
     assert_eq!(
@@ -307,8 +316,12 @@ async fn proxy_modes_auto_auth_failed_message_wrapped() {
         .expect("json"),
     )
     .expect("write config");
-    let runtime =
-        proxy::initialize_mcp(&dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await;
+    let runtime = proxy::initialize_mcp(
+        &dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await;
 
     let result = proxy::execute_connect(&runtime, "demo").await;
     let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -1122,7 +1135,15 @@ async fn build_approval_runtime(dir: &Path, port: u16) -> Arc<proxy::McpRuntime>
         .expect("json"),
     )
     .expect("write config");
-    proxy::initialize_mcp(dir, Some(&dir.join(".mcp.json").to_string_lossy()), None).await
+    // Explicit per-test cache path: the default derives from
+    // `RPI_CODING_AGENT_DIR`, which `freeze_direct_tools_metadata_hook_*`
+    // mutates for the whole process — concurrent tests must not share it.
+    proxy::initialize_mcp(
+        dir,
+        Some(&dir.join(".mcp.json").to_string_lossy()),
+        Some(dir.join("mcp-cache.json")),
+    )
+    .await
 }
 
 fn args(query: &str) -> Option<serde_json::Map<String, Value>> {
@@ -1330,6 +1351,37 @@ async fn direct_tool_approval_gate_applies() {
     );
     assert_eq!(handler_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    runtime.owner_cancel.cancel();
+    runtime.manager.close_all().await;
+    stop.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// TE21 I-2（独立复核）：describe/search 对 `approveTools` 命中工具追加
+/// ` (requires approval)` 标记（proxy-modes.ts:567/696/712 @ 10a45367）。
+/// 未配置 `approveTools` 时无标记——既有 golden_search 4 用例与 mcp-parity
+/// 回归轨覆盖该分支。
+#[tokio::test]
+async fn describe_and_search_show_approval_marker() {
+    let dir = temp_dir("approval-marker");
+    let stop = CancellationToken::new();
+    let (port, _call_count) = spawn_approval_stub(stop.clone()).await;
+    let runtime = build_approval_runtime(&dir, port).await;
+
+    let describe = proxy::execute_describe(&runtime, "demo_echo");
+    let text = describe["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.starts_with("demo_echo (requires approval)\n"),
+        "describe marker: {text}"
+    );
+
+    let search = proxy::execute_search(&runtime, "echo", false, None, Some(false), None, None);
+    let text = search["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("- demo_echo (requires approval)"),
+        "search marker: {text}"
+    );
 
     runtime.owner_cancel.cancel();
     runtime.manager.close_all().await;

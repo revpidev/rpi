@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 struct FakeHost {
     cwd: Mutex<String>,
-    session_file: Mutex<String>,
+    session_file: Mutex<Option<String>>,
     session_file_calls: AtomicUsize,
     append_entries: Mutex<Vec<Value>>,
 }
@@ -48,9 +48,14 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
         "getActiveTools" | "getAllTools" => json!({"ok": []}),
         "ctx.sessionFile" => {
             host.session_file_calls.fetch_add(1, Ordering::SeqCst);
+            let path = host
+                .session_file
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             json!({
                 "ok": {
-                    "path": *host.session_file.lock().unwrap_or_else(|e| e.into_inner()),
+                    "path": path,
                     "id": "s1",
                 }
             })
@@ -171,7 +176,7 @@ async fn session_approvals_restore_rebuild_and_persist() {
 
     let host = Arc::new(FakeHost {
         cwd: Mutex::new(dir.to_string_lossy().into_owned()),
-        session_file: Mutex::new(session_path.to_string_lossy().into_owned()),
+        session_file: Mutex::new(Some(session_path.to_string_lossy().into_owned())),
         session_file_calls: AtomicUsize::new(0),
         append_entries: Mutex::new(Vec::new()),
     });
@@ -275,6 +280,27 @@ async fn session_approvals_restore_rebuild_and_persist() {
     // G4: no raw-argument field can appear in the persisted payload.
     assert!(data.get("args").is_none());
     assert!(data.get("query").is_none());
+
+    // I-1 / TE-D41: in-memory sessions (`--no-session`, `path: null`) have no
+    // JSONL to replay, so a restore clears the set (fail-closed). Pinned here
+    // because upstream rebuilds from the in-memory branch
+    // (`sessionManager.getBranch()`, index.ts:217-229 @ 928c30c) — the rpi
+    // transitional path cannot, and 04-design §6.2 `ctx.sessionEntries` is
+    // the future ABI fix.
+    *host.session_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let identity_d = get_tool_approval_identity("demo", &tool, &json!({"query": "d"}));
+    assert!(runtime
+        .approval
+        .grant_session("demo", "search", &identity_d));
+    assert_eq!(runtime.approval.len(), 4);
+    dispatch_event(
+        "session_tree",
+        json!({"type": "session_tree", "newLeafId": "e1", "oldLeafId": "e2"}),
+    );
+    assert!(
+        runtime.approval.is_empty(),
+        "in-memory restore is fail-closed (TE-D41)"
+    );
 
     std::env::remove_var("RPI_CODING_AGENT_DIR");
     match saved_agent_dir {

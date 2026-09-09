@@ -971,15 +971,7 @@ impl approval::ApprovalHandler for TuiApprovalHandler {
             return approval::ApprovalDecision::Deny;
         };
         let channel = state.channel();
-        let json = serde_json::to_string_pretty(args).unwrap_or_else(|_| "{}".to_string());
-        let sanitized = utils::sanitize_terminal_text(&json);
-        let preview = if sanitized.chars().count() > 500 {
-            let mut truncated: String = sanitized.chars().take(500).collect();
-            truncated.push_str("...");
-            truncated
-        } else {
-            sanitized
-        };
+        let preview = approval::dialog_preview(args);
         let title = format!(
             "MCP: {} wants to run {}",
             utils::sanitize_terminal_text(server_name),

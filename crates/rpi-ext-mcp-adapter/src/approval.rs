@@ -391,6 +391,26 @@ pub fn approval_rejection_details(
     }
 }
 
+/// `JSON.stringify(args ?? {}, null, 2)` + `sanitizeTerminalText` + 500-char
+/// truncation (tool-approval.ts:160-165 @ 928c30c). Null/absent arguments
+/// render as `{}` (upstream `args ?? {}`).
+pub fn dialog_preview(args: &Value) -> String {
+    let normalized = if args.is_null() {
+        json!({})
+    } else {
+        args.clone()
+    };
+    let json = serde_json::to_string_pretty(&normalized).unwrap_or_else(|_| "{}".to_string());
+    let sanitized = crate::utils::sanitize_terminal_text(&json);
+    if sanitized.chars().count() > 500 {
+        let mut truncated: String = sanitized.chars().take(500).collect();
+        truncated.push_str("...");
+        truncated
+    } else {
+        sanitized
+    }
+}
+
 fn ordered_details(
     mode: Option<&str>,
     error: &str,
@@ -853,6 +873,21 @@ mod tests {
             direct,
             json!({"error": "approval_denied", "server": "demo", "tool": "search"})
         );
+    }
+
+    /// I-3 (复核): the dialog preview normalizes null/absent args to `{}` and
+    /// caps the sanitized text at 500 chars + `...` (tool-approval.ts:160-165
+    /// @ 928c30c).
+    #[test]
+    fn dialog_preview_renders_null_as_empty_object_and_truncates() {
+        assert_eq!(dialog_preview(&Value::Null), "{}");
+        assert_eq!(dialog_preview(&json!({})), "{}");
+        assert_eq!(dialog_preview(&json!({"a": 1})), "{ \"a\": 1 }");
+        let long = json!({"q": "x".repeat(600)});
+        let preview = dialog_preview(&long);
+        assert!(preview.ends_with("..."));
+        assert_eq!(preview.chars().count(), 503);
+        assert!(!dialog_preview(&json!({"q": "a\u{1b}[31mb\u{7}c"})).contains('\u{1b}'));
     }
 
     /// Restore clears stale grants before replaying the target branch (A6/A7).
