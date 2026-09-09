@@ -349,6 +349,17 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     ) {
         return json!({"error": err});
     }
+    // Slash commands (R7.2.1.1): `/mcp` and `/mcp-auth` become reachable on
+    // the ABI. Registered on every install/rebind, exactly like the flag and
+    // the event handlers above (a fresh host starts with an empty registry).
+    for (name, description) in commands::command_definitions() {
+        if let Err(err) = register(
+            "registerCommand",
+            json!({"name": name, "description": description}),
+        ) {
+            return json!({"error": err});
+        }
+    }
     for event in ["session_start", "session_shutdown", "tool_result"] {
         if let Err(err) = register("on", json!({"event": event})) {
             return json!({"error": err});
@@ -608,6 +619,16 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
         return pack(&Value::Null);
     };
     match message.get("kind").and_then(Value::as_str) {
+        // Slash-command dispatch (R7.2.1.1, [RPI-OWN]): the host registers
+        // `/mcp` and `/mcp-auth` via `registerCommand` and forwards
+        // `{"kind":"command","name","args"}`; `command.*` host calls are
+        // legal inside this dispatch only. Unknown names return an error
+        // result — never a panic and never a hang.
+        Some("command") => {
+            let name = message.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = message.get("args").and_then(Value::as_str).unwrap_or("");
+            pack(&handle_command(state, name, args))
+        }
         Some("toolExecute") => {
             let tool_name = message
                 .get("toolName")
@@ -780,6 +801,430 @@ fn current_config_path(state: &PluginState) -> Option<String> {
     )
     .and_then(|v| v.as_str().map(str::to_string))
     .filter(|s| !s.is_empty())
+}
+
+// ============================================================================
+// Slash commands (`/mcp`, `/mcp-auth`) — R7.2.1.1/.3/.4, [RPI-OWN]
+// ============================================================================
+
+/// Host-call facade for command handlers. Mirrors the upstream command
+/// context surface (`ctx.hasUI` / `ctx.mode` / `ctx.ui.notify|select|
+/// setStatus`) using only existing ABI methods (`ui.*`, capability `ui`).
+struct CommandHost<'a> {
+    calls: &'a RpiHostCalls,
+    cookie: usize,
+}
+
+impl CommandHost<'_> {
+    fn has_ui(&self) -> bool {
+        host_call_ok(self.calls, self.cookie, "ctx.hasUI", json!({}))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    }
+
+    fn mode(&self) -> String {
+        host_call_ok(self.calls, self.cookie, "ctx.mode", json!({}))
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    /// `canRenderPanel` (commands.ts @ v2.32.1 `10a45367`:38-47, upstream
+    /// #365 — absent from the v2.24.0 port baseline): `hasUI` alone is not
+    /// enough — rpc/print/json bind a headless bridge whose `ui.select` never
+    /// settles, so an overlay/select additionally requires
+    /// `ctx.mode === "tui"`.
+    fn can_render_panel(&self) -> bool {
+        self.has_ui() && self.mode() == "tui"
+    }
+
+    fn notify(&self, message: &str, kind: &str) {
+        if !self.has_ui() {
+            return;
+        }
+        host_call(
+            self.calls,
+            self.cookie,
+            "ui.notify",
+            json!({"message": message, "notifyType": kind}),
+        );
+    }
+
+    /// Show a select dialog (status view). The selection is informational and
+    /// deliberately discarded; the host blocks until the dialog resolves.
+    fn select(&self, title: &str, options: &[String]) {
+        host_call_ok(
+            self.calls,
+            self.cookie,
+            "ui.select",
+            json!({"title": title, "options": options}),
+        );
+    }
+
+    fn set_status(&self, key: &str, text: Option<&str>) {
+        if !self.has_ui() {
+            return;
+        }
+        host_call(
+            self.calls,
+            self.cookie,
+            "ui.setStatus",
+            json!({"key": key, "text": text}),
+        );
+    }
+}
+
+/// Resolve the ready runtime, awaiting an in-flight init (upstream
+/// `await initPromise`). `NotStarted`/`Failed` map to the same error results
+/// the proxy/direct tools return.
+fn command_runtime(state: &PluginState) -> Result<Arc<proxy::McpRuntime>, Value> {
+    state.runtime.block_on(state.dispatcher.current_direct())
+}
+
+/// `{"kind":"command"}` dispatch entry (see the dispatch arm). Unknown
+/// names return an error result — never a panic and never a hang (R7.2.1.4).
+fn handle_command(state: &PluginState, name: &str, args: &str) -> Value {
+    match name {
+        "mcp" => handle_mcp_command(state, args),
+        "mcp-auth" => handle_mcp_auth_command(state, args),
+        other => commands::error_result(format!("Unknown command: {other}"), "unknown_command"),
+    }
+}
+
+/// `/mcp [status|tools|enable|disable|reconnect|logout]` (FR-A/FR-B/FR-D).
+fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
+    let channel = state.channel();
+    let calls = RpiHostCalls { call: channel.call };
+    let host = CommandHost {
+        calls: &calls,
+        cookie: channel.cookie,
+    };
+    let (subcommand, target) = commands::parse_subcommand(args);
+
+    match subcommand {
+        commands::McpSubcommand::Status => {
+            let runtime = match command_runtime(state) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            let (config, metadata) = proxy::search_state_snapshot(&runtime);
+            let text = commands::format_status_text(&config, &runtime.manager, &metadata);
+            if host.can_render_panel() {
+                let mut options: Vec<String> = text
+                    .lines()
+                    .map(str::to_string)
+                    .filter(|line| !line.trim().is_empty())
+                    .collect();
+                options.push("Close".to_string());
+                host.select("MCP Server Status", &options);
+            } else {
+                // RPC keeps a real bridge (notify reaches the client);
+                // print/json bind the null bridge, where the returned text is
+                // the observable command output (print-mode stdout contract:
+                // the plugin never writes stdout, lib.rs:9-11).
+                host.notify(&text, "info");
+            }
+            commands::text_result(text)
+        }
+        commands::McpSubcommand::Tools => {
+            let runtime = match command_runtime(state) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            let (config, metadata) = proxy::search_state_snapshot(&runtime);
+            let text = commands::format_tools_text(&config, &metadata);
+            host.notify(&text, "info");
+            commands::text_result(text)
+        }
+        commands::McpSubcommand::Enable | commands::McpSubcommand::Disable => {
+            let disabled = matches!(subcommand, commands::McpSubcommand::Disable);
+            let action = if disabled { "disable" } else { "enable" };
+            let Some(server) = target else {
+                let text = format!("Usage: /mcp {action} <server>");
+                host.notify(&text, "error");
+                return commands::error_result(text, "invalid_args");
+            };
+            let runtime = match command_runtime(state) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            if !runtime.config.mcp_servers.contains_key(&server) {
+                let text = format!("Server \"{server}\" not found in effective config");
+                host.notify(&text, "error");
+                return commands::error_result(text, "server_not_found");
+            }
+            // FR-D: project-level `<cwd>/.rpi/mcp.json`, read-modify-write,
+            // unknown fields preserved, atomic tmp+rename (ADR-0001 path).
+            let cwd = session_cwd(state);
+            match commands::write_project_server_disabled_override(&cwd, &server, disabled) {
+                Ok((path, changed)) => {
+                    let text = commands::enable_disable_message(&server, disabled, changed, &path);
+                    host.notify(&text, "info");
+                    commands::text_result_with_details(
+                        text,
+                        json!({
+                            "server": server,
+                            "disabled": disabled,
+                            "changed": changed,
+                            "path": path.to_string_lossy(),
+                        }),
+                    )
+                }
+                Err(error) => {
+                    let text = format!(
+                        "Failed to update the project MCP override for \"{server}\": {error}"
+                    );
+                    host.notify(&text, "error");
+                    commands::error_result(text, "write_failed")
+                }
+            }
+        }
+        commands::McpSubcommand::Reconnect => {
+            let runtime = match command_runtime(state) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            let names: Vec<String> = match target {
+                Some(server) => {
+                    if !runtime.config.mcp_servers.contains_key(&server) {
+                        let text = format!("Server \"{server}\" not found in config");
+                        host.notify(&text, "error");
+                        return commands::error_result(text, "server_not_found");
+                    }
+                    vec![server]
+                }
+                None => runtime.config.mcp_servers.keys().cloned().collect(),
+            };
+            let mut lines = Vec::new();
+            for name in names {
+                lines.push(reconnect_server(state, &host, &runtime, &name));
+            }
+            update_status_bar(state);
+            commands::text_result(lines.join("\n"))
+        }
+        commands::McpSubcommand::Logout => {
+            let Some(server) = target else {
+                let text = "Usage: /mcp logout <server>".to_string();
+                host.notify(&text, "error");
+                return commands::error_result(text, "invalid_args");
+            };
+            let runtime = match command_runtime(state) {
+                Ok(runtime) => runtime,
+                Err(result) => return result,
+            };
+            if !runtime.config.mcp_servers.contains_key(&server) {
+                let text = format!("Server \"{server}\" not found in config");
+                host.notify(&text, "error");
+                return commands::error_result(text, "server_not_found");
+            }
+            let options = crate::oauth::store::AuthStorageOptions {
+                base_dir: oauth_dir(&runtime),
+            };
+            match crate::oauth::remove_auth(&server, &options) {
+                Ok(()) => {
+                    state.runtime.block_on(runtime.manager.close(&server));
+                    update_status_bar(state);
+                    let text = format!(
+                        "OAuth credentials cleared for \"{server}\". Run /mcp-auth {server} to authenticate again."
+                    );
+                    host.notify(&text, "info");
+                    commands::text_result(text)
+                }
+                Err(error) => {
+                    let text =
+                        format!("Failed to clear OAuth credentials for \"{server}\": {error}");
+                    host.notify(&text, "error");
+                    commands::error_result(text, "logout_failed")
+                }
+            }
+        }
+        commands::McpSubcommand::Unknown(other) => {
+            let text = format!("Unknown /mcp subcommand: {other}\n{}", commands::MCP_USAGE);
+            host.notify(&text, "error");
+            commands::error_result(text, "unknown_subcommand")
+        }
+    }
+}
+
+/// `reconnectServer` (commands.ts:138-210 @ `3d953f90`, v2.24.0): close +
+/// connect, refresh metadata/cache/status, clear the failure record.
+/// Returns the text line.
+fn reconnect_server(
+    state: &PluginState,
+    host: &CommandHost<'_>,
+    runtime: &Arc<proxy::McpRuntime>,
+    name: &str,
+) -> String {
+    let Some(definition) = runtime.config.mcp_servers.get(name).cloned() else {
+        let text = format!("Server \"{name}\" not found in config");
+        host.notify(&text, "error");
+        return text;
+    };
+    if definition.is_disabled() {
+        let text = format!("MCP: {name} is disabled. Run /mcp enable {name}, then /reload.");
+        host.notify(&text, "warning");
+        return text;
+    }
+    let outcome = state.runtime.block_on(async {
+        runtime.manager.close(name).await;
+        runtime.manager.connect(name, &definition).await
+    });
+    match outcome {
+        Ok(connection) => match connection.status() {
+            crate::manager::ConnectionStatus::Connected => {
+                proxy::update_server_metadata(runtime, name);
+                proxy::update_metadata_cache(runtime, name);
+                runtime.failures.clear(name);
+                proxy::notify_metadata_updated(runtime, name, "command-reconnect");
+                proxy::mark_keep_alive_after_connect(runtime, name);
+                let text = format!(
+                    "MCP: Reconnected to {name} ({} tools, {} resources)",
+                    connection.tools.len(),
+                    connection.resources.len()
+                );
+                host.notify(&text, "info");
+                text
+            }
+            crate::manager::ConnectionStatus::NeedsAuth => {
+                let text = format!("MCP: {name} requires OAuth. Run /mcp-auth {name} first.");
+                host.notify(&text, "warning");
+                text
+            }
+            _ => {
+                let text =
+                    format!("MCP: Failed to reconnect to {name}: connection did not become ready");
+                host.notify(&text, "error");
+                text
+            }
+        },
+        Err(error) => {
+            let message = error.to_string();
+            runtime
+                .failures
+                .record(name, &message, runtime.owner_cancel.clone());
+            let text = format!("MCP: Failed to reconnect to {name}: {message}");
+            host.notify(&text, "error");
+            text
+        }
+    }
+}
+
+/// `/mcp-auth <server>` (R7.2.1.1/.4): interactive OAuth only. A headless
+/// session returns the guidance text immediately — the #365 no-hang contract
+/// (`authenticateServer` commands.ts:232-243 @ `3d953f90`, no-UI message at
+/// :242).
+fn handle_mcp_auth_command(state: &PluginState, args: &str) -> Value {
+    let channel = state.channel();
+    let calls = RpiHostCalls { call: channel.call };
+    let host = CommandHost {
+        calls: &calls,
+        cookie: channel.cookie,
+    };
+    let server = args.trim().to_string();
+    if server.is_empty() {
+        let text = "Usage: /mcp-auth <server>".to_string();
+        host.notify(&text, "error");
+        return commands::error_result(text, "invalid_args");
+    }
+    if !host.has_ui() {
+        let text = "OAuth authentication requires an interactive session.".to_string();
+        return commands::error_result(text, "no_ui");
+    }
+    let runtime = match command_runtime(state) {
+        Ok(runtime) => runtime,
+        Err(result) => return result,
+    };
+    let Some(definition) = runtime.config.mcp_servers.get(&server).cloned() else {
+        let text = format!("Server \"{server}\" not found in config");
+        host.notify(&text, "error");
+        return commands::error_result(text, "server_not_found");
+    };
+    if definition.is_disabled() {
+        let text =
+            format!("Server \"{server}\" is disabled. Run /mcp enable {server}, then /reload.");
+        host.notify(&text, "warning");
+        return commands::error_result(text, "server_disabled");
+    }
+    if !crate::manager::supports_oauth(&definition) {
+        let text = format!(
+            "Server \"{server}\" does not use OAuth authentication.\nSet \"auth\": \"oauth\" or omit auth for auto-detection."
+        );
+        host.notify(&text, "error");
+        return commands::error_result(text, "not_oauth");
+    }
+    let server_url = match crate::utils::resolve_server_url(definition.get("url")) {
+        Ok(Some(url)) => url,
+        Ok(None) => {
+            let text = format!(
+                "Server \"{server}\" has no URL configured (OAuth requires HTTP transport)"
+            );
+            host.notify(&text, "error");
+            return commands::error_result(text, "no_url");
+        }
+        Err(_) => {
+            // The resolution error embeds the interpolated URL (potential
+            // credential material) — never forward it (G4).
+            let text = format!("Server \"{server}\" has an invalid or unresolvable URL");
+            host.notify(&text, "error");
+            return commands::error_result(text, "invalid_url");
+        }
+    };
+
+    // The authorization-URL callback runs on the OAuth task: capture the
+    // host trampoline (fn pointer + cookie are Copy and 'static) instead of
+    // borrowing the CommandHost.
+    let call = channel.call;
+    let cookie = channel.cookie;
+    let server_for_url = server.clone();
+    let options = crate::oauth::AuthenticateOptions {
+        auth_storage_options: crate::oauth::store::AuthStorageOptions {
+            base_dir: oauth_dir(&runtime),
+        },
+        on_authorization_url: Some(Arc::new(move |url: &str| {
+            let calls = RpiHostCalls { call };
+            let message =
+                format!("Complete {server_for_url} OAuth\nOpen the authorization page:\n{url}");
+            host_call(
+                &calls,
+                cookie,
+                "ui.notify",
+                json!({"message": message, "notifyType": "info"}),
+            );
+        })),
+        ..Default::default()
+    };
+
+    host.set_status("mcp-auth", Some(&format!("Authenticating {server}...")));
+    let outcome = state.runtime.block_on(crate::oauth::authenticate(
+        &server,
+        &server_url,
+        &definition,
+        &options,
+    ));
+    host.set_status("mcp-auth", None);
+    match outcome {
+        Ok(_) => {
+            let text = format!("OAuth authentication successful for \"{server}\".");
+            host.notify(&text, "info");
+            commands::text_result(text)
+        }
+        Err(error) => {
+            let text = format!("Failed to authenticate \"{server}\": {error}");
+            host.notify(&text, "error");
+            commands::error_result(text, "auth_failed")
+        }
+    }
+}
+
+/// `settings.oauthDir` → auth store base directory (proxy.rs
+/// `attempt_auto_auth` parity).
+fn oauth_dir(runtime: &proxy::McpRuntime) -> Option<std::path::PathBuf> {
+    runtime
+        .config
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.get("oauthDir"))
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from)
 }
 
 /// The root module export (abi_stable).

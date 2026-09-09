@@ -18,6 +18,99 @@ use serde_json::{json, Map, Value};
 use crate::error::AdapterError;
 use crate::metadata::McpConfig;
 
+/// Registered slash commands (R7.2.1.1): `install` issues one
+/// `registerCommand` host call per entry and the manifest `commands`
+/// capability is asserted against this list (`tests/manifest_capabilities.rs`).
+pub fn command_definitions() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "mcp",
+            "Show MCP server status (status/tools/enable/disable/reconnect/logout)",
+        ),
+        ("mcp-auth", "Authenticate with an MCP server (OAuth)"),
+    ]
+}
+
+/// Parsed `/mcp` subcommand (R7.2.1.1). Empty args and `status` both map to
+/// [`McpSubcommand::Status`] (upstream `case "status": case "":`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpSubcommand {
+    Status,
+    Tools,
+    Enable,
+    Disable,
+    Reconnect,
+    Logout,
+    Unknown(String),
+}
+
+/// Parse `/mcp` arguments: the first whitespace token selects the
+/// subcommand, the trimmed remainder is the target server name.
+pub fn parse_subcommand(args: &str) -> (McpSubcommand, Option<String>) {
+    let trimmed = args.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default().trim();
+    let target = (!rest.is_empty()).then(|| rest.to_string());
+    let subcommand = match head {
+        "" | "status" => McpSubcommand::Status,
+        "tools" => McpSubcommand::Tools,
+        "enable" => McpSubcommand::Enable,
+        "disable" => McpSubcommand::Disable,
+        "reconnect" => McpSubcommand::Reconnect,
+        "logout" => McpSubcommand::Logout,
+        other => McpSubcommand::Unknown(other.to_string()),
+    };
+    (subcommand, target)
+}
+
+/// Usage line for the `/mcp` family (unknown subcommand / missing target).
+pub const MCP_USAGE: &str = "Usage: /mcp [status|tools|enable <server>|disable <server>|reconnect [server]|logout <server>]";
+
+/// AgentToolResult-shaped text result. The host's command dispatch drops
+/// the return value today, so every handler also mirrors its text through
+/// `ui.notify` when a UI is bound; the result payload stays the assertable
+/// ABI contract for `hasUI == false` (print/json) and for host callers.
+pub fn text_result(text: impl Into<String>) -> Value {
+    json!({ "content": [{ "type": "text", "text": text.into() }] })
+}
+
+/// Text result plus a structured `details` object.
+pub fn text_result_with_details(text: impl Into<String>, details: Value) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text.into() }],
+        "details": details,
+    })
+}
+
+/// Error result: text + `isError` + `details.error` kind. Command handlers
+/// must return this instead of panicking or hanging (R7.2.1.4).
+pub fn error_result(text: impl Into<String>, kind: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text.into() }],
+        "isError": true,
+        "details": { "error": kind },
+    })
+}
+
+/// `enable`/`disable` confirmation text. Mirrors upstream (`index.ts:560-565`
+/// @ `3d953f90`, v2.24.0): changed → path + `/reload` guidance; unchanged →
+/// already-in-target-state notice.
+pub fn enable_disable_message(server: &str, disabled: bool, changed: bool, path: &Path) -> String {
+    if changed {
+        format!(
+            "{} server \"{server}\" in {} — run /reload to apply",
+            if disabled { "Disabled" } else { "Enabled" },
+            path.display()
+        )
+    } else {
+        format!(
+            "Server \"{server}\" is already {}",
+            if disabled { "disabled" } else { "enabled" }
+        )
+    }
+}
+
 /// `<cwd>/.rpi/mcp.json` (upstream `.pi/mcp.json`, ADR-0001 rename).
 pub fn project_pi_config_path(cwd: &Path) -> PathBuf {
     cwd.join(".rpi").join("mcp.json")
@@ -410,5 +503,128 @@ mod tests {
         let config = McpConfig::default();
         let text = format_tools_text(&config, &[]);
         assert_eq!(text, "No MCP tools available");
+    }
+
+    /// A1 baseline: the integration dispatch test
+    /// (`tests/command_wiring.rs`) asserts the same literal, tying the
+    /// wired `/mcp status` output to this pure-function baseline.
+    #[test]
+    fn format_status_text_known_baseline() {
+        use crate::metadata::ServerEntry;
+        use indexmap::IndexMap;
+
+        fn entry(value: Value) -> ServerEntry {
+            ServerEntry(value.as_object().cloned().unwrap_or_default())
+        }
+
+        let mut mcp_servers = IndexMap::new();
+        mcp_servers.insert(
+            "demo".to_string(),
+            entry(json!({"command": "node", "lifecycle": "lazy"})),
+        );
+        mcp_servers.insert(
+            "off".to_string(),
+            entry(json!({"command": "node", "disabled": true})),
+        );
+        mcp_servers.insert(
+            "oauth-demo".to_string(),
+            entry(json!({"url": "http://127.0.0.1:9/mcp", "auth": "oauth", "lifecycle": "lazy"})),
+        );
+        let config = McpConfig {
+            mcp_servers,
+            imports: None,
+            settings: None,
+        };
+        let manager = McpServerManager::new(None);
+        assert_eq!(
+            format_status_text(&config, &manager, &[]),
+            "MCP Server Status:\n\n○ demo: not connected\n⊘ off: disabled (run /mcp enable off, then /reload)\n○ oauth-demo: not connected"
+        );
+    }
+
+    #[test]
+    fn command_definitions_cover_mcp_and_mcp_auth() {
+        let names: Vec<&str> = command_definitions()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(names, ["mcp", "mcp-auth"]);
+        for (name, description) in command_definitions() {
+            assert!(!name.is_empty());
+            assert!(!description.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_subcommand_maps_known_forms() {
+        assert_eq!(parse_subcommand(""), (McpSubcommand::Status, None));
+        assert_eq!(parse_subcommand("  "), (McpSubcommand::Status, None));
+        assert_eq!(parse_subcommand("status"), (McpSubcommand::Status, None));
+        assert_eq!(parse_subcommand("tools"), (McpSubcommand::Tools, None));
+        assert_eq!(
+            parse_subcommand("disable demo"),
+            (McpSubcommand::Disable, Some("demo".to_string()))
+        );
+        assert_eq!(
+            parse_subcommand("enable  demo  "),
+            (McpSubcommand::Enable, Some("demo".to_string()))
+        );
+        assert_eq!(
+            parse_subcommand("reconnect"),
+            (McpSubcommand::Reconnect, None)
+        );
+        assert_eq!(
+            parse_subcommand("reconnect demo"),
+            (McpSubcommand::Reconnect, Some("demo".to_string()))
+        );
+        assert_eq!(
+            parse_subcommand("logout demo"),
+            (McpSubcommand::Logout, Some("demo".to_string()))
+        );
+        assert_eq!(
+            parse_subcommand("setup"),
+            (McpSubcommand::Unknown("setup".to_string()), None)
+        );
+        // Server names may contain spaces; the remainder is one target.
+        assert_eq!(
+            parse_subcommand("logout my server"),
+            (McpSubcommand::Logout, Some("my server".to_string()))
+        );
+    }
+
+    #[test]
+    fn enable_disable_message_matches_upstream_shape() {
+        let path = Path::new("/repo/.rpi/mcp.json");
+        assert_eq!(
+            enable_disable_message("demo", true, true, path),
+            "Disabled server \"demo\" in /repo/.rpi/mcp.json — run /reload to apply"
+        );
+        assert_eq!(
+            enable_disable_message("demo", false, true, path),
+            "Enabled server \"demo\" in /repo/.rpi/mcp.json — run /reload to apply"
+        );
+        assert_eq!(
+            enable_disable_message("demo", true, false, path),
+            "Server \"demo\" is already disabled"
+        );
+        assert_eq!(
+            enable_disable_message("demo", false, false, path),
+            "Server \"demo\" is already enabled"
+        );
+    }
+
+    #[test]
+    fn result_builders_shape() {
+        assert_eq!(
+            text_result("hello"),
+            json!({"content": [{"type": "text", "text": "hello"}]})
+        );
+        let error = error_result("boom", "invalid_args");
+        assert_eq!(error["isError"], json!(true));
+        assert_eq!(error["details"]["error"], json!("invalid_args"));
+        assert_eq!(error["content"][0]["text"], json!("boom"));
+        let detailed = text_result_with_details("ok", json!({"changed": true}));
+        assert_eq!(detailed["details"]["changed"], json!(true));
+        assert!(detailed.get("isError").is_none());
     }
 }
