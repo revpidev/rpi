@@ -79,14 +79,26 @@ fn text_of(result: &rpi_agent::types::AgentToolResult) -> String {
     common::result_text(result)
 }
 
+/// Removes the sandbox on drop (including assert panics) so repeated
+/// `cargo test --workspace` runs do not accumulate `/tmp` dirs.
+struct Sandbox(PathBuf);
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn l0_load_registers_ask_user_question_and_q0_envelopes() {
     let Some(plugin) = require_plugin() else {
         return;
     };
     // Deterministic config: empty HOME + no XDG override -> defaults.
-    let sandbox = std::env::temp_dir().join(format!("rpi-askq-l0-sandbox-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&sandbox);
+    let sandbox_guard =
+        Sandbox(std::env::temp_dir().join(format!("rpi-askq-l0-sandbox-{}", std::process::id())));
+    let sandbox = sandbox_guard.0.as_path();
+    let _ = std::fs::remove_dir_all(sandbox);
     std::fs::create_dir_all(sandbox.join("proj/.rpi")).unwrap();
     std::fs::create_dir_all(sandbox.join("home")).unwrap();
     std::fs::create_dir_all(sandbox.join("agent")).unwrap();
