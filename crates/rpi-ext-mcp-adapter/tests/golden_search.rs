@@ -11,6 +11,7 @@ use rpi_ext_mcp_adapter::search::{
     paginate, rank_suggestions, rank_tool_matches, score_tool_match, SearchState,
 };
 use serde_json::Value;
+use std::collections::HashSet;
 
 struct FixtureState {
     config: McpConfig,
@@ -62,6 +63,7 @@ fn search_matches_upstream_scores_and_ordering() {
     let search_state = SearchState {
         config: &state.config,
         tool_metadata: &state.tool_metadata,
+        unavailable_servers: &HashSet::new(),
     };
 
     // Exact score parity per tool (including None for non-matches).

@@ -28,4 +28,11 @@ pub enum AdapterError {
     /// Metadata cache serialization failure.
     #[error("metadata cache serialization error: {0}")]
     CacheSerialize(String),
+
+    /// OAuth token endpoint rejected a refresh with RFC 6749 §5.2
+    /// `invalid_grant`: the refresh token (or the dynamic client
+    /// registration bound to it) is stale — callers drop the stored client
+    /// registration so the next flow re-registers (#503).
+    #[error("OAuth refresh token rejected (invalid_grant)")]
+    OAuthInvalidGrant,
 }

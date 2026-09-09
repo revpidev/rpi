@@ -576,6 +576,19 @@ impl OAuthCredentialStore {
         Ok(())
     }
 
+    /// `clearClientInfo` (mcp-auth.ts:983-989 @ 10a45367): drop the stored dynamic
+    /// client registration while keeping tokens — a refresh-capable
+    /// credential may still be usable, and the next interactive flow
+    /// registers a fresh client (#503).
+    pub fn clear_client_info(&self, server_name: &str) -> Result<(), AdapterError> {
+        let Some(mut entry) = self.get_entry(server_name)? else {
+            return Ok(());
+        };
+        entry.client_info = None;
+        let server_url = entry.server_url.clone();
+        self.save_entry(server_name, entry, server_url.as_deref())
+    }
+
     /// `isTokenExpired` (mcp-auth.ts:958-963).
     pub fn is_token_expired(&self, server_name: &str) -> Result<Option<bool>, AdapterError> {
         let entry = self.get_entry(server_name)?;

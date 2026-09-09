@@ -803,6 +803,10 @@ use rpi_ext_mcp_adapter::install_for_test;
 struct FakeHost {
     cwd: StdMutex<String>,
     registered: StdMutex<Vec<String>>,
+    /// Every registerTool call in order: (name, description). Used to assert
+    /// the proxy description is byte-stable across metadata refreshes
+    /// (R7.2.5.1/#432): an unchanged description must not re-register.
+    registrations: StdMutex<Vec<(String, String)>>,
 }
 
 impl FakeHost {
@@ -810,6 +814,7 @@ impl FakeHost {
         Arc::new(Self {
             cwd: StdMutex::new(cwd.to_string()),
             registered: StdMutex::new(Vec::new()),
+            registrations: StdMutex::new(Vec::new()),
         })
     }
 
@@ -818,6 +823,16 @@ impl FakeHost {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn registrations_for(&self, tool: &str) -> Vec<String> {
+        self.registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(name, _)| name == tool)
+            .map(|(_, description)| description.clone())
+            .collect()
     }
 }
 
@@ -841,6 +856,16 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
                 .unwrap_or_default()
                 .to_string();
             if !name.is_empty() {
+                let description = args
+                    .get("definition")
+                    .and_then(|d| d.get("description"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                host.registrations
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((name.clone(), description));
                 let mut registered = host.registered.lock().unwrap_or_else(|e| e.into_inner());
                 if !registered.contains(&name) {
                     registered.push(name.clone());
@@ -894,6 +919,47 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     let dir = temp_dir("freeze-wiring");
     let host = FakeHost::new(&dir.to_string_lossy());
 
+    // 健康 stub：连接成功 → 不进入失败退避（#434 后失败服务器会隐藏
+    // 缓存 direct 工具，冻结面断言需要可用服务器；对齐上游 mock 连接态）。
+    // 有状态 tools/list：`shout` 只在 reconnect 后出现，用于区分
+    // “冻结期间 metadata 钩子不重建”与“connect 同步仍重建”。
+    let stop = CancellationToken::new();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let shout_visible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let shout_flag = shout_visible.clone();
+    tokio::spawn(run_stub(
+        listener,
+        Arc::new(move |request: &StubRequest| {
+            let body: Value = serde_json::from_str(&request.body).unwrap_or(Value::Null);
+            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
+            match method {
+                "initialize" => (
+                    200,
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                    rpc_result(&request.body, initialize_result("2025-03-26")),
+                ),
+                "tools/list" => {
+                    let mut tools = vec![json!({ "name": "echo", "description": "v2" })];
+                    if shout_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        tools.push(json!({ "name": "shout", "description": "new tool" }));
+                    }
+                    (
+                        200,
+                        vec![("content-type".to_string(), "application/json".to_string())],
+                        rpc_result(&request.body, json!({ "tools": tools })),
+                    )
+                }
+                _ => (
+                    200,
+                    vec![("content-type".to_string(), "application/json".to_string())],
+                    rpc_result(&request.body, json!({})),
+                ),
+            }
+        }),
+        stop.clone(),
+    ));
+
     // 元数据缓存：为 stub 服务器造一份可用缓存（direct 面来自缓存，
     // 无需真实连接）。config_hash 必须与 .mcp.json 中的服务器定义一致
     // （isServerCacheValid 按哈希 + cached_at 校验）。写入
@@ -901,8 +967,11 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     let agent_dir = dir.join("agent-home");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
     let base = now_unix_ms();
-    let entry =
-        json!({ "url": "http://127.0.0.1:9/mcp", "lifecycle": "eager", "directTools": true });
+    let entry = json!({
+        "url": format!("http://127.0.0.1:{port}/mcp"),
+        "lifecycle": "eager",
+        "directTools": true
+    });
     let definition =
         rpi_ext_mcp_adapter::metadata::ServerEntry(entry.as_object().cloned().unwrap_or_default());
     let config_hash =
@@ -924,8 +993,8 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
     .expect("cache");
 
     // 会话 cwd 下的 .mcp.json：freezeDirectTools=true + eager 服务器
-    // （触发 install 的 load-time prewarm）。eager 连接会失败（无 stub），
-    // 但后台 init 仍会完成并发布 Ready。
+    // （触发 install 的 load-time prewarm）。stub 连接成功，后台 init
+    // 完成并发布 Ready。
     std::fs::write(
         dir.join(".mcp.json"),
         serde_json::to_string_pretty(&json!({
@@ -1016,9 +1085,19 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
         "frozen surface must NOT pick up new cache tools: {:?}",
         host.registered_names()
     );
+    // R7.2.5.1/#432: 描述为 config 纯函数——元数据刷新不得重注册 mcp 工具
+    // （重注册会改写 prompt 前缀缓存）。
+    assert_eq!(
+        host.registrations_for("mcp").len(),
+        1,
+        "metadata refresh must not re-register the proxy tool: {:?}",
+        host.registrations_for("mcp")
+    );
 
     // connect 同步钩子（on_connect_sync，index.ts:822-824）仍重建工具面：
-    // 走真实 execute → fire_on_connect_sync 分发（连接失败也会触发）。
+    // 让 stub 的 live tools/list 出现 shout，走真实 execute →
+    // fire_on_connect_sync 分发。
+    shout_visible.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = dispatcher.execute(&json!({"connect": "demo"}), &[]).await;
     assert!(
         host.registered_names().contains(&"demo_shout".to_string()),
@@ -1036,6 +1115,7 @@ async fn freeze_direct_tools_metadata_hook_skips_connect_hook_syncs() {
         Some(value) => std::env::set_var("MCP_DIRECT_TOOLS", value),
         None => std::env::remove_var("MCP_DIRECT_TOOLS"),
     }
+    stop.cancel();
     let _ = std::fs::remove_dir_all(&dir);
 }
 

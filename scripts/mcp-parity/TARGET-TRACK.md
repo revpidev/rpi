@@ -70,10 +70,10 @@ node scripts/mcp-parity/run-render-call-parity.mjs
 | 面 | 承接 | 验收形态 |
 |----|------|----------|
 | 审批参数作用域（参数 A 批准后参数 B 仍拦截） | TE21 | fixture 用例 + 持久化 `/resume` 恢复 |
-| 退避可见性（连续失败后的状态/诊断） | TE22 | stub 服务器故障注入 + 状态断言 |
-| 503/202/401 分类 | TE22 | 协议腿响应分类向量 |
+| 退避可见性（连续失败后的状态/诊断） | TE22 | **已落地**（`tests/te22_backoff_oauth.rs`：失败注入 → status/list/search/describe/instructions/direct 逐面断言 + 过期恢复 + `/mcp status|tools`） |
+| 503/202/401 分类 | TE22 | 协议腿响应分类向量（401 腿 `http-auth-401` 回归轨/目标轨均 MATCH；503/202 归 TE24） |
 | 嵌套参数（对象/数组参数哈希稳定） | TE21 | 参数作用域向量 |
-| OAuth 401 与重注册 | TE22 | `run-oauth-parity.mjs` + 401 续流用例 |
+| OAuth 401 与重注册 | TE22 | **已落地**（`tests/te22_backoff_oauth.rs`：MemorySecretStore 注入 + 401 compare-and-delete；stub AS `invalid_grant` → DCR 请求体逐字段断言）；`run-oauth-parity.mjs` 回归轨/目标轨均 MATCH |
 
 ## 6. 形状/口径
 

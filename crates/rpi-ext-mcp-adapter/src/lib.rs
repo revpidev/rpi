@@ -103,6 +103,10 @@ struct DirectSurface {
     env_override: Option<Vec<String>>,
     early_config: metadata::McpConfig,
     proxy_registered: bool,
+    /// Last description passed to `registerTool` (index.ts:233/1189/1205
+    /// `proxyToolDescription`): `syncProxyTool` re-registers when the pure
+    /// description changes (R7.2.5.1/#432).
+    proxy_description: Option<String>,
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
@@ -176,10 +180,24 @@ fn sync_tool_surface(state: &PluginState) {
     } else {
         env_override
     };
+    // `activeFailureServers` (index.ts:288-292 @ 10a45367): the resolver
+    // drops a server's direct tools while it is inside the failure window
+    // (R7.2.3.1/#434).
+    let unavailable: std::collections::HashSet<String> = state
+        .dispatcher
+        .try_runtime()
+        .map(|runtime| runtime.active_failure_servers())
+        .unwrap_or_default();
     let specs = if env_raw.as_deref() == Some("__none__") {
         Vec::new()
     } else {
-        direct::resolve_direct_tools(&config, cache.as_ref(), prefix, env_selectors.as_deref())
+        direct::resolve_direct_tools(
+            &config,
+            cache.as_ref(),
+            prefix,
+            env_selectors.as_deref(),
+            &unavailable,
+        )
     };
     let missing = cache::get_missing_configured_direct_tool_servers(
         &config,
@@ -200,42 +218,46 @@ fn sync_tool_surface(state: &PluginState) {
         registry.sync(&specs, &mut surface)
     };
 
-    // syncProxyTool (index.ts:845-876).
+    // syncProxyTool (index.ts:1192-1219 @ 10a45367): register on first use and
+    // re-register when the pure config description changes.
     let should_register = direct::should_register_proxy_tool(&config, &specs, &missing);
-    let mut proxy_registered = state
-        .direct
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .proxy_registered;
-    if should_register && !proxy_registered {
-        let description = direct::build_proxy_description(&config, cache.as_ref(), &specs);
-        let mut surface = HostSurface {
-            calls: &channel.calls(),
-            cookie: channel.cookie,
-        };
-        surface.register_tool(json!({
-            "definition": {
-                "name": "mcp",
-                "label": "MCP",
-                "description": description,
-                "promptSnippet": "MCP gateway — status, search, describe, auth, and single MCP tool calls",
-                "parameters": proxy::tool_parameters_schema(),
-                // renderMcpProxyToolCall (index.ts:698) + renderMcpToolResult
-                // (index.ts:719): the host attaches the render closures and
-                // dispatches {"kind":"render","what":"toolCall"|"toolResult"}
-                // back here (host_call.rs:245-289).
-                "renderCall": true,
-                "renderResult": true,
-            },
-        }));
-        proxy_registered = true;
-    } else if !should_register && proxy_registered {
+    let (mut proxy_registered, mut proxy_description) = {
+        let surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
+        (surface.proxy_registered, surface.proxy_description.clone())
+    };
+    if should_register {
+        let description = direct::build_proxy_description(&config);
+        if !proxy_registered || proxy_description.as_deref() != Some(description.as_str()) {
+            let mut surface = HostSurface {
+                calls: &channel.calls(),
+                cookie: channel.cookie,
+            };
+            surface.register_tool(json!({
+                "definition": {
+                    "name": "mcp",
+                    "label": "MCP",
+                    "description": description,
+                    "promptSnippet": "MCP gateway — status, search, describe, auth, and single MCP tool calls",
+                    "parameters": proxy::tool_parameters_schema(),
+                    // renderMcpProxyToolCall (tool-result-renderer.ts:304) + renderMcpToolResult
+                    // (index.ts:231/284 @ 10a45367): the host attaches the render closures and
+                    // dispatches {"kind":"render","what":"toolCall"|"toolResult"}
+                    // back here (host_call.rs:245-289).
+                    "renderCall": true,
+                    "renderResult": true,
+                },
+            }));
+            proxy_registered = true;
+            proxy_description = Some(description);
+        }
+    } else if proxy_registered {
         let mut surface = HostSurface {
             calls: &channel.calls(),
             cookie: channel.cookie,
         };
         if surface.unregister_tool("mcp") {
             proxy_registered = false;
+            proxy_description = None;
         }
     }
     if report.added.len() + report.updated.len() + report.deactivated.len() > 0 {
@@ -250,6 +272,7 @@ fn sync_tool_surface(state: &PluginState) {
     let mut surface = state.direct.lock().unwrap_or_else(|e| e.into_inner());
     surface.registry = registry;
     surface.proxy_registered = proxy_registered;
+    surface.proxy_description = proxy_description;
 }
 
 fn now_ms() -> u64 {
@@ -401,6 +424,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                 env_override,
                 early_config,
                 proxy_registered: false,
+                proxy_description: None,
             };
         }
         // Config discovery from the new session's cwd (ctx.cwd through the
@@ -460,6 +484,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             env_override,
             early_config,
             proxy_registered: false,
+            proxy_description: None,
         })),
         pending_leaf: Mutex::new(None),
     };
@@ -1105,8 +1130,13 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
                 Ok(runtime) => runtime,
                 Err(result) => return result,
             };
-            let (config, metadata) = proxy::search_state_snapshot(&runtime);
-            let text = commands::format_status_text(&config, &runtime.manager, &metadata);
+            let (config, metadata, _) = proxy::search_state_snapshot(&runtime);
+            let text = commands::format_status_text(
+                &config,
+                &runtime.manager,
+                &metadata,
+                &runtime.failures,
+            );
             if host.can_render_panel() {
                 let mut options: Vec<String> = text
                     .lines()
@@ -1129,8 +1159,9 @@ fn handle_mcp_command(state: &PluginState, args: &str) -> Value {
                 Ok(runtime) => runtime,
                 Err(result) => return result,
             };
-            let (config, metadata) = proxy::search_state_snapshot(&runtime);
-            let text = commands::format_tools_text(&config, &metadata);
+            let (config, metadata, unavailable) = proxy::search_state_snapshot(&runtime);
+            let unavailable: Vec<String> = unavailable.into_iter().collect();
+            let text = commands::format_tools_text(&config, &metadata, &unavailable);
             host.notify(&text, "info");
             commands::text_result(text)
         }
@@ -1272,8 +1303,15 @@ fn reconnect_server(
             crate::manager::ConnectionStatus::Connected => {
                 proxy::update_server_metadata(runtime, name);
                 proxy::update_metadata_cache(runtime, name);
-                runtime.failures.clear(name);
-                proxy::notify_metadata_updated(runtime, name, "command-reconnect");
+                // commands.ts:224 @ 10a45367: a reconnect clears the
+                // failure window with a reason; the plain notify covers the
+                // no-active-window case.
+                if !runtime
+                    .failures
+                    .clear_with_reason(name, "command-reconnect")
+                {
+                    proxy::notify_metadata_updated(runtime, name, "command-reconnect");
+                }
                 proxy::mark_keep_alive_after_connect(runtime, name);
                 let text = format!(
                     "MCP: Reconnected to {name} ({} tools, {} resources)",

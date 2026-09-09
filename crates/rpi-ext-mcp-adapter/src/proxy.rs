@@ -21,7 +21,7 @@
 //!   tool result with `details.error: "invalid_args"` and re-flagged via the
 //!   plugin's own `tool_result` hook (deviation TE-D04).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -107,12 +107,36 @@ type ConnectingHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Callback fired at metadata refresh points (index.ts:313-321).
 type MetadataUpdatedHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+impl McpRuntime {
+    /// `isServerInActiveFailureBackoff` against this runtime
+    /// (failure-backoff.ts:18-23): connected/needs-auth connections are
+    /// never in backoff even when a stale failure was recorded.
+    pub fn is_server_in_active_failure_backoff(&self, server_name: &str) -> bool {
+        self.failures
+            .is_server_in_active_failure_backoff(&self.manager, server_name)
+    }
+
+    /// The failure set consumed by the direct-tool resolver and the pure
+    /// ranking layer (`activeFailureServers`, index.ts:288-292 @ 10a45367).
+    pub fn active_failure_servers(&self) -> HashSet<String> {
+        self.config
+            .mcp_servers
+            .keys()
+            .filter(|name| self.is_server_in_active_failure_backoff(name))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Snapshot of the state a pure search/ranking call needs:
+/// `(config, tool_metadata, active_failure_servers)`.
+pub(crate) type SearchStateSnapshot =
+    (McpConfig, Vec<(String, Vec<ToolMetadata>)>, HashSet<String>);
+
 // SearchState holds `&[(String, Vec<ToolMetadata>)]`; provide it via a
 // snapshot helper to keep lock times minimal. `pub(crate)`: the slash-command
 // handlers (TE20) render the same status/tools text from the same snapshot.
-pub(crate) fn search_state_snapshot(
-    state: &McpRuntime,
-) -> (McpConfig, Vec<(String, Vec<ToolMetadata>)>) {
+pub(crate) fn search_state_snapshot(state: &McpRuntime) -> SearchStateSnapshot {
     let metadata = state
         .tool_metadata
         .lock()
@@ -120,7 +144,11 @@ pub(crate) fn search_state_snapshot(
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    (state.config.clone(), metadata)
+    (
+        state.config.clone(),
+        metadata,
+        state.active_failure_servers(),
+    )
 }
 
 fn wire_tool(value: &Value) -> Option<McpTool> {
@@ -343,6 +371,15 @@ pub async fn initialize_mcp(
                 }
                 update_server_metadata(&state, &name);
                 update_metadata_cache(&state, &name);
+                // init.ts:424 @ 10a45367: clearFailure with a reason
+                // fires the metadata hook only when a window was active;
+                // otherwise the plain notify keeps the surface fresh.
+                if !state
+                    .failures
+                    .clear_with_reason(&name, "direct-tools-bootstrap")
+                {
+                    notify_metadata_updated(&state, &name, "direct-tools-bootstrap");
+                }
                 mark_keep_alive_after_connect(&state, &name);
             }
             Err(message) => {
@@ -358,8 +395,12 @@ pub async fn initialize_mcp(
     lifecycle.set_reconnect_callback(Arc::new(move |name| {
         update_server_metadata(&reconnect_state, name);
         update_metadata_cache(&reconnect_state, name);
-        notify_metadata_updated(&reconnect_state, name, "lifecycle-reconnect");
-        reconnect_state.failures.clear(name);
+        if !reconnect_state
+            .failures
+            .clear_with_reason(name, "lifecycle-reconnect")
+        {
+            notify_metadata_updated(&reconnect_state, name, "lifecycle-reconnect");
+        }
     }));
     let failure_state = state.clone();
     let failure_cancel = owner_cancel.clone();
@@ -368,6 +409,15 @@ pub async fn initialize_mcp(
             .failures
             .record(name, message, failure_cancel.clone());
     }));
+
+    // init.ts:83/90 @ 10a45367: failure-window start/expiry repaints the
+    // tool surface and the status bar through the same metadata hook.
+    let failure_change_state = state.clone();
+    state
+        .failures
+        .set_change_callback(Arc::new(move |name, reason| {
+            notify_metadata_updated(&failure_change_state, name, reason);
+        }));
 
     lifecycle.start_health_checks();
     state
@@ -544,6 +594,13 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
         resources,
         prompts,
         instructions: connection.instructions.clone(),
+        // #446: persist the server's declared cache hints so a later
+        // `is_server_cache_valid` can apply `min(maxAge, ttlMs)`.
+        ttl_ms: connection.tool_list_hints.as_ref().and_then(|h| h.ttl_ms),
+        cache_scope: connection
+            .tool_list_hints
+            .as_ref()
+            .and_then(|h| h.cache_scope.clone()),
         cached_at: now_ms(),
     };
     let mut servers = IndexMap::new();
@@ -610,10 +667,14 @@ pub async fn lazy_connect(state: &McpRuntime, server_name: &str) -> bool {
                 notify_metadata_updated(state, server_name, "lazy-connect-needs-auth");
                 return false;
             }
-            state.failures.clear(server_name);
             update_server_metadata(state, server_name);
             update_metadata_cache(state, server_name);
-            notify_metadata_updated(state, server_name, "lazy-connect");
+            if !state
+                .failures
+                .clear_with_reason(server_name, "lazy-connect")
+            {
+                notify_metadata_updated(state, server_name, "lazy-connect");
+            }
             mark_keep_alive_after_connect(state, server_name);
             true
         }
@@ -622,8 +683,8 @@ pub async fn lazy_connect(state: &McpRuntime, server_name: &str) -> bool {
                 .failures
                 .record(server_name, &error.to_string(), state.owner_cancel.clone());
             debug!(server = %server_name, "MCP: lazy connect failed");
-            // Repaint: clears the transient status (proxy-modes.ts:760).
-            notify_metadata_updated(state, server_name, "lazy-connect-failed");
+            // `record` fires the failure-backoff-started metadata hook,
+            // which repaints the transient status (proxy-modes.ts:760).
             false
         }
     }
@@ -860,6 +921,17 @@ fn disabled_result(mode: &str, server_name: &str) -> Value {
     )
 }
 
+/// `serverBackoffResult` (proxy-modes.ts:82-90 @ 10a45367, #434): the server is
+/// inside its failure window — the tool surface must not advertise it.
+fn server_backoff_result(state: &McpRuntime, mode: &str, server_name: &str) -> Value {
+    let failed_ago = state.failures.failure_age_seconds(server_name).unwrap_or(0);
+    let message = format!("Server \"{server_name}\" not available (last failed {failed_ago}s ago)");
+    text_result(
+        message,
+        json!({ "mode": mode, "error": "server_backoff", "server": server_name }),
+    )
+}
+
 /// The default needs-auth guidance (proxy-modes.ts:48-54).
 pub fn auth_required_message(config: &McpConfig, server_name: &str) -> String {
     let default_message = format!(
@@ -977,7 +1049,9 @@ pub async fn attempt_auto_auth(state: &McpRuntime, server_name: &str) -> Result<
         Ok(_) => {
             // Close stale connection, clear failure, reconnect.
             state.manager.close(server_name).await;
-            state.failures.clear(server_name);
+            state
+                .failures
+                .clear_with_reason(server_name, "auth-complete");
             match state.manager.connect(server_name, definition).await {
                 Ok(conn) if conn.status() == ConnectionStatus::Connected => {
                     state.failures.clear(server_name);
@@ -1026,7 +1100,6 @@ pub fn execute_status(state: &McpRuntime) -> Value {
         } else {
             tool_metadata.get(name)
         };
-        let tool_count = metadata.map_or(0, Vec::len);
         let failed_ago = if disabled {
             None
         } else {
@@ -1054,6 +1127,13 @@ pub fn execute_status(state: &McpRuntime) -> Value {
         } else if !disabled && metadata.is_some() {
             status = "cached";
         }
+        // proxy-modes.ts:362 @ 10a45367: a failed server reports 0 tools so
+        // the status text and details never advertise its cached catalog.
+        let tool_count = if status == "failed" {
+            0
+        } else {
+            metadata.map_or(0, Vec::len)
+        };
         let mut entry = json!({
             "name": name,
             "status": status,
@@ -1142,12 +1222,18 @@ pub fn execute_search(
         if state.config.is_server_disabled(server) {
             return disabled_result("search", server);
         }
+        // proxy-modes.ts:603 @ 10a45367: a server-scoped search against a
+        // server in backoff reports the backoff instead of cached tools.
+        if state.is_server_in_active_failure_backoff(server) {
+            return server_backoff_result(state, "search", server);
+        }
     }
 
-    let (config, metadata_snapshot) = search_state_snapshot(state);
+    let (config, metadata_snapshot, unavailable) = search_state_snapshot(state);
     let search_state = SearchState {
         config: &config,
         tool_metadata: &metadata_snapshot,
+        unavailable_servers: &unavailable,
     };
 
     #[derive(Clone)]
@@ -1192,6 +1278,10 @@ pub fn execute_search(
         for (server_name, metadata) in &metadata_snapshot {
             let definition = config.mcp_servers.get(server_name);
             if definition.is_some_and(ServerEntry::is_disabled) {
+                continue;
+            }
+            // proxy-modes.ts:645 @ 10a45367: regex search skips backoff.
+            if unavailable.contains(server_name) {
                 continue;
             }
             if let Some(server) = server {
@@ -1424,6 +1514,7 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
     let mut server_name: Option<String> = None;
     let mut tool_meta: Option<ToolMetadata> = None;
     let mut disabled_match: Option<String> = None;
+    let mut failed_match: Option<String> = None;
     for (server, metadata) in tool_metadata.iter() {
         let Some(found) = find_tool_by_name(metadata, tool_name) else {
             continue;
@@ -1431,6 +1522,14 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
         if state.config.is_server_disabled(server) {
             if disabled_match.is_none() {
                 disabled_match = Some(server.clone());
+            }
+            continue;
+        }
+        // proxy-modes.ts:527/547 @ 10a45367: a backoff server is not a match;
+        // remember it so the not-found path can report the backoff.
+        if state.is_server_in_active_failure_backoff(server) {
+            if failed_match.is_none() {
+                failed_match = Some(server.clone());
             }
             continue;
         }
@@ -1444,10 +1543,14 @@ pub fn execute_describe(state: &McpRuntime, tool_name: &str) -> Value {
         if let Some(disabled) = disabled_match {
             return disabled_result("describe", &disabled);
         }
-        let (config, snapshot) = search_state_snapshot(state);
+        if let Some(failed) = failed_match {
+            return server_backoff_result(state, "describe", &failed);
+        }
+        let (config, snapshot, unavailable) = search_state_snapshot(state);
         let search_state = SearchState {
             config: &config,
             tool_metadata: &snapshot,
+            unavailable_servers: &unavailable,
         };
         let suggestions = rank_suggestions(&search_state, tool_name, 5);
         let suggestion_text = if suggestions.is_empty() {
@@ -1536,6 +1639,16 @@ pub fn execute_list(state: &McpRuntime, server: &str) -> Value {
         .map(|m| m.iter().map(|t| t.name.clone()).collect())
         .unwrap_or_default();
     let connection = state.manager.get_connection(server);
+    // proxy-modes.ts:747 @ 10a45367: backoff short-circuits the per-server
+    // list with the upstream `server_backoff` details shape.
+    if state.is_server_in_active_failure_backoff(server) {
+        let mut result = server_backoff_result(state, "list", server);
+        result["details"] = json!({
+            "mode": "list", "server": server, "tools": [], "count": 0,
+            "error": "server_backoff",
+        });
+        return result;
+    }
     let instructions = state
         .server_instructions
         .lock()
@@ -1588,13 +1701,24 @@ pub fn execute_list(state: &McpRuntime, server: &str) -> Value {
         );
     }
 
+    // "not connected" alone reads as an outage while the tools listed below
+    // are real and the connection is simply lazy. Distinguish auth from plain
+    // laziness so the caller knows which remedy applies (#474,
+    // proxy-modes.ts:781-791 @ 10a45367, #474 = 824b137).
     let cached_note = if connection
         .as_ref()
         .is_some_and(|c| c.status() == ConnectionStatus::Connected)
     {
-        ""
+        String::new()
+    } else if connection
+        .as_ref()
+        .is_some_and(|c| c.status() == ConnectionStatus::NeedsAuth)
+    {
+        format!(" (needs auth — run mcp({{ action: \"auth-start\", server: \"{server}\" }}))")
     } else {
-        " (not connected, cached)"
+        format!(
+            " (lazy: tools from cache, not connected yet — mcp({{ connect: \"{server}\" }}) to connect)"
+        )
     };
     let mut text = format!("{server} ({} tools{cached_note}):\n\n", tool_names.len());
     let descriptions: HashMap<String, String> = metadata
@@ -1637,6 +1761,11 @@ pub fn execute_instructions(state: &McpRuntime, server: &str) -> Value {
     }
     if state.config.is_server_disabled(server) {
         return disabled_result("instructions", server);
+    }
+    // proxy-modes.ts:825 @ 10a45367: instructions for a server in backoff
+    // report the backoff rather than cached text.
+    if state.is_server_in_active_failure_backoff(server) {
+        return server_backoff_result(state, "instructions", server);
     }
     let instructions = state
         .server_instructions
@@ -1725,9 +1854,13 @@ pub async fn execute_connect(state: &McpRuntime, server_name: &str) -> Value {
             }
             update_server_metadata(state, server_name);
             update_metadata_cache(state, server_name);
-            notify_metadata_updated(state, server_name, "proxy-connect");
+            if !state
+                .failures
+                .clear_with_reason(server_name, "proxy-connect")
+            {
+                notify_metadata_updated(state, server_name, "proxy-connect");
+            }
             mark_keep_alive_after_connect(state, server_name);
-            state.failures.clear(server_name);
             execute_list(state, server_name)
         }
         Err(error) => {
@@ -1913,10 +2046,11 @@ pub async fn execute_call(
                                 .and_then(|m| find_tool_by_name(m, tool_name))
                                 .cloned();
                             if tool_meta.is_none() {
-                                let (config, snapshot) = search_state_snapshot(state);
+                                let (config, snapshot, unavailable) = search_state_snapshot(state);
                                 let search_state = SearchState {
                                     config: &config,
                                     tool_metadata: &snapshot,
+                                    unavailable_servers: &unavailable,
                                 };
                                 let suggestions = rank_suggestions(&search_state, tool_name, 5);
                                 let suggestion_text = if suggestions.is_empty() {
@@ -2092,10 +2226,11 @@ pub async fn execute_call(
         } else {
             msg.push_str(" Use mcp({ search: \"...\" }) to search.");
         }
-        let (config, snapshot) = search_state_snapshot(state);
+        let (config, snapshot, unavailable) = search_state_snapshot(state);
         let search_state = SearchState {
             config: &config,
             tool_metadata: &snapshot,
+            unavailable_servers: &unavailable,
         };
         let suggestions = rank_suggestions(&search_state, tool_name, 5);
         if !suggestions.is_empty() {
@@ -2200,10 +2335,14 @@ pub async fn execute_call(
                         return text_result(message, details);
                     }
                 }
-                state.failures.clear(&server_name);
                 update_server_metadata(state, &server_name);
                 update_metadata_cache(state, &server_name);
-                notify_metadata_updated(state, &server_name, "proxy-call-reconnect");
+                if !state
+                    .failures
+                    .clear_with_reason(&server_name, "proxy-call-reconnect")
+                {
+                    notify_metadata_updated(state, &server_name, "proxy-call-reconnect");
+                }
                 mark_keep_alive_after_connect(state, &server_name);
                 connection = Some(new_connection);
             }

@@ -100,6 +100,14 @@ pub struct ServerCacheEntry {
     pub prompts: Option<Vec<CachedPrompt>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Server `tools/list` cache hint (types.ts:705, #446): lifetime in ms
+    /// declared by the server. `None` = old cache entry without the field
+    /// (forward compatible: only `maxAge` applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// Server `tools/list` cache scope hint (types.ts:706, #446).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<String>,
     /// Unix epoch milliseconds (JS `Date.now()`).
     pub cached_at: u64,
 }
@@ -290,8 +298,11 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
     Ok(hex)
 }
 
-/// `isServerCacheValid` (metadata-cache.ts:105-120): hash match + `cachedAt`
-/// freshness (7-day TTL; `max_age_ms == 0` disables the age check).
+/// `isServerCacheValid` (metadata-cache.ts:114-136 @ 10a45367, #446): hash
+/// match + freshness. A declared `ttlMs` caps the effective max age
+/// (`min(maxAge, ttlMs)`), `ttlMs == 0` always expires, and `maxAgeMs == 0`
+/// still means "no age limit" (an old entry without `ttlMs` keeps the
+/// pre-#446 behavior).
 pub fn is_server_cache_valid(
     entry: &ServerCacheEntry,
     definition: &ServerEntry,
@@ -303,6 +314,18 @@ pub fn is_server_cache_valid(
     };
     if entry.config_hash != config_hash {
         return false;
+    }
+    if let Some(declared_ttl_ms) = entry.ttl_ms {
+        if declared_ttl_ms == 0 {
+            return false;
+        }
+        let age_ms = now_ms.saturating_sub(entry.cached_at);
+        let effective_max_age = if max_age_ms > 0 {
+            max_age_ms.min(declared_ttl_ms)
+        } else {
+            declared_ttl_ms
+        };
+        return age_ms < effective_max_age;
     }
     if max_age_ms > 0 && now_ms.saturating_sub(entry.cached_at) > max_age_ms {
         return false;
@@ -593,6 +616,117 @@ mod tests {
             0,
             u64::MAX
         ));
+    }
+
+    /// #446 / R7.2.6.1（`__tests__/metadata-cache-ttl.test.ts`）：有效性 =
+    /// `min(maxAge, ttlMs)`；`ttlMs == 0` 恒失效；旧条目缺字段向前兼容。
+    #[test]
+    fn cache_validity_honours_declared_ttl_matrix() {
+        let definition = entry(json!({ "command": "node" }));
+        let hash = compute_server_hash(&definition).expect("hash");
+        let base = ServerCacheEntry {
+            config_hash: hash.clone(),
+            cached_at: 1_000,
+            ..Default::default()
+        };
+
+        // ttlMs == 0 → always invalid, even at age 0 and with maxAge == 0.
+        let zero = ServerCacheEntry {
+            ttl_ms: Some(0),
+            ..base.clone()
+        };
+        assert!(!is_server_cache_valid(
+            &zero,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000
+        ));
+        assert!(!is_server_cache_valid(&zero, &definition, 0, 1_000));
+
+        // Declared ttl shorter than maxAge → min() wins (4ms declared).
+        let short = ServerCacheEntry {
+            ttl_ms: Some(4),
+            cache_scope: Some("private".to_string()),
+            ..base.clone()
+        };
+        assert!(is_server_cache_valid(
+            &short,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_003
+        ));
+        assert!(!is_server_cache_valid(
+            &short,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_004
+        ));
+
+        // Declared ttl longer than maxAge → maxAge still caps. The ttl path
+        // uses a strict `<` (upstream `ageMs < effectiveMaxAge`), so the
+        // boundary at exactly maxAge is already invalid.
+        let long = ServerCacheEntry {
+            ttl_ms: Some(CACHE_MAX_AGE_MS * 10),
+            ..base.clone()
+        };
+        assert!(is_server_cache_valid(
+            &long,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000 + CACHE_MAX_AGE_MS - 1
+        ));
+        assert!(!is_server_cache_valid(
+            &long,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000 + CACHE_MAX_AGE_MS
+        ));
+
+        // maxAge == 0 + declared ttl → ttl applies (no "unlimited" escape).
+        assert!(!is_server_cache_valid(&long, &definition, 0, u64::MAX));
+        assert!(is_server_cache_valid(&long, &definition, 0, 1_001));
+
+        // Missing ttlMs (old cache) → pre-#446 maxAge-only semantics.
+        let legacy = ServerCacheEntry {
+            cached_at: 1_000,
+            ..base.clone()
+        };
+        assert!(is_server_cache_valid(
+            &legacy,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000 + CACHE_MAX_AGE_MS
+        ));
+        assert!(!is_server_cache_valid(
+            &legacy,
+            &definition,
+            CACHE_MAX_AGE_MS,
+            1_000 + CACHE_MAX_AGE_MS + 1
+        ));
+    }
+
+    /// 旧 `mcp-cache.json`（无 `ttlMs`/`cacheScope` 字段）可反序列化，
+    /// 且写回时缺省字段不落盘（保持旧格式兼容）。
+    #[test]
+    fn legacy_cache_entry_without_ttl_fields_round_trips() {
+        let raw = json!({
+            "version": 1,
+            "servers": {
+                "demo": {
+                    "configHash": "abc",
+                    "tools": [],
+                    "resources": [],
+                    "cachedAt": 42
+                }
+            }
+        });
+        let parsed: MetadataCache = serde_json::from_value(raw).expect("legacy parses");
+        let entry = parsed.servers.get("demo").expect("entry");
+        assert_eq!(entry.ttl_ms, None);
+        assert_eq!(entry.cache_scope, None);
+        let serialized = serde_json::to_value(entry).expect("serialize");
+        assert!(serialized.get("ttlMs").is_none());
+        assert!(serialized.get("cacheScope").is_none());
     }
 
     #[test]
