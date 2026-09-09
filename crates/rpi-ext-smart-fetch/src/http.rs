@@ -13,9 +13,9 @@
 //!   so a name upstream rejects is rejected here too, and the
 //!   "Available profiles: …" message lists exactly the upstream set;
 //! - `onRequestEvent` phase tracking does not exist in the crates.io engine —
-//!   phases are marked by pipeline position instead (design §3.1), so the
-//!   pre-response timeout phase is reported as `waiting` (declared deviation,
-//!   see TE06 task file).
+//!   phases are marked by pipeline position instead (design §3.1), so
+//!   `send()`-stage timeouts (including the pre-response wait) report
+//!   `connecting` (declared deviation TE-D23, see TE06 task file).
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
