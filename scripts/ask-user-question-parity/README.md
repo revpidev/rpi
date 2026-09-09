@@ -8,9 +8,16 @@ and diffs the two legs case by case. **Non-zero exit = any difference.**
 ```bash
 # one-time: the orchestrator installs tsx + typebox into the deps dir
 # (override with RPI_ASKQ_PARITY_DEPS; default /tmp/rpi-ask-user-question-parity-deps)
-cargo build -p rpi-ext-ask-user-question --example parity_runner
 node scripts/ask-user-question-parity/run-parity.mjs
 ```
+
+The orchestrator builds this crate's `parity_runner` example itself before the
+Rust leg: three workspace crates (ask-user-question / mcp-adapter / subagents)
+ship an example with that name, so cargo's shared
+`target/debug/examples/parity_runner` is whichever was built last. The in-script
+build makes the harness independent of workspace build order (mcp-parity
+precedent); the manual `cargo build -p rpi-ext-ask-user-question --example
+parity_runner` step is therefore optional.
 
 Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 `upstream-<group>.jsonl` / `rust-<group>.jsonl` raw legs).

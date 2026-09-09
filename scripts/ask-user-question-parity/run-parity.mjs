@@ -5,11 +5,17 @@
 // 1. Verifies the pinned submodule HEAD (external/rpiv-mono @ 338b264c) and
 //    materializes a read-only snapshot of the six upstream pure-function
 //    modules into the deps dir (external/ is never written).
-// 2. Runs the upstream modules (tsx) on the shared fixtures.
-// 3. Runs the Rust parity_runner example on the same fixtures.
-// 4. Normalizes both sides (key-order-insensitive deep compare) and diffs.
-// 5. Checks the vendored locale tables byte-for-byte against the submodule.
-// 6. Writes fixtures/generated/ask-user-question-parity/{parity-report.md,
+// 2. Builds this crate's `parity_runner` example. Three workspace crates
+//    (ask-user-question / mcp-adapter / subagents) ship an example with that
+//    name, so cargo's shared `target/debug/examples/parity_runner` is
+//    whichever built last — building it here makes the harness independent of
+//    build order (mcp-parity precedent; cargo emits an output-filename
+//    collision warning for the shared path).
+// 3. Runs the upstream modules (tsx) on the shared fixtures.
+// 4. Runs the Rust parity_runner example on the same fixtures.
+// 5. Normalizes both sides (key-order-insensitive deep compare) and diffs.
+// 6. Checks the vendored locale tables byte-for-byte against the submodule.
+// 7. Writes fixtures/generated/ask-user-question-parity/{parity-report.md,
 //    upstream-*.jsonl, rust-*.jsonl}.
 //
 // Non-zero exit = any case mismatched. First run installs tsx + typebox into
@@ -114,6 +120,17 @@ function runUpstream(group) {
 		.split("\n")
 		.filter(Boolean)
 		.map((line) => JSON.parse(line));
+}
+
+function buildRustRunner() {
+	const result = run(
+		"cargo",
+		["build", "-p", "rpi-ext-ask-user-question", "--example", "parity_runner"],
+		{ cwd: REPO },
+	);
+	if (result.status !== 0) {
+		throw new Error(`cargo build parity_runner failed:\n${result.stderr}\n${result.stdout}`);
+	}
 }
 
 function runRust(group) {
@@ -222,6 +239,7 @@ function compareLocales(report) {
 
 function main() {
 	ensureDeps();
+	buildRustRunner();
 	const head = submoduleHead();
 	const snapshotHashes = materializeSnapshot();
 	mkdirSync(GENERATED, { recursive: true });
