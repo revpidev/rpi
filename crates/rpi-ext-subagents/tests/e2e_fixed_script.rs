@@ -1023,6 +1023,99 @@ fn e2e_fixed_child_full_pipeline() {
         );
     }
 
+    // ---- Scenario 12d (TE16): stop marks tasks sub-steps stopped ------
+    {
+        let dump = sandbox.dump("stop-terminal");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "slow");
+        std::env::set_var("RPI_E2E_SLOW_MS", "5000");
+        std::env::remove_var("RPI_E2E_SLOW_INDICES");
+        let result = execute(json!({
+            "tasks": [
+                { "key": "a", "agent": "scout", "task": "stopped A" },
+                { "key": "b", "agent": "scout", "task": "stopped B" }
+            ],
+            "concurrency": 2,
+            "async": true
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let run_id = result["details"]["runId"].as_str().unwrap().to_string();
+        let status_file = result["details"]["statusFile"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // Let both children spawn before stopping so the scenario kills
+        // running children rather than an unstarted batch.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let stop = execute(json!({ "action": "stop", "id": run_id }));
+        assert_eq!(stop["isError"], Value::Bool(false), "{stop}");
+        // The run and every sub-step settle as stopped — never failed
+        // (R7.1.6.1 D-R4).
+        let status: Value =
+            serde_json::from_str(&std::fs::read_to_string(&status_file).unwrap()).unwrap();
+        assert_eq!(status["state"], json!("stopped"), "{status}");
+        let steps = status["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 2, "{status}");
+        for step in steps {
+            assert_eq!(step["status"], json!("stopped"), "{status}");
+            assert_eq!(step["terminal"], json!("stopped"), "{status}");
+            assert_ne!(step["status"], json!("failed"), "{status}");
+        }
+    }
+
+    // ---- Scenario 12e (TE16): explicit output collisions fail closed ----
+    {
+        let dump = sandbox.dump("output-collision");
+        let _ = std::fs::remove_dir_all(&dump);
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let shared = sandbox.project.join("shared-report.md");
+        let result = execute(json!({
+            "tasks": [
+                { "key": "a", "agent": "scout", "task": "collide A", "output": shared },
+                { "key": "b", "agent": "worker", "task": "collide B", "output": shared }
+            ],
+            "concurrency": 2,
+            "async": true
+        }));
+        assert_eq!(result["isError"], Value::Bool(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("tasks[0] (scout)"), "{text}");
+        assert!(text.contains("tasks[1] (worker)"), "{text}");
+        assert!(text.contains("Use distinct output paths."), "{text}");
+        // Fail-closed: no receipt and no child process (no dump artifacts).
+        assert!(result["details"].get("runId").is_none(), "{result}");
+        assert!(
+            !dump.join("argv.txt").exists(),
+            "no child may spawn on an output collision"
+        );
+    }
+
+    // ---- Scenario 12f (TE16): invalid baseRef fails closed ----
+    {
+        let dump = sandbox.dump("base-ref-invalid");
+        let _ = std::fs::remove_dir_all(&dump);
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        for bad in [json!("HEAD~1"), json!("-b"), json!("a b"), json!(42)] {
+            let result = execute(json!({
+                "tasks": [{ "key": "a", "agent": "scout", "task": "base ref", "worktree": true }],
+                "baseRef": bad,
+                "async": true
+            }));
+            assert_eq!(result["isError"], Value::Bool(true), "{bad}: {result}");
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("baseRef") || text.contains("HEAD~1"),
+                "{bad}: {text}"
+            );
+        }
+        assert!(
+            !dump.join("argv.txt").exists(),
+            "no child may spawn on an invalid baseRef"
+        );
+    }
+
     // ---- Scenario 13 (TE09): foreground streaming snapshots (FR-A) ----
     {
         let dump = sandbox.dump("streaming");

@@ -40,5 +40,46 @@
         "expected": { "step.thinking": "high" }
       }
     ]
+  },
+  "terminal_vectors": {
+    "//": "TE16 (R7.1.6.1, 2026-09-09): full classifier vector set. Inputs map to classify_terminal(exitCode, timedOut, processSignal, {stopRequested, interruptRequested}) in crates/rpi-ext-subagents/src/p1/parallel.rs; expected.stepStatus is the persisted status string (04 §3.3.5). Precedence follows upstream run-history.ts:141-152 (stopped > interrupted > timedOut > unexplained signal > exit 0 > failed), with rpi naming the interrupt face 'paused'.",
+    "cases": [
+      {
+        "name": "complete",
+        "input": { "exitCode": 0 },
+        "expected": { "stepStatus": "complete" }
+      },
+      {
+        "name": "failed",
+        "input": { "exitCode": 1, "error": "boom" },
+        "expected": { "stepStatus": "failed" }
+      },
+      {
+        "name": "stopped-by-stop-request",
+        "input": { "exitCode": 1, "processSignal": "SIGTERM", "stopRequested": true },
+        "expected": { "stepStatus": "stopped" },
+        "note": "R7.1.6.1 #1060: a stop-requested child is stopped, never failed"
+      },
+      {
+        "name": "stopped-by-unexplained-signal",
+        "input": { "exitCode": 1, "processSignal": "SIGKILL" },
+        "expected": { "stepStatus": "stopped" }
+      },
+      {
+        "name": "paused-by-interrupt",
+        "input": { "exitCode": 0, "interruptRequested": true },
+        "expected": { "stepStatus": "paused" }
+      },
+      {
+        "name": "timed-out",
+        "input": { "exitCode": 1, "timedOut": true },
+        "expected": { "stepStatus": "timed_out" }
+      },
+      {
+        "name": "stop-wins-over-timeout",
+        "input": { "exitCode": 1, "timedOut": true, "stopRequested": true },
+        "expected": { "stepStatus": "stopped" }
+      }
+    ]
   }
 }
