@@ -3097,6 +3097,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-ext-ask-user-question"
+version = "0.1.4-rc.5"
+dependencies = [
+ "abi_stable",
+ "async-trait",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-ext-host",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "rpi-ext-host"
 version = "0.1.4-rc.5"
 dependencies = [

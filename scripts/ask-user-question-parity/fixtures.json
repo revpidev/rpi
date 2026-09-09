@@ -1,0 +1,218 @@
+{
+  "schema": {
+    "cases": [
+      { "name": "schema_and_constants", "input": null }
+    ]
+  },
+  "normalize": {
+    "cases": [
+      {
+        "name": "noop",
+        "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "crlf_question_and_fields",
+        "input": { "questions": [ { "question": "line1\r\nline2", "header": "H\r\n2", "options": [ { "label": "A\r\n1", "description": "d\r\n1", "preview": "p\r\n1" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "lone_cr_deleted",
+        "input": { "questions": [ { "question": "GEMBA\r_LOG\r_FILE", "header": "H\r", "options": [ { "label": "A\r", "description": "d\r" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "mixed_terminators",
+        "input": { "questions": [ { "question": "a\r\nb\rc\r\r\nd", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "astral_emoji",
+        "input": { "questions": [ { "question": "🦀\r\n🦀", "header": "H", "options": [ { "label": "🦀\r", "description": "d" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "preview_absent_stays_absent",
+        "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "empty_preview_string_stays_present",
+        "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a", "preview": "" }, { "label": "B", "description": "b" } ] } ] }
+      },
+      {
+        "name": "multi_select_preserved",
+        "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ], "multiSelect": true } ] }
+      },
+      {
+        "name": "multi_select_false_preserved",
+        "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ], "multiSelect": false } ] }
+      }
+    ]
+  },
+  "validate": {
+    "cases": [
+      { "name": "ok_min_one_question", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] } },
+      { "name": "ok_max_four_questions", "input": { "questions": [ { "question": "Q1?", "header": "H1", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q2?", "header": "H2", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q3?", "header": "H3", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q4?", "header": "H4", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] } },
+      { "name": "ok_four_options", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" }, { "label": "C", "description": "c" }, { "label": "D", "description": "d" } ] } ] } },
+      { "name": "no_questions", "input": { "questions": [] } },
+      { "name": "too_many_questions", "input": { "questions": [ { "question": "Q1?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q2?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q3?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q4?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q5?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] } },
+      { "name": "duplicate_question", "input": { "questions": [ { "question": "Q?", "header": "H1", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q?", "header": "H2", "options": [ { "label": "C", "description": "c" }, { "label": "D", "description": "d" } ] } ] } },
+      { "name": "empty_options", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" } ] } ] } },
+      { "name": "reserved_other", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "Other", "description": "o" } ] } ] } },
+      { "name": "reserved_type_something", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "Type something.", "description": "t" } ] } ] } },
+      { "name": "reserved_next", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "Next", "description": "n" } ] } ] } },
+      { "name": "reserved_precedes_duplicate_label", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "Next", "description": "a" }, { "label": "Next", "description": "b" } ] } ] } },
+      { "name": "duplicate_option_label", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "A", "description": "b" } ] } ] } },
+      { "name": "reserved_case_sensitive", "input": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "other", "description": "a" }, { "label": "next", "description": "b" } ] } ] } },
+      { "name": "duplicate_label_across_questions_ok", "input": { "questions": [ { "question": "Q1?", "header": "H1", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q2?", "header": "H2", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] } },
+      { "name": "duplicate_question_precedes_empty_options", "input": { "questions": [ { "question": "Q?", "header": "H1", "options": [ { "label": "A", "description": "a" } ] }, { "question": "Q?", "header": "H2", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] } }
+    ]
+  },
+  "envelope": {
+    "cases": [
+      {
+        "name": "answered_option",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_custom",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "custom", "answer": "typed text" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_custom_empty_placeholder",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "custom", "answer": "" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_custom_null_placeholder",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "custom", "answer": null } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_option_empty_string_kept",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_option_null_placeholder",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": null } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_multi",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ], "multiSelect": true } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "multi", "answer": null, "selected": ["A", "B"] } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_multi_empty_placeholder",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ], "multiSelect": true } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "multi", "answer": null, "selected": [] } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_with_notes",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A", "notes": "a note" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_with_preview",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a", "preview": "preview md" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A", "preview": "preview md" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "answered_with_preview_and_notes",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a", "preview": "preview md" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A", "preview": "preview md", "notes": "note" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "empty_preview_and_notes_no_suffix",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A", "preview": "", "notes": "" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "global_note_only",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [], "cancelled": false, "globalNote": "hello\nworld" }
+        }
+      },
+      {
+        "name": "global_note_with_answer",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 0, "question": "Q?", "kind": "option", "answer": "A" } ], "cancelled": false, "globalNote": "note." }
+        }
+      },
+      {
+        "name": "cancelled",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [], "cancelled": true }
+        }
+      },
+      {
+        "name": "cancelled_with_global_note",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [], "cancelled": true, "globalNote": "kept" }
+        }
+      },
+      {
+        "name": "null_result",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": null
+        }
+      },
+      {
+        "name": "empty_answers_not_cancelled_declines",
+        "input": {
+          "params": { "questions": [ { "question": "Q?", "header": "H", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] } ] },
+          "result": { "answers": [], "cancelled": false }
+        }
+      },
+      {
+        "name": "partial_submission_skips_unanswered",
+        "input": {
+          "params": { "questions": [ { "question": "Q1?", "header": "H1", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q2?", "header": "H2", "options": [ { "label": "C", "description": "c" }, { "label": "D", "description": "d" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 1, "question": "Q2?", "kind": "option", "answer": "C" } ], "cancelled": false }
+        }
+      },
+      {
+        "name": "out_of_order_answers_follow_question_order",
+        "input": {
+          "params": { "questions": [ { "question": "Q1?", "header": "H1", "options": [ { "label": "A", "description": "a" }, { "label": "B", "description": "b" } ] }, { "question": "Q2?", "header": "H2", "options": [ { "label": "C", "description": "c" }, { "label": "D", "description": "d" } ] } ] },
+          "result": { "answers": [ { "questionIndex": 1, "question": "Q2?", "kind": "option", "answer": "C" }, { "questionIndex": 0, "question": "Q1?", "kind": "option", "answer": "A" } ], "cancelled": false }
+        }
+      }
+    ]
+  },
+  "row-intent": {
+    "cases": [
+      { "name": "single_select_absent", "input": {} },
+      { "name": "single_select_false", "input": { "multiSelect": false } },
+      { "name": "multi_select_true", "input": { "multiSelect": true } },
+      { "name": "constants", "input": null }
+    ]
+  }
+}

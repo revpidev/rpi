@@ -488,4 +488,33 @@ mod tests {
         component.handle_input("\x1b");
         assert!(!component.render(80).is_empty());
     }
+
+    /// TE28 deliverable 4 (00-feasibility §7 verification 3): the RPC dialog
+    /// fallback folds option descriptions/previews into a multi-line title
+    /// (`\n\n` separated). The selector must wrap it to the pane width
+    /// without exceeding it or dropping content.
+    #[test]
+    fn multiline_title_wraps_within_width_and_keeps_content() {
+        crate::modes::interactive::interactive_mode::install_global_keybindings();
+        let title = "Header one\n\n1. option A — description text that is long enough to wrap\n2. option B — another description";
+        let (component, _) = component_with(Some(title), vec!["a"], None);
+        let width = 30usize;
+        let lines: Vec<String> = component
+            .render(width)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        for line in &lines {
+            assert!(
+                rpi_tui::utils::visible_width(line) <= width,
+                "line exceeds {width} columns: {line:?}"
+            );
+        }
+        for fragment in ["Header one", "1. option A", "2. option B", "description"] {
+            assert!(
+                lines.iter().any(|line| line.contains(fragment)),
+                "title fragment {fragment:?} missing from {lines:?}"
+            );
+        }
+    }
 }

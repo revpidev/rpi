@@ -7,6 +7,7 @@ members = [
     "crates/rpi-tui",
     "crates/rpi",
     "crates/rpi-ext-host",
+    "crates/rpi-ext-ask-user-question",
     "crates/rpi-ext-mcp-adapter",
     "crates/rpi-ext-subagents",
     "crates/rpi-ext-smart-fetch",
@@ -26,6 +27,7 @@ rpi-ai = { path = "crates/rpi-ai" }
 rpi-agent = { path = "crates/rpi-agent" }
 rpi-tui = { path = "crates/rpi-tui" }
 rpi-ext-host = { path = "crates/rpi-ext-host" }
+rpi-ext-ask-user-question = { path = "crates/rpi-ext-ask-user-question" }
 rpi-ext-mcp-adapter = { path = "crates/rpi-ext-mcp-adapter" }
 rpi-ext-smart-fetch = { path = "crates/rpi-ext-smart-fetch" }
 rpi-ext-statusline = { path = "crates/rpi-ext-statusline" }

@@ -1,0 +1,15 @@
+{"name":"ok_min_one_question","output":{"ok":true}}
+{"name":"ok_max_four_questions","output":{"ok":true}}
+{"name":"ok_four_options","output":{"ok":true}}
+{"name":"no_questions","output":{"ok":false,"error":"no_questions","message":"Error: At least one question is required"}}
+{"name":"too_many_questions","output":{"ok":false,"error":"too_many_questions","message":"Error: At most 4 questions are allowed per invocation"}}
+{"name":"duplicate_question","output":{"ok":false,"error":"duplicate_question","message":"Error: Question text must be unique within an invocation"}}
+{"name":"empty_options","output":{"ok":false,"error":"empty_options","message":"Error: Each question requires at least 2 options"}}
+{"name":"reserved_other","output":{"ok":false,"error":"reserved_label","message":"Error: Option label is reserved (Other, Type something., Next)"}}
+{"name":"reserved_type_something","output":{"ok":false,"error":"reserved_label","message":"Error: Option label is reserved (Other, Type something., Next)"}}
+{"name":"reserved_next","output":{"ok":false,"error":"reserved_label","message":"Error: Option label is reserved (Other, Type something., Next)"}}
+{"name":"reserved_precedes_duplicate_label","output":{"ok":false,"error":"reserved_label","message":"Error: Option label is reserved (Other, Type something., Next)"}}
+{"name":"duplicate_option_label","output":{"ok":false,"error":"duplicate_option_label","message":"Error: Option labels must be unique within a question"}}
+{"name":"reserved_case_sensitive","output":{"ok":true}}
+{"name":"duplicate_label_across_questions_ok","output":{"ok":true}}
+{"name":"duplicate_question_precedes_empty_options","output":{"ok":false,"error":"duplicate_question","message":"Error: Question text must be unique within an invocation"}}

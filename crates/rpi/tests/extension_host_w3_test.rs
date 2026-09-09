@@ -1086,3 +1086,63 @@ async fn w3_exec_runs_command_and_reports_timeout() {
         .expect("exec missing");
     assert_eq!(result.code, 1);
 }
+
+// ---------------------------------------------------------------------------
+// TE28 deliverable 4 — 00-feasibility §7 verification 2
+// ---------------------------------------------------------------------------
+
+/// `before_agent_start` handlers may call `setActiveTools`; the same turn's
+/// tool list must reflect the change. rpi emits the event during prompt
+/// assembly (`agent_session.rs:1841`) before `run_agent_prompt` (`:1885`), and
+/// `set_active_tools_by_name` (`:1532`) installs the new list on the agent
+/// immediately — this test pins that ordering end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w3_before_agent_start_set_active_tools_applies_to_same_turn() {
+    let (host, slot) = host_with_api(Vec::new()).await;
+    let api = slot_api(&slot);
+    let noop = || -> ext::ToolExecuteFn {
+        Arc::new(|_req, _ctx| Box::pin(async { Ok(rpi_agent::types::AgentToolResult::default()) }))
+    };
+    register_tool(&api, "keeper", noop());
+    register_tool(&api, "stripped", noop());
+    let handler_api = api.clone();
+    api.on(
+        "before_agent_start",
+        Arc::new(move |_payload, _ctx| {
+            let api = handler_api.clone();
+            Box::pin(async move {
+                api.set_active_tools(vec!["keeper".to_owned()])
+                    .expect("set_active_tools inside before_agent_start");
+                Ok(Value::Null)
+            })
+        }),
+    )
+    .expect("register before_agent_start handler");
+
+    let fixture = session_fixture(
+        vec![tool_call_step("stripped", json!({})), text_step("done")],
+        host,
+        FauxProviderOptions::default(),
+    )
+    .await;
+
+    fixture
+        .session
+        .prompt("go", rpi::core::agent_session::PromptOptions::default())
+        .await
+        .expect("prompt");
+    fixture.session.wait_for_idle().await;
+
+    // The handler ran during prompt assembly; the active set reflects it.
+    assert_eq!(
+        fixture.session.get_active_tool_names(),
+        vec!["keeper".to_owned()],
+        "handler's setActiveTools applied"
+    );
+    // The model still called the stripped tool; the same turn's tool list did
+    // not contain it, so the call failed before execution.
+    let result = tool_result_json(&fixture.session);
+    assert_eq!(result["isError"], json!(true), "{result}");
+    let text = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(text.contains("Tool stripped not found"), "{result}");
+}

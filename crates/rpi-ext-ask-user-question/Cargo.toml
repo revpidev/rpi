@@ -1,0 +1,30 @@
+[package]
+name = "rpi-ext-ask-user-question"
+description = "Structured ask_user_question tool (L0 native plugin) — port of @juicesharp/rpiv-ask-user-question v2.9.0+ (338b264c)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# rlib: all logic lives in the library for unit/parity tests; cdylib is the
+# distributed artifact loaded by rpi-ext-host's native loader (mcp-adapter
+# Cargo.toml precedent; design §1).
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+# Native ABI types (RpiNativeModule / RpiHostCalls) for the cdylib thin shell.
+rpi-ext-host.workspace = true
+abi_stable = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# TE28 deliverable 4: the five 00-feasibility §7 pre-verifications drive the
+# real extension host (tool execute + bound UI bridge) and the real cdylib
+# (l0_load), so the test binaries need the host-side types.
+rpi-agent.workspace = true
+rpi-ai.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
