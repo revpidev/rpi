@@ -1,5 +1,5 @@
 {
-  "//": "Discovery fixture materialization (R7.1.3.2/.3, TE15). Committed files under agents-tree/ cover malformed definitions, nested trees and `sync-backups` pruning. `.rpi/` and symlinks are created at test time instead of being committed: `.rpi/` is gitignored repo-wide (`.gitignore` -> `.rpi/`) and symlinks are not portable to Windows checkouts.",
+  "//": "Discovery fixture materialization (R7.1.3.1-.3, TE15). Committed files under agents-tree/ cover malformed definitions, nested trees and `sync-backups` pruning. `.rpi/` and symlinks are created at test time instead of being committed: `.rpi/` is gitignored repo-wide (`.gitignore` -> `.rpi/`) and symlinks are not portable to Windows checkouts. `broken-frontmatter.md` (unterminated fence) and `broken-no-colon.md` (missing description) are silent skips — upstream parseFrontmatter ignores malformed lines and loadAgentsFromDefinitionFiles `continue`s without a name/description (verified against v0.66.0 @ 0fc0eebb, probe recorded in TE15 §7); the two `broken-invalid-*.md` files are the ones that throw and therefore produce diagnostics.",
   "base_dir": "agents-tree",
   "create_dirs": [".rpi"],
   "create_files": [
@@ -30,8 +30,20 @@
     ".rpi/pruned.md",
     "sync-backups/pruned.md"
   ],
+  "expected_silent_skips": [
+    "broken-frontmatter.md (unterminated frontmatter: no name/description -> upstream `continue`, no diagnostic)",
+    "broken-no-colon.md (malformed line ignored; missing description -> upstream `continue`, no diagnostic)"
+  ],
   "expected_diagnostics": [
-    "broken-frontmatter.md (unterminated frontmatter)",
-    "broken-no-colon.md (malformed frontmatter line)"
+    {
+      "path": "broken-invalid-async.md",
+      "scope": "user",
+      "error": "Agent 'broken-async' has invalid async frontmatter; expected true or false."
+    },
+    {
+      "path": "broken-invalid-timeout.md",
+      "scope": "user",
+      "error": "Agent 'broken-timeout' has invalid timeoutMs frontmatter; expected a positive integer."
+    }
   ]
 }

@@ -1,7 +1,7 @@
 # subagents 对拍 harness（TE04 G3；双轨重定基 TE13）
 
 驱动钉死版上游 pi-subagents 与本 crate 的 `build_rpi_args` / frontmatter 解析器 /
-`get_finalOutput` / fallback 模式表跑同一组 fixture，归一化后逐项 diff。
+`get_finalOutput` / fallback 模式表 / 发现入口跑同一组 fixture，归一化后逐项 diff。
 
 ## 双轨
 
@@ -41,6 +41,18 @@ Rust 腿由 `run-parity.mjs` 自己构建（cargo 缓存命中时近零开销）
 
 退出码：回归轨非 0 = 有差异；目标轨非 0 = 存在**未归因**差异。
 
+### 目标轨 discovery 腿（TE15，R7.1.3）
+
+`--track=target` 多跑一个 `discovery` 模式：同一条 tree 用例由**两侧各自物化**——
+上游腿把 fixture 里的 `<CFGDIR>` 落为 `.pi`，Rust 腿落为 `.rpi`，输出再把该段归一
+回 `<CFGDIR>`；两侧都调用**真实发现入口**（上游 v0.66 `discoverAgents(cwd, "user")`，
+rpi `discover_agents_with_user_dirs_with_diagnostics`），比较过滤到该树后的
+`agents`（name/source/path）与 `diagnostics`（path/source/error）。上游腿把 HOME /
+USERPROFILE / `PI_CODING_AGENT_DIR` 指向仓库外 sandbox 并设 `PI_OFFLINE=1`（跳过
+`npm root -g`），scope `user` 使 v0.66 走 `discoverAgentsUncached`，同一进程内多
+用例互不污染；内建 agent 与 `~/.agents` 由两侧按路径过滤排除。symlink 用例仅
+非 Windows 平台创建（两侧一致跳过，见 `fixtures/subagents-v066/discovery/materialize.json`）。
+
 ## 目标轨上游来源（仓库外，external/ 零写入）
 
 `setup-target-source.sh` 用 `git -C external/pi-subagents archive <pin>` 把 v0.66 源码抽取到
@@ -77,10 +89,10 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
 | 文件 | 职责 |
 |------|------|
 | `fixtures.json` | 基线共享用例：9 组 argv/env 输入、6 组 frontmatter 内容、5 组 message 数组 |
-| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量 |
+| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量、discovery tree（TE15） |
 | `args-golden-v048.json` | argv/env 冻结黄金文件（[RPI-OWN]） |
 | `expected-target-diffs.json` | 目标轨差异归因清单（R + 承接任务） |
-| `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件 |
+| `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件、discovery 走 v0.66 `discoverAgents` |
 | `setup-target-source.sh` | 仓库外抽取 v0.66 快照 + 安装其 prod 依赖（external/ 零写入） |
 | `examples/parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`）；由编排器构建并私有拷贝后执行 |
 | `run-parity.mjs` | 编排 + 归一化 diff + 归因 + 报告落盘；物化 fixture 与 Rust 二进制拷贝落仓库外临时目录 |
@@ -126,6 +138,10 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
   `connection (error|reset|closed|aborted)`/`500`/`internal server error` 模式与
   `isRetryableModelFailureAttempt`/`isContextOverflow`/`recordRetryableModelFailure`
   （R7.1.2.1–.3，TE14）；`isRetryableModelFailure` 与 `formatModelAttemptNote` 语义未变。
+- `src/agents/agents.ts` 发现面：`DISCOVERY_PRUNED_DIR_NAMES` 补 `.pi`/`sync-backups`
+  （#1596/671bc27c）；symlink 目录按目录跟随 + `visitedDirectories` realpath 集
+  （#1505/#1510/9433419a）；单文件 try/catch → `AgentDiscoveryDiagnostic`
+  （#1200/e973fa3c）。rpi 以 `.rpi` 替代 `.pi`（ADR-0001），其余按同语义对拍（TE15）。
 
 ## 环境隔离（运行前须知）
 

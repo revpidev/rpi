@@ -185,8 +185,15 @@ pub fn handle_management_action_with(
     }
     match action {
         "list" => {
-            let agents = discover::discover_agents(cwd, "both", settings, None).unwrap_or_default();
-            ToolOutcome::text(format_agent_list(&agents))
+            let (agents, diagnostics) =
+                discover::discover_agents_with_diagnostics(cwd, "both", settings, None);
+            let mut text = format_agent_list(&agents);
+            let diagnostic_lines = format_discovery_diagnostics(&diagnostics);
+            if !diagnostic_lines.is_empty() {
+                text.push('\n');
+                text.push_str(&diagnostic_lines.join("\n"));
+            }
+            ToolOutcome::text(text)
         }
         "get" => {
             let Some(name) = agent_name else {
@@ -537,6 +544,27 @@ fn format_async_status(verb: &str, status: &Value) -> String {
 
 /// Doctor sections (extension/doctor.ts:229-270, P0 subset): Runtime,
 /// Filesystem, Discovery, Depth/budget, Permission-system env parity.
+/// `appendAgentDiagnosticLines` (agent-management.ts:851-857): additive
+/// discovery diagnostics block. rpi shape is `path (scope): error` (the
+/// upstream block prints `name ?? filePath`; rpi always has the path and the
+/// task pins path + scope + error). Returns an empty vector when there is
+/// nothing to report so existing output lines stay byte-identical.
+pub fn format_discovery_diagnostics(diagnostics: &[discover::DiscoverDiagnostic]) -> Vec<String> {
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Invalid agent definitions:".to_string()];
+    for diagnostic in diagnostics {
+        lines.push(format!(
+            "- {} ({}): {}",
+            diagnostic.path.to_string_lossy(),
+            diagnostic.scope.as_str(),
+            diagnostic.error
+        ));
+    }
+    lines
+}
+
 fn doctor_report(
     cwd: &Path,
     settings: &SettingsPair,
@@ -571,23 +599,28 @@ fn doctor_report(
     }
     sections.push(filesystem);
 
-    match discover::discover_agents(cwd, "both", settings, None) {
-        Ok(agents) => {
-            let by_source = |source: discover::AgentSource| {
-                agents.iter().filter(|agent| agent.source == source).count()
-            };
-            sections.push(format!(
-                "Discovery:\n- agents: {} (builtin {}, user {}, project {})\n- chains: 0",
-                agents.len(),
-                by_source(discover::AgentSource::Builtin),
-                by_source(discover::AgentSource::User),
-                by_source(discover::AgentSource::Project),
-            ));
-        }
-        Err(error) => {
-            sections.push(format!("Discovery:\n- failed: {error}"));
-        }
+    let (agents, diagnostics) =
+        discover::discover_agents_with_diagnostics(cwd, "both", settings, None);
+    let by_source = |source: discover::AgentSource| {
+        agents.iter().filter(|agent| agent.source == source).count()
+    };
+    let mut discovery = format!(
+        "Discovery:\n- agents: {} (builtin {}, user {}, project {})\n- chains: 0",
+        agents.len(),
+        by_source(discover::AgentSource::Builtin),
+        by_source(discover::AgentSource::User),
+        by_source(discover::AgentSource::Project),
+    );
+    // `doctor.ts:146-147`: invalid definitions are appended to the agents line.
+    for diagnostic in &diagnostics {
+        discovery.push_str(&format!(
+            "\n- invalid agent {} ({}): {}",
+            diagnostic.path.to_string_lossy(),
+            diagnostic.scope.as_str(),
+            diagnostic.error
+        ));
     }
+    sections.push(discovery);
 
     let max_depth = crate::runner::budget::resolve_current_max_depth(
         config.max_subagent_depth.as_ref().and_then(Value::as_u64),

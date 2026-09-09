@@ -1401,6 +1401,63 @@ pub mod parity {
     pub fn is_retryable_model_failure_public(error: Option<&str>) -> bool {
         crate::launch::model::is_retryable_model_failure(error)
     }
+
+    /// Discovery parity facade (TE15 target-track discovery leg, R7.1.3).
+    #[derive(Debug, Clone)]
+    pub struct DiscoveryInputPublic {
+        pub cwd: PathBuf,
+        pub scope: String,
+        pub user_dirs: Vec<PathBuf>,
+        pub builtin_dir: Option<PathBuf>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DiscoveredAgentPublic {
+        pub name: String,
+        pub source: String,
+        pub file_path: PathBuf,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DiscoverDiagnosticPublic {
+        pub path: PathBuf,
+        pub scope: String,
+        pub error: String,
+    }
+
+    /// Runs the real discovery entry point with explicit user dirs and returns
+    /// plain-data agents + diagnostics for the harness.
+    pub fn discover_public(
+        input: &DiscoveryInputPublic,
+    ) -> (Vec<DiscoveredAgentPublic>, Vec<DiscoverDiagnosticPublic>) {
+        let settings = crate::config::SettingsPair::default();
+        let (agents, diagnostics) =
+            crate::agents::discover::discover_agents_with_user_dirs_with_diagnostics(
+                &input.cwd,
+                &input.scope,
+                &settings,
+                input.builtin_dir.as_deref(),
+                input.user_dirs.clone(),
+            );
+        (
+            agents
+                .into_iter()
+                .map(|agent| DiscoveredAgentPublic {
+                    name: agent.name,
+                    source: agent.source.as_str().to_string(),
+                    file_path: agent.file_path,
+                })
+                .collect(),
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| DiscoverDiagnosticPublic {
+                    path: diagnostic.path,
+                    scope: diagnostic.scope.as_str().to_string(),
+                    error: diagnostic.error,
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Replay surface for the recorded child stream fixture

@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-08T15:16:24.206Z
+generated: 2026-09-09T03:13:24.112Z
 
 ## args
 
@@ -56,6 +56,10 @@ generated: 2026-09-08T15:16:24.206Z
 - attempt-no-tools-empty-messages: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
 - attempt-empty-output-cold-start: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
 - attempt-matching-message-error: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
+
+## discovery
+
+- user-tree-robustness: MATCH
 
 ## Attribution summary
 

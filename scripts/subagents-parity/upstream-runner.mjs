@@ -14,8 +14,9 @@
 //
 // Run via run-parity.mjs — never run inside external/ (the submodule stays
 // read-only; nothing here writes to it).
-import { readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -167,12 +168,82 @@ function loadArgsGolden() {
 	return byName;
 }
 
+// TE15 discovery-tree leg (R7.1.3): materialize the case tree under a sandbox
+// user-agent dir with the upstream config-dir name (`.pi`; the Rust leg uses
+// `.rpi`, both map back to `<CFGDIR>`), then drive the real v0.66
+// `discoverAgents` in `user` scope. Scope `user` keeps discovery uncached
+// (`discoverAgentsUncached`), so repeated cases in one process stay isolated.
+// Returns normalized agents + diagnostics; the Rust runner emits the same
+// shape.
+async function discoveryCase(fixture) {
+	const root = mkdtempSync(join(tmpdir(), "rpi-sub-discovery-parity-up-"));
+	const home = join(root, "home");
+	const agentDir = join(root, "agentdir");
+	const userDir = join(agentDir, "agents");
+	const projectDir = join(root, "proj");
+	mkdirSync(home, { recursive: true });
+	mkdirSync(userDir, { recursive: true });
+	mkdirSync(projectDir, { recursive: true });
+	const cfgDir = ".pi";
+	for (const [rawPath, content] of Object.entries(fixture.tree?.files ?? {})) {
+		const target = join(userDir, rawPath.replaceAll("<CFGDIR>", cfgDir));
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(target, content);
+	}
+	// Symlinks are not portable to Windows checkouts; both legs skip them there
+	// (materialize.json records the same limitation).
+	if (process.platform !== "win32") {
+		for (const link of fixture.tree?.symlinks ?? []) {
+			symlinkSync(link.target, join(userDir, link.path), "dir");
+		}
+	}
+	const saved = {
+		HOME: process.env.HOME,
+		USERPROFILE: process.env.USERPROFILE,
+		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+		PI_OFFLINE: process.env.PI_OFFLINE,
+		PI_SUBAGENT_EXTRA_AGENT_DIRS: process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS,
+	};
+	process.env.HOME = home;
+	process.env.USERPROFILE = home;
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_OFFLINE = "1";
+	delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+	try {
+		const { discoverAgents } = await import(moduleUrl(TARGET_ROOT, "src/agents/agents.ts"));
+		const result = discoverAgents(projectDir, "user");
+		const under = (filePath) => {
+			const rel = relative(userDir, filePath);
+			return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+		};
+		const relativize = (filePath) => {
+			const rel = relative(userDir, filePath).split("\\").join("/");
+			return rel.startsWith(`${cfgDir}/`) ? `<CFGDIR>/${rel.slice(cfgDir.length + 1)}` : rel;
+		};
+		const agents = result.agents
+			.filter((agent) => under(agent.filePath))
+			.map((agent) => ({ name: agent.name, source: agent.source, path: relativize(agent.filePath) }))
+			.sort((a, b) => a.name.localeCompare(b.name));
+		const diagnostics = (result.agentDiagnostics ?? [])
+			.filter((diagnostic) => under(diagnostic.filePath))
+			.map((diagnostic) => ({ path: relativize(diagnostic.filePath), source: diagnostic.source, error: diagnostic.error }))
+			.sort((a, b) => a.path.localeCompare(b.path));
+		return { agents, diagnostics };
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		rmSync(root, { recursive: true, force: true });
+	}
+}
+
 async function main() {
 	const mode = process.argv[2];
 	const fixturePath = process.argv[3];
 	if (!mode || !fixturePath) {
 		console.error(
-			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback> <fixture.json>",
+			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback|discovery> <fixture.json>",
 		);
 		process.exit(2);
 	}
@@ -194,6 +265,8 @@ async function main() {
 			output = utils.getFinalOutput(fixture.messages ?? []);
 		} else if (mode === "fallback") {
 			output = fallbackCase(modelFallback, fixture);
+		} else if (mode === "discovery") {
+			output = await discoveryCase(fixture);
 		} else {
 			console.error(`upstream-runner: unknown mode ${mode}`);
 			process.exit(2);

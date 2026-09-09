@@ -14,7 +14,7 @@
 //! Intentional differences: `.pi`/`~/.pi` → `.rpi`/`~/.rpi` (ADR-0001);
 //! `PI_SUBAGENT_EXTRA_AGENT_DIRS` → `RPI_SUBAGENT_EXTRA_AGENT_DIRS`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::paths;
@@ -371,10 +371,23 @@ fn split_tool_list(raw: Option<Vec<String>>) -> (Option<Vec<String>>, Vec<String
     (raw.map(|_| tools), mcp)
 }
 
+/// One skipped agent definition or directory entry (additive discovery
+/// diagnostic, R7.1.3.1; upstream `AgentDiscoveryDiagnostic`,
+/// agents.ts:245-250). `path` is the file/directory that failed, `scope` is
+/// the discovery source it was found under and `error` is the parse/IO error
+/// summary (never file contents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverDiagnostic {
+    pub path: PathBuf,
+    pub scope: AgentSource,
+    pub error: String,
+}
+
 /// Frontmatter → AgentConfig (`loadAgentsFromDir` body, agents.ts:1510-1656).
-/// `Err` mirrors the upstream throws (invalid async/timeoutMs abort the whole
-/// discovery); `Ok(None)` = file skipped (missing name/description, invalid
-/// package) exactly like upstream `continue`.
+/// `Err` mirrors the upstream throws (invalid async/timeoutMs/package); the
+/// caller records it as a [`DiscoverDiagnostic`] and continues.
+/// `Ok(None)` = file skipped (missing name/description) exactly like the
+/// upstream `continue`.
 pub fn agent_from_content(
     content: &str,
     file_path: &Path,
@@ -392,7 +405,9 @@ pub fn agent_from_content(
 
     let package_name = match parse_package_name(fm.get("package").map(String::as_str)) {
         Ok(package) => package,
-        Err(_) => return Ok(None),
+        // Upstream `parsePackageName(frontmatter.package, `Agent 'x' package`)`
+        // throws since #1200 (e973fa3c); the caller turns it into a diagnostic.
+        Err(error) => return Err(format!("Agent '{local_name}' package {error}")),
     };
     let runtime_name = build_runtime_name(local_name, package_name.as_deref());
 
@@ -519,10 +534,15 @@ pub fn agent_from_content(
     }))
 }
 
-/// Load agents from one directory (`loadAgentsFromDir`, agents.ts:1497-1662).
-/// Malformed definitions that upstream treats as fatal (invalid async /
-/// timeoutMs) abort the whole directory load with the upstream message.
-pub fn load_agents_from_dir(dir: &Path, source: &str) -> Result<Vec<AgentConfig>, String> {
+/// Load agents from one directory (`loadAgentsFromDir`, agents.ts:2166-2168 +
+/// `loadAgentsFromDefinitionFiles`, agents.ts:1960-2163). Per-file failures
+/// are isolated: they become [`DiscoverDiagnostic`] entries and the remaining
+/// files still load (#1200, e973fa3c). Diagnostics keep the traversal order
+/// (name-sorted, depth-first) so callers can assert them stably.
+pub fn load_agents_from_dir_with_diagnostics(
+    dir: &Path,
+    source: &str,
+) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
     let source = match source {
         "builtin" => AgentSource::Builtin,
         "user" => AgentSource::User,
@@ -530,18 +550,42 @@ pub fn load_agents_from_dir(dir: &Path, source: &str) -> Result<Vec<AgentConfig>
         _ => AgentSource::User,
     };
     let mut agents = Vec::new();
-    for file_path in list_files_recursive(dir, root_predicate()) {
+    let mut diagnostics = Vec::new();
+    for file_path in collect_files_recursive(dir, root_predicate(), source, &mut diagnostics) {
         if is_legacy_agent_skill_path(dir, &file_path) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&file_path) else {
-            continue;
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(content) => content,
+            Err(error) => {
+                diagnostics.push(DiscoverDiagnostic {
+                    path: file_path,
+                    scope: source,
+                    error: format!("cannot read agent definition: {error}"),
+                });
+                continue;
+            }
         };
-        if let Some(agent) = agent_from_content(&content, &file_path, source)? {
-            agents.push(agent);
+        match agent_from_content(&content, &file_path, source) {
+            Ok(Some(agent)) => agents.push(agent),
+            // Missing name/description: upstream `continue`, no diagnostic.
+            Ok(None) => {}
+            Err(error) => diagnostics.push(DiscoverDiagnostic {
+                path: file_path,
+                scope: source,
+                error,
+            }),
         }
     }
-    Ok(agents)
+    (agents, diagnostics)
+}
+
+/// Backward-compatible wrapper over
+/// [`load_agents_from_dir_with_diagnostics`]: same signature and return shape
+/// as before (A-R2), diagnostics ignored.
+#[allow(dead_code)] // backward-compatible API surface (A-R2); exercised in tests
+pub fn load_agents_from_dir(dir: &Path, source: &str) -> Result<Vec<AgentConfig>, String> {
+    Ok(load_agents_from_dir_with_diagnostics(dir, source).0)
 }
 
 fn root_predicate() -> fn(&str) -> bool {
@@ -549,10 +593,12 @@ fn root_predicate() -> fn(&str) -> bool {
     |file_name: &str| file_name.ends_with(".md") && !file_name.ends_with(".chain.md")
 }
 
-const DISCOVERY_PRUNED_DIR_NAMES: [&str; 2] = [".git", "node_modules"];
+// `DISCOVERY_PRUNED_DIR_NAMES` (agents.ts:1678, #1596/671bc27c): `.pi` maps
+// to `.rpi` per ADR-0001; `sync-backups` is the operational backup dir.
+const DISCOVERY_PRUNED_DIR_NAMES: [&str; 4] = [".git", "node_modules", ".rpi", "sync-backups"];
 
 fn should_prune_discovery_dir(root_dir: &Path, dir: &Path, dir_name: &str) -> bool {
-    // agents.ts:1394-1398.
+    // agents.ts:1684-1688.
     if DISCOVERY_PRUNED_DIR_NAMES.contains(&dir_name) {
         return true;
     }
@@ -567,35 +613,120 @@ fn is_project_root_candidate(dir: &Path) -> bool {
     paths::get_project_config_dir(dir).is_dir() || dir.join(".agents").is_dir()
 }
 
-/// `listFilesRecursive` (agents.ts:1400-1424): name-sorted (byte order ≈
+/// `listFilesRecursive` (agents.ts:1690-1731): name-sorted (byte order ≈
 /// localeCompare for ASCII), depth-first, pruned dirs skipped, symlinked files
-/// included.
+/// included. Directory symlinks are followed (#1505/#1510, 9433419a) and a
+/// realpath `visited` set keeps cycles and duplicate links from recursing
+/// twice. Traversal failures are collected by the caller through the
+/// diagnostic variant.
+#[allow(dead_code)] // upstream API surface; exercised in tests
 pub fn list_files_recursive(dir: &Path, predicate: fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut diagnostics = Vec::new();
+    collect_files_recursive(dir, predicate, AgentSource::User, &mut diagnostics)
+}
+
+/// Internal walker behind [`list_files_recursive`]: returns matching files in
+/// traversal order and pushes one [`DiscoverDiagnostic`] per unreadable
+/// entry/directory (C-R3). A missing root is silent (upstream
+/// `listFilesRecursive` returns `[]` for `!existsSync(dir)`).
+fn collect_files_recursive(
+    dir: &Path,
+    predicate: fn(&str) -> bool,
+    scope: AgentSource,
+    diagnostics: &mut Vec<DiscoverDiagnostic>,
+) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    if !dir.exists() {
+        return files;
+    }
+    let mut visited = HashSet::new();
+    walk_discovery_dir(
+        dir,
+        dir,
+        predicate,
+        scope,
+        &mut visited,
+        &mut files,
+        diagnostics,
+    );
+    files
+}
+
+fn walk_discovery_dir(
+    root_dir: &Path,
+    dir: &Path,
+    predicate: fn(&str) -> bool,
+    scope: AgentSource,
+    visited: &mut HashSet<PathBuf>,
+    files: &mut Vec<PathBuf>,
+    diagnostics: &mut Vec<DiscoverDiagnostic>,
+) {
+    // Upstream marks the directory itself visited before iterating
+    // (agents.ts:1702-1707); `cycle -> .` is therefore skipped on the first
+    // hop. canonicalize is the realpathSync equivalent.
+    match std::fs::canonicalize(dir) {
+        Ok(real) => {
+            if !visited.insert(real) {
+                return;
+            }
+        }
+        Err(error) => {
+            diagnostics.push(DiscoverDiagnostic {
+                path: dir.to_path_buf(),
+                scope,
+                error: format!("cannot resolve directory: {error}"),
+            });
+            return;
+        }
+    }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(_) => return files,
+        Err(error) => {
+            diagnostics.push(DiscoverDiagnostic {
+                path: dir.to_path_buf(),
+                scope,
+                error: format!("cannot read directory: {error}"),
+            });
+            return;
+        }
     };
     let mut sorted: Vec<_> = entries.flatten().collect();
     sorted.sort_by_key(|entry| entry.file_name());
     for entry in sorted {
         let file_path = dir.join(entry.file_name());
-        let meta = entry.file_type().ok();
-        if matches!(meta, Some(t) if t.is_dir()) {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !should_prune_discovery_dir(dir, &file_path, &name) {
-                files.extend(list_files_recursive(&file_path, predicate));
+        let name = entry.file_name().to_string_lossy().to_string();
+        // `fs::metadata` follows symlinks (#1505/#1510): a symlink to a
+        // directory is walked as a directory, a symlink to a file still
+        // passes the name predicate (C-R4).
+        let metadata = match std::fs::metadata(&file_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                diagnostics.push(DiscoverDiagnostic {
+                    path: file_path,
+                    scope,
+                    error: format!("cannot read entry metadata: {error}"),
+                });
+                continue;
+            }
+        };
+        if metadata.is_dir() {
+            if !should_prune_discovery_dir(root_dir, &file_path, &name) {
+                walk_discovery_dir(
+                    root_dir,
+                    &file_path,
+                    predicate,
+                    scope,
+                    visited,
+                    files,
+                    diagnostics,
+                );
             }
             continue;
         }
-        // isFile || isSymbolicLink: entries whose type is a symlink to a file
-        // pass the predicate by name.
-        let name = entry.file_name().to_string_lossy().to_string();
-        if predicate(&name) {
+        if metadata.is_file() && predicate(&name) {
             files.push(file_path);
         }
     }
-    files
 }
 
 /// `isLegacyAgentSkillPath` (agents.ts:1426-1433): a `.agents/skills` segment
@@ -684,11 +815,31 @@ pub fn discover_agents(
     settings: &crate::config::SettingsPair,
     builtin_dir: Option<&Path>,
 ) -> Result<Vec<AgentConfig>, String> {
-    discover_agents_with_user_dirs(cwd, scope, settings, builtin_dir, user_agent_dirs())
+    Ok(discover_agents_with_diagnostics(cwd, scope, settings, builtin_dir).0)
+}
+
+/// Additive discovery entry point (R7.1.3.1): same discovery as
+/// [`discover_agents`] plus one [`DiscoverDiagnostic`] per skipped definition
+/// or unreadable directory, in discovery order (builtin → user dirs → project
+/// dirs). Per-file failures never abort the batch.
+pub fn discover_agents_with_diagnostics(
+    cwd: &Path,
+    scope: &str,
+    settings: &crate::config::SettingsPair,
+    builtin_dir: Option<&Path>,
+) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    discover_agents_with_user_dirs_with_diagnostics(
+        cwd,
+        scope,
+        settings,
+        builtin_dir,
+        user_agent_dirs(),
+    )
 }
 
 /// Test seam over [`discover_agents`]: explicit user-level directories
 /// (extra dirs → agentDir/agents → ~/.agents upstream order).
+#[allow(dead_code)] // backward-compatible API surface (A-R2); exercised in tests
 pub fn discover_agents_with_user_dirs(
     cwd: &Path,
     scope: &str,
@@ -696,14 +847,35 @@ pub fn discover_agents_with_user_dirs(
     builtin_dir: Option<&Path>,
     user_dirs: Vec<PathBuf>,
 ) -> Result<Vec<AgentConfig>, String> {
+    Ok(discover_agents_with_user_dirs_with_diagnostics(
+        cwd,
+        scope,
+        settings,
+        builtin_dir,
+        user_dirs,
+    )
+    .0)
+}
+
+/// Diagnostics-aware variant of [`discover_agents_with_user_dirs`].
+pub fn discover_agents_with_user_dirs_with_diagnostics(
+    cwd: &Path,
+    scope: &str,
+    settings: &crate::config::SettingsPair,
+    builtin_dir: Option<&Path>,
+    user_dirs: Vec<PathBuf>,
+) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
     let default_model = settings.default_model.clone();
     // `applySubagentDefaults` (agents.ts:995-1009, called per scope at
     // 1760/1771/1779): defaultModel → defaultThinking → defaultExtensions,
     // each fill-only.
     let default_thinking = settings.default_thinking.clone();
     let default_extensions = settings.default_extensions.clone();
+    let mut diagnostics = Vec::new();
 
-    let mut builtin = crate::agents::builtin::load_builtin_agents(builtin_dir);
+    let (mut builtin, mut builtin_diagnostics) =
+        crate::agents::builtin::load_builtin_agents_with_diagnostics(builtin_dir);
+    diagnostics.append(&mut builtin_diagnostics);
     apply_subagent_defaults(
         &mut builtin,
         &default_model,
@@ -717,7 +889,10 @@ pub fn discover_agents_with_user_dirs(
     } else {
         let mut agents = Vec::new();
         for dir in user_dirs {
-            agents.extend(load_agents_from_dir(&dir, "user")?);
+            let (mut dir_agents, mut dir_diagnostics) =
+                load_agents_from_dir_with_diagnostics(&dir, "user");
+            agents.append(&mut dir_agents);
+            diagnostics.append(&mut dir_diagnostics);
         }
         // Same-source dedupe: first definition wins (agents.ts:1844-1849).
         dedupe_by_name(agents)
@@ -736,7 +911,10 @@ pub fn discover_agents_with_user_dirs(
     } else {
         let mut agents = Vec::new();
         for dir in project_agent_dirs(cwd) {
-            agents.extend(load_agents_from_dir(&dir, "project")?);
+            let (mut dir_agents, mut dir_diagnostics) =
+                load_agents_from_dir_with_diagnostics(&dir, "project");
+            agents.append(&mut dir_agents);
+            diagnostics.append(&mut dir_diagnostics);
         }
         dedupe_by_name(agents)
     };
@@ -766,10 +944,13 @@ pub fn discover_agents_with_user_dirs(
             merged.insert(agent.name.clone(), agent);
         }
     }
-    Ok(merged
-        .into_values()
-        .filter(|agent| agent.disabled != Some(true))
-        .collect())
+    (
+        merged
+            .into_values()
+            .filter(|agent| agent.disabled != Some(true))
+            .collect(),
+        diagnostics,
+    )
 }
 
 fn dedupe_by_name(agents: Vec<AgentConfig>) -> Vec<AgentConfig> {
@@ -1295,5 +1476,398 @@ mod tests {
         assert_eq!(researcher.mcp_direct_tools.len(), 0);
         // Builtins without an explicit model inherit subagents.defaultModel.
         assert_eq!(researcher.model.as_deref(), Some("model-x"));
+    }
+}
+
+/// TE15 discovery robustness tests (R7.1.3.1–.4). The fixture tree is the
+/// TE13 deliverable `fixtures/subagents-v066/discovery/agents-tree/`;
+/// `materialize.json` in the same directory pins what the upstream v0.66.0
+/// snapshot produces for it (silent skips, diagnostics, pruned paths).
+#[cfg(test)]
+mod discovery_robustness_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const HIDDEN_RPI_AGENT: &str = "---\nname: hidden-rpi-agent\ndescription: pruned\n---\nbody\n";
+
+    fn fixture_tree() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/subagents-v066/discovery/agents-tree")
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                copy_dir_recursive(&from, &to);
+            } else {
+                std::fs::copy(&from, &to).unwrap();
+            }
+        }
+    }
+
+    /// Materialize `agents-tree/` plus the `materialize.json` extras (`.rpi/`,
+    /// symlinks) into a fresh sandbox. Returns `(sandbox_root, tree_root)`.
+    fn materialize(tag: &str) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("rpi-sub-disc15-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = root.join("agents");
+        copy_dir_recursive(&fixture_tree(), &tree);
+        std::fs::create_dir_all(tree.join(".rpi")).unwrap();
+        std::fs::write(tree.join(".rpi").join("pruned.md"), HIDDEN_RPI_AGENT).unwrap();
+        std::fs::create_dir_all(root.join("cwd")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("nested", tree.join("linked-nested")).unwrap();
+            std::os::unix::fs::symlink(".", tree.join("cycle")).unwrap();
+        }
+        (root, tree)
+    }
+
+    fn discover_fixture(tree: &Path) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+        let cwd = tree.parent().unwrap().join("cwd");
+        discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &crate::config::SettingsPair::default(),
+            None,
+            vec![tree.to_path_buf()],
+        )
+    }
+
+    fn names(agents: &[AgentConfig]) -> Vec<String> {
+        let mut names: Vec<String> = agents.iter().map(|agent| agent.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// T-1 (A2/A4): a fatal per-file error is isolated, every other agent
+    /// (including the builtins) stays visible and the diagnostic carries
+    /// path/scope/error without file contents.
+    #[test]
+    fn bad_file_is_isolated_and_builtins_stay_visible() {
+        let (root, tree) = materialize("t1");
+        let (agents, diagnostics) = discover_fixture(&tree);
+
+        let visible = names(&agents);
+        for expected in [
+            "delegate",
+            "oracle",
+            "researcher",
+            "reviewer",
+            "scout",
+            "worker",
+            "good-agent",
+            "good-nested",
+        ] {
+            assert!(
+                visible.iter().any(|name| name == expected),
+                "{expected} missing: {visible:?}"
+            );
+        }
+        assert!(!visible.iter().any(|name| name == "broken-async"));
+        assert!(!visible.iter().any(|name| name == "broken-timeout"));
+
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].path, tree.join("broken-invalid-async.md"));
+        assert_eq!(diagnostics[0].scope, AgentSource::User);
+        assert_eq!(
+            diagnostics[0].error,
+            "Agent 'broken-async' has invalid async frontmatter; expected true or false."
+        );
+        assert_eq!(diagnostics[1].path, tree.join("broken-invalid-timeout.md"));
+        assert_eq!(
+            diagnostics[1].error,
+            "Agent 'broken-timeout' has invalid timeoutMs frontmatter; expected a positive integer."
+        );
+        for diagnostic in &diagnostics {
+            assert!(
+                !diagnostic.error.contains("This file exists only"),
+                "diagnostic must not embed file contents: {diagnostic:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-2: one diagnostic per fatal file, in stable traversal order.
+    #[test]
+    fn multiple_bad_files_yield_one_diagnostic_each_in_order() {
+        let root =
+            std::env::temp_dir().join(format!("rpi-sub-disc15-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("a-bad.md"),
+            "---\nname: a\ndescription: d\nasync: nope\n---\nb\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b-good.md"),
+            "---\nname: b\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("c-bad.md"),
+            "---\nname: c\ndescription: d\ntimeoutMs: -1\n---\nb\n",
+        )
+        .unwrap();
+        let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&root, "user");
+        assert_eq!(names(&agents), vec!["b".to_string()]);
+        let paths: Vec<PathBuf> = diagnostics.iter().map(|d| d.path.clone()).collect();
+        assert_eq!(paths, vec![root.join("a-bad.md"), root.join("c-bad.md")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-3 (B-R2/B-R3): `.rpi` and `sync-backups` are pruned at any depth, but
+    /// an explicit discovery root inside `.rpi` is still read.
+    #[test]
+    fn nested_pruned_dirs_are_skipped_and_explicit_root_is_read() {
+        let (root, tree) = materialize("t3");
+        let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&tree, "user");
+        let visible = names(&agents);
+        assert!(visible.contains(&"good-agent".to_string()), "{visible:?}");
+        assert!(
+            !visible.contains(&"hidden-rpi-agent".to_string()),
+            "{visible:?}"
+        );
+        assert!(
+            !visible.contains(&"sync-backup-agent".to_string()),
+            "{visible:?}"
+        );
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+
+        let explicit_root = root.join("proj/.rpi/agents");
+        std::fs::create_dir_all(&explicit_root).unwrap();
+        std::fs::write(
+            explicit_root.join("inside.md"),
+            "---\nname: inside-agent\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        let (inside, inside_diagnostics) =
+            load_agents_from_dir_with_diagnostics(&explicit_root, "project");
+        assert_eq!(names(&inside), vec!["inside-agent".to_string()]);
+        assert!(inside_diagnostics.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-4 (C-R1/C-R2): a symlinked directory is followed and the realpath
+    /// visited set resolves its agents exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directory_is_followed_once() {
+        let (root, tree) = materialize("t4");
+        let (agents, _) = load_agents_from_dir_with_diagnostics(&tree, "user");
+        let nested: Vec<&AgentConfig> = agents
+            .iter()
+            .filter(|agent| agent.name == "good-nested")
+            .collect();
+        assert_eq!(nested.len(), 1, "{agents:?}");
+        // Traversal order is name-sorted, so `linked-nested` is entered before
+        // `nested` and owns the file path (upstream parity).
+        assert_eq!(
+            nested[0].file_path,
+            tree.join("linked-nested/good-nested.md")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-5 (A3/C-R2): a symlink cycle terminates within the guard window and
+    /// does not duplicate agents.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cycle_terminates_without_duplicates() {
+        let (root, tree) = materialize("t5");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&tree, "user");
+            let _ = sender.send((names(&agents), diagnostics.len()));
+        });
+        let (visible, diagnostics) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("discovery must terminate despite the A->B->A symlink cycle");
+        assert_eq!(
+            visible
+                .iter()
+                .filter(|name| name.as_str() == "good-agent")
+                .count(),
+            1,
+            "{visible:?}"
+        );
+        assert_eq!(diagnostics, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-6 (C-R3): broken links and unreadable directories become diagnostics
+    /// and never abort the walk or panic.
+    #[cfg(unix)]
+    #[test]
+    fn broken_link_and_permission_failures_are_diagnosed() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-disc15-t6-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("good.md"),
+            "---\nname: good\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("missing-target", root.join("dangling.md")).unwrap();
+        let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&root, "user");
+        assert_eq!(names(&agents), vec!["good".to_string()]);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].path, root.join("dangling.md"));
+        assert!(
+            diagnostics[0].error.contains("cannot read entry metadata"),
+            "{diagnostics:?}"
+        );
+
+        // Permission failure: chmod 000 a subdirectory. When the process can
+        // still read it (root), the assertion is skipped.
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(
+            locked.join("hidden.md"),
+            "---\nname: hidden\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let readable = std::fs::read_dir(&locked).is_ok();
+        let (agents, diagnostics) = load_agents_from_dir_with_diagnostics(&root, "user");
+        assert_eq!(names(&agents), vec!["good".to_string()]);
+        if !readable {
+            assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+            assert!(diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path == locked
+                    && diagnostic.error.contains("cannot read directory")));
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-7 (D-R3): user/project override priority is unchanged by the
+    /// diagnostics/ prunning rework.
+    #[test]
+    fn multi_level_override_priority_is_unchanged() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-disc15-t7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let user = root.join("user/agents");
+        let project = root.join("proj/.rpi/agents");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            user.join("scout.md"),
+            "---\nname: scout\ndescription: user scout\n---\nu\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("scout.md"),
+            "---\nname: scout\ndescription: project scout\n---\np\n",
+        )
+        .unwrap();
+        let cwd = root.join("proj");
+        let (agents, diagnostics) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &crate::config::SettingsPair::default(),
+            None,
+            vec![user.clone()],
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let scout = agents.iter().find(|agent| agent.name == "scout").unwrap();
+        assert_eq!(scout.description, "project scout");
+        assert_eq!(scout.source, AgentSource::Project);
+        let (user_scope, _) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "user",
+            &crate::config::SettingsPair::default(),
+            None,
+            vec![user],
+        );
+        assert_eq!(
+            user_scope
+                .iter()
+                .find(|agent| agent.name == "scout")
+                .unwrap()
+                .description,
+            "user scout"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-8 (D-R2): `list`/`get` shapes stay byte-identical when no diagnostics
+    /// exist; the diagnostic block is strictly additive.
+    #[test]
+    fn list_output_shape_is_unchanged_and_diagnostics_append() {
+        let (root, tree) = materialize("t8");
+        let (agents, diagnostics) = discover_fixture(&tree);
+        let base = crate::actions::format_agent_list(&agents);
+        let block = crate::actions::format_discovery_diagnostics(&diagnostics);
+        assert_eq!(block.len(), 3, "{block:?}");
+        assert_eq!(block[0], "Invalid agent definitions:");
+        assert!(block[1].contains("broken-invalid-async.md"));
+        assert!(block[1].contains("(user): Agent 'broken-async'"));
+        let combined = format!("{base}\n{}", block.join("\n"));
+        assert!(combined.starts_with(&base), "existing lines must not move");
+        assert!(combined.ends_with(&block.join("\n")));
+
+        let good = agents
+            .iter()
+            .find(|agent| agent.name == "good-agent")
+            .unwrap();
+        let detail = crate::actions::format_agent_detail(good);
+        assert!(detail.starts_with("Agent: good-agent (user)"), "{detail}");
+        assert!(detail.contains("Path: "));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// T-9 (A1): the legacy wrappers keep their signature and return exactly
+    /// the diagnostics-aware agent list.
+    #[test]
+    fn legacy_wrappers_return_the_same_agents() {
+        let (root, tree) = materialize("t9");
+        let (new_agents, _) = load_agents_from_dir_with_diagnostics(&tree, "user");
+        let legacy_agents = load_agents_from_dir(&tree, "user").unwrap();
+        assert_eq!(names(&legacy_agents), names(&new_agents));
+        assert_eq!(
+            legacy_agents
+                .iter()
+                .map(|agent| agent.file_path.clone())
+                .collect::<Vec<_>>(),
+            new_agents
+                .iter()
+                .map(|agent| agent.file_path.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let cwd = root.join("cwd");
+        let settings = crate::config::SettingsPair::default();
+        let legacy =
+            discover_agents_with_user_dirs(&cwd, "both", &settings, None, vec![tree.clone()])
+                .unwrap();
+        let (new, _) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &settings,
+            None,
+            vec![tree.clone()],
+        );
+        assert_eq!(names(&legacy), names(&new));
+        // Public entry point keeps the Result shape (A-R2) and resolves the
+        // ambient user dirs through the same wrapper.
+        let from_public = discover_agents(&cwd, "both", &settings, None).unwrap();
+        let ambient =
+            discover_agents_with_user_dirs(&cwd, "both", &settings, None, user_agent_dirs())
+                .unwrap();
+        assert_eq!(names(&from_public), names(&ambient));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

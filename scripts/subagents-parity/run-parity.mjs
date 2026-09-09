@@ -20,7 +20,10 @@
 //      upstream deleted `pi-args.ts` in v0.65).
 //   2. frontmatter/final-output/fallback: Rust vs the v0.66 snapshot modules
 //      extracted by setup-target-source.sh.
-//   3. Diffs are attributed through expected-target-diffs.json
+//   3. discovery (TE15): the case tree is materialized per side (`.pi`
+//      upstream / `.rpi` rpi, both normalized to `<CFGDIR>`) and both legs
+//      run their real discovery entry point; agents + diagnostics are diffed.
+//   4. Diffs are attributed through expected-target-diffs.json
 //      (`upstream-semantics` vs `rpi-deviation`, each with R + owner task);
 //      writes fixtures/generated/subagents-parity-v066/parity-report.md.
 //   Non-zero exit = any UNATTRIBUTED diff.
@@ -51,7 +54,7 @@ const GENERATED = resolve(
 );
 const MODES =
 	TRACK === "target"
-		? ["args", "frontmatter", "final-output", "fallback"]
+		? ["args", "frontmatter", "final-output", "fallback", "discovery"]
 		: ["args", "frontmatter", "final-output"];
 
 // Session paths in fixtures.json use the /sess/root placeholder; both legs
