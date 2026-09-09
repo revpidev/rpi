@@ -146,6 +146,15 @@ impl Sandbox {
             r#"{"asyncByDefault": false}"#,
         )
         .unwrap();
+        // TE14: fallback-chain fixture agent (R7.1.2.3 replay guard). The
+        // built-in agents declare no fallbackModels, so the guard needs a
+        // user-scope agent to exercise a real second candidate.
+        std::fs::create_dir_all(agent_dir.join("agents")).unwrap();
+        std::fs::write(
+            agent_dir.join("agents").join("fallbacker.md"),
+            "---\nname: fallbacker\ndescription: TE14 fallback replay guard fixture\nmodel: faux/primary\nfallbackModels: faux/secondary\ntools: read\n---\n\nYou are a fallback fixture agent. Reply briefly.\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(&dump_root).unwrap();
         std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
         std::env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());
@@ -716,6 +725,126 @@ fn e2e_fixed_child_full_pipeline() {
         result["content"][0]["text"].as_str().unwrap(),
         "after retry"
     );
+
+    // ---- Scenario 8b (TE14): fallback replay guard (R7.1.2.3) -----------
+    {
+        // Tool activity happened before the retryable failure: the guard must
+        // keep the run to ONE child (no whole-task replay on the same cwd).
+        let dump = sandbox.dump("fallback-guard-tools");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
+        let result = execute(json!({
+            "agent": "fallbacker",
+            "task": "fail after tools",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("rate limit exceeded"), "{text}");
+        let spawns = spawn_log(&dump);
+        assert_eq!(
+            spawns.len(),
+            1,
+            "tool activity must block replay: {spawns:?}"
+        );
+        assert!(spawns[0].contains("faux/primary"), "{spawns:?}");
+    }
+    {
+        // No tool activity: the existing fallback chain still advances.
+        let dump = sandbox.dump("fallback-chain-no-tools");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
+        let result = execute(json!({
+            "agent": "fallbacker",
+            "task": "fail without tools",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(true), "{result}");
+        let spawns = spawn_log(&dump);
+        assert_eq!(
+            spawns.len(),
+            2,
+            "zero-tool retryable failure replays once: {spawns:?}"
+        );
+        assert!(spawns[0].contains("faux/primary"), "{spawns:?}");
+        assert!(spawns[1].contains("faux/secondary"), "{spawns:?}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Retrying with faux/secondary"), "{text}");
+    }
+    {
+        // Context overflow is terminal: no fallback candidate is consumed and
+        // the attempt note explains why (R7.1.2.2).
+        let dump = sandbox.dump("fallback-overflow");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "fallback-fail-overflow");
+        let result = execute(json!({
+            "agent": "fallbacker",
+            "task": "overflow",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(true), "{result}");
+        let spawns = spawn_log(&dump);
+        assert_eq!(
+            spawns.len(),
+            1,
+            "overflow must not consume a candidate: {spawns:?}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("context overflow"), "{text}");
+    }
+    // ---- Scenario 8c (TE14): background shares the same guard (A2) ------
+    {
+        let dump = sandbox.dump("fallback-async-tools");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "fallback-fail-tools");
+        let result = execute(json!({
+            "agent": "fallbacker",
+            "task": "async fail after tools",
+            "async": true,
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 30000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let spawns = spawn_log(&dump);
+        assert_eq!(
+            spawns.len(),
+            1,
+            "background path blocks replay too: {spawns:?}"
+        );
+    }
+    {
+        let dump = sandbox.dump("fallback-async-no-tools");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "fallback-fail-no-tools");
+        let result = execute(json!({
+            "agent": "fallbacker",
+            "task": "async fail without tools",
+            "async": true,
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let wait = rpi_ext_subagents::execute_tool_for_test(
+            "subagent_wait",
+            &json!({ "all": true, "timeoutMs": 30000 }),
+        );
+        assert_eq!(wait["isError"], Value::Bool(false), "{wait}");
+        let spawns = spawn_log(&dump);
+        assert_eq!(
+            spawns.len(),
+            2,
+            "background zero-tool failure replays once: {spawns:?}"
+        );
+        assert!(spawns[1].contains("faux/secondary"), "{spawns:?}");
+    }
 
     // ---- Scenario 9 (TE05): parallel tasks composition (FR-P1-01) ----
     {
@@ -1350,6 +1479,17 @@ fn e2e_fixed_child_full_pipeline() {
         "no residual children at end"
     );
     let _ = std::fs::remove_dir_all(&sandbox.root);
+}
+
+/// TE14: one line per child invocation (`<mode> <model>`) appended by the
+/// fixed child — proves "zero second spawn" for the replay guard (task §6 A1).
+fn spawn_log(dump: &Path) -> Vec<String> {
+    std::fs::read_to_string(dump.join("spawns.txt"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn find_latest_jsonl(dir: &Path) -> Option<PathBuf> {

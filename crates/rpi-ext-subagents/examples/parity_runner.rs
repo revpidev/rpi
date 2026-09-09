@@ -139,12 +139,11 @@ fn run_final_output_case(messages: &Value) -> Value {
     ))
 }
 
-/// Fallback/replay vectors (target track only, TE13).
+/// Fallback/replay vectors (target track; R7.1.2.1/.2/.3 landed in TE14).
 ///
-/// `retryable` drives the ported `isRetryableModelFailure`. `context-overflow`
-/// (R7.1.2.2) and `attempt` (R7.1.2.3) have no Rust function until TE14, so the
-/// runner emits JSON `null`; the orchestrator turns that into an attributed
-/// diff via `expected-target-diffs.json` instead of failing silently.
+/// `retryable` drives `isRetryableModelFailure`, `context-overflow` drives
+/// `isContextOverflow`, `attempt` drives `isRetryableModelFailureAttempt` —
+/// all three diffed against the v0.66 snapshot modules.
 fn run_fallback_case(case: &Value) -> Value {
     let kind = case.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
@@ -153,8 +152,21 @@ fn run_fallback_case(case: &Value) -> Value {
                 case.get("error").and_then(Value::as_str),
             ),
         }),
-        "context-overflow" => json!({ "contextOverflow": Value::Null }),
-        "attempt" => json!({ "attempt": Value::Null }),
+        "context-overflow" => json!({
+            "contextOverflow": rpi_ext_subagents::parity::is_context_overflow_public(
+                case.get("error").and_then(Value::as_str),
+            ),
+        }),
+        "attempt" => json!({
+            "attempt": rpi_ext_subagents::parity::is_retryable_model_failure_attempt_public(
+                case.get("error").and_then(Value::as_str),
+                case.get("messages")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]),
+                case.get("toolCount").and_then(Value::as_u64).unwrap_or(0),
+            ),
+        }),
         other => json!({ "error": format!("unknown fallback fixture kind: {other}") }),
     }
 }

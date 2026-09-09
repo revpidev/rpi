@@ -343,7 +343,9 @@ if (TRACK === "target") {
 	report.push(unattributed.length === 0 ? "- (none)" : unattributed.map((item) => `- ${item}`).join("\n"));
 	report.push("");
 	if (unattributed.length > 0) ok = false;
-	report.push("", ok ? "## RESULT: ATTRIBUTED-OK" : "## RESULT: UNATTRIBUTED DIFF");
+	const attributedCount = attribution["upstream-semantics"].length + attribution["rpi-deviation"].length;
+	const result = !ok ? "UNATTRIBUTED DIFF" : attributedCount === 0 ? "MATCH" : "ATTRIBUTED-OK";
+	report.push("", `## RESULT: ${result}`);
 } else {
 	report.push("", ok ? "## RESULT: MATCH" : "## RESULT: MISMATCH");
 }

@@ -996,13 +996,6 @@ impl ChildRunState {
             if let Some(model) = message.get("model").and_then(Value::as_str) {
                 self.model = Some(model.to_string());
             }
-            if let Some(error) = message
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .filter(|e| !e.is_empty())
-            {
-                self.assistant_error = Some(error.to_string());
-            }
             // terminalAssistantStop (execution.ts:964-969): stopReason "stop"
             // with no toolCall blocks in the final message.
             let has_tool_call = message
@@ -1014,8 +1007,37 @@ impl ChildRunState {
                         .any(|b| b.get("type").and_then(Value::as_str) == Some("toolCall"))
                 })
                 .unwrap_or(false);
-            if message.get("stopReason").and_then(Value::as_str) == Some("stop") && !has_tool_call {
+            let stop_reason = message.get("stopReason").and_then(Value::as_str);
+            let error_message = message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .filter(|e| !e.is_empty());
+            if let Some(error) = error_message {
+                self.assistant_error = Some(error.to_string());
+            } else if has_tool_call && stop_reason == Some("toolUse") {
+                // #1919 (3e9c36e3, execution.ts:1120-1124): a recovered
+                // request can finish via a terminating tool, without a text
+                // stop.
+                self.assistant_error = None;
+            }
+            if stop_reason == Some("stop") && !has_tool_call {
                 outcome.lifecycle = project_child_lifecycle(None, false, true);
+                // #1919 (execution.ts:1125-1130): a clean terminal stop with
+                // text clears a recovered assistant error. Text presence is
+                // judged on the same `extractTextFromContent` source as the
+                // terminal-empty detection below.
+                if error_message.is_none()
+                    && message
+                        .get("content")
+                        .map(|content| {
+                            !super::display::extract_text_from_content(content)
+                                .trim()
+                                .is_empty()
+                        })
+                        .unwrap_or(false)
+                {
+                    self.assistant_error = None;
+                }
             }
             // recentOutput append (execution.ts:962, inside the assistant
             // block): the assistant text's last 10 lines.
@@ -1123,6 +1145,75 @@ pub fn get_final_output(messages: &[Value]) -> String {
         }
     }
     valid_text_parts.first().cloned().unwrap_or_default()
+}
+
+/// `hasEmptyTerminalAssistantResponse` (utils.ts:456-467 @ v0.66.0, #1921
+/// 38ef6788): the last assistant message is a terminal empty response — either
+/// no content blocks with zero output tokens, or (only when it is the final
+/// message) a `stop` with empty text parts.
+pub fn has_empty_terminal_assistant_response(messages: &[Value]) -> bool {
+    let Some(last_assistant) = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+    else {
+        return false;
+    };
+    let Some(content) = last_assistant.get("content").and_then(Value::as_array) else {
+        return false;
+    };
+    let output_tokens = last_assistant
+        .get("usage")
+        .and_then(|usage| usage.get("output"))
+        .and_then(Value::as_u64);
+    if content.is_empty() && output_tokens == Some(0) {
+        return true;
+    }
+    let is_final_message = messages
+        .last()
+        .is_some_and(|last| std::ptr::eq(last, last_assistant));
+    is_final_message
+        && last_assistant.get("stopReason").and_then(Value::as_str) == Some("stop")
+        && last_assistant
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        && !content.is_empty()
+        && content.iter().all(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part.get("text").and_then(Value::as_str) == Some("")
+        })
+}
+
+/// `formatEmptyTerminalAssistantResponseError` (utils.ts:469-481 @ v0.66.0):
+/// prefer the terminal message's `errorMessage`, then a non-`stop` stopReason,
+/// then the cold-start text.
+pub fn format_empty_terminal_assistant_response_error(messages: &[Value]) -> String {
+    let last_assistant = messages
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"));
+    if let Some(error_message) = last_assistant
+        .and_then(|message| message.get("errorMessage"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        return error_message.to_string();
+    }
+    let stop_reason = last_assistant
+        .and_then(|message| message.get("stopReason"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|stop| !stop.is_empty());
+    match stop_reason {
+        Some(stop) if stop != "stop" => {
+            format!("Subagent produced no output after terminal assistant stopReason \"{stop}\".")
+        }
+        _ => {
+            "Subagent produced no output (possible model cold-start or empty response).".to_string()
+        }
+    }
 }
 
 /// Acceptance report detection (utils.ts:314-327): fenced ```acceptance-report
@@ -1483,6 +1574,209 @@ mod tests {
             0,
         );
         assert_eq!(outcome.lifecycle, ChildLifecycleAction::None);
+    }
+
+    #[test]
+    fn assistant_error_cleared_on_recovered_tool_use() {
+        // #1919 / 3e9c36e3: a recovered request can finish via a terminating
+        // tool, without a text stop.
+        let mut state = ChildRunState::default();
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[], "error", Some("provider transport failed")),
+            })
+            .to_string(),
+            0,
+        );
+        assert_eq!(
+            state.assistant_error.as_deref(),
+            Some("provider transport failed")
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "toolCall", "id": "t", "name": "read", "arguments": {}}],
+                    "stopReason": "toolUse",
+                },
+            })
+            .to_string(),
+            1,
+        );
+        assert_eq!(state.assistant_error, None, "recovered via tool use");
+    }
+
+    #[test]
+    fn assistant_error_cleared_on_terminal_stop_with_text() {
+        let mut state = ChildRunState::default();
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[], "error", Some("rate limit exceeded")),
+            })
+            .to_string(),
+            0,
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&["recovered after retry"], "stop", None),
+            })
+            .to_string(),
+            1,
+        );
+        assert_eq!(state.assistant_error, None, "clean terminal text clears it");
+    }
+
+    #[test]
+    fn assistant_error_survives_ambiguous_terminal_messages() {
+        // Upstream recovered-assistant-error.test.ts: a toolUse stop without
+        // an actual tool call does not clear; an error-bearing toolUse
+        // response replaces rather than clears.
+        let mut state = ChildRunState::default();
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[], "error", Some("provider transport failed")),
+            })
+            .to_string(),
+            0,
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[], "toolUse", None),
+            })
+            .to_string(),
+            1,
+        );
+        assert_eq!(
+            state.assistant_error.as_deref(),
+            Some("provider transport failed")
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "toolCall", "id": "t", "name": "read", "arguments": {}}],
+                    "stopReason": "toolUse",
+                    "errorMessage": "later provider failure",
+                },
+            })
+            .to_string(),
+            2,
+        );
+        assert_eq!(
+            state.assistant_error.as_deref(),
+            Some("later provider failure"),
+            "a later errorMessage replaces the earlier one"
+        );
+    }
+
+    #[test]
+    fn assistant_error_survives_terminal_stop_without_text() {
+        let mut state = ChildRunState::default();
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[], "error", Some("rate limit exceeded")),
+            })
+            .to_string(),
+            0,
+        );
+        state.process_line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": assistant_message(&[""], "stop", None),
+            })
+            .to_string(),
+            1,
+        );
+        assert_eq!(
+            state.assistant_error.as_deref(),
+            Some("rate limit exceeded"),
+            "empty terminal text does not clear the error"
+        );
+    }
+
+    #[test]
+    fn empty_terminal_assistant_response_shapes() {
+        // No content blocks + zero output tokens (v0.48 arm).
+        let empty_blocks = serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "stop",
+            "usage": {"output": 0},
+        });
+        assert!(has_empty_terminal_assistant_response(&[empty_blocks]));
+        // Empty text part + stop + final message (v0.66 #1921 arm).
+        let empty_text = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "stopReason": "stop",
+            "usage": {"output": 4},
+        });
+        assert!(has_empty_terminal_assistant_response(std::slice::from_ref(
+            &empty_text
+        )));
+        // Same message but a later user/toolResult message follows: not final.
+        assert!(!has_empty_terminal_assistant_response(&[
+            empty_text.clone(),
+            serde_json::json!({"role": "user", "content": []}),
+        ]));
+        // Non-empty text is a real terminal response.
+        let with_text = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "done"}],
+            "stopReason": "stop",
+            "usage": {"output": 3},
+        });
+        assert!(!has_empty_terminal_assistant_response(&[with_text]));
+        // Non-zero output tokens keep the v0.48 arm off.
+        let tokens = serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "stop",
+            "usage": {"output": 7},
+        });
+        assert!(!has_empty_terminal_assistant_response(&[tokens]));
+        // No assistant message at all.
+        assert!(!has_empty_terminal_assistant_response(&[]));
+    }
+
+    #[test]
+    fn empty_terminal_error_text_precedence() {
+        let with_error = serde_json::json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": ""}],
+            "stopReason": "stop",
+            "errorMessage": "provider said no",
+        });
+        assert_eq!(
+            format_empty_terminal_assistant_response_error(&[with_error]),
+            "provider said no"
+        );
+        let non_stop = serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "length",
+        });
+        assert_eq!(
+            format_empty_terminal_assistant_response_error(&[non_stop]),
+            "Subagent produced no output after terminal assistant stopReason \"length\"."
+        );
+        let plain = serde_json::json!({
+            "role": "assistant",
+            "content": [],
+            "stopReason": "stop",
+        });
+        assert_eq!(
+            format_empty_terminal_assistant_response_error(&[plain]),
+            "Subagent produced no output (possible model cold-start or empty response)."
+        );
     }
 
     #[test]

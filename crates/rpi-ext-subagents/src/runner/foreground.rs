@@ -871,9 +871,25 @@ pub async fn run_foreground_with_fallback(
     let mut result = run_attempt(input, first).await;
     attempted.extend(result.attempted_models.iter().cloned());
     for candidate in &candidates[1..] {
-        let advance = result.exit_code != 0
-            && !result.timed_out
-            && crate::launch::model::is_retryable_model_failure(result.error.as_deref());
+        if result.exit_code == 0 || result.timed_out {
+            break;
+        }
+        // Context overflow is terminal: it must not consume a fallback
+        // candidate (R7.1.2.2; model-fallback.ts:613-619 @ v0.66.0).
+        if crate::launch::model::is_context_overflow(result.error.as_deref()) {
+            notes.push(format!(
+                "[fallback] {} failed: context overflow — the input exceeds this model's context window. Reduce the task input or use a model with a larger context window.",
+                attempted.last().map(String::as_str).unwrap_or_default()
+            ));
+            break;
+        }
+        // Whole-task replay is only safe without tool activity (R7.1.2.3
+        // `isRetryableModelFailureAttempt`; model-fallback.ts:601-611).
+        let advance = crate::launch::model::is_retryable_model_failure_attempt(
+            result.error.as_deref(),
+            &result.messages,
+            result.tool_count,
+        );
         if !advance {
             break;
         }
@@ -936,10 +952,11 @@ fn persist_artifacts(
     let _ = artifacts::write_metadata(&paths.metadata_path, &metadata);
 }
 
-/// Exit-code and error synthesis (execution.ts:1085-1121, 1204-1247).
-/// Priority: timeout > stream/protocol error > toolDiagnosticError >
-/// assistantError > unexplained signal > raw non-JSON stdout. Error with a
-/// zero exit forces exit 1.
+/// Exit-code and error synthesis (execution.ts:1085-1121, 1204-1247,
+/// 1449-1468 @ v0.66.0). Priority: timeout > stream/protocol error >
+/// toolDiagnosticError > assistantError > unexplained signal > raw non-JSON
+/// stdout, then the empty-terminal-response diagnosis when no error is
+/// pending (R7.1.1.2). Error with a zero exit forces exit 1.
 #[allow(clippy::too_many_arguments)]
 fn synthesize_exit(
     input: &ForegroundRunInput,
@@ -952,7 +969,6 @@ fn synthesize_exit(
     raw_stdout: String,
     duration_ms: u64,
 ) -> ForegroundRunResult {
-    let final_output_raw = events::get_final_output(&state.messages);
     let status = exit_status.ok();
     #[cfg(unix)]
     let signal_of_status = status.and_then(|status| {
@@ -961,13 +977,44 @@ fn synthesize_exit(
     });
     #[cfg(not(unix))]
     let signal_of_status: Option<i32> = None;
+    synthesize_exit_from_parts(
+        input,
+        state,
+        status.and_then(|status| status.code()),
+        signal_of_status,
+        timed_out,
+        user_aborted,
+        stream_error,
+        tool_diagnostic_error,
+        raw_stdout,
+        duration_ms,
+    )
+}
+
+/// Process-status-free core of [`synthesize_exit`]: `code`/`signal` replace
+/// the platform `ExitStatus` so the terminal classification stays unit-testable
+/// on every target.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_exit_from_parts(
+    input: &ForegroundRunInput,
+    state: ChildRunState,
+    code: Option<i32>,
+    signal_of_status: Option<i32>,
+    timed_out: bool,
+    user_aborted: bool,
+    stream_error: Option<&str>,
+    tool_diagnostic_error: Option<&str>,
+    raw_stdout: String,
+    duration_ms: u64,
+) -> ForegroundRunResult {
+    let final_output_raw = events::get_final_output(&state.messages);
 
     // finalCode = (signal) ? (code ?? 1) : (code ?? 0) — a forced drain after
     // a clean terminal is upstream's exit-0 case, approximated by a 0 code.
-    let mut exit_code = match (&status, signal_of_status) {
-        (_, Some(_)) => status.and_then(|s| s.code()).unwrap_or(1),
-        (Some(status), _) if status.success() => 0,
-        (Some(status), _) => status.code().unwrap_or(0),
+    let mut exit_code = match (code, signal_of_status) {
+        (_, Some(_)) => code.unwrap_or(1),
+        (Some(0), _) => 0,
+        (Some(other), _) => other,
         (None, _) => 1,
     };
     let process_signal = signal_of_status.map(signal_name);
@@ -1020,17 +1067,23 @@ fn synthesize_exit(
         final_output = format!("{timeout_note}\n\nPartial output before timeout:\n{final_output}");
     }
 
-    // No-output failure (1231-1247): clean exit, no error, empty output.
-    if exit_code == 0
-        && error.is_none()
-        && final_output.trim().is_empty()
-        && !state.messages.is_empty()
-    {
-        exit_code = 1;
-        error = Some(
-            "Subagent produced no output (possible model cold-start or empty response)."
-                .to_string(),
-        );
+    // Empty terminal response (execution.ts:1449-1468 @ v0.66.0, R7.1.1.2
+    // #1921): a clean exit with no final text, or a final assistant message
+    // that carries no text, is an empty-output failure. Upstream gates this
+    // block on `exitCode === 0 && !result.error`; `toolDiagnosticError` and
+    // `assistantError` are already folded into `error` above (`closeError`,
+    // execution.ts:1298), so an unrecovered provider error still wins.
+    if exit_code == 0 && error.is_none() {
+        let missing_output = final_output.trim().is_empty();
+        let terminal_empty_after_useful_work =
+            events::has_empty_terminal_assistant_response(&state.messages)
+                && (state.tool_count > 0 || !final_output.trim().is_empty());
+        if missing_output || terminal_empty_after_useful_work {
+            exit_code = 1;
+            error = Some(events::format_empty_terminal_assistant_response_error(
+                &state.messages,
+            ));
+        }
     }
     if error.is_some() && exit_code == 0 {
         exit_code = 1;
@@ -1168,6 +1221,195 @@ mod frame_signature_tests {
             frame_signature(None, "x"),
             frame_signature(None, "x"),
             "no status fields yet (first events) still compares equal"
+        );
+    }
+}
+
+/// TE14 terminal classification (R7.1.1.1/.2): the recorded v0.66 event-stream
+/// groups are replayed through the real parser + `synthesize_exit_from_parts`
+/// and compared against `fixtures/subagents-v066/events/expected.json`.
+#[cfg(test)]
+mod terminal_classification_tests {
+    use super::*;
+
+    fn test_input() -> ForegroundRunInput {
+        ForegroundRunInput {
+            agent_name: "scout".to_string(),
+            agent_system_prompt: String::new(),
+            agent_system_prompt_mode: "replace",
+            agent_tools: None,
+            agent_extensions: None,
+            agent_subagent_only_extensions: None,
+            agent_inherit_project_context: true,
+            agent_inherit_skills: false,
+            task: "replay".to_string(),
+            task_delivery: None,
+            cwd: std::env::temp_dir(),
+            session_dir: None,
+            session_file: None,
+            model: None,
+            thinking: None,
+            run_id: "00000000".to_string(),
+            timeout_ms: Some(30_000),
+            child_index: 0,
+            child_max_subagent_depth: 2,
+            artifacts_dir: None,
+            include_jsonl: false,
+            include_transcript: false,
+            parent_session_id: None,
+            self_extension: None,
+            fanout_authorized: false,
+            resolved_skill_names: None,
+            context_label: "fresh".to_string(),
+            steer_inbox: None,
+            supervisor_channel: None,
+            stream_sink: None,
+            step_status: None,
+            abort_probe: None,
+        }
+    }
+
+    fn fixture_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/subagents-v066/events")
+    }
+
+    /// Replay one recorded stdout JSONL group through the real parser and the
+    /// terminal classifier with a clean synthetic exit.
+    fn replay_group(file: &str) -> ForegroundRunResult {
+        let path = fixture_dir().join(file);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let mut state = events::ChildRunState::default();
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            state.process_line(line, 0);
+        }
+        synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        )
+    }
+
+    #[test]
+    fn recorded_event_stream_groups_match_upstream_expected() {
+        let raw = std::fs::read_to_string(fixture_dir().join("expected.json"))
+            .expect("expected.json readable");
+        let expected: Value = serde_json::from_str(&raw).expect("expected.json parses");
+        let groups = expected["groups"].as_array().expect("groups array");
+        assert!(!groups.is_empty(), "fixture must cover the three groups");
+        for group in groups {
+            let file = group["file"].as_str().expect("group file");
+            let want = &group["expected"];
+            let result = replay_group(file);
+            assert_eq!(
+                result.exit_code,
+                want["exitCode"].as_i64().expect("exitCode") as i32,
+                "{file}: exit code"
+            );
+            assert_eq!(
+                result.error,
+                want["error"].as_str().map(str::to_string),
+                "{file}: error text"
+            );
+            assert_eq!(
+                result.final_output,
+                want["finalOutput"].as_str().expect("finalOutput"),
+                "{file}: final output"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_empty_after_useful_work_is_empty_output() {
+        // finalText is non-empty (earlier turn), but the final assistant
+        // message is an empty terminal stop: upstream
+        // `terminalEmptyAfterUsefulWork` still reports empty-output.
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"useful work"}],"stopReason":"stop","usage":{"output":3}}}"#,
+            0,
+        );
+        state.process_line(r#"{"type":"tool_execution_start","toolName":"read"}"#, 1);
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"output":0}}}"#,
+            2,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Subagent produced no output (possible model cold-start or empty response).")
+        );
+    }
+
+    #[test]
+    fn unrecovered_assistant_error_still_wins_over_empty_output() {
+        // Upstream folds assistantError into closeError before the empty-output
+        // block (execution.ts:1298/1449): an error that was never recovered is
+        // reported even when the terminal response is empty.
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limit exceeded"}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            None,
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(result.error.as_deref(), Some("rate limit exceeded"));
+    }
+
+    #[test]
+    fn tool_diagnostic_wins_over_assistant_error_and_empty_output() {
+        let mut state = events::ChildRunState::default();
+        state.process_line(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"provider down"}}"#,
+            0,
+        );
+        let result = synthesize_exit_from_parts(
+            &test_input(),
+            state,
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            Some("Subagent missing required tool: edit"),
+            String::new(),
+            0,
+        );
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Subagent missing required tool: edit")
         );
     }
 }

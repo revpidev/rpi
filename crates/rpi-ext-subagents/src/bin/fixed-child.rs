@@ -52,6 +52,21 @@ fn main() {
         }
         let _ = std::fs::create_dir_all(&dump_dir);
         let args: Vec<String> = std::env::args().collect();
+        // TE14: append-only spawn log (one line per child invocation) so the
+        // fallback replay guard asserts "zero second spawn" instead of
+        // trusting the guard's return value (R7.1.2.3 / task §6 A1).
+        let model = args
+            .windows(2)
+            .find(|window| window[0] == "--model")
+            .map(|window| window[1].clone())
+            .unwrap_or_default();
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dump_dir).join("spawns.txt"))
+        {
+            let _ = writeln!(log, "{mode} {model}");
+        }
         let _ = std::fs::write(
             std::path::Path::new(&dump_dir).join("argv.txt"),
             args.join("\n"),
@@ -173,6 +188,42 @@ fn main() {
             );
             let _ = out.flush();
             std::process::exit(3);
+        }
+        // TE14 fallback replay-guard fixtures (R7.1.2.3): a retryable provider
+        // failure with real tool activity must NOT trigger a second child;
+        // without tool activity the fallback chain still advances; a context
+        // overflow is terminal and must not consume a candidate (R7.1.2.2).
+        "fallback-fail-tools" => {
+            emit(
+                &mut out,
+                r#"{"type":"tool_execution_start","toolName":"read","args":{"path":"/tmp/e2e.rs"}}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"tool_execution_end","toolName":"read"}"#,
+            );
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limit exceeded"}}"#,
+            );
+            let _ = out.flush();
+            std::process::exit(1);
+        }
+        "fallback-fail-no-tools" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limit exceeded"}}"#,
+            );
+            let _ = out.flush();
+            std::process::exit(1);
+        }
+        "fallback-fail-overflow" => {
+            emit(
+                &mut out,
+                r#"{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"context_length_exceeded"}}"#,
+            );
+            let _ = out.flush();
+            std::process::exit(1);
         }
         "rawjunk" => {
             emit(&mut out, "this is not json at all");

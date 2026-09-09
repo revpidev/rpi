@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-08T15:16:24.206Z
+generated: 2026-09-09T02:40:02.355Z
 
 ## args
 
@@ -40,40 +40,28 @@ generated: 2026-09-08T15:16:24.206Z
 
 ## fallback
 
-- retry-request-limit-exceeded: ATTRIBUTED [upstream-semantics] R7.1.2.1 → TE14 fields: retryable
-- retry-usage-limit: ATTRIBUTED [upstream-semantics] R7.1.2.1 → TE14 fields: retryable
-- retry-connection-reset: ATTRIBUTED [upstream-semantics] R7.1.2.1 → TE14 fields: retryable
-- retry-http-500: ATTRIBUTED [upstream-semantics] R7.1.2.1 → TE14 fields: retryable
-- retry-internal-server-error: ATTRIBUTED [upstream-semantics] R7.1.2.1 → TE14 fields: retryable
+- retry-request-limit-exceeded: MATCH
+- retry-usage-limit: MATCH
+- retry-connection-reset: MATCH
+- retry-http-500: MATCH
+- retry-internal-server-error: MATCH
 - retry-rate-limit-control: MATCH
 - retry-quota-control: MATCH
 - retry-tool-failure-not-retryable: MATCH
-- overflow-context-length-exceeded: ATTRIBUTED [upstream-semantics] R7.1.2.2 → TE14 fields: contextOverflow
-- overflow-maximum-context-length: ATTRIBUTED [upstream-semantics] R7.1.2.2 → TE14 fields: contextOverflow
-- overflow-plain-error-control: ATTRIBUTED [upstream-semantics] R7.1.2.2 → TE14 fields: contextOverflow
-- overflow-tool-failure-not-overflow: ATTRIBUTED [upstream-semantics] R7.1.2.2 → TE14 fields: contextOverflow
-- attempt-tool-count-blocks-replay: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
-- attempt-no-tools-empty-messages: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
-- attempt-empty-output-cold-start: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
-- attempt-matching-message-error: ATTRIBUTED [upstream-semantics] R7.1.2.3 → TE14 fields: attempt
+- overflow-context-length-exceeded: MATCH
+- overflow-maximum-context-length: MATCH
+- overflow-plain-error-control: MATCH
+- overflow-tool-failure-not-overflow: MATCH
+- attempt-tool-count-blocks-replay: MATCH
+- attempt-no-tools-empty-messages: MATCH
+- attempt-empty-output-cold-start: MATCH
+- attempt-matching-message-error: MATCH
 
 ## Attribution summary
 
 ### upstream-semantics
 
-- fallback/retry-request-limit-exceeded (R7.1.2.1 → TE14)
-- fallback/retry-usage-limit (R7.1.2.1 → TE14)
-- fallback/retry-connection-reset (R7.1.2.1 → TE14)
-- fallback/retry-http-500 (R7.1.2.1 → TE14)
-- fallback/retry-internal-server-error (R7.1.2.1 → TE14)
-- fallback/overflow-context-length-exceeded (R7.1.2.2 → TE14)
-- fallback/overflow-maximum-context-length (R7.1.2.2 → TE14)
-- fallback/overflow-plain-error-control (R7.1.2.2 → TE14)
-- fallback/overflow-tool-failure-not-overflow (R7.1.2.2 → TE14)
-- fallback/attempt-tool-count-blocks-replay (R7.1.2.3 → TE14)
-- fallback/attempt-no-tools-empty-messages (R7.1.2.3 → TE14)
-- fallback/attempt-empty-output-cold-start (R7.1.2.3 → TE14)
-- fallback/attempt-matching-message-error (R7.1.2.3 → TE14)
+- (none)
 
 ### rpi-deviation
 
@@ -84,4 +72,4 @@ generated: 2026-09-08T15:16:24.206Z
 - (none)
 
 
-## RESULT: ATTRIBUTED-OK
+## RESULT: MATCH
