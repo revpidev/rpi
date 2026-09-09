@@ -596,7 +596,7 @@ impl ToolSelectorCandidateIndex {
         self.all_current_candidates.contains(candidate)
     }
 
-    /// `hasCandidate` (types.ts:916-918 @ 10a45367): the global set or the
+    /// `hasCandidate` (types.ts:919-920 @ 10a45367): the global set or the
     /// per-tool-name additional set.
     fn has_candidate(&self, tool_name: &str, candidate: &str) -> bool {
         self.contains(candidate)

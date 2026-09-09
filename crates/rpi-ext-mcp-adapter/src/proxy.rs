@@ -1655,8 +1655,8 @@ fn ambiguous_tool_result(mode: &str, tool_name: &str) -> Value {
     )
 }
 
-/// `tool_not_found_after_reconnect` (proxy-modes.ts:1015-1023 lazy path /
-/// :1240-1247 connect path @ 10a45367): the connect path appends the
+/// `tool_not_found_after_reconnect` (proxy-modes.ts:1034-1040 lazy path /
+/// :1239-1249 connect path @ 10a45367): the connect path appends the
 /// available-tools hint, the lazy-connect path does not.
 fn tool_not_found_after_reconnect_result(
     state: &McpRuntime,
@@ -2405,7 +2405,7 @@ pub async fn execute_call(
             .collect();
         candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));
 
-        // proxy-modes.ts:1108-1130 @ 10a45367 (#346): collect exact matches
+        // proxy-modes.ts:1103-1114 @ 10a45367 (#346): collect exact matches
         // first, then normalized fallbacks, and fail closed on ties.
         let mut lazy_exact_matches: Vec<(String, ToolMetadata)> = Vec::new();
         let mut lazy_fallback_matches: Vec<(String, ToolMetadata)> = Vec::new();

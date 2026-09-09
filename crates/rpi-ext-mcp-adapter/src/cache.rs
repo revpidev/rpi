@@ -362,7 +362,7 @@ pub fn serialize_resources(resources: &[McpResource]) -> Vec<CachedResource> {
         .collect()
 }
 
-/// `reconstructToolMetadata` (metadata-cache.ts:193-256 @ 10a45367): rebuild
+/// `reconstructToolMetadata` (metadata-cache.ts:193-264 @ 10a45367): rebuild
 /// the tool metadata of an unconnected server from its cache entry. The P2
 /// `isUiToolVisibleToModel` filter is a no-op here (no `_meta` is cached).
 ///
