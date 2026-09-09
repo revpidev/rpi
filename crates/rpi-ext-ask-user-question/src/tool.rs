@@ -1,15 +1,17 @@
 //! Tool definition + `execute` orchestration.
 //!
 //! Port of upstream `packages/rpiv-ask-user-question/ask-user-question.ts` @
-//! `338b264c` for the Q0 surface: registration payload (schema/description/
+//! `338b264c` for the Q0/Q1 surface: registration payload (schema/description/
 //! promptSnippet/promptGuidelines with config overrides), the fixed
 //! `execute` order (normalize → `ctx.hasUI` guard → validate → `prompt` event
 //! → branch) and the envelope shapes for every failure exit.
 //!
-//! Branch wiring: Q0 has no component (TE30) and no RPC walker (TE29), so the
-//! post-event branch returns the `no_custom_ui` envelope — the upstream
-//! contract for "host cannot render and has no `select`/`input`". TE29/TE30
-//! replace that single arm; the surrounding order and guards are final.
+//! Branch wiring (TE29): RPC hosts (`ctx.mode == "rpc"`, upstream issue #78)
+//! route to the sequential dialog walker up front; every other host falls to
+//! the `resolveUndefinedResult` contract — dialog primitives → walker,
+//! otherwise `no_custom_ui`. TE30 replaces the static component-unavailable
+//! arm with the interactive component (`ui.custom` equivalent); the
+//! surrounding order and guards stay.
 
 use serde_json::{json, Value};
 
@@ -23,7 +25,9 @@ use crate::config::{
     DEFAULT_TOOL_DESCRIPTION,
 };
 use crate::events;
+use crate::i18n::I18n;
 use crate::reconcile::ASK_USER_QUESTION_TOOL_NAME;
+use crate::rpc_fallback;
 use crate::tool::envelope::build_tool_result;
 use crate::tool::normalize::normalize_question_params;
 use crate::tool::types::{
@@ -64,11 +68,35 @@ fn has_ui(host: &dyn HostCall) -> bool {
         .unwrap_or(false)
 }
 
+/// `(ctx as { mode?: string }).mode` — hosts that predate `ctx.mode` (or a
+/// failing probe) answer `None`, which is simply "not rpc" (the upstream
+/// backstop below then catches those builds).
+fn host_mode(host: &dyn HostCall) -> Option<String> {
+    host.call("ctx.mode", json!({}))
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+}
+
 fn failure_result(error: QuestionnaireError, message: &str) -> Value {
     build_tool_result(
         message,
         serde_json::to_value(QuestionnaireResult::failure(error)).unwrap_or(Value::Null),
     )
+}
+
+/// Dialog transport failure inside the walker (upstream: the dialog promise
+/// rejects and propagates out of `execute`, which the host wraps into an
+/// errored tool result). rpi surfaces the same shape inline: `isError` + the
+/// failure detail (the handler-error convention, requirements 附录 B).
+fn host_error_result(error: &HostError) -> Value {
+    let mut result = build_tool_result(
+        format!("Error: ask_user_question host dialog failed: {error}"),
+        json!({ "answers": [], "cancelled": true }),
+    );
+    if let Some(object) = result.as_object_mut() {
+        object.insert("isError".to_owned(), Value::Bool(true));
+    }
+    result
 }
 
 /// Defensive exit for params that do not match the registered schema. The
@@ -122,16 +150,101 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
         );
     }
 
-    // Q0 branch placeholder: TE29 wires the RPC dialog walker
-    // (`ctx.mode == "rpc"` / `unknownMethod` fallback), TE30 the interactive
-    // component. Until a renderer exists, the honest answer is the
-    // upstream `no_custom_ui` envelope.
-    failure_result(QuestionnaireError::NoCustomUi, ERROR_NO_CUSTOM_UI)
+    // RPC hosts (VSCode pendant, ACP clients like Zed/Paseo — upstream issue
+    // #78): `ui.custom` cannot render there, but the select/input dialog
+    // sub-protocol works; hosts advertising `ctx.mode` (rpi always does)
+    // route to the sequential dialog walker up front, skipping the component
+    // path entirely.
+    if host_mode(host).as_deref() == Some("rpc")
+        && rpc_fallback::has_dialog_ui(Some(&rpc_fallback::HostCallUi::probe(host)))
+    {
+        return run_rpc_path_with(
+            host,
+            &typed,
+            &I18n::detect(),
+            crate::emit_terminal_attention_stdout,
+        );
+    }
+
+    // TUI component path (TE30). Until the component lands the host cannot
+    // render the questionnaire — upstream's `resolveUndefinedResult`
+    // contract: dialog primitives → walker, otherwise `no_custom_ui`
+    // (upstream `ask-user-question.ts:242-245`).
+    resolve_undefined_result_with(host, &typed, &I18n::detect())
 }
 
-/// Emit the `blocked` bracket around a wait (used by TE29/TE30). Exposed here
-/// so the Q0 contract test can assert the pair is well-formed; `execute` does
-/// not wait yet.
+/// `runRpcPath` — the RPC walker bracketed by the blocked-event pair, with
+/// the terminal BEL between `blocked:true` and the first dialog. The
+/// closing emit always runs (upstream `finally`), even when a dialog
+/// transport fails. The BEL emitter is injected so tests can pin the
+/// ordering without touching stdout.
+fn run_rpc_path_with(
+    host: &dyn HostCall,
+    typed: &QuestionParams,
+    i18n: &I18n,
+    emit_bel: impl FnOnce(),
+) -> Value {
+    emit_blocked_or_warn(host, true);
+    let outcome = {
+        emit_bel();
+        let mut ui = rpc_fallback::HostCallDialogUi::new(host);
+        rpc_fallback::run_rpc_questionnaire(&mut ui, typed, i18n)
+    };
+    emit_blocked_or_warn(host, false);
+    match outcome {
+        Ok(result) => crate::tool::envelope::build_questionnaire_response(Some(&result), typed),
+        Err(error) => {
+            tracing::warn!(
+                kind = %error.kind,
+                message = %error.message,
+                "rpiv-ask-user-question: rpc dialog host call failed"
+            );
+            host_error_result(&error)
+        }
+    }
+}
+
+/// `resolveUndefinedResult` (`ask-user-question.ts:236-247`): the host could
+/// not render the component (Q1: statically — the plugin ships no component
+/// yet), so fall to the dialog primitives or tell the model the user never
+/// saw the questions. No blocked/BEL bracket on this path (upstream runs the
+/// walker bare here).
+fn resolve_undefined_result_with(
+    host: &dyn HostCall,
+    typed: &QuestionParams,
+    i18n: &I18n,
+) -> Value {
+    if rpc_fallback::has_dialog_ui(Some(&rpc_fallback::HostCallUi::probe(host))) {
+        let mut ui = rpc_fallback::HostCallDialogUi::new(host);
+        match rpc_fallback::run_rpc_questionnaire(&mut ui, typed, i18n) {
+            Ok(result) => crate::tool::envelope::build_questionnaire_response(Some(&result), typed),
+            Err(error) => {
+                tracing::warn!(
+                    kind = %error.kind,
+                    message = %error.message,
+                    "rpiv-ask-user-question: fallback dialog host call failed"
+                );
+                host_error_result(&error)
+            }
+        }
+    } else {
+        failure_result(QuestionnaireError::NoCustomUi, ERROR_NO_CUSTOM_UI)
+    }
+}
+
+fn emit_blocked_or_warn(host: &dyn HostCall, active: bool) {
+    if let Err(error) = events::emit_blocked(host, active) {
+        tracing::warn!(
+            kind = %error.kind,
+            message = %error.message,
+            "rpiv-ask-user-question: blocked event emit failed"
+        );
+    }
+}
+
+/// Emit the `blocked` bracket around a wait (`runRpcPath` since TE29;
+/// TE30 reuses it for the component). Exposed so the Q0 contract test can
+/// assert the pair is well-formed.
 pub fn emit_blocked(host: &dyn HostCall, active: bool) -> Result<(), HostError> {
     events::emit_blocked(host, active)
 }
@@ -177,6 +290,29 @@ mod tests {
                 Some(index) => queue.remove(index).1,
                 None => Ok(Value::Null),
             }
+        }
+    }
+
+    /// Timeline wrapper over [`FakeHost`] — labels each host call so the
+    /// BEL position can be asserted between the blocked emits.
+    struct RecordingHost<'a> {
+        inner: &'a FakeHost,
+        timeline: &'a Mutex<Vec<String>>,
+    }
+
+    impl HostCall for RecordingHost<'_> {
+        fn call(&self, method: &str, args: Value) -> Result<Value, HostError> {
+            let label = if method == "events.emit" {
+                format!(
+                    "events.emit:{}:{}",
+                    args["event"].as_str().unwrap_or("?"),
+                    args["payload"]["active"]
+                )
+            } else {
+                method.to_owned()
+            };
+            self.timeline.lock().expect("timeline").push(label);
+            self.inner.call(method, args)
         }
     }
 
@@ -268,8 +404,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_execute_emits_prompt_then_q0_placeholder() {
-        let host = FakeHost::new(&[("ctx.hasUI", json!(true))]);
+    fn tool_execute_emits_prompt_then_no_custom_ui_when_dialogs_unavailable() {
+        // hasUI guard passes, but the dialog-primitive probe answers false
+        // (the rpi equivalent of upstream `hasDialogUI(ctx.ui) === false`) —
+        // the `no_custom_ui` envelope with the byte-identical literal.
+        let host = FakeHost::new(&[
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)),
+            ("ctx.mode", json!("tui")),
+            ("ctx.hasUI", json!(false)),
+        ]);
         let result = execute(&host, &valid_params());
         assert_eq!(result["content"][0]["text"], ERROR_NO_CUSTOM_UI);
         assert_eq!(result["details"]["error"], json!("no_custom_ui"));
@@ -281,6 +425,192 @@ mod tests {
         assert_eq!(
             calls[1].1["payload"]["questions"][0]["options"][0]["hasPreview"],
             json!(false)
+        );
+        assert_eq!(calls[2].0, "ctx.mode");
+        assert_eq!(calls[3].0, "ctx.hasUI", "probe re-reads hasUI");
+    }
+
+    /// RPC hosts route to the dialog walker: `ctx.mode == "rpc"` + both
+    /// primitives available → `ui.select`, never a component mount
+    /// (upstream "does NOT call ctx.ui.custom in RPC mode").
+    #[test]
+    fn rpc_mode_uses_walker() {
+        let host = FakeHost::new(&[
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)),
+            ("ctx.mode", json!("rpc")),
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)),
+            ("ui.select", json!("1. A — a")),
+            ("events.emit", json!(null)),
+        ]);
+        let result = execute(&host, &valid_params());
+        assert_eq!(
+            result["content"][0]["text"],
+            "User has answered your questions: \"Pick one?\"=\"A\". You can now continue with the user's answers in mind."
+        );
+        assert_eq!(result["details"]["cancelled"], json!(false));
+        assert_eq!(result["details"]["answers"][0]["kind"], json!("option"));
+        assert_eq!(result["details"]["answers"][0]["answer"], json!("A"));
+        let calls = host.calls();
+        let methods: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "ctx.hasUI",
+                "events.emit",
+                "ctx.mode",
+                "ctx.hasUI",
+                "events.emit",
+                "ui.select",
+                "events.emit"
+            ]
+        );
+        assert!(
+            !methods.contains(&"ui.custom"),
+            "no component path in RPC mode"
+        );
+        let select_args = &calls[5].1;
+        assert_eq!(select_args["options"][0], "1. A — a");
+        assert_eq!(select_args["options"][1], "2. B — b");
+        // Sentinel row number + locale-sourced label (same table the walker
+        // used — stable under any test env).
+        let sentinel = I18n::detect().display_label(crate::state::row_intent::RowKind::Other);
+        assert_eq!(select_args["options"][2], json!(format!("3. {sentinel}")));
+    }
+
+    /// `runRpcPath` ordering (upstream pins: blocked:true → BEL → first
+    /// dialog → blocked:false), and the BEL emitter is invoked exactly once.
+    #[test]
+    fn rpc_mode_blocked_and_bel_bracket_order() {
+        let host = FakeHost::new(&[
+            ("events.emit", json!(null)),
+            ("ui.select", json!("1. A — a")),
+            ("events.emit", json!(null)),
+        ]);
+        let timeline: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let recording = RecordingHost {
+            inner: &host,
+            timeline: &timeline,
+        };
+        let mut bel_count = 0;
+        let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
+        let result = run_rpc_path_with(&recording, &params, &I18n::for_locale("en"), || {
+            bel_count += 1;
+            timeline.lock().expect("timeline").push("BEL".to_owned());
+        });
+        assert_eq!(
+            bel_count, 1,
+            "exactly one BEL between blocked:true and the first dialog"
+        );
+        assert_eq!(
+            result["content"][0]["text"],
+            "User has answered your questions: \"Pick one?\"=\"A\". You can now continue with the user's answers in mind."
+        );
+        let timeline = timeline.lock().expect("timeline").clone();
+        assert_eq!(
+            timeline,
+            vec![
+                "events.emit:rpiv:ask-user:blocked:true",
+                "BEL",
+                "ui.select",
+                "events.emit:rpiv:ask-user:blocked:false",
+            ]
+        );
+    }
+
+    /// A dialog transport failure surfaces as an `isError` result and the
+    /// closing `blocked:false` still runs (upstream `finally`).
+    #[test]
+    fn rpc_dialog_transport_failure_returns_is_error_with_closing_blocked() {
+        let host = FakeHost::default();
+        {
+            let mut queue = host.replies.lock().expect("queue");
+            queue.push(("events.emit".to_owned(), Ok(json!(null))));
+            queue.push((
+                "ui.select".to_owned(),
+                Err(HostError {
+                    kind: "capabilityDenied".to_owned(),
+                    message: "ui.select requires capability ui".to_owned(),
+                }),
+            ));
+            queue.push(("events.emit".to_owned(), Ok(json!(null))));
+        }
+        let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
+        let result = run_rpc_path_with(&host, &params, &I18n::for_locale("en"), || {});
+        assert_eq!(result["isError"], json!(true));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("host dialog failed"));
+        let calls = host.calls();
+        assert_eq!(calls[0].1["payload"], json!({ "active": true }));
+        assert_eq!(calls[2].1["payload"], json!({ "active": false }));
+    }
+
+    /// Non-RPC host with the component unavailable (static until TE30) falls
+    /// to the walker — no blocked bracket on the backstop path (upstream runs
+    /// the walker bare inside `resolveUndefinedResult`).
+    #[test]
+    fn unknown_method_falls_back_to_walker_without_blocked_bracket() {
+        let host = FakeHost::new(&[
+            ("ctx.hasUI", json!(true)),
+            ("events.emit", json!(null)),
+            ("ctx.mode", json!("tui")),
+            ("ctx.hasUI", json!(true)),
+            ("ui.select", json!(null)),
+        ]);
+        let result = execute(&host, &valid_params());
+        assert_eq!(
+            result["content"][0]["text"],
+            "User declined to answer questions"
+        );
+        assert_eq!(result["details"]["cancelled"], json!(true));
+        let calls = host.calls();
+        let emit_count = calls
+            .iter()
+            .filter(|(method, _)| method == "events.emit")
+            .count();
+        assert_eq!(emit_count, 1, "only the prompt event — no blocked pair");
+        assert_eq!(calls[4].0, "ui.select");
+    }
+
+    /// `no_custom_ui` literal is byte-identical to upstream
+    /// `ERROR_NO_CUSTOM_UI` (`ask-user-question.ts:79`).
+    #[test]
+    fn unknown_method_without_dialogs_returns_no_custom_ui() {
+        assert_eq!(
+            ERROR_NO_CUSTOM_UI,
+            "Error: this client cannot render the questionnaire (custom UI is unavailable, e.g. RPC/ACP hosts such as Zed or Paseo). The user never saw the questions — do NOT treat this as a decline. Ask the questions as plain chat text instead, without using this tool."
+        );
+        assert_eq!(
+            ERROR_NO_UI,
+            "Error: UI not available (running in non-interactive mode)"
+        );
+    }
+
+    /// FR-Q1-H: the same walker outcome through the RPC branch and the
+    /// fallback branch produces the identical envelope.
+    #[test]
+    fn envelope_identical_across_paths() {
+        let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
+        let i18n = I18n::for_locale("en");
+
+        let rpc_host = FakeHost::new(&[
+            ("events.emit", json!(null)),
+            ("ui.select", json!("2. B — b")),
+            ("events.emit", json!(null)),
+        ]);
+        let rpc = run_rpc_path_with(&rpc_host, &params, &i18n, || {});
+
+        let fallback_host =
+            FakeHost::new(&[("ctx.hasUI", json!(true)), ("ui.select", json!("2. B — b"))]);
+        let fallback = resolve_undefined_result_with(&fallback_host, &params, &i18n);
+
+        assert_eq!(rpc, fallback);
+        assert_eq!(
+            rpc["content"][0]["text"],
+            "User has answered your questions: \"Pick one?\"=\"B\". You can now continue with the user's answers in mind."
         );
     }
 
@@ -296,7 +626,6 @@ mod tests {
         assert_eq!(payload["questions"][0]["question"], "Pick\none?");
         assert_eq!(payload["questions"][0]["options"][0]["label"], "A");
     }
-
     #[test]
     fn tool_execute_invalid_params_returns_structured_error() {
         let host = FakeHost::new(&[("ctx.hasUI", json!(true))]);

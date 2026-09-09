@@ -16,6 +16,7 @@ const normalize = await import(`${SNAPSHOT}/tool/normalize-params.ts`);
 const validate = await import(`${SNAPSHOT}/tool/validate-questionnaire.ts`);
 const envelope = await import(`${SNAPSHOT}/tool/response-envelope.ts`);
 const rowIntent = await import(`${SNAPSHOT}/state/row-intent.ts`);
+const rpcFallback = await import(`${SNAPSHOT}/rpc-fallback.ts`);
 
 function jsonClone(value) {
 	return JSON.parse(JSON.stringify(value));
@@ -63,11 +64,53 @@ function rowIntentCase(name, input) {
 	return { sentinelsToAppend: [...rowIntent.sentinelsToAppend(rowIntentQuestion(input))] };
 }
 
+/** TE29: mock `DialogUI` — records every call, pops one scripted reply per
+ * call (`{cancel: true}` or exhausted script = dismissed → undefined). The
+ * upstream i18n bridge is the identity fallback (the rpiv-i18n SDK is not a
+ * harness dep), so titles/labels resolve to the canonical English literals —
+ * the Rust leg injects the same `en` table. */
+function scriptedUi(script) {
+	const calls = [];
+	const queue = [...(script ?? [])];
+	const next = () => (queue.length > 0 ? queue.shift() : { cancel: true });
+	return {
+		ui: {
+			select: async (title, options) => {
+				calls.push({ method: "select", title, options: [...options] });
+				const entry = next();
+				return entry.cancel === true ? undefined : entry.reply;
+			},
+			input: async (title, placeholder) => {
+				calls.push({ method: "input", title, placeholder: placeholder ?? null });
+				const entry = next();
+				return entry.cancel === true ? undefined : entry.reply;
+			},
+		},
+		calls,
+	};
+}
+
+async function rpcCase(input) {
+	if (input.probe !== undefined) {
+		// hasDialogUI judgment table: {select, input} flags, null = undefined ui.
+		if (input.probe === null) {
+			return { hasDialogUI: rpcFallback.hasDialogUI(undefined) };
+		}
+		const ui = {};
+		if (input.probe.select) ui.select = async () => undefined;
+		if (input.probe.input) ui.input = async () => "";
+		return { hasDialogUI: rpcFallback.hasDialogUI(ui) };
+	}
+	const { ui, calls } = scriptedUi(input.script);
+	const result = jsonClone(await rpcFallback.runRpcQuestionnaire(ui, input.params));
+	return { calls, result };
+}
+
 async function main() {
 	const group = process.argv[2];
 	const fixturePath = process.argv[3];
 	if (!group || !fixturePath) {
-		console.error("usage: upstream-runner.mjs <schema|normalize|validate|envelope|row-intent> <fixture.json>");
+		console.error("usage: upstream-runner.mjs <schema|normalize|validate|envelope|row-intent|rpc> <fixture.json>");
 		process.exit(2);
 	}
 	const fixtures = JSON.parse(readFileSync(fixturePath, "utf-8"));
@@ -84,6 +127,8 @@ async function main() {
 			output = envelope.buildQuestionnaireResponse(fixture.input.result, fixture.input.params);
 		} else if (group === "row-intent") {
 			output = rowIntentCase(fixture.name, fixture.input);
+		} else if (group === "rpc") {
+			output = await rpcCase(fixture.input);
 		} else {
 			throw new Error(`unknown group: ${group}`);
 		}

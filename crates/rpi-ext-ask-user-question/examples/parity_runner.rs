@@ -5,15 +5,16 @@
 //!
 //! Prints one `{"name", "output"}` JSON line per fixture case; `run-parity.mjs`
 //! diffs the lines against the upstream tsx leg. Groups: `schema`,
-//! `normalize`, `validate`, `envelope`, `row-intent`.
+//! `normalize`, `validate`, `envelope`, `row-intent`, `rpc`.
 
 use std::fs;
 
 use rpi_ext_ask_user_question::parity::{
-    labels_by_kind_json, meta, normalize_question_params, question_params_schema,
-    reserved_label_set, sentinels_to_append, validate_questionnaire, OptionData, QuestionData,
-    QuestionParams, QuestionnaireResult, RowKind, ValidationResult, MAX_HEADER_LENGTH,
-    MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, RESERVED_LABELS,
+    has_dialog_ui, labels_by_kind_json, meta, normalize_question_params, question_params_schema,
+    reserved_label_set, run_rpc_questionnaire, sentinels_to_append, validate_questionnaire,
+    DialogOutcome, DialogUi, HostUi, OptionData, QuestionData, QuestionParams, QuestionnaireResult,
+    RowKind, ValidationResult, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS,
+    MIN_OPTIONS, RESERVED_LABELS,
 };
 use serde_json::{json, Value};
 
@@ -79,6 +80,109 @@ fn row_intent_output(name: &str, input: &Value) -> Value {
     json!({ "sentinelsToAppend": sentinels })
 }
 
+/// TE29 `rpc` group — the dialog walker against a scripted UI (the upstream
+/// leg's mock pops the same replies; the snapshot i18n bridge is the identity
+/// fallback, so the Rust leg pins the `en` table).
+struct ScriptEntry {
+    reply: Option<String>,
+    cancel: bool,
+}
+
+struct ScriptedDialogUi {
+    script: std::collections::VecDeque<ScriptEntry>,
+    calls: Vec<Value>,
+}
+
+impl ScriptedDialogUi {
+    fn from_fixtures(script: &[Value]) -> Self {
+        Self {
+            script: script
+                .iter()
+                .map(|entry| ScriptEntry {
+                    reply: entry
+                        .get("reply")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    cancel: entry
+                        .get("cancel")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+                .collect(),
+            calls: Vec::new(),
+        }
+    }
+
+    fn next(&mut self) -> DialogOutcome {
+        // An exhausted script = dismissed (the upstream mock default).
+        match self.script.pop_front() {
+            Some(entry) if !entry.cancel => Ok(entry.reply),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl DialogUi for ScriptedDialogUi {
+    fn select(&mut self, title: &str, options: &[String]) -> DialogOutcome {
+        self.calls.push(json!({
+            "method": "select",
+            "title": title,
+            "options": options,
+        }));
+        self.next()
+    }
+
+    fn input(&mut self, title: &str, placeholder: Option<&str>) -> DialogOutcome {
+        self.calls.push(json!({
+            "method": "input",
+            "title": title,
+            "placeholder": placeholder,
+        }));
+        self.next()
+    }
+}
+
+/// Flagged probe surface (upstream `hasDialogUI` judgment table).
+struct FlagHostUi {
+    select: bool,
+    input: bool,
+}
+
+impl HostUi for FlagHostUi {
+    fn select_available(&self) -> bool {
+        self.select
+    }
+
+    fn input_available(&self) -> bool {
+        self.input
+    }
+}
+
+fn rpc_output(input: &Value) -> Value {
+    if let Some(probe) = input.get("probe") {
+        let ui = probe.as_object().map(|probe| FlagHostUi {
+            select: probe
+                .get("select")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            input: probe.get("input").and_then(Value::as_bool).unwrap_or(false),
+        });
+        return json!({ "hasDialogUI": has_dialog_ui(ui.as_ref().map(|u| u as &dyn HostUi)) });
+    }
+    let params: QuestionParams =
+        serde_json::from_value(input.get("params").cloned().unwrap_or(Value::Null))
+            .expect("fixture params");
+    let script = input
+        .get("script")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut ui = ScriptedDialogUi::from_fixtures(&script);
+    let i18n = rpi_ext_ask_user_question::parity::I18n::for_locale("en");
+    let result = run_rpc_questionnaire(&mut ui, &params, &i18n).expect("scripted ui never fails");
+    json!({ "calls": ui.calls, "result": result })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
@@ -120,6 +224,7 @@ fn main() {
                 )
             }
             "row-intent" => row_intent_output(name, &input),
+            "rpc" => rpc_output(&input),
             other => panic!("unknown group: {other}"),
         };
         println!("{}", json!({"name": name, "output": output}));

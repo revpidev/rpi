@@ -43,7 +43,7 @@ const RUST_RUNNER = resolve(REPO, "target/debug/examples/parity_runner");
 const VENDORED_LOCALES = resolve(REPO, "crates/rpi-ext-ask-user-question/locales");
 const GENERATED = resolve(REPO, "fixtures/generated/ask-user-question-parity");
 const PINNED_COMMIT = "338b264c1ca4fd8828cc849b632f4f7ad88d2e78";
-const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent"];
+const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc"];
 const UPSTREAM_MODULES = [
 	"tool/types.ts",
 	"tool/normalize-params.ts",
@@ -51,6 +51,8 @@ const UPSTREAM_MODULES = [
 	"tool/response-envelope.ts",
 	"tool/format-answer.ts",
 	"state/row-intent.ts",
+	"state/i18n-bridge.ts",
+	"rpc-fallback.ts",
 ];
 
 function sha256(path) {
@@ -245,7 +247,7 @@ function main() {
 	mkdirSync(GENERATED, { recursive: true });
 
 	const report = [
-		"# ask-user-question parity report (TE28 G3/G12)",
+		"# ask-user-question parity report (TE28/TE29 G3/G12)",
 		"",
 		`generated: ${new Date().toISOString()}`,
 		`upstream submodule: ${UPSTREAM.replace(`${REPO}/`, "")}`,

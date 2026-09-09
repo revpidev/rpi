@@ -251,8 +251,10 @@ impl QuestionnaireResult {
     }
 }
 
-/// `isQuestionnaireResult` guard (upstream `types.ts`) — used by the RPC
-/// walker in TE29; kept here so the contract is frozen with the types.
+/// `isQuestionnaireResult` guard (upstream `types.ts`) — wire-value guard
+/// for results crossing boundaries (upstream uses it in its own test suite;
+/// the walker constructs results directly, so there is no Q1 call site —
+/// kept here so the contract is frozen with the types).
 pub fn is_questionnaire_result(value: &Value) -> bool {
     let Some(object) = value.as_object() else {
         return false;

@@ -1,7 +1,13 @@
-//! Host-integration smoke (TE28 G12): the real cdylib through the actual
-//! `NativeExtensionHost` — manifest capabilities, `ask_user_question`
-//! registration surface, and the Q0 `execute` envelopes over the real ABI
-//! (`no_ui` without a UI bridge, `no_custom_ui` with one).
+//! Host-integration smoke (TE28/TE29 G12): the real cdylib through the
+//! actual `NativeExtensionHost` — manifest capabilities, `ask_user_question`
+//! registration surface, and the `execute` envelopes over the real ABI
+//! (`no_ui` without a UI bridge; the TE29 dialog walker with one — RPC mode
+//! answered, TUI-mode fallback cancelled).
+//!
+//! G2 (TE29): the Q0 step "with a UI bridge → `no_custom_ui` placeholder"
+//! changed — the walker now owns every post-`prompt` branch (upstream
+//! `runRpcPath` / `resolveUndefinedResult`; the placeholder arm was the
+//! documented pre-TE29 state, task file §1/§2).
 //!
 //! One `#[tokio::test]` per binary: the env overrides below (HOME /
 //! XDG_CONFIG_HOME / agent dir) are process-global.
@@ -90,7 +96,7 @@ impl Drop for Sandbox {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn l0_load_registers_ask_user_question_and_q0_envelopes() {
+async fn l0_load_registers_ask_user_question_and_envelopes() {
     let Some(plugin) = require_plugin() else {
         return;
     };
@@ -193,15 +199,18 @@ async fn l0_load_registers_ask_user_question_and_q0_envelopes() {
     assert_eq!(result.details["cancelled"], true);
     assert_eq!(result.details["answers"], serde_json::json!([]));
 
-    // 4. With a UI bridge -> hasUI=true -> prompt event + Q0 placeholder.
+    // 4. TUI-mode bridge, walker fallback (Q1: the component arm is
+    //    statically unavailable) — a cancelled select dismisses the whole
+    //    questionnaire → decline envelope.
+    let tui_bridge = RecordingBridge::new(vec![None]);
     host.set_ui(
-        Some(RecordingBridge::new(vec![])),
+        Some(tui_bridge.clone()),
         rpi_ext_host::types::ExtensionMode::Tui,
     );
     let result = (definition.execute)(
         rpi_ext_host::types::ToolExecuteRequest {
-            tool_call_id: "l0-ui".to_owned(),
-            params,
+            tool_call_id: "l0-tui-fallback".to_owned(),
+            params: params.clone(),
             signal: tokio_util::sync::CancellationToken::new(),
             on_update: None,
         },
@@ -209,13 +218,86 @@ async fn l0_load_registers_ask_user_question_and_q0_envelopes() {
     )
     .await
     .expect("execute resolves");
-    assert!(
-        text_of(&result).starts_with("Error: this client cannot render the questionnaire"),
-        "{}",
-        text_of(&result)
-    );
-    assert_eq!(result.details["error"], "no_custom_ui");
+    assert_eq!(text_of(&result), "User declined to answer questions");
     assert_eq!(result.details["cancelled"], true);
+    assert_eq!(result.details["error"], serde_json::Value::Null);
+    assert_eq!(tui_bridge.selects().len(), 1, "one select per question");
+
+    // 5. RPC-mode bridge — `ctx.mode == "rpc"` routes to the walker up
+    //    front; the answered select reaches the envelope through the full
+    //    host-call chain (guard → prompt event → mode probe → blocked pair
+    //    → ui.select).
+    let rpc_bridge = RecordingBridge::new(vec![Some("1. A — a")]);
+    host.set_ui(
+        Some(rpc_bridge.clone()),
+        rpi_ext_host::types::ExtensionMode::Rpc,
+    );
+    let result = (definition.execute)(
+        rpi_ext_host::types::ToolExecuteRequest {
+            tool_call_id: "l0-rpc-walker".to_owned(),
+            params: params.clone(),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+        },
+        host.core().create_context(),
+    )
+    .await
+    .expect("execute resolves");
+    assert_eq!(
+        text_of(&result),
+        "User has answered your questions: \"Pick one?\"=\"A\". You can now continue with the user's answers in mind."
+    );
+    assert_eq!(result.details["cancelled"], false);
+    assert_eq!(result.details["answers"][0]["kind"], "option");
+    let titles = rpc_bridge.selects();
+    assert_eq!(titles.len(), 1);
+    assert!(titles[0].starts_with("[Pick] Pick one?"), "{}", titles[0]);
+
+    // 6. Two-question RPC walk — consecutive dialogs of BOTH kinds through
+    //    the real chain (§8.1: no deadlock; one dialog per question).
+    let two_questions = serde_json::json!({
+        "questions": [
+            params["questions"][0].clone(),
+            {
+                "question": "Pick a color?",
+                "header": "Color",
+                "multiSelect": true,
+                "options": [
+                    {"label": "red", "description": "r"},
+                    {"label": "green", "description": "g"}
+                ]
+            }
+        ]
+    });
+    let walk_bridge = RecordingBridge::scripted(vec![Some("1. A — a")], vec![Some("1")]);
+    host.set_ui(
+        Some(walk_bridge.clone()),
+        rpi_ext_host::types::ExtensionMode::Rpc,
+    );
+    let result = (definition.execute)(
+        rpi_ext_host::types::ToolExecuteRequest {
+            tool_call_id: "l0-rpc-walk".to_owned(),
+            params: two_questions,
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+        },
+        host.core().create_context(),
+    )
+    .await
+    .expect("execute resolves");
+    assert_eq!(
+        text_of(&result),
+        "User has answered your questions: \"Pick one?\"=\"A\". \"Pick a color?\"=\"red\". You can now continue with the user's answers in mind."
+    );
+    assert_eq!(walk_bridge.selects().len(), 1);
+    assert_eq!(walk_bridge.inputs().len(), 1);
+    let (input_title, placeholder) = &walk_bridge.inputs()[0];
+    assert!(
+        input_title.starts_with("[Color] Pick a color?"),
+        "{input_title}"
+    );
+    assert!(input_title.contains("1. red — r"));
+    assert_eq!(placeholder.as_deref(), Some("1,3"));
 
     let _ = std::fs::remove_dir_all(full.parent().unwrap());
 }

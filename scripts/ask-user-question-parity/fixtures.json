@@ -214,5 +214,675 @@
       { "name": "multi_select_true", "input": { "multiSelect": true } },
       { "name": "constants", "input": null }
     ]
+  },
+  "rpc": {
+    "cases": [
+      {
+        "name": "has_dialog_ui_both_primitives",
+        "input": {
+          "probe": {
+            "select": true,
+            "input": true
+          }
+        }
+      },
+      {
+        "name": "has_dialog_ui_only_select",
+        "input": {
+          "probe": {
+            "select": true,
+            "input": false
+          }
+        }
+      },
+      {
+        "name": "has_dialog_ui_only_input",
+        "input": {
+          "probe": {
+            "select": false,
+            "input": true
+          }
+        }
+      },
+      {
+        "name": "has_dialog_ui_neither",
+        "input": {
+          "probe": {
+            "select": false,
+            "input": false
+          }
+        }
+      },
+      {
+        "name": "has_dialog_ui_undefined",
+        "input": {
+          "probe": null
+        }
+      },
+      {
+        "name": "single_select_option_answer",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. A — a"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_second_option",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "2. B — b"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_custom_answer",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "3. Type something."
+            },
+            {
+              "reply": "typed it"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_custom_answer_cancel",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "3. Type something."
+            },
+            {
+              "cancel": true
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_no_header_no_prefix",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. A — a"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_cancel_dismisses",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "cancel": true
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_non_numeric_reply_is_cancel",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "banana"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_out_of_range_reply_is_cancel",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "9. weird"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_preview_folded_and_truncated",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a",
+                    "preview": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b",
+                    "preview": "short-b"
+                  },
+                  {
+                    "label": "C",
+                    "description": "c"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "2. B — b"
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_preview_astral_boundary",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a",
+                    "preview": "🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀🦀"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. A — a"
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_indices_dedup",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1,3,1"
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_space_separated",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1 3"
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_period_suffixed",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. 3."
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_empty_commit",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "   "
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_non_index_custom",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "red, something else entirely"
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_out_of_range_number_custom",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "13"
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_select_cancel_dismisses",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "cancel": true
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_question_sequential_walk",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              },
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. A — a"
+            },
+            {
+              "reply": "2"
+            }
+          ]
+        }
+      },
+      {
+        "name": "mid_walk_cancel_preserves_answers",
+        "input": {
+          "params": {
+            "questions": [
+              {
+                "question": "Which?",
+                "header": "Pick",
+                "options": [
+                  {
+                    "label": "A",
+                    "description": "a"
+                  },
+                  {
+                    "label": "B",
+                    "description": "b"
+                  }
+                ]
+              },
+              {
+                "question": "Pick colors?",
+                "header": "Colors",
+                "multiSelect": true,
+                "options": [
+                  {
+                    "label": "red",
+                    "description": "r"
+                  },
+                  {
+                    "label": "green",
+                    "description": "g"
+                  },
+                  {
+                    "label": "blue",
+                    "description": "b"
+                  }
+                ]
+              }
+            ]
+          },
+          "script": [
+            {
+              "reply": "1. A — a"
+            },
+            {
+              "cancel": true
+            }
+          ]
+        }
+      }
+    ]
   }
 }

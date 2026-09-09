@@ -1,4 +1,4 @@
-# ask-user-question parity harness (TE28 G3/G12)
+# ask-user-question parity harness (TE28/TE29 G3/G12)
 
 Drives the **pinned upstream pure-function modules** (`juicesharp/rpiv-mono` →
 `packages/rpiv-ask-user-question/` @ `338b264c` = v2.9.0 + 7 commits, the #192
@@ -42,7 +42,10 @@ records each file's sha256 in the report. The deps dir carries `tsx` + the
 HEAD is asserted against `338b264c1ca4fd8828cc849b632f4f7ad88d2e78`.
 
 Driven modules: `tool/{types,normalize-params,validate-questionnaire,response-envelope,format-answer}.ts`,
-`state/row-intent.ts` (type-only imports into `view/` are erased by tsx).
+`state/row-intent.ts`, `state/i18n-bridge.ts` + `rpc-fallback.ts` (TE29 walker leg; type-only imports into
+`view/` are erased by tsx; the i18n bridge falls back to its identity `t` when the `rpiv-i18n` SDK is
+absent — the harness deps do not install it — so the walker leg runs on canonical English, and the Rust
+leg pins `I18n::for_locale("en")` to match).
 
 ## Normalization whitelist
 
@@ -67,3 +70,9 @@ Driven modules: `tool/{types,normalize-params,validate-questionnaire,response-en
   out-of-order answers.
 - `row-intent` — sentinel append matrix + the full `ROW_INTENT_META` /
   `LABELS_BY_KIND` / reserved-set constants.
+- `rpc` (TE29) — `hasDialogUI` judgment table (`{select, input}` flags + `undefined` ui) and the
+  sequential dialog walker: each case drives a scripted `DialogUI` (`{reply}` / `{cancel}` entries,
+  exhausted script = dismiss) and compares the recorded calls (method/title/options/placeholder) and
+  the final `QuestionnaireResult` verbatim — titles (header prefix, preview folding, ≤600 UTF-16-unit
+  truncation incl. a clean astral boundary), option lines + sentinel row, multi-select token parsing
+  (indices/dedup/space/period/out-of-range/empty commit/custom), cancels and mid-walk partial answers.

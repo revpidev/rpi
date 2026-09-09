@@ -21,20 +21,48 @@ use rpi_ext_host::api::{
 };
 use serde_json::Value;
 
-/// Records dialog order + concurrency; pops scripted answers per `select`.
+/// Records dialog order + concurrency; pops scripted answers per dialog
+/// kind (`select` answers from one queue, `input` from another).
+///
+/// Since TE29 the ask-user-question walker drives BOTH primitives, so the
+/// bridge records input calls (title + placeholder) and pops input answers
+/// the same way as selects.
 pub struct RecordingBridge {
     selects: Mutex<Vec<String>>,
     answers: Mutex<VecDeque<Option<String>>>,
+    inputs: Mutex<Vec<(String, Option<String>)>>,
+    input_answers: Mutex<VecDeque<Option<String>>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
 }
 
 impl RecordingBridge {
-    /// Build with one scripted answer per expected `select` (`None` = cancel).
+    /// Build with one scripted answer per expected `select` (`None` = cancel)
+    /// and no input answers (every `input` cancels).
     pub fn new(answers: Vec<Option<&str>>) -> Arc<Self> {
+        Self::scripted(answers, Vec::new())
+    }
+
+    /// Build with scripted answers for both dialog kinds (`None` = cancel).
+    pub fn scripted(
+        select_answers: Vec<Option<&str>>,
+        input_answers: Vec<Option<&str>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             selects: Mutex::new(Vec::new()),
-            answers: Mutex::new(answers.into_iter().map(|a| a.map(str::to_owned)).collect()),
+            answers: Mutex::new(
+                select_answers
+                    .into_iter()
+                    .map(|a| a.map(str::to_owned))
+                    .collect(),
+            ),
+            inputs: Mutex::new(Vec::new()),
+            input_answers: Mutex::new(
+                input_answers
+                    .into_iter()
+                    .map(|a| a.map(str::to_owned))
+                    .collect(),
+            ),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
         })
@@ -43,6 +71,14 @@ impl RecordingBridge {
     /// Titles of the dialogs opened so far, in order.
     pub fn selects(&self) -> Vec<String> {
         self.selects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// `(title, placeholder)` of every `input` dialog, in order.
+    pub fn inputs(&self) -> Vec<(String, Option<String>)> {
+        self.inputs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
@@ -85,11 +121,19 @@ impl UiBridge for RecordingBridge {
     }
     async fn input(
         &self,
-        _t: &str,
-        _p: Option<&str>,
+        title: &str,
+        placeholder: Option<&str>,
         _o: Option<UiDialogOptions>,
     ) -> Option<String> {
-        None
+        self.inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((title.to_owned(), placeholder.map(str::to_owned)));
+        self.input_answers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front()
+            .flatten()
     }
     fn notify(&self, _m: &str, _k: NotifyType) {}
     fn on_terminal_input(&self, _h: TerminalInputHandler) -> Unsubscribe {

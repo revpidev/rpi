@@ -25,6 +25,7 @@ pub mod config;
 pub mod events;
 pub mod i18n;
 pub mod reconcile;
+pub mod rpc_fallback;
 pub mod state;
 pub mod tool;
 
@@ -274,6 +275,11 @@ pub mod parity {
     pub use crate::events::{build_blocked_payload, build_prompt_payload};
     pub use crate::i18n::{match_locale, parse_locale_env, I18n, SUPPORTED_LOCALES};
     pub use crate::reconcile::reconcile_active_tools;
+    pub use crate::rpc_fallback::{
+        build_preview_block, format_option_line, has_dialog_ui, parse_index, run_rpc_questionnaire,
+        DialogOutcome, DialogUi, HostUi, CUSTOM_ANSWER_TITLE, MAX_PREVIEW_CHARS,
+        MULTI_SELECT_INSTRUCTIONS, MULTI_SELECT_PLACEHOLDER,
+    };
     pub use crate::state::build::{build_items_for_question, QuestionItem};
     pub use crate::state::row_intent::{
         is_reserved_label, label_by_kind, labels_by_kind_json, meta, reserved_label_set,
