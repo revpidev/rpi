@@ -454,7 +454,9 @@ impl MountState {
         self.push_event(ComponentEvent::Blur);
     }
 
-    /// Host dialog closed (R-U2.2 / R-U10.2): restore focus only when the
+    /// Host dialog closed (R-U2.2 / R-U10.2): first land any visibility
+    /// change requested while the dialog owned the screen (R-U4.3 — a
+    /// deferred hide must not be dropped), then restore focus only when the
     /// component was focused before AND is still visible. A component that
     /// became visible while the dialog was open is mounted now.
     fn dialog_closed(&self) {
@@ -462,12 +464,13 @@ impl MountState {
             return;
         }
         let restore_focus = self.blur_for_dialog.swap(false, Ordering::SeqCst);
+        let was_mounted = self.mounted.load(Ordering::SeqCst);
+        // Land deferred visibility (hide/show) now that the dialog is gone.
+        self.apply_visibility();
         if self.hidden.load(Ordering::SeqCst) {
             // R-U10.2: an invisible component must not silently regain focus.
             return;
         }
-        let was_mounted = self.mounted.load(Ordering::SeqCst);
-        self.apply_visibility();
         if restore_focus {
             // Overlay mode: the overlay stayed mounted, refocus it. Editor
             // mode was remounted by `apply_visibility` above.
@@ -1785,6 +1788,14 @@ mod interactive_component {
             ComponentEvent::Visibility { hidden: true }
         );
         registry.dialog_closed();
+        // R-U4.3: the hide requested while the dialog owned the screen must
+        // land when the dialog closes — the overlay may not stay on screen.
+        let overlay = mount.last_overlay();
+        assert!(
+            *overlay.hidden.lock().unwrap(),
+            "hidden overlay must not stay on screen (R-U4.3)"
+        );
+        assert!(overlay.set_hidden_calls.load(Ordering::SeqCst) >= 1);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(20),
@@ -1794,7 +1805,7 @@ mod interactive_component {
             .is_err(),
             "hidden component must not regain focus (R-U10.2)"
         );
-        assert_eq!(mount.last_overlay().focus_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(overlay.focus_calls.load(Ordering::SeqCst), 0);
         registry.dispose("ext", handle).expect("dispose");
     }
 
@@ -1944,6 +1955,33 @@ mod interactive_component {
             )
             .expect("render");
         assert_eq!(render_entry(&registry, 80)[0], "abcd");
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    /// R-U3.2 / design 02 §3.7 C1 注记 ④: an explicit cursor column inside a
+    /// wide grapheme snaps to the grapheme start (never splits it).
+    #[test]
+    fn component_registry_cursor_snaps_out_of_wide_grapheme() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        let frame_at = |col: usize| ComponentFrame {
+            lines: vec!["你好".to_owned()],
+            cursor: Some(ComponentCursor { row: 0, col }),
+            done: rpi_ext_host::interactive_ui::DoneValue::Absent,
+        };
+        // Column 1 is inside the first wide grapheme → snaps to column 0.
+        registry.render("ext", handle, frame_at(1)).expect("render");
+        assert_eq!(
+            render_entry(&registry, 80)[0],
+            format!("{CURSOR_MARKER}你好")
+        );
+        // Column 2 is a grapheme boundary → stays there.
+        registry.render("ext", handle, frame_at(2)).expect("render");
+        assert_eq!(
+            render_entry(&registry, 80)[0],
+            format!("你{CURSOR_MARKER}好")
+        );
         registry.dispose("ext", handle).expect("dispose");
     }
 
