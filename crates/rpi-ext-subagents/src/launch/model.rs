@@ -555,11 +555,15 @@ pub fn build_model_candidates(
 // Retry classification (model-fallback.ts:320-340)
 // ---------------------------------------------------------------------------
 
-/// `RETRYABLE_MODEL_FAILURE_PATTERNS` (model-fallback.ts:282-318) — matched
-/// case-insensitively against the child error text.
+/// `RETRYABLE_MODEL_FAILURE_PATTERNS` (model-fallback.ts:537-577 @ v0.66.0
+/// 0fc0eebb) — matched against the child error text. Every pattern carries
+/// its own flags; `REQUEST_LIMIT_EXCEEDED` is anchored and case-sensitive
+/// exactly like upstream.
 static RETRYABLE_MODEL_FAILURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
+        r"^REQUEST_LIMIT_EXCEEDED$",
         r"(?i)rate\s*limit",
+        r"(?i)usage\s*limit",
         r"(?i)too many requests",
         r"(?i)\b429\b",
         r"(?i)quota",
@@ -579,6 +583,7 @@ static RETRYABLE_MODEL_FAILURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(||
         r"(?i)overloaded",
         r"(?i)service unavailable",
         r"(?i)temporar(?:ily)? unavailable",
+        r"(?i)connection\s+(?:error|reset|closed|aborted)",
         r"(?i)connection refused",
         r"(?i)fetch failed",
         r"(?i)network error",
@@ -587,9 +592,11 @@ static RETRYABLE_MODEL_FAILURE_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(||
         r"(?i)upstream",
         r"(?i)timed? out",
         r"(?i)timeout",
+        r"(?i)\b500\b",
         r"(?i)\b502\b",
         r"(?i)\b503\b",
         r"(?i)\b504\b",
+        r"(?i)internal server error",
         r"(?i)cold.?start",
         r"(?i)empty response",
         r"(?i)no output",
@@ -608,7 +615,7 @@ static TOOL_FAILURE_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("tool failure prefix regex")
 });
 
-/// `isRetryableModelFailure` (model-fallback.ts:329-333).
+/// `isRetryableModelFailure` (model-fallback.ts:579-584 @ v0.66.0).
 pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     let Some(error) = error else {
         return false;
@@ -619,6 +626,96 @@ pub fn is_retryable_model_failure(error: Option<&str>) -> bool {
     RETRYABLE_MODEL_FAILURE_PATTERNS
         .iter()
         .any(|pattern| pattern.is_match(error))
+}
+
+/// `CONTEXT_OVERFLOW_PATTERNS` (model-fallback.ts:625-637 @ v0.66.0).
+/// Deliberately disjoint from [`RETRYABLE_MODEL_FAILURE_PATTERNS`]: an overflow
+/// means the input exceeded the model's context window, so retrying the same
+/// input (same model or a fallback) cannot succeed.
+static CONTEXT_OVERFLOW_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        r"(?i)context(?: length| window| limit)? (?:exceed|overflow|too long)",
+        r"(?i)maximum context length",
+        r"(?i)too many tokens",
+        r"(?i)token limit",
+        r"(?i)context_length_exceeded",
+        r"(?i)length_required",
+        r"(?i)maximum.*tokens",
+        r"(?i)prompt.*too long",
+        r"(?i)input.*too long",
+        r"(?i)exceeded.*context",
+        r"(?i)context.*overflow",
+    ]
+    .iter()
+    .filter_map(|pattern| Regex::new(pattern).ok())
+    .collect()
+});
+
+/// `isContextOverflow` (model-fallback.ts:643-647 @ v0.66.0): a terminal,
+/// non-retryable classification — callers must not advance the fallback chain
+/// (R7.1.2.2).
+pub fn is_context_overflow(error: Option<&str>) -> bool {
+    let Some(error) = error else {
+        return false;
+    };
+    if TOOL_FAILURE_PREFIX.is_match(error.trim()) {
+        return false;
+    }
+    CONTEXT_OVERFLOW_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(error))
+}
+
+/// `formatEmptyTerminalAssistantResponseError` cold-start text
+/// (utils.ts:481) — the empty-output attempt still advances the chain.
+const EMPTY_OUTPUT_COLD_START_ERROR: &str =
+    "Subagent produced no output (possible model cold-start or empty response).";
+
+/// `/^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$/`
+/// (model-fallback.ts:603).
+static EMPTY_OUTPUT_STOP_REASON_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"^Subagent produced no output after terminal assistant stopReason "[^"]+"\.$"#)
+        .expect("empty output stop reason regex")
+});
+
+/// `isRetryableModelFailureAttempt` (model-fallback.ts:601-611 @ v0.66.0,
+/// R7.1.2.3): a retryable *model* failure may only replay the whole task when
+/// the attempt produced **no tool activity** (`toolCount > 0` → false — a
+/// replay would re-run tools against the same cwd/worktree). `messages`
+/// carries the attempt transcript: the upstream tail only replays when the
+/// error text is an errorMessage of one of those messages (or the attempt had
+/// no messages at all).
+pub fn is_retryable_model_failure_attempt(
+    error: Option<&str>,
+    messages: &[Value],
+    tool_count: u64,
+) -> bool {
+    if !is_retryable_model_failure(error) {
+        return false;
+    }
+    if tool_count > 0 {
+        return false;
+    }
+    let Some(error_text) = error else {
+        return false;
+    };
+    if error_text == EMPTY_OUTPUT_COLD_START_ERROR
+        || EMPTY_OUTPUT_STOP_REASON_RE.is_match(error_text)
+    {
+        return true;
+    }
+    if messages.is_empty() {
+        return true;
+    }
+    let trimmed = error_text.trim();
+    !trimmed.is_empty()
+        && messages.iter().any(|message| {
+            message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                == Some(trimmed)
+        })
 }
 
 /// `formatModelAttemptNote` (model-fallback.ts:335-340).
@@ -902,6 +999,102 @@ mod tests {
         assert!(!is_retryable_model_failure(Some(
             "some unrelated compile note"
         )));
+        // v0.66 additions (#1215/#1955/#1957, model-fallback.ts:537-577).
+        assert!(is_retryable_model_failure(Some("REQUEST_LIMIT_EXCEEDED")));
+        // Anchored + case-sensitive upstream (`/^REQUEST_LIMIT_EXCEEDED$/`).
+        assert!(!is_retryable_model_failure(Some("request_limit_exceeded")));
+        assert!(!is_retryable_model_failure(Some(
+            "REQUEST_LIMIT_EXCEEDED retry later"
+        )));
+        assert!(is_retryable_model_failure(Some(
+            "usage limit reached for this account"
+        )));
+        assert!(is_retryable_model_failure(Some("connection reset by peer")));
+        assert!(is_retryable_model_failure(Some(
+            "HTTP 500 Internal Server Error"
+        )));
+        assert!(is_retryable_model_failure(Some("Internal Server Error")));
+    }
+
+    #[test]
+    fn context_overflow_classification() {
+        // R7.1.2.2: independent, non-retryable classification.
+        assert!(is_context_overflow(Some("context_length_exceeded")));
+        assert!(is_context_overflow(Some(
+            "maximum context length is 200000 tokens"
+        )));
+        assert!(is_context_overflow(Some(
+            "prompt is too long for this model"
+        )));
+        assert!(!is_context_overflow(None));
+        assert!(!is_context_overflow(Some(
+            "plain provider failure without overflow wording"
+        )));
+        // TOOL_FAILURE_PREFIX precedence: a tool's own "token limit" text is
+        // neither overflow nor a model failure.
+        assert!(!is_context_overflow(Some(
+            "write failed (exit 1): token limit exceeded"
+        )));
+        assert!(!is_retryable_model_failure(Some(
+            "write failed (exit 1): token limit exceeded"
+        )));
+        // Overflow and retryable patterns stay mutually exclusive on the
+        // same error text (task §6 A3).
+        for error in [
+            "context_length_exceeded",
+            "maximum context length is 200000 tokens",
+            "prompt is too long for this model",
+        ] {
+            assert!(!is_retryable_model_failure(Some(error)), "{error}");
+        }
+    }
+
+    #[test]
+    fn retryable_attempt_guard_blocks_replay_after_tools() {
+        let retryable = Some("rate limit exceeded");
+        // toolCount > 0 → never replay the whole task (R7.1.2.3 A1).
+        assert!(!is_retryable_model_failure_attempt(retryable, &[], 1));
+        assert!(!is_retryable_model_failure_attempt(
+            retryable,
+            &[serde_json::json!({ "role": "assistant", "errorMessage": "rate limit exceeded" })],
+            3
+        ));
+        // toolCount == 0 + no messages → still replayable.
+        assert!(is_retryable_model_failure_attempt(retryable, &[], 0));
+        // Empty-output diagnostics replay even with messages present.
+        assert!(is_retryable_model_failure_attempt(
+            Some(EMPTY_OUTPUT_COLD_START_ERROR),
+            &[serde_json::json!({ "role": "assistant", "content": [] })],
+            0
+        ));
+        assert!(is_retryable_model_failure_attempt(
+            Some("Subagent produced no output after terminal assistant stopReason \"length\"."),
+            &[],
+            0
+        ));
+        // With a transcript, the error must come from one of its messages
+        // (model-fallback.ts:610 tail).
+        assert!(is_retryable_model_failure_attempt(
+            retryable,
+            &[serde_json::json!({ "role": "assistant", "errorMessage": "rate limit exceeded" })],
+            0
+        ));
+        assert!(!is_retryable_model_failure_attempt(
+            retryable,
+            &[serde_json::json!({ "role": "assistant", "errorMessage": "other failure" })],
+            0
+        ));
+        // Non-retryable and context-overflow texts never replay.
+        assert!(!is_retryable_model_failure_attempt(
+            Some("some unrelated compile note"),
+            &[],
+            0
+        ));
+        assert!(!is_retryable_model_failure_attempt(
+            Some("context_length_exceeded"),
+            &[],
+            0
+        ));
     }
 
     #[test]

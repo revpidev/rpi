@@ -1394,12 +1394,23 @@ pub mod parity {
     }
 
     /// `isRetryableModelFailure` parity facade (TE13 target-track fallback
-    /// leg). The pattern table is still the v0.48 one; R7.1.2.1's new patterns
-    /// land in TE14 and are attributed in `expected-target-diffs.json` until
-    /// then. `isContextOverflow`/`isRetryableModelFailureAttempt` (R7.1.2.2/.3)
-    /// are intentionally absent until TE14.
+    /// leg; pattern table completed for R7.1.2.1 in TE14).
     pub fn is_retryable_model_failure_public(error: Option<&str>) -> bool {
         crate::launch::model::is_retryable_model_failure(error)
+    }
+
+    /// `isContextOverflow` parity facade (TE14, R7.1.2.2).
+    pub fn is_context_overflow_public(error: Option<&str>) -> bool {
+        crate::launch::model::is_context_overflow(error)
+    }
+
+    /// `isRetryableModelFailureAttempt` parity facade (TE14, R7.1.2.3).
+    pub fn is_retryable_model_failure_attempt_public(
+        error: Option<&str>,
+        messages: &[serde_json::Value],
+        tool_count: u64,
+    ) -> bool {
+        crate::launch::model::is_retryable_model_failure_attempt(error, messages, tool_count)
     }
 }
 

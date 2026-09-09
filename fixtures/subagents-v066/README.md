@@ -33,6 +33,13 @@
   3. `tool-error-empty-reply.jsonl`：探索性工具报错后模型空回复——
      empty-output 诊断优先于旧工具错（R7.1.1.2 #1921）。
 
+> **TE14 落地注记（2026-09-09）**：三组 JSONL + `expected.json` 已被
+> `crates/rpi-ext-subagents/src/runner/foreground.rs` 的
+> `terminal_classification_tests::recorded_event_stream_groups_match_upstream_expected`
+> 直接消费（`ChildRunState` 回放 + `synthesize_exit_from_parts`），逐组断言
+> `exitCode`/`error`/`finalOutput` 与 `expected` 一致，全绿；`currentRpiAtM0`
+> 记录的 M0 行为已被 R7.1.1.1/.2 修正取代。
+
 ## 发现目录（`discovery/`）
 
 - `agents-tree/` 提交的文件覆盖：合法 agent、未闭合 frontmatter、

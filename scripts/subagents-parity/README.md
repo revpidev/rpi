@@ -72,6 +72,14 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
 - 差异字段为 `null` 表示 Rust 侧函数尚未实现（如 M0 的 `isContextOverflow` /
   `isRetryableModelFailureAttempt`），同样按上述两节归因，不静默跳过。
 
+> **TE14 落地注记（2026-09-09）**：`expected-target-diffs.json` 已清空——
+> R7.1.2.1 模式表五项补齐（`REQUEST_LIMIT_EXCEEDED`/`usage limit`/
+> `connection (error|reset|closed|aborted)`/`\b500\b`/`internal server error`）、
+> `isContextOverflow`（R7.1.2.2）与 `isRetryableModelFailureAttempt`（R7.1.2.3）
+> 落地后，fallback 16 用例全部 `MATCH`（目标轨 43/43），报告落
+> `fixtures/generated/subagents-parity-v066/parity-report.md`（`RESULT: MATCH`）。
+> 后续 TE15–TE18 若产生新差异，按原规则在清单追加归因。
+
 ## 组成
 
 | 文件 | 职责 |
