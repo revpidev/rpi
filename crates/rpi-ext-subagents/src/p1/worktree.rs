@@ -78,25 +78,6 @@ fn bounded_handoff_diagnostic(text: &str) -> String {
     bounded
 }
 
-/// Setup failure split into the artifact-safe summary and the full
-/// caller-facing detail. Only [`reason`](Self::reason) reaches the handoff
-/// file; the hook's captured stderr stays in [`detail`](Self::detail).
-#[derive(Debug, Clone)]
-struct SetupFailure {
-    reason: String,
-    detail: String,
-}
-
-impl SetupFailure {
-    /// A failure whose message already contains no captured output.
-    fn safe(message: String) -> Self {
-        Self {
-            detail: message.clone(),
-            reason: message,
-        }
-    }
-}
-
 /// `validGitRef` (worktree.ts:445-452) plus the rpi fail-closed leading-dash
 /// rule (TE16 §8-3): reject empty/`@`/oversized refs, path escapes, Git
 /// revision syntax (`..`/`@{`/`~`/`^`/`:`/`?`/`*`/`[`/`]`/`\\`), control
@@ -269,13 +250,13 @@ pub fn create_worktree(
         worktree_path.join(cwd_relative)
     };
     let mut synthetic_paths = Vec::new();
-    let result = (|| -> Result<WorktreeInfo, SetupFailure> {
+    let result = (|| -> Result<WorktreeInfo, String> {
         let node_modules_linked = link_node_modules_if_present(toplevel, &worktree_path);
         if node_modules_linked {
             synthetic_paths.push("node_modules".to_string());
         }
         if let Some((hook, timeout_ms)) = config.worktree_setup_hook() {
-            let hook = resolve_worktree_setup_hook(&hook, toplevel).map_err(SetupFailure::safe)?;
+            let hook = resolve_worktree_setup_hook(&hook, toplevel)?;
             let hook_synthetic = run_worktree_setup_hook(
                 &hook,
                 timeout_ms,
@@ -302,27 +283,28 @@ pub fn create_worktree(
 
     match result {
         Ok(info) => Ok(info),
-        Err(failure) => {
+        Err(error) => {
             // R7.1.5.2 (#1902): preserve the uncertain allocation. The branch
-            // and worktree stay on disk for manual recovery; the handoff
-            // records only the artifact-safe reason (no captured stderr),
-            // while the caller receives the full detail.
+            // and worktree stay on disk for manual recovery. The error (and
+            // therefore the persisted `status.json` step error) carries no
+            // captured hook output — upstream never echoes hook stderr
+            // (worktree.ts:798-820 reports parse failures only), and G4
+            // forbids credentials in error messages/artifacts.
             let handoff = write_preserved_worktree_handoff(
                 base_dir,
                 run_id,
                 index,
                 &worktree_path,
                 &branch,
-                &failure.reason,
+                &error,
             );
             let handoff_note = handoff
                 .as_ref()
                 .map(|path| format!("; handoff: {}", path.to_string_lossy()))
                 .unwrap_or_default();
             Err(format!(
-                "worktree setup failed for {} (branch {branch}): {}. Preserved for manual recovery{handoff_note}",
-                worktree_path.to_string_lossy(),
-                failure.detail
+                "worktree setup failed for {} (branch {branch}): {error}. Preserved for manual recovery{handoff_note}",
+                worktree_path.to_string_lossy()
             ))
         }
     }
@@ -399,7 +381,7 @@ fn run_worktree_setup_hook(
     run_id: &str,
     base_commit: &str,
     agent: Option<&str>,
-) -> Result<Vec<String>, SetupFailure> {
+) -> Result<Vec<String>, String> {
     let stdin = json!({
         "version": 1,
         "repoRoot": toplevel.to_string_lossy(),
@@ -418,7 +400,7 @@ fn run_worktree_setup_hook(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| SetupFailure::safe(format!("worktree setup hook failed to start: {e}")))?;
+        .map_err(|e| format!("worktree setup hook failed to start: {e}"))?;
     // Timeout via a watchdog thread (spawnSync-equivalent): the waiter runs
     // on its own thread, the watchdog polls it. On timeout the hook process
     // is killed (Node spawnSync {timeout} sends its killSignal) — a runaway
@@ -435,29 +417,28 @@ fn run_worktree_setup_hook(
         std::time::Duration::from_millis(timeout_ms),
         hook_pid,
     )
-    .map_err(|_| {
-        SetupFailure::safe(format!(
-            "worktree setup hook timed out after {timeout_ms}ms"
-        ))
-    })?;
+    .map_err(|_| format!("worktree setup hook timed out after {timeout_ms}ms"))?;
     if !output.status.success() {
-        let exit = output.status.code();
-        return Err(SetupFailure {
-            reason: format!("worktree setup hook failed (exit {exit:?})"),
-            detail: format!(
-                "worktree setup hook failed (exit {exit:?}): {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
+        // The hook's captured stderr is deliberately discarded: upstream
+        // never echoes it (worktree.ts:798-820), and the error reaches the
+        // persisted status document (`step["error"]`), so G4 credential
+        // hygiene wins over the extra diagnostic. The exit code plus the
+        // worktree path/handoff are enough to reproduce by running the hook
+        // manually.
+        return Err(format!(
+            "worktree setup hook failed (exit {})",
+            output
+                .status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "signal".to_string())
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Value = serde_json::from_str(stdout.trim()).map_err(|_| {
-        SetupFailure::safe("worktree setup hook stdout must be a JSON object".to_string())
-    })?;
+    let parsed: Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "worktree setup hook stdout must be a JSON object".to_string())?;
     if !parsed.is_object() {
-        return Err(SetupFailure::safe(
-            "worktree setup hook stdout must be a JSON object".to_string(),
-        ));
+        return Err("worktree setup hook stdout must be a JSON object".to_string());
     }
     Ok(parsed
         .get("syntheticPaths")
@@ -1326,9 +1307,9 @@ mod tests {
         // T-4: a failing setup hook must not roll the worktree/branch back.
         let (dir, toplevel, base_commit) = test_repo("setupfail");
         let hook = toplevel.join("failing-hook.sh");
-        // The stderr carries a secret-shaped token: it must reach the caller
-        // diagnostic but never the persisted handoff artifact (G4 red line;
-        // upstream never copies captured stderr into artifacts).
+        // The stderr carries a secret-shaped token: it must reach neither
+        // the returned error (persisted as `step["error"]`) nor the handoff
+        // artifact (G4 red line; upstream never echoes hook stderr).
         std::fs::write(
             &hook,
             "#!/bin/sh\necho 'token=super-secret-hook-token' >&2\nexit 3\n",
@@ -1361,9 +1342,10 @@ mod tests {
         );
         assert!(error.contains("Preserved for manual recovery"), "{error}");
         assert!(
-            error.contains("super-secret-hook-token"),
-            "caller keeps the full hook diagnostic: {error}"
+            !error.contains("super-secret-hook-token"),
+            "caller error must not echo captured hook stderr: {error}"
         );
+        assert!(error.contains("hook failed (exit 3)"), "{error}");
         assert!(worktree_path.exists(), "allocation preserved");
         assert!(branch_exists(&toplevel, &branch), "branch preserved");
         let handoff = base_dir.join("handoffs").join("runsetup-preserved-0.json");

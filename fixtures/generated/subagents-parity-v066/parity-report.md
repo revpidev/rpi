@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-09T04:29:37.270Z
+generated: 2026-09-09T04:40:13.516Z
 
 ## args
 
