@@ -101,8 +101,11 @@ type ConnectingHook = Arc<dyn Fn(&str) + Send + Sync>;
 type MetadataUpdatedHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 // SearchState holds `&[(String, Vec<ToolMetadata>)]`; provide it via a
-// snapshot helper to keep lock times minimal.
-fn search_state_snapshot(state: &McpRuntime) -> (McpConfig, Vec<(String, Vec<ToolMetadata>)>) {
+// snapshot helper to keep lock times minimal. `pub(crate)`: the slash-command
+// handlers (TE20) render the same status/tools text from the same snapshot.
+pub(crate) fn search_state_snapshot(
+    state: &McpRuntime,
+) -> (McpConfig, Vec<(String, Vec<ToolMetadata>)>) {
     let metadata = state
         .tool_metadata
         .lock()
