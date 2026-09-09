@@ -1,6 +1,6 @@
 # OAuth cross-implementation parity report (TE02 item 5 / TE03 groundwork)
 
-Generated: 2026-09-09T10:01:49.064Z (rerun: `node scripts/mcp-parity/run-oauth-parity.mjs`)
+Generated: 2026-09-09T10:33:55.324Z (rerun: `node scripts/mcp-parity/run-oauth-parity.mjs`)
 Upstream: pi-mcp-adapter @ 3d953f90 (mcp-auth-flow.ts via SDK 2.0 auth)
 rpi: crates/rpi-ext-mcp-adapter oauth.rs
 

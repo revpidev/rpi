@@ -371,7 +371,7 @@ pub async fn initialize_mcp(
                 }
                 update_server_metadata(&state, &name);
                 update_metadata_cache(&state, &name);
-                // init.ts:417-421 @ 10a45367: clearFailure with a reason
+                // init.ts:424 @ 10a45367: clearFailure with a reason
                 // fires the metadata hook only when a window was active;
                 // otherwise the plain notify keeps the surface fresh.
                 if !state

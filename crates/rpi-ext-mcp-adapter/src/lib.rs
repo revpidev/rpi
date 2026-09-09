@@ -239,8 +239,8 @@ fn sync_tool_surface(state: &PluginState) {
                     "description": description,
                     "promptSnippet": "MCP gateway — status, search, describe, auth, and single MCP tool calls",
                     "parameters": proxy::tool_parameters_schema(),
-                    // renderMcpProxyToolCall (index.ts:698) + renderMcpToolResult
-                    // (index.ts:719): the host attaches the render closures and
+                    // renderMcpProxyToolCall (tool-result-renderer.ts:304) + renderMcpToolResult
+                    // (index.ts:231/284 @ 10a45367): the host attaches the render closures and
                     // dispatches {"kind":"render","what":"toolCall"|"toolResult"}
                     // back here (host_call.rs:245-289).
                     "renderCall": true,
@@ -1303,7 +1303,7 @@ fn reconnect_server(
             crate::manager::ConnectionStatus::Connected => {
                 proxy::update_server_metadata(runtime, name);
                 proxy::update_metadata_cache(runtime, name);
-                // commands.ts:198-204 @ 10a45367: a reconnect clears the
+                // commands.ts:224 @ 10a45367: a reconnect clears the
                 // failure window with a reason; the plain notify covers the
                 // no-active-window case.
                 if !runtime

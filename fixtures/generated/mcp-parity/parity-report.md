@@ -1,8 +1,8 @@
 # MCP adapter cross-implementation parity report (design §5.2)
 
-Generated: 2026-09-09T10:01:47.792Z (rerun: `node scripts/mcp-parity/run-mcp-parity.mjs`)
+Generated: 2026-09-09T10:33:49.914Z (rerun: `node scripts/mcp-parity/run-mcp-parity.mjs`)
 Upstream: pi-mcp-adapter @ 3d953f90 (server-manager.ts, McpServerManager)
-rpi: crates/rpi-ext-mcp-adapter @ a5aa2db (uncommitted working tree)
+rpi: crates/rpi-ext-mcp-adapter @ 3612329 (uncommitted working tree)
 
 Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server.
 
