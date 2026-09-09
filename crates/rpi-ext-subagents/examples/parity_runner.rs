@@ -238,6 +238,7 @@ fn run_discovery_case(case: &Value) -> Value {
         agents.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
         let mut diagnostics: Vec<Value> = diagnostics
             .into_iter()
+            .filter(|diagnostic| diagnostic.path.starts_with(&user_dir))
             .map(|diagnostic| {
                 json!({
                     "path": relativize(&diagnostic.path),
