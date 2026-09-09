@@ -86,8 +86,8 @@ use rpi_tui::components::text::Text;
 use rpi_tui::components::truncated_text::TruncatedText;
 use rpi_tui::keybindings as tui_keybindings;
 use rpi_tui::tui::{
-    shared_component_from_boxed, Component, Container, Focusable, RenderHandle, SharedComponent,
-    TuiMode, TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions,
+    shared_component_from_boxed, Component, Container, Focusable, OverlayHandle, RenderHandle,
+    SharedComponent, TuiMode, TuiMouseEvent, TuiMouseHandlerResult, TuiStopOptions,
 };
 use rpi_tui::tui_handle::{Renderer, TuiHandle};
 use rpi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenRenderState};
@@ -152,6 +152,7 @@ fn now_millis() -> u64 {
 /// follow-up flow is still a T13/T15 hook).
 #[allow(dead_code)]
 pub(crate) mod commands_selectors;
+pub(crate) mod component_registry;
 pub(crate) mod ui_bridge;
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1241,6 +1242,9 @@ pub(crate) struct InteractiveUi {
     /// the new theme (TE11 FR-E.3 theme replay).
     extension_ui_bridge:
         Mutex<Option<Arc<super::interactive_mode::ui_bridge::InteractiveUiBridge>>>,
+    /// Interactive custom UI components (ADR-0024 / V14-21 C1): the native
+    /// host registry behind `ui.mountComponent` … `ui.disposeComponent`.
+    pub(crate) component_registry: component_registry::ComponentRegistry,
 
     /// The built-in startup header (only when not quiet), for the
     /// tools-expanded linkage (interactive-mode.ts:3812-3824).
@@ -1400,6 +1404,93 @@ pub(crate) struct InteractiveUi {
     /// renderer (interactive-mode.ts:2314-2318).
     pub(crate) extension_input_listeners:
         Mutex<Vec<(u64, rpi_ext_host::api::TerminalInputHandler)>>,
+}
+
+/// Live-TUI mount surface for the interactive component registry
+/// (ADR-0024 C1). Holds a weak UI reference so a mounted component's state
+/// never keeps the UI (and its session) alive; every operation degrades to a
+/// no-op when the UI is gone (process teardown).
+pub(crate) struct UiMountPoint {
+    ui: Weak<InteractiveUi>,
+}
+
+/// Live [`component_registry::OverlayControl`] over an rpi-tui overlay
+/// handle.
+struct TuiOverlayControl(OverlayHandle);
+
+impl UiMountPoint {
+    pub(crate) fn new(ui: &Arc<InteractiveUi>) -> Self {
+        Self {
+            ui: Arc::downgrade(ui),
+        }
+    }
+}
+
+impl component_registry::OverlayControl for TuiOverlayControl {
+    fn set_hidden(&self, hidden: bool) {
+        self.0.set_hidden(hidden);
+    }
+
+    fn focus(&self) {
+        self.0.focus();
+    }
+
+    fn hide(&self) {
+        self.0.hide();
+    }
+}
+
+impl component_registry::ComponentMountPoint for UiMountPoint {
+    fn mount_overlay(
+        &self,
+        entry: SharedComponent,
+        options: rpi_tui::tui::OverlayOptions,
+    ) -> Option<Arc<dyn component_registry::OverlayControl>> {
+        self.ui.upgrade().map(|ui| {
+            let handle = ui.ui.show_overlay(entry, Some(options));
+            Arc::new(TuiOverlayControl(handle)) as Arc<dyn component_registry::OverlayControl>
+        })
+    }
+
+    fn show_editor_region(&self, entry: SharedComponent) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.show_selector(entry);
+        }
+    }
+
+    fn hide_editor_region(&self, entry: &SharedComponent) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.hide_selector_if_current(entry);
+        }
+    }
+
+    fn request_render(&self) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.render_handle.request_render();
+        }
+    }
+
+    fn add_input_listener(&self, listener: rpi_tui::tui::TuiInputListener) -> u64 {
+        match self.ui.upgrade() {
+            Some(ui) => ui.ui.add_input_listener(listener),
+            None => 0,
+        }
+    }
+
+    fn remove_input_listener(&self, id: u64) {
+        if let Some(ui) = self.ui.upgrade() {
+            ui.ui.remove_input_listener(id);
+        }
+    }
+
+    fn terminal_size(&self) -> (usize, usize) {
+        match self.ui.upgrade() {
+            Some(ui) => ui
+                .ui
+                .with_terminal(|terminal| (terminal.columns() as usize, terminal.rows() as usize)),
+            None => (0, 0),
+        }
+    }
 }
 
 /// The last `showStatus` text child (tracked for back-to-back coalescing).
@@ -1704,6 +1795,13 @@ impl InteractiveUi {
     /// `rebindCurrentSession`, interactive-mode.ts:1732-1758). Callers must
     /// re-subscribe via [`InteractiveUi::subscribe_to_agent`] afterwards.
     pub(crate) fn set_session(&self, session: AgentSession) {
+        // ADR-0024 C1 (R-U1.5): a mounted interactive component belongs to
+        // the session that mounted it; a rebind (session switch/reload)
+        // delivers `dispose{sessionReload}` and force-unmounts after the
+        // grace. The rest of the host-forced matrix (tool abort / shutdown /
+        // extension unload) is wired in C3.
+        self.component_registry
+            .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionReload);
         *self
             .session
             .write()
@@ -2504,6 +2602,16 @@ impl InteractiveUi {
         drop(active);
         // Clear the settings selector weak ref (selector is no longer mounted).
         *lock(&self.settings_selector_weak) = None;
+    }
+
+    /// Whether `entry` still owns the editor region (ADR-0024 C1): the
+    /// interactive component bridge uses this to avoid restoring a component
+    /// after a superseding selector replaced it (the same guard as
+    /// [`Self::hide_selector_if_current`]).
+    pub(crate) fn selector_is_current(&self, entry: &SharedComponent) -> bool {
+        lock(&self.active_selector)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
     }
 
     /// Swap the editor-container content to `entry` and move focus to
@@ -3754,6 +3862,12 @@ impl InteractiveUi {
         if let Some(bridge) = lock(&self.extension_ui_bridge).clone() {
             bridge.retheme_widgets();
         }
+        // Interactive components get the new theme JSON so they can repaint
+        // on their next frame (R-U3.4, ADR-0024 C1).
+        self.component_registry.notify_theme(
+            crate::core::themes::theme_json_value(theme.name.as_deref().unwrap_or("dark"))
+                .unwrap_or_else(crate::core::themes::default_theme_json),
+        );
         self.ui.request_render(false);
     }
 
@@ -4357,6 +4471,7 @@ impl InteractiveMode {
             active_selector: Mutex::new(None),
             self_arc: Mutex::new(None),
             extension_ui_bridge: Mutex::new(None),
+            component_registry: component_registry::ComponentRegistry::new(),
             changelog_markdown: Mutex::new(None),
             built_in_header: Mutex::new(None),
             streaming: Mutex::new(None),
@@ -8712,6 +8827,301 @@ mod tests {
         let dark_theme = crate::core::themes::load_theme("dark", None).unwrap();
         ui.apply_theme(Arc::new(dark_theme));
         assert_eq!(lock(&ui.widgets_above).children.len(), 1);
+        mode.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------------
+    // V14-21 C1: interactive component registry (native end-to-end)
+    // ---------------------------------------------------------------------
+
+    /// FR-A/B/C/D/E/F end-to-end on the real TUI: mount → render → keyboard
+    /// input through the terminal → `done` unmount, with the frame composited
+    /// into the captured terminal writes.
+    #[tokio::test]
+    async fn c1_component_overlay_mount_render_input_done() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{ComponentEvent, ComponentFrame, MountOptions};
+
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+        let options = MountOptions {
+            label: Some("c1-e2e".to_owned()),
+            ..MountOptions::default()
+        };
+        let handle = bridge.mount_component("ext", options).await.expect("mount");
+        ui.ui.tick(std::time::Instant::now());
+        bridge
+            .render_component(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["C1-OVERLAY-FRAME".to_owned()]),
+            )
+            .expect("render");
+        ui.ui.render_now(true);
+        assert!(
+            terminal.writes().contains("C1-OVERLAY-FRAME"),
+            "frame composited into the terminal writes"
+        );
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("initial resize")
+        .expect("poll");
+        assert!(
+            matches!(initial, ComponentEvent::Resize { .. }),
+            "{initial:?}"
+        );
+
+        // Raw key bytes reach the focused component (R-U2.1).
+        terminal.feed("x");
+        ui.ui.tick(std::time::Instant::now());
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("input event")
+        .expect("poll");
+        assert_eq!(
+            event,
+            ComponentEvent::Input {
+                data: "x".to_owned()
+            }
+        );
+
+        // `done` unmounts and removes the overlay (R-U1.4).
+        bridge
+            .render_component(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["final".to_owned()])
+                    .with_done(serde_json::json!({"ok": true})),
+            )
+            .expect("done");
+        assert_eq!(ui.component_registry.active_handle(), None);
+        assert!(!ui.ui.has_overlay(), "overlay removed on done");
+        mode.shutdown().await;
+    }
+
+    /// FR-E/R-U2.2/R-U10: a host dialog blurs the component, keys go to the
+    /// dialog only, and closing the dialog restores component focus.
+    #[tokio::test]
+    async fn c1_component_dialog_blur_focus_and_key_isolation() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{ComponentEvent, ComponentFrame, MountOptions};
+
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = Arc::new(ui_bridge::InteractiveUiBridge::new(&mode.ui_state));
+        let ui = &mode.ui_state;
+        let handle = bridge
+            .mount_component("ext", MountOptions::default())
+            .await
+            .expect("mount");
+        ui.ui.tick(std::time::Instant::now());
+        bridge
+            .render_component(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["dialog-under-test".to_owned()]),
+            )
+            .expect("render");
+        ui.ui.render_now(true);
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("initial resize")
+        .expect("poll");
+        assert!(
+            matches!(initial, ComponentEvent::Resize { .. }),
+            "{initial:?}"
+        );
+
+        // Open a bridge dialog on another task; it stays open until the test
+        // feeds Enter to its selector.
+        let dialog_bridge = Arc::clone(&bridge);
+        let dialog = tokio::spawn(async move {
+            dialog_bridge
+                .select("Pick", &["Allow".to_owned()], None)
+                .await
+        });
+        for _ in 0..200 {
+            if lock(&ui.active_selector).is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("blur")
+        .expect("poll");
+        assert_eq!(event, ComponentEvent::Blur);
+
+        // Keys during the dialog go to the dialog, not the component.
+        terminal.feed("z");
+        ui.ui.tick(std::time::Instant::now());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                bridge.poll_component("ext", handle)
+            )
+            .await
+            .is_err(),
+            "blurred component must not receive keys"
+        );
+        let selector = lock(&ui.active_selector).clone().expect("selector");
+        selector.lock().unwrap().handle_input("\r");
+        assert_eq!(dialog.await.expect("dialog task"), Some("Allow".to_owned()));
+
+        // Dialog closed → focus restored (R-U2.2).
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("focus")
+        .expect("poll");
+        assert_eq!(event, ComponentEvent::Focus);
+        bridge.dispose_component("ext", handle).expect("dispose");
+        mode.shutdown().await;
+    }
+
+    /// FR-B/E/R-U4.2/R-U2.3: editor-region mount, hide/show restore and the
+    /// `keysWhenHidden` whitelist through the real input pipeline.
+    #[tokio::test]
+    async fn c1_component_editor_region_hidden_keys_roundtrip() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{ComponentEvent, ComponentFrame, MountOptions};
+
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+        let options = MountOptions {
+            overlay: false,
+            keys_when_hidden: vec!["ctrl+]".to_owned()],
+            ..MountOptions::default()
+        };
+        let handle = bridge.mount_component("ext", options).await.expect("mount");
+        ui.ui.tick(std::time::Instant::now());
+        assert!(lock(&ui.active_selector).is_some(), "editor region owned");
+        bridge
+            .render_component(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["C1-EDITOR-FRAME".to_owned()]),
+            )
+            .expect("render");
+        ui.ui.render_now(true);
+        assert!(terminal.writes().contains("C1-EDITOR-FRAME"));
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("initial resize")
+        .expect("poll");
+        assert!(
+            matches!(initial, ComponentEvent::Resize { .. }),
+            "{initial:?}"
+        );
+
+        // Hide restores the editor; the whitelisted key still routes.
+        bridge
+            .set_component_hidden("ext", handle, true)
+            .expect("hide");
+        assert!(lock(&ui.active_selector).is_none(), "editor restored");
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("visibility")
+        .expect("poll");
+        assert_eq!(event, ComponentEvent::Visibility { hidden: true });
+        terminal.feed("\u{1d}");
+        ui.ui.tick(std::time::Instant::now());
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("hidden key")
+        .expect("poll");
+        assert_eq!(
+            event,
+            ComponentEvent::Input {
+                data: "\u{1d}".to_owned()
+            }
+        );
+
+        // Unhide remounts the region; dispose restores the editor.
+        bridge
+            .set_component_hidden("ext", handle, false)
+            .expect("show");
+        assert!(lock(&ui.active_selector).is_some(), "region remounted");
+        bridge.dispose_component("ext", handle).expect("dispose");
+        assert!(lock(&ui.active_selector).is_none());
+        mode.shutdown().await;
+    }
+
+    /// FR-E/R-U2.4: `nonCapturing` never steals the keyboard.
+    #[tokio::test]
+    async fn c1_component_non_capturing_does_not_steal_keys() {
+        use rpi_ext_host::api::UiBridge;
+        use rpi_ext_host::interactive_ui::{
+            ComponentEvent, MountOptions, OverlayOptions as WireOverlay,
+        };
+
+        let (mut mode, terminal, _session) = mode_harness().await;
+        mode.init().await;
+        let bridge = ui_bridge::InteractiveUiBridge::new(&mode.ui_state);
+        let ui = &mode.ui_state;
+        let options = MountOptions {
+            overlay_options: Some(WireOverlay {
+                non_capturing: true,
+                ..WireOverlay::default()
+            }),
+            ..MountOptions::default()
+        };
+        let handle = bridge.mount_component("ext", options).await.expect("mount");
+        ui.ui.tick(std::time::Instant::now());
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            bridge.poll_component("ext", handle),
+        )
+        .await
+        .expect("initial resize")
+        .expect("poll");
+        assert!(
+            matches!(initial, ComponentEvent::Resize { .. }),
+            "{initial:?}"
+        );
+        terminal.feed("q");
+        ui.ui.tick(std::time::Instant::now());
+        assert!(
+            lock(&ui.editor).get_text().contains('q'),
+            "nonCapturing overlay leaves the editor focused"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                bridge.poll_component("ext", handle)
+            )
+            .await
+            .is_err(),
+            "nonCapturing component must not receive keys"
+        );
+        bridge.dispose_component("ext", handle).expect("dispose");
         mode.shutdown().await;
     }
 

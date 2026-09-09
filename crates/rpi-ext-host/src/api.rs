@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ExtError;
+use crate::interactive_ui::{
+    ComponentEvent, ComponentFrame, ComponentHandle, InteractiveUiError, InteractiveUiErrorKind,
+    MountOptions,
+};
 use crate::types::{
     ArgumentCompletionsFn, CommandHandlerFn, ComponentTree, EntryRenderFn, ExtSourceInfo,
     ExtensionFlag, ExtensionMode, ExtensionShortcut, FlagType, FlagValue, MessageRenderFn,
@@ -805,6 +809,97 @@ pub trait UiBridge: Send + Sync {
     fn get_tools_expanded(&self) -> bool;
     fn set_tools_expanded(&self, expanded: bool);
 
+    // -- Interactive custom UI ABI (ADR-0024; V14-20 C0 protocol,
+    //    V14-21 C1 native implementation) ---------------------------------
+
+    /// Whether this bridge implements the interactive custom UI ABI
+    /// (ADR-0024). The dispatch layer asks this **before** validating args,
+    /// so a guest probe (R-U9.2) on a mode without an interactive UI
+    /// (RPC/print/null) still gets `unknownMethod` instead of a misleading
+    /// `invalidRequest`. Decorators forward it; only the TUI bridge answers
+    /// `true` in v0.1.4.
+    fn supports_interactive_ui(&self) -> bool {
+        false
+    }
+
+    /// `ui.mountComponent` (R-U1.1 / R-U4): mount an interactive component
+    /// (overlay or editor region) and return its handle. Non-blocking.
+    ///
+    /// `owner` is the calling extension's identity (the
+    /// [`crate::bridges::NamespacedUiBridge`] namespace); the registry keeps
+    /// one active slot per owner (R-U1.6). Host modes without an
+    /// interactive UI (RPC/print/null) keep the default `unknownMethod`.
+    async fn mount_component(
+        &self,
+        _owner: &str,
+        _options: MountOptions,
+    ) -> Result<ComponentHandle, InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.mountComponent"))
+    }
+
+    /// `ui.pollComponent` (R-U1.2): **blocking** wait for the next event of
+    /// `handle` (the guest thread parks; the host runtime keeps running).
+    async fn poll_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+    ) -> Result<ComponentEvent, InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.pollComponent"))
+    }
+
+    /// `ui.renderComponent` (R-U1.3 / R-U3): replace the component frame and
+    /// request a redraw (no-op when the frame exceeds the limits).
+    fn render_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+        _frame: ComponentFrame,
+    ) -> Result<(), InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.renderComponent"))
+    }
+
+    /// `ui.setComponentHidden` (R-U4.3 / R-U4.4): collapse/expand and echo a
+    /// `visibility` event.
+    fn set_component_hidden(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+        _hidden: bool,
+    ) -> Result<(), InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.setComponentHidden"))
+    }
+
+    /// `ui.wakeComponent` (R-U5.2): wake a blocked `pollComponent` with a
+    /// `render` event. C1 keeps the queue/`Notify` infrastructure but the
+    /// method itself lands with C2 (native background threads + wasm tick).
+    fn wake_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+    ) -> Result<(), InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.wakeComponent"))
+    }
+
+    /// `ui.disposeComponent` (R-U1.4 / R-U6.4): guest-side unmount; repeated
+    /// calls are idempotent no-ops.
+    fn dispose_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+    ) -> Result<(), InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.disposeComponent"))
+    }
+
+    /// `ui.editExternal` (R-U11): host external editor; lands with C3.
+    async fn edit_external(
+        &self,
+        _owner: &str,
+        _text: &str,
+        _language: Option<&str>,
+    ) -> Result<Option<String>, InteractiveUiError> {
+        Err(interactive_ui_unsupported("ui.editExternal"))
+    }
+
     /// Identity of the no-op bridge: upstream computes
     /// `hasUI = uiContext !== noOpUIContext` (runner.ts:438-440), so the
     /// null bridge must be recognizable. Real bridges leave this false.
@@ -818,6 +913,15 @@ pub trait UiBridge: Send + Sync {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+}
+
+/// Default `unknownMethod` for the interactive UI ABI (R-U9.2 probe signal)
+/// on hosts/modes that do not implement it (RPC/print/null bridges).
+fn interactive_ui_unsupported(method: &str) -> InteractiveUiError {
+    InteractiveUiError::new(
+        InteractiveUiErrorKind::UnknownMethod,
+        format!("{method}: interactive UI ABI is not supported by this host mode"),
+    )
 }
 
 // ============================================================================

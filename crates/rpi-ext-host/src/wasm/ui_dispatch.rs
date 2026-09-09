@@ -20,6 +20,106 @@ fn err<T>(kind: &'static str, message: impl Into<String>) -> Result<T, (&'static
     Err((kind, message.into()))
 }
 
+/// Map a structured bridge error onto the ABI error-kind table.
+fn ui_error(error: crate::interactive_ui::InteractiveUiError) -> (&'static str, String) {
+    use crate::interactive_ui::InteractiveUiErrorKind as Kind;
+    let kind = match error.kind {
+        Kind::CapabilityDenied => "capabilityDenied",
+        Kind::InvalidRequest => "invalidRequest",
+        Kind::UnknownMethod => "unknownMethod",
+        Kind::Call => "call",
+        Kind::Internal => "internal",
+        Kind::HandlerError => "handlerError",
+        Kind::FuelExhausted => "fuelExhausted",
+        Kind::ProtocolError => "protocolError",
+        // Forward-compatible unknown kinds must never masquerade as a
+        // known kind; `internal` is the safe fallback.
+        Kind::Other(_) => "internal",
+    };
+    (kind, error.message)
+}
+
+fn parse_ui_args<T: serde::de::DeserializeOwned>(
+    method: &str,
+    args: Value,
+) -> Result<T, (&'static str, String)> {
+    serde_json::from_value(args).map_err(|error| ("invalidRequest", format!("{method}: {error}")))
+}
+
+/// Interactive custom UI ABI dispatch (ADR-0024 §2.1). The blocking calls
+/// (`pollComponent`, `editExternal`) park the guest thread through the same
+/// [`block_on`] mechanism as `ui.select`; the host runtime keeps running.
+fn dispatch_interactive_ui(
+    state: &mut HostState,
+    ui: &Arc<dyn crate::api::UiBridge>,
+    method: &str,
+    args: Value,
+) -> CallResult {
+    use crate::interactive_ui::{
+        DisposeComponentArgs, EditExternalArgs, MountComponentArgs, PollComponentArgs,
+        RenderComponentArgs, SetComponentHiddenArgs, WakeComponentArgs,
+    };
+    // The context-level namespace is applied by `NamespacedUiBridge`; direct
+    // (host-level) callers fall back to the extension path as the owner.
+    let owner = state.api.extension().path.clone();
+    match method {
+        crate::interactive_ui::METHOD_MOUNT_COMPONENT => {
+            let args: MountComponentArgs = parse_ui_args(method, args)?;
+            let ui = Arc::clone(ui);
+            let handle = block_on(&state.async_handle, async move {
+                ui.mount_component(&owner, args.options).await
+            })?
+            .map_err(ui_error)?;
+            Ok(json!({ "handle": handle.0 }))
+        }
+        crate::interactive_ui::METHOD_POLL_COMPONENT => {
+            let args: PollComponentArgs = parse_ui_args(method, args)?;
+            let ui = Arc::clone(ui);
+            let event = block_on(&state.async_handle, async move {
+                ui.poll_component(&owner, args.handle).await
+            })?
+            .map_err(ui_error)?;
+            Ok(json!({ "event": event }))
+        }
+        crate::interactive_ui::METHOD_RENDER_COMPONENT => {
+            let args: RenderComponentArgs = parse_ui_args(method, args)?;
+            ui.render_component(&owner, args.handle, args.frame)
+                .map_err(ui_error)?;
+            Ok(json!({ "ok": true }))
+        }
+        crate::interactive_ui::METHOD_SET_COMPONENT_HIDDEN => {
+            let args: SetComponentHiddenArgs = parse_ui_args(method, args)?;
+            ui.set_component_hidden(&owner, args.handle, args.hidden)
+                .map_err(ui_error)?;
+            Ok(json!({ "ok": true }))
+        }
+        crate::interactive_ui::METHOD_WAKE_COMPONENT => {
+            let args: WakeComponentArgs = parse_ui_args(method, args)?;
+            ui.wake_component(&owner, args.handle).map_err(ui_error)?;
+            Ok(json!({ "ok": true }))
+        }
+        crate::interactive_ui::METHOD_DISPOSE_COMPONENT => {
+            let args: DisposeComponentArgs = parse_ui_args(method, args)?;
+            ui.dispose_component(&owner, args.handle)
+                .map_err(ui_error)?;
+            Ok(json!({ "ok": true }))
+        }
+        crate::interactive_ui::METHOD_EDIT_EXTERNAL => {
+            let args: EditExternalArgs = parse_ui_args(method, args)?;
+            let ui = Arc::clone(ui);
+            let text = block_on(&state.async_handle, async move {
+                ui.edit_external(&owner, &args.text, args.language.as_deref())
+                    .await
+            })?
+            .map_err(ui_error)?;
+            Ok(json!({ "text": text }))
+        }
+        // `is_interactive_ui_method` gates the caller; keep the fallback
+        // fail-closed if the frozen method table ever grows.
+        _ => err("unknownMethod", format!("unknown host call: {method}")),
+    }
+}
+
 fn dialog_options(args: &Value) -> Option<UiDialogOptions> {
     args.get("timeout")
         .and_then(Value::as_u64)
@@ -44,26 +144,27 @@ fn widget_content(args: &Value) -> Option<WidgetContent> {
 }
 
 pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> CallResult {
-    // v0.1.4 C0 (ADR-0024): the seven interactive custom UI host-calls are
-    // frozen in the method table but not implemented yet. They answer
-    // `unknownMethod` (the R-U9.2 probe signal) **before** the UI-bridge
-    // lookup, so the answer does not depend on the bridge being bound — a
-    // guest probing during load sees the same "unsupported" result as one
-    // probing later. Capability `ui` was already enforced by the caller.
-    if crate::interactive_ui::is_interactive_ui_method(method) {
-        return err(
-            "unknownMethod",
-            format!(
-                "{method}: interactive UI ABI is not implemented in this host build \
-                 (C0 protocol freeze; implementation lands with C1/C2)"
-            ),
-        );
-    }
     let ui = state
         .api
         .context()
         .ui()
         .map_err(|e| ("stale", e.to_string()))?;
+    // v0.1.4 C1 (ADR-0024 / V14-21): the interactive custom UI host-calls
+    // route to the mode bridge. The bridge stamps the calling extension's
+    // identity (`NamespacedUiBridge`) and owns the component registry; host
+    // modes without an interactive UI answer `unknownMethod` (the R-U9.2
+    // probe signal) **before** args are validated, so a probe never depends
+    // on the method's argument shape. `wakeComponent`/`editExternal` are
+    // forwarded too and answer `unknownMethod` until C2/C3 land.
+    if crate::interactive_ui::is_interactive_ui_method(method) {
+        if !ui.supports_interactive_ui() {
+            return err(
+                "unknownMethod",
+                format!("{method}: interactive UI ABI is not supported by this host mode"),
+            );
+        }
+        return dispatch_interactive_ui(state, &ui, method, args);
+    }
     match method {
         "ui.select" => {
             let title = str_arg(&args, "title").unwrap_or_default().to_owned();
@@ -246,7 +347,11 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::api::{
+        ExtensionApi, ExtensionRuntime, LoadedExtension, SetThemeResult, TerminalInputHandler,
+        ThemeInfo, UiBridge, Unsubscribe,
+    };
+    use crate::types::{ComponentTree, ExtensionMode};
     use crate::wasm::{Capability, DispatchTarget, HostState, NativeForward};
 
     extern "C" fn dummy_dispatch(
@@ -282,14 +387,14 @@ mod tests {
     /// `unknownMethod` — the guest probe signal — without touching the UI
     /// bridge (so an unbound bridge cannot turn the probe into `stale`).
     #[test]
-    fn interactive_ui_methods_answer_unknown_method_in_c0() {
+    fn interactive_ui_methods_answer_unknown_method_on_unbound_host() {
         let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
         for method in crate::interactive_ui::INTERACTIVE_UI_METHODS {
             match dispatch(&mut state, method, serde_json::json!({})) {
                 Err((kind, message)) => {
                     assert_eq!(kind, "unknownMethod", "{method}");
                     assert!(
-                        message.contains("C0 protocol freeze"),
+                        message.contains("not supported by this host mode"),
                         "{method}: {message}"
                     );
                 }
@@ -298,11 +403,286 @@ mod tests {
         }
     }
 
-    /// V14-20 FR-E (R-U8.1): the capability gate runs before the empty
-    /// implementation, and the pre-existing `ui.custom` path is untouched
-    /// (G2: it still reaches its own arm instead of the C0 answer).
+    /// Scripted `UiBridge` for the C1 dispatch tests: records the owner and
+    /// args, answers the five C1 methods, keeps `wake`/`editExternal` at
+    /// `unknownMethod` (C2/C3 scope).
+    struct ScriptedC1Bridge {
+        calls: std::sync::Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl ScriptedC1Bridge {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<(String, String, Value)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UiBridge for ScriptedC1Bridge {
+        async fn select(
+            &self,
+            _t: &str,
+            _o: &[String],
+            _opts: Option<UiDialogOptions>,
+        ) -> Option<String> {
+            None
+        }
+        async fn confirm(&self, _t: &str, _m: &str, _opts: Option<UiDialogOptions>) -> bool {
+            false
+        }
+        async fn input(
+            &self,
+            _t: &str,
+            _p: Option<&str>,
+            _opts: Option<UiDialogOptions>,
+        ) -> Option<String> {
+            None
+        }
+        fn notify(&self, _m: &str, _k: NotifyType) {}
+        fn on_terminal_input(&self, _h: TerminalInputHandler) -> Unsubscribe {
+            Box::new(|| {})
+        }
+        fn set_status(&self, _k: &str, _t: Option<&str>) {}
+        fn set_working_message(&self, _m: Option<&str>) {}
+        fn set_working_visible(&self, _v: bool) {}
+        fn set_working_indicator(&self, _o: Option<WorkingIndicatorOptions>) {}
+        fn set_hidden_thinking_label(&self, _l: Option<&str>) {}
+        fn set_widget(
+            &self,
+            _k: &str,
+            _c: Option<WidgetContent>,
+            _o: Option<ExtensionWidgetOptions>,
+        ) {
+        }
+        fn set_footer(&self, _c: Option<ComponentTree>) {}
+        fn set_header(&self, _c: Option<ComponentTree>) {}
+        fn set_title(&self, _t: &str) {}
+        async fn custom(&self, _c: ComponentTree, _o: Option<Value>) -> Option<Value> {
+            None
+        }
+        fn paste_to_editor(&self, _t: &str) {}
+        fn set_editor_text(&self, _t: &str) {}
+        fn get_editor_text(&self) -> String {
+            String::new()
+        }
+        async fn editor(&self, _t: &str, _p: Option<&str>) -> Option<String> {
+            None
+        }
+        fn add_autocomplete_provider(&self, _p: Value) {}
+        fn set_editor_component(&self, _c: Option<ComponentTree>) {}
+        fn get_editor_component(&self) -> Option<ComponentTree> {
+            None
+        }
+        fn theme(&self) -> Value {
+            Value::Null
+        }
+        fn get_all_themes(&self) -> Vec<ThemeInfo> {
+            Vec::new()
+        }
+        fn get_theme(&self, _n: &str) -> Option<Value> {
+            None
+        }
+        fn set_theme(&self, _t: Value) -> SetThemeResult {
+            SetThemeResult {
+                success: false,
+                error: None,
+            }
+        }
+        fn get_tools_expanded(&self) -> bool {
+            false
+        }
+        fn set_tools_expanded(&self, _e: bool) {}
+
+        fn supports_interactive_ui(&self) -> bool {
+            true
+        }
+
+        async fn mount_component(
+            &self,
+            owner: &str,
+            options: crate::interactive_ui::MountOptions,
+        ) -> Result<crate::interactive_ui::ComponentHandle, crate::interactive_ui::InteractiveUiError>
+        {
+            self.calls.lock().unwrap().push((
+                "mount".to_owned(),
+                owner.to_owned(),
+                serde_json::to_value(options).unwrap(),
+            ));
+            Ok(crate::interactive_ui::ComponentHandle(7))
+        }
+
+        async fn poll_component(
+            &self,
+            owner: &str,
+            handle: crate::interactive_ui::ComponentHandle,
+        ) -> Result<crate::interactive_ui::ComponentEvent, crate::interactive_ui::InteractiveUiError>
+        {
+            self.calls.lock().unwrap().push((
+                "poll".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "handle": handle.0 }),
+            ));
+            Ok(crate::interactive_ui::ComponentEvent::Tick)
+        }
+
+        fn render_component(
+            &self,
+            owner: &str,
+            handle: crate::interactive_ui::ComponentHandle,
+            frame: crate::interactive_ui::ComponentFrame,
+        ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+            self.calls.lock().unwrap().push((
+                "render".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "handle": handle.0, "lines": frame.lines }),
+            ));
+            Ok(())
+        }
+
+        fn set_component_hidden(
+            &self,
+            owner: &str,
+            handle: crate::interactive_ui::ComponentHandle,
+            hidden: bool,
+        ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+            self.calls.lock().unwrap().push((
+                "hidden".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "handle": handle.0, "hidden": hidden }),
+            ));
+            Ok(())
+        }
+
+        fn dispose_component(
+            &self,
+            owner: &str,
+            handle: crate::interactive_ui::ComponentHandle,
+        ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+            self.calls.lock().unwrap().push((
+                "dispose".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "handle": handle.0 }),
+            ));
+            Ok(())
+        }
+
+        fn wake_component(
+            &self,
+            _owner: &str,
+            _handle: crate::interactive_ui::ComponentHandle,
+        ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+            Err(crate::interactive_ui::InteractiveUiError::new(
+                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod,
+                "ui.wakeComponent: lands with C2",
+            ))
+        }
+
+        async fn edit_external(
+            &self,
+            _owner: &str,
+            _text: &str,
+            _language: Option<&str>,
+        ) -> Result<Option<String>, crate::interactive_ui::InteractiveUiError> {
+            Err(crate::interactive_ui::InteractiveUiError::new(
+                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod,
+                "ui.editExternal: lands with C3",
+            ))
+        }
+    }
+
+    /// V14-21 FR-A…FR-H: the five C1 methods parse args, stamp the
+    /// extension namespace as owner and wrap results in the §2.1 envelopes;
+    /// `wake`/`editExternal` stay `unknownMethod`; invalid args are
+    /// `invalidRequest` **before** any state is created (probe path).
     #[test]
-    fn interactive_ui_capability_gate_precedes_c0_and_ui_custom_is_untouched() {
+    fn component_registry_dispatch_c1_methods() {
+        let bridge = Arc::new(ScriptedC1Bridge::new());
+        let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(bridge.clone()), ExtensionMode::Tui);
+
+        let mounted = dispatch(
+            &mut state,
+            "ui.mountComponent",
+            serde_json::json!({ "options": { "label": "ask_user_question" } }),
+        )
+        .expect("mount dispatch");
+        assert_eq!(mounted, serde_json::json!({ "handle": 7 }));
+
+        let polled = dispatch(
+            &mut state,
+            "ui.pollComponent",
+            serde_json::json!({ "handle": 7 }),
+        )
+        .expect("poll dispatch");
+        assert_eq!(polled, serde_json::json!({ "event": { "type": "tick" } }));
+
+        let rendered = dispatch(
+            &mut state,
+            "ui.renderComponent",
+            serde_json::json!({ "handle": 7, "lines": ["line"] }),
+        )
+        .expect("render dispatch");
+        assert_eq!(rendered, serde_json::json!({ "ok": true }));
+
+        dispatch(
+            &mut state,
+            "ui.setComponentHidden",
+            serde_json::json!({ "handle": 7, "hidden": true }),
+        )
+        .expect("hidden dispatch");
+        dispatch(
+            &mut state,
+            "ui.disposeComponent",
+            serde_json::json!({ "handle": 7 }),
+        )
+        .expect("dispose dispatch");
+
+        // C2/C3 methods stay unknownMethod with their own message.
+        for (method, args) in [
+            ("ui.wakeComponent", serde_json::json!({ "handle": 7 })),
+            ("ui.editExternal", serde_json::json!({ "text": "draft" })),
+        ] {
+            let (kind, message) = dispatch(&mut state, method, args).expect_err("unimplemented");
+            assert_eq!(kind, "unknownMethod", "{method}");
+            assert!(message.contains("lands with C"), "{method}: {message}");
+        }
+
+        // The owner stamped by the namespaced context, not the caller's.
+        let calls = bridge.calls();
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[0].0, "mount");
+        assert!(calls[0].1.contains("inline"), "{calls:?}");
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({ "overlay": true, "tickMs": 0, "keysWhenHidden": [],
+                                 "cursor": true, "maxFrameBytes": 1048576,
+                                 "label": "ask_user_question" })
+        );
+        assert_eq!(
+            calls[2].2,
+            serde_json::json!({ "handle": 7, "lines": ["line"] })
+        );
+
+        // Probe (R-U9.2): empty args fail validation before any mount.
+        let (kind, _) =
+            dispatch(&mut state, "ui.mountComponent", serde_json::json!({})).expect_err("probe");
+        assert_eq!(kind, "invalidRequest");
+        assert_eq!(bridge.calls().len(), 5, "probe must not reach the bridge");
+    }
+
+    /// V14-20 FR-E (R-U8.1): the capability gate runs before the dispatch,
+    /// and the pre-existing `ui.custom` path is untouched (G2: it still
+    /// reaches its own arm).
+    #[test]
+    fn interactive_ui_capability_gate_precedes_dispatch_and_ui_custom_is_untouched() {
         let request = serde_json::to_vec(&serde_json::json!({
             "call": "ui.mountComponent",
             "args": {},
@@ -318,7 +698,8 @@ mod tests {
         let (mut state, _runtime) = host_state(HashSet::from([Capability::Ui]));
         // `ui.custom` keeps its own arm: an unbound slot resolves through the
         // upstream `noOpUIContext` equivalent (NullUiBridge) and returns null,
-        // exactly as before C0 — it is not intercepted by the C0 answer.
+        // exactly as before the interactive UI ABI — it is not intercepted by
+        // the C1 dispatch.
         match dispatch(
             &mut state,
             "ui.custom",

@@ -29,6 +29,10 @@ use rpi_ext_host::api::{
     ThemeInfo, UiBridge, UiDialogOptions, Unsubscribe, WidgetContent, WidgetPlacement,
     WorkingIndicatorOptions,
 };
+use rpi_ext_host::interactive_ui::{
+    ComponentEvent, ComponentFrame, ComponentHandle, InteractiveUiError, InteractiveUiErrorKind,
+    MountOptions,
+};
 use rpi_ext_host::types::ComponentTree;
 use rpi_tui::tui::{Component, Focusable};
 use serde_json::Value;
@@ -103,6 +107,17 @@ impl InteractiveUiBridge {
         self.ui.upgrade()
     }
 
+    /// The live UI or a structured `protocolError` when the bridge outlived
+    /// it (extension host teardown) — never a panic (R-U6.2).
+    fn detached(&self) -> Result<Arc<InteractiveUi>, InteractiveUiError> {
+        self.ui().ok_or_else(|| {
+            InteractiveUiError::new(
+                InteractiveUiErrorKind::ProtocolError,
+                "interactive UI bridge is detached (the TUI is gone)",
+            )
+        })
+    }
+
     /// The live `InteractiveUi` — the L0 escape hatch for built-in native
     /// extensions (llama.cpp manager mounts its native view).
     pub fn interactive_ui(&self) -> Option<Arc<InteractiveUi>> {
@@ -119,6 +134,10 @@ impl InteractiveUiBridge {
         rx: oneshot::Receiver<Option<String>>,
     ) -> Option<String> {
         let ui = self.ui()?;
+        // ADR-0024 C1 (R-U2.2): the four bridge dialogs blur the active
+        // interactive component while they own the keyboard and restore its
+        // focus afterwards (unless it was hidden meanwhile, R-U10.2).
+        ui.component_registry.dialog_opened();
         ui.show_selector(entry.clone());
         let result = match opts.and_then(|o| o.timeout) {
             Some(ms) if ms > 0 => {
@@ -134,8 +153,13 @@ impl InteractiveUiBridge {
         // interactive-mode.ts:4355-4361). By the time we wake, another
         // selector (built-in, or another extension's dialog) may own the
         // editor region; an unconditional hide would close the replacement.
+        // The component focus restore shares that guard: a superseded dialog
+        // must not remount/refocus the component over the replacement.
         if let Some(ui) = self.ui() {
-            ui.hide_selector_if_current(&entry);
+            if ui.selector_is_current(&entry) {
+                ui.hide_selector_if_current(&entry);
+                ui.component_registry.dialog_closed();
+            }
         }
         result
     }
@@ -723,5 +747,88 @@ impl UiBridge for InteractiveUiBridge {
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
+    }
+
+    // -- Interactive custom UI ABI (ADR-0024; V14-21 C1 native) -----------
+
+    fn supports_interactive_ui(&self) -> bool {
+        true
+    }
+
+    async fn mount_component(
+        &self,
+        owner: &str,
+        options: MountOptions,
+    ) -> Result<ComponentHandle, InteractiveUiError> {
+        let ui = self.detached()?;
+        let mount: Arc<dyn super::component_registry::ComponentMountPoint> =
+            Arc::new(super::UiMountPoint::new(&ui));
+        ui.component_registry.mount(owner, options, mount)
+    }
+
+    async fn poll_component(
+        &self,
+        owner: &str,
+        handle: ComponentHandle,
+    ) -> Result<ComponentEvent, InteractiveUiError> {
+        let ui = self.detached()?;
+        ui.component_registry.poll(owner, handle).await
+    }
+
+    fn render_component(
+        &self,
+        owner: &str,
+        handle: ComponentHandle,
+        frame: ComponentFrame,
+    ) -> Result<(), InteractiveUiError> {
+        self.detached()?
+            .component_registry
+            .render(owner, handle, frame)
+    }
+
+    fn set_component_hidden(
+        &self,
+        owner: &str,
+        handle: ComponentHandle,
+        hidden: bool,
+    ) -> Result<(), InteractiveUiError> {
+        self.detached()?
+            .component_registry
+            .set_hidden(owner, handle, hidden)
+    }
+
+    fn wake_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+    ) -> Result<(), InteractiveUiError> {
+        // C1 ships the queue/`Notify` infrastructure; the method is wired in
+        // C2 together with the native background-thread and wasm tick paths
+        // (V14-21 §2.2).
+        Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::UnknownMethod,
+            "ui.wakeComponent: lands with C2 (native background threads + wasm tick)",
+        ))
+    }
+
+    fn dispose_component(
+        &self,
+        owner: &str,
+        handle: ComponentHandle,
+    ) -> Result<(), InteractiveUiError> {
+        self.detached()?.component_registry.dispose(owner, handle)
+    }
+
+    async fn edit_external(
+        &self,
+        _owner: &str,
+        _text: &str,
+        _language: Option<&str>,
+    ) -> Result<Option<String>, InteractiveUiError> {
+        // P1, lands with C3 (R-U11).
+        Err(InteractiveUiError::new(
+            InteractiveUiErrorKind::UnknownMethod,
+            "ui.editExternal: lands with C3",
+        ))
     }
 }

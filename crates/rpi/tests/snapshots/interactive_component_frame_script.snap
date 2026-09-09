@@ -1,0 +1,12 @@
+# frame 0 (width 40)
+header
+
+body line
+# frame 1 (width 40)
+abc_pi:cdef
+[31mred[39m
+# frame 2 (width 40)
+abcde_pi:cfghij
+# frame 3 (width 4)
+clip
+[1mbold

@@ -304,6 +304,78 @@ impl UiBridge for NamespacedUiBridge {
         self.inner.set_tools_expanded(expanded);
     }
 
+    // Interactive custom UI ABI (ADR-0024): the wrapper IS the per-extension
+    // identity, so it stamps every call with its own namespace (an extension
+    // cannot address another extension's component slot, R-U1.6/R-U8.2).
+
+    fn supports_interactive_ui(&self) -> bool {
+        self.inner.supports_interactive_ui()
+    }
+
+    async fn mount_component(
+        &self,
+        _owner: &str,
+        options: crate::interactive_ui::MountOptions,
+    ) -> Result<crate::interactive_ui::ComponentHandle, crate::interactive_ui::InteractiveUiError>
+    {
+        self.inner.mount_component(&self.namespace, options).await
+    }
+
+    async fn poll_component(
+        &self,
+        _owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<crate::interactive_ui::ComponentEvent, crate::interactive_ui::InteractiveUiError>
+    {
+        self.inner.poll_component(&self.namespace, handle).await
+    }
+
+    fn render_component(
+        &self,
+        _owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+        frame: crate::interactive_ui::ComponentFrame,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.render_component(&self.namespace, handle, frame)
+    }
+
+    fn set_component_hidden(
+        &self,
+        _owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+        hidden: bool,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner
+            .set_component_hidden(&self.namespace, handle, hidden)
+    }
+
+    fn wake_component(
+        &self,
+        _owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.wake_component(&self.namespace, handle)
+    }
+
+    fn dispose_component(
+        &self,
+        _owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.dispose_component(&self.namespace, handle)
+    }
+
+    async fn edit_external(
+        &self,
+        _owner: &str,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<Option<String>, crate::interactive_ui::InteractiveUiError> {
+        self.inner
+            .edit_external(&self.namespace, text, language)
+            .await
+    }
+
     fn is_noop(&self) -> bool {
         self.inner.is_noop()
     }
@@ -612,6 +684,74 @@ impl UiBridge for UiPromptBridge {
 
     fn set_tools_expanded(&self, expanded: bool) {
         self.inner.set_tools_expanded(expanded);
+    }
+
+    // Interactive custom UI ABI (ADR-0024) forwards unchanged: these are not
+    // prompts, so they must not open a `ui_prompt_*` span.
+
+    fn supports_interactive_ui(&self) -> bool {
+        self.inner.supports_interactive_ui()
+    }
+
+    async fn mount_component(
+        &self,
+        owner: &str,
+        options: crate::interactive_ui::MountOptions,
+    ) -> Result<crate::interactive_ui::ComponentHandle, crate::interactive_ui::InteractiveUiError>
+    {
+        self.inner.mount_component(owner, options).await
+    }
+
+    async fn poll_component(
+        &self,
+        owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<crate::interactive_ui::ComponentEvent, crate::interactive_ui::InteractiveUiError>
+    {
+        self.inner.poll_component(owner, handle).await
+    }
+
+    fn render_component(
+        &self,
+        owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+        frame: crate::interactive_ui::ComponentFrame,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.render_component(owner, handle, frame)
+    }
+
+    fn set_component_hidden(
+        &self,
+        owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+        hidden: bool,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.set_component_hidden(owner, handle, hidden)
+    }
+
+    fn wake_component(
+        &self,
+        owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.wake_component(owner, handle)
+    }
+
+    fn dispose_component(
+        &self,
+        owner: &str,
+        handle: crate::interactive_ui::ComponentHandle,
+    ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
+        self.inner.dispose_component(owner, handle)
+    }
+
+    async fn edit_external(
+        &self,
+        owner: &str,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<Option<String>, crate::interactive_ui::InteractiveUiError> {
+        self.inner.edit_external(owner, text, language).await
     }
 
     fn is_noop(&self) -> bool {
