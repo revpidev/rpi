@@ -18,8 +18,9 @@
 //! skipped; explicit `mcp({ connect })` still syncs (index.ts:822-824).
 //!
 //! P1-wave scope: OAuth auto-auth (FR-P1-04) and session recovery
-//! (FR-P1-08) are wired into the direct executor (TE-D09/TE-D11); tool
-//! approval (FR-P1-07) and MCP UI sessions (P2) are not.
+//! (FR-P1-08) are wired into the direct executor (TE-D09/TE-D11); MCP UI
+//! sessions (P2) are absent; the approveTools approval gate (FR-P1-07 /
+//! R7.2.2) is wired in `execute_direct_tool` (TE21).
 
 use std::collections::{HashMap, HashSet};
 
