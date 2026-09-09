@@ -544,6 +544,88 @@ async fn w5_navigate_tree_cancel_branch() {
     assert!(cancelled, "session_before_tree cancel propagates");
 }
 
+/// TE21 / `session_tree` payload (agent-session.ts:3288-3295 @ 9841914):
+/// navigation emits `newLeafId`/`oldLeafId` so extensions can rebuild the
+/// active branch. rpi previously emitted a payload-less `{"type"}` event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn w5_navigate_tree_emits_new_and_old_leaf_ids() {
+    let event_log = Arc::new(Mutex::new(Vec::new()));
+    let fixture = runtime_fixture(event_log).await;
+    let session = fixture.runtime.session().clone();
+
+    // Lay three user entries; navigating to the middle one moves the leaf to
+    // its parent (agent-session.ts:3013-3028) and emits the payload.
+    let (first_id, second_id, third_id) = {
+        let manager = session.session_manager();
+        let mut manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let first = manager
+            .append_message(rpi_agent::messages::AgentMessage::User(
+                rpi_ai::types::UserMessage {
+                    role: rpi_ai::types::UserRole::User,
+                    content: rpi_ai::types::UserContent::Text("q1".to_owned()),
+                    timestamp: 1,
+                },
+            ))
+            .expect("user");
+        let second = manager
+            .append_message(rpi_agent::messages::AgentMessage::User(
+                rpi_ai::types::UserMessage {
+                    role: rpi_ai::types::UserRole::User,
+                    content: rpi_ai::types::UserContent::Text("q2".to_owned()),
+                    timestamp: 2,
+                },
+            ))
+            .expect("user2");
+        let third = manager
+            .append_message(rpi_agent::messages::AgentMessage::User(
+                rpi_ai::types::UserMessage {
+                    role: rpi_ai::types::UserRole::User,
+                    content: rpi_ai::types::UserContent::Text("q3".to_owned()),
+                    timestamp: 3,
+                },
+            ))
+            .expect("user3");
+        (first, second, third)
+    };
+
+    let payloads: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = payloads.clone();
+    let host = fixture.hosts.lock().unwrap()[0].clone();
+    let listener = InlineExtension::Anonymous(Arc::new(move |api| {
+        let captured = captured.clone();
+        on_json(&api, ext::EVENT_SESSION_TREE, move |payload| {
+            captured.lock().unwrap().push(payload);
+            Ok(Value::Null)
+        });
+        Box::pin(async { Ok(()) })
+    }));
+    host.load_inline(&[listener]).await;
+
+    let runtime = Arc::new(tokio::sync::Mutex::new(fixture.runtime));
+    let actions = RuntimeCommandActions::new(&runtime);
+    let result = actions.navigate_tree(&second_id, Default::default()).await;
+    assert!(!result, "navigation completes");
+
+    let payloads = payloads.lock().unwrap().clone();
+    assert_eq!(payloads.len(), 1, "exactly one session_tree emit");
+    let payload = &payloads[0];
+    assert_eq!(payload["type"], json!(ext::EVENT_SESSION_TREE));
+    assert_eq!(
+        payload["newLeafId"],
+        json!(first_id),
+        "middle user entry navigates to its parent"
+    );
+    assert_eq!(payload["oldLeafId"], json!(third_id));
+    assert!(
+        payload.get("summaryEntry").is_none(),
+        "no summary entry without summarize"
+    );
+    assert!(
+        payload.get("fromExtension").is_none(),
+        "fromExtension only present with a summary"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // reload（agent-session.ts:2600-2628 + loader.ts:151-155）
 // ---------------------------------------------------------------------------
