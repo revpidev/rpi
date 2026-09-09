@@ -2220,7 +2220,7 @@ pub async fn execute_call(
             .tool_metadata
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        // proxy-modes.ts:968-974 @ 10a45367 (#346): cross-server ambiguity is
+        // proxy-modes.ts:968-972 @ 10a45367 (#346): cross-server ambiguity is
         // fail-closed before first-match selection.
         let exact_matches = get_enabled_tool_matches(state, &metadata, tool_name, true);
         if exact_matches.len() > 1 {
@@ -2232,7 +2232,7 @@ pub async fn execute_call(
             return ambiguous_tool_result("call", tool_name);
         }
         let mut disabled_match: Option<(String, ToolMetadata)> = None;
-        // Pass 1 — exact prefixed name (proxy-modes.ts:981-995 @ 10a45367).
+        // Pass 1 — exact prefixed name (proxy-modes.ts:975-985 @ 10a45367).
         for (server, tools) in metadata.iter() {
             let Some(found) = tools.iter().find(|tool| tool.name == tool_name) else {
                 continue;
@@ -2247,7 +2247,7 @@ pub async fn execute_call(
             tool_meta = Some(found.clone());
             break;
         }
-        // Pass 2 — normalized fallback (proxy-modes.ts:996-1010 @ 10a45367).
+        // Pass 2 — normalized fallback (proxy-modes.ts:986-998 @ 10a45367).
         if tool_meta.is_none() && disabled_match.is_none() {
             for (server, tools) in metadata.iter() {
                 let Some(found) = find_tool_by_name(tools, tool_name) else {
@@ -2657,7 +2657,7 @@ pub async fn execute_call(
                 }
                 mark_keep_alive_after_connect(state, &server_name);
                 connection = Some(new_connection);
-                // proxy-modes.ts:1231-1247 @ 10a45367: the fresh catalog may
+                // proxy-modes.ts:1230-1250 @ 10a45367: the fresh catalog may
                 // resolve the tool differently (or not at all); re-resolve
                 // with the server-scoped/single matcher before calling.
                 let matched = {

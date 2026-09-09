@@ -794,7 +794,7 @@ pub fn has_tool_filters(definition: &ServerEntry) -> bool {
         .any(|value| value.is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())))
 }
 
-/// `buildToolMetadata` (tool-metadata.ts:9-130 @ 10a45367).
+/// `buildToolMetadata` (tool-metadata.ts:9-140 @ 10a45367).
 ///
 /// P0 scope note: upstream also extracts `_meta` UI fields and consults
 /// `isUiToolVisibleToModel`; both are MCP UI (P2 non-goal) and are skipped.

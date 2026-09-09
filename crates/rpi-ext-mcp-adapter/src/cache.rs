@@ -466,7 +466,7 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// `createCachedToolSelectorCandidateIndex` (metadata-cache.ts:258-281
+/// `createCachedToolSelectorCandidateIndex` (metadata-cache.ts:266-288
 /// @ 10a45367): current (non-legacy) candidates of every configured server
 /// with a valid cache, so a legacy-only include/exclude selector cannot
 /// sweep another tool's current name.
@@ -903,7 +903,7 @@ mod tests {
         assert_eq!(names, ["xcodebuild_list_sims", "xcodebuild_read_y"]);
     }
 
-    /// #346 (metadata-cache.ts:258-281 @ 10a45367): the cached cross-server
+    /// #346 (metadata-cache.ts:266-288 @ 10a45367): the cached cross-server
     /// selector index suppresses a legacy-only include selector that would
     /// sweep another server's current name.
     #[test]
