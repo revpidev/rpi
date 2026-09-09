@@ -49,6 +49,9 @@
   取自 v0.66 `src/shared/types.ts:398/537`；聚合语义锚点
   `src/runs/foreground/subagent-executor.ts:4228-4237`（stopped/timedOut/
   interrupted）。TE16 补齐完整向量后本文件可扩面（不得静默改语义）。
+- **TE16 扩面（2026-09-09）**：新增 `terminal_vectors.cases`（7 例，含 precedence
+  与 `stop-wins-over-timeout`），由 `crates/rpi-ext-subagents/src/p1/parallel.rs`
+  单测消费；`cases`/`thinking` 原形状未改（仅追加节）。
 - `notify-fields.json`：行格式锚点 `src/runs/background/notify.ts:213-232`。
   TE17 落地后 `cases.expected_lines` 作为 renderer 往返断言输入。
 
