@@ -884,5 +884,1772 @@
         }
       }
     ]
+  },
+  "state": {
+    "cases": [
+      {
+        "name": "nav_regular_keeps_the_active_draft_buffer_intact",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 1,
+              "inputValue": ""
+            }
+          ]
+        }
+      },
+      {
+        "name": "nav_onto_other_row_with_prior_custom_answer_restores_the_buffer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "custom",
+                "answer": "Hello"
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 2,
+              "inputValue": ""
+            }
+          ]
+        }
+      },
+      {
+        "name": "nav_onto_other_row_with_no_draft_resets_the_buffer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 2,
+              "inputValue": ""
+            }
+          ]
+        }
+      },
+      {
+        "name": "nav_back_onto_other_restores_the_in_flight_draft_ahead_of_a_confirmed_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "custom",
+                "answer": "confirmed"
+              }
+            },
+            "customDraftsByTab": {
+              "0": "draft"
+            }
+          },
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 2,
+              "inputValue": ""
+            }
+          ]
+        }
+      },
+      {
+        "name": "an_explicitly_cleared_draft_does_not_resurrect_a_confirmed_custom_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "custom",
+                "answer": "confirmed"
+              }
+            },
+            "customDraftsByTab": {
+              "0": ""
+            }
+          },
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 2,
+              "inputValue": ""
+            }
+          ]
+        }
+      },
+      {
+        "name": "snapshots_the_live_input_value_when_navigation_leaves_the_custom_row",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "optionIndex": 2,
+            "inputMode": true
+          },
+          "actions": [
+            {
+              "kind": "nav",
+              "nextIndex": 1,
+              "inputValue": "draft"
+            }
+          ]
+        }
+      },
+      {
+        "name": "tab_switch_emits_notes_focused_and_value_and_resets_transients",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesVisible": true,
+            "submitChoiceIndex": 1,
+            "customDraftsByTab": {
+              "1": "second"
+            }
+          },
+          "actions": [
+            {
+              "kind": "tab_switch",
+              "nextTab": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "tab_switch_rehydrates_the_target_questions_draft",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "customDraftsByTab": {
+              "0": "first",
+              "1": "second"
+            }
+          },
+          "actions": [
+            {
+              "kind": "tab_switch",
+              "nextTab": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "tab_switch_syncs_multi_checked_from_answers",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "answers": {
+              "1": {
+                "questionIndex": 1,
+                "question": "Pick one",
+                "kind": "multi",
+                "answer": null,
+                "selected": [
+                  "B"
+                ]
+              }
+            },
+            "multiSelectChecked": [
+              0
+            ]
+          },
+          "actions": [
+            {
+              "kind": "tab_switch",
+              "nextTab": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_regular_option_emits_done_with_the_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_makes_the_confirmed_custom_answer_authoritative_by_removing_its_draft",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "customDraftsByTab": {
+              "0": "stale"
+            }
+          },
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "custom",
+                "answer": "latest"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_regular_option_matching_a_preview_bearing_option_augments_answer_preview",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a",
+                  "preview": "code block"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_merges_pending_notes_from_notes_by_tab",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesByTab": {
+              "0": "note"
+            }
+          },
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_custom_on_multi_clears_the_checked_set",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "multiSelectChecked": [
+              0
+            ],
+            "customDraftsByTab": {
+              "0": "typed"
+            }
+          },
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "custom",
+                "answer": "typed"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "name": "confirm_with_auto_advance_switches_tab_instead_of_done",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "confirm",
+              "answer": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              },
+              "autoAdvanceTab": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "toggle_persists_the_multi_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "actions": [
+            {
+              "kind": "toggle",
+              "index": 0
+            },
+            {
+              "kind": "toggle",
+              "index": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "toggle_an_empty_selection_deletes_the_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "multiSelectChecked": [
+              0
+            ],
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "multi",
+                "answer": null,
+                "selected": [
+                  "A"
+                ]
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "toggle",
+              "index": 0
+            }
+          ]
+        }
+      },
+      {
+        "name": "toggle_on_a_single_select_question_keeps_answers_untouched",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "toggle",
+              "index": 0
+            }
+          ]
+        }
+      },
+      {
+        "name": "toggle_keeps_pending_notes_in_the_multi_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "notesByTab": {
+              "0": "n"
+            }
+          },
+          "actions": [
+            {
+              "kind": "toggle",
+              "index": 0
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_confirm_commits_the_selection",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "actions": [
+            {
+              "kind": "multi_confirm",
+              "selected": [
+                "A",
+                "B"
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_confirm_accepts_an_empty_selection",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "actions": [
+            {
+              "kind": "multi_confirm",
+              "selected": []
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_confirm_with_auto_advance_switches_tab",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "currentTab": 1
+          },
+          "actions": [
+            {
+              "kind": "multi_confirm",
+              "selected": [
+                "A"
+              ],
+              "autoAdvanceTab": 2
+            }
+          ]
+        }
+      },
+      {
+        "name": "multi_confirm_ignores_a_missing_question",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 5
+          },
+          "actions": [
+            {
+              "kind": "multi_confirm",
+              "selected": []
+            }
+          ]
+        }
+      },
+      {
+        "name": "input_clear_clears_the_draft",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "customDraftsByTab": {
+              "0": "x"
+            }
+          },
+          "actions": [
+            {
+              "kind": "input_clear"
+            }
+          ]
+        }
+      },
+      {
+        "name": "input_edit_emits_open_input_editor",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "input_edit",
+              "value": "draft"
+            }
+          ]
+        }
+      },
+      {
+        "name": "input_replace_sets_the_draft_and_buffer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "input_replace",
+              "value": "edited"
+            }
+          ]
+        }
+      },
+      {
+        "name": "notes_enter_seeds_from_the_answer_mirror",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A",
+                "notes": "kept note"
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "notes_enter"
+            }
+          ]
+        }
+      },
+      {
+        "name": "notes_exit_trims_and_merges_the_draft",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesVisible": true,
+            "notesDraft": "  hi  "
+          },
+          "actions": [
+            {
+              "kind": "notes_exit"
+            }
+          ]
+        }
+      },
+      {
+        "name": "notes_exit_on_empty_text_removes_notes_and_strips_the_answer",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesVisible": true,
+            "notesDraft": "   ",
+            "notesByTab": {
+              "0": "old"
+            },
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A",
+                "notes": "old"
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "notes_exit"
+            }
+          ]
+        }
+      },
+      {
+        "name": "notes_forward_emits_a_forward_keystroke",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesVisible": true
+          },
+          "actions": [
+            {
+              "kind": "notes_forward",
+              "data": "x"
+            }
+          ]
+        }
+      },
+      {
+        "name": "submit_lifts_the_global_note",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 2,
+            "notesByTab": {
+              "2": "global"
+            }
+          },
+          "actions": [
+            {
+              "kind": "submit"
+            }
+          ]
+        }
+      },
+      {
+        "name": "cancel_reports_partial_answers",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          },
+          "actions": [
+            {
+              "kind": "cancel"
+            }
+          ]
+        }
+      },
+      {
+        "name": "submit_nav_moves_the_picker_choice",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 2
+          },
+          "actions": [
+            {
+              "kind": "submit_nav",
+              "nextIndex": 1
+            }
+          ]
+        }
+      },
+      {
+        "name": "toggle_collapsed_emits_overlay_hidden_and_back",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "toggle_collapsed"
+            },
+            {
+              "kind": "toggle_collapsed"
+            }
+          ]
+        }
+      },
+      {
+        "name": "ignore_is_a_noop",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "actions": [
+            {
+              "kind": "ignore"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "keys": {
+    "keyMatrix": [
+      "\r",
+      " ",
+      "n",
+      "\u001b",
+      "\u001b[A",
+      "\u001b[B",
+      "\u001bOA",
+      "\u001bOB",
+      "\t",
+      "\u001b[Z",
+      "\u001b[C",
+      "\u001b[D",
+      "\u001d",
+      "\n",
+      "\u0015",
+      "\u0007",
+      "x",
+      "\u001b[13;2u",
+      "\u001b[1;5A"
+    ],
+    "cases": [
+      {
+        "name": "single_select_question",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "single_select_other_row_input",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "optionIndex": 2,
+            "inputMode": true
+          },
+          "runtime": {
+            "inputBuffer": "hi"
+          }
+        }
+      },
+      {
+        "name": "input_mode_multiline_cursor_middle",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "optionIndex": 2,
+            "inputMode": true
+          },
+          "runtime": {
+            "inputBuffer": "a\nb",
+            "canMoveInputUp": true,
+            "canMoveInputDown": false
+          }
+        }
+      },
+      {
+        "name": "input_mode_multiline_cursor_top",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "optionIndex": 2,
+            "inputMode": true
+          },
+          "runtime": {
+            "inputBuffer": "a\nb",
+            "canMoveInputUp": false,
+            "canMoveInputDown": true
+          }
+        }
+      },
+      {
+        "name": "multi_select_question_option",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "optionIndex": 0
+          }
+        }
+      },
+      {
+        "name": "multi_select_question_other",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "optionIndex": 2,
+            "inputMode": true
+          },
+          "runtime": {
+            "inputBuffer": "draft"
+          }
+        }
+      },
+      {
+        "name": "multi_select_question_next",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick many",
+              "header": "HM",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ],
+              "multiSelect": true
+            }
+          ],
+          "setup": {
+            "optionIndex": 3
+          }
+        }
+      },
+      {
+        "name": "two_questions_first_tab",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "name": "two_questions_second_tab",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 1
+          }
+        }
+      },
+      {
+        "name": "submit_tab_submit_choice",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 2
+          }
+        }
+      },
+      {
+        "name": "submit_tab_cancel_choice",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            },
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "currentTab": 2,
+            "submitChoiceIndex": 1
+          }
+        }
+      },
+      {
+        "name": "notes_editor_open",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "notesVisible": true,
+            "notesDraft": "note"
+          }
+        }
+      },
+      {
+        "name": "collapsed_state",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "collapsed": true
+          }
+        }
+      },
+      {
+        "name": "collapse_key_off",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "runtime": {
+            "collapseKey": "off"
+          }
+        }
+      },
+      {
+        "name": "answered_option_confirmed",
+        "input": {
+          "questions": [
+            {
+              "question": "Pick one",
+              "header": "H",
+              "options": [
+                {
+                  "label": "A",
+                  "description": "a"
+                },
+                {
+                  "label": "B",
+                  "description": "b"
+                }
+              ]
+            }
+          ],
+          "setup": {
+            "answers": {
+              "0": {
+                "questionIndex": 0,
+                "question": "Pick one",
+                "kind": "option",
+                "answer": "A"
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "empty_questions",
+        "input": {
+          "questions": []
+        }
+      }
+    ]
   }
 }

@@ -1,6 +1,6 @@
-# ask-user-question parity report (TE28/TE29 G3/G12)
+# ask-user-question parity report (TE28/TE29/TE30 G3/G12)
 
-generated: 2026-09-09T15:09:50.343Z
+generated: 2026-09-10T14:03:42.115Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
 submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
 typebox: 1.3.6
@@ -15,6 +15,9 @@ typebox: 1.3.6
 - state/row-intent.ts: dbb44959cffb56fd031ea751d28f7c5647ef117051ec6edc5a96bb877f64ca16
 - state/i18n-bridge.ts: c2921835574265924e0a96a1d10b010d6edd78b07b7ee14e4a4b92cc2287a809
 - rpc-fallback.ts: 14997c0b37294a466665b9661529522112de56891bf380dae81346d299396a29
+- state/state-reducer.ts: 8ed9bdf4596c884fdf36d4411f6c1852ca236d5d9f161c1252961fed5dc18145
+- state/key-router.ts: c77a98c1435e1c3bcb0a658079ccd1e4e54968f2bb7631f7057ed2be05b4ee6e
+- external/pi/packages/tui/src/keys.ts (pi-tui stub): b972facce4233a4623239fc38029e28cae15d0fb326558c0c09dc02cf4345fa7
 
 ## schema
 
@@ -106,6 +109,81 @@ typebox: 1.3.6
 - multi_select_cancel_dismisses: MATCH
 - multi_question_sequential_walk: MATCH
 - mid_walk_cancel_preserves_answers: MATCH
+
+## state
+
+- nav_regular_keeps_the_active_draft_buffer_intact: MATCH
+- nav_onto_other_row_with_prior_custom_answer_restores_the_buffer: MATCH
+- nav_onto_other_row_with_no_draft_resets_the_buffer: MATCH
+- nav_back_onto_other_restores_the_in_flight_draft_ahead_of_a_confirmed_answer: MATCH
+- an_explicitly_cleared_draft_does_not_resurrect_a_confirmed_custom_answer: MATCH
+- snapshots_the_live_input_value_when_navigation_leaves_the_custom_row: MATCH
+- tab_switch_emits_notes_focused_and_value_and_resets_transients: MATCH
+- tab_switch_rehydrates_the_target_questions_draft: MATCH
+- tab_switch_syncs_multi_checked_from_answers: MATCH
+- confirm_regular_option_emits_done_with_the_answer: MATCH
+- confirm_makes_the_confirmed_custom_answer_authoritative_by_removing_its_draft: MATCH
+- confirm_regular_option_matching_a_preview_bearing_option_augments_answer_preview: MATCH
+- confirm_merges_pending_notes_from_notes_by_tab: MATCH
+- confirm_custom_on_multi_clears_the_checked_set: MATCH
+- confirm_with_auto_advance_switches_tab_instead_of_done: MATCH
+- toggle_persists_the_multi_answer: MATCH
+- toggle_an_empty_selection_deletes_the_answer: MATCH
+- toggle_on_a_single_select_question_keeps_answers_untouched: MATCH
+- toggle_keeps_pending_notes_in_the_multi_answer: MATCH
+- multi_confirm_commits_the_selection: MATCH
+- multi_confirm_accepts_an_empty_selection: MATCH
+- multi_confirm_with_auto_advance_switches_tab: MATCH
+- multi_confirm_ignores_a_missing_question: MATCH
+- input_clear_clears_the_draft: MATCH
+- input_edit_emits_open_input_editor: MATCH
+- input_replace_sets_the_draft_and_buffer: MATCH
+- notes_enter_seeds_from_the_answer_mirror: MATCH
+- notes_exit_trims_and_merges_the_draft: MATCH
+- notes_exit_on_empty_text_removes_notes_and_strips_the_answer: MATCH
+- notes_forward_emits_a_forward_keystroke: MATCH
+- submit_lifts_the_global_note: MATCH
+- cancel_reports_partial_answers: MATCH
+- submit_nav_moves_the_picker_choice: MATCH
+- toggle_collapsed_emits_overlay_hidden_and_back: MATCH
+- ignore_is_a_noop: MATCH
+
+## keys
+
+- single_select_question: MATCH
+- single_select_other_row_input: MATCH
+- input_mode_multiline_cursor_middle: MATCH
+- input_mode_multiline_cursor_top: MATCH
+- multi_select_question_option: MATCH
+- multi_select_question_other: MATCH
+- multi_select_question_next: MATCH
+- two_questions_first_tab: MATCH
+- two_questions_second_tab: MATCH
+- submit_tab_submit_choice: MATCH
+- submit_tab_cancel_choice: MATCH
+- notes_editor_open: MATCH
+- collapsed_state: MATCH
+- collapse_key_off: MATCH
+- answered_option_confirmed: MATCH
+- empty_questions: MATCH
+
+## golden-frames
+
+- four_questions-100.jsonl: MATCH (6 frames)
+- four_questions-120.jsonl: MATCH (6 frames)
+- four_questions-80.jsonl: MATCH (6 frames)
+- input_draft-100.jsonl: MATCH (9 frames)
+- input_draft-120.jsonl: MATCH (9 frames)
+- input_draft-80.jsonl: MATCH (9 frames)
+- multi_select-100.jsonl: MATCH (8 frames)
+- multi_select-120.jsonl: MATCH (8 frames)
+- multi_select-80.jsonl: MATCH (8 frames)
+- single_select-100.jsonl: MATCH (5 frames)
+- single_select-120.jsonl: MATCH (5 frames)
+- single_select-80.jsonl: MATCH (5 frames)
+- submit_page-100.jsonl: MATCH (6 frames)
+- submit_page-120.jsonl: MATCH (6 frames)
+- submit_page-80.jsonl: MATCH (6 frames)
 
 ## locales
 

@@ -88,6 +88,21 @@ fn failure_result(error: QuestionnaireError, message: &str) -> Value {
 /// rejects and propagates out of `execute`, which the host wraps into an
 /// errored tool result). rpi surfaces the same shape inline: `isError` + the
 /// failure detail (the handler-error convention, requirements 附录 B).
+/// Component transport/registry failure (upstream: the `custom()` promise
+/// rejects and propagates out of `execute`, which the host wraps into an
+/// errored tool result). Same `isError` shape as [`host_error_result`] with
+/// component-specific wording.
+fn component_error_result(error: &HostError) -> Value {
+    let mut result = build_tool_result(
+        format!("Error: ask_user_question component failed: {error}"),
+        json!({ "answers": [], "cancelled": true }),
+    );
+    if let Some(object) = result.as_object_mut() {
+        object.insert("isError".to_owned(), Value::Bool(true));
+    }
+    result
+}
+
 fn host_error_result(error: &HostError) -> Value {
     let mut result = build_tool_result(
         format!("Error: ask_user_question host dialog failed: {error}"),
@@ -166,10 +181,12 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
         );
     }
 
-    // TUI component path (TE30). Until the component lands the host cannot
-    // render the questionnaire — upstream's `resolveUndefinedResult`
-    // contract: dialog primitives → walker, otherwise `no_custom_ui`
-    // (upstream `ask-user-question.ts:242-245`).
+    // TUI component path (TE30): mount the interactive component and drive
+    // the poll/render loop. A host without the interactive-UI ABI (C0/old
+    // host) answers `unknownMethod` on the first mount — upstream's
+    // `ctx.ui.custom()` resolving undefined — and falls through to the
+    // `resolveUndefinedResult` contract below (dialog primitives → walker,
+    // otherwise `no_custom_ui`).
     resolve_undefined_result_with(host, &typed, &I18n::detect())
 }
 
@@ -204,16 +221,45 @@ fn run_rpc_path_with(
     }
 }
 
-/// `resolveUndefinedResult` (`ask-user-question.ts:236-247`): the host could
-/// not render the component (Q1: statically — the plugin ships no component
-/// yet), so fall to the dialog primitives or tell the model the user never
-/// saw the questions. No blocked/BEL bracket on this path (upstream runs the
-/// walker bare here).
+/// `resolveUndefinedResult` (`ask-user-question.ts:236-247`): try the
+/// interactive component first; a host that cannot render it (`unknownMethod`)
+/// falls to the dialog primitives or tells the model the user never saw the
+/// questions.
+///
+/// The component attempt is bracketed by the `rpiv:ask-user:blocked` event
+/// pair (upstream `try/finally`); the fallback walker below runs bare, like
+/// upstream's `resolveUndefinedResult`. The terminal BEL between
+/// `blocked:true` and the mount is Q3 (FR-Q3-G); Q2 only keeps the event
+/// bracket.
 fn resolve_undefined_result_with(
     host: &dyn HostCall,
     typed: &QuestionParams,
     i18n: &I18n,
 ) -> Value {
+    emit_blocked_or_warn(host, true);
+    let component = crate::state::session::run(host, typed, i18n, &crate::config::load_config());
+    emit_blocked_or_warn(host, false);
+
+    match component {
+        Ok(result) => crate::tool::envelope::build_questionnaire_response(Some(&result), typed),
+        Err(error) if error.is_unknown_method() => resolve_without_component(host, typed, i18n),
+        Err(error) => {
+            tracing::warn!(
+                kind = %error.kind,
+                message = %error.message,
+                "rpiv-ask-user-question: component host call failed"
+            );
+            component_error_result(&HostError {
+                kind: error.kind.as_str().to_owned(),
+                message: error.message,
+            })
+        }
+    }
+}
+
+/// The dialog-primitive / `no_custom_ui` fallback (upstream
+/// `resolveUndefinedResult`).
+fn resolve_without_component(host: &dyn HostCall, typed: &QuestionParams, i18n: &I18n) -> Value {
     if rpc_fallback::has_dialog_ui(Some(&rpc_fallback::HostCallUi::probe(host))) {
         let mut ui = rpc_fallback::HostCallDialogUi::new(host);
         match rpc_fallback::run_rpc_questionnaire(&mut ui, typed, i18n) {
@@ -277,6 +323,32 @@ mod tests {
         fn calls(&self) -> Vec<(String, Value)> {
             self.calls.lock().expect("calls").clone()
         }
+    }
+
+    /// One scripted reply: `Ok(value)` or an ABI error `(kind, message)`.
+    type ScriptEntry<'a> = (&'a str, Result<Value, (&'static str, &'static str)>);
+
+    /// Scripted host with per-method `Ok`/`Err` replies (error entries model
+    /// the ABI `unknownMethod`/`internal` envelopes).
+    fn host_script(entries: Vec<ScriptEntry<'_>>) -> FakeHost {
+        let host = FakeHost::default();
+        {
+            let mut queue = host.replies.lock().expect("queue");
+            for (method, value) in entries {
+                queue.push((
+                    method.to_owned(),
+                    value.map_err(|(kind, message)| HostError {
+                        kind: kind.to_owned(),
+                        message: message.to_owned(),
+                    }),
+                ));
+            }
+        }
+        host
+    }
+
+    fn unknown_method() -> (&'static str, &'static str) {
+        ("unknownMethod", "unknown host call: ui.mountComponent")
     }
 
     impl HostCall for FakeHost {
@@ -408,26 +480,40 @@ mod tests {
         // hasUI guard passes, but the dialog-primitive probe answers false
         // (the rpi equivalent of upstream `hasDialogUI(ctx.ui) === false`) —
         // the `no_custom_ui` envelope with the byte-identical literal.
-        let host = FakeHost::new(&[
-            ("ctx.hasUI", json!(true)),
-            ("events.emit", json!(null)),
-            ("ctx.mode", json!("tui")),
-            ("ctx.hasUI", json!(false)),
+        let host = host_script(vec![
+            ("ctx.hasUI", Ok(json!(true))),
+            ("events.emit", Ok(json!(null))), // prompt
+            ("ctx.mode", Ok(json!("tui"))),
+            ("events.emit", Ok(json!(null))), // blocked:true
+            ("ui.mountComponent", Err(unknown_method())),
+            ("events.emit", Ok(json!(null))), // blocked:false
+            ("ctx.hasUI", Ok(json!(false))),  // dialog-primitive probe
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(result["content"][0]["text"], ERROR_NO_CUSTOM_UI);
         assert_eq!(result["details"]["error"], json!("no_custom_ui"));
         assert_eq!(result["details"]["cancelled"], json!(true));
         let calls = host.calls();
-        assert_eq!(calls[0].0, "ctx.hasUI");
-        assert_eq!(calls[1].0, "events.emit");
+        let methods: Vec<&str> = calls.iter().map(|(method, _)| method.as_str()).collect();
+        assert_eq!(
+            methods,
+            vec![
+                "ctx.hasUI",
+                "events.emit",
+                "ctx.mode",
+                "events.emit",
+                "ui.mountComponent",
+                "events.emit",
+                "ctx.hasUI"
+            ]
+        );
         assert_eq!(calls[1].1["event"], "rpiv:ask-user:prompt");
         assert_eq!(
             calls[1].1["payload"]["questions"][0]["options"][0]["hasPreview"],
             json!(false)
         );
-        assert_eq!(calls[2].0, "ctx.mode");
-        assert_eq!(calls[3].0, "ctx.hasUI", "probe re-reads hasUI");
+        assert_eq!(calls[3].1["payload"], json!({ "active": true }));
+        assert_eq!(calls[5].1["payload"], json!({ "active": false }));
     }
 
     /// RPC hosts route to the dialog walker: `ctx.mode == "rpc"` + both
@@ -548,17 +634,21 @@ mod tests {
         assert_eq!(calls[2].1["payload"], json!({ "active": false }));
     }
 
-    /// Non-RPC host with the component unavailable (static until TE30) falls
-    /// to the walker — no blocked bracket on the backstop path (upstream runs
-    /// the walker bare inside `resolveUndefinedResult`).
+    /// Non-RPC host whose component mount answers `unknownMethod` falls to
+    /// the bare walker: the component attempt carries the blocked bracket
+    /// (upstream `try/finally` around `ctx.ui.custom`), the fallback walker
+    /// itself runs bare inside `resolveUndefinedResult`.
     #[test]
-    fn unknown_method_falls_back_to_walker_without_blocked_bracket() {
-        let host = FakeHost::new(&[
-            ("ctx.hasUI", json!(true)),
-            ("events.emit", json!(null)),
-            ("ctx.mode", json!("tui")),
-            ("ctx.hasUI", json!(true)),
-            ("ui.select", json!(null)),
+    fn component_unknown_method_falls_back_to_walker_bare() {
+        let host = host_script(vec![
+            ("ctx.hasUI", Ok(json!(true))),
+            ("events.emit", Ok(json!(null))), // prompt
+            ("ctx.mode", Ok(json!("tui"))),
+            ("events.emit", Ok(json!(null))), // blocked:true
+            ("ui.mountComponent", Err(unknown_method())),
+            ("events.emit", Ok(json!(null))), // blocked:false
+            ("ctx.hasUI", Ok(json!(true))),   // dialog-primitive probe
+            ("ui.select", Ok(json!(null))),
         ]);
         let result = execute(&host, &valid_params());
         assert_eq!(
@@ -571,8 +661,100 @@ mod tests {
             .iter()
             .filter(|(method, _)| method == "events.emit")
             .count();
-        assert_eq!(emit_count, 1, "only the prompt event — no blocked pair");
-        assert_eq!(calls[4].0, "ui.select");
+        assert_eq!(
+            emit_count, 3,
+            "prompt + the component attempt's blocked pair"
+        );
+        assert_eq!(calls[7].0, "ui.select");
+    }
+
+    /// TE30 component path: a TUI host answers mount/poll/render; the user
+    /// confirms the first option; the envelope carries the answer and no
+    /// dialog primitive is touched.
+    #[test]
+    fn component_path_answers_without_touching_dialogs() {
+        let host = host_script(vec![
+            ("ctx.hasUI", Ok(json!(true))),
+            ("events.emit", Ok(json!(null))), // prompt
+            ("ctx.mode", Ok(json!("tui"))),
+            ("events.emit", Ok(json!(null))), // blocked:true
+            ("ui.mountComponent", Ok(json!({"handle": 7}))),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "resize", "width": 80, "height": 24}})),
+            ),
+            ("ui.renderComponent", Ok(json!({"ok": true}))),
+            (
+                "ui.pollComponent",
+                Ok(json!({"event": {"type": "input", "data": "
+"}})),
+            ),
+            ("ui.renderComponent", Ok(json!({"ok": true}))),
+            ("events.emit", Ok(json!(null))), // blocked:false
+        ]);
+        let result = execute(&host, &valid_params());
+        assert_eq!(
+            result["content"][0]["text"],
+            "User has answered your questions: \"Pick one?\"=\"A\". You can now continue with the user's answers in mind."
+        );
+        assert_eq!(result["details"]["cancelled"], json!(false));
+        assert_eq!(result["details"]["answers"][0]["answer"], json!("A"));
+        let calls = host.calls();
+        let methods: Vec<&str> = calls.iter().map(|(method, _)| method.as_str()).collect();
+        assert!(
+            !methods.contains(&"ui.select"),
+            "no walker on the component path"
+        );
+        assert!(!methods.contains(&"ui.custom"));
+        // Mount options: bottom-center overlay, tickMs 0, cursor on.
+        assert_eq!(calls[4].1["options"]["overlay"], json!(true));
+        assert_eq!(
+            calls[4].1["options"]["overlayOptions"]["anchor"],
+            json!("bottom-center")
+        );
+        assert_eq!(calls[4].1["options"]["tickMs"], json!(0));
+        assert_eq!(calls[4].1["options"]["cursor"], json!(true));
+        assert_eq!(calls[4].1["options"]["keysWhenHidden"], json!(["ctrl+]"]));
+        // Two frames: the first contains the question, the second carries
+        // `done` with the answer.
+        let renders: Vec<&Value> = calls
+            .iter()
+            .filter(|(method, _)| method == "ui.renderComponent")
+            .map(|(_, args)| args)
+            .collect();
+        assert_eq!(renders.len(), 2);
+        let first_lines = renders[0]["lines"].as_array().expect("lines");
+        assert!(first_lines
+            .iter()
+            .any(|line| line.as_str().is_some_and(|line| line.contains("Pick one?"))));
+        assert_eq!(renders[1]["done"]["answers"][0]["answer"], json!("A"));
+    }
+
+    /// A component transport failure that is not `unknownMethod` surfaces as
+    /// an `isError` tool result (the host wraps a thrown `execute` upstream)
+    /// and never falls through to the walker.
+    #[test]
+    fn component_host_error_returns_is_error_without_walker() {
+        let host = host_script(vec![
+            ("ctx.hasUI", Ok(json!(true))),
+            ("events.emit", Ok(json!(null))), // prompt
+            ("ctx.mode", Ok(json!("tui"))),
+            ("events.emit", Ok(json!(null))), // blocked:true
+            ("ui.mountComponent", Err(("internal", "registry exploded"))),
+            ("events.emit", Ok(json!(null))), // blocked:false
+        ]);
+        let result = execute(&host, &valid_params());
+        assert_eq!(result["isError"], json!(true));
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("component failed: internal: registry exploded"));
+        let methods: Vec<String> = host
+            .calls()
+            .iter()
+            .map(|(method, _)| method.clone())
+            .collect();
+        assert!(!methods.iter().any(|method| method == "ui.select"));
     }
 
     /// `no_custom_ui` literal is byte-identical to upstream
@@ -603,8 +785,13 @@ mod tests {
         ]);
         let rpc = run_rpc_path_with(&rpc_host, &params, &i18n, || {});
 
-        let fallback_host =
-            FakeHost::new(&[("ctx.hasUI", json!(true)), ("ui.select", json!("2. B — b"))]);
+        let fallback_host = host_script(vec![
+            ("events.emit", Ok(json!(null))), // blocked:true
+            ("ui.mountComponent", Err(unknown_method())),
+            ("events.emit", Ok(json!(null))), // blocked:false
+            ("ctx.hasUI", Ok(json!(true))),
+            ("ui.select", Ok(json!("2. B — b"))),
+        ]);
         let fallback = resolve_undefined_result_with(&fallback_host, &params, &i18n);
 
         assert_eq!(rpc, fallback);

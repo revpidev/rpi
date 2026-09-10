@@ -3105,6 +3105,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-ext-host",
+ "rpi-tui",
  "serde",
  "serde_json",
  "tokio",

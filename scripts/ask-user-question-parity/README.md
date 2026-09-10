@@ -26,9 +26,10 @@ Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 
 | File | Role |
 |------|------|
-| `fixtures.json` | Shared cases, grouped `schema` / `normalize` / `validate` / `envelope` / `row-intent` |
+| `fixtures.json` | Shared cases, grouped `schema` / `normalize` / `validate` / `envelope` / `row-intent` / `rpc` / `state` / `keys` |
 | `upstream-runner.mjs` | Imports the upstream TS modules via `tsx` and prints one JSON line per case |
-| `run-parity.mjs` | Verifies the submodule pin, materializes the snapshot, runs both legs, normalizes, diffs, writes the report |
+| `run-parity.mjs` | Verifies the submodule pin, materializes the snapshot (+ the `@earendil-works/pi-tui` keys stub), runs both legs, normalizes, diffs, checks the golden-frame baseline, writes the report |
+| `gen-golden-frames.mjs` | Re-records `golden-frames/*.jsonl` from the native fixture component (run deliberately; the files are committed) |
 | `examples/parity_runner.rs` (in the crate) | Rust leg over the same fixtures via the `parity` facade |
 
 ## Snapshot policy (external/ stays read-only)
@@ -42,10 +43,15 @@ records each file's sha256 in the report. The deps dir carries `tsx` + the
 HEAD is asserted against `338b264c1ca4fd8828cc849b632f4f7ad88d2e78`.
 
 Driven modules: `tool/{types,normalize-params,validate-questionnaire,response-envelope,format-answer}.ts`,
-`state/row-intent.ts`, `state/i18n-bridge.ts` + `rpc-fallback.ts` (TE29 walker leg; type-only imports into
+`state/{row-intent,i18n-bridge,state-reducer,key-router}.ts` + `rpc-fallback.ts` (type-only imports into
 `view/` are erased by tsx; the i18n bridge falls back to its identity `t` when the `rpiv-i18n` SDK is
-absent — the harness deps do not install it — so the walker leg runs on canonical English, and the Rust
+absent — the harness deps do not install it — so every leg runs on canonical English, and the Rust
 leg pins `I18n::for_locale("en")` to match).
+
+`state/key-router.ts` imports `@earendil-works/pi-tui` (`Key`, `matchesKey`). The harness writes a stub
+package into `$RPI_ASKQ_PARITY_DEPS/node_modules/@earendil-works/pi-tui/` whose entry is a **verbatim
+copy** of `external/pi/packages/tui/src/keys.ts` @ `9841914c` (self-contained; the hash is recorded in
+the report). The Rust leg matches through `rpi_tui::keys::matches_key`, the port of the same source.
 
 ## Normalization whitelist
 
@@ -70,6 +76,32 @@ leg pins `I18n::for_locale("en")` to match).
   out-of-order answers.
 - `row-intent` — sentinel append matrix + the full `ROW_INTENT_META` /
   `LABELS_BY_KIND` / reserved-set constants.
+- `state` (TE30) — dialog state machine vectors: each case runs an action
+  sequence through the upstream `state/state-reducer.ts` (`reduce`) and the
+  Rust `reducer::apply`, comparing the canonical per-step state snapshot
+  (maps/sets as sorted JSON) plus the effect list. Coverage mirrors the
+  upstream `state-reducer.test.ts` scenarios (nav/draft restore, tab switch,
+  confirm/custom/preview/notes, multi toggle + empty selection, multi_confirm,
+  input clear/edit/replace, notes enter/exit/forward, submit/cancel/submit_nav,
+  collapse, ignore).
+- `keys` (TE30) — key router cascade: each setup state (single/multi question,
+  inline input single/multi-line, Submit tab, notes open, collapsed, two
+  questions, answered, empty questions, `collapseKey:"off"`) is routed through
+  the group-level `keyMatrix` (Enter/Space/`n`/Esc/CSI+SS3 arrows/Tab/Shift+Tab/
+  Left/Right/`Ctrl+]`/newline/`Ctrl+U`/`Ctrl+G`/plain text/Kitty sequences) and
+  compared action-by-action against the upstream `state/key-router.ts`.
+
+## Golden frames (TE30)
+
+`golden-frames/<scenario>-<width>.jsonl` (committed) freezes the native
+fixture component's `{lines,cursor?,done?}` frames for the Q2 matrix — single
+question / four questions / multi-select / inline-input draft / Submit page at
+80/100/120 columns. The Rust integration test
+(`crates/rpi-ext-ask-user-question/tests/golden_frames.rs`) re-renders and
+compares byte-for-byte; `run-parity.mjs` does the same as part of the harness.
+Re-record deliberately with `node scripts/ask-user-question-parity/gen-golden-frames.mjs`
+and review the diff (TE31 re-records this baseline for the rich-interaction
+pass).
 - `rpc` (TE29) — `hasDialogUI` judgment table (`{select, input}` flags + `undefined` ui) and the
   sequential dialog walker: each case drives a scripted `DialogUI` (`{reply}` / `{cancel}` entries,
   exhausted script = dismiss) and compares the recorded calls (method/title/options/placeholder) and

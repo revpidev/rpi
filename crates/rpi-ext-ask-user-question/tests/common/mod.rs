@@ -19,6 +19,9 @@ use rpi_ext_host::api::{
     ExtensionWidgetOptions, NotifyType, SetThemeResult, TerminalInputHandler, ThemeInfo, UiBridge,
     UiDialogOptions, Unsubscribe, WidgetContent, WorkingIndicatorOptions,
 };
+use rpi_ext_host::interactive_ui::{
+    ComponentEvent, ComponentFrame, ComponentHandle, InteractiveUiError, MountOptions,
+};
 use serde_json::Value;
 
 /// Records dialog order + concurrency; pops scripted answers per dialog
@@ -195,4 +198,164 @@ pub fn result_text(result: &AgentToolResult) -> String {
             _ => String::new(),
         })
         .collect()
+}
+
+/// Scripted interactive-UI bridge (TE30): implements the C1 component
+/// methods over the real `NativeExtensionHost` so the plugin's
+/// mount/poll/render loop runs through the actual host-call chain.
+///
+/// `poll_component` pops one scripted event per call; `render_component`
+/// records every frame. Non-component methods stay no-ops like
+/// [`RecordingBridge`] (the component path never calls them).
+pub struct ComponentBridge {
+    events: Mutex<VecDeque<ComponentEvent>>,
+    frames: Mutex<Vec<ComponentFrame>>,
+    mounts: Mutex<Vec<MountOptions>>,
+    handle: u64,
+}
+
+impl ComponentBridge {
+    /// Build with one scripted `pollComponent` reply per entry (the
+    /// component loop stops at the first `done` frame, so no trailing event
+    /// is needed).
+    pub fn new(events: Vec<ComponentEvent>) -> Arc<Self> {
+        Arc::new(Self {
+            events: Mutex::new(events.into()),
+            frames: Mutex::new(Vec::new()),
+            mounts: Mutex::new(Vec::new()),
+            handle: 1,
+        })
+    }
+
+    /// Frames submitted through `ui.renderComponent`, in order.
+    pub fn frames(&self) -> Vec<ComponentFrame> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Mount options seen through `ui.mountComponent`, in order.
+    pub fn mounts(&self) -> Vec<MountOptions> {
+        self.mounts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl UiBridge for ComponentBridge {
+    async fn select(
+        &self,
+        _title: &str,
+        _options: &[String],
+        _opts: Option<UiDialogOptions>,
+    ) -> Option<String> {
+        None
+    }
+    async fn confirm(&self, _t: &str, _m: &str, _o: Option<UiDialogOptions>) -> bool {
+        false
+    }
+    async fn input(
+        &self,
+        _title: &str,
+        _placeholder: Option<&str>,
+        _opts: Option<UiDialogOptions>,
+    ) -> Option<String> {
+        None
+    }
+    fn notify(&self, _m: &str, _k: NotifyType) {}
+    fn on_terminal_input(&self, _h: TerminalInputHandler) -> Unsubscribe {
+        Box::new(|| {})
+    }
+    fn set_status(&self, _k: &str, _t: Option<&str>) {}
+    fn set_working_message(&self, _m: Option<&str>) {}
+    fn set_working_visible(&self, _v: bool) {}
+    fn set_working_indicator(&self, _o: Option<WorkingIndicatorOptions>) {}
+    fn set_hidden_thinking_label(&self, _l: Option<&str>) {}
+    fn set_widget(&self, _k: &str, _c: Option<WidgetContent>, _o: Option<ExtensionWidgetOptions>) {}
+    fn set_footer(&self, _c: Option<Value>) {}
+    fn set_header(&self, _c: Option<Value>) {}
+    fn set_title(&self, _t: &str) {}
+    async fn custom(&self, _c: Value, _o: Option<Value>) -> Option<Value> {
+        None
+    }
+    fn paste_to_editor(&self, _t: &str) {}
+    fn set_editor_text(&self, _t: &str) {}
+    fn get_editor_text(&self) -> String {
+        String::new()
+    }
+    async fn editor(&self, _t: &str, _p: Option<&str>) -> Option<String> {
+        None
+    }
+    fn add_autocomplete_provider(&self, _p: Value) {}
+    fn set_editor_component(&self, _c: Option<Value>) {}
+    fn get_editor_component(&self) -> Option<Value> {
+        None
+    }
+    fn theme(&self) -> Value {
+        Value::Null
+    }
+    fn get_all_themes(&self) -> Vec<ThemeInfo> {
+        Vec::new()
+    }
+    fn get_theme(&self, _n: &str) -> Option<Value> {
+        None
+    }
+    fn set_theme(&self, _t: Value) -> SetThemeResult {
+        SetThemeResult {
+            success: false,
+            error: None,
+        }
+    }
+    fn get_tools_expanded(&self) -> bool {
+        false
+    }
+    fn set_tools_expanded(&self, _e: bool) {}
+
+    // -- Interactive custom UI ABI (V14-21 C1) ------------------------------
+
+    fn supports_interactive_ui(&self) -> bool {
+        true
+    }
+
+    async fn mount_component(
+        &self,
+        _owner: &str,
+        options: MountOptions,
+    ) -> Result<ComponentHandle, InteractiveUiError> {
+        self.mounts
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(options);
+        Ok(ComponentHandle(self.handle))
+    }
+
+    async fn poll_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+    ) -> Result<ComponentEvent, InteractiveUiError> {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop_front()
+            .ok_or_else(|| {
+                InteractiveUiError::invalid_request("ComponentBridge: no scripted event left")
+            })
+    }
+
+    fn render_component(
+        &self,
+        _owner: &str,
+        _handle: ComponentHandle,
+        frame: ComponentFrame,
+    ) -> Result<(), InteractiveUiError> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(frame);
+        Ok(())
+    }
 }

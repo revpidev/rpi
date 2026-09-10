@@ -10,7 +10,8 @@
 use std::fs;
 
 use rpi_ext_ask_user_question::parity::{
-    has_dialog_ui, labels_by_kind_json, meta, normalize_question_params, question_params_schema,
+    golden_frame_json, golden_renders, has_dialog_ui, labels_by_kind_json, meta,
+    normalize_question_params, question_params_schema, replay_keys_case, replay_state_case,
     reserved_label_set, run_rpc_questionnaire, sentinels_to_append, validate_questionnaire,
     DialogOutcome, DialogUi, HostUi, OptionData, QuestionData, QuestionParams, QuestionnaireResult,
     RowKind, ValidationResult, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS,
@@ -183,13 +184,46 @@ fn rpc_output(input: &Value) -> Value {
     json!({ "calls": ui.calls, "result": result })
 }
 
+/// TE30 `state` group replay (shared with `tests/state_vectors.rs`; the
+/// upstream leg reduces the same actions through the pinned TS modules).
+fn state_output(input: &Value) -> Value {
+    replay_state_case(input)
+}
+
+/// TE30 `keys` group replay (shared with `tests/state_vectors.rs`).
+fn keys_output(input: &Value, key_matrix: &[Value]) -> Value {
+    replay_keys_case(input, key_matrix)
+}
+
+/// `golden` group: print one line per scenario/width frame
+/// (`gen-golden-frames.mjs` splits them into JSONL files; ignored by the
+/// diff-based groups).
+fn golden_output() {
+    for render in golden_renders() {
+        for frame in &render.frames {
+            println!(
+                "{}",
+                json!({ "file": render.file, "frame": golden_frame_json(frame) })
+            );
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("usage: parity_runner <group> [fixture.json]");
+        std::process::exit(2);
+    }
+    let group = args[1].as_str();
+    if group == "golden" {
+        golden_output();
+        return;
+    }
     if args.len() < 3 {
         eprintln!("usage: parity_runner <group> <fixture.json>");
         std::process::exit(2);
     }
-    let group = args[1].as_str();
     let fixtures: Value =
         serde_json::from_str(&fs::read_to_string(&args[2]).expect("fixture file"))
             .expect("fixture json");
@@ -198,6 +232,12 @@ fn main() {
         .and_then(|group| group.get("cases"))
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("group {group} has no cases"));
+    let key_matrix: Vec<Value> = fixtures
+        .get("keys")
+        .and_then(|group| group.get("keyMatrix"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     for case in cases {
         let name = case.get("name").and_then(Value::as_str).expect("case name");
@@ -225,6 +265,8 @@ fn main() {
             }
             "row-intent" => row_intent_output(name, &input),
             "rpc" => rpc_output(&input),
+            "state" => state_output(&input),
+            "keys" => keys_output(&input, &key_matrix),
             other => panic!("unknown group: {other}"),
         };
         println!("{}", json!({"name": name, "output": output}));

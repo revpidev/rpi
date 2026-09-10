@@ -17,6 +17,128 @@ const validate = await import(`${SNAPSHOT}/tool/validate-questionnaire.ts`);
 const envelope = await import(`${SNAPSHOT}/tool/response-envelope.ts`);
 const rowIntent = await import(`${SNAPSHOT}/state/row-intent.ts`);
 const rpcFallback = await import(`${SNAPSHOT}/rpc-fallback.ts`);
+// TE30: the dialog state machine + key router (the `@earendil-works/pi-tui`
+// import in key-router.ts resolves to the harness stub package, a verbatim
+// copy of `external/pi/packages/tui/src/keys.ts` @ 9841914c).
+const stateReducer = await import(`${SNAPSHOT}/state/state-reducer.ts`);
+const keyRouter = await import(`${SNAPSHOT}/state/key-router.ts`);
+const i18nBridge = await import(`${SNAPSHOT}/state/i18n-bridge.ts`);
+// Stubbed `@earendil-works/pi-tui`: the harness materializes a package whose
+// entry is a verbatim copy of `external/pi/packages/tui/src/keys.ts` @
+// 9841914c. The snapshot's own bare import resolves it from the deps
+// node_modules; this leg loads the same file by path (the runner lives
+// outside the deps tree, so bare resolution would not find it).
+const DEPS = SNAPSHOT.replace(/\/snapshot\/?$/, "");
+const piTui = await import(`${DEPS}/node_modules/@earendil-works/pi-tui/index.ts`);
+
+/** Upstream `buildItemsForQuestion` (ask-user-question.ts:289-297). */
+function buildItemsForQuestion(question) {
+	const items = question.options.map((o) => ({ kind: "option", label: o.label, description: o.description }));
+	for (const kind of rowIntent.sentinelsToAppend(question)) {
+		items.push({ kind, label: i18nBridge.displayLabel(kind) });
+	}
+	return items;
+}
+
+function fixtureItems(input) {
+	if (input.itemsByTab) return input.itemsByTab;
+	return input.questions.map((question) => buildItemsForQuestion(question));
+}
+
+/** Canonical questionnaire state from a partial fixture snapshot. */
+function stateFromJson(setup = {}) {
+	const mapFrom = (object) =>
+		new Map(Object.entries(object ?? {}).map(([key, value]) => [Number(key), value]));
+	return {
+		currentTab: setup.currentTab ?? 0,
+		optionIndex: setup.optionIndex ?? 0,
+		inputMode: setup.inputMode ?? false,
+		notesVisible: setup.notesVisible ?? false,
+		answers: mapFrom(setup.answers),
+		multiSelectChecked: new Set(setup.multiSelectChecked ?? []),
+		customDraftsByTab: mapFrom(setup.customDraftsByTab),
+		notesByTab: mapFrom(setup.notesByTab),
+		submitChoiceIndex: setup.submitChoiceIndex ?? 0,
+		notesDraft: setup.notesDraft ?? "",
+		collapsed: setup.collapsed ?? false,
+	};
+}
+
+/** Canonical snapshot (identical shape to the Rust `snapshot()`). */
+function snapshotState(state) {
+	const objectFrom = (map) =>
+		Object.fromEntries([...map.entries()].sort((a, b) => a[0] - b[0]));
+	return {
+		currentTab: state.currentTab,
+		optionIndex: state.optionIndex,
+		inputMode: state.inputMode,
+		notesVisible: state.notesVisible,
+		answers: objectFrom(state.answers),
+		multiSelectChecked: [...state.multiSelectChecked].sort((a, b) => a - b),
+		customDraftsByTab: objectFrom(state.customDraftsByTab),
+		notesByTab: objectFrom(state.notesByTab),
+		submitChoiceIndex: state.submitChoiceIndex,
+		notesDraft: state.notesDraft,
+		collapsed: state.collapsed,
+	};
+}
+
+/** TE30 `state` group: action sequence -> per-step snapshot + effects. */
+function stateCase(input) {
+	const questions = input.questions;
+	const itemsByTab = fixtureItems(input);
+	let state = stateFromJson(input.setup);
+	const ctx = { questions, itemsByTab };
+	const steps = [];
+	for (const action of input.actions ?? []) {
+		const result = stateReducer.reduce(state, action, ctx);
+		steps.push({ state: snapshotState(result.state), effects: jsonClone(result.effects) });
+		state = result.state;
+	}
+	return { steps };
+}
+
+/** Upstream keybinding defaults for the names the questionnaire reads
+ * (`packages/tui/src/keybindings.ts` + `packages/coding-agent/src/core/keybindings.ts`). */
+const DEFAULT_BINDINGS = {
+	"tui.select.up": ["up"],
+	"tui.select.down": ["down"],
+	"tui.select.confirm": ["enter"],
+	"tui.input.submit": ["enter"],
+	"tui.select.cancel": ["escape", "ctrl+c"],
+	"tui.input.newLine": ["shift+enter", "ctrl+j"],
+	"tui.editor.cursorUp": ["up"],
+	"tui.editor.cursorDown": ["down"],
+	"tui.editor.deleteToLineStart": ["ctrl+u"],
+	"app.editor.external": ["ctrl+g"],
+};
+
+/** TE30 `keys` group: raw key bytes -> routed action. */
+function keysCase(input, keyMatrix) {
+	const questions = input.questions;
+	const itemsByTab = fixtureItems(input);
+	const state = stateFromJson(input.setup);
+	const runtimeInput = input.runtime ?? {};
+	const bindings = { ...DEFAULT_BINDINGS, ...(runtimeInput.bindings ?? {}) };
+	const keybindings = {
+		matches: (data, name) => (bindings[name] ?? []).some((key) => piTui.matchesKey(data, key)),
+	};
+	const items = itemsByTab[state.currentTab] ?? [];
+	const runtime = {
+		keybindings,
+		inputBuffer: runtimeInput.inputBuffer ?? "",
+		canMoveInputUp: runtimeInput.canMoveInputUp ?? false,
+		canMoveInputDown: runtimeInput.canMoveInputDown ?? false,
+		questions,
+		isMulti: questions.length > 1,
+		currentItem: items[state.optionIndex],
+		items,
+		collapseKey: runtimeInput.collapseKey ?? "ctrl+]",
+	};
+	const keys = input.keys ?? keyMatrix ?? [];
+	return { actions: keys.map((data) => jsonClone(keyRouter.routeKey(data, state, runtime))) };
+}
+
 
 function jsonClone(value) {
 	return JSON.parse(JSON.stringify(value));
@@ -110,7 +232,9 @@ async function main() {
 	const group = process.argv[2];
 	const fixturePath = process.argv[3];
 	if (!group || !fixturePath) {
-		console.error("usage: upstream-runner.mjs <schema|normalize|validate|envelope|row-intent|rpc> <fixture.json>");
+		console.error(
+		"usage: upstream-runner.mjs <schema|normalize|validate|envelope|row-intent|rpc|state|keys> <fixture.json>",
+	);
 		process.exit(2);
 	}
 	const fixtures = JSON.parse(readFileSync(fixturePath, "utf-8"));
@@ -129,6 +253,10 @@ async function main() {
 			output = rowIntentCase(fixture.name, fixture.input);
 		} else if (group === "rpc") {
 			output = await rpcCase(fixture.input);
+		} else if (group === "state") {
+			output = stateCase(fixture.input);
+		} else if (group === "keys") {
+			output = keysCase(fixture.input, fixtures.keys?.keyMatrix ?? []);
 		} else {
 			throw new Error(`unknown group: ${group}`);
 		}

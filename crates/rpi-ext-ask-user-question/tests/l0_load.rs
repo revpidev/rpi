@@ -16,8 +16,9 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use common::RecordingBridge;
+use common::{ComponentBridge, RecordingBridge};
 use rpi_ext_host::host::NativeExtensionHost;
+use rpi_ext_host::interactive_ui::ComponentEvent;
 
 fn plugin_path() -> PathBuf {
     let target = std::env::var("CARGO_TARGET_DIR")
@@ -199,9 +200,11 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
     assert_eq!(result.details["cancelled"], true);
     assert_eq!(result.details["answers"], serde_json::json!([]));
 
-    // 4. TUI-mode bridge, walker fallback (Q1: the component arm is
-    //    statically unavailable) — a cancelled select dismisses the whole
-    //    questionnaire → decline envelope.
+    // 4. TUI-mode bridge without the interactive-UI ABI (the RecordingBridge
+    //    keeps the trait default `supportsInteractiveUi = false`) →
+    //    `ui.mountComponent` answers unknownMethod → the walker fallback; a
+    //    cancelled select dismisses the whole questionnaire → decline
+    //    envelope.
     let tui_bridge = RecordingBridge::new(vec![None]);
     host.set_ui(
         Some(tui_bridge.clone()),
@@ -298,6 +301,67 @@ async fn l0_load_registers_ask_user_question_and_envelopes() {
     );
     assert!(input_title.contains("1. red — r"));
     assert_eq!(placeholder.as_deref(), Some("1,3"));
+
+    // 7. TE30 TUI component path: the mount/poll/render loop runs through
+    //    the real host-call chain (mountComponent -> pollComponent ->
+    //    renderComponent), the scripted Enter submits the first option, and
+    //    the envelope carries it. No walker dialog is touched.
+    let component_bridge = ComponentBridge::new(vec![
+        ComponentEvent::Resize {
+            width: 80,
+            height: 24,
+        },
+        ComponentEvent::Input {
+            data: "\r".to_owned(),
+        },
+    ]);
+    host.set_ui(
+        Some(component_bridge.clone()),
+        rpi_ext_host::types::ExtensionMode::Tui,
+    );
+    let result = (definition.execute)(
+        rpi_ext_host::types::ToolExecuteRequest {
+            tool_call_id: "l0-component".to_owned(),
+            params: params.clone(),
+            signal: tokio_util::sync::CancellationToken::new(),
+            on_update: None,
+        },
+        host.core().create_context(),
+    )
+    .await
+    .expect("execute resolves");
+    assert_eq!(
+        text_of(&result),
+        "User has answered your questions: \"Pick one?\"=\"A\". You can now continue with the user's answers in mind."
+    );
+    assert_eq!(result.details["cancelled"], false);
+    assert_eq!(result.details["answers"][0]["kind"], "option");
+    let mounts = component_bridge.mounts();
+    assert_eq!(mounts.len(), 1, "one mounted component per tool call");
+    assert!(mounts[0].overlay);
+    assert_eq!(mounts[0].tick_ms, 0, "the dialog subscribes to no ticks");
+    assert_eq!(mounts[0].keys_when_hidden, vec!["ctrl+]".to_owned()]);
+    assert_eq!(mounts[0].label.as_deref(), Some("ask_user_question"));
+    let frames = component_bridge.frames();
+    assert!(frames.len() >= 2, "initial frame + done frame");
+    assert!(
+        frames[0]
+            .lines
+            .iter()
+            .any(|line| line.contains("Pick one?")),
+        "{:?}",
+        frames[0].lines
+    );
+    let last = frames.last().expect("frames");
+    assert!(last.is_done(), "the final render carries done");
+    assert_eq!(
+        last.done
+            .value()
+            .and_then(|value| value.get("answers"))
+            .and_then(|answers| answers.get(0))
+            .and_then(|answer| answer.get("answer")),
+        Some(&serde_json::json!("A"))
+    );
 
     let _ = std::fs::remove_dir_all(full.parent().unwrap());
 }

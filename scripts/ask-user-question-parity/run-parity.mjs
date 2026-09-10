@@ -43,7 +43,7 @@ const RUST_RUNNER = resolve(REPO, "target/debug/examples/parity_runner");
 const VENDORED_LOCALES = resolve(REPO, "crates/rpi-ext-ask-user-question/locales");
 const GENERATED = resolve(REPO, "fixtures/generated/ask-user-question-parity");
 const PINNED_COMMIT = "338b264c1ca4fd8828cc849b632f4f7ad88d2e78";
-const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc"];
+const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc", "state", "keys"];
 const UPSTREAM_MODULES = [
 	"tool/types.ts",
 	"tool/normalize-params.ts",
@@ -53,7 +53,14 @@ const UPSTREAM_MODULES = [
 	"state/row-intent.ts",
 	"state/i18n-bridge.ts",
 	"rpc-fallback.ts",
+	// TE30: dialog state machine + key router.
+	"state/state-reducer.ts",
+	"state/key-router.ts",
 ];
+// The `@earendil-works/pi-tui` import in key-router.ts is stubbed with the
+// pinned upstream keys module (self-contained; no other tui sources needed).
+const PI_TUI_KEYS = resolve(REPO, "external/pi/packages/tui/src/keys.ts");
+const GOLDEN_DIR = resolve(GENERATED, "golden-frames");
 
 function sha256(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -105,6 +112,20 @@ function materializeSnapshot() {
 		copyFileSync(from, to);
 		hashes.push({ module, sha256: sha256(from) });
 	}
+	// Stub `@earendil-works/pi-tui` for the snapshot key-router import: a
+	// verbatim copy of the pinned upstream keys module, resolved by Node from
+	// the deps node_modules (external/ stays read-only).
+	const stubDir = resolve(DEPS, "node_modules/@earendil-works/pi-tui");
+	mkdirSync(stubDir, { recursive: true });
+	writeFileSync(
+		resolve(stubDir, "package.json"),
+		`${JSON.stringify({ name: "@earendil-works/pi-tui", version: "0.0.0-harness", type: "module", main: "index.ts" }, null, 2)}\n`,
+	);
+	copyFileSync(PI_TUI_KEYS, resolve(stubDir, "index.ts"));
+	hashes.push({
+		module: "external/pi/packages/tui/src/keys.ts (pi-tui stub)",
+		sha256: sha256(PI_TUI_KEYS),
+	});
 	return hashes;
 }
 
@@ -205,6 +226,49 @@ function compareGroup(group, report) {
 	return allMatch;
 }
 
+/** TE30 golden frames: render fresh frames and compare byte-for-byte against
+ * the committed baseline (`gen-golden-frames.mjs` re-records). */
+function compareGoldenFrames(report) {
+	const result = run(RUST_RUNNER, ["golden"]);
+	if (result.status !== 0) {
+		report.push(`## golden-frames: RUN FAILED\n\n${result.stderr}\n`);
+		return false;
+	}
+	const byFile = new Map();
+	for (const line of result.stdout.trim().split("\n").filter(Boolean)) {
+		const entry = JSON.parse(line);
+		if (!byFile.has(entry.file)) byFile.set(entry.file, []);
+		byFile.get(entry.file).push(JSON.stringify(entry.frame));
+	}
+	if (!existsSync(GOLDEN_DIR)) {
+		report.push(
+			`## golden-frames\n\nMISSING ${GOLDEN_DIR.replace(`${REPO}/`, "")} — run: node scripts/ask-user-question-parity/gen-golden-frames.mjs\n`,
+		);
+		return false;
+	}
+	const committed = readdirSync(GOLDEN_DIR).filter((file) => file.endsWith(".jsonl")).sort();
+	const lines = [];
+	let allMatch = true;
+	for (const file of committed) {
+		const expected = readFileSync(resolve(GOLDEN_DIR, file), "utf-8").trimEnd();
+		const actual = (byFile.get(file) ?? []).join("\n");
+		if (expected !== actual) {
+			lines.push(`- ${file}: MISMATCH (re-record with gen-golden-frames.mjs if intended)`);
+			allMatch = false;
+		} else {
+			lines.push(`- ${file}: MATCH (${expected.split("\n").length} frames)`);
+		}
+	}
+	for (const file of byFile.keys()) {
+		if (!committed.includes(file)) {
+			lines.push(`- ${file}: EXTRA rendered file not in the golden baseline`);
+			allMatch = false;
+		}
+	}
+	report.push(`## golden-frames\n\n${lines.join("\n")}\n`);
+	return allMatch;
+}
+
 function compareLocales(report) {
 	const upstreamLocales = resolve(UPSTREAM, "locales");
 	const files = readdirSync(upstreamLocales).filter((file) => file.endsWith(".json"));
@@ -247,7 +311,7 @@ function main() {
 	mkdirSync(GENERATED, { recursive: true });
 
 	const report = [
-		"# ask-user-question parity report (TE28/TE29 G3/G12)",
+		"# ask-user-question parity report (TE28/TE29/TE30 G3/G12)",
 		"",
 		`generated: ${new Date().toISOString()}`,
 		`upstream submodule: ${UPSTREAM.replace(`${REPO}/`, "")}`,
@@ -269,6 +333,7 @@ function main() {
 	for (const group of GROUPS) {
 		ok = compareGroup(group, report) && ok;
 	}
+	ok = compareGoldenFrames(report) && ok;
 	ok = compareLocales(report) && ok;
 	report.push("", ok ? "## RESULT: MATCH" : "## RESULT: MISMATCH");
 

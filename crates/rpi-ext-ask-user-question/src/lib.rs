@@ -23,11 +23,14 @@
 
 pub mod config;
 pub mod events;
+pub mod golden;
 pub mod i18n;
+pub mod parity_cases;
 pub mod reconcile;
 pub mod rpc_fallback;
 pub mod state;
 pub mod tool;
+pub mod view;
 
 use std::io::IsTerminal;
 use std::sync::{Mutex, OnceLock};
@@ -273,7 +276,12 @@ pub mod parity {
         validate_guidance_fields, AskUserQuestionConfig, GuidanceFields, DEFAULT_COLLAPSE_KEY,
     };
     pub use crate::events::{build_blocked_payload, build_prompt_payload};
+    pub use crate::golden::{
+        frame_json as golden_frame_json, renders as golden_renders, GoldenFrame, GoldenRender,
+        WIDTHS as GOLDEN_WIDTHS,
+    };
     pub use crate::i18n::{match_locale, parse_locale_env, I18n, SUPPORTED_LOCALES};
+    pub use crate::parity_cases::{replay_keys_case, replay_state_case};
     pub use crate::reconcile::reconcile_active_tools;
     pub use crate::rpc_fallback::{
         build_preview_block, format_option_line, has_dialog_ui, parse_index, run_rpc_questionnaire,
@@ -281,10 +289,16 @@ pub mod parity {
         MULTI_SELECT_INSTRUCTIONS, MULTI_SELECT_PLACEHOLDER,
     };
     pub use crate::state::build::{build_items_for_question, QuestionItem};
+    pub use crate::state::key_router::{route_key, Action, Keybindings, QuestionnaireRuntime};
+    pub use crate::state::reducer::{
+        apply as apply_action, result_for, state_from_json, ApplyContext, ApplyResult, Effect,
+        QuestionnaireState,
+    };
     pub use crate::state::row_intent::{
         is_reserved_label, label_by_kind, labels_by_kind_json, meta, reserved_label_set,
         sentinels_to_append, RowIntentMeta, RowKind, ROW_INTENT_META, SENTINEL_KINDS,
     };
+    pub use crate::state::session::{mount_options, InputBuffer, QuestionnaireComponent};
     pub use crate::tool::envelope::{
         build_answer_segment, build_questionnaire_response, build_tool_result,
         format_answer_scalar, FormatAnswerVariant, DECLINE_MESSAGE, ENVELOPE_PREFIX,
@@ -406,7 +420,15 @@ mod tests {
 
         // toolExecute -> execute path (ctx.hasUI + prompt event).
         queue_reply(Ok(json!(true))); // ctx.hasUI
-        queue_reply(Ok(Value::Null)); // events.emit
+        queue_reply(Ok(Value::Null)); // events.emit (prompt)
+        queue_reply(Ok(Value::Null)); // ctx.mode
+        queue_reply(Ok(Value::Null)); // events.emit (blocked:true)
+        queue_reply(Err((
+            "unknownMethod",
+            "unknown host call: ui.mountComponent",
+        )));
+        queue_reply(Ok(Value::Null)); // events.emit (blocked:false)
+        queue_reply(Ok(json!(false))); // ctx.hasUI (dialog-primitive probe)
         let result = dispatch_for_test(&json!({
             "kind": "toolExecute",
             "toolName": "ask_user_question",
