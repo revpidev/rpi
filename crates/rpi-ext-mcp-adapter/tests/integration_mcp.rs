@@ -1448,3 +1448,79 @@ async fn te24_catalog_listen_reestablishes_after_remote_cancel_and_close_cancels
     assert!(!pid_alive(&pid), "fixture child reaped (G4)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn te24_catalog_listen_reopens_after_crash_without_close() {
+    // Round-2 review N1: a crashed connection never passes through
+    // close(name); the stale handle must not fence the NEW connection's
+    // listen (owning-connection Weak + transport-death liveness).
+    let dir = temp_dir("te24-listen-crash");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(&log, &pid, &[("RPI_MCP_FIXTURE_MODERN_2026", "1")]);
+    let mut map = entry.as_map().clone();
+    map.insert("protocolVersion".to_string(), json!("2026-07-28"));
+    let entry = ServerEntry(map);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let listen_count = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.trim() == "subscriptions/listen")
+            .count()
+    };
+
+    let connection = manager
+        .connect("fixture", &entry)
+        .await
+        .expect("first connect");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listen_count() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(listen_count(), 1, "first listen opened");
+
+    // Crash the child WITHOUT close(): the transport dies, on_close flips
+    // the old connection to Closed, the listen watcher settles.
+    let first_pid: i32 = std::fs::read_to_string(&pid)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    #[cfg(unix)]
+    unsafe {
+        // Safety: kill(2) a pid we just spawned via the fixture server.
+        libc::kill(first_pid, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while connection.status() != ConnectionStatus::Closed && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        connection.status(),
+        ConnectionStatus::Closed,
+        "crash observed"
+    );
+
+    // Reconnect (no close(name) in between): the new connection's listen
+    // must open — the stale handle is fenced by owner Weak + is_closed.
+    let _second = manager
+        .connect("fixture", &entry)
+        .await
+        .expect("second connect");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listen_count() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        listen_count() >= 2,
+        "second connection opens its own listen, got {}",
+        listen_count()
+    );
+
+    manager.close_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

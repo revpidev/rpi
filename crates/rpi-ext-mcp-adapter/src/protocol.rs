@@ -250,6 +250,14 @@ impl McpClient {
             // notify the owner (SDK onclose semantics).
             if let Some(client) = weak.upgrade() {
                 client.fail_all_pending();
+                // Settle every in-flight listen too: dropping the entries
+                // resolves the watchers (remote/transport death flips
+                // `is_closed`) and any still-opening ack waiter (Closed).
+                client
+                    .listen_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
                 let on_close = client
                     .on_close
                     .lock()

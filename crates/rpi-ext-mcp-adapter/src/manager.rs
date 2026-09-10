@@ -182,6 +182,13 @@ pub const KEEP_ALIVE_REFRESH_TIMEOUT_MS: Duration = Duration::from_millis(5_000)
 /// (`keep-alive-refresh`, `listen-recovered`, …).
 pub type MetadataListChangedListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
+/// One live catalog listen: the OWNING connection (weak — a stale handle
+/// must never fence a replacement connection's listen) plus the handle.
+type ListenHandleEntry = (
+    std::sync::Weak<ServerConnection>,
+    Arc<crate::protocol::ListenHandle>,
+);
+
 pub struct McpServerManager {
     connections: Mutex<HashMap<String, Arc<ServerConnection>>>,
     connect_promises: Mutex<HashMap<String, SharedConnect>>,
@@ -193,10 +200,13 @@ pub struct McpServerManager {
     /// Servers with a live catalog `subscriptions/listen` (R7.2.8.4/#468);
     /// cleared on close so a reconnect re-opens.
     listen_open: Mutex<HashSet<String>>,
-    /// Live listen handles (keyed by server): `close()` sends the
-    /// wire-level `notifications/cancelled` before the transport dies
-    /// (the spec-courteous half of the SDK's close belt-and-braces).
-    listen_handles: Mutex<HashMap<String, Arc<crate::protocol::ListenHandle>>>,
+    /// Live listen handles (keyed by server) paired with the OWNING
+    /// connection: `close()` sends the wire-level
+    /// `notifications/cancelled` before the transport dies (the
+    /// spec-courteous half of the SDK's close belt-and-braces), and the
+    /// weak connection fences a stale handle after a crash-without-close
+    /// (a new connection must never be skipped by the old one's handle).
+    listen_handles: Mutex<HashMap<String, ListenHandleEntry>>,
     /// Weak self for client callbacks registered BEFORE the handshake (the
     /// notification handler must be live when `notifications/initialized`
     /// lands — the fixture-style proactive list_changed fires right after).
@@ -592,14 +602,22 @@ impl McpServerManager {
         {
             let mut open = self.listen_open.lock().unwrap_or_else(|e| e.into_inner());
             if open.contains(name) {
-                // Re-establish a DROPPED listen (remote cancel/graceful
-                // close): a stale handle falls through to a re-open.
+                // Re-establish a DROPPED listen (remote cancel / graceful
+                // close / transport death) AND fence the owning connection:
+                // a handle from a superseded connection (crash-without-close
+                // → `lazy_connect`/lifecycle straight `connect`) must not
+                // skip the new connection's listen.
                 let alive = self
                     .listen_handles
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(name)
-                    .is_some_and(|handle| !handle.is_closed());
+                    .is_some_and(|(owner, handle)| {
+                        owner
+                            .upgrade()
+                            .is_some_and(|owner| Arc::ptr_eq(&owner, connection))
+                            && !handle.is_closed()
+                    });
                 if alive {
                     return;
                 }
@@ -623,7 +641,10 @@ impl McpServerManager {
                 self.listen_handles
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(name.to_string(), Arc::new(handle));
+                    .insert(
+                        name.to_string(),
+                        (Arc::downgrade(connection), Arc::new(handle)),
+                    );
             }
             Err(error) => {
                 tracing::debug!(
@@ -997,7 +1018,7 @@ impl McpServerManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
-        if let Some(listen) = listen {
+        if let Some((_, listen)) = listen {
             listen.close().await;
         }
         let connection = self
@@ -1027,7 +1048,7 @@ impl McpServerManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
-            .map(|(_, h)| h)
+            .map(|(_, (_, handle))| handle)
             .collect();
         for listen in listens {
             listen.close().await;
