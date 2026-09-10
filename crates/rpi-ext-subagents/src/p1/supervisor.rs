@@ -278,6 +278,38 @@ fn error_result(text: &str) -> Value {
     })
 }
 
+/// Pending blocking supervisor asks for one child (FR-A / #1980,
+/// `steerAsyncRun`'s `findPendingAsks` seam): requests still sitting in
+/// `requests/` that expect a reply (need_decision / interview_request —
+/// `progress_update` writes return immediately and never block) for the
+/// given run + child index. Unanswered asks mean the child cannot consume a
+/// steer, so the steer gate reports them instead of writing the inbox.
+pub fn pending_asks(run_id: &str, child_index: usize) -> Vec<Value> {
+    let root = channels_root();
+    let Ok(channel_entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut asks = Vec::new();
+    for channel in channel_entries.flatten() {
+        for request in read_requests(&channel.path()) {
+            let blocking = request["reason"].as_str() == Some("need_decision")
+                || request["reason"].as_str() == Some("interview_request");
+            if !blocking {
+                continue;
+            }
+            if request["runId"].as_str() != Some(run_id) {
+                continue;
+            }
+            if request["childIndex"].as_u64() != Some(child_index as u64) {
+                continue;
+            }
+            asks.push(request);
+        }
+    }
+    asks.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    asks
+}
+
 /// Parent-side `subagent_supervisor` ({action: pending|reply}) —
 /// `NATIVE_SUPERVISOR_TOOL_NAME` handler (L559-587).
 pub fn parent_supervisor_action(

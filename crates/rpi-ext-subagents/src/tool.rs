@@ -88,8 +88,8 @@ pub fn tool_parameters_schema() -> Value {
             },
             "context": {
                 "type": "string",
-                "enum": ["fresh", "fork"],
-                "description": "Explicit context overrides every child: fresh (isolated session) or fork (branch of the parent session)."
+                "enum": ["fresh", "fork", "profile"],
+                "description": "Explicit context overrides every child: fresh (isolated session), fork (branch of the parent session), or profile (each child uses its agent's declared defaultContext instead of this call-level default)."
             },
             "async": {
                 "type": "boolean",
@@ -118,6 +118,11 @@ pub fn tool_parameters_schema() -> Value {
             "output": {
                 "type": ["string", "boolean"],
                 "description": "Output file the child result is saved to (string path); false disables."
+            },
+            "outputMode": {
+                "type": "string",
+                "enum": ["inline", "file-only"],
+                "description": "Output mode (#1305): inline (default — result text returned) or file-only (result is written to the output file and the reply carries the saved-file reference; requires output)."
             },
             "model": {
                 "type": "string",
@@ -169,6 +174,27 @@ pub fn tool_parameters_schema() -> Value {
                 "enum": ["user", "project", "both"],
                 "description": "Discovery scope for list/agent resolution; default both."
             },
+            "view": {
+                "type": "string",
+                "enum": ["transcript"],
+                "description": "With action status (#1963): inspect a run's child transcript on demand; requires id, accepts index and lines (default 80, max 1000)."
+            },
+            "index": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Child index for status view:transcript (and steer targetIndex alias)."
+            },
+            "lines": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1000,
+                "description": "Line bound for status view:transcript (default 80)."
+            },
+            "childId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "With action stop (#1603): stop one child of a multi-child run (`step:<index>` or the child's run id) instead of the whole run."
+            },
             "workflowScript": {
                 "type": "string",
                 "minLength": 1,
@@ -181,6 +207,10 @@ pub fn tool_parameters_schema() -> Value {
             "baseRef": {
                 "type": "string",
                 "description": "Git ref the managed worktrees branch from (default HEAD). Named refs only (for example refs/heads/main); full commit IDs and revision expressions are rejected before launch."
+            },
+            "capabilities": {
+                "type": "boolean",
+                "description": "With action list (#1717): compact capability lines plus structured details.agentCapabilities records (prompt-free agent selection)."
             }
         }
     })
@@ -446,7 +476,11 @@ fn assemble_single_details(
         "exitCode": result.exit_code,
         "usage": result.usage,
         "timedOut": result.timed_out,
+        "outputMode": outcome.output_mode,
     });
+    if let Some(name) = &outcome.session_name {
+        single["sessionName"] = json!(name);
+    }
     if let Some(signal) = &result.process_signal {
         single["processSignal"] = json!(signal);
     }

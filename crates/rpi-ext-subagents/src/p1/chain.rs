@@ -34,7 +34,11 @@ pub struct StepSpec {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub context: Option<ContextMode>,
+    /// #1303 `context: "profile"` — see [`ChildSpec::context_profile`].
+    pub context_profile: bool,
     pub output: OutputOverride,
+    /// #1305 per-step `outputMode` (inline | file-only).
+    pub output_mode: Option<String>,
     pub reads: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub progress: bool,
@@ -140,10 +144,19 @@ pub fn parse_steps(steps: &Value) -> Result<Vec<StepSpec>, String> {
             context: match object.get("context").and_then(Value::as_str) {
                 Some("fork") => Some(ContextMode::Fork),
                 Some("fresh") => Some(ContextMode::Fresh),
+                Some("profile") => None,
                 Some(_) => Some(ContextMode::Fresh),
                 None => None,
             },
+            context_profile: object.get("context").and_then(Value::as_str) == Some("profile"),
             output,
+            output_mode: match object.get("outputMode").and_then(Value::as_str) {
+                Some("inline") | Some("file-only") => object
+                    .get("outputMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                _ => None,
+            },
             reads,
             skills,
             progress: object
@@ -502,11 +515,13 @@ pub async fn run_chain_async(
             model: step.model.clone(),
             thinking: step.thinking.clone(),
             context: step.context,
+            context_profile: step.context_profile,
             cwd: step.cwd.clone(),
             output: match output_override {
                 Some(path) => OutputOverride::Path(path),
                 None => OutputOverride::Disabled,
             },
+            output_mode: step.output_mode.clone(),
             timeout_ms: step.timeout_ms,
             child_index: index as u32,
             skills: Some(skills),

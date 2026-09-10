@@ -74,19 +74,25 @@ const POST_EXIT_DRAIN_HARD_MS: u64 = 8000;
 /// Live children registry for the shutdown sweep. `kill_on_drop(true)` covers
 /// future-drop and process-exit; this covers `session_shutdown` events and the
 /// async `stop` action (FR-P1-04: stop is terminal, so the running child is
-/// signalled through the registry by run id).
-type LiveChildEntry = (u32, String, Arc<tokio::sync::Mutex<Child>>);
+/// signalled through the registry by run id). The child index rides along
+/// for child-scoped stops (#1367/#1603: stop one child of a multi-child
+/// async run without widening to the whole run).
+type LiveChildEntry = (u32, String, u32, Arc<tokio::sync::Mutex<Child>>);
 static LIVE_CHILDREN: Mutex<BTreeMap<u64, LiveChildEntry>> = Mutex::new(BTreeMap::new());
 static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(1);
 
-fn register_child(child: Child, run_id: &str) -> (u64, u32, Arc<tokio::sync::Mutex<Child>>) {
+fn register_child(
+    child: Child,
+    run_id: &str,
+    child_index: u32,
+) -> (u64, u32, Arc<tokio::sync::Mutex<Child>>) {
     let id = NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed);
     let pid = child.id().unwrap_or(0);
     let shared = Arc::new(tokio::sync::Mutex::new(child));
     LIVE_CHILDREN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(id, (pid, run_id.to_string(), shared.clone()));
+        .insert(id, (pid, run_id.to_string(), child_index, shared.clone()));
     (id, pid, shared)
 }
 
@@ -107,8 +113,35 @@ pub fn request_stop_for_run(run_id: &str) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .filter(|(_, child_run, _)| child_run == run_id)
-            .map(|(pid, _, child)| (*pid, child.clone()))
+            .filter(|(_, child_run, _, _)| child_run == run_id)
+            .map(|(pid, _, _, child)| (*pid, child.clone()))
+            .collect()
+    };
+    let term = std::time::Instant::now();
+    for (pid, _) in &children {
+        signal_pid(*pid, Signal::Term);
+    }
+    let elapsed = term.elapsed();
+    if elapsed < Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) {
+        std::thread::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS) - elapsed);
+    }
+    for (pid, _) in children {
+        signal_pid(pid, Signal::Kill);
+    }
+}
+
+/// Signal only the live children of one child index within `run_id`
+/// (#1367/#1603 child-scoped stop — the model-attempt loop re-spawns under
+/// the same index, so every live pid of that index is signalled; siblings
+/// keep running). SIGTERM now, SIGKILL after the shutdown grace.
+pub fn request_stop_for_run_child(run_id: &str, child_index: u32) {
+    let children: Vec<(u32, Arc<tokio::sync::Mutex<Child>>)> = {
+        LIVE_CHILDREN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, child_run, index, _)| child_run == run_id && *index == child_index)
+            .map(|(pid, _, _, child)| (*pid, child.clone()))
             .collect()
     };
     let term = std::time::Instant::now();
@@ -135,7 +168,7 @@ pub async fn kill_all_children_for_shutdown() {
             .cloned()
             .collect()
     };
-    for (pid, _, child) in children {
+    for (pid, _, _, child) in children {
         signal_pid(pid, Signal::Term);
         tokio::time::sleep(Duration::from_millis(SHUTDOWN_TERM_TO_KILL_MS)).await;
         signal_pid(pid, Signal::Kill);
@@ -218,6 +251,12 @@ pub struct ForegroundRunInput {
     pub context_label: String,
     /// Steer inbox for async children (FR-P1-04); None clears the env.
     pub steer_inbox: Option<PathBuf>,
+    /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
+    /// env intersection) propagated to the child env; `None` clears it.
+    pub thinking_ceiling: Option<String>,
+    /// Child session display name (#1615 `deriveChildSessionName`);
+    /// `None` clears the env.
+    pub session_name: Option<String>,
     /// Supervisor channel dir (FR-P1-10); None clears the env.
     pub supervisor_channel: Option<PathBuf>,
     /// Streaming frame sink (TE09 FR-A): every progress-bearing child event
@@ -305,6 +344,8 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         fanout_authorized: input.fanout_authorized,
         self_extension: input.self_extension.clone(),
         steer_inbox: input.steer_inbox.clone(),
+        thinking_ceiling: input.thinking_ceiling.clone(),
+        session_name: input.session_name.clone(),
         supervisor_channel: input.supervisor_channel.clone(),
     });
 
@@ -382,7 +423,8 @@ pub async fn run_foreground(input: &ForegroundRunInput) -> ForegroundRunResult {
         );
     }
 
-    let (child_id, child_pid, child_handle) = register_child(child, &input.run_id);
+    let (child_id, child_pid, child_handle) =
+        register_child(child, &input.run_id, input.child_index);
     // Persist the pid for the stale-run reconciler (ADR-0019 crash branch):
     // a host crash orphans these children (independent process group, full
     // stdout pipe), and the next plugin init reaps them by recorded pid.
@@ -893,6 +935,16 @@ pub async fn run_foreground_with_fallback(
             &result.messages,
             result.tool_count,
         );
+        // #1318: a retryable provider failure records a TTL exclusion for
+        // the failing model — later launches skip it for the window
+        // (`recordRetryableModelFailure`; request-shape and overflow errors
+        // never record).
+        if advance {
+            crate::launch::model_exclusions::record_retryable_model_failure(
+                attempted.last().map(String::as_str),
+                result.error.as_deref(),
+            );
+        }
         if !advance {
             break;
         }
@@ -1274,6 +1326,8 @@ mod terminal_classification_tests {
             resolved_skill_names: None,
             context_label: "fresh".to_string(),
             steer_inbox: None,
+            thinking_ceiling: None,
+            session_name: None,
             supervisor_channel: None,
             stream_sink: None,
             step_status: None,

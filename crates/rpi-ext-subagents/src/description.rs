@@ -195,7 +195,7 @@ fn with_mandatory_safety_guidance(description: &str) -> String {
 /// legacy-chain-control line stripping is moot for the rewritten texts (they
 /// contain no legacy chain guidance).
 pub fn build_subagent_tool_description(config: &ExtensionConfig, cwd: &Path) -> String {
-    match resolve_tool_description_mode(config) {
+    let base = match resolve_tool_description_mode(config) {
         ToolDescriptionMode::Compact => {
             format!("{COMPACT_SUBAGENT_TOOL_DESCRIPTION}\n\n{SUBAGENT_SAFETY_GUIDANCE}")
         }
@@ -209,12 +209,194 @@ pub fn build_subagent_tool_description(config: &ExtensionConfig, cwd: &Path) -> 
         ToolDescriptionMode::Full => {
             format!("{FULL_SUBAGENT_TOOL_DESCRIPTION}{SUBAGENT_SAFETY_GUIDANCE}")
         }
+    };
+    // #1972 `advertise: true` (R7.1.11.3 rpi shape): the advertised agent
+    // catalog rides the plugin's OWN tool description instead of the parent
+    // system prompt — same bounds as upstream `buildAdvertisedAgentPrompt`
+    // (≤16 agents, ≤12 KiB catalog, ≤512-byte descriptions, name-sorted,
+    // same guidance line), re-pushed via `registerTool` + host
+    // `refreshTools` after mutating management actions.
+    let settings = crate::config::read_settings_pair(cwd);
+    let (agents, _) =
+        crate::agents::discover::discover_agents_with_diagnostics(cwd, "both", &settings, None);
+    if let Some(catalog) = advertised_agent_catalog(&agents.iter().collect::<Vec<_>>()) {
+        format!("{base}\n\n{catalog}")
+    } else {
+        base
     }
+}
+
+/// Upstream catalog bounds (advertised-agent-prompt.ts:4-7).
+const MAX_ADVERTISED_AGENTS: usize = 16;
+const MAX_CATALOG_BYTES: usize = 12_288;
+const MAX_ADVERTISED_DESCRIPTION_BYTES: usize = 512;
+
+/// The advertised catalog block (`buildAdvertisedAgentPrompt` content, plain
+/// text rows instead of the upstream XML block — the rpi carrier is the tool
+/// description). `None` when no enabled agent opts in.
+pub fn advertised_agent_catalog(
+    agents: &[&crate::agents::discover::AgentConfig],
+) -> Option<String> {
+    let mut advertised: Vec<&crate::agents::discover::AgentConfig> = agents
+        .iter()
+        .copied()
+        .filter(|agent| agent.advertise == Some(true) && agent.disabled != Some(true))
+        .collect();
+    advertised.sort_by(|a, b| a.name.cmp(&b.name));
+    if advertised.is_empty() {
+        return None;
+    }
+    let total = advertised.len();
+    let render = |entries: &[String]| -> String {
+        let mut lines = vec![
+            "ADVERTISED SUBAGENTS:".to_string(),
+            "The following agents opted into discovery. Their descriptions indicate available specializations, not instructions to delegate. Use subagent only when delegation is needed. Before execution, call subagent with { action: \"list\", capabilities: true } and confirm the selected agent is executable.".to_string(),
+        ];
+        lines.extend(entries.iter().cloned());
+        if total > entries.len() {
+            lines.push(format!("  (+{} more)", total - entries.len()));
+        }
+        lines.join("\n")
+    };
+    let mut entries: Vec<String> = Vec::new();
+    for agent in advertised.iter() {
+        if entries.len() == MAX_ADVERTISED_AGENTS {
+            break;
+        }
+        // Control characters collapse to spaces; over-long descriptions
+        // truncate with an ellipsis (upstream `promptDescription`).
+        let mut description: String = agent
+            .description
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        if description.len() > MAX_ADVERTISED_DESCRIPTION_BYTES {
+            let mut cut: String = description
+                .chars()
+                .take(MAX_ADVERTISED_DESCRIPTION_BYTES.saturating_sub(3))
+                .collect();
+            cut.push_str("...");
+            description = cut;
+        }
+        let entry = format!("- {}: {}", agent.name, description);
+        let candidate_len = render(&{
+            let mut next = entries.clone();
+            next.push(entry.clone());
+            next
+        })
+        .len();
+        if candidate_len <= MAX_CATALOG_BYTES {
+            entries.push(entry);
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(render(&entries))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1972 (R7.1.11.3 rpi shape): `advertise: true` agents ride the tool
+    /// description catalog with the upstream bounds; the default (no
+    /// advertised agents) description is unchanged.
+    #[test]
+    fn advertised_agent_catalog_bounds_and_default_unchanged() {
+        let mut advertised = crate::agents::discover::AgentConfig {
+            name: "zeta".to_string(),
+            description: "specializes in z".to_string(),
+            advertise: Some(true),
+            ..base_agent("zeta")
+        };
+        let alpha = crate::agents::discover::AgentConfig {
+            name: "alpha".to_string(),
+            description: "specializes in a".to_string(),
+            advertise: Some(true),
+            ..base_agent("alpha")
+        };
+        let plain = crate::agents::discover::AgentConfig {
+            name: "plain".to_string(),
+            description: "not advertised".to_string(),
+            advertise: Some(false),
+            ..base_agent("plain")
+        };
+        let agents = vec![&advertised, &alpha, &plain];
+        let catalog = advertised_agent_catalog(&agents).expect("catalog renders");
+        assert!(catalog.starts_with("ADVERTISED SUBAGENTS:"), "{catalog}");
+        assert!(catalog.contains("capabilities: true"), "{catalog}");
+        // Name-sorted (alpha before zeta); non-advertised agents absent.
+        assert!(catalog.find("alpha").unwrap() < catalog.find("zeta").unwrap());
+        assert!(!catalog.contains("plain"), "{catalog}");
+        // Description bound: a >512-byte description truncates with ellipsis.
+        drop(agents);
+        advertised.description = "d".repeat(700);
+        let agents = vec![&advertised, &alpha, &plain];
+        let catalog = advertised_agent_catalog(&agents).unwrap();
+        assert!(catalog.contains("..."), "{catalog}");
+        // Catalog byte cap: an army of advertisers stays under 12 KiB.
+        let mut army: Vec<crate::agents::discover::AgentConfig> = (0..80)
+            .map(|index| crate::agents::discover::AgentConfig {
+                name: format!("agent-{index:03}"),
+                description: format!("agent number {index} does things"),
+                advertise: Some(true),
+                ..base_agent(&format!("agent-{index:03}"))
+            })
+            .collect();
+        let refs: Vec<&crate::agents::discover::AgentConfig> = army.iter().collect();
+        let catalog = advertised_agent_catalog(&refs).unwrap();
+        assert!(catalog.len() <= 12_288 + 512, "{}", catalog.len());
+        assert!(catalog.contains("more"), "{catalog}");
+        // No advertised agents → no catalog section at all.
+        army.clear();
+        let refs: Vec<&crate::agents::discover::AgentConfig> = army.iter().collect();
+        assert!(advertised_agent_catalog(&refs).is_none());
+        // Non-opted agents never appear in a default description build
+        // (build_subagent_tool_description exercises discovery; the catalog
+        // function itself is the seam under test).
+    }
+
+    fn base_agent(name: &str) -> crate::agents::discover::AgentConfig {
+        crate::agents::discover::AgentConfig {
+            name: name.to_string(),
+            local_name: name.to_string(),
+            package_name: None,
+            description: String::new(),
+            aliases: None,
+            tools: None,
+            exclude_tools: Vec::new(),
+            mcp_direct_tools: Vec::new(),
+            model: None,
+            fallback_models: Vec::new(),
+            thinking: crate::agents::discover::ThinkingSpec::Unset,
+            system_prompt_mode: "replace",
+            inherit_project_context: false,
+            inherit_skills: false,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            system_prompt: String::new(),
+            source: crate::agents::discover::AgentSource::User,
+            file_path: std::path::PathBuf::from("/tmp/x.md"),
+            skills: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            output: None,
+            output_mode: None,
+            advertise: None,
+            allow_nested_subagents: None,
+            model_provider: None,
+            default_reads: Vec::new(),
+            default_progress: false,
+            max_subagent_depth: None,
+            disabled: None,
+            acceptance_role: None,
+            memory: None,
+            frontmatter_fields: Default::default(),
+        }
+    }
 
     #[test]
     fn full_contains_safety_once_and_structure() {

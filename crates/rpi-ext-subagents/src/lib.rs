@@ -551,6 +551,22 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             if let Err(error) = register("on", json!({ "event": "session_start" })) {
                 return json!({"error": {"kind": "init", "message": error.to_string()}});
             }
+            // #1615: the parent named this child at launch — surface it
+            // through `setSessionName` so the child's session file is
+            // identifiable in `--resume` and host session browsers (the
+            // child keeps the name verbatim; intercom routing targets live
+            // in env, not the session name, in rpi's model).
+            if let Ok(name) = std::env::var(launch::args::SUBAGENT_SESSION_NAME_ENV) {
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    if let Err(error) = register("setSessionName", json!({ "name": name })) {
+                        tracing::warn!(
+                            error = %error.to_string(),
+                            "setSessionName rejected; child session keeps its default name"
+                        );
+                    }
+                }
+            }
             // Supervisor client (FR-P1-10): children with a channel dir get
             // contact_supervisor (native-supervisor-channel.ts L298).
             // Registration is best-effort: a bare-file `--extension` injection
@@ -611,6 +627,12 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         PluginMode::Parent => {
             let config = config::load_config();
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            // #1439: `modelExclusions.defaultTtlMs` overrides the TTL for
+            // newly recorded exclusions (extension init →
+            // `setDefaultTTL(resolveModelExclusionTTL(config))`).
+            if let Some(ttl) = config.model_exclusions_default_ttl_ms {
+                crate::launch::model_exclusions::set_default_ttl(ttl);
+            }
             if let Err(error) = register(
                 "registerTool",
                 json!({
@@ -717,7 +739,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                                 "id": { "type": "string", "description": "Run id or unique id prefix; omit to wait on any background run." },
                                 "all": { "type": "boolean", "description": "Wait for every background run to finish (default: first terminal)." },
                                 "nonBlocking": { "type": "boolean", "description": "Register a wake and return immediately." },
-                                "timeoutMs": { "type": "integer", "description": "Wait timeout in milliseconds (default 30 minutes)." }
+                                "timeoutMs": { "type": "integer", "description": "Wait timeout in milliseconds (default: config waitTool.defaultTimeoutMs, then 30 minutes). Window expiry is a non-error active-work result." },
+                                "stopOnAttention": { "type": "boolean", "description": "False keeps the wait open through idle attention; pending supervisor requests still stop the wait." }
                             }
                         },
                     }),
@@ -1081,7 +1104,16 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
         .get("timeoutMs")
         .and_then(Value::as_u64)
         .filter(|v| *v > 0)
+        // #1591: the default window is configurable
+        // (`waitTool.defaultTimeoutMs`, env override) — None falls back to
+        // the built-in 30 minutes.
+        .or_else(|| config.wait_tool_default_timeout_ms())
         .unwrap_or(30 * 60 * 1000);
+    // #1315 `stopOnAttention`: accepted for call-shape parity. rpi's only
+    // attention source is a pending supervisor ask, and upstream stops the
+    // wait on supervisor asks in BOTH modes — so the value has no
+    // distinguishing effect here (documented in TE19 §7).
+    let _stop_on_attention = params.get("stopOnAttention").and_then(Value::as_bool);
     // The live-activity stream rides the same toolUpdate seam as the
     // foreground snapshots (upstream deps.onUpdate, subagent-wait.ts:578).
     let (update_sink, abort_probe) = {
@@ -1133,6 +1165,15 @@ fn execute_subagent_wait(params: &Value, state: &PluginState, tool_call_id: Opti
                      Completion still arrives as a session message; inspect with \
                      subagent({{action:\"status\"}}) or wait again with subagent_wait.",
                     waited["runs"].as_array().map(Vec::len).unwrap_or(0)
+                )
+            }
+            // #1315: a run needs a decision — answer it, then wait again.
+            else if let Some(attention) = waited["attention"].as_object() {
+                format!(
+                    "Wait stopped: background run {} is blocked on a pending supervisor request {}. Reply with subagent_supervisor({{action:\"reply\", replyTo:\"{}\", message:\"<explicit answer>\"}}), then wait again.",
+                    attention.get("runId").and_then(Value::as_str).unwrap_or("?"),
+                    attention.get("requestId").and_then(Value::as_str).unwrap_or("?"),
+                    attention.get("requestId").and_then(Value::as_str).unwrap_or("?"),
                 )
             }
             // The timeout branch (wait_for_runs deadline) must read as a
@@ -1403,6 +1444,8 @@ pub mod parity {
             fanout_authorized: input.fanout_authorized,
             self_extension: input.self_extension.clone(),
             steer_inbox: input.steer_inbox.clone(),
+            thinking_ceiling: None,
+            session_name: None,
             supervisor_channel: None,
         };
         let result = crate::launch::args::build_rpi_args(&internal)?;
@@ -1539,6 +1582,8 @@ pub mod parity {
             fallback_models,
             registry_ref,
             preferred_provider,
+            None,
+            None,
             None,
             origin,
             &mut sink,

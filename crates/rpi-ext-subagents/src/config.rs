@@ -87,6 +87,14 @@ pub struct ExtensionConfig {
     /// `intercomBridge` (FR-P1-10): `{ mode?: "always"|"fork-only"|"off",
     /// instructionFile?, resultDelivery? }` (intercom-bridge.ts:82-89).
     pub intercom_bridge: Option<Value>,
+    /// `waitTool.defaultTimeoutMs` (#1591): default `subagent_wait` window
+    /// when the call omits `timeoutMs` (positive integer; env
+    /// `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS` overrides). None = the
+    /// built-in 30-minute default.
+    pub wait_tool_default_timeout_ms: Option<u64>,
+    /// `modelExclusions.defaultTtlMs` (#1439): TTL for newly recorded model
+    /// exclusions (finite positive ≤ 8e15; None = 24h default).
+    pub model_exclusions_default_ttl_ms: Option<u64>,
 }
 
 impl Default for ExtensionConfig {
@@ -119,6 +127,8 @@ impl ExtensionConfig {
             worktree_base_dir: None,
             worktree_setup_hook: None,
             intercom_bridge: None,
+            wait_tool_default_timeout_ms: None,
+            model_exclusions_default_ttl_ms: None,
         }
     }
 
@@ -214,6 +224,22 @@ impl ExtensionConfig {
                 .unwrap_or(true),
             _ => true,
         }
+    }
+
+    /// `waitTool.defaultTimeoutMs` (#1591, wait-config.ts
+    /// `resolveWaitToolConfig`): env `RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS`
+    /// (positive integer) > config > None (the caller's built-in default).
+    pub fn wait_tool_default_timeout_ms(&self) -> Option<u64> {
+        const ENV: &str = "RPI_SUBAGENT_WAIT_TOOL_DEFAULT_TIMEOUT_MS";
+        if let Ok(raw) = std::env::var(ENV) {
+            match raw.trim().parse::<u64>() {
+                Ok(v) if v >= 1 => return Some(v),
+                _ => {
+                    tracing::warn!(env = %ENV, value = %raw, "invalid defaultTimeoutMs env value; ignoring")
+                }
+            }
+        }
+        self.wait_tool_default_timeout_ms
     }
 
     /// `fleet.enabled` (TE11 FR-C): env
@@ -426,22 +452,54 @@ fn parse_config(raw: &Value, path: &str) -> Result<ExtensionConfig, String> {
         }
     }
     if let Some(wait_tool) = object.get("waitTool") {
-        // wait-config.ts:22-29: boolean, or object whose `enabled` (when
-        // present) is a boolean.
+        // wait-config.ts:22-29 + #1591: boolean, or object whose `enabled`
+        // (when present) is a boolean and whose `defaultTimeoutMs` (when
+        // present) is a positive integer.
         let valid = wait_tool.is_boolean()
-            || wait_tool
-                .as_object()
-                .is_some_and(|o| match o.get("enabled") {
+            || wait_tool.as_object().is_some_and(|o| {
+                let enabled_ok = match o.get("enabled") {
                     None => true,
                     Some(enabled) => enabled.is_boolean(),
-                });
+                };
+                let timeout_ok = match o.get("defaultTimeoutMs") {
+                    None => true,
+                    Some(timeout) => timeout.as_u64().is_some_and(|v| v >= 1),
+                };
+                enabled_ok && timeout_ok
+            });
         if !valid {
             return Err(
-                "config.waitTool must be a boolean or an object with optional enabled boolean"
+                "config.waitTool must be a boolean or an object with optional enabled boolean and defaultTimeoutMs positive integer"
                     .into(),
             );
         }
+        if let Some(timeout) = wait_tool
+            .as_object()
+            .and_then(|o| o.get("defaultTimeoutMs"))
+            .and_then(Value::as_u64)
+            .filter(|v| *v >= 1)
+        {
+            config.wait_tool_default_timeout_ms = Some(timeout);
+        }
         config.wait_tool = Some(wait_tool.clone());
+    }
+    if let Some(exclusions) = object.get("modelExclusions") {
+        // #1439: `{defaultTtlMs?}` — finite positive ≤ 8e15
+        // (config.ts:105-107). Only `defaultTtlMs` is read.
+        if let Some(ttl) = exclusions.as_object().and_then(|o| o.get("defaultTtlMs")) {
+            match ttl
+                .as_u64()
+                .filter(|v| *v >= 1 && *v <= 8_000_000_000_000_000)
+            {
+                Some(v) => config.model_exclusions_default_ttl_ms = Some(v),
+                None => {
+                    return Err(
+                        "config.modelExclusions.defaultTtlMs must be a finite positive number no greater than 8000000000000000"
+                            .into(),
+                    )
+                }
+            }
+        }
     }
     if let Some(fleet) = object.get("fleet") {
         // TE11 FR-C: boolean, or `{enabled?, expanded?}` with boolean values.
@@ -595,7 +653,16 @@ pub struct AgentOverride {
     pub default_context: Option<Option<String>>,
     /// `read-only` | `writer` | false (clear) — FR-P1-09.
     pub acceptance_role: Option<Option<String>>,
+    /// `systemPrompt` override (agents.ts:1104-1106).
     pub system_prompt: Option<String>,
+    /// `defaultProvider` builtin override (#1393, agents.ts:1087-1090):
+    /// non-empty string sets the agent's preferred provider; `false`
+    /// (`Some(None)`) clears it so the settings default does not apply.
+    pub default_provider: Option<Option<String>>,
+    /// `allowNestedSubagents` override (#1587, agents.ts:1100-1102).
+    pub allow_nested_subagents: Option<bool>,
+    /// `outputMode` override (#1305, agents.ts:979-983): inline | file-only.
+    pub output_mode: Option<String>,
     pub skills: Option<Option<Vec<String>>>,
 }
 
@@ -609,6 +676,17 @@ pub struct SubagentSettings {
     pub disable_thinking: Option<bool>,
     pub default_extensions: Option<Vec<String>>,
     pub model_scope: Option<crate::launch::model::ModelScopeConfig>,
+    // —— v0.66 keys (TE19 / R7.1.10.x, R7.1.11.x) ——
+    /// `maxThinking` (#1397): thinking ceiling across subagent launches
+    /// (off|minimal|low|medium|high|xhigh|max); project settings win.
+    pub max_thinking: Option<String>,
+    /// `defaultProvider` (#1393): preferred provider for bare model ids;
+    /// project settings win.
+    pub default_provider: Option<String>,
+    /// `agentScanDirs` (#1801): extra agent discovery directories
+    /// (one-segment `*` wildcard allowed); user-scope and project-scope
+    /// settings stay scoped to their own discovery level.
+    pub agent_scan_dirs: Option<Vec<String>>,
 }
 
 /// `readSubagentSettings` (agents.ts:860-928) — fail-fast on invalid values.
@@ -715,6 +793,71 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                 path.to_string_lossy(),
                 message
             ))
+        }
+    }
+    // —— v0.66 keys (TE19) ——
+    if let Some(value) = subagents.get("maxThinking") {
+        // agents.ts:1164-1170: ThinkingLevel vocabulary, fail-fast.
+        match value.as_str().map(str::trim) {
+            Some(level)
+                if matches!(
+                    level,
+                    "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                ) =>
+            {
+                parsed.max_thinking = Some(level.to_string());
+            }
+            _ => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'maxThinking'; expected one of off, minimal, low, medium, high, xhigh, or max.",
+                    path.to_string_lossy()
+                ))
+            }
+        }
+    }
+    if let Some(value) = subagents.get("defaultProvider") {
+        // agents.ts:1148-1154: non-empty string.
+        match value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(provider) => parsed.default_provider = Some(provider.to_string()),
+            None => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'defaultProvider'; expected a non-empty string.",
+                    path.to_string_lossy()
+                ))
+            }
+        }
+    }
+    if let Some(value) = subagents.get("agentScanDirs") {
+        // agents.ts settings parse + agent-scan-dirs.test.ts: array of
+        // strings (non-string entries fail the whole settings file like
+        // upstream `invalid 'agentScanDirs'`).
+        match value.as_array() {
+            Some(items) => {
+                let mut dirs = Vec::new();
+                let mut valid = true;
+                for item in items {
+                    match item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(dir) => dirs.push(dir.to_string()),
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    return Err(format!(
+                        "Subagent settings in '{}' have invalid 'agentScanDirs'; expected an array of strings.",
+                        path.to_string_lossy()
+                    ));
+                }
+                parsed.agent_scan_dirs = Some(dirs);
+            }
+            None => {
+                return Err(format!(
+                    "Subagent settings in '{}' have invalid 'agentScanDirs'; expected an array of strings.",
+                    path.to_string_lossy()
+                ))
+            }
         }
     }
     if let Some(overrides) = subagents.get("agentOverrides") {
@@ -899,6 +1042,50 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                 .to_string(),
                         );
                     }
+                    "defaultProvider" => {
+                        // #1393 (agents.ts:1087-1090): non-empty string or false.
+                        parsed_entry.default_provider = Some(match field {
+                            Value::Bool(false) => None,
+                            Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                            _ => {
+                                return Err(invalid_override_field(
+                                    path,
+                                    name,
+                                    "defaultProvider",
+                                    "a non-empty string or false",
+                                ))
+                            }
+                        });
+                    }
+                    "allowNestedSubagents" => {
+                        // #1587 (agents.ts:1100-1102).
+                        parsed_entry.allow_nested_subagents =
+                            Some(field.as_bool().ok_or_else(|| {
+                                invalid_override_field(
+                                    path,
+                                    name,
+                                    "allowNestedSubagents",
+                                    "a boolean",
+                                )
+                            })?);
+                    }
+                    "outputMode" => {
+                        // #1305 (agents.ts:979-983): inline | file-only.
+                        match field.as_str() {
+                            Some("inline") | Some("file-only") => {
+                                parsed_entry.output_mode =
+                                    Some(field.as_str().unwrap_or("inline").to_string());
+                            }
+                            _ => {
+                                return Err(invalid_override_field(
+                                    path,
+                                    name,
+                                    "outputMode",
+                                    "'inline' or 'file-only'",
+                                ))
+                            }
+                        }
+                    }
                     "skills" => {
                         parsed_entry.skills = Some(parse_override_string_array_or_false(
                             field, path, name, "skills",
@@ -1001,6 +1188,10 @@ pub struct SettingsPair {
     /// `modelScope` — project wins when a project settings file exists
     /// (same mask discipline as the other defaults).
     pub model_scope: Option<crate::launch::model::ModelScopeConfig>,
+    /// `resolveSubagentMaxThinking` (agents.ts:1303-1309): project wins.
+    pub max_thinking: Option<String>,
+    /// `resolveSubagentDefaultProvider` (agents.ts:1242-1250): project wins.
+    pub default_provider: Option<String>,
 }
 
 /// Read both settings files. Invalid files warn and contribute nothing.
@@ -1060,6 +1251,19 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
     } else {
         user.model_scope.clone()
     };
+    // `resolveSubagentMaxThinking` / `resolveSubagentDefaultProvider`
+    // (agents.ts:1303-1309/1242-1250): a project settings file that sets the
+    // key masks the user level.
+    let max_thinking = if project_settings_present && project.max_thinking.is_some() {
+        project.max_thinking.clone()
+    } else {
+        user.max_thinking.clone()
+    };
+    let default_provider = if project_settings_present && project.default_provider.is_some() {
+        project.default_provider.clone()
+    } else {
+        user.default_provider.clone()
+    };
     SettingsPair {
         default_model: project
             .default_model
@@ -1073,6 +1277,8 @@ pub fn read_settings_pair(cwd: &std::path::Path) -> SettingsPair {
         project_thinking_configured,
         default_extensions,
         model_scope,
+        max_thinking,
+        default_provider,
         user,
         project,
     }
@@ -1143,6 +1349,115 @@ mod tests {
     fn cleanup_days_must_be_non_negative_integer() {
         assert!(parse(r#"{"artifactConfig":{"cleanupDays":-1}}"#).is_err());
         assert!(parse(r#"{"artifactConfig":{"cleanupDays":3}}"#).is_ok());
+    }
+
+    /// TE19 (R7.1.10.1/R7.1.11.1): the v0.66 settings keys parse, and a
+    /// project file that sets them masks the user level (project wins).
+    #[test]
+    fn v066_settings_keys_parse_and_project_wins() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-v066-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let user_path = dir.join("user-settings.json");
+        std::fs::write(
+            &user_path,
+            r#"{"subagents":{
+                "maxThinking":"high",
+                "defaultProvider":"user-prov",
+                "agentScanDirs":["/tmp/scan-user"]
+            }}"#,
+        )
+        .unwrap();
+        let user = read_subagent_settings(&user_path).unwrap();
+        assert_eq!(user.max_thinking.as_deref(), Some("high"));
+        assert_eq!(user.default_provider.as_deref(), Some("user-prov"));
+        assert_eq!(
+            user.agent_scan_dirs.as_deref(),
+            Some(["/tmp/scan-user".to_string()].as_slice())
+        );
+        // Invalid vocabulary fails the whole file (agents.ts:1164-1170).
+        let bad = dir.join("bad-thinking.json");
+        std::fs::write(&bad, r#"{"subagents":{"maxThinking":"ultra"}}"#).unwrap();
+        let error = read_subagent_settings(&bad).unwrap_err();
+        assert!(error.contains("invalid 'maxThinking'"), "{error}");
+        assert!(
+            error.contains("off, minimal, low, medium, high, xhigh, or max"),
+            "{error}"
+        );
+        let bad_provider = dir.join("bad-provider.json");
+        std::fs::write(&bad_provider, r#"{"subagents":{"defaultProvider":42}}"#).unwrap();
+        assert!(read_subagent_settings(&bad_provider)
+            .unwrap_err()
+            .contains("invalid 'defaultProvider'"));
+        let bad_scan = dir.join("bad-scan.json");
+        std::fs::write(&bad_scan, r#"{"subagents":{"agentScanDirs":["/ok",42]}}"#).unwrap();
+        assert!(read_subagent_settings(&bad_scan)
+            .unwrap_err()
+            .contains("invalid 'agentScanDirs'"));
+        // Override fields: defaultProvider string|false, allowNestedSubagents
+        // bool, outputMode enum.
+        let override_path = dir.join("overrides.json");
+        std::fs::write(
+            &override_path,
+            r#"{"subagents":{"agentOverrides":{
+                "scout":{"defaultProvider":"openai","allowNestedSubagents":true,"outputMode":"file-only"},
+                "worker":{"defaultProvider":false,"outputMode":"inline"}
+            }}}"#,
+        )
+        .unwrap();
+        let parsed = read_subagent_settings(&override_path).unwrap();
+        assert_eq!(
+            parsed.overrides["scout"].default_provider,
+            Some(Some("openai".to_string()))
+        );
+        assert_eq!(parsed.overrides["scout"].allow_nested_subagents, Some(true));
+        assert_eq!(
+            parsed.overrides["scout"].output_mode.as_deref(),
+            Some("file-only")
+        );
+        // `false` clears the provider (Some(None)).
+        assert_eq!(parsed.overrides["worker"].default_provider, Some(None));
+        let bad_mode = dir.join("bad-mode.json");
+        std::fs::write(
+            &bad_mode,
+            r#"{"subagents":{"agentOverrides":{"x":{"outputMode":"boxed"}}}}"#,
+        )
+        .unwrap();
+        assert!(read_subagent_settings(&bad_mode)
+            .unwrap_err()
+            .contains("outputMode"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1591/#1439: waitTool.defaultTimeoutMs + modelExclusions.defaultTtlMs
+    /// parse with validation, and resolve through env overrides.
+    #[test]
+    fn wait_window_and_exclusion_ttl_config() {
+        fn load_config_at(path: &std::path::Path) -> ExtensionConfig {
+            let raw = read_json_file(path).expect("config file");
+            parse_config(&raw, &path.to_string_lossy()).expect("config parses")
+        }
+        let dir = std::env::temp_dir().join(format!("rpi-sub-cfg-wait-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rpi-extension.json");
+        std::fs::write(
+            &path,
+            r#"{"waitTool":{"enabled":true,"defaultTimeoutMs":120000},
+                "modelExclusions":{"defaultTtlMs":3600000}}"#,
+        )
+        .unwrap();
+        let config = load_config_at(&path);
+        assert_eq!(config.wait_tool_default_timeout_ms(), Some(120_000));
+        assert_eq!(config.model_exclusions_default_ttl_ms, Some(3_600_000));
+        // Invalid shapes fail the config load.
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, r#"{"waitTool":{"defaultTimeoutMs":0}}"#).unwrap();
+        assert!(parse_config(&read_json_file(&bad).unwrap(), "bad.json").is_err());
+        let bad_ttl = dir.join("bad-ttl.json");
+        std::fs::write(&bad_ttl, r#"{"modelExclusions":{"defaultTtlMs":-5}}"#).unwrap();
+        assert!(parse_config(&read_json_file(&bad_ttl).unwrap(), "bad-ttl.json").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

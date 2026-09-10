@@ -132,7 +132,14 @@ function runRust(mode, modeFile) {
 	const binary = ensureRustRunner();
 	const result = spawnSync(binary, [mode, modeFile], {
 		encoding: "utf-8",
-		env: cleanSessionEnv({ ...process.env }),
+		env: cleanSessionEnv({
+			...process.env,
+			// TE19 (#1318): isolate the model-exclusion store per harness run
+			// — recorded exclusions from fixtures (or an earlier e2e run on
+			// the default path) must not silently drop fixture candidates
+			// from the model legs.
+			RPI_MODEL_EXCLUSIONS_PATH: `${tmpdir()}/rpi-subagents-parity-exclusions-${process.pid}.json`,
+		}),
 	});
 	if (result.status !== 0) {
 		throw new Error(`rust parity_runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);
@@ -219,6 +226,14 @@ function normalizeOutput(output) {
 			// counterpart on either pin; its presence is pinned by crate unit
 			// tests + the e2e env dump instead of this diff.
 			"RPI_NO_GLOBAL_CONTEXT",
+			// TE19 (#1397/#1615): v0.66 launch-contract additions with no
+			// v0.48 argv/env counterpart — the intersected thinking ceiling
+			// (thinking-ceiling.ts, upstream threads it in-process) and the
+			// child session display name (child-session-name.ts, upstream
+			// rides the child runtime config). Pinned by crate unit tests +
+			// the e2e env dump.
+			"RPI_SUBAGENT_THINKING_CEILING",
+			"RPI_SUBAGENT_SESSION_NAME",
 		]);
 		for (const key of Object.keys(clone.env).sort()) {
 			if (RPI_ONLY_ENV_KEYS.has(key)) continue;

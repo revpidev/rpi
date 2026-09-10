@@ -112,12 +112,20 @@ pub fn parse_tasks(tasks: &Value, max_tasks: u64) -> Result<Vec<TaskEntry>, Stri
                 model: str_field(object, "model"),
                 thinking: str_field(object, "thinking"),
                 context: context_field(object),
+                context_profile: object.get("context").and_then(Value::as_str) == Some("profile"),
                 cwd: object
                     .get("cwd")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                     .map(crate::paths::expand_tilde_and_resolve),
                 output,
+                output_mode: match object.get("outputMode").and_then(Value::as_str) {
+                    Some("inline") | Some("file-only") => object
+                        .get("outputMode")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                },
                 timeout_ms: positive_u64(object.get("timeoutMs"))
                     .or_else(|| positive_u64(object.get("maxRuntimeMs"))),
                 child_index: index as u32,

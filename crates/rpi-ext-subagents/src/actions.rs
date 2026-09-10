@@ -158,6 +158,120 @@ pub fn format_agent_detail(agent: &AgentConfig) -> String {
     lines.join("\n")
 }
 
+/// `formatAgentCapabilitiesLine` (#1717, agent-management.ts:751-771 @
+/// 0fc0eebb): one line per agent carrying the selection-relevant facts —
+/// description preview, tool surface, model, thinking. The header reads
+/// `Executable agents (capabilities):`.
+pub fn format_agent_capabilities_list(agents: &[AgentConfig]) -> String {
+    let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut lines = vec!["Executable agents (capabilities):".to_string()];
+    if sorted.is_empty() {
+        lines.push("- (none)".to_string());
+    } else {
+        for agent in sorted {
+            let mut tools = "none".to_string();
+            let mut declared = agent.tools.clone().unwrap_or_default();
+            declared.extend(agent.mcp_direct_tools.iter().map(|t| format!("mcp:{t}")));
+            if agent.tools.is_none() && agent.mcp_direct_tools.is_empty() {
+                tools = "default/ambient".to_string();
+            } else if !declared.is_empty() {
+                tools = declared.join(", ");
+            }
+            if !agent.exclude_tools.is_empty() {
+                tools = format!("{tools}; excludes: {}", agent.exclude_tools.join(", "));
+            }
+            let model = match &agent.model {
+                Some(model) => model.clone(),
+                None => "inherits current session".to_string(),
+            };
+            let thinking = match &agent.thinking {
+                crate::agents::discover::ThinkingSpec::Level(level) => level.clone(),
+                crate::agents::discover::ThinkingSpec::Disabled => "off".to_string(),
+                crate::agents::discover::ThinkingSpec::Unset => "default".to_string(),
+            };
+            lines.push(format!(
+                "- {} ({}): Description: {}; Tools: {}; Model: {}; Thinking: {}",
+                agent.name,
+                agent.source_str(),
+                truncate_chars(&agent.description, 240),
+                tools,
+                model,
+                thinking
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let normalized: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed: String = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        collapsed
+    } else {
+        let mut cut: String = collapsed.chars().take(max_chars - 1).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// `agentCapabilitiesSnapshot` (#1720, agent-management.ts:860-870 +
+/// `agentCapabilityRow` @ 0fc0eebb): structured per-agent records so callers
+/// can select agents without parsing prose rows.
+pub fn agent_capabilities_snapshot(agents: &[AgentConfig]) -> Value {
+    let mut sorted: Vec<&AgentConfig> = agents.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    json!({
+        "agents": sorted
+            .iter()
+            .map(|agent| {
+                let mut record = json!({
+                    "name": agent.name,
+                    "description": truncate_chars(&agent.description, 1000),
+                    "source": agent.source_str(),
+                    "executable": true,
+                    "tools": {
+                        "tools": agent.tools,
+                        "mcpDirectTools": agent.mcp_direct_tools,
+                        "excludes": agent.exclude_tools,
+                    },
+                    "model": {
+                        "value": agent.model,
+                        "fallbackModels": agent.fallback_models,
+                        "thinking": match &agent.thinking {
+                            crate::agents::discover::ThinkingSpec::Level(level) => json!(level),
+                            crate::agents::discover::ThinkingSpec::Disabled => json!("off"),
+                            crate::agents::discover::ThinkingSpec::Unset => Value::Null,
+                        },
+                    },
+                    "execution": {
+                        "defaultAsync": agent.default_async,
+                        "timeoutMs": agent.default_timeout_ms,
+                    },
+                    "output": {
+                        "path": agent.output,
+                        "mode": agent.output_mode,
+                    },
+                    "extensions": {
+                        "names": agent.extensions,
+                        "subagentOnly": agent.subagent_only_extensions,
+                        "skills": agent.skills,
+                    },
+                });
+                if let Some(aliases) = &agent.aliases {
+                    record["aliases"] = json!(aliases);
+                }
+                record
+            })
+            .collect::<Vec<_>>(),
+        "restrictedCount": 0,
+    })
+}
+
 /// Extra dependencies the P1 control actions need (async registry access).
 pub struct ActionDeps<'a> {
     pub host: Option<&'a dyn crate::HostContext>,
@@ -167,7 +281,63 @@ pub struct ActionDeps<'a> {
 }
 
 /// `handleManagementAction` (agent-management.ts:1242 dispatch, P1 subset).
+/// Mutating actions (create/update/delete/disable/enable/eject/reset) also
+/// refresh the advertised-agent catalog: the `subagent` tool is
+/// re-registered with a rebuilt description, and the host's `refreshTools`
+/// fires from the registration (R7.1.11.3 rpi shape — no parent system
+/// prompt injection).
 pub fn handle_management_action_with(
+    action: &str,
+    agent_name: Option<&str>,
+    cwd: &Path,
+    settings: &SettingsPair,
+    config: &crate::config::ExtensionConfig,
+    deps: &ActionDeps<'_>,
+) -> ToolOutcome {
+    let outcome = handle_management_action_inner(action, agent_name, cwd, settings, config, deps);
+    if matches!(
+        action,
+        "create" | "update" | "delete" | "disable" | "enable" | "eject" | "reset"
+    ) {
+        refresh_advertised_catalog(deps.host, cwd, config);
+    }
+    outcome
+}
+
+/// Re-register the `subagent` tool so the advertised catalog (if any)
+/// rebuilds; registration failure is logged and non-fatal (the action
+/// itself already succeeded).
+fn refresh_advertised_catalog(
+    host: Option<&dyn crate::HostContext>,
+    cwd: &Path,
+    config: &crate::config::ExtensionConfig,
+) {
+    let Some(host) = host else {
+        return;
+    };
+    let Some(calls) = host.async_calls() else {
+        return;
+    };
+    let description = crate::description::build_subagent_tool_description(config, cwd);
+    let response = crate::host_call_static(
+        &calls,
+        "registerTool",
+        json!({
+            "name": "subagent",
+            "label": "Subagent",
+            "description": description,
+            "promptSnippet": "Delegate focused subtasks to child agent sessions (scout/researcher/worker/reviewer/oracle/delegate) or manage them via action.",
+            "parameters": crate::tool::tool_parameters_schema(),
+            "renderCall": true,
+            "renderResult": true,
+        }),
+    );
+    if response.get("error").is_some() {
+        tracing::warn!("advertised-catalog refresh: registerTool rejected");
+    }
+}
+
+fn handle_management_action_inner(
     action: &str,
     agent_name: Option<&str>,
     cwd: &Path,
@@ -187,13 +357,34 @@ pub fn handle_management_action_with(
         "list" => {
             let (agents, diagnostics) =
                 discover::discover_agents_with_diagnostics(cwd, "both", settings, None);
-            let mut text = format_agent_list(&agents);
+            // #1717/#1720: `capabilities: true` switches to the compact
+            // capability lines and attaches structured `details.agentCapabilities`
+            // records (agent-management.ts:972-995 + agentCapabilityRow @
+            // 0fc0eebb); the default listing shape is unchanged.
+            let capability_mode = raw_params.get("capabilities") == Some(&Value::Bool(true));
+            let mut text = if capability_mode {
+                format_agent_capabilities_list(&agents)
+            } else {
+                format_agent_list(&agents)
+            };
             let diagnostic_lines = format_discovery_diagnostics(&diagnostics);
             if !diagnostic_lines.is_empty() {
                 text.push('\n');
                 text.push_str(&diagnostic_lines.join("\n"));
             }
-            ToolOutcome::text(text)
+            let mut details = Value::Null;
+            if capability_mode {
+                details = json!({
+                    "mode": "management",
+                    "results": [],
+                    "agentCapabilities": agent_capabilities_snapshot(&agents),
+                });
+            }
+            ToolOutcome {
+                text,
+                details,
+                is_error: false,
+            }
         }
         "get" => {
             let Some(name) = agent_name else {
@@ -207,6 +398,37 @@ pub fn handle_management_action_with(
             }
         }
         "status" => {
+            // Optional view selectors (#1963): `view:"transcript"` requires
+            // an id and reads that run's live child transcript on demand;
+            // the fleet view is [DEFER] (03 §2.13) so transcript is the only
+            // valid view in rpi.
+            let view = raw_params.get("view").and_then(Value::as_str);
+            if let Some(view) = view {
+                if view != "transcript" {
+                    return ToolOutcome::error(format!(
+                        "Unknown status view: {view}. Valid: transcript."
+                    ));
+                }
+                let Some(id) = id_param(&raw_params) else {
+                    return ToolOutcome::error(
+                        "status view \"transcript\" requires the run id (use { id })."
+                            .to_string(),
+                    );
+                };
+                let lines = raw_params
+                    .get("lines")
+                    .and_then(Value::as_u64)
+                    .map(|v| v.clamp(1, 1000))
+                    .unwrap_or(80) as usize;
+                let index = raw_params
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as usize);
+                return match format_status_transcript(&id, index, lines) {
+                    Ok(text) => ToolOutcome::text(text),
+                    Err(message) => ToolOutcome::error(message),
+                };
+            }
             // Foreground memory + live async registry (async-status.ts shape).
             let memory = FOREGROUND_RUN_MEMORY
                 .lock()
@@ -248,6 +470,20 @@ pub fn handle_management_action_with(
             }
             ToolOutcome::text(lines.join("\n"))
         }
+        // Lifecycle diagnostics for one async run (#1037): run/dir/state/
+        // process-terminal + a bounded events summary — no prompts, secrets
+        // or transcripts.
+        "debug.run" => {
+            let Some(id) = id_param(&raw_params) else {
+                return ToolOutcome::error(
+                    "action \"debug.run\" requires the run id (use { id }).".to_string(),
+                );
+            };
+            match format_run_lifecycle_debug(&id) {
+                Ok(text) => ToolOutcome::text(text),
+                Err(message) => ToolOutcome::error(message),
+            }
+        }
         // Async control actions (async-stop-action.ts / control-channel.ts).
         "interrupt" => match id_param(&raw_params) {
             Some(id) => match crate::runner::background::interrupt_run(&id) {
@@ -260,29 +496,98 @@ pub fn handle_management_action_with(
         },
         "stop" => match id_param(&raw_params) {
             Some(id) => {
-                // Cooperative stop + direct child signalling; the bounded
-                // terminal wait happens on the plugin runtime.
-                let (Some(runtime), Some(_host)) = (deps.runtime, deps.host) else {
-                    return ToolOutcome::error(
-                        "action \"stop\" is unavailable in this context.".to_string(),
-                    );
-                };
+                // Child-scoped stop (#1367/#1603): `childId` resolves one
+                // child of a multi-child run; malformed ids are rejected —
+                // never widened to a run-level stop. Identity candidates
+                // per step: `step.runId` (when present) then `step:<index>`
+                // (child-identity.ts:26-28 subset).
+                let child_id = raw_params
+                    .get("childId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 match crate::runner::background::find_run(&id) {
                     Some(handle) => {
                         // Terminal runs stay registered (wait/status read
-                        // them); stopping one is a no-op — report its final
-                        // state instead of the misleading "Stop requested".
+                        // them); stopping one is invalid_state (#1965) —
+                        // report instead of queueing or silently succeeding.
+                        // Checked BEFORE the runtime dependency: a terminal
+                        // run cannot be stopped regardless of context.
                         let snapshot = crate::runner::background::status_snapshot(&handle);
                         let state = snapshot["state"].as_str().unwrap_or_default();
                         if matches!(
                             state,
                             "complete" | "failed" | "stopped" | "paused" | "rejected"
                         ) {
-                            return ToolOutcome::text(format!(
-                                "Background run {} already reached a terminal state: {state}.",
+                            return ToolOutcome::error(format!(
+                                "invalid_state: Background run {} is {state}; stop only supports running async runs.",
                                 handle.run_id
                             ));
                         }
+                        // Child-scoped stop resolves + validates BEFORE the
+                        // runtime dependency: the rejections are pure status
+                        // decisions, and the child stop itself only signals
+                        // (no bounded wait).
+                        let steps: Vec<Value> = snapshot["steps"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(child_id) = &child_id {
+                            let mut matches: Vec<usize> = Vec::new();
+                            for (index, step) in steps.iter().enumerate() {
+                                let step_marker = format!("step:{index}");
+                                let candidates = [
+                                    step["runId"].as_str(),
+                                    Some(step_marker.as_str()),
+                                ];
+                                if candidates.contains(&Some(child_id.as_str())) {
+                                    matches.push(index);
+                                }
+                            }
+                            let Some(&index) = matches.first() else {
+                                return ToolOutcome::error(format!(
+                                    "Child '{child_id}' was not found under background run '{}'.",
+                                    handle.run_id
+                                ));
+                            };
+                            if matches.len() > 1 {
+                                return ToolOutcome::error(format!(
+                                    "Child '{child_id}' is ambiguous under background run '{}'.",
+                                    handle.run_id
+                                ));
+                            }
+                            let step_state = steps[index]["status"].as_str().unwrap_or("unknown");
+                            if !matches!(step_state, "pending" | "running" | "queued") {
+                                return ToolOutcome::error(format!(
+                                    "invalid_state: Child '{child_id}' in background run '{}' is {step_state}; stop only supports pending or running children.",
+                                    handle.run_id
+                                ));
+                            }
+                            crate::runner::foreground::request_stop_for_run_child(
+                                &handle.run_id,
+                                index as u32,
+                            );
+                            crate::artifacts::append_jsonl(
+                                &handle.run_dir.join("events.jsonl"),
+                                &serde_json::json!({
+                                    "type": "control.stop",
+                                    "runId": handle.run_id,
+                                    "targetIndex": index,
+                                    "childId": child_id,
+                                })
+                                .to_string(),
+                            );
+                            return ToolOutcome::text(format!(
+                                "Stop requested for child {child_id} in background run {}.",
+                                handle.run_id
+                            ));
+                        }
+                        // Cooperative stop + direct child signalling; the
+                        // bounded terminal wait happens on the plugin runtime.
+                        let (Some(runtime), Some(_host)) = (deps.runtime, deps.host) else {
+                            return ToolOutcome::error(
+                                "action \"stop\" is unavailable in this context.".to_string(),
+                            );
+                        };
                         handle.control.request_stop();
                         crate::runner::foreground::request_stop_for_run(&handle.run_id);
                         let run_dir = handle.run_dir.clone();
@@ -339,7 +644,11 @@ pub fn handle_management_action_with(
                 .and_then(Value::as_str)
                 .unwrap_or("steer")
                 .to_string();
-            let target_index = raw_params.get("targetIndex").and_then(Value::as_u64).map(|v| v as usize);
+            let target_index = raw_params
+                .get("targetIndex")
+                .or_else(|| raw_params.get("index"))
+                .and_then(Value::as_u64)
+                .map(|v| v as usize);
             let Some(message) = message else {
                 return ToolOutcome::error(
                     "action \"steer\" requires a non-empty message.".to_string(),
@@ -514,9 +823,275 @@ pub fn handle_management_action_with(
         }
         "doctor" => ToolOutcome::text(doctor_report(cwd, settings, config)),
         other => ToolOutcome::error(format!(
-            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, doctor."
+            "Unknown subagent action \"{other}\". Supported actions: list, get, status, interrupt, stop, steer, resume, refine, refine.show, refine.rollback, grant-spawn-budget, debug.run, doctor."
         )),
     }
+}
+
+/// `formatAsyncRunTranscript` subset (#1963, run-status.ts + fleet-view.ts
+/// @ 0fc0eebb): bounded transcript tail for one child of a run. Sources in
+/// order: the step's live transcript artifact (`transcriptPath`, stamped at
+/// launch) → the step's saved output (`artifactPaths.outputPath` /
+/// `savedOutputPath`) → the persisted child session file. `lines` bounds the
+/// tail (default 80, cap 1000, fleet-view.ts `transcriptLineLimit`); each
+/// rendered line is capped so the body can never explode the tool result.
+pub fn format_status_transcript(
+    id: &str,
+    index: Option<usize>,
+    line_limit: usize,
+) -> Result<String, String> {
+    let status = crate::runner::background::read_run_status(id)
+        .ok_or_else(|| format!("No background run matches '{id}'."))?;
+    let run_id = status["runId"].as_str().unwrap_or("?").to_string();
+    let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
+    if steps.is_empty() {
+        return Err(format!(
+            "Background run {run_id} has no children to inspect."
+        ));
+    }
+    let index = index.unwrap_or(0);
+    let Some(step) = steps.get(index) else {
+        return Err(format!(
+            "Transcript index {index} is out of range for {} children.",
+            steps.len()
+        ));
+    };
+    let agent = step["agent"].as_str().unwrap_or("subagent");
+    let mut lines = vec![
+        format!("Run: {run_id}"),
+        format!("State: {}", status["state"].as_str().unwrap_or("?")),
+        format!("Mode: {}", status["mode"].as_str().unwrap_or("single")),
+        format!("Child: {index} ({agent})"),
+    ];
+    // Source resolution: live transcript artifact → saved output → session
+    // file tail (upstream `outputPaths` → `recentOutput` → session tail).
+    let transcript_path = step["transcriptPath"]
+        .as_str()
+        .or_else(|| step["artifactPaths"]["transcriptPath"].as_str())
+        .map(str::to_string);
+    let output_path = step["artifactPaths"]["outputPath"]
+        .as_str()
+        .or_else(|| step["savedOutputPath"].as_str())
+        .map(str::to_string);
+    let session_file = step["sessionFile"].as_str().map(str::to_string);
+    if let Some(path) = &transcript_path {
+        lines.push(format!("Transcript: {path}"));
+    }
+    if let Some(path) = &output_path {
+        lines.push(format!("Output: {path}"));
+    }
+    if let Some(path) = &session_file {
+        lines.push(format!("Session: {path}"));
+    }
+    let mut body: Vec<String> = Vec::new();
+    let mut source = "Transcript tail".to_string();
+    if let Some(path) = transcript_path
+        .as_deref()
+        .filter(|p| std::path::Path::new(p).is_file())
+    {
+        match read_transcript_artifact_tail(path, line_limit) {
+            Ok(tail) => {
+                source = if tail.1 {
+                    format!("Transcript tail from {path} (tail truncated)")
+                } else {
+                    format!("Transcript tail from {path}")
+                };
+                body = tail.0;
+            }
+            Err(error) => {
+                lines.push(format!(
+                    "Transcript warning: failed to read {path}: {error}"
+                ));
+            }
+        }
+    }
+    if body.is_empty() {
+        if let Some(path) = output_path
+            .as_deref()
+            .filter(|p| std::path::Path::new(p).is_file())
+        {
+            if let Ok(raw) = std::fs::read_to_string(path) {
+                let all: Vec<&str> = raw.lines().collect();
+                let start = all.len().saturating_sub(line_limit);
+                body = all[start..]
+                    .iter()
+                    .map(|line| bounded_transcript_line(line))
+                    .collect();
+                source = if start > 0 {
+                    format!("Output tail from {path} (tail truncated)")
+                } else {
+                    format!("Output tail from {path}")
+                };
+            }
+        }
+    }
+    if body.is_empty() {
+        if let Some(path) = session_file
+            .as_deref()
+            .filter(|p| std::path::Path::new(p).is_file())
+        {
+            match read_session_transcript_tail(path, line_limit) {
+                Ok(tail) => {
+                    source = format!("Session transcript tail from {path}");
+                    body = tail;
+                }
+                Err(error) => lines.push(format!("Session warning: {error}")),
+            }
+        }
+    }
+    if body.is_empty() {
+        lines.push(format!(
+            "No transcript available for child {index} yet (the child may not have started or produced output)."
+        ));
+    } else {
+        lines.push(String::new());
+        lines.push(source);
+        lines.extend(body);
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Per-rendered-line cap for transcript views (#2015 single-line bound;
+/// aligned with `MAX_STREAMED_OUTPUT_LINE_CHARS`, streaming.rs).
+const TRANSCRIPT_LINE_MAX_CHARS: usize = 2000;
+
+fn bounded_transcript_line(line: &str) -> String {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let count = line.chars().count();
+    if count <= TRANSCRIPT_LINE_MAX_CHARS {
+        line.to_string()
+    } else {
+        let mut cut: String = line.chars().take(TRANSCRIPT_LINE_MAX_CHARS - 1).collect();
+        cut.push('…');
+        cut
+    }
+}
+
+/// Tail of the live transcript artifact: each line is one child stdout
+/// event (JSON); message events render `role: first line of text`, tool
+/// events render the tool name, anything else the event type. Non-JSON
+/// lines (stderr interleave) render as-is.
+fn read_transcript_artifact_tail(
+    path: &str,
+    line_limit: usize,
+) -> Result<(Vec<String>, bool), String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let all: Vec<&str> = raw.lines().collect();
+    let truncated = all.len() > line_limit;
+    let start = all.len().saturating_sub(line_limit);
+    let mut out = Vec::new();
+    for line in &all[start..] {
+        let rendered = match serde_json::from_str::<Value>(line) {
+            Ok(event) => {
+                let event_type = event["type"].as_str().unwrap_or("event");
+                match event_type {
+                    "message_end" | "tool_result_end" => {
+                        let role = event["message"]["role"].as_str().unwrap_or("message");
+                        let text = crate::runner::display::extract_text_from_content(
+                            &event["message"]["content"],
+                        );
+                        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                        format!("{role}: {first}")
+                    }
+                    "tool_execution_start" => {
+                        format!("tool: {}", event["toolName"].as_str().unwrap_or("?"))
+                    }
+                    other => other.to_string(),
+                }
+            }
+            Err(_) => line.trim().to_string(),
+        };
+        out.push(bounded_transcript_line(&rendered));
+    }
+    Ok((out, truncated))
+}
+
+/// Tail of a child session JSONL (rpi session format: `{"type":"message",
+/// "message":{"role","content"}}` entries): message roles + first line of
+/// text, bounded.
+fn read_session_transcript_tail(path: &str, line_limit: usize) -> Result<Vec<String>, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut messages: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if entry["type"].as_str() != Some("message") {
+            continue;
+        }
+        let role = entry["message"]["role"].as_str().unwrap_or("message");
+        if !matches!(role, "user" | "assistant") {
+            continue;
+        }
+        // rpi session content is either a plain string (user turns) or a
+        // block array (assistant turns).
+        let content = &entry["message"]["content"];
+        let text = match content.as_str() {
+            Some(plain) => plain.to_string(),
+            None => crate::runner::display::extract_text_from_content(content),
+        };
+        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        messages.push(format!("{role}: {first}"));
+    }
+    let start = messages.len().saturating_sub(line_limit);
+    Ok(messages[start..]
+        .iter()
+        .map(|line| bounded_transcript_line(line))
+        .collect())
+}
+
+/// `formatRunLifecycleDebug` subset (#1037, run-status.ts:86-116): run/dir/
+/// state/mode + process terminal + a bounded events summary — deliberately
+/// no prompts, secrets, or transcript bodies.
+pub fn format_run_lifecycle_debug(id: &str) -> Result<String, String> {
+    let status = crate::runner::background::read_run_status(id)
+        .ok_or_else(|| format!("No background run matches '{id}'."))?;
+    let run_id = status["runId"].as_str().unwrap_or("?").to_string();
+    let run_dir = crate::runner::background::async_runs_dir().join(&run_id);
+    let events_path = run_dir.join("events.jsonl");
+    let process_terminal = status["processTerminal"]
+        .as_object()
+        .map(|terminal| {
+            format!(
+                "{}@{}",
+                terminal.get("kind").and_then(Value::as_str).unwrap_or("?"),
+                terminal.get("at").and_then(Value::as_str).unwrap_or("?")
+            )
+        })
+        .unwrap_or_else(|| "missing".to_string());
+    let mut lines = vec![
+        "Run lifecycle debug".to_string(),
+        format!("Run: {run_id}"),
+        format!("Dir: {}", run_dir.to_string_lossy()),
+        format!(
+            "Status file: {}",
+            run_dir.join("status.json").to_string_lossy()
+        ),
+        format!("Events log: {}", events_path.to_string_lossy()),
+        format!(
+            "Session: {}",
+            status["sessionId"].as_str().unwrap_or("unknown")
+        ),
+        format!("State: {}", status["state"].as_str().unwrap_or("?")),
+        format!("Mode: {}", status["mode"].as_str().unwrap_or("single")),
+        format!("Process terminal: {process_terminal}"),
+    ];
+    // Bounded events summary: count + last event type only (no payloads —
+    // events can carry task text).
+    if let Ok(raw) = std::fs::read_to_string(&events_path) {
+        let count = raw.lines().filter(|l| !l.trim().is_empty()).count();
+        let last = raw
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|entry| entry["type"].as_str().map(str::to_string))
+            .collect::<Vec<_>>()
+            .pop();
+        lines.push(format!("Events: {count} entries"));
+        if let Some(last) = last {
+            lines.push(format!("Last event: {last}"));
+        }
+    }
+    Ok(lines.join("\n"))
 }
 
 /// `{ id }` or `{ runId }` param for control actions.
@@ -1133,6 +1708,311 @@ fn manage_refine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registry scratch handle for the action-path tests.
+    fn action_test_run(run_id: &str, state: &str, steps: Value) {
+        use crate::runner::background::{AsyncRunHandle, ASYNC_RUNS};
+        let run_dir = std::env::temp_dir().join(run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _ = std::fs::create_dir_all(&run_dir);
+        let handle = std::sync::Arc::new(AsyncRunHandle {
+            run_id: run_id.to_string(),
+            status: std::sync::Arc::new(std::sync::RwLock::new(json!({
+                "runId": run_id,
+                "mode": "parallel",
+                "state": state,
+                "steps": steps,
+            }))),
+            control: std::sync::Arc::new(crate::runner::background::AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.to_string(), handle);
+    }
+
+    fn cleanup_run(run_id: &str) {
+        let run_dir = std::env::temp_dir().join(run_id);
+        crate::runner::background::unregister_run_for_test(run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    fn stop_action(id: &str, child_id: Option<&str>) -> ToolOutcome {
+        let params = match child_id {
+            Some(child_id) => json!({ "action": "stop", "id": id, "childId": child_id }),
+            None => json!({ "action": "stop", "id": id }),
+        };
+        handle_management_action_with(
+            "stop",
+            None,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: None,
+                runtime: None,
+                params: Some(params),
+            },
+        )
+    }
+
+    #[test]
+    fn stop_on_terminal_run_is_invalid_state() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("stop-terminal-{}", std::process::id());
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{"agent": "w", "status": "complete"}]),
+        );
+        let outcome = stop_action(&run_id, None);
+        assert!(outcome.is_error, "{:?}", outcome.text);
+        assert!(
+            outcome.text.starts_with("invalid_state:"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("is complete; stop only supports running async runs"),
+            "{}",
+            outcome.text
+        );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn stop_child_id_resolution_and_rejection() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("stop-child-{}", std::process::id());
+        action_test_run(
+            &run_id,
+            "running",
+            json!([
+                { "agent": "a", "status": "running" },
+                { "agent": "b", "status": "complete" },
+                { "agent": "c", "status": "pending" },
+            ]),
+        );
+        // Unknown child: rejected, never widened to a run-level stop
+        // (no runtime dependency was even needed for the rejection).
+        let outcome = stop_action(&run_id, Some("nope"));
+        assert!(outcome.is_error);
+        assert!(
+            outcome.text.contains("was not found under"),
+            "{}",
+            outcome.text
+        );
+        // Terminal child: invalid_state naming its status.
+        let outcome = stop_action(&run_id, Some("step:1"));
+        assert!(outcome.is_error);
+        assert!(
+            outcome.text.starts_with("invalid_state:"),
+            "{}",
+            outcome.text
+        );
+        assert!(
+            outcome
+                .text
+                .contains("stop only supports pending or running children"),
+            "{}",
+            outcome.text
+        );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_view_reads_bounded_tail() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-view-{}", std::process::id());
+        let base = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Live transcript artifact with mixed events.
+        let transcript = base.join("run_transcript.jsonl");
+        let mut body = String::new();
+        for index in 0..100 {
+            body.push_str(
+                &json!({
+                    "type": "tool_execution_start",
+                    "toolName": format!("tool-{index}"),
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        body.push_str(
+            &json!({
+                "type": "message_end",
+                "message": { "role": "assistant", "content": [{"type": "text", "text": "final answer\nsecond line"}] },
+            })
+            .to_string(),
+        );
+        body.push('\n');
+        action_test_run(
+            &run_id,
+            "running",
+            json!([{
+                "agent": "worker",
+                "status": "running",
+                "transcriptPath": transcript.to_string_lossy(),
+            }]),
+        );
+        std::fs::write(&transcript, body).unwrap();
+        let text = format_status_transcript(&run_id, None, 5).expect("view renders");
+        assert!(text.starts_with("Run: "), "{}", text);
+        assert!(text.contains("Mode: parallel"), "{}", text);
+        assert!(text.contains("Child: 0 (worker)"), "{}", text);
+        assert!(text.contains("Transcript tail from "), "{}", text);
+        assert!(text.contains("(tail truncated)"), "{}", text);
+        assert!(text.contains("tool-96"), "{}", text);
+        assert!(text.contains("assistant: final answer"), "{}", text);
+        // The early tools were elided by the line bound.
+        assert!(!text.contains("tool-1\n"), "{}", text);
+        // Unknown view values are rejected; fleet stays [DEFER].
+        let outcome = handle_management_action_with(
+            "status",
+            None,
+            Path::new("/tmp"),
+            &SettingsPair::default(),
+            &crate::config::ExtensionConfig::new(),
+            &ActionDeps {
+                host: None,
+                runtime: None,
+                params: Some(json!({ "action": "status", "id": run_id, "view": "fleet" })),
+            },
+        );
+        assert!(outcome.is_error);
+        assert!(
+            outcome.text.contains("Valid: transcript"),
+            "{}",
+            outcome.text
+        );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn status_transcript_falls_back_to_session_file() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("transcript-session-{}", std::process::id());
+        let base = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let session = base.join("session.jsonl");
+        action_test_run(
+            &run_id,
+            "complete",
+            json!([{
+                "agent": "worker",
+                "status": "complete",
+                "sessionFile": session.to_string_lossy(),
+            }]),
+        );
+        std::fs::write(
+            &session,
+            concat!(
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"do the thing\"}}\n",
+                "{\"type\":\"summary\",\"summary\":\"ignored\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"done\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let text = format_status_transcript(&run_id, None, 80).expect("view renders");
+        assert!(text.contains("Session transcript tail from "), "{}", text);
+        assert!(text.contains("user: do the thing"), "{}", text);
+        assert!(text.contains("assistant: done"), "{}", text);
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn debug_run_reports_lifecycle_without_transcripts() {
+        let _guard = crate::runner::background::tests::REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("debug-run-{}", std::process::id());
+        // format_run_lifecycle_debug reads events.jsonl from the real async
+        // runs dir (the same place live runs write).
+        let base = crate::runner::background::async_runs_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // An events log whose payloads carry task text — the debug view must
+        // not print them.
+        std::fs::write(
+            base.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"run.started\",\"runId\":\"x\"}\n",
+                "{\"type\":\"control.steer\",\"message\":\"SECRET TASK TEXT\"}\n",
+            ),
+        )
+        .unwrap();
+        action_test_run(
+            &run_id,
+            "running",
+            json!([{"agent": "w", "status": "running"}]),
+        );
+        let text = format_run_lifecycle_debug(&run_id).expect("debug renders");
+        assert!(text.starts_with("Run lifecycle debug"), "{}", text);
+        assert!(text.contains(&format!("Run: {run_id}")), "{}", text);
+        assert!(text.contains("State: running"), "{}", text);
+        assert!(text.contains("Events: 2 entries"), "{}", text);
+        assert!(text.contains("Last event: control.steer"), "{}", text);
+        assert!(!text.contains("SECRET TASK TEXT"), "{}", text);
+        assert!(
+            format_run_lifecycle_debug("no-such-run-xyz").is_err(),
+            "unknown run is an error"
+        );
+        cleanup_run(&run_id);
+    }
+
+    #[test]
+    fn list_capabilities_mode_shapes() {
+        let agents = crate::agents::builtin::load_builtin_agents(None);
+        let listing = format_agent_capabilities_list(&agents);
+        assert!(
+            listing.starts_with("Executable agents (capabilities):"),
+            "{}",
+            listing
+        );
+        // Oracle declares thinking high and an explicit tool list.
+        assert!(listing.contains("Thinking: high"), "{}", listing);
+        assert!(
+            listing.contains("Tools: read, grep, find, ls, bash, intercom"),
+            "{}",
+            listing
+        );
+        assert!(
+            listing.contains("Model: inherits current session"),
+            "{}",
+            listing
+        );
+        // Structured records: every builtin appears once with the stable fields.
+        let snapshot = agent_capabilities_snapshot(&agents);
+        let records = snapshot["agents"].as_array().unwrap();
+        assert_eq!(records.len(), agents.len());
+        for record in records {
+            assert!(record["name"].is_string());
+            assert!(record["executable"].as_bool() == Some(true));
+            assert!(record["tools"].is_object());
+            assert!(record["model"].is_object());
+            assert!(record["execution"].is_object());
+            assert!(record["output"].is_object());
+            assert!(record["extensions"].is_object());
+        }
+        assert_eq!(snapshot["restrictedCount"], json!(0));
+    }
 
     #[test]
     fn list_and_detail_format() {

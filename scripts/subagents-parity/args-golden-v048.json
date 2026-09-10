@@ -1,5 +1,5 @@
 {
-  "//": "Frozen argv/env baseline for the subagents target track ([RPI-OWN], ADR-0025 §4): recorded from the pinned v0.48.0 upstream leg (pi-args.ts) before the v0.65 deletion. Regenerate with `node scripts/subagents-parity/run-parity.mjs --record-args-golden`.",
+  "//": "Frozen argv/env baseline for the subagents target track ([RPI-OWN], ADR-0025 §4): recorded from the pinned v0.48.0 upstream leg (pi-args.ts) before the v0.65 deletion. Regenerate with `node scripts/subagents-parity/run-parity.mjs --record-args-golden` (records only the fixtures.json args cases; TE18+ semantics cases carry inline expected objects in fixtures-target.json — see compareArgsTarget).",
   "cases": [
     {
       "name": "minimal-fresh",

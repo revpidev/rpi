@@ -41,8 +41,15 @@ pub struct ChildSpec {
     pub model: Option<String>,
     pub thinking: Option<String>,
     pub context: Option<ContextMode>,
+    /// #1303 `context: "profile"`: use the agent's declared
+    /// `defaultContext` instead of the call-level default — escapes a
+    /// top-level `context` inherited by every task/step.
+    pub context_profile: bool,
     pub cwd: Option<PathBuf>,
     pub output: OutputOverride,
+    /// #1305 call/step-level `outputMode`: inline | file-only (defaults
+    /// through to the agent's own `outputMode`, then "inline").
+    pub output_mode: Option<String>,
     pub timeout_ms: Option<u64>,
     pub child_index: u32,
     /// Explicit skill list (chain step `skill`); `None` inherits agent skills.
@@ -99,15 +106,24 @@ impl ChildSpec {
             context: match object.get("context").and_then(Value::as_str) {
                 Some("fork") => Some(ContextMode::Fork),
                 Some("fresh") => Some(ContextMode::Fresh),
+                Some("profile") => None,
                 Some(_) => Some(ContextMode::Fresh),
                 None => None,
             },
+            context_profile: object.get("context").and_then(Value::as_str) == Some("profile"),
             cwd: object
                 .get("cwd")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(crate::paths::expand_tilde_and_resolve),
             output,
+            output_mode: match object.get("outputMode").and_then(Value::as_str) {
+                Some("inline") | Some("file-only") => object
+                    .get("outputMode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                _ => None,
+            },
             timeout_ms: resolve_call_timeout(object),
             child_index: 0,
             skills: None,
@@ -308,12 +324,41 @@ impl RunCtx {
     }
 }
 
+/// `deriveChildSessionName` (#1615, child-session-name.ts @ 0fc0eebb):
+/// `agent: <task excerpt>` where the excerpt is `previewDisplayText(task,
+/// 60)`; the whole name caps at 80. `None` only when both inputs are empty.
+fn derive_child_session_name(agent: &str, task: &str) -> Option<String> {
+    let agent = agent.trim();
+    let excerpt_source = task.trim();
+    let excerpt = if excerpt_source.is_empty() {
+        String::new()
+    } else {
+        crate::runner::display::preview_display_text(excerpt_source, 60)
+    };
+    let base = if !agent.is_empty() && !excerpt.is_empty() {
+        format!("{agent}: {excerpt}")
+    } else if !agent.is_empty() {
+        agent.to_string()
+    } else {
+        excerpt
+    };
+    if base.is_empty() {
+        return None;
+    }
+    Some(crate::runner::display::preview_display_text(&base, 80))
+}
+
 /// Outcome of one child launch.
 pub struct ChildOutcome {
     pub agent_name: String,
     pub context: ContextMode,
     pub result: ForegroundRunResult,
     pub saved_output_path: Option<PathBuf>,
+    /// #1615 child display name (`deriveChildSessionName`): threaded into
+    /// the run status steps and result payloads.
+    pub session_name: Option<String>,
+    /// Effective output mode (#1305): "inline" | "file-only".
+    pub output_mode: &'static str,
 }
 
 /// Outcome of the fork attempt (ADR-0026 decision 1, TE18 FR-G): either a
@@ -382,11 +427,17 @@ pub async fn run_child_async(
         .or(Some(foreground::DEFAULT_FOREGROUND_TIMEOUT_MS));
 
     // Context policy: child > top-level > agent default (unknown → fresh).
-    let mut context = spec
-        .context
-        .or(ctx.top_context)
-        .or(agent.default_context)
-        .unwrap_or(ContextMode::Fresh);
+    let mut context = if spec.context_profile {
+        // #1303 `context: "profile"`: the agent's declared `defaultContext`
+        // wins over the call-level default (top_context) — the per-step
+        // escape from a global context default.
+        agent.default_context.unwrap_or(ContextMode::Fresh)
+    } else {
+        spec.context
+            .or(ctx.top_context)
+            .or(agent.default_context)
+            .unwrap_or(ContextMode::Fresh)
+    };
 
     let effective_cwd = spec.cwd.clone().unwrap_or_else(|| ctx.base_cwd.clone());
 
@@ -457,7 +508,13 @@ pub async fn run_child_async(
     let explicit_model = spec.model.as_deref().or(ctx.top_model.as_deref());
     let model_origin =
         model::resolve_model_origin(explicit_model, agent.model.as_deref(), parent_ref);
-    let preferred_provider = parent_ref.map(|(provider, _)| provider);
+    // #1393 (execution.ts:1798): the agent's provider (settings
+    // `subagents.defaultProvider` fill or builtin override) outranks the
+    // parent session's provider as the preferred resolution provider.
+    let preferred_provider = agent
+        .model_provider
+        .as_deref()
+        .or_else(|| parent_ref.map(|(provider, _)| provider));
     let scope = ctx.settings.model_scope.as_ref();
     let mut warn_sink = |violation: &model::ModelScopeViolation| {
         tracing::warn!(violation = %violation.message, "model scope violation");
@@ -477,6 +534,8 @@ pub async fn run_child_async(
         registry_ref,
         preferred_provider,
         scope,
+        Some(&agent.name),
+        parent_ref,
         model_origin,
         &mut warn_sink,
     )?;
@@ -487,6 +546,32 @@ pub async fn run_child_async(
             spec.thinking.as_deref().or(ctx.top_thinking.as_deref()),
         ),
     };
+
+    // #1397 `subagents.maxThinking` (thinking-ceiling.ts @ 0fc0eebb): the
+    // settings ceiling (project wins) intersected with the inherited
+    // ceiling (env — a child launched under a tighter ancestor keeps it,
+    // the rpi mapping of upstream's launch-contract `thinkingCeiling`).
+    // Fail-closed: an explicit requested level above the ceiling aborts
+    // the launch before the spawn (`assertThinkingWithinCeiling`).
+    let thinking_ceiling = model::intersect_thinking_ceilings([
+        ctx.settings.max_thinking.as_deref(),
+        std::env::var(crate::launch::args::SUBAGENT_THINKING_CEILING_ENV)
+            .ok()
+            .as_deref(),
+    ]);
+    if let Some(ceiling) = thinking_ceiling {
+        if let Some(requested) =
+            model::effective_requested_thinking(resolved.as_deref(), thinking.as_deref())
+        {
+            model::assert_thinking_within_ceiling(&requested, ceiling, &agent.name, &ctx.run_id)?;
+        }
+    }
+
+    // #1615 `deriveChildSessionName` (child-session-name.ts): display-only
+    // `agent: task excerpt` (excerpt ≤60 chars, total cap 80) threaded into
+    // the child env (the child's plugin init calls `setSessionName`) and the
+    // result/status payloads.
+    let session_name = derive_child_session_name(&agent.name, &spec.task);
 
     // Skills: explicit step/child list > agent frontmatter; missing names
     // fail the run like upstream (`Skills not found: …`, execution.ts:1470).
@@ -571,6 +656,26 @@ pub async fn run_child_async(
             .map(crate::paths::expand_tilde_and_resolve),
     };
 
+    // Effective output mode (#1305, subagent-executor.ts:3260 @ 0fc0eebb):
+    // call/step param > agent frontmatter/builtin override > "inline".
+    // `file-only` requires a writable output path
+    // (`validateFileOnlyOutputMode`).
+    let output_mode: &'static str = match spec.output_mode.as_deref() {
+        Some("file-only") => "file-only",
+        Some("inline") => "inline",
+        Some(_) => "inline",
+        None => match agent.output_mode.as_deref() {
+            Some("file-only") => "file-only",
+            _ => "inline",
+        },
+    };
+    if output_mode == "file-only" && output_path.is_none() {
+        return Err(format!(
+            "Single run ({}) sets outputMode: \"file-only\" but does not configure an output file. Set output to a path or use outputMode: \"inline\".",
+            agent.name
+        ));
+    }
+
     // Spawn cap — one slot per child against the composite run id.
     let max_spawns = budget::resolve_max_spawns_per_run(
         ctx.config
@@ -591,11 +696,16 @@ pub async fn run_child_async(
         }
     }
 
-    // Fanout authorization: only when the explicit allowlist names `subagent`.
+    // Fanout authorization (#1587): the explicit tools allowlist naming
+    // `subagent`, OR `allowNestedSubagents: true` while `excludeTools`
+    // does not name it (child-tool-plan.ts:329-333 — the flag authorizes
+    // nested fanout without replacing inherited tools/extensions).
     let fanout_authorized = agent
         .tools
         .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t == "subagent"));
+        .is_some_and(|tools| tools.iter().any(|t| t == "subagent"))
+        || (agent.allow_nested_subagents == Some(true)
+            && !agent.exclude_tools.iter().any(|t| t == "subagent"));
     let self_extension = crate::launch::binary::resolve_self_extension_path()
         .map(|p| p.to_string_lossy().to_string());
     if fanout_authorized && self_extension.is_none() {
@@ -715,6 +825,8 @@ pub async fn run_child_async(
         }),
         context_label: context.as_str().to_string(),
         steer_inbox: spec.steer_inbox.clone(),
+        thinking_ceiling: thinking_ceiling.map(str::to_string),
+        session_name: session_name.clone(),
         supervisor_channel,
         stream_sink: ctx.frame_sink.clone(),
         step_status: ctx.step_status.clone(),
@@ -858,12 +970,36 @@ pub async fn run_child_async(
             saved_output_path = Some(output_path.clone());
         }
     }
+    // #1305 `file-only`: the saved file is authoritative — the returned
+    // content becomes the saved-output reference instead of the inline
+    // text (`formatSavedOutputReference`, single-output.ts:160-172).
+    if output_mode == "file-only" {
+        if let Some(saved) = &saved_output_path {
+            let bytes = result.final_output.len();
+            let lines = result.final_output.lines().count().max(1);
+            let size = if bytes < 1024 {
+                format!("{bytes} B")
+            } else if bytes < 1024 * 1024 {
+                format!("{:.1} KB", bytes as f64 / 1024.0)
+            } else {
+                format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+            };
+            let reference = format!(
+                "Output saved to: {} ({size}, {lines} {}). Read this file if needed.",
+                saved.to_string_lossy(),
+                if lines == 1 { "line" } else { "lines" }
+            );
+            result.final_output = reference;
+        }
+    }
 
     Ok(ChildOutcome {
         agent_name: agent.name.clone(),
         context,
         result,
         saved_output_path,
+        session_name,
+        output_mode,
     })
 }
 
@@ -1053,6 +1189,10 @@ mod te18_gate_budget_tests {
             extensions: None,
             subagent_only_extensions: None,
             output: None,
+            output_mode: None,
+            advertise: None,
+            allow_nested_subagents: None,
+            model_provider: None,
             default_reads: Vec::new(),
             default_progress: false,
             max_subagent_depth: None,
@@ -1082,5 +1222,64 @@ mod te18_gate_budget_tests {
             Some(&0),
             "gate rejection must not consume the spawn budget"
         );
+    }
+    // ---- TE19: session name + output mode --------------------------------
+
+    /// #1615 `deriveChildSessionName`: `agent: excerpt` (60-char excerpt,
+    /// 80-char total); label preferred, empty inputs → None.
+    #[test]
+    fn child_session_name_shape() {
+        assert_eq!(
+            derive_child_session_name("scout", "do the thing").as_deref(),
+            Some("scout: do the thing")
+        );
+        assert_eq!(
+            derive_child_session_name("scout", "").as_deref(),
+            Some("scout")
+        );
+        assert_eq!(
+            derive_child_session_name("", "task only").as_deref(),
+            Some("task only")
+        );
+        assert_eq!(derive_child_session_name("", ""), None);
+        // Long task: excerpt capped at 60 chars.
+        let long_task = "t".repeat(200);
+        let name = derive_child_session_name("scout", &long_task).unwrap();
+        assert!(name.chars().count() <= 80, "{}", name.chars().count());
+        assert!(name.starts_with("scout: "), "{name}");
+        // Total cap: a very long agent name alone still caps at 80.
+        let name = derive_child_session_name(&"a".repeat(120), "").unwrap();
+        assert!(name.chars().count() <= 80, "{}", name.chars().count());
+    }
+
+    /// #1305: call-level outputMode parse (inline|file-only; anything else
+    /// falls through to the agent's own setting downstream).
+    #[test]
+    fn output_mode_parse_from_params() {
+        let mut object = serde_json::Map::new();
+        object.insert("agent".into(), json!("scout"));
+        object.insert("task".into(), json!("t"));
+        object.insert("outputMode".into(), json!("file-only"));
+        let spec = ChildSpec::from_params(&object);
+        assert_eq!(spec.output_mode.as_deref(), Some("file-only"));
+        object.insert("outputMode".into(), json!("inline"));
+        let spec = ChildSpec::from_params(&object);
+        assert_eq!(spec.output_mode.as_deref(), Some("inline"));
+        object.insert("outputMode".into(), json!("boxed"));
+        let spec = ChildSpec::from_params(&object);
+        assert_eq!(spec.output_mode, None, "unknown values defer downstream");
+    }
+
+    /// #1303: `context: "profile"` parses as the profile marker (context
+    /// cleared; the launch path resolves the agent's declared default).
+    #[test]
+    fn context_profile_parse_from_params() {
+        let mut object = serde_json::Map::new();
+        object.insert("agent".into(), json!("scout"));
+        object.insert("task".into(), json!("t"));
+        object.insert("context".into(), json!("profile"));
+        let spec = ChildSpec::from_params(&object);
+        assert!(spec.context.is_none());
+        assert!(spec.context_profile);
     }
 }

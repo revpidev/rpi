@@ -128,7 +128,7 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
         let registry = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
         registry.values().cloned().collect()
     };
-    let mut active = Vec::new();
+    let mut active: Vec<(u64, String, FleetRow)> = Vec::new();
     let mut terminal: Vec<(u64, FleetRow)> = Vec::new();
     let mut seen_ids: Vec<String> = Vec::new();
     for handle in runs {
@@ -145,7 +145,14 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
         let mut row = fleet_row(&handle.run_id, &status, handle.started_ms, now_ms);
         seen_ids.push(handle.run_id.clone());
         match state.as_str() {
-            STATE_QUEUED | STATE_RUNNING => active.push(row),
+            STATE_QUEUED | STATE_RUNNING => {
+                // #1923/#1924: active rows keep start-time order (the run id
+                // is the deterministic tie-breaker for same-millisecond
+                // starts) — fleet-status.ts:480
+                // `.sort((l, r) => l.startedAt - r.startedAt ||
+                // l.key.localeCompare(r.key))`.
+                active.push((handle.started_ms, handle.run_id.clone(), row));
+            }
             _ => {
                 let entry = linger
                     .entry(handle.run_id.clone())
@@ -171,8 +178,13 @@ pub fn capture_fleet(now_ms: u64, linger: &mut HashMap<String, (u64, u64)>) -> F
         .take(MAX_TERMINAL_ROWS)
         .map(|(_, row)| row)
         .collect();
+    active.sort_by(|(left_started, left_id, _), (right_started, right_id, _)| {
+        left_started
+            .cmp(right_started)
+            .then_with(|| left_id.cmp(right_id))
+    });
     FleetSnapshot {
-        active,
+        active: active.into_iter().map(|(_, _, row)| row).collect(),
         lingering,
         limit: config::load_config().max_active_async_runs_per_session(),
     }
@@ -589,6 +601,72 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .insert(run_id.to_string(), handle.clone());
         handle
+    }
+
+    /// #1923/#1924: active rows keep start-time order (run id breaks
+    /// same-millisecond ties); lingering rows stay newest-seen-first.
+    #[test]
+    fn active_rows_sorted_by_start_time_with_id_tiebreak() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_linger_for_test(60_000);
+        {
+            let mut runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            runs.clear();
+        }
+        let running = |run_id: &str, started_ms: u64| {
+            spawn_test_handle(
+                run_id,
+                json!({
+                    "mode": "single",
+                    "state": STATE_RUNNING,
+                    "steps": [{"agent": "worker", "status": "running"}],
+                }),
+                started_ms,
+            )
+        };
+        // Deliberately out-of-registry-order starts; b/c share a start ms.
+        let late = running("fleet-sort-late", 30_000);
+        let tie_b = running("fleet-sort-tie-b", 10_000);
+        let tie_a = running("fleet-sort-tie-a", 10_000);
+        let early = running("fleet-sort-early", 5_000);
+        let terminal = spawn_test_handle(
+            "fleet-sort-terminal",
+            json!({"mode": "single", "state": "complete", "steps": []}),
+            1_000,
+        );
+        let mut linger = HashMap::new();
+        let snapshot = capture_fleet(40_000, &mut linger);
+        let ids: Vec<&str> = snapshot
+            .active
+            .iter()
+            .map(|row| row.run_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "fleet-sort-early",
+                "fleet-sort-tie-a",
+                "fleet-sort-tie-b",
+                "fleet-sort-late"
+            ],
+            "active rows in (started_ms, run_id) order: {ids:?}"
+        );
+        assert_eq!(snapshot.lingering.len(), 1);
+        assert_eq!(snapshot.lingering[0].run_id, "fleet-sort-terminal");
+        // Repeat calls are stable (no registry-iteration reshuffle).
+        let again = capture_fleet(40_500, &mut linger);
+        let ids_again: Vec<&str> = again.active.iter().map(|row| row.run_id.as_str()).collect();
+        assert_eq!(ids, ids_again);
+        drop(late);
+        drop(tie_b);
+        drop(tie_a);
+        drop(early);
+        drop(terminal);
+        {
+            let mut runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+            runs.clear();
+        }
+        set_linger_for_test(u64::MAX);
     }
 
     /// End-to-end probe of the refresh loop itself: a stub host channel

@@ -91,6 +91,20 @@ pub struct AgentConfig {
     pub extensions: Option<Vec<String>>,
     pub subagent_only_extensions: Option<Vec<String>>,
     pub output: Option<String>,
+    /// `outputMode` (#1305): "inline" (default) | "file-only" — agent
+    /// frontmatter / builtin override; call-level output mode outranks it.
+    pub output_mode: Option<String>,
+    /// `advertise` (#1972): opt into discovery — the advertised catalog
+    /// rides the plugin's own tool description (R7.1.11.3 rpi shape).
+    pub advertise: Option<bool>,
+    /// `allowNestedSubagents` (#1587): explicit nested-fanout authorization
+    /// that does not require `subagent` in the tools allowlist (blocked when
+    /// `excludeTools` names it).
+    pub allow_nested_subagents: Option<bool>,
+    /// `defaultProvider` fill (#1393): preferred provider for model
+    /// resolution — settings `subagents.defaultProvider` (fill-only) or the
+    /// builtin `defaultProvider` override; outranks the parent's provider.
+    pub model_provider: Option<String>,
     pub default_reads: Vec<String>,
     pub default_progress: bool,
     pub max_subagent_depth: Option<u64>,
@@ -530,6 +544,34 @@ pub fn agent_from_content(
         extensions,
         subagent_only_extensions,
         output: fm.get("output").cloned(),
+        output_mode: match fm.get("outputMode").map(String::as_str) {
+            // agents.ts:979-983: inline | file-only; anything else is a
+            // fatal definition error.
+            Some("inline") | Some("file-only") => fm.get("outputMode").cloned(),
+            Some(other) => {
+                return Err(format!(
+                    "Agent '{local_name}' has invalid outputMode; expected 'inline' or 'file-only' (got '{other}')."
+                ))
+            }
+            None => None,
+        },
+        advertise: match fm.get("advertise").map(String::as_str) {
+            // agents.ts:1985-1990: true | false; anything else is fatal.
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(other) => {
+                return Err(format!(
+                    "Agent '{local_name}' has invalid advertise frontmatter; expected true or false (got '{other}')."
+                ))
+            }
+            None => None,
+        },
+        allow_nested_subagents: match fm.get("allowNestedSubagents").map(String::as_str) {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+        model_provider: None,
         default_reads,
         default_progress: fm.get("defaultProgress").map(String::as_str) == Some("true"),
         max_subagent_depth,
@@ -779,6 +821,77 @@ pub fn find_configured_project_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `applySubagentDefaultModel` provider fill (#1393, agents.ts:1267-1282):
+/// agents without an explicit `modelProvider` inherit the settings
+/// `subagents.defaultProvider` (fill-only; builtin overrides that ran later
+/// can still clear it — upstream order: defaults apply, then overrides).
+fn apply_default_provider(agents: &mut [AgentConfig], default_provider: &Option<String>) {
+    if let Some(provider) = default_provider {
+        for agent in agents.iter_mut() {
+            if agent.model_provider.is_none() {
+                agent.model_provider = Some(provider.clone());
+            }
+        }
+    }
+}
+
+/// `agentScanDirs` expansion (#1801, agent-scan-dirs.test.ts semantics):
+/// each entry is a directory path where **exactly one whole `*` path
+/// segment** expands to the current children of its parent directory
+/// (re-read at discovery time — newly added children appear). Constrained
+/// wildcards (`flow-*`) are NOT wildcards — the pattern stays literal and
+/// matches nothing on disk. Backslash separators normalize to `/`. Entries
+/// without a wildcard stay verbatim.
+pub fn expand_agent_scan_dirs(entries: &[String]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in entries {
+        let normalized = entry.replace('\\', "/");
+        let path = PathBuf::from(&normalized);
+        let components: Vec<std::path::Component> = path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+        let wildcard = components
+            .iter()
+            .position(|c| c.as_os_str().to_string_lossy() == "*");
+        match wildcard {
+            Some(index)
+                if components
+                    .iter()
+                    .filter(|c| c.as_os_str().to_string_lossy() == "*")
+                    .count()
+                    == 1 =>
+            {
+                // One whole `*` segment: expand against the parent prefix
+                // (absolute roots survive — components preserve RootDir).
+                let parent: PathBuf = components[..index].iter().map(|c| c.as_os_str()).collect();
+                if let Ok(children) = std::fs::read_dir(&parent) {
+                    let mut expanded: Vec<PathBuf> = children
+                        .flatten()
+                        .map(|child| child.path())
+                        .filter(|path| path.is_dir())
+                        .map(|path| {
+                            let mut full = path;
+                            for component in &components[index + 1..] {
+                                full = full.join(component.as_os_str());
+                            }
+                            full
+                        })
+                        .collect();
+                    expanded.sort();
+                    out.extend(expanded);
+                }
+            }
+            _ => {
+                // Literal (including constrained wildcards — upstream treats
+                // them as non-scans; the literal path just won't exist).
+                out.push(PathBuf::from(&normalized));
+            }
+        }
+    }
+    out
+}
+
 fn user_agent_dirs() -> Vec<PathBuf> {
     // extra dirs (PATH-style) → `<agentDir>/agents` (old) → `~/.agents` (new)
     // (agents.ts:1726-1744). Order within the user level is preserved;
@@ -798,21 +911,25 @@ fn user_agent_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn project_agent_dirs(cwd: &Path) -> Vec<PathBuf> {
+fn project_agent_dirs(cwd: &Path, settings: &crate::config::SettingsPair) -> Vec<PathBuf> {
     // agents.ts:1698-1712: legacy `<root>/.agents` first, then preferred
     // `<root>/.rpi/agents`; both are read, preferred wins on same name via
     // load order (later entries overwrite in the per-source map below).
-    let Some(root) = find_configured_project_root(cwd) else {
-        return Vec::new();
-    };
+    // #1801: project-scope `agentScanDirs` append after the fixed project
+    // dirs (same fixed-wins rule as the user level).
     let mut dirs = Vec::new();
-    let legacy = root.join(".agents");
-    if legacy.is_dir() {
-        dirs.push(legacy);
-    }
-    let preferred = paths::get_project_config_dir(&root).join("agents");
-    if preferred.is_dir() {
-        dirs.push(preferred);
+    if let Some(root) = find_configured_project_root(cwd) {
+        let legacy = root.join(".agents");
+        if legacy.is_dir() {
+            dirs.push(legacy);
+        }
+        let preferred = paths::get_project_config_dir(&root).join("agents");
+        if preferred.is_dir() {
+            dirs.push(preferred);
+        }
+        if let Some(scan_dirs) = settings.project.agent_scan_dirs.as_deref() {
+            dirs.extend(expand_agent_scan_dirs(scan_dirs));
+        }
     }
     dirs
 }
@@ -874,8 +991,17 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     scope: &str,
     settings: &crate::config::SettingsPair,
     builtin_dir: Option<&Path>,
-    user_dirs: Vec<PathBuf>,
+    mut user_dirs: Vec<PathBuf>,
 ) -> (Vec<AgentConfig>, Vec<DiscoverDiagnostic>) {
+    // #1801: user-scope `agentScanDirs` append after the (explicit or
+    // default) fixed user dirs — fixed definitions win on same-name because
+    // scan dirs load last (agents.ts discovery order + the upstream test
+    // "lets fixed user agents override same-name scan-dir agents").
+    if scope != "project" {
+        if let Some(scan_dirs) = settings.user.agent_scan_dirs.as_deref() {
+            user_dirs.extend(expand_agent_scan_dirs(scan_dirs));
+        }
+    }
     let default_model = settings.default_model.clone();
     // `applySubagentDefaults` (agents.ts:995-1009, called per scope at
     // 1760/1771/1779): defaultModel → defaultThinking → defaultExtensions,
@@ -893,6 +1019,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
         &default_thinking,
         &default_extensions,
     );
+    apply_default_provider(&mut builtin, &settings.default_provider);
     apply_builtin_overrides(&mut builtin, settings);
 
     let mut user: Vec<AgentConfig> = if scope == "project" {
@@ -911,6 +1038,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     apply_default_model(&mut user, &default_model);
     apply_default_thinking(&mut user, &default_thinking);
     apply_default_extensions(&mut user, &default_extensions);
+    apply_default_provider(&mut user, &settings.default_provider);
     apply_custom_overrides(
         &mut user,
         &settings.project.overrides,
@@ -921,7 +1049,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
         Vec::new()
     } else {
         let mut agents = Vec::new();
-        for dir in project_agent_dirs(cwd) {
+        for dir in project_agent_dirs(cwd, settings) {
             let (mut dir_agents, mut dir_diagnostics) =
                 load_agents_from_dir_with_diagnostics(&dir, "project");
             agents.append(&mut dir_agents);
@@ -932,6 +1060,7 @@ pub fn discover_agents_with_user_dirs_with_diagnostics(
     apply_default_model(&mut project, &default_model);
     apply_default_thinking(&mut project, &default_thinking);
     apply_default_extensions(&mut project, &default_extensions);
+    apply_default_provider(&mut project, &settings.default_provider);
     apply_custom_overrides(
         &mut project,
         &settings.project.overrides,
@@ -1164,6 +1293,18 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     }
     if let Some(skills) = &entry.skills {
         agent.skills = skills.clone().unwrap_or_default();
+    }
+    // —— v0.66 override fields (TE19) ——
+    if let Some(provider) = &entry.default_provider {
+        // #1393: string sets, `false` clears (the settings-level fill then
+        // never re-applies — the fill runs before overrides).
+        agent.model_provider = provider.clone();
+    }
+    if let Some(allow_nested) = entry.allow_nested_subagents {
+        agent.allow_nested_subagents = Some(allow_nested);
+    }
+    if let Some(output_mode) = &entry.output_mode {
+        agent.output_mode = Some(output_mode.clone());
     }
 }
 
@@ -1852,6 +1993,163 @@ mod discovery_robustness_tests {
 
     /// T-8 (D-R2): `list`/`get` shapes stay byte-identical when no diagnostics
     /// exist; the diagnostic block is strictly additive.
+    /// #1801 `agentScanDirs`: one whole `*` segment expands at read time;
+    /// constrained wildcards stay literal (match nothing); scan-dir agents
+    /// lose same-name collisions to the fixed dirs (load last).
+    #[test]
+    fn agent_scan_dirs_expansion_semantics() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // template-a/agents has an agent; template-b exists without one yet.
+        for (template, agent) in [("template-a", Some("scan-a")), ("template-b", None)] {
+            let dir = root.join(template).join("agents");
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(agent) = agent {
+                std::fs::write(
+                    dir.join(format!("{agent}.md")),
+                    format!("---\nname: {agent}\ndescription: scan dirs test\n---\nbody\n"),
+                )
+                .unwrap();
+            }
+        }
+        std::fs::create_dir_all(root.join("flow-x").join("agents")).unwrap();
+        std::fs::write(
+            root.join("flow-x").join("agents").join("flow-agent.md"),
+            "---\nname: flow-agent\ndescription: constrained wildcard must not match\n---\n",
+        )
+        .unwrap();
+
+        // One wildcard segment expands both templates; backslash-separated
+        // patterns normalize to `/` first (agent-scan-dirs.test.ts
+        // "accepts backslash-separated wildcard patterns").
+        let backslash_pattern = format!("{}\\*\\agents", root.to_string_lossy().replace('/', "\\"));
+        let expanded = expand_agent_scan_dirs(&[backslash_pattern]);
+        assert!(
+            expanded.iter().any(|p| p.ends_with("template-a/agents")),
+            "{expanded:?}"
+        );
+        let expanded =
+            expand_agent_scan_dirs(&[root.join("*").join("agents").to_string_lossy().to_string()]);
+        assert!(expanded.len() >= 2, "{expanded:?}");
+        // Constrained wildcards are literal — never a broad scan.
+        let constrained = expand_agent_scan_dirs(&[root
+            .join("flow-*")
+            .join("agents")
+            .to_string_lossy()
+            .to_string()]);
+        assert_eq!(
+            constrained,
+            vec![root.join("flow-*").join("agents")],
+            "constrained wildcard stays literal"
+        );
+        // Discovery through settings scan dirs (user scope): the scan-dir
+        // agent is found; a same-name fixed user dir definition wins.
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let fixed = root.join("fixed-agents");
+        std::fs::create_dir_all(&fixed).unwrap();
+        std::fs::write(
+            fixed.join("scan-a.md"),
+            "---\nname: scan-a\ndescription: from fixed dir\n---\n",
+        )
+        .unwrap();
+        let settings = crate::config::SettingsPair {
+            user: crate::config::SubagentSettings {
+                agent_scan_dirs: Some(vec![root
+                    .join("*")
+                    .join("agents")
+                    .to_string_lossy()
+                    .to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (agents, _diagnostics) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &settings,
+            None,
+            vec![fixed.clone()], // the fixed user dir (env-dir stand-in)
+        );
+        let scan_a = agents.iter().find(|a| a.name == "scan-a").unwrap();
+        assert!(
+            scan_a.file_path.starts_with(&fixed),
+            "fixed definition wins: {}",
+            scan_a.file_path.display()
+        );
+        // The one-segment wildcard legitimately matches every child
+        // directory — flow-x/agents included (the constrained `flow-*`
+        // non-scan behavior was verified via `constrained` above).
+        assert!(agents.iter().any(|a| a.name == "flow-agent"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1972/#1587/#1305/#1393 frontmatter + fill semantics.
+    #[test]
+    fn v066_frontmatter_and_provider_fill() {
+        let root = std::env::temp_dir().join(format!("rpi-sub-fm66-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("advertiser.md"),
+            "---\nname: advertiser\ndescription: opts into discovery\nadvertise: true\nallowNestedSubagents: true\noutputMode: file-only\noutput: out.md\n---\nbody\n",
+        )
+        .unwrap();
+        // Invalid advertise value is a fatal definition error.
+        std::fs::write(
+            dir.join("bad-advertise.md"),
+            "---\nname: bad-advertise\ndescription: d\nadvertise: maybe\n---\n",
+        )
+        .unwrap();
+        // Invalid outputMode is a fatal definition error.
+        std::fs::write(
+            dir.join("bad-mode.md"),
+            "---\nname: bad-mode\ndescription: d\noutputMode: boxed\n---\n",
+        )
+        .unwrap();
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let settings = crate::config::SettingsPair {
+            default_provider: Some("openai".to_string()),
+            ..Default::default()
+        };
+        let (agents, diagnostics) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &settings,
+            None,
+            vec![dir.clone()],
+        );
+        let advertiser = agents.iter().find(|a| a.name == "advertiser").unwrap();
+        assert_eq!(advertiser.advertise, Some(true));
+        assert_eq!(advertiser.allow_nested_subagents, Some(true));
+        assert_eq!(advertiser.output_mode.as_deref(), Some("file-only"));
+        // #1393: the settings defaultProvider fills agents without one.
+        assert_eq!(advertiser.model_provider.as_deref(), Some("openai"));
+        // Both invalid definitions became diagnostics (per-file isolation).
+        let names: Vec<String> = diagnostics
+            .iter()
+            .map(|d| d.path.to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|p| p.contains("bad-advertise.md")),
+            "{names:?}"
+        );
+        assert!(names.iter().any(|p| p.contains("bad-mode.md")), "{names:?}");
+        // Default matrix: without the settings key, model_provider stays None.
+        let (plain, _) = discover_agents_with_user_dirs_with_diagnostics(
+            &cwd,
+            "both",
+            &crate::config::SettingsPair::default(),
+            None,
+            vec![dir],
+        );
+        let advertiser = plain.iter().find(|a| a.name == "advertiser").unwrap();
+        assert_eq!(advertiser.model_provider, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn list_output_shape_is_unchanged_and_diagnostics_append() {
         let (root, tree) = materialize("t8");

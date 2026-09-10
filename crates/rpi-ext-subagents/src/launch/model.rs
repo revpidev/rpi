@@ -344,20 +344,155 @@ pub fn registry_unavailable_diagnostic(has_model_input: bool) -> Option<&'static
 }
 
 // ---------------------------------------------------------------------------
+// Thinking ceiling (`maxThinking`, #1397 — shared/thinking-ceiling.ts)
+// ---------------------------------------------------------------------------
+
+/// `THINKING_LEVELS` (model-info.ts:3): rank order, index = rank.
+pub const THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// `parseThinkingLevel` (thinking-ceiling.ts:15-19): valid level or error.
+pub fn parse_thinking_level(value: &str) -> Result<&'static str, String> {
+    THINKING_LEVELS
+        .iter()
+        .find(|level| **level == value)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "Invalid thinking level; expected one of {}.",
+                THINKING_LEVELS.join(", ")
+            )
+        })
+}
+
+fn thinking_rank(level: &str) -> Option<usize> {
+    THINKING_LEVELS
+        .iter()
+        .position(|candidate| *candidate == level)
+}
+
+/// `intersectThinkingCeilings` (thinking-ceiling.ts:21-25): the lowest of
+/// the present ceilings (`None` entries drop out; all `None` → `None`).
+pub fn intersect_thinking_ceilings<'a>(
+    ceilings: impl IntoIterator<Item = Option<&'a str>>,
+) -> Option<&'static str> {
+    ceilings
+        .into_iter()
+        .flatten()
+        .filter_map(|level| thinking_rank(level).map(|_| level))
+        .min_by_key(|level| thinking_rank(level).unwrap_or(usize::MAX))
+        .and_then(|level| parse_thinking_level(level).ok())
+}
+
+/// `resolveEffectiveThinking` (model-info.ts:56-61): the model string's
+/// thinking suffix wins over the config thinking; `None` when neither
+/// carries one (the model catalog's default does not count for the assert).
+pub fn effective_requested_thinking(
+    model: Option<&str>,
+    config_thinking: Option<&str>,
+) -> Option<String> {
+    if let Some(model) = model {
+        let (_, suffix) = split_thinking_suffix(model);
+        let suffix = suffix.strip_prefix(':').unwrap_or(suffix);
+        if !suffix.is_empty() && thinking_rank(suffix).is_some() {
+            return Some(suffix.to_string());
+        }
+    }
+    config_thinking
+        .filter(|level| thinking_rank(level).is_some())
+        .map(str::to_string)
+}
+
+/// `assertThinkingWithinCeiling` (thinking-ceiling.ts:43-56): an explicit
+/// requested level above the ceiling fails the launch (fail-closed, not a
+/// clamp).
+pub fn assert_thinking_within_ceiling(
+    requested: &str,
+    ceiling: &str,
+    agent: &str,
+    run_id: &str,
+) -> Result<(), String> {
+    let (Some(requested_rank), Some(ceiling_rank)) =
+        (thinking_rank(requested), thinking_rank(ceiling))
+    else {
+        return Ok(());
+    };
+    if requested_rank <= ceiling_rank {
+        return Ok(());
+    }
+    Err(format!(
+        "Thinking level '{requested}' exceeds configured maximum '{ceiling}' for agent '{agent}' run '{run_id}'."
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // modelScope (model-scope.ts)
 // ---------------------------------------------------------------------------
 
-/// `ModelScopeConfig` (model-scope.ts:12-20).
+/// `ModelScopeConfig` (model-scope.ts:12-20 + #1328 `agents`).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ModelScopeConfig {
     pub enforce: Option<bool>,
     pub strict: Option<bool>,
     pub allow: Option<Vec<String>>,
+    /// #1328: additional restrictions keyed by canonical agent name.
+    pub agents: std::collections::BTreeMap<String, ModelScopeConfig>,
 }
 
 impl ModelScopeConfig {
     pub fn enforced(&self) -> bool {
         self.enforce == Some(true)
+    }
+
+    /// `resolveModelScopesForAgent` (model-scope.ts:151-170): the global
+    /// rule (when it carries an allow list) plus the matching per-agent rule,
+    /// each with `inherit` allow patterns expanded to the parent's
+    /// `provider/id`. Inherited per-agent fields fall back to the global
+    /// rule.
+    pub fn resolved_scopes_for_agent(
+        &self,
+        agent_name: &str,
+        parent_model: Option<(&str, &str)>,
+    ) -> Vec<(ModelScopeConfig, String)> {
+        let expand = |patterns: &[String]| -> Vec<String> {
+            patterns
+                .iter()
+                .map(|pattern| {
+                    if pattern == "inherit" {
+                        match parent_model {
+                            Some((provider, id)) => format!("{provider}/{id}"),
+                            None => pattern.clone(),
+                        }
+                    } else {
+                        pattern.clone()
+                    }
+                })
+                .collect()
+        };
+        let mut scopes = Vec::new();
+        if let Some(allow) = &self.allow {
+            let mut rule = ModelScopeConfig {
+                enforce: self.enforce,
+                strict: self.strict,
+                allow: Some(expand(allow)),
+                agents: Default::default(),
+            };
+            if rule.enforce.is_none() {
+                rule.enforce = Some(false);
+            }
+            scopes.push((rule, "modelScope".to_string()));
+        }
+        if let Some(agent_rule) = self.agents.get(agent_name) {
+            if let Some(allow) = &agent_rule.allow {
+                let rule = ModelScopeConfig {
+                    enforce: Some(agent_rule.enforce.unwrap_or(self.enforce.unwrap_or(false))),
+                    strict: agent_rule.strict.or(self.strict),
+                    allow: Some(expand(allow)),
+                    agents: Default::default(),
+                };
+                scopes.push((rule, format!("modelScope.agents.{agent_name}")));
+            }
+        }
+        scopes
     }
 }
 
@@ -406,7 +541,7 @@ pub struct ModelScopeViolation {
     pub allowed_patterns: Vec<String>,
 }
 
-/// `checkModelScope` (model-scope.ts:62-82): pure scope decision.
+/// `checkModelScope` (model-scope.ts:62-82): pure scope decision (one rule).
 pub fn check_model_scope(
     model: Option<&str>,
     scope: Option<&ModelScopeConfig>,
@@ -480,6 +615,47 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
             patterns.push(pattern.to_string());
         }
         config.allow = Some(patterns);
+    }
+    // #1328 `modelScope.agents.<name>`: per-agent restrictions
+    // (model-scope.ts:179-196); nested `agents` inside a rule is rejected.
+    if let Some(agents) = object.get("agents") {
+        let Some(agents_object) = agents.as_object() else {
+            return Err(
+                "have invalid 'modelScope.agents'; expected an object keyed by agent name."
+                    .to_string(),
+            );
+        };
+        for (raw_name, raw_rule) in agents_object {
+            let name = raw_name.trim();
+            if name.is_empty() {
+                return Err(
+                    "have invalid 'modelScope.agents' key; expected a non-empty agent name."
+                        .to_string(),
+                );
+            }
+            let Some(rule_object) = raw_rule.as_object() else {
+                return Err(format!(
+                    "have invalid 'modelScope.agents.{name}'; expected an object."
+                ));
+            };
+            if rule_object.contains_key("agents") {
+                return Err(format!(
+                    "have invalid 'modelScope.agents.{name}.agents'; nested agent scopes are not supported."
+                ));
+            }
+            let mut rule_wrapper = serde_json::Map::new();
+            for key in ["enforce", "strict", "allow"] {
+                if let Some(value) = rule_object.get(key) {
+                    rule_wrapper.insert(key.to_string(), value.clone());
+                }
+            }
+            let parsed_rule = parse_model_scope_config(Some(&Value::Object(rule_wrapper)))
+                .map(|rule| rule.unwrap_or_default())
+                .map_err(|message| {
+                    message.replace("modelScope.", &format!("modelScope.agents.{name}."))
+                })?;
+            config.agents.insert(name.to_string(), parsed_rule);
+        }
     }
     Ok(Some(config))
 }
@@ -617,32 +793,89 @@ pub fn resolve_model_origin(
     ModelOrigin::Configured
 }
 
-/// `buildModelCandidates` (model-fallback.ts:461-541 @ 0fc0eebb, P0 subset
-/// without the exclusion cache / zero-usable exclusion evidence —
-/// modelExclusions are R7.1.10.2/M3): primary + fallbacks, deduped, resolved
-/// against the registry. The primary passes through when it was resolved by
-/// the caller (explicit/inherited origin); a configured primary and fallback
-/// entries go through the strict resolution, misses are skipped with a warn,
-/// and a chain left with no usable candidate re-runs the first skip through
-/// the required check so the launch fails closed (#1093).
+/// `buildModelCandidates` (model-fallback.ts:461-541 @ 0fc0eebb): primary +
+/// fallbacks, deduped, resolved against the registry. The primary passes
+/// through when it was resolved by the caller (explicit/inherited origin); a
+/// configured primary and fallback entries go through the strict resolution,
+/// misses are skipped with a warn, and a chain left with no usable candidate
+/// re-runs the first skip through the required check so the launch fails
+/// closed (#1093).
+///
+/// v0.66 additions (TE19 FR-G): every resolved candidate then passes the
+/// active exclusion filter (#1318 — excluded candidates drop with a warn
+/// diagnostic; an all-excluded chain fails closed with per-exclusion
+/// evidence, #1439) and the resolved global + per-agent scope checks
+/// (#1328 — `resolveModelScopesForAgent`).
+#[allow(clippy::too_many_arguments)]
 pub fn build_model_candidates(
     primary_model: Option<&str>,
     fallback_models: &[String],
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
+    agent_name: Option<&str>,
+    parent_model: Option<(&str, &str)>,
     origin: ModelOrigin,
     on_warn: &mut dyn FnMut(&ModelScopeViolation),
 ) -> Result<Vec<String>, String> {
+    let resolved_scopes: Vec<(ModelScopeConfig, String)> = scope
+        .map(|scope| match agent_name {
+            Some(name) => scope.resolved_scopes_for_agent(name, parent_model),
+            None => scope
+                .resolved_scopes_for_agent("", parent_model)
+                .into_iter()
+                .filter(|(_rule, origin)| origin == "modelScope")
+                .collect(),
+        })
+        .unwrap_or_default();
+    let enforce_scopes = |model: &str,
+                          source: ModelSource,
+                          warn: &mut dyn FnMut(&ModelScopeViolation)|
+     -> Result<(), String> {
+        for (rule, rule_origin) in &resolved_scopes {
+            if let Some(mut violation) = check_model_scope(Some(model), Some(rule), source) {
+                violation.message = format!(
+                    "Model '{}' is outside the configured subagent model scope ({}). Allowed patterns: {}.",
+                    violation.model,
+                    rule_origin,
+                    violation
+                        .allowed_patterns
+                        .join(", ")
+                );
+                if violation.is_error {
+                    return Err(violation.message);
+                }
+                warn(&violation);
+            }
+        }
+        Ok(())
+    };
+
     if let ModelOrigin::Explicit = origin {
         // Explicit primaries fail closed immediately (upstream normalizes
-        // them via the required resolution before the chain).
+        // them via the required resolution before the chain) and pass the
+        // scope checks as "explicit" (hard error on violation).
         if let Some(primary) = primary_model.map(str::trim).filter(|m| !m.is_empty()) {
-            resolve_required_subagent_model_candidate(
+            let normalized = resolve_required_subagent_model_candidate(
                 primary,
                 available_models,
                 preferred_provider,
             )?;
+            // An explicitly requested model under an active exclusion fails
+            // closed with the exclusion reason instead of silently swapping
+            // (`throwForExplicitModelExclusion`).
+            if let Some(exclusion) =
+                crate::launch::model_exclusions::find_model_exclusion(&normalized)
+            {
+                return Err(format!(
+                    "Requested subagent model '{normalized}' is excluded and cannot be replaced by a fallback (reason: {}; expires: {}).",
+                    exclusion.reason,
+                    exclusion.expires_at
+                ));
+            }
+            if !resolved_scopes.is_empty() {
+                enforce_scopes(&normalized, ModelSource::Explicit, on_warn)?;
+            }
         }
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -686,21 +919,41 @@ pub fn build_model_candidates(
         if seen.contains(&normalized) {
             continue;
         }
-        if (index > 0 || scope.is_some_and(|s| s.strict == Some(true)))
-            && scope.is_some_and(|s| s.enforced())
+        if index > 0
+            || resolved_scopes
+                .iter()
+                .any(|(rule, _)| rule.enforced() && rule.strict == Some(true))
         {
-            if let Some(violation) =
-                check_model_scope(Some(&normalized), scope, ModelSource::Inherited)
-            {
-                if violation.is_error {
-                    return Err(violation.message);
-                }
-                on_warn(&violation);
-            }
+            enforce_scopes(&normalized, ModelSource::Inherited, on_warn)?;
         }
         seen.insert(normalized.clone());
         candidates.push(normalized);
     }
+    // #1318 exclusion filter: excluded candidates drop with a diagnostic;
+    // the zero-usable case fails closed with evidence (#1439).
+    let mut excluded_evidence: Vec<String> = Vec::new();
+    let mut excluded_count = 0usize;
+    let before_filter = candidates.len();
+    {
+        let mut on_excluded =
+            |candidate: &str, exclusion: &crate::launch::model_exclusions::ModelExclusion| {
+                excluded_count += 1;
+                if excluded_evidence.len() < 4 {
+                    let provider = exclusion.provider.as_deref().unwrap_or("unspecified");
+                    excluded_evidence.push(format!(
+                        "{candidate} — model: {}; provider: {provider}; reason: {}; expires: {}",
+                        exclusion.model_id.as_deref().unwrap_or("unspecified"),
+                        exclusion.reason,
+                        exclusion.expires_at
+                    ));
+                }
+            };
+        candidates = crate::launch::model_exclusions::filter_fallback_candidates(
+            candidates,
+            Some(&mut on_excluded),
+        );
+    }
+    let _ = before_filter;
     if candidates.is_empty() {
         // A chain that skipped its only resolvable entry fails closed through
         // the required check (upstream re-runs the first skip).
@@ -717,6 +970,27 @@ pub fn build_model_candidates(
                 available_models,
                 preferred_provider,
             )?;
+        }
+        // #1439 zero-usable evidence: every resolvable candidate was
+        // excluded — fail closed naming them (`ZERO_USABLE_MODEL_CANDIDATES_ERROR`).
+        if excluded_count > 0 {
+            let evidence = if excluded_evidence.is_empty() {
+                String::new()
+            } else {
+                let omitted = excluded_count - excluded_evidence.len();
+                format!(
+                    " (excluded: {}{})",
+                    excluded_evidence.join("; "),
+                    if omitted > 0 {
+                        format!("; ... and {omitted} more")
+                    } else {
+                        String::new()
+                    }
+                )
+            };
+            return Err(format!(
+                "No usable subagent models remain after registry, scope, and cached-exclusion filtering.{evidence}"
+            ));
         }
     }
     Ok(candidates)
@@ -1036,6 +1310,7 @@ mod tests {
     #[test]
     fn scope_decision_severity_by_source() {
         let scope = ModelScopeConfig {
+            agents: Default::default(),
             enforce: Some(true),
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
@@ -1051,6 +1326,7 @@ mod tests {
             check_model_scope(Some("anthropic/x"), Some(&scope), ModelSource::Explicit).is_none()
         );
         let empty = ModelScopeConfig {
+            agents: Default::default(),
             enforce: Some(true),
             strict: None,
             allow: Some(vec![]),
@@ -1114,6 +1390,7 @@ mod tests {
     fn candidates_dedupe_and_scope_check_fallbacks() {
         let registry = models();
         let scope = ModelScopeConfig {
+            agents: Default::default(),
             enforce: Some(true),
             strict: None,
             allow: Some(vec!["anthropic/*".to_string()]),
@@ -1133,6 +1410,8 @@ mod tests {
             Some(&scope),
             // configured origin: the primary is strict-resolved like a
             // fallback (the test's "claude-5" hits the registry).
+            None,
+            None,
             ModelOrigin::Configured,
             &mut sink,
         )
@@ -1431,6 +1710,8 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            None,
+            None,
             ModelOrigin::Explicit,
             &mut sink,
         )
@@ -1444,6 +1725,8 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            None,
+            None,
             ModelOrigin::Configured,
             &mut sink,
         )
@@ -1455,6 +1738,8 @@ mod te18_model_tests {
             Some("faux/primary"),
             &["claude-5".to_string()],
             Some(&registry),
+            None,
+            None,
             None,
             None,
             ModelOrigin::Configured,
@@ -1471,6 +1756,8 @@ mod te18_model_tests {
             Some(&registry),
             None,
             None,
+            None,
+            None,
             ModelOrigin::Explicit,
             &mut sink,
         )
@@ -1482,6 +1769,8 @@ mod te18_model_tests {
             None,
             &["faux/secondary".to_string()],
             Some(&registry),
+            None,
+            None,
             None,
             None,
             ModelOrigin::Configured,
@@ -1498,6 +1787,8 @@ mod te18_model_tests {
             Some("faux/parent-model"),
             &[],
             Some(&registry),
+            None,
+            None,
             None,
             None,
             ModelOrigin::Inherited,
@@ -1520,5 +1811,100 @@ mod te18_model_tests {
             "{text}"
         );
         assert!(registry_unavailable_diagnostic(false).is_none());
+    }
+    // ---- TE19 (R7.1.10): thinking ceiling + scope agents + exclusions ----
+
+    #[test]
+    fn thinking_ceiling_helpers_match_upstream_ranks() {
+        assert_eq!(parse_thinking_level("off").unwrap(), "off");
+        assert!(parse_thinking_level("ultra").is_err());
+        // Intersect keeps the LOWEST present ceiling; all-None stays None.
+        assert_eq!(
+            intersect_thinking_ceilings([Some("high"), Some("low"), None]),
+            Some("low")
+        );
+        assert_eq!(intersect_thinking_ceilings([None::<&str>, None]), None);
+        // Model suffix wins over config thinking; catalog defaults never
+        // surface (resolveEffectiveThinking).
+        assert_eq!(
+            effective_requested_thinking(Some("prov/m:high"), Some("low")),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            effective_requested_thinking(Some("prov/m"), Some("low")),
+            Some("low".to_string())
+        );
+        assert_eq!(effective_requested_thinking(Some("prov/m"), None), None);
+        // Within ceiling passes; above fails closed with the agent/run ids.
+        assert!(assert_thinking_within_ceiling("low", "high", "a", "r").is_ok());
+        let error = assert_thinking_within_ceiling("max", "high", "scout", "run-1").unwrap_err();
+        assert!(
+            error.contains("'max' exceeds configured maximum 'high'"),
+            "{error}"
+        );
+        assert!(error.contains("agent 'scout' run 'run-1'"), "{error}");
+    }
+
+    #[test]
+    fn model_scope_agents_and_inherit_alias() {
+        // The exclusion store is process-global; isolate this test's
+        // explicit-candidate checks from any recorded exclusion.
+        std::env::set_var(
+            "RPI_MODEL_EXCLUSIONS_PATH",
+            std::env::temp_dir().join(format!("rpi-model-excl-scope-{}", std::process::id())),
+        );
+        crate::launch::model_exclusions::reset_for_test();
+        let value: Value = serde_json::from_str(
+            r#"{"enforce":true,"allow":["anthropic/*"],
+                "agents":{"researcher":{"allow":["openai/*","inherit"]}}}"#,
+        )
+        .unwrap();
+        let scope = parse_model_scope_config(Some(&value)).unwrap().unwrap();
+        // Global rule for an agent without its own rule.
+        let scopes = scope.resolved_scopes_for_agent("worker", Some(("openai", "gpt")));
+        assert_eq!(scopes.len(), 1);
+        assert_eq!(scopes[0].1, "modelScope");
+        // Per-agent rule: agent gets global + its own; `inherit` expands to
+        // the parent's provider/id.
+        let scopes = scope.resolved_scopes_for_agent("researcher", Some(("openai", "gpt")));
+        assert_eq!(scopes.len(), 2, "{scopes:?}");
+        assert_eq!(scopes[1].1, "modelScope.agents.researcher");
+        let allow = scopes[1].0.allow.as_deref().unwrap();
+        assert!(allow.contains(&"openai/gpt".to_string()), "{allow:?}");
+        assert!(allow.contains(&"openai/*".to_string()), "{allow:?}");
+        // Nested agent rules are rejected.
+        let nested: Value =
+            serde_json::from_str(r#"{"agents":{"x":{"agents":{"y":{"allow":["a/*"]}}}}}"#).unwrap();
+        assert!(parse_model_scope_config(Some(&nested)).is_err());
+        // build_model_candidates enforces the resolved rules: an explicit
+        // model outside the agent's own allowlist fails closed naming the
+        // rule origin, researcher's parent-matching model passes.
+        let mut sink = |_violation: &ModelScopeViolation| {};
+        let error = build_model_candidates(
+            Some("openai/gpt"),
+            &[],
+            None,
+            None,
+            Some(&scope),
+            Some("worker"),
+            Some(("openai", "gpt")),
+            ModelOrigin::Explicit,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("modelScope"), "{error}");
+        let candidates = build_model_candidates(
+            Some("openai/gpt"),
+            &[],
+            None,
+            None,
+            Some(&scope),
+            Some("researcher"),
+            Some(("openai", "gpt")),
+            ModelOrigin::Inherited,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(candidates, vec!["openai/gpt".to_string()]);
     }
 }

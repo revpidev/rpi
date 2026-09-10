@@ -120,6 +120,13 @@ fn register_run(handle: Arc<AsyncRunHandle>) {
         .insert(handle.run_id.clone(), handle);
 }
 
+/// Crate-visible wrapper for action-path tests (unregister_run is private).
+#[cfg(test)]
+#[doc(hidden)]
+pub(crate) fn unregister_run_for_test(run_id: &str) {
+    unregister_run(run_id);
+}
+
 fn unregister_run(run_id: &str) {
     ASYNC_RUNS
         .lock()
@@ -888,6 +895,10 @@ pub async fn drive_run(
             // The run dir steer inbox is the async control surface; every
             // other field keeps its foreground meaning (B2: no silent loss).
             spec.steer_inbox = Some(steer_inbox_dir(&handle.run_dir, 0));
+            // Live transcript pointer (#1963): the derived transcript
+            // artifact path rides the step from launch so `status
+            // view:"transcript"` can read a running child on demand.
+            set_step_transcript_path(&handle, &ctx, &spec.agent_name, 0);
             mark_step(&handle, 0, "running");
             match crate::p1::launch_child::run_child_async(&spec, &agent, &ctx).await {
                 Ok(outcome) => {
@@ -897,6 +908,15 @@ pub async fn drive_run(
                             step["sessionFile"] = json!(session_file.to_string_lossy());
                         });
                     }
+                    // #1615: the child display name rides the step so status
+                    // surfaces can label rows; #1305 records the effective
+                    // output mode alongside the saved-output path.
+                    set_step_field(&handle, 0, |step| {
+                        if let Some(name) = &outcome.session_name {
+                            step["sessionName"] = json!(name);
+                        }
+                        step["outputMode"] = json!(outcome.output_mode);
+                    });
                     // Same step fields as the parallel/chain paths so the
                     // completion notice can resolve the saved output path
                     // (R7.1.7.2: `artifactPaths.outputPath` →
@@ -938,11 +958,31 @@ pub async fn drive_run(
             // 3740-3755; pre-fix every step hung on `queued` until the
             // whole batch finished, misleading subagent_wait readers).
             let event_handle = handle.clone();
+            let step_transcripts: Vec<Option<PathBuf>> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    ctx.artifacts_dir.as_ref().map(|dir| {
+                        crate::artifacts::get_artifact_paths(
+                            dir,
+                            &ctx.run_id,
+                            &entry.spec.agent_name,
+                            Some(index as u32),
+                        )
+                        .transcript_path
+                    })
+                })
+                .collect();
             let on_step: crate::p1::parallel::ParallelStepSink =
                 std::sync::Arc::new(move |index, event| {
                     match event {
                         crate::p1::parallel::ParallelStepEvent::Started => {
                             mark_step(&event_handle, index, "running");
+                            if let Some(path) = &step_transcripts[index] {
+                                set_step_field(&event_handle, index, |step| {
+                                    step["transcriptPath"] = json!(path.to_string_lossy());
+                                });
+                            }
                         }
                         crate::p1::parallel::ParallelStepEvent::Finished {
                             exit_code,
@@ -1102,6 +1142,25 @@ fn set_step_field(handle: &Arc<AsyncRunHandle>, index: usize, mutate: impl FnOnc
                 mutate(step);
             }
         }
+    });
+}
+
+/// Stamp one step's derived transcript artifact path (#1963 live transcript
+/// pointer — additive field; absent when artifacts are disabled).
+fn set_step_transcript_path(
+    handle: &Arc<AsyncRunHandle>,
+    ctx: &RunCtx,
+    agent_name: &str,
+    index: usize,
+) {
+    let Some(dir) = &ctx.artifacts_dir else {
+        return;
+    };
+    let path =
+        crate::artifacts::get_artifact_paths(dir, &ctx.run_id, agent_name, Some(index as u32))
+            .transcript_path;
+    set_step_field(handle, index, |step| {
+        step["transcriptPath"] = json!(path.to_string_lossy());
     });
 }
 
@@ -1454,15 +1513,80 @@ pub fn steer_inbox_dir(run_dir: &Path, index: usize) -> PathBuf {
 }
 
 /// `SteerRequest` (control-channel.ts:66-77) written into the child inbox.
+///
+/// Delivery gates (R7.1.8.1/.2, #1980/#1976/#1983 — checked in order, all
+/// BEFORE any filesystem write so a rejected steer leaves no half-written
+/// inbox or `control.steer` event):
+/// 1. unknown id → error;
+/// 2. terminal/shutdown state → `… cannot be steered` (same terminal set
+///    as `find_active_run`);
+/// 3. single-child run blocked on an unanswered supervisor ask →
+///    `need_decision` guidance listing the request ids (upstream
+///    `steerAsyncRun`'s pending-ask gate, async-steering-action.ts:44-58 @
+///    0fc0eebb — applies only to `mode == "single"`, exactly one
+///    running/pending step, target index 0);
+/// 4. explicit target index out of range / non-steerable child → error
+///    naming the available range;
+/// 5. no steerable child at all → error.
 pub fn deliver_steer(
     run_id: &str,
     message: &str,
     mode: &str,
     target_index: Option<usize>,
 ) -> Result<Value, String> {
-    let handle = find_active_run(run_id)
-        .ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    let handle =
+        find_run(run_id).ok_or_else(|| format!("No active background run matches '{run_id}'."))?;
+    let status = status_snapshot(&handle);
+    let state = status["state"].as_str().unwrap_or("").to_string();
+    if is_terminal_state(&state) {
+        // #1976/#1983: a run past shutdown never accepts steering — report
+        // instead of queueing a request no child will read.
+        return Err(format!(
+            "Background run {} is {state} and cannot be steered.",
+            handle.run_id
+        ));
+    }
+    let steps: Vec<Value> = status["steps"].as_array().cloned().unwrap_or_default();
+    let step_live = |step: &Value| {
+        matches!(
+            step["status"].as_str(),
+            Some("running") | Some("pending") | Some("queued")
+        )
+    };
+    // Pending-ask gate (#1980): single-child runs only.
+    if status["mode"].as_str() == Some("single")
+        && steps.len() == 1
+        && target_index.unwrap_or(0) == 0
+        && steps.first().is_some_and(&step_live)
+    {
+        let asks = crate::p1::supervisor::pending_asks(&handle.run_id, 0);
+        if !asks.is_empty() {
+            return Err(steer_needs_decision_message(&handle.run_id, &asks));
+        }
+    }
     let index = target_index.unwrap_or(0);
+    if let Some(explicit) = target_index {
+        if steps.is_empty() || explicit >= steps.len() {
+            return Err(format!(
+                "Background run {} has {} children. Index {explicit} is out of range.",
+                handle.run_id,
+                steps.len()
+            ));
+        }
+        let step = &steps[explicit];
+        if !step_live(step) {
+            let step_state = step["status"].as_str().unwrap_or("unknown");
+            return Err(format!(
+                "Background run {} child {explicit} is {step_state} and cannot be steered.",
+                handle.run_id
+            ));
+        }
+    } else if !steps.is_empty() && !steps.iter().any(step_live) {
+        return Err(format!(
+            "Background run {} has no running child to steer.",
+            handle.run_id
+        ));
+    }
     let inbox = steer_inbox_dir(&handle.run_dir, index);
     std::fs::create_dir_all(&inbox).map_err(|e| e.to_string())?;
     let request_id = crate::runner::budget::random_run_id();
@@ -1485,6 +1609,29 @@ pub fn deliver_steer(
         json!({ "runId": handle.run_id, "id": request_id, "targetIndex": index }),
     );
     Ok(request)
+}
+
+/// The #1980 rejection text: the parent must answer the pending ask first;
+/// each ask's request id is rendered as a ready-to-paste `subagent_supervisor`
+/// reply call (upstream shapes the same guidance,
+/// async-steering-action.ts:50-57).
+fn steer_needs_decision_message(run_id: &str, asks: &[Value]) -> String {
+    let ambiguous = asks.len() > 1;
+    let replies = asks
+        .iter()
+        .map(|ask| {
+            let id = ask["id"].as_str().unwrap_or("?");
+            format!(
+                "subagent_supervisor({{\"action\":\"reply\",\"replyTo\":\"{id}\",\"message\":\"<explicit answer>\"}})"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "need_decision: steering not delivered or queued — background run {run_id} is blocked on {} pending supervisor ask(s). No reply was attempted. Reply explicitly{} first:\n{replies}",
+        asks.len(),
+        if ambiguous { " to the intended request ID" } else { "" }
+    )
 }
 
 /// Read a finished or live run's status.json by id (resume lookup). The id
@@ -1751,6 +1898,31 @@ pub async fn wait_for_runs(
     // poll loop (None = never pushed → first round always pushes).
     let mut last_signature: Option<String> = None;
     loop {
+        // #1315 attention (upstream stops the wait on supervisor asks in
+        // BOTH stopOnAttention modes, subagent-wait.ts:618-622): a waited
+        // run blocked on an unanswered ask returns early — otherwise the
+        // wait would burn its whole window on a child that cannot proceed.
+        for run_id in &initial_ids {
+            let asks = crate::p1::supervisor::pending_asks(run_id, 0);
+            if let Some(ask) = asks.first() {
+                let request_id = ask["id"].as_str().unwrap_or("?").to_string();
+                let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+                let snapshots: Vec<Value> = initial_ids
+                    .iter()
+                    .filter_map(|id| runs.get(id.as_str()).map(|h| status_snapshot(h)))
+                    .collect();
+                drop(runs);
+                return Ok(json!({
+                    "waited": 0,
+                    "all": all,
+                    "attention": {
+                        "runId": run_id,
+                        "requestId": request_id,
+                    },
+                    "runs": snapshots,
+                }));
+            }
+        }
         // User abort (extension-ABI abort-channel gap): the wait tool is a
         // synchronous dispatch the runtime cannot cancel, so it polls the
         // probe each cycle and returns promptly. The runs themselves keep
@@ -2758,6 +2930,8 @@ pub(crate) mod tests {
                 tool_budget: None,
                 session_file: None,
                 steer_inbox: None,
+                context_profile: false,
+                output_mode: None,
                 skill_fallback_cwd: None,
                 skill_primary_cwd: None,
             },
@@ -2973,5 +3147,197 @@ pub(crate) mod tests {
         assert!(pushes_seen <= 4, "bounded frames: {pushes_seen}");
 
         unregister_run(&handle.run_id);
+    }
+
+    // ---- TE19 (R7.1.8.1/.2): steer gates -------------------------------
+
+    /// A running single-child handle with a real temp run dir.
+    fn steer_test_run(run_id: &str, run_dir: &Path) -> Arc<AsyncRunHandle> {
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.to_string(),
+            status: Arc::new(RwLock::new(json!({
+                "runId": run_id,
+                "mode": "single",
+                "state": STATE_RUNNING,
+                "steps": [{ "agent": "worker", "status": "running" }],
+            }))),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.to_path_buf(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.to_string(), handle.clone());
+        handle
+    }
+
+    /// Write a pending blocking supervisor ask for `run_id` child 0.
+    fn write_pending_ask(run_id: &str, request_id: &str) {
+        let channel = crate::p1::supervisor::channel_dir(run_id, "worker", 0);
+        crate::p1::supervisor::ensure_channel(&channel);
+        std::fs::write(
+            channel.join("requests").join(format!("{request_id}.json")),
+            json!({
+                "type": "subagent.supervisor.request",
+                "id": request_id,
+                "createdAt": "2026-09-10T00:00:00.000Z",
+                "reason": "need_decision",
+                "message": "Ship or hold?",
+                "expectsReply": true,
+                "orchestratorSessionId": "session-a",
+                "runId": run_id,
+                "agent": "worker",
+                "childIndex": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn remove_ask(run_id: &str, request_id: &str) {
+        let channel = crate::p1::supervisor::channel_dir(run_id, "worker", 0);
+        let _ = std::fs::remove_file(channel.join("requests").join(format!("{request_id}.json")));
+        let _ = std::fs::remove_dir_all(&channel);
+    }
+
+    #[test]
+    fn steer_gate_blocks_on_pending_ask_without_touching_inbox() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("steer-gate-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let _handle = steer_test_run(&run_id, &run_dir);
+        write_pending_ask(&run_id, "req-1");
+
+        let error = deliver_steer(&run_id, "change of plans", "steer", None)
+            .expect_err("pending ask must block the steer");
+        // The rejection carries the guidance + the request id (FR-A).
+        assert!(error.contains("need_decision"), "{error}");
+        assert!(
+            error.contains("blocked on 1 pending supervisor ask"),
+            "{error}"
+        );
+        assert!(error.contains("req-1"), "{error}");
+        assert!(error.contains("subagent_supervisor"), "{error}");
+        // No inbox file, no control.steer event — the gate ran before any write.
+        let inbox = steer_inbox_dir(&run_dir, 0);
+        assert!(!inbox.exists(), "inbox dir must not be created");
+        assert!(!run_dir.join("events.jsonl").exists());
+
+        // Answering (consuming the ask) unblocks the normal path.
+        remove_ask(&run_id, "req-1");
+        let request = deliver_steer(&run_id, "change of plans", "steer", None)
+            .expect("steer delivers once the ask is answered");
+        assert_eq!(request["targetIndex"], json!(0));
+        assert!(steer_inbox_dir(&run_dir, 0).is_dir());
+        assert!(run_dir.join("events.jsonl").exists());
+
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn steer_gate_only_counts_blocking_asks_for_that_run() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // progress_update asks never block; asks for other runs never match.
+        assert!(crate::p1::supervisor::pending_asks("no-such-run", 0).is_empty());
+        let run_id = format!("steer-scope-{}", std::process::id());
+        let channel = crate::p1::supervisor::channel_dir(&run_id, "worker", 0);
+        crate::p1::supervisor::ensure_channel(&channel);
+        std::fs::write(
+            channel.join("requests").join("p1.json"),
+            json!({
+                "id": "p1", "createdAt": "2026-09-10T00:00:00.000Z",
+                "reason": "progress_update", "runId": run_id, "childIndex": 0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            crate::p1::supervisor::pending_asks(&run_id, 0).is_empty(),
+            "progress_update never blocks"
+        );
+        let _ = std::fs::remove_dir_all(&channel);
+    }
+
+    #[test]
+    fn steer_on_terminal_run_reports_undeliverable() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("steer-terminal-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let handle = steer_test_run(&run_id, &run_dir);
+        {
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["state"] = json!(STATE_COMPLETE);
+            status["steps"][0]["status"] = json!("complete");
+        }
+        let error = deliver_steer(&run_id, "hello?", "steer", None)
+            .expect_err("terminal runs cannot be steered");
+        assert!(
+            error.contains("is complete and cannot be steered"),
+            "{error}"
+        );
+        assert!(!run_dir.join("control").exists());
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn steer_target_index_bounds_and_child_state() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("steer-bounds-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let handle = steer_test_run(&run_id, &run_dir);
+        {
+            let mut status = handle.status.write().unwrap_or_else(|e| e.into_inner());
+            status["mode"] = json!("parallel");
+            status["steps"] = json!([
+                { "agent": "a", "status": "running" },
+                { "agent": "b", "status": "complete" },
+            ]);
+        }
+        // Out of range: names the available range.
+        let error =
+            deliver_steer(&run_id, "m", "steer", Some(5)).expect_err("index 5 out of range");
+        assert!(error.contains("has 2 children"), "{error}");
+        assert!(error.contains("Index 5 is out of range"), "{error}");
+        // Terminal child: refuses to steer it.
+        let error = deliver_steer(&run_id, "m", "steer", Some(1))
+            .expect_err("terminal child cannot be steered");
+        assert!(
+            error.contains("child 1 is complete and cannot be steered"),
+            "{error}"
+        );
+        // Live child at an explicit index delivers to THAT inbox.
+        let request = deliver_steer(&run_id, "m", "steer", Some(0)).expect("index 0 steers");
+        assert_eq!(request["targetIndex"], json!(0));
+        assert!(steer_inbox_dir(&run_dir, 0).is_dir());
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn steer_unknown_run_is_not_found() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let error = deliver_steer("no-such-run-xyz", "m", "steer", None).unwrap_err();
+        assert!(
+            error.contains("No active background run matches"),
+            "{error}"
+        );
     }
 }

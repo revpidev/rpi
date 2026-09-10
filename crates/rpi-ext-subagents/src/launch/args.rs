@@ -43,6 +43,12 @@ pub const SUBAGENT_CHILD_INDEX_ENV: &str = "RPI_SUBAGENT_CHILD_INDEX";
 pub const SUBAGENT_PARENT_DEPTH_ENV: &str = "RPI_SUBAGENT_PARENT_DEPTH";
 pub const SUBAGENT_PARENT_EVENT_SINK_ENV: &str = "RPI_SUBAGENT_PARENT_EVENT_SINK";
 pub const SUBAGENT_STEER_INBOX_ENV: &str = "RPI_SUBAGENT_STEER_INBOX";
+/// #1397 `subagents.maxThinking`: the effective (intersected) thinking
+/// ceiling a child's own subagent launches must stay under.
+pub const SUBAGENT_THINKING_CEILING_ENV: &str = "RPI_SUBAGENT_THINKING_CEILING";
+/// #1615 child session display name: set on the child so its own plugin
+/// init calls `setSessionName` (host session browsers / `--resume`).
+pub const SUBAGENT_SESSION_NAME_ENV: &str = "RPI_SUBAGENT_SESSION_NAME";
 pub const SUBAGENT_PARENT_CONTROL_INBOX_ENV: &str = "RPI_SUBAGENT_PARENT_CONTROL_INBOX";
 pub const SUBAGENT_PARENT_ROOT_RUN_ID_ENV: &str = "RPI_SUBAGENT_PARENT_ROOT_RUN_ID";
 pub const SUBAGENT_PARENT_RUN_ID_ENV: &str = "RPI_SUBAGENT_PARENT_RUN_ID";
@@ -162,6 +168,15 @@ pub struct BuildArgsInput {
     /// Supervisor channel dir (FR-P1-10): activates the child-side
     /// `contact_supervisor` tool; `None` clears the env.
     pub supervisor_channel: Option<PathBuf>,
+    /// Effective thinking ceiling (#1397 `subagents.maxThinking` + inherited
+    /// env intersection): propagated to the child so grandchildren stay
+    /// under the tightest ancestor ceiling (launch-contract
+    /// `thinkingCeiling` mapping). `None` clears the env.
+    pub thinking_ceiling: Option<String>,
+    /// Child session display name (#1615 `deriveChildSessionName`):
+    /// `agent: task excerpt` capped at 80 chars; the child's plugin init
+    /// calls `setSessionName` with it.
+    pub session_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -557,6 +572,22 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     } else {
         cleared(&mut env, SUBAGENT_STEER_INBOX_ENV);
     }
+    // #1397: the child inherits the effective ceiling so its own launches
+    // intersect against the tightest ancestor.
+    if let Some(ceiling) = &input.thinking_ceiling {
+        env.insert(
+            SUBAGENT_THINKING_CEILING_ENV.to_string(),
+            Some(ceiling.clone()),
+        );
+    } else {
+        cleared(&mut env, SUBAGENT_THINKING_CEILING_ENV);
+    }
+    // #1615: the child names its own session for host browsers / --resume.
+    if let Some(name) = &input.session_name {
+        env.insert(SUBAGENT_SESSION_NAME_ENV.to_string(), Some(name.clone()));
+    } else {
+        cleared(&mut env, SUBAGENT_SESSION_NAME_ENV);
+    }
     if let Some(channel) = &input.supervisor_channel {
         env.insert(
             crate::p1::supervisor::SUPERVISOR_CHANNEL_DIR_ENV.to_string(),
@@ -805,6 +836,47 @@ mod tests {
         let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, Some(SELF));
         assert_eq!(plan.effective_tool_allowlist, vec!["read"]);
         assert_eq!(plan.extension_args, vec![SELF, "/abs/tool.so"]);
+    }
+
+    /// #1397/#1615: the thinking ceiling and session name propagate to the
+    /// child env; `None` clears both (registry-style explicit env map).
+    #[test]
+    fn ceiling_and_session_name_env_propagation() {
+        let dir = std::env::temp_dir().join(format!("rpi-sub-args-t19-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut input = base_input();
+        input.session_dir = Some(dir.clone());
+        input.thinking_ceiling = Some("low".to_string());
+        input.session_name = Some("scout: do the thing".to_string());
+        let result = build_rpi_args(&input).unwrap();
+        assert_eq!(
+            result
+                .env
+                .get(crate::launch::args::SUBAGENT_THINKING_CEILING_ENV),
+            Some(&Some("low".into()))
+        );
+        assert_eq!(
+            result
+                .env
+                .get(crate::launch::args::SUBAGENT_SESSION_NAME_ENV),
+            Some(&Some("scout: do the thing".into()))
+        );
+        // None clears both keys (children must not inherit stale values).
+        input.thinking_ceiling = None;
+        input.session_name = None;
+        let result = build_rpi_args(&input).unwrap();
+        assert_eq!(
+            result
+                .env
+                .get(crate::launch::args::SUBAGENT_THINKING_CEILING_ENV),
+            Some(&Some(String::new()))
+        );
+        assert_eq!(
+            result
+                .env
+                .get(crate::launch::args::SUBAGENT_SESSION_NAME_ENV),
+            Some(&Some(String::new()))
+        );
     }
 
     #[test]

@@ -250,11 +250,46 @@ pub fn render_subagent_tool_result(result: &Value, options: &Value, call_args: &
 }
 
 /// Wrap `(text, fg)` rows into the card's column tree (every row truncates).
+/// Total-body guard (#2015, rpi mapping of the upstream transcript preview
+/// bounds): the rendered card is capped at [`MAX_CARD_LINES`] rows and
+/// [`MAX_CARD_BODY_CHARS`] payload characters — host-side `truncate` bounds
+/// width, this bounds the body itself so a runaway transcript tail cannot
+/// explode the tool result. Overflow elides the oldest rows past the head
+/// two (aggregate + stats) with a `… +N lines` marker row.
+const MAX_CARD_LINES: usize = 100;
+const MAX_CARD_BODY_CHARS: usize = 16_384;
+
 fn card_tree(lines: Vec<(String, &'static str)>) -> Value {
+    let mut lines = lines;
+    if lines.len() > MAX_CARD_LINES {
+        // Keep the head rows (aggregate + stats) and the newest tail; the
+        // middle elides under one `… +N lines` marker.
+        let overflow = lines.len() - (MAX_CARD_LINES - 1);
+        let mut head: Vec<(String, &'static str)> = lines.drain(..2).collect();
+        let tail_len = MAX_CARD_LINES - 3;
+        let tail_start = lines.len().saturating_sub(tail_len);
+        let tail: Vec<(String, &'static str)> = lines.split_off(tail_start);
+        head.push((format!("… +{overflow} lines"), "dim"));
+        head.extend(tail);
+        lines = head;
+    }
+    let mut budget = MAX_CARD_BODY_CHARS;
+    let mut bounded_lines = Vec::with_capacity(lines.len());
+    for (text, fg) in lines {
+        let text = if text.chars().count() > budget {
+            let mut cut: String = text.chars().take(budget.max(1).saturating_sub(1)).collect();
+            cut.push('…');
+            cut
+        } else {
+            text
+        };
+        budget = budget.saturating_sub(text.chars().count());
+        bounded_lines.push((text, fg));
+    }
     json!({
         "type": "column",
         "props": {},
-        "children": lines
+        "children": bounded_lines
             .into_iter()
             .map(|(text, fg)| json!({
                 "type": "text",
@@ -502,7 +537,16 @@ fn artifact_output_path(entry: &Value) -> Option<String> {
 
 /// The expanded tail: recentOutput while running, the final output at
 /// terminal (bounded to a few lines).
+/// #2015 (rpi mapping): the running preview keeps the LAST
+/// [`EXPANDED_TAIL_LINES`] lines (matching the terminal bound) — a single
+/// bounded window instead of the whole in-memory 50-line recentOutput.
 fn expanded_tail(result: &Value, results: &[Value], is_partial: bool) -> String {
+    const EXPANDED_TAIL_LINES: usize = 10;
+    fn tail_lines(text: &str) -> Vec<&str> {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines.len().saturating_sub(EXPANDED_TAIL_LINES);
+        lines[start..].to_vec()
+    }
     if is_partial {
         let tail = results
             .first()
@@ -511,20 +555,14 @@ fn expanded_tail(result: &Value, results: &[Value], is_partial: bool) -> String 
             .or_else(|| results.first().and_then(|_| result.get("recentOutput")))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        return tail.trim_end().to_string();
+        return tail_lines(tail.trim_end()).join("\n");
     }
     let output = results
         .first()
         .and_then(|entry| entry.get("finalOutput"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let lines: Vec<&str> = output.lines().collect();
-    let tail: Vec<&str> = if lines.len() > 10 {
-        lines[lines.len() - 10..].to_vec()
-    } else {
-        lines
-    };
-    tail.join("\n")
+    tail_lines(output).join("\n")
 }
 
 fn usage_totals(results: &[Value], progress: &[Value]) -> (u64, u64) {
@@ -624,6 +662,57 @@ mod tests {
         assert_eq!(title["props"]["bold"], json!(true));
         assert_eq!(title["props"]["truncate"], json!(true));
         assert_eq!(title["props"]["fg"], "toolTitle");
+    }
+
+    // ===== TE19 (#2015 rpi mapping): body caps =====
+
+    /// The card body is capped — overflow elides the middle under a
+    /// `… +N lines` marker; per-line payloads truncate.
+    #[test]
+    fn card_tree_caps_total_body() {
+        let lines: Vec<(String, &'static str)> = (0..150)
+            .map(|index| (format!("line-{index}"), "muted"))
+            .collect();
+        let tree = card_tree(lines);
+        let children = tree["children"].as_array().unwrap();
+        assert!(children.len() <= 100, "{}", children.len());
+        let texts: Vec<&str> = children
+            .iter()
+            .map(|child| child["props"]["text"].as_str().unwrap())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("lines")), "{texts:?}");
+        // Head survives, the newest tail survives, the middle is gone.
+        assert_eq!(texts[0], "line-0");
+        assert_eq!(texts[2], "\u{2026} +51 lines");
+        assert_eq!(texts[3], "line-53");
+        assert!(texts.last().unwrap().contains("line-149"));
+        // Single overlong lines cap at the payload bound, not the raw length.
+        let long: Vec<(String, &'static str)> = vec![("x".repeat(20_000), "muted")];
+        let tree = card_tree(long);
+        let text = tree["children"][0]["props"]["text"].as_str().unwrap();
+        assert!(text.chars().count() < 20_000, "{}", text.chars().count());
+        assert!(text.ends_with('\u{2026}'));
+    }
+
+    /// The partial (running) expanded tail keeps the last 10 lines instead
+    /// of the whole in-memory recentOutput window.
+    #[test]
+    fn expanded_partial_tail_is_line_bounded() {
+        let mut entry = partial_details();
+        let mut recent = String::new();
+        for index in 0..40 {
+            recent.push_str(&format!("out-{index}\n"));
+        }
+        entry["results"][0]["progress"]["recentOutput"] = json!(recent);
+        let result = json!({ "details": entry });
+        let tail = expanded_tail(
+            &result,
+            result["details"]["results"].as_array().unwrap(),
+            true,
+        );
+        assert!(tail.contains("out-39"), "{tail}");
+        assert!(!tail.contains("out-5\n"), "{tail}");
+        assert!(tail.lines().count() <= 10, "{tail}");
     }
 
     // ===== FR-B: partial frames =====
