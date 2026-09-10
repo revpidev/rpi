@@ -40,7 +40,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "934771a8-7989-4cf4-9c6d-a4d8142edbd8",
+        "mcp-session-id": "bf22cb9c-0f9a-4697-a5f0-73b1cb15f6fc",
         "x-accel-buffering": "no",
         "content-length": 192
       },
@@ -112,7 +112,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "934771a8-7989-4cf4-9c6d-a4d8142edbd8",
+        "mcp-session-id": "bf22cb9c-0f9a-4697-a5f0-73b1cb15f6fc",
         "x-accel-buffering": "no",
         "content-length": 256
       },
@@ -215,7 +215,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "934771a8-7989-4cf4-9c6d-a4d8142edbd8",
+        "mcp-session-id": "bf22cb9c-0f9a-4697-a5f0-73b1cb15f6fc",
         "x-accel-buffering": "no"
       },
       "body": "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Elicitation error: MCP error -32601: Method not found\"}]},\"jsonrpc\":\"2.0\",\"id\":2}\n\n"
@@ -236,7 +236,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "934771a8-7989-4cf4-9c6d-a4d8142edbd8",
+        "mcp-session-id": "bf22cb9c-0f9a-4697-a5f0-73b1cb15f6fc",
         "x-accel-buffering": "no"
       },
       "body": "event: message\ndata: {\"method\":\"elicitation/create\",\"params\":{\"message\":\"Test client default value handling - please accept with defaults\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"User name\",\"default\":\"John Doe\"},\"age\":{\"type\":\"integer\",\"description\":\"User age\",\"default\":30},\"score\":{\"type\":\"number\",\"description\":\"User score\",\"default\":95.5},\"status\":{\"type\":\"string\",\"description\":\"User status\",\"enum\":[\"active\",\"inactive\",\"pending\"],\"default\":\"active\"},\"verified\":{\"type\":\"boolean\",\"description\":\"Verification status\",\"default\":true}},\"required\":[]}},\"jsonrpc\":\"2.0\",\"id\":0}\n\n"

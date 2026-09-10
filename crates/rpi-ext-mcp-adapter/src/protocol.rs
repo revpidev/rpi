@@ -161,10 +161,13 @@ pub struct ListenEntry {
 }
 
 /// `McpSubscription` handle (SDK `listen()` result, close half): sends
-/// `notifications/cancelled` for the listen id and drops the state.
+/// `notifications/cancelled` for the listen id and drops the state;
+/// `is_closed` reports remote/graceful/local teardown so the manager can
+/// re-establish a dropped catalog listen.
 pub struct ListenHandle {
     client: Arc<McpClient>,
     id: String,
+    closed: Arc<AtomicBool>,
 }
 
 impl ListenHandle {
@@ -184,6 +187,13 @@ impl ListenHandle {
                 Some(json!({ "requestId": self.id })),
             )
             .await;
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// True once the subscription settled (remote graceful close, server
+    /// cancel, transport close or local [`Self::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 }
 
@@ -450,7 +460,7 @@ impl McpClient {
             self.next_listen_id.fetch_add(1, Ordering::SeqCst)
         );
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-        let (closed_tx, _closed_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
         self.listen_states
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -479,10 +489,23 @@ impl McpClient {
         // Ack phase bounded by the caller's timeout (SDK
         // DEFAULT_REQUEST_TIMEOUT_MSEC); a timeout tears the request down.
         match tokio::time::timeout(timeout, ack_rx).await {
-            Ok(Ok(Ok(_honored))) => Ok(ListenHandle {
-                client: self.clone(),
-                id: listen_id,
-            }),
+            Ok(Ok(Ok(_honored))) => {
+                // Liveness watcher (R7.2.8.4 re-establish support): the
+                // dispatch paths settle `closed_rx` on remote graceful
+                // close / server cancel; dropping the entry (local close /
+                // transport teardown) also resolves it.
+                let closed_flag = Arc::new(AtomicBool::new(false));
+                let flag = closed_flag.clone();
+                tokio::spawn(async move {
+                    let _ = closed_rx.await;
+                    flag.store(true, Ordering::SeqCst);
+                });
+                Ok(ListenHandle {
+                    client: self.clone(),
+                    id: listen_id,
+                    closed: closed_flag,
+                })
+            }
             Ok(Ok(Err(error))) => {
                 self.listen_states
                     .lock()

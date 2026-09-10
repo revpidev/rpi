@@ -1377,3 +1377,74 @@ async fn te24_legacy_connection_skips_listen_and_still_refreshes() {
     assert!(!pid_alive(&pid), "legacy fixture child reaped (G4)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn te24_catalog_listen_reestablishes_after_remote_cancel_and_close_cancels() {
+    // Round-1 review B1/B2 closure: (a) a remotely cancelled listen is
+    // re-established by the next refresh pass (liveness-checked dedup);
+    // (b) close() sends the wire-level notifications/cancelled.
+    let dir = temp_dir("te24-listen-reestablish");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(
+        &log,
+        &pid,
+        &[
+            ("RPI_MCP_FIXTURE_MODERN_2026", "1"),
+            ("RPI_MCP_FIXTURE_CANCEL_LISTEN_AFTER_MS", "300"),
+        ],
+    );
+    let mut map = entry.as_map().clone();
+    map.insert("protocolVersion".to_string(), json!("2026-07-28"));
+    let entry = ServerEntry(map);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+
+    let listen_count = || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.trim() == "subscriptions/listen")
+            .count()
+    };
+    // Wait for the first listen (opened by the connect background task).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while listen_count() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(listen_count(), 1, "initial listen opened");
+
+    // Let the server cancel arrive, then run a refresh pass: the dropped
+    // listen must be re-established (second subscriptions/listen on the
+    // wire).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let _ = manager.refresh_tools("fixture", &connection).await;
+        if listen_count() >= 2 || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        listen_count() >= 2,
+        "cancelled listen re-established, got {}",
+        listen_count()
+    );
+
+    // close() emits notifications/cancelled for the live listen (B2).
+    manager.close("fixture").await;
+    let cancelled = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.trim() == "notifications/cancelled")
+        .count();
+    assert!(
+        cancelled >= 1,
+        "close sends the wire-level listen cancel, got {cancelled}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

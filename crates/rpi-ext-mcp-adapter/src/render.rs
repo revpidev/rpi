@@ -375,9 +375,12 @@ pub fn resolve_mcp_tool_render_options(
         }
         _ => McpToolResultRendering::Compact,
     };
+    // JS `collapsedLines === 1 || === 2 || === 3` accepts the float form
+    // (`2.0 === 2`); serde_json keeps `2.0` as f64, so match on the float
+    // and require an integral value in range.
     let collapsed = settings
         .and_then(|s| s.get("collapsedResultLines"))
-        .and_then(Value::as_u64);
+        .and_then(Value::as_f64);
     let default_lines = match result_rendering {
         McpToolResultRendering::Boxed => DEFAULT_BOXED_COLLAPSED_LINES,
         McpToolResultRendering::Compact => DEFAULT_COMPACT_COLLAPSED_LINES,
@@ -385,7 +388,7 @@ pub fn resolve_mcp_tool_render_options(
     McpToolRenderOptions {
         result_rendering,
         collapsed_result_lines: match collapsed {
-            Some(lines @ 1..=3) => lines as usize,
+            Some(lines) if lines.fract() == 0.0 && (1.0..=3.0).contains(&lines) => lines as usize,
             _ => default_lines,
         },
     }
@@ -756,6 +759,19 @@ mod tests {
         assert_eq!(
             resolve_mcp_tool_render_options(valid.as_ref()).collapsed_result_lines,
             2
+        );
+        // JS accepts the float form (`2.0 === 2`).
+        let float_lines = json!({ "collapsedResultLines": 2.0 }).as_object().cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(float_lines.as_ref()).collapsed_result_lines,
+            2,
+            "integer-valued float accepted"
+        );
+        let fractional = json!({ "collapsedResultLines": 2.5 }).as_object().cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(fractional.as_ref()).collapsed_result_lines,
+            1,
+            "fractional value falls to the compact default"
         );
         let junk = json!({ "toolResultRendering": "weird", "collapsedResultLines": "x" })
             .as_object()

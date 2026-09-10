@@ -683,9 +683,12 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
         instructions: connection.instructions.clone(),
         // #446: persist the server's declared cache hints so a later
         // `is_server_cache_valid` can apply `min(maxAge, ttlMs)`.
-        ttl_ms: connection.tool_list_hints.as_ref().and_then(|h| h.ttl_ms),
+        ttl_ms: connection
+            .tool_list_hints_snapshot()
+            .as_ref()
+            .and_then(|h| h.ttl_ms),
         cache_scope: connection
-            .tool_list_hints
+            .tool_list_hints_snapshot()
             .as_ref()
             .and_then(|h| h.cache_scope.clone()),
         cached_at: now_ms(),

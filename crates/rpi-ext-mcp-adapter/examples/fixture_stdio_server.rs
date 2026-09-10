@@ -102,7 +102,9 @@ fn main() {
             "subscriptions/listen" => {
                 // #468: acknowledge with the subscription id mirror, then
                 // hold the stream open (graceful close = a later RESULT for
-                // the same string id, which the test never triggers).
+                // the same string id; CANCEL_LISTEN_AFTER_MS models a
+                // server-side cancel so the manager's re-establish path is
+                // exercisable).
                 let listen_id = message
                     .get("id")
                     .cloned()
@@ -111,7 +113,7 @@ fn main() {
                     "jsonrpc": "2.0",
                     "method": "notifications/subscriptions/acknowledged",
                     "params": {
-                        "_meta": { "io.modelcontextprotocol/subscriptionId": listen_id },
+                        "_meta": { "io.modelcontextprotocol/subscriptionId": listen_id.clone() },
                         "notifications": message
                             .get("params")
                             .and_then(|p| p.get("notifications"))
@@ -119,6 +121,25 @@ fn main() {
                             .unwrap_or_else(|| serde_json::json!({})),
                     },
                 }));
+                let cancel_ms: u64 = std::env::var("RPI_MCP_FIXTURE_CANCEL_LISTEN_AFTER_MS")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(0);
+                if cancel_ms > 0 {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(cancel_ms));
+                        let stdout = std::io::stdout();
+                        let mut out = stdout.lock();
+                        let cancel = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/cancelled",
+                            "params": { "requestId": listen_id },
+                        });
+                        let _ = serde_json::to_writer(&mut out, &cancel);
+                        let _ = writeln!(out);
+                        let _ = out.flush();
+                    });
+                }
                 serde_json::Value::Null
             }
             "ping" => serde_json::json!({}),

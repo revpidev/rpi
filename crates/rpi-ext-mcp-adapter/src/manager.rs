@@ -62,8 +62,9 @@ pub struct ServerConnection {
     pub status: Mutex<ConnectionStatus>,
     pub credentials_invalidated: AtomicBool,
     /// Cache hints from the server's `tools/list` (server-manager.ts:138 @
-    /// 10a45367, #446); written into the metadata cache entry.
-    pub tool_list_hints: Option<crate::protocol::ToolListHints>,
+    /// 10a45367, #446); written into the metadata cache entry and swapped
+    /// together with the catalog by the keep-alive/list-changed refresh.
+    pub tool_list_hints: Mutex<Option<crate::protocol::ToolListHints>>,
 }
 
 impl ServerConnection {
@@ -87,6 +88,22 @@ impl ServerConnection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Snapshot of the `tools/list` cache hints.
+    pub fn tool_list_hints_snapshot(&self) -> Option<crate::protocol::ToolListHints> {
+        self.tool_list_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Swap the cache hints alongside the catalog.
+    fn set_tool_list_hints(&self, hints: Option<crate::protocol::ToolListHints>) {
+        *self
+            .tool_list_hints
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = hints;
     }
 
     /// Snapshot of the prompt catalog.
@@ -176,6 +193,10 @@ pub struct McpServerManager {
     /// Servers with a live catalog `subscriptions/listen` (R7.2.8.4/#468);
     /// cleared on close so a reconnect re-opens.
     listen_open: Mutex<HashSet<String>>,
+    /// Live listen handles (keyed by server): `close()` sends the
+    /// wire-level `notifications/cancelled` before the transport dies
+    /// (the spec-courteous half of the SDK's close belt-and-braces).
+    listen_handles: Mutex<HashMap<String, Arc<crate::protocol::ListenHandle>>>,
     /// Weak self for client callbacks registered BEFORE the handshake (the
     /// notification handler must be live when `notifications/initialized`
     /// lands — the fixture-style proactive list_changed fires right after).
@@ -198,6 +219,7 @@ impl McpServerManager {
             stopped: AtomicBool::new(false),
             metadata_list_changed_listener: Mutex::new(None),
             listen_open: Mutex::new(HashSet::new()),
+            listen_handles: Mutex::new(HashMap::new()),
             self_weak: Mutex::new(None),
             auth_store_override: Mutex::new(None),
         });
@@ -386,8 +408,21 @@ impl McpServerManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), connection.clone());
-        if let Some(client) = &connection.client {
-            self.ensure_catalog_listen(name, &connection, client).await;
+        // Fire-and-forget (server-manager.ts:349 `void this.ensureListen
+        // (...)`): the listen ack must NEVER stall the connect — a modern
+        // server that accepts `subscriptions/listen` but answers slowly
+        // would otherwise hold the connection open for the ack timeout.
+        if let Some(client) = connection.client.clone() {
+            let manager = self.clone();
+            let name_owned = name.to_string();
+            let connection = connection.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    manager
+                        .ensure_catalog_listen(&name_owned, &connection, &client)
+                        .await;
+                });
+            }
         }
         Ok(connection)
     }
@@ -557,22 +592,38 @@ impl McpServerManager {
         {
             let mut open = self.listen_open.lock().unwrap_or_else(|e| e.into_inner());
             if open.contains(name) {
-                return;
+                // Re-establish a DROPPED listen (remote cancel/graceful
+                // close): a stale handle falls through to a re-open.
+                let alive = self
+                    .listen_handles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(name)
+                    .is_some_and(|handle| !handle.is_closed());
+                if alive {
+                    return;
+                }
+                self.listen_handles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
+                open.remove(name);
             }
             open.insert(name.to_string());
         }
-        // The listen handle lives for the connection's lifetime; closing
-        // the server drops it (the child/process teardown ends the stream).
         // Errors clear the marker so a later pass retries.
+        // `ensureListen`'s attempt budget (server-manager.ts:601-604 @
+        // 10a45367): min(resolved request timeout, 5s keep-alive budget).
         let timeout = self
             .request_timeout(&connection.definition)
-            .min(crate::manager::KEEP_ALIVE_REFRESH_TIMEOUT_MS.max(Duration::from_secs(60)));
+            .min(KEEP_ALIVE_REFRESH_TIMEOUT_MS);
         match client.open_listen(Value::Object(filter), timeout).await {
-            Ok(_handle) => {
+            Ok(handle) => {
                 tracing::debug!(server = %name, "MCP: catalog listen opened");
-                // Intentionally leaked per connection: the handle's close
-                // fires from close()/shutdown teardown.
-                std::mem::forget(_handle);
+                self.listen_handles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name.to_string(), Arc::new(handle));
             }
             Err(error) => {
                 tracing::debug!(
@@ -637,6 +688,10 @@ impl McpServerManager {
             return Ok(ToolRefreshResult::Superseded);
         };
 
+        // `await this.ensureListen(...)` (server-manager.ts:411 @ 10a45367):
+        // a dropped catalog listen is re-established before the refresh.
+        self.ensure_catalog_listen(name, expected, &client).await;
+
         // No tools capability → ping proves the session usable
         // (server-manager.ts:421-431).
         let capabilities = client.server_capabilities();
@@ -671,25 +726,32 @@ impl McpServerManager {
                 })
             }
             Err(error) => Err(error),
-            Ok((tools, _hints)) => {
+            Ok((tools, hints)) => {
                 let still_current = self
                     .get_connection(name)
                     .is_some_and(|c| Arc::ptr_eq(&c, expected));
                 if !still_current {
                     return Ok(ToolRefreshResult::Superseded);
                 }
+                // `refreshTools` compares BOTH the catalog and the cache
+                // hints (server-manager.ts:459-466 @ 10a45367); either
+                // differing swaps both and fires the listener.
                 let unchanged = {
-                    let current = expected.tools.lock().unwrap_or_else(|e| e.into_inner());
-                    *current == tools
+                    let current_tools = expected.tools.lock().unwrap_or_else(|e| e.into_inner());
+                    let current_hints = expected
+                        .tool_list_hints
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *current_tools == tools && *current_hints == hints
                 };
                 if unchanged {
                     return Ok(ToolRefreshResult::Unchanged);
                 }
-                // Swap the catalog under the connection's identity and fire
-                // the metadata listener (upstream bumps toolsRevision; the
-                // Rust connection swaps the Vec under this lock — readers
-                // see either the old or the new full list).
+                // Swap under the connection's identity and fire the
+                // metadata listener (upstream bumps toolsRevision; readers
+                // snapshot either the old or the new full state).
                 expected.set_tools(tools);
+                expected.set_tool_list_hints(hints);
                 self.fire_metadata_list_changed(name, "keep-alive-refresh");
                 Ok(ToolRefreshResult::Updated)
             }
@@ -739,9 +801,17 @@ impl McpServerManager {
                 .or_else(|| self.default_cwd.clone());
             if let Some(cwd) = cwd {
                 match std::fs::metadata(&cwd) {
-                    Err(_) => {
+                    // `statSync(cwd, { throwIfNoEntry: false })` only
+                    // suppresses ENOENT; any other stat error surfaces as
+                    // the OS error (upstream lets it throw).
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         return Err(ProtocolError::Transport(format!(
                             "MCP server \"{name}\" configured cwd does not exist: \"{cwd}\""
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(ProtocolError::Transport(format!(
+                            "MCP server \"{name}\" configured cwd could not be inspected (\"{cwd}\"): {error}"
                         )));
                     }
                     Ok(stats) if !stats.is_dir() => {
@@ -920,6 +990,16 @@ impl McpServerManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
+        // The wire-level `notifications/cancelled` goes out before the
+        // transport dies (spec-courteous half of the SDK close pair).
+        let listen = self
+            .listen_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        if let Some(listen) = listen {
+            listen.close().await;
+        }
         let connection = self
             .connections
             .lock()
@@ -938,6 +1018,20 @@ impl McpServerManager {
     /// `protocol::stdio::StdioChild::shutdown`.
     pub async fn close_all(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.listen_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        let listens: Vec<Arc<crate::protocol::ListenHandle>> = self
+            .listen_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        for listen in listens {
+            listen.close().await;
+        }
         let connections: Vec<Arc<ServerConnection>> = self
             .connections
             .lock()
@@ -1061,7 +1155,7 @@ fn build_connection(
         in_flight: AtomicUsize::new(0),
         status: Mutex::new(ConnectionStatus::Connected),
         credentials_invalidated: AtomicBool::new(false),
-        tool_list_hints: metadata.tool_list_hints,
+        tool_list_hints: Mutex::new(metadata.tool_list_hints),
     }
 }
 
@@ -1079,7 +1173,7 @@ fn needs_auth_connection(definition: &ServerEntry) -> ServerConnection {
         in_flight: AtomicUsize::new(0),
         status: Mutex::new(ConnectionStatus::NeedsAuth),
         credentials_invalidated: AtomicBool::new(true),
-        tool_list_hints: None,
+        tool_list_hints: Mutex::new(None),
     }
 }
 
@@ -1679,6 +1773,31 @@ mod tests {
                 .contains("configured cwd is not a directory"),
             "got: {by_default}"
         );
+        // A non-ENOENT stat failure (ENOTDIR here) is NOT reported as
+        // "does not exist" — it surfaces the OS error instead.
+        let not_dir_path = if cfg!(target_os = "windows") {
+            "C:\\definitely\\not\\a\\dir\\child".to_string()
+        } else {
+            "/dev/null/child".to_string()
+        };
+        let inspected = manager
+            .connect(
+                "srv",
+                &entry(json!({ "command": "true", "cwd": not_dir_path })),
+            )
+            .await
+            .err()
+            .expect("connect fails");
+        let inspected = inspected.to_string();
+        assert!(
+            inspected.contains("could not be inspected"),
+            "non-ENOENT stat errors must not claim the path is missing: {inspected}"
+        );
+        assert!(
+            !inspected.contains("does not exist"),
+            "non-ENOENT stat errors must not claim the path is missing: {inspected}"
+        );
+
         // A valid directory cwd proceeds to the spawn (a different error:
         // the handshake fails because `true` is not an MCP server).
         let ok_cwd = manager

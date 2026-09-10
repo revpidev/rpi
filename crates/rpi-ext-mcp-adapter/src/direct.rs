@@ -685,22 +685,37 @@ fn prepare_direct_tool_arguments(
     if validator.is_valid(&prepared) {
         return Ok(prepared);
     }
-    let errors: Vec<String> = validator
+    let errors: Vec<(String, String, String)> = validator
         .iter_errors(&prepared)
-        .map(|error| error.to_string())
+        .map(|error| {
+            // TypeBox reports `instancePath`/`keyword`/`message`; the
+            // jsonschema crate exposes the instance location and the
+            // schema location (whose last segment is the failing keyword),
+            // so the envelope carries real values rather than constants.
+            let instance = error.instance_path.as_str();
+            let instance_path = if instance.is_empty() {
+                "/".to_string()
+            } else {
+                instance.to_string()
+            };
+            let keyword = error
+                .schema_path
+                .as_str()
+                .rsplit('/')
+                .find(|segment| !segment.is_empty())
+                .unwrap_or("")
+                .to_string();
+            (instance_path, keyword, error.to_string())
+        })
         .collect();
     let total = errors.len();
     let issues: Vec<Value> = errors
         .iter()
         .take(8)
-        .map(|message| {
+        .map(|(instance_path, keyword, message)| {
             json!({
-                // TypeBox reports `instancePath`/`keyword`/`message`; the
-                // jsonschema crate's Display carries the path + keyword in
-                // the message text (first-8 + total + truncated keep the
-                // upstream envelope shape).
-                "instancePath": "/",
-                "keyword": "type",
+                "instancePath": instance_path,
+                "keyword": keyword,
                 "message": message,
             })
         })
@@ -1869,9 +1884,13 @@ mod tests {
             .map(|(_, tail)| tail)
             .unwrap_or_default();
         let parsed: Value = serde_json::from_str(tail).expect("envelope is JSON");
-        assert!(parsed
-            .get("issues")
-            .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())));
+        let issues = parsed["issues"].as_array().expect("issues");
+        assert!(!issues.is_empty());
+        // Real instancePath/keyword from the validator (round-1 O4): the
+        // missing required property surfaces as required at the root.
+        let issue = &issues[0];
+        assert_eq!(issue["instancePath"], json!("/"), "{issue}");
+        assert_eq!(issue["keyword"], json!("required"), "{issue}");
         assert!(parsed
             .get("total")
             .is_some_and(|v| v.as_u64().is_some_and(|t| t > 0)));
