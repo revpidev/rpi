@@ -22,6 +22,7 @@
 //! sessions (P2) are absent; the approveTools approval gate (FR-P1-07 /
 //! R7.2.2) is wired in `execute_direct_tool` (TE21).
 
+use indexmap::IndexSet;
 use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
@@ -29,9 +30,8 @@ use tracing::warn;
 
 use crate::cache::{is_server_cache_valid, MetadataCache};
 use crate::metadata::{
-    format_tool_name, get_tool_name_candidates_with, has_tool_filters, is_tool_allowed,
-    resolve_tool_prefix, resource_name_to_tool_name, McpConfig, ToolPrefix,
-    ToolSelectorCandidateIndex,
+    format_tool_name, has_tool_filters, index_candidate_scan, is_tool_allowed, resolve_tool_prefix,
+    resource_name_to_tool_name, McpConfig, ToolPrefix, ToolSelectorCandidateIndex,
 };
 use crate::utils::truncate_at_word;
 
@@ -86,12 +86,7 @@ fn direct_selector_candidate_index(
     cache: &MetadataCache,
     prefix: ToolPrefix,
 ) -> ToolSelectorCandidateIndex {
-    let mut candidates: Vec<String> = Vec::new();
-    let mut push = |value: String| {
-        if !candidates.contains(&value) {
-            candidates.push(value);
-        }
-    };
+    let mut candidates: IndexSet<String> = IndexSet::new();
     for (other_server_name, other_definition) in &config.mcp_servers {
         if other_definition.is_disabled() {
             continue;
@@ -110,21 +105,18 @@ fn direct_selector_candidate_index(
         let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
         for tool in &other_cache.tools {
             for candidate in
-                get_tool_name_candidates_with(&tool.name, other_server_name, other_prefix, false)
+                index_candidate_scan(&tool.name, other_server_name, other_prefix, false)
             {
-                push(candidate);
+                candidates.insert(candidate);
             }
         }
         if other_definition.exposes_resources() {
             for resource in &other_cache.resources {
                 let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
-                for candidate in get_tool_name_candidates_with(
-                    &base_name,
-                    other_server_name,
-                    other_prefix,
-                    false,
-                ) {
-                    push(candidate);
+                for candidate in
+                    index_candidate_scan(&base_name, other_server_name, other_prefix, false)
+                {
+                    candidates.insert(candidate);
                 }
             }
         }
@@ -1123,7 +1115,7 @@ fn merge(target: &mut Value, source: &Value) {
 mod tests {
     use super::*;
     use crate::cache::{CachedResource, CachedTool, ServerCacheEntry};
-    use crate::metadata::ServerEntry;
+    use crate::metadata::{index_candidate_scans, reset_index_candidate_scans, ServerEntry};
 
     fn spec(name: &str, server: &str) -> DirectToolSpec {
         DirectToolSpec {
@@ -1396,6 +1388,95 @@ mod tests {
         );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, ["my-server_do_thing", "my_server_do_other"]);
+    }
+
+    /// TE25 FR-A R2/R3 (#357/#393): `resolve_direct_tools` builds the
+    /// cross-server selector index only for servers with include/exclude
+    /// selectors, and the index scans each cached tool once (2N for two
+    /// servers).
+    #[test]
+    fn direct_collision_index_is_lazy_without_filters_and_linear_with_filters() {
+        let build = |has_filters: bool, per_server: usize| {
+            let definition = |name: &str, filters: bool| {
+                let mut map = json!({
+                    "command": name,
+                    "directTools": true,
+                    "lifecycle": "lazy",
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+                if filters {
+                    map.insert("includeTools".to_string(), json!(["*"]));
+                }
+                ServerEntry(map)
+            };
+            let mut config = McpConfig::default();
+            let a = definition("a", has_filters);
+            let b = definition("b", false);
+            config.mcp_servers.insert("a".to_string(), a.clone());
+            config.mcp_servers.insert("b".to_string(), b.clone());
+            let mut cache = MetadataCache {
+                version: crate::cache::CACHE_VERSION,
+                servers: Default::default(),
+            };
+            for (name, definition) in [("a", &a), ("b", &b)] {
+                cache.servers.insert(
+                    name.to_string(),
+                    ServerCacheEntry {
+                        config_hash: crate::cache::compute_server_hash(definition).expect("hash"),
+                        tools: (0..per_server)
+                            .map(|index| CachedTool {
+                                name: format!("tool_{index}"),
+                                ..Default::default()
+                            })
+                            .collect(),
+                        cached_at: now_ms(),
+                        ..Default::default()
+                    },
+                );
+            }
+            (config, cache)
+        };
+
+        // No filters → no cross-server scan.
+        let (config, cache) = build(false, 4);
+        reset_index_candidate_scans();
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(specs.len(), 8);
+        assert_eq!(index_candidate_scans(), 0);
+
+        // Filters on server `a` → one scan per cached tool of both servers.
+        let (config, cache) = build(true, 4);
+        reset_index_candidate_scans();
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(specs.len(), 8);
+        assert_eq!(index_candidate_scans(), 8);
+
+        // Double the catalog → double the scans (linear).
+        let (config, cache) = build(true, 8);
+        reset_index_candidate_scans();
+        let specs = resolve_direct_tools(
+            &config,
+            Some(&cache),
+            ToolPrefix::Server,
+            None,
+            &HashSet::new(),
+        );
+        assert_eq!(specs.len(), 16);
+        assert_eq!(index_candidate_scans(), 16);
     }
 
     /// #434：退避中的 server 不出现在 direct 面（#A4）。

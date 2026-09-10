@@ -18,9 +18,10 @@
 //   RPI_MCP_FIXTURE_ONLY=names node rpi/scripts/gen-mcp-adapter-fixtures.mjs
 //
 // `RPI_MCP_FIXTURE_ONLY` is a comma-separated subset of
-// `tsshape,names,search,config-merge,config-hash,glob` (default: all) so a
-// task can re-record only the fixtures its upstream face owns; the other
-// tasks keep their own re-record scope (TE24 owns the remaining faces).
+// `tsshape,names,search,config-merge,config-hash,glob,cache` (default: all)
+// so a task can re-record only the fixtures its upstream face owns; the
+// other tasks keep their own re-record scope (TE24 owns the remaining
+// faces; TE25 owns `cache`).
 //
 // Prerequisite (kept out of the repo on purpose; the submodule must stay
 // pristine):
@@ -958,10 +959,78 @@ async function genGlob() {
   });
 }
 
+// ---------------------------------------------------------- cache compact
+
+// #395 / R7.2.12.2 (TE25): upstream `saveMetadataCache` writes
+// `JSON.stringify(merged)` (metadata-cache.ts:78 @ 10a45367) — compact JSON
+// with no indentation. This fixture pins those exact bytes for the schema
+// shape rpi serializes; `tests/golden_cache_compact.rs` asserts both
+// "upstream bytes → plugin read" and "plugin write → upstream bytes".
+async function genCacheCompact() {
+  const source = readFileSync(join(UPSTREAM, "metadata-cache.ts"), "utf-8");
+  if (!source.includes("writeFileSync(tmpPath, JSON.stringify(merged), ")) {
+    throw new Error(
+      "[gen-fixtures] upstream saveMetadataCache is no longer a compact JSON.stringify write " +
+        "(see #395); update the cache golden before re-recording",
+    );
+  }
+
+  // Key order mirrors `MetadataCache` / `ServerCacheEntry` / `CachedTool`,
+  // i.e. the insertion order upstream's object spread preserves.
+  const merged = {
+    version: 1,
+    servers: {
+      alpha: {
+        configHash: "h-alpha",
+        tools: [
+          {
+            name: "search_records",
+            description: "Find records",
+            inputSchema: {
+              type: "object",
+              properties: { q: { type: "string" } },
+              required: ["q"],
+            },
+          },
+          { name: "list.sims" },
+        ],
+        resources: [
+          { uri: "mcp://alpha/doc", name: "Doc", description: "Readable doc" },
+        ],
+        prompts: [
+          {
+            name: "summarize",
+            title: "Summarize",
+            description: "Summarize a doc",
+            arguments: [{ name: "uri", required: true }],
+          },
+        ],
+        instructions: "Alpha instructions",
+        ttlMs: 1500,
+        cacheScope: "server",
+        cachedAt: 1700000000000,
+      },
+      beta: {
+        configHash: "h-beta",
+        tools: [],
+        resources: [],
+        cachedAt: 1,
+      },
+    },
+  };
+
+  writeFixture("cache_compact_cases.json", {
+    provenance: `external/pi-mcp-adapter/metadata-cache.ts:78 @ ${PIN} saveMetadataCache write path (JSON.stringify merged), executed by gen-mcp-adapter-fixtures.mjs`,
+    merged,
+    compact: JSON.stringify(merged),
+  });
+}
+
 if (shouldRun("tsshape")) await genTsShape();
 if (shouldRun("names")) await genNames();
 if (shouldRun("search")) await genSearch();
 if (shouldRun("config-merge")) await genConfigMerge();
 if (shouldRun("config-hash")) await genConfigHash();
 if (shouldRun("glob")) await genGlob();
+if (shouldRun("cache")) await genCacheCompact();
 console.log("[gen-fixtures] done");

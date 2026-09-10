@@ -150,6 +150,126 @@ async fn gate_ready_transitions_and_fires_on_ready() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `init_failed` convergence (TE25 FR-C R1/R2): an init future that
+/// resolves with an error converges the state to `Failed` (no permanent
+/// `Initializing`), and the failed gate can be re-armed and reach Ready.
+#[tokio::test]
+async fn init_error_converges_to_failed_and_allows_retry() {
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    dispatcher.start_init_with(fails_with("fixture-converge-boom"));
+    assert_eq!(dispatcher.init_state_kind(), "initializing");
+
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert_eq!(result["details"]["error"], json!("init_failed"));
+    assert_eq!(dispatcher.init_state_kind(), "failed");
+    assert_eq!(
+        dispatcher.init_failed_message().as_deref(),
+        Some("fixture-converge-boom")
+    );
+
+    // Retry from Failed (start_init_with allows any non-Ready/non-
+    // Initializing state).
+    let dir = temp_dir("converge-retry");
+    let runtime = initialize_mcp(&dir, None, Some(dir.join("cache.json"))).await;
+    dispatcher.start_init_with(std::future::ready(Ok(runtime)).boxed().shared());
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert_eq!(result["details"]["mode"], json!("status"));
+    assert_eq!(dispatcher.init_state_kind(), "ready");
+
+    dispatcher.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `init_failed` / cancel convergence (TE25 FR-C R1/R2): an explicitly
+/// cancelled init converges to `Failed("initialization cancelled")`, so the
+/// 30s proxy gate and the unbounded direct gate report `init_failed`
+/// immediately instead of waiting on a future nobody drives, and a retry
+/// from the cancelled state reaches Ready.
+#[tokio::test]
+async fn cancel_init_converges_to_failed_and_allows_retry() {
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    dispatcher.set_init_wait_timeout(std::time::Duration::from_millis(50));
+    dispatcher.start_init_with(never_resolves());
+    assert_eq!(dispatcher.init_state_kind(), "initializing");
+
+    dispatcher.cancel_init();
+    assert_eq!(dispatcher.init_state_kind(), "failed");
+    assert_eq!(
+        dispatcher.init_failed_message().as_deref(),
+        Some("initialization cancelled")
+    );
+
+    let started = std::time::Instant::now();
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "cancelled init must not park the 30s gate"
+    );
+    assert_eq!(result["details"]["error"], json!("init_failed"));
+    assert_eq!(
+        result["content"][0]["text"],
+        json!("MCP initialization failed: initialization cancelled")
+    );
+
+    // The direct-tool gate has no timeout bound: after cancellation it must
+    // report the failure instead of waiting forever.
+    let direct = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        dispatcher.current_direct(),
+    )
+    .await
+    .expect("current_direct must not hang after cancel");
+    let direct = match direct {
+        Ok(_) => panic!("cancelled init must not be ready"),
+        Err(result) => result,
+    };
+    assert_eq!(direct["details"]["error"], json!("init_failed"));
+    assert_eq!(
+        direct["details"]["message"],
+        json!("initialization cancelled")
+    );
+
+    // Retry from the cancelled state.
+    let dir = temp_dir("cancel-retry");
+    let runtime = initialize_mcp(&dir, None, Some(dir.join("cache.json"))).await;
+    dispatcher.start_init_with(std::future::ready(Ok(runtime)).boxed().shared());
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert_eq!(result["details"]["mode"], json!("status"));
+    assert_eq!(dispatcher.init_state_kind(), "ready");
+
+    dispatcher.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Driver-drop convergence (TE25 FR-C R1 drop guard): aborting the
+/// background init driver leaves the state `Initializing` no longer — the
+/// `InitDriverGuard` fallback converges to `Failed`.
+#[tokio::test]
+async fn driver_drop_converges_to_failed() {
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    let handle = dispatcher
+        .start_init_with_driver(never_resolves())
+        .expect("driver spawns on the test runtime");
+    assert_eq!(dispatcher.init_state_kind(), "initializing");
+
+    handle.abort();
+    let deadline = std::time::Duration::from_secs(5);
+    let converged = tokio::time::timeout(deadline, async {
+        while dispatcher.init_state_kind() != "failed" {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(converged.is_ok(), "driver drop must converge to Failed");
+    assert_eq!(
+        dispatcher.init_failed_message().as_deref(),
+        Some("initialization cancelled")
+    );
+
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert_eq!(result["details"]["error"], json!("init_failed"));
+}
+
 /// B-1 regression: `start_init` on a tokio runtime spawns a background
 /// driver that polls the init future to completion — the gate reaches Ready
 /// with NO caller awaiting it (upstream `setImmediate` prewarm semantics).

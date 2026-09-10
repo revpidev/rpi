@@ -1,0 +1,62 @@
+{
+  "provenance": "external/pi-mcp-adapter/metadata-cache.ts:78 @ 10a45367 saveMetadataCache write path (JSON.stringify merged), executed by gen-mcp-adapter-fixtures.mjs",
+  "merged": {
+    "version": 1,
+    "servers": {
+      "alpha": {
+        "configHash": "h-alpha",
+        "tools": [
+          {
+            "name": "search_records",
+            "description": "Find records",
+            "inputSchema": {
+              "type": "object",
+              "properties": {
+                "q": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "q"
+              ]
+            }
+          },
+          {
+            "name": "list.sims"
+          }
+        ],
+        "resources": [
+          {
+            "uri": "mcp://alpha/doc",
+            "name": "Doc",
+            "description": "Readable doc"
+          }
+        ],
+        "prompts": [
+          {
+            "name": "summarize",
+            "title": "Summarize",
+            "description": "Summarize a doc",
+            "arguments": [
+              {
+                "name": "uri",
+                "required": true
+              }
+            ]
+          }
+        ],
+        "instructions": "Alpha instructions",
+        "ttlMs": 1500,
+        "cacheScope": "server",
+        "cachedAt": 1700000000000
+      },
+      "beta": {
+        "configHash": "h-beta",
+        "tools": [],
+        "resources": [],
+        "cachedAt": 1
+      }
+    }
+  },
+  "compact": "{\"version\":1,\"servers\":{\"alpha\":{\"configHash\":\"h-alpha\",\"tools\":[{\"name\":\"search_records\",\"description\":\"Find records\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}},{\"name\":\"list.sims\"}],\"resources\":[{\"uri\":\"mcp://alpha/doc\",\"name\":\"Doc\",\"description\":\"Readable doc\"}],\"prompts\":[{\"name\":\"summarize\",\"title\":\"Summarize\",\"description\":\"Summarize a doc\",\"arguments\":[{\"name\":\"uri\",\"required\":true}]}],\"instructions\":\"Alpha instructions\",\"ttlMs\":1500,\"cacheScope\":\"server\",\"cachedAt\":1700000000000},\"beta\":{\"configHash\":\"h-beta\",\"tools\":[],\"resources\":[],\"cachedAt\":1}}}"
+}

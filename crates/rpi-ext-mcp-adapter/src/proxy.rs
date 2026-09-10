@@ -3038,16 +3038,43 @@ fn merge_objects(target: &mut Value, source: &Value) {
 
 /// Initialization state machine behind the 30s gate (index.ts:72-75,
 /// 758-783).
+///
+/// TE25 FR-C (R7.2.12.3) convergence invariant: a future that finishes
+/// (Ok/Err) or is cancelled always lands on `Ready` or `Failed`; the state
+/// never stays `Initializing` once its future can no longer make progress.
 #[derive(Clone)]
 enum InitState {
     NotStarted,
-    Initializing(Shared<BoxFuture<'static, Result<Arc<McpRuntime>, Arc<String>>>>),
+    Initializing(InitFuture),
     Ready(Arc<McpRuntime>),
-    /// Initialization returned an error (currently unreachable:
-    /// `initialize_mcp` degrades per-server instead of failing; kept so the
-    /// `init_failed` gate arm stays wired for future hard-failure paths).
-    #[allow(dead_code)]
+    /// Initialization hard-failed or was cancelled (TE25 FR-C). Reachable
+    /// from the driver's error arm, the gate waiters' error arm, the
+    /// driver-drop guard and the [`ProxyDispatcher::cancel_init`] seam.
     Failed(Arc<String>),
+}
+
+/// The shared init future (TE25 FR-C): `Initializing` holds exactly one of
+/// these, so an `Initializing` state always carries a live future handle.
+pub type InitFuture = Shared<BoxFuture<'static, Result<Arc<McpRuntime>, Arc<String>>>>;
+
+/// Drop guard around the background init driver (TE25 FR-C: a dropped or
+/// cancelled driver future must not leave the state `Initializing`
+/// forever). If the driver task is aborted before its shared future
+/// resolves, `fail_init` converges the state. The guard runs in the driver
+/// task's locals, outside every dispatcher lock, so locking in `Drop`
+/// cannot deadlock with the `*state = ...` assignments in
+/// `finish_init`/`current` (which drop the stored future while holding the
+/// lock).
+struct InitDriverGuard {
+    dispatcher: std::sync::Weak<ProxyDispatcher>,
+}
+
+impl Drop for InitDriverGuard {
+    fn drop(&mut self) {
+        if let Some(dispatcher) = self.dispatcher.upgrade() {
+            dispatcher.fail_init("initialization cancelled");
+        }
+    }
 }
 
 /// Surface-sync hooks fired by the dispatcher (the directTools surface
@@ -3098,10 +3125,7 @@ impl ProxyDispatcher {
     /// `init_timeout` / `init_failed` gate arms can be exercised by direct
     /// injection (a never-resolving or failing future) instead of real
     /// 30-second initialization paths.
-    pub fn start_init_with(
-        self: &Arc<Self>,
-        future: Shared<BoxFuture<'static, Result<Arc<McpRuntime>, Arc<String>>>>,
-    ) {
+    pub fn start_init_with(self: &Arc<Self>, future: InitFuture) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
             InitState::Ready(_) | InitState::Initializing(_) => return,
@@ -3110,12 +3134,66 @@ impl ProxyDispatcher {
         *state = InitState::Initializing(future);
     }
 
+    /// Test seam (TE25 FR-C drop-convergence): install a caller-built init
+    /// future AND spawn the same background driver `start_init` uses,
+    /// returning the driver handle so a test can abort it and assert the
+    /// `InitDriverGuard` fallback. In production the driver handle is
+    /// detached exactly like `start_init`.
+    #[doc(hidden)]
+    pub fn start_init_with_driver(
+        self: &Arc<Self>,
+        future: InitFuture,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &*state {
+            InitState::Ready(_) | InitState::Initializing(_) => return None,
+            _ => {}
+        }
+        let handle = self.spawn_init_driver(&future);
+        *state = InitState::Initializing(future);
+        handle
+    }
+
     /// Peek at the ready runtime without waiting (surface sync at install /
     /// metadata-update time).
     pub fn try_runtime(&self) -> Option<Arc<McpRuntime>> {
         match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
             InitState::Ready(runtime) => Some(runtime.clone()),
             _ => None,
+        }
+    }
+
+    /// Init-state discriminant (TE25 FR-C R3 observability seam):
+    /// `"not_started"` / `"initializing"` / `"ready"` / `"failed"`.
+    /// [`Self::init_failed_message`] exposes the failure text.
+    #[doc(hidden)]
+    pub fn init_state_kind(&self) -> &'static str {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            InitState::NotStarted => "not_started",
+            InitState::Initializing(_) => "initializing",
+            InitState::Ready(_) => "ready",
+            InitState::Failed(_) => "failed",
+        }
+    }
+
+    /// The stored failure text while the state is `Failed`.
+    #[doc(hidden)]
+    pub fn init_failed_message(&self) -> Option<String> {
+        match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
+            InitState::Failed(message) => Some(message.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Cancel an in-flight init attempt (test seam for TE25 FR-C R1/R2):
+    /// `Initializing` converges to `Failed("initialization cancelled")`, so
+    /// `current`/`current_direct` stop waiting and a later
+    /// `start_init`/`start_init_with` can retry. No-op in any other state.
+    #[doc(hidden)]
+    pub fn cancel_init(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&*state, InitState::Initializing(_)) {
+            *state = InitState::Failed(Arc::new("initialization cancelled".to_string()));
         }
     }
 
@@ -3166,20 +3244,38 @@ impl ProxyDispatcher {
             InitState::Ready(_) | InitState::Initializing(_) => return,
             _ => {}
         }
-        let future = async move { initialize_mcp(&cwd, config_path.as_deref(), None).await }
-            .map(Ok)
-            .boxed()
-            .shared();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let dispatcher = Arc::clone(self);
-            let driver = future.clone();
-            handle.spawn(async move {
-                if let Ok(runtime) = driver.await {
-                    dispatcher.finish_init(runtime);
-                }
-            });
-        }
+        let future: InitFuture =
+            async move { initialize_mcp(&cwd, config_path.as_deref(), None).await }
+                .map(Ok::<Arc<McpRuntime>, Arc<String>>)
+                .boxed()
+                .shared();
+        // The lock stays held across the spawn so an instantly-resolving
+        // future parks in `finish_init` until `Initializing` is published.
+        let _driver = self.spawn_init_driver(&future);
         *state = InitState::Initializing(future);
+    }
+
+    /// Spawn the background driver for an init future: polls it to
+    /// completion and converges the state on Ok/Err (TE25 FR-C). The caller
+    /// holds the state lock. Returns the task handle (detached in
+    /// production; abortable by the drop-convergence test seam).
+    fn spawn_init_driver(
+        self: &Arc<Self>,
+        future: &InitFuture,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let dispatcher = Arc::clone(self);
+        let driver = future.clone();
+        let guard = InitDriverGuard {
+            dispatcher: Arc::downgrade(&dispatcher),
+        };
+        Some(handle.spawn(async move {
+            let _guard = guard;
+            match driver.await {
+                Ok(runtime) => dispatcher.finish_init(runtime),
+                Err(message) => dispatcher.fail_init(&message),
+            }
+        }))
     }
 
     /// Driver-task completion: publish the ready runtime and fire `on_ready`
@@ -3191,6 +3287,16 @@ impl ProxyDispatcher {
             *state = InitState::Ready(runtime);
             drop(state);
             self.fire_on_ready();
+        }
+    }
+
+    /// Error/cancel convergence (TE25 FR-C R1): transition `Initializing` to
+    /// `Failed` so the state never outlives its future. No-op when another
+    /// path already converged (Ready/Failed) or a shutdown reset the gate.
+    fn fail_init(&self, message: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(&*state, InitState::Initializing(_)) {
+            *state = InitState::Failed(Arc::new(message.to_string()));
         }
     }
 
@@ -3264,7 +3370,10 @@ impl ProxyDispatcher {
                 }
                 Ok(runtime)
             }
-            Ok(Err(message)) => Err(GateError::Failed(message.to_string())),
+            Ok(Err(message)) => {
+                self.fail_init(&message);
+                Err(GateError::Failed(message.to_string()))
+            }
             Err(_) => Err(GateError::Timeout),
         }
     }
@@ -3305,10 +3414,13 @@ impl ProxyDispatcher {
                 }
                 Ok(runtime)
             }
-            Err(message) => Err(json!({
-                "content": [{ "type": "text", "text": format!("MCP initialization failed: {message}") }],
-                "details": { "error": "init_failed", "message": message.to_string() },
-            })),
+            Err(message) => {
+                self.fail_init(&message);
+                Err(json!({
+                    "content": [{ "type": "text", "text": format!("MCP initialization failed: {message}") }],
+                    "details": { "error": "init_failed", "message": message.to_string() },
+                }))
+            }
         }
     }
 

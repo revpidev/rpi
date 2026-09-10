@@ -94,48 +94,169 @@ fn starts_with(haystack: &str, needle: &str) -> bool {
     haystack.starts_with(needle)
 }
 
-/// `scoreToolMatch` (search-ranking.ts:67-157). `None` means "no match".
-pub fn score_tool_match(
-    tool: &ToolMetadata,
-    server: &str,
-    query: &str,
-    keywords: Option<&[String]>,
-) -> Option<i64> {
-    let normalized_query = normalize_search_text(query).trim().to_string();
-    let query_tokens = tokenize(query);
-    if query_tokens.is_empty() {
-        return None;
-    }
+// Test-only preparation counter (TE25 FR-A R3/A2: "no repeated
+// normalization" is asserted by call counts). Thread-local so parallel
+// unit tests stay isolated; compiled out of production builds.
+#[cfg(test)]
+thread_local! {
+    static PREPARED_TOOL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-    let fields: [(i64, String); 4] = [
-        (WEIGHT_NAME, normalize_search_text(&tool.name)),
+#[cfg(test)]
+fn note_prepared_tool() {
+    PREPARED_TOOL_CALLS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn prepared_tool_calls() -> usize {
+    PREPARED_TOOL_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_prepared_tool_calls() {
+    PREPARED_TOOL_CALLS.with(|count| count.set(0));
+}
+
+/// Normalized name/description/... fields plus keyword tokens, prepared once
+/// per tool and reused across every query in a catalog
+/// (search-ranking.ts:26-36 @ 10a45367 `PreparedToolSearch`).
+struct PreparedToolSearch<'a> {
+    tool: &'a ToolMetadata,
+    /// `[(weight, normalized_value, tokens)]` for name / originalName /
+    /// server / description, in upstream field order.
+    fields: [(i64, String, Vec<String>); 4],
+    keyword_phrases: Vec<String>,
+    keyword_tokens: Vec<String>,
+}
+
+/// Per-server prepared slice (search-ranking.ts:43-51 @ 10a45367
+/// `CachedServerSearch`).
+struct PreparedServerSearch<'a> {
+    server_name: &'a str,
+    tools: Vec<PreparedToolSearch<'a>>,
+}
+
+/// A prepared tool catalog (the rpi equivalent of upstream's per-state
+/// `WeakMap` cache): built from one `SearchState` snapshot and reused across
+/// every ranking call that runs against it — most notably the repeated
+/// rankings inside [`rank_suggestions`]. A snapshot is cloned per call, so
+/// the reuse boundary is the snapshot, exactly like upstream's cache keys
+/// on the live state object.
+pub(crate) struct PreparedSearchCatalog<'a> {
+    servers: Vec<PreparedServerSearch<'a>>,
+}
+
+impl<'a> PreparedSearchCatalog<'a> {
+    /// Prepare every tool of the snapshot once (`getPreparedTools`,
+    /// search-ranking.ts:199-229 @ 10a45367). Keywords are resolved only
+    /// when the server declares `searchKeywords` and the caller wants the
+    /// keyword boost.
+    fn prepare(state: &SearchState<'a>, include_keywords: bool) -> Self {
+        let global_prefix = state.config.global_tool_prefix();
+        let servers = state
+            .tool_metadata
+            .iter()
+            .map(|(server_name, metadata)| {
+                let definition = state.config.mcp_servers.get(server_name);
+                let keywords_enabled =
+                    include_keywords && definition.and_then(ServerEntry::search_keywords).is_some();
+                let tools = metadata
+                    .iter()
+                    .map(|tool| {
+                        let keywords = if keywords_enabled {
+                            resolve_search_keywords(
+                                definition,
+                                &tool.original_name,
+                                server_name,
+                                global_prefix,
+                            )
+                        } else {
+                            Vec::new()
+                        };
+                        let keywords_ref = if keywords_enabled {
+                            Some(keywords.as_slice())
+                        } else {
+                            None
+                        };
+                        prepare_tool_search(tool, server_name, keywords_ref)
+                    })
+                    .collect();
+                PreparedServerSearch {
+                    server_name: server_name.as_str(),
+                    tools,
+                }
+            })
+            .collect();
+        Self { servers }
+    }
+}
+
+/// `prepareToolSearch` (search-ranking.ts:87-105 @ 10a45367).
+fn prepare_tool_search<'a>(
+    tool: &'a ToolMetadata,
+    server: &str,
+    keywords: Option<&[String]>,
+) -> PreparedToolSearch<'a> {
+    #[cfg(test)]
+    note_prepared_tool();
+    let name = normalize_search_text(&tool.name);
+    let original_name = normalize_search_text(&tool.original_name);
+    let server = normalize_search_text(server);
+    let description = normalize_search_text(&tool.description);
+    let keyword_phrases: Vec<String> = keywords
+        .unwrap_or(&[])
+        .iter()
+        .map(|keyword| normalize_search_text(keyword).trim().to_string())
+        .filter(|phrase| !phrase.is_empty())
+        .collect();
+    let keyword_tokens: Vec<String> = keyword_phrases.iter().flat_map(|p| tokenize(p)).collect();
+    let fields = [
+        (WEIGHT_NAME, name.clone(), tokenize(&name)),
         (
             WEIGHT_ORIGINAL_NAME,
-            normalize_search_text(&tool.original_name),
+            original_name.clone(),
+            tokenize(&original_name),
         ),
-        (WEIGHT_SERVER, normalize_search_text(server)),
-        (WEIGHT_DESCRIPTION, normalize_search_text(&tool.description)),
+        (WEIGHT_SERVER, server.clone(), tokenize(&server)),
+        (
+            WEIGHT_DESCRIPTION,
+            description.clone(),
+            tokenize(&description),
+        ),
     ];
+    PreparedToolSearch {
+        tool,
+        fields,
+        keyword_phrases,
+        keyword_tokens,
+    }
+}
+
+/// `scorePreparedToolMatch` (search-ranking.ts:107-197 @ 10a45367).
+fn score_prepared_tool_match(
+    prepared: &PreparedToolSearch<'_>,
+    normalized_query: &str,
+    query_tokens: &[String],
+) -> Option<i64> {
     let mut score: i64 = 0;
     let mut phrase_matched = false;
     let mut whole_field_exact = false;
     let mut matched_tokens: Vec<&String> = Vec::new();
 
-    for (weight, value) in &fields {
-        let field_tokens = tokenize(value);
-        if *value == normalized_query {
+    for (weight, value, field_tokens) in &prepared.fields {
+        if value == normalized_query {
             score += weight * 14;
             phrase_matched = true;
             whole_field_exact = true;
-        } else if starts_with(value, &normalized_query) {
+        } else if starts_with(value, normalized_query) {
             score += weight * 9;
             phrase_matched = true;
-        } else if value.contains(&normalized_query) {
+        } else if value.contains(normalized_query) {
             score += weight * 6;
             phrase_matched = true;
         }
 
-        for token in &query_tokens {
+        for token in query_tokens {
             if field_tokens.contains(token) {
                 score += weight * 4;
                 if !matched_tokens.contains(&token) {
@@ -159,44 +280,38 @@ pub fn score_tool_match(
 
     // Configured keywords are discrete phrases: the phrase-level bonus takes
     // the best single phrase (search-ranking.ts:111-114).
-    if let Some(keywords) = keywords.filter(|k| !k.is_empty()) {
+    if !prepared.keyword_phrases.is_empty() {
         let weight = WEIGHT_KEYWORDS;
-        let phrases: Vec<String> = keywords
-            .iter()
-            .map(|k| normalize_search_text(k).trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect();
         let mut phrase_score = 0;
-        for phrase in &phrases {
-            if *phrase == normalized_query {
+        for phrase in &prepared.keyword_phrases {
+            if phrase == normalized_query {
                 phrase_score = phrase_score.max(weight * 14);
                 phrase_matched = true;
                 whole_field_exact = true;
-            } else if starts_with(phrase, &normalized_query) {
+            } else if starts_with(phrase, normalized_query) {
                 phrase_score = phrase_score.max(weight * 9);
                 phrase_matched = true;
-            } else if phrase.contains(&normalized_query) {
+            } else if phrase.contains(normalized_query) {
                 phrase_score = phrase_score.max(weight * 6);
                 phrase_matched = true;
             }
         }
         score += phrase_score;
 
-        let keyword_tokens: Vec<String> = phrases.iter().flat_map(|p| tokenize(p)).collect();
-        for token in &query_tokens {
-            if keyword_tokens.contains(token) {
+        for token in query_tokens {
+            if prepared.keyword_tokens.contains(token) {
                 score += weight * 4;
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
                 }
-            } else if keyword_tokens.iter().any(|kt| {
+            } else if prepared.keyword_tokens.iter().any(|kt| {
                 starts_with(kt, token) || (kt.len() >= MIN_STEM_LENGTH && starts_with(token, kt))
             }) {
                 score += weight * 2;
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
                 }
-            } else if phrases.iter().any(|p| p.contains(token)) {
+            } else if prepared.keyword_phrases.iter().any(|p| p.contains(token)) {
                 score += weight;
                 if !matched_tokens.contains(&token) {
                     matched_tokens.push(token);
@@ -222,7 +337,10 @@ pub fn score_tool_match(
         (coverage * 10.0 + 0.5).floor() as i64
     };
     if let Some(first) = query_tokens.first() {
-        if tokenize(&tool.name).contains(first) {
+        // Upstream `prepared.nameTokens` is `preparedFields[0].tokens`
+        // (search-ranking.ts:102/188); `normalizeSearchText` is idempotent,
+        // so the prepared name tokens equal `tokenize(tool.name)`.
+        if prepared.fields[0].2.contains(first) {
             score += 8;
         }
     }
@@ -230,6 +348,26 @@ pub fn score_tool_match(
         score += 20;
     }
     Some(score)
+}
+
+/// `scoreToolMatch` (search-ranking.ts:67-157): single-tool wrapper over
+/// [`prepare_tool_search`] + [`score_prepared_tool_match`].
+pub fn score_tool_match(
+    tool: &ToolMetadata,
+    server: &str,
+    query: &str,
+    keywords: Option<&[String]>,
+) -> Option<i64> {
+    let normalized_query = normalize_search_text(query).trim().to_string();
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return None;
+    }
+    score_prepared_tool_match(
+        &prepare_tool_search(tool, server, keywords),
+        &normalized_query,
+        &query_tokens,
+    )
 }
 
 /// `resolveSearchKeywords` (search-ranking.ts:31-54): keys match by original
@@ -270,46 +408,61 @@ pub fn resolve_search_keywords(
     keywords
 }
 
-/// `rankToolMatches` (search-ranking.ts:159-181).
+/// `rankToolMatches` (search-ranking.ts:231-260 @ 10a45367): prepare the
+/// snapshot's tool fields once, then score every prepared tool.
 pub fn rank_tool_matches(
     state: &SearchState,
     query: &str,
     server: Option<&str>,
     include_keywords: bool,
 ) -> Vec<RankedToolMatch> {
+    let catalog = PreparedSearchCatalog::prepare(state, include_keywords);
+    rank_prepared_matches(&catalog, state, query, server)
+}
+
+/// Ranking over an already prepared catalog: reused by [`rank_suggestions`]
+/// so the tool fields are normalized/tokenized once for every suggestion
+/// query (#392).
+fn rank_prepared_matches(
+    catalog: &PreparedSearchCatalog<'_>,
+    state: &SearchState<'_>,
+    query: &str,
+    server: Option<&str>,
+) -> Vec<RankedToolMatch> {
     let mut matches = Vec::new();
-    let global_prefix = state.config.global_tool_prefix();
-    for (server_name, metadata) in state.tool_metadata {
+    let normalized_query = normalize_search_text(query).trim().to_string();
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() {
+        return matches;
+    }
+    for prepared_server in &catalog.servers {
         if let Some(server) = server {
-            if server_name != server {
+            if prepared_server.server_name != server {
                 continue;
             }
         }
         // search-ranking.ts:246: skip servers in active failure backoff.
-        if state.unavailable_servers.contains(server_name) {
+        if state
+            .unavailable_servers
+            .contains(prepared_server.server_name)
+        {
             continue;
         }
-        let definition = state.config.mcp_servers.get(server_name);
-        if definition.is_some_and(ServerEntry::is_disabled) {
+        if state
+            .config
+            .mcp_servers
+            .get(prepared_server.server_name)
+            .is_some_and(ServerEntry::is_disabled)
+        {
             continue;
         }
-        let has_keywords =
-            include_keywords && definition.and_then(ServerEntry::search_keywords).is_some();
-        for tool in metadata {
-            let keywords = if has_keywords {
-                resolve_search_keywords(definition, &tool.original_name, server_name, global_prefix)
-            } else {
-                Vec::new()
-            };
-            let keywords_ref = if has_keywords {
-                Some(keywords.as_slice())
-            } else {
-                None
-            };
-            if let Some(score) = score_tool_match(tool, server_name, query, keywords_ref) {
+        for prepared in &prepared_server.tools {
+            if let Some(score) =
+                score_prepared_tool_match(prepared, &normalized_query, &query_tokens)
+            {
                 matches.push(RankedToolMatch {
-                    server: server_name.clone(),
-                    tool: tool.clone(),
+                    server: prepared_server.server_name.to_string(),
+                    tool: prepared.tool.clone(),
                     score,
                 });
             }
@@ -359,9 +512,11 @@ pub fn paginate<T: Clone>(items: &[T], offset: i64, limit: i64) -> Page<T> {
     }
 }
 
-/// `rankSuggestions` (search-ranking.ts:197-206): strip the longest matching
-/// server prefix (any of server/short/mcp forms) from the requested name,
-/// then rank the remainder without keyword boosts.
+/// `rankSuggestions` (search-ranking.ts:279-288 @ 10a45367): strip the
+/// longest matching server prefix (any of server/short/mcp forms) from the
+/// requested name, then rank the remainder without keyword boosts. The
+/// prepared catalog is built once and reused by every candidate ranking
+/// (#392).
 pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<String> {
     let mut stripped: Vec<String> = Vec::new();
     for server in state.config.mcp_servers.keys() {
@@ -378,7 +533,8 @@ pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<St
         Some(candidate) => &name[candidate.len() + 1..],
         None => name,
     };
-    rank_tool_matches(state, query, None, false)
+    let catalog = PreparedSearchCatalog::prepare(state, false);
+    rank_prepared_matches(&catalog, state, query, None)
         .into_iter()
         .take(limit)
         .map(|m| m.tool.name)
@@ -388,6 +544,8 @@ pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::json;
 
     // Intent ports of `__tests__/search-ranking.test.ts` @ 3d953f90
     // (coding-standards §12.2).
@@ -543,5 +701,109 @@ mod tests {
         );
         assert_eq!(tokenize("list_sims"), vec!["list", "sims"]);
         assert_eq!(tokenize("a:b/c"), vec!["a", "b", "c"]);
+    }
+
+    /// TE25 FR-A R2 (#392 5d9e382): normalized fields and keyword tokens
+    /// are prepared once per tool per ranking call (counted — not timed:
+    /// see `prepared_tool_calls`).
+    #[test]
+    fn prepared_catalog_prepares_each_tool_once_per_ranking_call() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "demo".to_string(),
+            ServerEntry(
+                json!({
+                    "command": "demo",
+                    "searchKeywords": { "search_*": ["fuzzy lookup"] },
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            ),
+        );
+        let metadata = vec![(
+            "demo".to_string(),
+            vec![
+                tool("search_records", "Find records"),
+                tool("create_record", "Create a record"),
+                tool("list_sims", "List sims"),
+            ],
+        )];
+        let unavailable = HashSet::new();
+        let state = SearchState {
+            config: &config,
+            tool_metadata: &metadata,
+            unavailable_servers: &unavailable,
+        };
+
+        reset_prepared_tool_calls();
+        let matches = rank_tool_matches(&state, "record", None, true);
+        assert!(!matches.is_empty());
+        assert_eq!(prepared_tool_calls(), 3);
+
+        // Suggestions build one prepared catalog for the single stripped
+        // query (no per-suggestion re-preparation).
+        reset_prepared_tool_calls();
+        let suggestions = rank_suggestions(&state, "demo_search_records", 5);
+        assert!(suggestions.contains(&"search_records".to_string()));
+        assert_eq!(prepared_tool_calls(), 3);
+    }
+
+    /// TE25 FR-A R2 (#392 upstream test "refreshes prepared fields when
+    /// catalog or keyword references change"): prepared data never outlives
+    /// its snapshot, so keyword/catalog edits are visible on the next call.
+    #[test]
+    fn prepared_fields_refresh_when_keywords_or_catalog_change() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "demo".to_string(),
+            ServerEntry(
+                json!({
+                    "command": "demo",
+                    "searchKeywords": { "search_records": ["fuzzy"] },
+                })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+            ),
+        );
+        let metadata = vec![(
+            "demo".to_string(),
+            vec![tool("search_records", "Find records")],
+        )];
+        let unavailable = HashSet::new();
+        let state = SearchState {
+            config: &config,
+            tool_metadata: &metadata,
+            unavailable_servers: &unavailable,
+        };
+        assert!(rank_tool_matches(&state, "fuzzy", None, true).len() == 1);
+
+        config.mcp_servers.get_mut("demo").map(|definition| {
+            definition.as_map_mut().insert(
+                "searchKeywords".to_string(),
+                json!({ "search_records": ["semantic"] }),
+            )
+        });
+        let state = SearchState {
+            config: &config,
+            tool_metadata: &metadata,
+            unavailable_servers: &unavailable,
+        };
+        assert_eq!(rank_tool_matches(&state, "fuzzy", None, true).len(), 0);
+        assert_eq!(rank_tool_matches(&state, "semantic", None, true).len(), 1);
+
+        // Catalog swap refreshes the prepared fields too.
+        let swapped = vec![(
+            "demo".to_string(),
+            vec![tool("create_record", "Create a record")],
+        )];
+        let state = SearchState {
+            config: &config,
+            tool_metadata: &swapped,
+            unavailable_servers: &unavailable,
+        };
+        assert_eq!(rank_tool_matches(&state, "search", None, true).len(), 0);
+        assert_eq!(rank_tool_matches(&state, "create", None, true).len(), 1);
     }
 }

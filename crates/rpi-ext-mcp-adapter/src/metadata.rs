@@ -15,7 +15,7 @@
 //! - MCP UI `_meta` extraction (`uiResourceUri` / `uiVisibility` /
 //!   `uiStreamMode`) is P2 [non-goal in TE02]; `build_tool_metadata` skips it.
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
@@ -820,7 +820,7 @@ pub fn build_tool_metadata(
     known_metadata: Option<&IndexMap<String, Vec<ToolMetadata>>>,
 ) -> BuildToolMetadataResult {
     let mut result = BuildToolMetadataResult::default();
-    let mut seen_names: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
     let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
     let selector_candidate_index = if has_tool_filters(definition) {
         configured_servers.map(|configured_servers| {
@@ -851,10 +851,9 @@ pub fn build_tool_metadata(
             continue;
         }
         let name = format_tool_name(&tool.name, server_name, effective_prefix);
-        if seen_names.contains(&name) {
+        if !seen_names.insert(name.clone()) {
             continue;
         }
-        seen_names.push(name.clone());
         result.metadata.push(ToolMetadata {
             name,
             original_name: tool.name.clone(),
@@ -878,10 +877,9 @@ pub fn build_tool_metadata(
                 continue;
             }
             let name = format_tool_name(&base_name, server_name, effective_prefix);
-            if seen_names.contains(&name) {
+            if !seen_names.insert(name.clone()) {
                 continue;
             }
-            seen_names.push(name.clone());
             result.metadata.push(ToolMetadata {
                 name,
                 original_name: base_name,
@@ -896,6 +894,49 @@ pub fn build_tool_metadata(
     }
 
     result
+}
+
+// Test-only scan counter for the index builders (TE25 FR-A R3/A2:
+// cross-server collision scanning is asserted by call counts, never wall
+// clock). Thread-local so parallel unit tests stay isolated; compiled out
+// of production builds.
+#[cfg(test)]
+thread_local! {
+    static INDEX_CANDIDATE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_index_candidate_scan() {
+    INDEX_CANDIDATE_SCANS.with(|count| count.set(count.get() + 1));
+}
+
+/// Number of cross-server candidate generations since the last reset
+/// (TE25 FR-A R3). `#[cfg(test)]`-only: the production path has no counter.
+#[cfg(test)]
+pub(crate) fn index_candidate_scans() -> usize {
+    INDEX_CANDIDATE_SCANS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_index_candidate_scans() {
+    INDEX_CANDIDATE_SCANS.with(|count| count.set(0));
+}
+
+/// Candidate generation used by the three index builders
+/// (`build_selector_candidate_index`, `create_cached_tool_selector_candidate_index`,
+/// `direct_selector_candidate_index`): identical to
+/// [`get_tool_name_candidates_with`], plus the test-only scan counter that
+/// backs the TE25 linearity assertions. In production this is a plain
+/// forwarder.
+pub(crate) fn index_candidate_scan(
+    tool_name: &str,
+    server_name: &str,
+    prefix: ToolPrefix,
+    include_legacy: bool,
+) -> Vec<String> {
+    #[cfg(test)]
+    note_index_candidate_scan();
+    get_tool_name_candidates_with(tool_name, server_name, prefix, include_legacy)
 }
 
 /// `createToolSelectorCandidateIndex` construction inside
@@ -915,22 +956,15 @@ fn build_selector_candidate_index(
     configured_servers: &IndexMap<String, ServerEntry>,
     known_metadata: Option<&IndexMap<String, Vec<ToolMetadata>>>,
 ) -> ToolSelectorCandidateIndex {
-    let mut candidates: Vec<String> = Vec::new();
-    let mut push = |value: String| {
-        if !candidates.contains(&value) {
-            candidates.push(value);
-        }
-    };
+    let mut candidates: IndexSet<String> = IndexSet::new();
     let mut evaluated_tool_names: Vec<String> = Vec::new();
     for tool in tools {
         if tool.name.is_empty() {
             continue;
         }
         evaluated_tool_names.push(tool.name.clone());
-        for candidate in
-            get_tool_name_candidates_with(&tool.name, server_name, effective_prefix, false)
-        {
-            push(candidate);
+        for candidate in index_candidate_scan(&tool.name, server_name, effective_prefix, false) {
+            candidates.insert(candidate);
         }
     }
     if definition.exposes_resources() {
@@ -940,10 +974,9 @@ fn build_selector_candidate_index(
             if resource.name.is_empty() || resource.uri.is_empty() {
                 continue;
             }
-            for candidate in
-                get_tool_name_candidates_with(&base_name, server_name, effective_prefix, false)
+            for candidate in index_candidate_scan(&base_name, server_name, effective_prefix, false)
             {
-                push(candidate);
+                candidates.insert(candidate);
             }
         }
     }
@@ -951,7 +984,7 @@ fn build_selector_candidate_index(
     // (tool-metadata.ts:60-72 @ 10a45367): when no metadata map is provided,
     // every configured server without known tools contributes its current
     // candidates for each evaluated tool name.
-    let mut additional: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut additional: IndexMap<String, IndexSet<String>> = IndexMap::new();
     for (other_server_name, other_definition) in configured_servers {
         if other_server_name == server_name {
             continue;
@@ -960,14 +993,14 @@ fn build_selector_candidate_index(
         let known_tools = known_metadata.and_then(|map| map.get(other_server_name));
         if let Some(known_tools) = known_tools {
             for tool in known_tools {
-                push(tool.name.clone());
-                for candidate in get_tool_name_candidates_with(
+                candidates.insert(tool.name.clone());
+                for candidate in index_candidate_scan(
                     &tool.original_name,
                     other_server_name,
                     other_prefix,
                     false,
                 ) {
-                    push(candidate);
+                    candidates.insert(candidate);
                 }
             }
             continue;
@@ -979,16 +1012,19 @@ fn build_selector_candidate_index(
         }
         for tool_name in &evaluated_tool_names {
             let entry = additional.entry(tool_name.clone()).or_default();
-            for candidate in
-                get_tool_name_candidates_with(tool_name, other_server_name, other_prefix, false)
+            for candidate in index_candidate_scan(tool_name, other_server_name, other_prefix, false)
             {
-                if !entry.contains(&candidate) {
-                    entry.push(candidate);
-                }
+                entry.insert(candidate);
             }
         }
     }
-    ToolSelectorCandidateIndex::from_candidates_with_additional(candidates, additional)
+    ToolSelectorCandidateIndex::from_candidates_with_additional(
+        candidates,
+        additional
+            .into_iter()
+            .map(|(tool_name, values)| (tool_name, values.into_iter().collect()))
+            .collect(),
+    )
 }
 
 /// `findToolByName` (tool-metadata.ts:154-160 @ 10a45367): exact match
@@ -1782,5 +1818,88 @@ mod tests {
             ]
             .join("\n")
         );
+    }
+
+    /// TE25 FR-A R3/A2 (#357 faf55f7): the cross-server candidate scan is
+    /// skipped entirely without include/exclude selectors, and with
+    /// selectors the scan count is linear in the tool count (counted — not
+    /// timed: see `index_candidate_scans`).
+    #[test]
+    fn collision_scan_is_lazy_without_filters_and_linear_with_filters() {
+        let make_tools = |count: usize| -> Vec<McpTool> {
+            (0..count)
+                .map(|index| McpTool {
+                    name: format!("tool_{index}"),
+                    ..Default::default()
+                })
+                .collect()
+        };
+        let known_for = |count: usize, server: &str| -> IndexMap<String, Vec<ToolMetadata>> {
+            let mut known = IndexMap::new();
+            known.insert(
+                server.to_string(),
+                (0..count)
+                    .map(|index| ToolMetadata {
+                        name: format!("{server}_tool_{index}"),
+                        original_name: format!("tool_{index}"),
+                        ..Default::default()
+                    })
+                    .collect(),
+            );
+            known
+        };
+        let configured = || {
+            let mut configured: IndexMap<String, ServerEntry> = IndexMap::new();
+            configured.insert("demo".to_string(), entry(Map::new()));
+            configured.insert("other".to_string(), entry(Map::new()));
+            configured
+        };
+        let filtered = entry(Map::from_iter([("includeTools".to_string(), json!(["*"]))]));
+
+        // No filters → no index build, no candidate generation (#357).
+        reset_index_candidate_scans();
+        let result = build_tool_metadata(
+            &make_tools(4),
+            &[],
+            &entry(Map::new()),
+            "demo",
+            ToolPrefix::Server,
+            Some(&configured()),
+            Some(&known_for(4, "other")),
+        );
+        assert_eq!(result.metadata.len(), 4);
+        assert_eq!(
+            index_candidate_scans(),
+            0,
+            "unfiltered build must not scan cross-server candidates"
+        );
+
+        // Filters → one generation per evaluated tool of this server plus
+        // one per known tool of the other server (2N), i.e. linear.
+        reset_index_candidate_scans();
+        let result = build_tool_metadata(
+            &make_tools(4),
+            &[],
+            &filtered,
+            "demo",
+            ToolPrefix::Server,
+            Some(&configured()),
+            Some(&known_for(4, "other")),
+        );
+        assert_eq!(result.metadata.len(), 4);
+        assert_eq!(index_candidate_scans(), 8);
+
+        reset_index_candidate_scans();
+        let result = build_tool_metadata(
+            &make_tools(8),
+            &[],
+            &filtered,
+            "demo",
+            ToolPrefix::Server,
+            Some(&configured()),
+            Some(&known_for(8, "other")),
+        );
+        assert_eq!(result.metadata.len(), 8);
+        assert_eq!(index_candidate_scans(), 16, "scan count doubles with N");
     }
 }

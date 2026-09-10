@@ -22,16 +22,17 @@
 //! by `serialize_tools`; the struct fields exist so upstream-written cache
 //! files round-trip byte-identically.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Digest;
 
 use crate::error::AdapterError;
 use crate::metadata::{
-    format_prompt_command_name, format_tool_name, get_tool_name_candidates_with, has_tool_filters,
+    format_prompt_command_name, format_tool_name, has_tool_filters, index_candidate_scan,
     is_tool_allowed, resolve_tool_prefix, resource_name_to_tool_name, McpResource, McpTool,
     ServerEntry, ToolMetadata, ToolPrefix, ToolSelectorCandidateIndex,
 };
@@ -187,9 +188,11 @@ pub fn save_metadata_cache(path: &Path, cache: &MetadataCache) -> Result<(), Ada
         servers: merged_servers,
     };
 
-    // `JSON.stringify(merged, null, 2)`: serde_json's pretty printer is also
-    // 2-space, no trailing newline, raw UTF-8 — byte-compatible.
-    let serialized = serde_json::to_string_pretty(&merged)
+    // `JSON.stringify(merged)` (metadata-cache.ts:78 @ v2.32.1 `10a45367`,
+    // #395): compact JSON, no indentation, no trailing newline, raw UTF-8 —
+    // serde_json's compact printer is byte-compatible for this schema
+    // (`tests/golden_cache_compact.rs` pins the upstream bytes).
+    let serialized = serde_json::to_string(&merged)
         .map_err(|err| AdapterError::CacheSerialize(err.to_string()))?;
     let tmp_path = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
     let result =
@@ -423,7 +426,7 @@ pub fn reconstruct_tool_metadata(
     shared_selector_candidate_index: Option<&ToolSelectorCandidateIndex>,
 ) -> Vec<ToolMetadata> {
     let mut metadata = Vec::new();
-    let mut seen_names: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
     let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
     let selector_candidate_index = if has_tool_filters(definition) {
         shared_selector_candidate_index.cloned().or_else(|| {
@@ -450,10 +453,9 @@ pub fn reconstruct_tool_metadata(
             continue;
         }
         let name = format_tool_name(&tool.name, server_name, effective_prefix);
-        if seen_names.contains(&name) {
+        if !seen_names.insert(name.clone()) {
             continue;
         }
-        seen_names.push(name.clone());
         metadata.push(ToolMetadata {
             name,
             original_name: tool.name.clone(),
@@ -480,10 +482,9 @@ pub fn reconstruct_tool_metadata(
                 continue;
             }
             let name = format_tool_name(&base_name, server_name, effective_prefix);
-            if seen_names.contains(&name) {
+            if !seen_names.insert(name.clone()) {
                 continue;
             }
-            seen_names.push(name.clone());
             metadata.push(ToolMetadata {
                 name,
                 original_name: base_name,
@@ -517,12 +518,7 @@ pub fn create_cached_tool_selector_candidate_index(
     cache: &MetadataCache,
     prefix: ToolPrefix,
 ) -> ToolSelectorCandidateIndex {
-    let mut candidates: Vec<String> = Vec::new();
-    let mut push = |value: String| {
-        if !candidates.contains(&value) {
-            candidates.push(value);
-        }
-    };
+    let mut candidates: IndexSet<String> = IndexSet::new();
     for (server_name, definition) in configured_servers {
         if definition.is_disabled() {
             continue;
@@ -535,19 +531,18 @@ pub fn create_cached_tool_selector_candidate_index(
         }
         let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
         for tool in &entry.tools {
-            for candidate in
-                get_tool_name_candidates_with(&tool.name, server_name, effective_prefix, false)
+            for candidate in index_candidate_scan(&tool.name, server_name, effective_prefix, false)
             {
-                push(candidate);
+                candidates.insert(candidate);
             }
         }
         if definition.exposes_resources() {
             for resource in &entry.resources {
                 let base_name = format!("read_{}", resource_name_to_tool_name(&resource.name));
                 for candidate in
-                    get_tool_name_candidates_with(&base_name, server_name, effective_prefix, false)
+                    index_candidate_scan(&base_name, server_name, effective_prefix, false)
                 {
-                    push(candidate);
+                    candidates.insert(candidate);
                 }
             }
         }
@@ -642,6 +637,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::metadata::{index_candidate_scans, reset_index_candidate_scans};
 
     fn entry(value: Value) -> ServerEntry {
         ServerEntry(value.as_object().cloned().unwrap_or_default())
@@ -1007,5 +1003,186 @@ mod tests {
             None,
         );
         assert_eq!(metadata.len(), 1);
+    }
+
+    /// TE25 FR-B R1/R2 (#395 b5f77b2): the cache is written as compact JSON
+    /// (upstream `JSON.stringify(merged)`), while atomic replace and the
+    /// cross-process merge stay intact. `tests/golden_cache_compact.rs`
+    /// pins the exact upstream bytes.
+    #[test]
+    fn save_writes_compact_json_and_keeps_merged_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("rpi-mcp-compact-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let path = dir.join("mcp-cache.json");
+
+        let entry = ServerCacheEntry {
+            config_hash: "hash".to_string(),
+            cached_at: 1,
+            ..Default::default()
+        };
+        save_metadata_cache(
+            &path,
+            &MetadataCache {
+                version: CACHE_VERSION,
+                servers: IndexMap::from_iter([("first".to_string(), entry.clone())]),
+            },
+        )
+        .expect("save first");
+        save_metadata_cache(
+            &path,
+            &MetadataCache {
+                version: CACHE_VERSION,
+                servers: IndexMap::from_iter([(
+                    "second".to_string(),
+                    ServerCacheEntry {
+                        cached_at: 2,
+                        ..entry.clone()
+                    },
+                )]),
+            },
+        )
+        .expect("save second");
+
+        let raw = std::fs::read_to_string(&path).expect("raw");
+        assert!(!raw.contains('\n'), "compact write must not indent: {raw}");
+        assert!(
+            !raw.contains("\": "),
+            "compact write must not pad keys: {raw}"
+        );
+        assert_eq!(
+            raw,
+            serde_json::to_string(&load_metadata_cache(&path).expect("round trip"))
+                .expect("reserialize")
+        );
+        let loaded = load_metadata_cache(&path).expect("load");
+        assert_eq!(loaded.servers.len(), 2);
+        assert_eq!(loaded.servers["first"].cached_at, 1);
+        assert_eq!(loaded.servers["second"].cached_at, 2);
+        assert!(std::fs::read_dir(&dir)
+            .map(|mut it| it.all(|entry| entry
+                .map(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .unwrap_or(true)))
+            .unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE25 FR-B R3: pretty caches written before the compact switch still
+    /// parse (whitespace-independent read path); `CACHE_VERSION` unchanged.
+    #[test]
+    fn load_reads_legacy_pretty_cache() {
+        let dir =
+            std::env::temp_dir().join(format!("rpi-mcp-pretty-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let path = dir.join("mcp-cache.json");
+        let pretty = serde_json::to_string_pretty(&MetadataCache {
+            version: CACHE_VERSION,
+            servers: IndexMap::from_iter([(
+                "demo".to_string(),
+                ServerCacheEntry {
+                    config_hash: "h".to_string(),
+                    tools: vec![CachedTool {
+                        name: "echo".to_string(),
+                        ..Default::default()
+                    }],
+                    ttl_ms: Some(1500),
+                    cached_at: 7,
+                    ..Default::default()
+                },
+            )]),
+        })
+        .expect("pretty");
+        assert!(
+            pretty.contains('\n'),
+            "fixture must be the old pretty shape"
+        );
+        std::fs::write(&path, pretty).unwrap_or_default();
+
+        let loaded = load_metadata_cache(&path).expect("legacy pretty cache parses");
+        let entry = loaded.servers.get("demo").expect("demo entry");
+        assert_eq!(entry.cached_at, 7);
+        assert_eq!(entry.ttl_ms, Some(1500));
+        assert_eq!(entry.tools[0].name, "echo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TE25 FR-A R2 (#393 9e454da): `create_cached_tool_selector_candidate_index`
+    /// scans every cached tool once (2N for two servers), and
+    /// `reconstruct_tool_metadata` reuses the shared index instead of
+    /// rebuilding it per filtered server (without sharing the same
+    /// reconstruction would scan 2N per server).
+    #[test]
+    fn shared_cached_selector_index_scans_each_cached_tool_once() {
+        let definition_a = entry(json!({ "command": "a", "includeTools": ["*"] }));
+        let definition_b = entry(json!({ "command": "b", "includeTools": ["*"] }));
+        let cache_entry = |definition: &ServerEntry| ServerCacheEntry {
+            config_hash: compute_server_hash(definition).expect("hash"),
+            tools: (0..3)
+                .map(|index| CachedTool {
+                    name: format!("tool_{index}"),
+                    ..Default::default()
+                })
+                .collect(),
+            cached_at: now_ms(),
+            ..Default::default()
+        };
+        let mut configured: IndexMap<String, ServerEntry> = IndexMap::new();
+        configured.insert("a".to_string(), definition_a.clone());
+        configured.insert("b".to_string(), definition_b.clone());
+        let mut cache = MetadataCache {
+            version: CACHE_VERSION,
+            servers: IndexMap::new(),
+        };
+        cache
+            .servers
+            .insert("a".to_string(), cache_entry(&definition_a));
+        cache
+            .servers
+            .insert("b".to_string(), cache_entry(&definition_b));
+
+        reset_index_candidate_scans();
+        let index =
+            create_cached_tool_selector_candidate_index(&configured, &cache, ToolPrefix::Server);
+        assert_eq!(
+            index_candidate_scans(),
+            6,
+            "2 servers x 3 tools, scanned once"
+        );
+
+        for (server, definition) in [("a", &definition_a), ("b", &definition_b)] {
+            let entry = cache.servers.get(server).expect("cached entry");
+            let metadata = reconstruct_tool_metadata(
+                server,
+                entry,
+                ToolPrefix::Server,
+                definition,
+                Some(&configured),
+                Some(&cache),
+                Some(&index),
+            );
+            assert_eq!(metadata.len(), 3);
+        }
+        assert_eq!(
+            index_candidate_scans(),
+            6,
+            "a shared index must not be rebuilt per filtered server"
+        );
+
+        // Positive control: without the shared index each filtered server
+        // rebuilds its own (2N each → 12 total here).
+        reset_index_candidate_scans();
+        for (server, definition) in [("a", &definition_a), ("b", &definition_b)] {
+            let entry = cache.servers.get(server).expect("cached entry");
+            let _ = reconstruct_tool_metadata(
+                server,
+                entry,
+                ToolPrefix::Server,
+                definition,
+                Some(&configured),
+                Some(&cache),
+                None,
+            );
+        }
+        assert_eq!(index_candidate_scans(), 12);
     }
 }
