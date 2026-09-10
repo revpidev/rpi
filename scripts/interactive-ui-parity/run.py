@@ -2,7 +2,8 @@
 """V14-22 dual-carrier interactive-UI parity runner (R-U7.4 / G11 item 2).
 
 Builds both fixture guests, runs the Rust driver over the JSONL corpus plus a
-seeded fuzz batch, diffs the native/wasm transcripts and writes
+seeded fuzz batch, aggregates the driver's per-scenario ``*.diff.json``
+verdicts and writes
 ``fixtures/generated/interactive-ui-parity/parity-report.md``. Non-zero exit
 on any difference, load failure or missing fixture.
 

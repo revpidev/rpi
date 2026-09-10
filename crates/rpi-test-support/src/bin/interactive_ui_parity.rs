@@ -2,9 +2,11 @@
 //!
 //! Drives the native fixture (`crates/rpi-test-native-plugin`) and the wasm
 //! fixture (`examples/wasm-extension`) with the same JSONL corpus through the
-//! real host-call channel and a deterministic [`ScriptedUiBridge`], then
-//! writes `{frames, terminal, toolResult}` per carrier. `run.py` diffs the
-//! two outputs byte-for-byte and renders the report.
+//! real host-call channel and a deterministic [`ScriptedUiBridge`]. Each
+//! scenario is judged here and written as `{scenario, carrier, mountOptions,
+//! frames, terminal, scriptExhausted, toolResult}` per carrier plus a
+//! `*.diff.json` verdict; `run.py` builds the fixtures, invokes this driver,
+//! aggregates the verdict files and writes the report.
 //!
 //! Usage:
 //! ```text
