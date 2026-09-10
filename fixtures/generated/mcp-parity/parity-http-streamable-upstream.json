@@ -25,12 +25,12 @@
       "id": "$id"
     },
     {
-      "method": "prompts/list",
+      "method": "tools/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },
     {
-      "method": "tools/list",
+      "method": "prompts/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },

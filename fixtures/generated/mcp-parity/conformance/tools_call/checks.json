@@ -81,37 +81,6 @@
   {
     "id": "incoming-request",
     "name": "Incoming-request",
-    "description": "Received GET request for /mcp",
-    "status": "INFO",
-    "timestamp": "$ts",
-    "details": {
-      "method": "GET",
-      "path": "/mcp"
-    }
-  },
-  {
-    "id": "outgoing-response",
-    "name": "Outgoing-response",
-    "description": "Sent 404 response for GET /mcp",
-    "status": "INFO",
-    "timestamp": "$ts",
-    "details": {
-      "method": "GET",
-      "path": "/mcp",
-      "statusCode": 404,
-      "headers": {
-        "x-powered-by": "Express",
-        "content-security-policy": "default-src 'none'",
-        "x-content-type-options": "nosniff",
-        "content-type": "text/html; charset=utf-8",
-        "content-length": 142
-      },
-      "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot GET /mcp</pre>\n</body>\n</html>\n"
-    }
-  },
-  {
-    "id": "incoming-request",
-    "name": "Incoming-request",
     "description": "Received POST request for /mcp (method: tools/list)",
     "status": "INFO",
     "timestamp": "$ts",
@@ -146,6 +115,37 @@
         "content-length": 303
       },
       "body": "event: message\ndata: {\"result\":{\"tools\":[{\"name\":\"add_numbers\",\"description\":\"Add two numbers together\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"number\",\"description\":\"First number\"},\"b\":{\"type\":\"number\",\"description\":\"Second number\"}},\"required\":[\"a\",\"b\"]}}]},\"jsonrpc\":\"2.0\",\"id\":1}\n\n"
+    }
+  },
+  {
+    "id": "incoming-request",
+    "name": "Incoming-request",
+    "description": "Received GET request for /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp"
+    }
+  },
+  {
+    "id": "outgoing-response",
+    "name": "Outgoing-response",
+    "description": "Sent 404 response for GET /mcp",
+    "status": "INFO",
+    "timestamp": "$ts",
+    "details": {
+      "method": "GET",
+      "path": "/mcp",
+      "statusCode": 404,
+      "headers": {
+        "x-powered-by": "Express",
+        "content-security-policy": "default-src 'none'",
+        "x-content-type-options": "nosniff",
+        "content-type": "text/html; charset=utf-8",
+        "content-length": 142
+      },
+      "body": "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n</head>\n<body>\n<pre>Cannot GET /mcp</pre>\n</body>\n</html>\n"
     }
   },
   {

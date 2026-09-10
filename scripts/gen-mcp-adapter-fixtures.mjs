@@ -420,7 +420,17 @@ async function genSearch() {
     settings: {},
   };
   const toolMetadata = new Map(servers.map((s) => [s.name, s.tools]));
-  const state = { config, toolMetadata };
+  // TE24: v2.32.1-era rankToolMatches consults
+  // isServerInActiveFailureBackoff (failure-backoff.ts:18-23) which reads
+  // state.manager.getConnection — a stub manager with no connections keeps
+  // every server out of backoff (no failureTracker entries either).
+  const state = {
+    config,
+    toolMetadata,
+    manager: { getConnection: () => undefined },
+    // Empty failureTracker (init.ts Map) — no server is in backoff.
+    failureTracker: new Map(),
+  };
 
   const queries = [
     "search", "search missing", "simulator", "synchronize", "fuzzy lookup",
