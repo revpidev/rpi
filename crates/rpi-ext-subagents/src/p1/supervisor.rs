@@ -310,6 +310,28 @@ pub fn pending_asks(run_id: &str, child_index: usize) -> Vec<Value> {
     asks
 }
 
+/// Run-level variant (#1315 attention, `needsAttention` is run-scoped in
+/// upstream's wait): every blocking ask under the run regardless of child
+/// index — a multi-child run blocked on child ≥1 must still stop the wait.
+pub fn pending_asks_for_run(run_id: &str) -> Vec<Value> {
+    let root = channels_root();
+    let Ok(channel_entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut asks = Vec::new();
+    for channel in channel_entries.flatten() {
+        for request in read_requests(&channel.path()) {
+            let blocking = request["reason"].as_str() == Some("need_decision")
+                || request["reason"].as_str() == Some("interview_request");
+            if blocking && request["runId"].as_str() == Some(run_id) {
+                asks.push(request);
+            }
+        }
+    }
+    asks.sort_by(|a, b| a["createdAt"].as_str().cmp(&b["createdAt"].as_str()));
+    asks
+}
+
 /// Parent-side `subagent_supervisor` ({action: pending|reply}) —
 /// `NATIVE_SUPERVISOR_TOOL_NAME` handler (L559-587).
 pub fn parent_supervisor_action(

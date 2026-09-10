@@ -1902,10 +1902,13 @@ pub async fn wait_for_runs(
         // BOTH stopOnAttention modes, subagent-wait.ts:618-622): a waited
         // run blocked on an unanswered ask returns early — otherwise the
         // wait would burn its whole window on a child that cannot proceed.
+        // Run-scoped (upstream `needsAttention`): any child of the run, not
+        // just child 0 (review round 1, problem 2).
         for run_id in &initial_ids {
-            let asks = crate::p1::supervisor::pending_asks(run_id, 0);
+            let asks = crate::p1::supervisor::pending_asks_for_run(run_id);
             if let Some(ask) = asks.first() {
                 let request_id = ask["id"].as_str().unwrap_or("?").to_string();
+                let child_index = ask["childIndex"].as_u64().unwrap_or(0);
                 let runs = ASYNC_RUNS.lock().unwrap_or_else(|e| e.into_inner());
                 let snapshots: Vec<Value> = initial_ids
                     .iter()
@@ -1918,6 +1921,7 @@ pub async fn wait_for_runs(
                     "attention": {
                         "runId": run_id,
                         "requestId": request_id,
+                        "childIndex": child_index,
                     },
                     "runs": snapshots,
                 }));
@@ -3325,6 +3329,76 @@ pub(crate) mod tests {
         let request = deliver_steer(&run_id, "m", "steer", Some(0)).expect("index 0 steers");
         assert_eq!(request["targetIndex"], json!(0));
         assert!(steer_inbox_dir(&run_dir, 0).is_dir());
+        unregister_run(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    /// #1315 run-scoped attention: a multi-child run blocked on child 1
+    /// still stops the wait (review round 1, problem 2).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn wait_attention_covers_any_child_index() {
+        let _guard = REGISTRY_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let run_id = format!("wait-attn-{}", std::process::id());
+        let run_dir = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        let handle = Arc::new(AsyncRunHandle {
+            run_id: run_id.clone(),
+            status: Arc::new(RwLock::new(json!({
+                "runId": run_id,
+                "mode": "parallel",
+                "state": STATE_RUNNING,
+                "steps": [
+                    { "agent": "a", "status": "running" },
+                    { "agent": "b", "status": "running" },
+                ],
+            }))),
+            control: Arc::new(AsyncControl::default()),
+            run_dir: run_dir.clone(),
+            started_ms: 0,
+            status_write_degraded: std::sync::atomic::AtomicBool::new(false),
+            pending_status_write_failure: std::sync::Mutex::new(None),
+        });
+        ASYNC_RUNS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(run_id.clone(), handle.clone());
+        // Pending ask for child 1 only.
+        let channel = crate::p1::supervisor::channel_dir(&run_id, "b", 1);
+        crate::p1::supervisor::ensure_channel(&channel);
+        std::fs::write(
+            channel.join("requests").join("req-c1.json"),
+            json!({
+                "id": "req-c1", "createdAt": "2026-09-10T00:00:00.000Z",
+                "reason": "need_decision", "expectsReply": true,
+                "runId": run_id, "childIndex": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // Child-0-scoped lookup misses; the run-scoped one hits.
+        assert!(crate::p1::supervisor::pending_asks(&run_id, 0).is_empty());
+        assert_eq!(
+            crate::p1::supervisor::pending_asks_for_run(&run_id).len(),
+            1
+        );
+        let started = std::time::Instant::now();
+        let result = wait_for_runs(Some(&run_id), false, 60_000, None, None)
+            .await
+            .expect("run was active at wait start");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "attention returns immediately, not after the 60s window"
+        );
+        assert_eq!(
+            result["attention"]["requestId"],
+            json!("req-c1"),
+            "{result}"
+        );
+        assert_eq!(result["attention"]["childIndex"], json!(1), "{result}");
+        let _ = std::fs::remove_dir_all(&channel);
         unregister_run(&run_id);
         let _ = std::fs::remove_dir_all(&run_dir);
     }

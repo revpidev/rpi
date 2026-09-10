@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use regex::Regex;
 use serde_json::{json, Value};
 
 /// `DEFAULT_MODEL_EXCLUSION_TTL_MS` (24h).
@@ -27,6 +28,59 @@ const MAX_ENTRIES: usize = 200;
 
 /// Env override for the store path (tests).
 pub const EXCLUSIONS_PATH_ENV: &str = "RPI_MODEL_EXCLUSIONS_PATH";
+
+/// Upstream catalog bounds — `MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH`
+/// (240) and `MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES` (20),
+/// model-fallback.ts:293-294.
+pub const MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH: usize = 240;
+pub const MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES: usize = 20;
+
+/// `redactSecretValues` (permissions.ts:14-18 @ 0fc0eebb, applied to every
+/// exclusion diagnostic upstream via `sanitizeModelExclusionDiagnostic` /
+/// `throwForExplicitModelExclusion`): bearer tokens and well-known key
+/// shapes become `[redacted]`.
+static SECRET_VALUE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:Bearer\s+\S+|(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,})\b")
+        .unwrap_or_else(|_| Regex::new("").expect("static regex"))
+});
+
+/// See [`SECRET_VALUE`].
+fn redact_secret_values(value: &str) -> String {
+    SECRET_VALUE.replace_all(value, "[redacted]").to_string()
+}
+
+/// `sanitizeModelExclusionDiagnostic` (model-fallback.ts:296-301 @
+/// 0fc0eebb): control characters (incl. U+2028/U+2029) collapse to spaces,
+/// the trimmed value (or the fallback when empty) passes secret redaction,
+/// then caps at [`MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH`] (upstream slices
+/// UTF-16 units; `chars()` keeps the cap at most as long).
+pub fn sanitize_diagnostic(value: &str, fallback: &str) -> String {
+    let normalized: String = value
+        .chars()
+        .map(|c| {
+            if (c as u32) <= 0x1f || c == '\u{7f}' || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = normalized.trim();
+    let source = if trimmed.is_empty() {
+        fallback
+    } else {
+        trimmed
+    };
+    let redacted = redact_secret_values(source);
+    if redacted.chars().count() <= MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH {
+        redacted
+    } else {
+        redacted
+            .chars()
+            .take(MODEL_EXCLUSION_DIAGNOSTIC_MAX_LENGTH)
+            .collect()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelExclusion {
@@ -448,6 +502,37 @@ mod tests {
         reset_for_test();
         let _ = std::fs::remove_file(&path);
         std::env::remove_var(EXCLUSIONS_PATH_ENV);
+    }
+
+    /// `sanitizeModelExclusionDiagnostic` (model-fallback.ts:296-301): control
+    /// characters collapse, secrets redact, 240 cap, empty falls back.
+    #[test]
+    fn sanitize_diagnostic_redacts_and_caps() {
+        // Control characters (incl. U+2028/U+2029) collapse to spaces.
+        let cleaned = sanitize_diagnostic("boom\u{1}[2J done\u{2028}next", "fallback");
+        assert!(cleaned.contains("boom"), "{cleaned}");
+        assert!(!cleaned.contains('\u{1}'), "{cleaned}");
+        assert!(!cleaned.contains('\u{2028}'), "{cleaned}");
+        // Secret shapes redact (upstream SECRET_VALUE via redactSecretValues).
+        let redacted = sanitize_diagnostic(
+            "401 unauthorized: Bearer abc.def.ghi and sk-proj-0123456789abcdef",
+            "fallback",
+        );
+        assert!(redacted.contains("[redacted]"), "{redacted}");
+        assert!(!redacted.contains("abc.def.ghi"), "{redacted}");
+        assert!(!redacted.contains("sk-proj-0123456789abcdef"), "{redacted}");
+        // 240-char cap.
+        let long = "x".repeat(600);
+        assert_eq!(sanitize_diagnostic(&long, "f").chars().count(), 240);
+        // Empty/whitespace-only falls back to the provided fallback.
+        assert_eq!(
+            sanitize_diagnostic("", "runtime-failure"),
+            "runtime-failure"
+        );
+        assert_eq!(
+            sanitize_diagnostic(" \u{1}\u{7f} ", "runtime-failure"),
+            "runtime-failure"
+        );
     }
 
     #[test]

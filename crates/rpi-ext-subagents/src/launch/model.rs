@@ -863,13 +863,18 @@ pub fn build_model_candidates(
             )?;
             // An explicitly requested model under an active exclusion fails
             // closed with the exclusion reason instead of silently swapping
-            // (`throwForExplicitModelExclusion`).
+            // (`throwForExplicitModelExclusion`, model-fallback.ts:337-341 —
+            // the reason passes control-char normalization + secret
+            // redaction + the 240 cap).
             if let Some(exclusion) =
                 crate::launch::model_exclusions::find_model_exclusion(&normalized)
             {
+                let reason = crate::launch::model_exclusions::sanitize_diagnostic(
+                    &exclusion.reason,
+                    "runtime-failure",
+                );
                 return Err(format!(
-                    "Requested subagent model '{normalized}' is excluded and cannot be replaced by a fallback (reason: {}; expires: {}).",
-                    exclusion.reason,
+                    "Requested subagent model '{normalized}' is excluded and cannot be replaced by a fallback (reason: {reason}; expires: {}).",
                     exclusion.expires_at
                 ));
             }
@@ -933,17 +938,24 @@ pub fn build_model_candidates(
     // the zero-usable case fails closed with evidence (#1439).
     let mut excluded_evidence: Vec<String> = Vec::new();
     let mut excluded_count = 0usize;
-    let before_filter = candidates.len();
     {
         let mut on_excluded =
             |candidate: &str, exclusion: &crate::launch::model_exclusions::ModelExclusion| {
                 excluded_count += 1;
-                if excluded_evidence.len() < 4 {
-                    let provider = exclusion.provider.as_deref().unwrap_or("unspecified");
+                let cap = crate::launch::model_exclusions::MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES;
+                if excluded_evidence.len() < cap {
+                    // `formatExcludedCandidateEvidence` (model-fallback.ts:309-316):
+                    // every field passes the diagnostic sanitizer (control-char
+                    // collapse + secret redaction + 240 cap).
+                    let sanitize = crate::launch::model_exclusions::sanitize_diagnostic;
+                    let display_candidate = sanitize(candidate, "unknown");
+                    let display_model =
+                        sanitize(exclusion.model_id.as_deref().unwrap_or(""), "unspecified");
+                    let display_provider =
+                        sanitize(exclusion.provider.as_deref().unwrap_or(""), "unspecified");
+                    let reason = sanitize(&exclusion.reason, "runtime-failure");
                     excluded_evidence.push(format!(
-                        "{candidate} — model: {}; provider: {provider}; reason: {}; expires: {}",
-                        exclusion.model_id.as_deref().unwrap_or("unspecified"),
-                        exclusion.reason,
+                        "{display_candidate} — model: {display_model}; provider: {display_provider}; reason: {reason}; expires: {}",
                         exclusion.expires_at
                     ));
                 }
@@ -953,7 +965,6 @@ pub fn build_model_candidates(
             Some(&mut on_excluded),
         );
     }
-    let _ = before_filter;
     if candidates.is_empty() {
         // A chain that skipped its only resolvable entry fails closed through
         // the required check (upstream re-runs the first skip).
