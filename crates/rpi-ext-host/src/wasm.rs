@@ -641,7 +641,10 @@ pub async fn instantiate_and_init(
 /// `handlerError`. Non-trap failures (missing export, bad JSON, dropped
 /// response) stay unclassified and keep their plain message.
 fn classify_guest_failure(message: &str) -> Option<&'static str> {
-    if message.contains("fuel") {
+    // wasmtime's exact fuel trap text ("all fuel consumed by WebAssembly");
+    // matching the bare word "fuel" would let a guest function named `fuel`
+    // in the backtrace misclassify an ordinary trap.
+    if message.contains("all fuel consumed") {
         Some("fuelExhausted")
     } else if message.contains("wasm trap") {
         Some("handlerError")

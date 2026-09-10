@@ -315,6 +315,10 @@ impl CarrierOutput {
 /// Whether two full carrier records differ only by the documented wasm frame
 /// budget clamp (R-U7.2 / design §4.4: native keeps the guest's budget, wasm
 /// caps it at 512 KiB). Any other difference is a parity failure.
+///
+/// The wasm value must be the **exact** documented clamp
+/// (`min(native, 512 KiB)`): a regression that quietly lowers the wasm budget
+/// further is not an allowed constraint difference.
 fn documented_constraint_only(native: &Value, wasm: &Value) -> bool {
     if native == wasm {
         return true;
@@ -328,9 +332,9 @@ fn documented_constraint_only(native: &Value, wasm: &Value) -> bool {
     let (Some(native_bytes), Some(wasm_bytes)) = (native_bytes, wasm_bytes) else {
         return false;
     };
-    if wasm_bytes > native_bytes
-        || wasm_bytes > rpi_ext_host::interactive_ui::WASM_DEFAULT_MAX_FRAME_BYTES as u64
-    {
+    let expected =
+        native_bytes.min(rpi_ext_host::interactive_ui::WASM_DEFAULT_MAX_FRAME_BYTES as u64);
+    if wasm_bytes != expected {
         return false;
     }
     let mut native = native.clone();
@@ -597,5 +601,54 @@ fn main() -> std::process::ExitCode {
             eprintln!("interactive-ui-parity: {error}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A record with the compared fields (only `maxFrameBytes` varies in the
+    /// constraint tests).
+    fn record(max_frame_bytes: u64) -> Value {
+        json!({
+            "scenario": "unit",
+            "carrier": "native",
+            "mountOptions": { "maxFrameBytes": max_frame_bytes },
+            "frames": [],
+            "terminal": null,
+            "scriptExhausted": false,
+            "toolResult": {},
+        })
+    }
+
+    /// V14-22 §4.1: the documented wasm clamp is accepted only at its exact
+    /// value; identical records trivially pass.
+    #[test]
+    fn documented_constraint_only_accepts_exact_clamp() {
+        assert!(documented_constraint_only(
+            &record(1_048_576),
+            &record(524_288)
+        ));
+        assert!(documented_constraint_only(
+            &record(300_000),
+            &record(300_000)
+        ));
+    }
+
+    /// Negative controls (review blind-spot 1/3): a further-lowered wasm
+    /// budget or any other field difference is a parity failure.
+    #[test]
+    fn documented_constraint_only_rejects_other_differences() {
+        assert!(!documented_constraint_only(
+            &record(1_048_576),
+            &record(262_144)
+        ));
+        let mut wasm = record(524_288);
+        wasm["frames"] = json!([{"lines": ["x"]}]);
+        assert!(!documented_constraint_only(&record(1_048_576), &wasm));
+        let mut wasm = record(524_288);
+        wasm["terminal"] = json!({"done": true});
+        assert!(!documented_constraint_only(&record(1_048_576), &wasm));
     }
 }

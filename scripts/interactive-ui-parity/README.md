@@ -45,6 +45,9 @@ cargo run -p rpi-test-support --bin interactive-ui-parity -- \
 每个场景必须以能触发 `done` 的输入（`q`）或 `dispose` 结束；脚本提前耗尽会被
 harness 判为失败（`scriptExhausted`）。
 
+> 驱动在系统临时目录下拷贝 fixture 包（逐场景清理）；若 `/tmp` 空间不足，
+> 先设置 `TMPDIR=<大容量目录>` 再运行（例如 `TMPDIR=$HOME/.cache/rpi-ui-parity-tmp`）。
+
 ## fuzz（§4.5）
 
 `run.py` 默认追加 24 个 seed 固定（`20260910`）的随机事件序列（长度/交错/
