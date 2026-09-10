@@ -1500,13 +1500,13 @@ pub fn execute_search(
         page.total,
         if page.total == 1 { "" } else { "s" }
     );
+    let mut approval_markers = SearchApprovalMarkers::new(&config, &metadata_snapshot);
     for item in &page.items {
-        let approval_marker =
-            if tool_requires_approval(state, &item.server, &item.tool.original_name) {
-                " (requires approval)"
-            } else {
-                ""
-            };
+        let approval_marker = if approval_markers.marker(&item.server, &item.tool.original_name) {
+            " (requires approval)"
+        } else {
+            ""
+        };
         if show_schemas {
             text.push_str(&format!("{}{}\n", item.tool.name, approval_marker));
             let description = if item.tool.description.is_empty() {
@@ -1592,6 +1592,73 @@ fn tool_requires_approval(state: &McpRuntime, server_name: &str, original_tool_n
         original_tool_name,
         Some(&context),
     )
+}
+
+/// Page-scoped approval markers (TE21 N-7 → TE25 R7.2.12.1): the selector
+/// candidate universe is built at most once per server scope for the whole
+/// result page instead of once per result. Behavior is identical to
+/// [`tool_requires_approval`] — same gate, same per-tool context derived
+/// from the same snapshot.
+struct SearchApprovalMarkers<'a> {
+    config: &'a McpConfig,
+    metadata: &'a [(String, Vec<ToolMetadata>)],
+    global: Option<crate::approval::ApprovalCandidateUniverse>,
+    scoped: HashMap<String, crate::approval::ApprovalCandidateUniverse>,
+}
+
+impl<'a> SearchApprovalMarkers<'a> {
+    fn new(config: &'a McpConfig, metadata: &'a [(String, Vec<ToolMetadata>)]) -> Self {
+        Self {
+            config,
+            metadata,
+            global: None,
+            scoped: HashMap::new(),
+        }
+    }
+
+    fn marker(&mut self, server_name: &str, original_tool_name: &str) -> bool {
+        // No approval config at all: upstream short-circuits before any
+        // metadata work (proxy-modes.ts:696 `isToolCallApprovalRequired`),
+        // so an unconfigured page pays no candidate scan.
+        let definition = self.config.mcp_servers.get(server_name);
+        let scoped = definition.and_then(|d| d.get("approveTools")).is_some();
+        if !scoped
+            && self
+                .config
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get("approveTools"))
+                .is_none()
+        {
+            return false;
+        }
+        let universe = if scoped {
+            self.scoped
+                .entry(server_name.to_string())
+                .or_insert_with(|| {
+                    crate::approval::approval_candidate_universe_from_pairs(
+                        self.config,
+                        self.metadata,
+                        server_name,
+                    )
+                })
+        } else {
+            self.global.get_or_insert_with(|| {
+                crate::approval::approval_candidate_universe_from_pairs(
+                    self.config,
+                    self.metadata,
+                    server_name,
+                )
+            })
+        };
+        let context = universe.context_for(self.config, server_name, original_tool_name);
+        crate::approval::is_tool_call_approval_required(
+            self.config,
+            server_name,
+            original_tool_name,
+            Some(&context),
+        )
+    }
 }
 
 /// Result of a server-scoped tool lookup (`getServerScopedToolMatch` /
@@ -3045,7 +3112,10 @@ fn merge_objects(target: &mut Value, source: &Value) {
 #[derive(Clone)]
 enum InitState {
     NotStarted,
-    Initializing(InitFuture),
+    Initializing {
+        future: InitFuture,
+        generation: u64,
+    },
     Ready(Arc<McpRuntime>),
     /// Initialization hard-failed or was cancelled (TE25 FR-C). Reachable
     /// from the driver's error arm, the gate waiters' error arm, the
@@ -3060,19 +3130,22 @@ pub type InitFuture = Shared<BoxFuture<'static, Result<Arc<McpRuntime>, Arc<Stri
 /// Drop guard around the background init driver (TE25 FR-C: a dropped or
 /// cancelled driver future must not leave the state `Initializing`
 /// forever). If the driver task is aborted before its shared future
-/// resolves, `fail_init` converges the state. The guard runs in the driver
+/// resolves, `fail_init` converges the state — but only the attempt it was
+/// spawned for: the generation fence keeps a stale driver from clobbering a
+/// newer `Initializing` (round-2 review O1). The guard runs in the driver
 /// task's locals, outside every dispatcher lock, so locking in `Drop`
 /// cannot deadlock with the `*state = ...` assignments in
 /// `finish_init`/`current` (which drop the stored future while holding the
 /// lock).
 struct InitDriverGuard {
     dispatcher: std::sync::Weak<ProxyDispatcher>,
+    generation: u64,
 }
 
 impl Drop for InitDriverGuard {
     fn drop(&mut self) {
         if let Some(dispatcher) = self.dispatcher.upgrade() {
-            dispatcher.fail_init("initialization cancelled");
+            dispatcher.fail_init(self.generation, "initialization cancelled");
         }
     }
 }
@@ -3095,6 +3168,10 @@ pub struct ProxyDispatcher {
     /// Gate wait bound; `INIT_WAIT_TIMEOUT` in production, injectable so the
     /// `init_timeout` arm is testable without 30s wall-clock waits.
     init_wait_timeout: Mutex<std::time::Duration>,
+    /// Monotonic init-attempt id (TE25 FR-C, round-2 O1): every
+    /// `Initializing` carries the attempt it belongs to, so a stale driver
+    /// completion/drop can never converge a newer attempt's state.
+    init_generation: std::sync::atomic::AtomicU64,
 }
 
 impl Default for ProxyDispatcher {
@@ -3109,7 +3186,15 @@ impl ProxyDispatcher {
             state: Mutex::new(InitState::NotStarted),
             hooks: Mutex::new(DispatcherHooks::default()),
             init_wait_timeout: Mutex::new(INIT_WAIT_TIMEOUT),
+            init_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Next init-attempt id.
+    fn next_generation(&self) -> u64 {
+        self.init_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
     }
 
     /// Test seam (design §5.2): shrink the gate wait bound. The reported
@@ -3128,10 +3213,11 @@ impl ProxyDispatcher {
     pub fn start_init_with(self: &Arc<Self>, future: InitFuture) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
-            InitState::Ready(_) | InitState::Initializing(_) => return,
+            InitState::Ready(_) | InitState::Initializing { .. } => return,
             _ => {}
         }
-        *state = InitState::Initializing(future);
+        let generation = self.next_generation();
+        *state = InitState::Initializing { future, generation };
     }
 
     /// Test seam (TE25 FR-C drop-convergence): install a caller-built init
@@ -3146,11 +3232,12 @@ impl ProxyDispatcher {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
-            InitState::Ready(_) | InitState::Initializing(_) => return None,
+            InitState::Ready(_) | InitState::Initializing { .. } => return None,
             _ => {}
         }
-        let handle = self.spawn_init_driver(&future);
-        *state = InitState::Initializing(future);
+        let generation = self.next_generation();
+        let handle = self.spawn_init_driver(&future, generation);
+        *state = InitState::Initializing { future, generation };
         handle
     }
 
@@ -3170,7 +3257,7 @@ impl ProxyDispatcher {
     pub fn init_state_kind(&self) -> &'static str {
         match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
             InitState::NotStarted => "not_started",
-            InitState::Initializing(_) => "initializing",
+            InitState::Initializing { .. } => "initializing",
             InitState::Ready(_) => "ready",
             InitState::Failed(_) => "failed",
         }
@@ -3192,7 +3279,7 @@ impl ProxyDispatcher {
     #[doc(hidden)]
     pub fn cancel_init(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(&*state, InitState::Initializing(_)) {
+        if matches!(&*state, InitState::Initializing { .. }) {
             *state = InitState::Failed(Arc::new("initialization cancelled".to_string()));
         }
     }
@@ -3241,7 +3328,7 @@ impl ProxyDispatcher {
     pub fn start_init(self: &Arc<Self>, cwd: PathBuf, config_path: Option<String>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &*state {
-            InitState::Ready(_) | InitState::Initializing(_) => return,
+            InitState::Ready(_) | InitState::Initializing { .. } => return,
             _ => {}
         }
         let future: InitFuture =
@@ -3251,51 +3338,60 @@ impl ProxyDispatcher {
                 .shared();
         // The lock stays held across the spawn so an instantly-resolving
         // future parks in `finish_init` until `Initializing` is published.
-        let _driver = self.spawn_init_driver(&future);
-        *state = InitState::Initializing(future);
+        let generation = self.next_generation();
+        let _driver = self.spawn_init_driver(&future, generation);
+        *state = InitState::Initializing { future, generation };
     }
 
-    /// Spawn the background driver for an init future: polls it to
-    /// completion and converges the state on Ok/Err (TE25 FR-C). The caller
-    /// holds the state lock. Returns the task handle (detached in
-    /// production; abortable by the drop-convergence test seam).
+    /// Spawn the background driver for one init attempt: polls it to
+    /// completion and converges the state on Ok/Err (TE25 FR-C), fenced by
+    /// `generation`. The caller holds the state lock. Returns the task
+    /// handle (detached in production; abortable by the drop-convergence
+    /// test seam).
     fn spawn_init_driver(
         self: &Arc<Self>,
         future: &InitFuture,
+        generation: u64,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let handle = tokio::runtime::Handle::try_current().ok()?;
         let dispatcher = Arc::clone(self);
         let driver = future.clone();
         let guard = InitDriverGuard {
             dispatcher: Arc::downgrade(&dispatcher),
+            generation,
         };
         Some(handle.spawn(async move {
             let _guard = guard;
             match driver.await {
-                Ok(runtime) => dispatcher.finish_init(runtime),
-                Err(message) => dispatcher.fail_init(&message),
+                Ok(runtime) => dispatcher.finish_init(runtime, generation),
+                Err(message) => dispatcher.fail_init(generation, &message),
             }
         }))
     }
 
     /// Driver-task completion: publish the ready runtime and fire `on_ready`
     /// (guarded by the Initializing -> Ready transition so concurrent gate
-    /// awaiters do not double-fire).
-    fn finish_init(self: &Arc<Self>, runtime: Arc<McpRuntime>) {
+    /// awaiters do not double-fire). The generation fence ignores a stale
+    /// driver whose attempt was superseded (round-2 review O1).
+    fn finish_init(self: &Arc<Self>, runtime: Arc<McpRuntime>, generation: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(&*state, InitState::Initializing(_)) {
+        if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+        {
             *state = InitState::Ready(runtime);
             drop(state);
             self.fire_on_ready();
         }
     }
 
-    /// Error/cancel convergence (TE25 FR-C R1): transition `Initializing` to
-    /// `Failed` so the state never outlives its future. No-op when another
-    /// path already converged (Ready/Failed) or a shutdown reset the gate.
-    fn fail_init(&self, message: &str) {
+    /// Error/cancel convergence (TE25 FR-C R1): transition the matching
+    /// `Initializing` attempt to `Failed` so the state never outlives its
+    /// future. No-op when another path already converged (Ready/Failed), a
+    /// shutdown reset the gate, or a newer attempt owns the state
+    /// (generation fence).
+    fn fail_init(&self, generation: u64, message: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(&*state, InitState::Initializing(_)) {
+        if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+        {
             *state = InitState::Failed(Arc::new(message.to_string()));
         }
     }
@@ -3330,7 +3426,7 @@ impl ProxyDispatcher {
                 flush_metadata_cache(&runtime);
                 runtime.lifecycle.graceful_shutdown().await;
             }
-            InitState::Initializing(future) => {
+            InitState::Initializing { future, .. } => {
                 if let Ok(runtime) = future.await {
                     runtime.owner_cancel.cancel();
                     flush_metadata_cache(&runtime);
@@ -3344,13 +3440,13 @@ impl ProxyDispatcher {
     /// The init gate (`currentDirect`'s typed core): Ready, Initializing
     /// (awaits the shared init future, 30s gate) or the failure text.
     pub(crate) async fn current(&self) -> Result<Arc<McpRuntime>, GateError> {
-        let shared = {
+        let (shared, generation) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
                 InitState::Ready(runtime) => return Ok(runtime.clone()),
                 InitState::Failed(message) => return Err(GateError::Failed(message.to_string())),
                 InitState::NotStarted => return Err(GateError::NotInitialized),
-                InitState::Initializing(shared) => shared.clone(),
+                InitState::Initializing { future, generation } => (future.clone(), *generation),
             }
         };
         let bound = *self
@@ -3363,7 +3459,10 @@ impl ProxyDispatcher {
                 // Guarded like `current_direct`: the background driver may
                 // have published Ready already (and a shutdown may have reset
                 // the gate) while this awaiter was parked on its shared clone.
-                if matches!(&*state, InitState::Initializing(_)) {
+                // The generation fence ignores an awaiter from a superseded
+                // attempt (round-2 review O1).
+                if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+                {
                     *state = InitState::Ready(runtime.clone());
                     drop(state);
                     self.fire_on_ready();
@@ -3371,7 +3470,7 @@ impl ProxyDispatcher {
                 Ok(runtime)
             }
             Ok(Err(message)) => {
-                self.fail_init(&message);
+                self.fail_init(generation, &message);
                 Err(GateError::Failed(message.to_string()))
             }
             Err(_) => Err(GateError::Timeout),
@@ -3385,7 +3484,7 @@ impl ProxyDispatcher {
     /// by a background task, so this wait is bounded by the time init itself
     /// takes to complete.
     pub async fn current_direct(&self) -> Result<Arc<McpRuntime>, Value> {
-        let shared = {
+        let (shared, generation) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
                 InitState::Ready(runtime) => return Ok(runtime.clone()),
@@ -3401,13 +3500,14 @@ impl ProxyDispatcher {
                         "details": { "error": "not_initialized" },
                     }));
                 }
-                InitState::Initializing(shared) => shared.clone(),
+                InitState::Initializing { future, generation } => (future.clone(), *generation),
             }
         };
         match shared.await {
             Ok(runtime) => {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if matches!(&*state, InitState::Initializing(_)) {
+                if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+                {
                     *state = InitState::Ready(runtime.clone());
                     drop(state);
                     self.fire_on_ready();
@@ -3415,7 +3515,7 @@ impl ProxyDispatcher {
                 Ok(runtime)
             }
             Err(message) => {
-                self.fail_init(&message);
+                self.fail_init(generation, &message);
                 Err(json!({
                     "content": [{ "type": "text", "text": format!("MCP initialization failed: {message}") }],
                     "details": { "error": "init_failed", "message": message.to_string() },

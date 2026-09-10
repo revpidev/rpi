@@ -189,6 +189,16 @@ type ListenHandleEntry = (
     Arc<crate::protocol::ListenHandle>,
 );
 
+/// Test-only catalog-listen bookkeeping snapshot (TE25 H2). `handles` entries
+/// are `(server, owner_live, owner_is_current_connection, handle_is_closed)`.
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct ListenBookkeeping {
+    pub open: HashSet<String>,
+    pub handles: Vec<(String, bool, bool, bool)>,
+    pub connections: Vec<String>,
+}
+
 pub struct McpServerManager {
     connections: Mutex<HashMap<String, Arc<ServerConnection>>>,
     connect_promises: Mutex<HashMap<String, SharedConnect>>,
@@ -1068,12 +1078,52 @@ impl McpServerManager {
         }
     }
 
+    /// Test-only snapshot of the catalog-listen bookkeeping (TE25 H2,
+    /// inherited from TE24 §7.2): `listen_open` / `listen_handles` /
+    /// `connections` must stay consistent across close / crash / reopen
+    /// paths. `handles` entries are `(server, owner_live,
+    /// owner_is_current_connection, handle_is_closed)`.
+    #[doc(hidden)]
+    pub fn listen_bookkeeping(&self) -> ListenBookkeeping {
+        let connections = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+        let open = self
+            .listen_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let handles = self
+            .listen_handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, (owner, handle))| {
+                let owner = owner.upgrade();
+                let owner_live = owner.is_some();
+                let owner_is_current = owner.as_ref().is_some_and(|owner| {
+                    connections
+                        .get(name)
+                        .is_some_and(|current| Arc::ptr_eq(current, owner))
+                });
+                (
+                    name.clone(),
+                    owner_live,
+                    owner_is_current,
+                    handle.is_closed(),
+                )
+            })
+            .collect();
+        ListenBookkeeping {
+            open,
+            handles,
+            connections: connections.keys().cloned().collect(),
+        }
+    }
+
     pub fn touch(&self, name: &str) {
         if let Some(connection) = self.get_connection(name) {
             connection.touch();
         }
     }
-
     pub fn increment_in_flight(&self, name: &str) {
         if let Some(connection) = self.get_connection(name) {
             connection.in_flight.fetch_add(1, Ordering::SeqCst);

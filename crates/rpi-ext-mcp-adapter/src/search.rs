@@ -136,12 +136,12 @@ struct PreparedServerSearch<'a> {
     tools: Vec<PreparedToolSearch<'a>>,
 }
 
-/// A prepared tool catalog (the rpi equivalent of upstream's per-state
-/// `WeakMap` cache): built from one `SearchState` snapshot and reused across
-/// every ranking call that runs against it — most notably the repeated
-/// rankings inside [`rank_suggestions`]. A snapshot is cloned per call, so
-/// the reuse boundary is the snapshot, exactly like upstream's cache keys
-/// on the live state object.
+/// A prepared tool catalog (the rpi adaptation of upstream's per-state
+/// `WeakMap` cache): built from one `SearchState` snapshot and reused by
+/// every ranking pass over that snapshot. Upstream's cross-call memo is
+/// deliberately **not** ported — rpi clones the snapshot per call, so a
+/// runtime-level cache would need generation plumbing for no win at the
+/// measured catalog sizes (TE25 §7.3-1, [非目标]).
 pub(crate) struct PreparedSearchCatalog<'a> {
     servers: Vec<PreparedServerSearch<'a>>,
 }
@@ -420,9 +420,9 @@ pub fn rank_tool_matches(
     rank_prepared_matches(&catalog, state, query, server)
 }
 
-/// Ranking over an already prepared catalog: reused by [`rank_suggestions`]
-/// so the tool fields are normalized/tokenized once for every suggestion
-/// query (#392).
+/// Ranking over an already prepared catalog: keeps preparation and scoring
+/// separate (#392) so a caller that ranks several queries against one
+/// snapshot pays the normalize/tokenize pass once.
 fn rank_prepared_matches(
     catalog: &PreparedSearchCatalog<'_>,
     state: &SearchState<'_>,
@@ -515,8 +515,8 @@ pub fn paginate<T: Clone>(items: &[T], offset: i64, limit: i64) -> Page<T> {
 /// `rankSuggestions` (search-ranking.ts:279-288 @ 10a45367): strip the
 /// longest matching server prefix (any of server/short/mcp forms) from the
 /// requested name, then rank the remainder without keyword boosts. The
-/// prepared catalog is built once and reused by every candidate ranking
-/// (#392).
+/// prepared catalog is built once for the snapshot and used by the single
+/// ranking pass (#392).
 pub fn rank_suggestions(state: &SearchState, name: &str, limit: usize) -> Vec<String> {
     let mut stripped: Vec<String> = Vec::new();
     for server in state.config.mcp_servers.keys() {

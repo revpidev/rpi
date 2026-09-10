@@ -270,6 +270,40 @@ async fn driver_drop_converges_to_failed() {
     assert_eq!(result["details"]["error"], json!("init_failed"));
 }
 
+/// Round-2 review O1 (generation fence): a superseded attempt's driver must
+/// not converge a newer attempt's state. Cancel attempt #1, install attempt
+/// #2, then abort #1's driver — the stale `InitDriverGuard` must leave the
+/// new attempt `Initializing`, and that attempt still reaches Ready.
+#[tokio::test]
+async fn stale_driver_guard_does_not_clobber_newer_attempt() {
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    let stale = dispatcher
+        .start_init_with_driver(never_resolves())
+        .expect("driver spawns on the test runtime");
+    dispatcher.cancel_init();
+    assert_eq!(dispatcher.init_state_kind(), "failed");
+
+    let dir = temp_dir("generation");
+    let runtime = initialize_mcp(&dir, None, Some(dir.join("cache.json"))).await;
+    dispatcher.start_init_with(std::future::ready(Ok(runtime)).boxed().shared());
+    assert_eq!(dispatcher.init_state_kind(), "initializing");
+
+    stale.abort();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        dispatcher.init_state_kind(),
+        "initializing",
+        "a stale generation must not converge the new attempt"
+    );
+
+    let result = dispatcher.execute(&json!({ "status": true }), &[]).await;
+    assert_eq!(result["details"]["mode"], json!("status"));
+    assert_eq!(dispatcher.init_state_kind(), "ready");
+
+    dispatcher.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// B-1 regression: `start_init` on a tokio runtime spawns a background
 /// driver that polls the init future to completion — the gate reaches Ready
 /// with NO caller awaiting it (upstream `setImmediate` prewarm semantics).

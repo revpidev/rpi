@@ -1524,3 +1524,160 @@ async fn te24_catalog_listen_reopens_after_crash_without_close() {
     assert!(!pid_alive(&pid), "fixture child reaped (G4)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// TE25 H2 (inherited from TE24 §7.2): `listen_open` / `listen_handles` /
+/// `connections` stay consistent across open → close → reconnect →
+/// crash-without-close + reopen → close_all. Invariants checked after every
+/// stage:
+/// - every handle has an `listen_open` marker and a live owner;
+/// - the handle's owner is the *current* connection for that server
+///   (owner fencing), so a crashed connection's handle can never fence the
+///   replacement connection;
+/// - at most one handle per open server (a settled handle is replaced, never
+///   accumulated);
+/// - `close`/`close_all` leave all three maps empty.
+///
+/// The fixture answers `subscriptions/listen` with an immediate empty result
+/// (the spec's graceful-close shape), so `handle_is_closed` may be true
+/// between ensure passes — that is exactly the remote-settle state the
+/// re-establish path repairs; the invariant checked here is that the book
+/// keeps a single, correctly-fenced handle either way.
+#[tokio::test]
+async fn te25_listen_mapping_invariants() {
+    fn assert_consistent(manager: &McpServerManager, stage: &str) {
+        let book = manager.listen_bookkeeping();
+        for (server, owner_live, owner_current, _closed) in &book.handles {
+            assert!(
+                book.open.contains(server),
+                "{stage}: handle without open marker for {server} ({book:?})"
+            );
+            assert!(
+                *owner_live,
+                "{stage}: dropped owner for {server} ({book:?})"
+            );
+            assert!(
+                *owner_current,
+                "{stage}: handle owner is not the current connection for {server} ({book:?})"
+            );
+            assert!(
+                book.connections.contains(server),
+                "{stage}: handle for unconnected server {server} ({book:?})"
+            );
+        }
+        for server in &book.open {
+            let count = book.handles.iter().filter(|(s, ..)| s == server).count();
+            assert!(
+                count <= 1,
+                "{stage}: duplicate handles for {server} ({book:?})"
+            );
+        }
+    }
+
+    let dir = temp_dir("te25-listen-invariants");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(&log, &pid, &[("RPI_MCP_FIXTURE_MODERN_2026", "1")]);
+    let mut map = entry.as_map().clone();
+    map.insert("protocolVersion".to_string(), json!("2026-07-28"));
+    let entry = ServerEntry(map);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let wait_for_listen = {
+        async fn wait(log: &Path, target: usize) -> usize {
+            let count = || {
+                std::fs::read_to_string(log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.trim() == "subscriptions/listen")
+                    .count()
+            };
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while count() < target && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            count()
+        }
+        move |target: usize| {
+            let log = log.clone();
+            async move { wait(&log, target).await }
+        }
+    };
+
+    // Stage 1: connect opens the listen; one fenced handle.
+    let _connection = manager.connect("fixture", &entry).await.expect("connect");
+    let counts = wait_for_listen(1).await;
+    assert!(counts >= 1, "first listen opened, got {counts}");
+    assert_consistent(&manager, "after open");
+    let book = manager.listen_bookkeeping();
+    assert!(book.open.contains("fixture"), "open marker: {book:?}");
+    assert_eq!(
+        book.handles
+            .iter()
+            .filter(|(server, ..)| server == "fixture")
+            .count(),
+        1,
+        "one handle after open: {book:?}"
+    );
+
+    // Stage 2: close clears all three maps for the server and cancels the
+    // wire-level listen.
+    manager.close("fixture").await;
+    let book = manager.listen_bookkeeping();
+    assert!(book.open.is_empty(), "close clears listen_open: {book:?}");
+    assert!(book.handles.is_empty(), "close clears handles: {book:?}");
+    assert!(
+        book.connections.is_empty(),
+        "close clears connections: {book:?}"
+    );
+
+    // Stage 3: reconnect opens a fresh, fenced handle.
+    let second = manager.connect("fixture", &entry).await.expect("reconnect");
+    let counts = wait_for_listen(2).await;
+    assert!(counts >= 2, "listen reopened after close, got {counts}");
+    assert_consistent(&manager, "after reconnect");
+
+    // Stage 4: crash WITHOUT close, then reconnect: the stale handle must be
+    // replaced by one owned by the new connection (TE24 N1 fencing).
+    let first_pid: i32 = std::fs::read_to_string(&pid)
+        .expect("pid file")
+        .trim()
+        .parse()
+        .expect("pid");
+    #[cfg(unix)]
+    unsafe {
+        // Safety: kill(2) a pid we just spawned via the fixture server.
+        libc::kill(first_pid, libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while second.status() != ConnectionStatus::Closed && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(second.status(), ConnectionStatus::Closed, "crash seen");
+    let _third = manager
+        .connect("fixture", &entry)
+        .await
+        .expect("post-crash connect");
+    let counts = wait_for_listen(3).await;
+    assert!(counts >= 3, "listen reopened after crash, got {counts}");
+    assert_consistent(&manager, "after crash reopen");
+    let book = manager.listen_bookkeeping();
+    assert_eq!(
+        book.handles
+            .iter()
+            .filter(|(server, ..)| server == "fixture")
+            .count(),
+        1,
+        "stale handle replaced, not duplicated: {book:?}"
+    );
+
+    // Stage 5: close_all drains everything.
+    manager.close_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let book = manager.listen_bookkeeping();
+    assert!(
+        book.open.is_empty() && book.handles.is_empty() && book.connections.is_empty(),
+        "close_all drains all three maps: {book:?}"
+    );
+    assert!(!pid_alive(&pid), "fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -178,6 +178,118 @@ pub struct ApprovalCandidateContext {
     pub other_current_candidates: Vec<String>,
 }
 
+/// The item-independent half of [`approval_candidate_context`] (TE21 N-7 →
+/// TE25 R7.2.12.1): the selector scope's current-name candidates, built
+/// once and reused across every result of one search page instead of
+/// rebuilding the whole cross-server candidate set per result.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalCandidateUniverse {
+    candidates: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl ApprovalCandidateUniverse {
+    /// Per-tool context: the universe minus this tool's current candidates
+    /// (same `retain` semantics as [`approval_candidate_context`]).
+    pub fn context_for(
+        &self,
+        config: &McpConfig,
+        server_name: &str,
+        original_tool_name: &str,
+    ) -> ApprovalCandidateContext {
+        let definition = config.mcp_servers.get(server_name);
+        let prefix = resolve_tool_prefix(definition, config.global_tool_prefix());
+        let current = get_tool_name_candidates_with(original_tool_name, server_name, prefix, false);
+        ApprovalCandidateContext {
+            other_current_candidates: self
+                .candidates
+                .iter()
+                .filter(|candidate| !current.contains(candidate))
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// Build the selector-scope candidate universe for one server: per-server
+/// `approveTools` scopes to the same server; a global setting compares
+/// across all servers (each with its own resolved prefix). Item-independent
+/// — reuse it for every result of a search page.
+pub fn approval_candidate_universe(
+    config: &McpConfig,
+    tool_metadata: &IndexMap<String, Vec<ToolMetadata>>,
+    server_name: &str,
+) -> ApprovalCandidateUniverse {
+    build_candidate_universe(
+        config,
+        server_name,
+        tool_metadata.get(server_name).map(Vec::as_slice),
+        tool_metadata.iter(),
+    )
+}
+
+/// Same universe over the search snapshot shape
+/// (`Vec<(server, tools)>`, `proxy::search_state_snapshot`): avoids
+/// re-keying the snapshot just to run the page-scoped approval markers.
+pub fn approval_candidate_universe_from_pairs(
+    config: &McpConfig,
+    tool_metadata: &[(String, Vec<ToolMetadata>)],
+    server_name: &str,
+) -> ApprovalCandidateUniverse {
+    let server_tools = tool_metadata
+        .iter()
+        .find(|(name, _)| name == server_name)
+        .map(|(_, tools)| tools.as_slice());
+    build_candidate_universe(
+        config,
+        server_name,
+        server_tools,
+        tool_metadata.iter().map(|(name, tools)| (name, tools)),
+    )
+}
+
+/// Shared builder for the two snapshot shapes.
+fn build_candidate_universe<'a>(
+    config: &McpConfig,
+    server_name: &str,
+    server_tools: Option<&'a [ToolMetadata]>,
+    all_servers: impl Iterator<Item = (&'a String, &'a Vec<ToolMetadata>)>,
+) -> ApprovalCandidateUniverse {
+    let definition = config.mcp_servers.get(server_name);
+    let server_scoped = definition.and_then(|d| d.get("approveTools")).is_some();
+    let mut universe = ApprovalCandidateUniverse::default();
+    let push = |candidate: String, universe: &mut ApprovalCandidateUniverse| {
+        if universe.seen.insert(candidate.clone()) {
+            universe.candidates.push(candidate);
+        }
+    };
+    if server_scoped {
+        if let Some(tools) = server_tools {
+            let prefix = resolve_tool_prefix(definition, config.global_tool_prefix());
+            for tool in tools {
+                for candidate in
+                    get_tool_name_candidates_with(&tool.original_name, server_name, prefix, false)
+                {
+                    push(candidate, &mut universe);
+                }
+            }
+        }
+    } else {
+        for (name, tools) in all_servers {
+            let other_prefix =
+                resolve_tool_prefix(config.mcp_servers.get(name), config.global_tool_prefix());
+            for tool in tools {
+                for candidate in
+                    get_tool_name_candidates_with(&tool.original_name, name, other_prefix, false)
+                {
+                    push(candidate, &mut universe);
+                }
+            }
+        }
+    }
+    universe
+}
+
 /// Build the candidate context for one tool. Per-server `approveTools`
 /// scopes the comparison to the same server; a global setting compares
 /// across all servers (each with its own resolved prefix).
@@ -187,44 +299,11 @@ pub fn approval_candidate_context(
     server_name: &str,
     original_tool_name: &str,
 ) -> ApprovalCandidateContext {
-    let definition = config.mcp_servers.get(server_name);
-    let server_scoped = definition.and_then(|d| d.get("approveTools")).is_some();
-    let prefix = resolve_tool_prefix(definition, config.global_tool_prefix());
-    let current = get_tool_name_candidates_with(original_tool_name, server_name, prefix, false);
-
-    let mut other: Vec<String> = Vec::new();
-    let mut push = |value: String| {
-        if !other.contains(&value) {
-            other.push(value);
-        }
-    };
-    if server_scoped {
-        if let Some(tools) = tool_metadata.get(server_name) {
-            for tool in tools {
-                for candidate in
-                    get_tool_name_candidates_with(&tool.original_name, server_name, prefix, false)
-                {
-                    push(candidate);
-                }
-            }
-        }
-    } else {
-        for (name, tools) in tool_metadata {
-            let other_prefix =
-                resolve_tool_prefix(config.mcp_servers.get(name), config.global_tool_prefix());
-            for tool in tools {
-                for candidate in
-                    get_tool_name_candidates_with(&tool.original_name, name, other_prefix, false)
-                {
-                    push(candidate);
-                }
-            }
-        }
-    }
-    other.retain(|candidate| !current.contains(candidate));
-    ApprovalCandidateContext {
-        other_current_candidates: other,
-    }
+    approval_candidate_universe(config, tool_metadata, server_name).context_for(
+        config,
+        server_name,
+        original_tool_name,
+    )
 }
 
 /// `isToolCallApprovalRequired` (tool-approval.ts:23-72 @ 10a45367): checks
@@ -509,6 +588,46 @@ mod tests {
         assert!(is_tool_call_approval_required(
             &config, "demo", "search", None
         ));
+    }
+
+    /// TE21 N-7 → TE25 R7.2.12.1: one page-scoped universe answers every
+    /// tool identically to the per-tool context builder (the item-specific
+    /// current-candidate exclusion is applied per tool).
+    #[test]
+    fn page_scoped_universe_matches_per_tool_context() {
+        let mut config = McpConfig {
+            settings: Some(
+                json!({ "approveTools": ["my_2d_server_do_thing"] })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            ..Default::default()
+        };
+        config
+            .mcp_servers
+            .insert("my-server".to_string(), server_entry(None));
+        config
+            .mcp_servers
+            .insert("my_2d_server".to_string(), server_entry(None));
+        let metadata = metadata_for(&[
+            ("my-server", &[("do-thing", "my-server_do-thing")]),
+            ("my_2d_server", &[("do_thing", "my_2d_server_do_thing")]),
+        ]);
+        let universe = approval_candidate_universe(&config, &metadata, "my-server");
+        for (server, tool) in [("my-server", "do-thing"), ("my_2d_server", "do_thing")] {
+            let expected = approval_candidate_context(&config, &metadata, server, tool);
+            let actual = universe.context_for(&config, server, tool);
+            assert_eq!(
+                actual.other_current_candidates, expected.other_current_candidates,
+                "{server}/{tool}"
+            );
+            assert_eq!(
+                is_tool_call_approval_required(&config, server, tool, Some(&actual)),
+                is_tool_call_approval_required(&config, server, tool, Some(&expected)),
+                "{server}/{tool}"
+            );
+        }
     }
 
     #[test]
