@@ -39,9 +39,13 @@ pub const MODEL_EXCLUSION_DIAGNOSTIC_MAX_ENTRIES: usize = 20;
 /// exclusion diagnostic upstream via `sanitizeModelExclusionDiagnostic` /
 /// `throwForExplicitModelExclusion`): bearer tokens and well-known key
 /// shapes become `[redacted]`.
+//
+// G4 不变式：静态字面量模式，编译有效性由 `sanitize_diagnostic_redacts_and_caps`
+// 用例固定（Bearer/sk- 两形态断言 [redacted]）；`Regex::new` 对固定字面量
+// 不会失败，失败即程序性错误——安全面不设静默降级分支（复核第 2 轮 P1）。
 static SECRET_VALUE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:Bearer\s+\S+|(?:sk|ghp|github_pat|xox[baprs])[-_A-Za-z0-9]{8,})\b")
-        .unwrap_or_else(|_| Regex::new("").expect("static regex"))
+        .expect("SECRET_VALUE static literal is a valid regex")
 });
 
 /// See [`SECRET_VALUE`].
