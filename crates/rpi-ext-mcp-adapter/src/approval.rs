@@ -628,6 +628,53 @@ mod tests {
                 "{server}/{tool}"
             );
         }
+
+        // Server-scoped `approveTools` (the `SearchApprovalMarkers::scoped`
+        // branch): the universe is that server's tool set only — the other
+        // server's names must not leak — and per-tool exclusion still
+        // matches the reference builder.
+        let mut scoped_config = McpConfig::default();
+        scoped_config.mcp_servers.insert(
+            "scoped".to_string(),
+            server_entry(Some(json!(["scoped_do_thing"]))),
+        );
+        scoped_config
+            .mcp_servers
+            .insert("other".to_string(), server_entry(None));
+        let scoped_metadata = metadata_for(&[
+            (
+                "scoped",
+                &[
+                    ("do_thing", "scoped_do_thing"),
+                    ("do_other", "scoped_do_other"),
+                ],
+            ),
+            ("other", &[("do_thing", "other_do_thing")]),
+        ]);
+        let scoped_universe =
+            approval_candidate_universe(&scoped_config, &scoped_metadata, "scoped");
+        assert!(
+            !scoped_universe
+                .context_for(&scoped_config, "scoped", "do_thing")
+                .other_current_candidates
+                .iter()
+                .any(|candidate| candidate == "other_do_thing"),
+            "a server-scoped universe must not include another server's names"
+        );
+        for tool in ["do_thing", "do_other"] {
+            let expected =
+                approval_candidate_context(&scoped_config, &scoped_metadata, "scoped", tool);
+            let actual = scoped_universe.context_for(&scoped_config, "scoped", tool);
+            assert_eq!(
+                actual.other_current_candidates, expected.other_current_candidates,
+                "scoped/{tool}"
+            );
+            assert_eq!(
+                is_tool_call_approval_required(&scoped_config, "scoped", tool, Some(&actual)),
+                is_tool_call_approval_required(&scoped_config, "scoped", tool, Some(&expected)),
+                "scoped/{tool}"
+            );
+        }
     }
 
     #[test]
