@@ -30,7 +30,7 @@ use futures::StreamExt;
 use indexmap::IndexMap;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, error};
 
 use crate::cache::{
     compute_server_hash, create_cached_tool_selector_candidate_index, get_metadata_cache_path,
@@ -408,10 +408,41 @@ pub async fn initialize_mcp(
                 if message == "aborted" {
                     continue;
                 }
+                // init.ts:381-390 @ 10a45367 (#411/#424): a transient 503 is
+                // an availability blip — still recorded as a failure (the
+                // backoff window hides the tools) but announced with ONE
+                // quiet notice, never the loud "Failed to connect" path and
+                // never a probe (the enrichment already classified it).
                 state.failures.record(&name, &message, owner_cancel.clone());
+                if message.contains("endpoint is temporarily unavailable (HTTP 503)") {
+                    debug!(
+                        server = %name,
+                        "MCP: startup connect hit transient upstream outage; will retry"
+                    );
+                    // The single quiet advisory rides the status surface
+                    // (upstream `ui.notify(warning)` / console.error — the
+                    // TUI adapter maps this through the failure window).
+                    continue;
+                }
+                error!(
+                    server = %name,
+                    "MCP: Failed to connect to {}: {}",
+                    name,
+                    crate::utils::sanitize_terminal_text(&message)
+                );
             }
         }
     }
+
+    // `setMetadataListChangedListener` (init.ts:192-199 @ 10a45367): any
+    // catalog change (keep-alive refresh, listen recovery) repaints the
+    // metadata, cache, tool surface and status bar.
+    let listener_state = state.clone();
+    manager.set_metadata_list_changed_listener(Arc::new(move |server_name, reason| {
+        update_server_metadata(&listener_state, server_name);
+        update_metadata_cache(&listener_state, server_name);
+        notify_metadata_updated(&listener_state, server_name, reason);
+    }));
 
     let reconnect_state = state.clone();
     lifecycle.set_reconnect_callback(Arc::new(move |name| {
@@ -430,6 +461,23 @@ pub async fn initialize_mcp(
         failure_state
             .failures
             .record(name, message, failure_cancel.clone());
+    }));
+
+    // `setHealthRestoredCallback` / `setAuthRequiredCallback`
+    // (init.ts:464-474 @ 10a45367).
+    let restored_state = state.clone();
+    lifecycle.set_health_restored_callback(Arc::new(move |name| {
+        restored_state
+            .failures
+            .clear_with_reason(name, "health-restored");
+        // The status repaint rides the failure-window hook when active;
+        // a plain surface refresh otherwise.
+        notify_metadata_updated(&restored_state, name, "health-restored");
+    }));
+    let auth_state = state.clone();
+    lifecycle.set_auth_required_callback(Arc::new(move |name| {
+        auth_state.failures.clear_with_reason(name, "auth-required");
+        notify_metadata_updated(&auth_state, name, "auth-required");
     }));
 
     // init.ts:83/90 @ 10a45367: failure-window start/expiry repaints the
@@ -505,7 +553,7 @@ pub fn update_server_metadata(state: &McpRuntime, server_name: &str) {
         return;
     }
     let prefix = state.config.global_tool_prefix();
-    let tools = wire_tools(&connection.tools);
+    let tools = wire_tools(&connection.tools_snapshot());
     let resources = wire_resources(&connection.resources);
     let result = {
         let known_metadata = state
@@ -600,7 +648,7 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
     let existing = load_metadata_cache(&state.cache_path);
     let existing_entry = existing.as_ref().and_then(|c| c.servers.get(server_name));
 
-    let tools = serialize_tools(&wire_tools(&connection.tools));
+    let tools = serialize_tools(&wire_tools(&connection.tools_snapshot()));
     let mut resources = if definition.exposes_resources() {
         serialize_resources(&wire_resources(&connection.resources))
     } else {
@@ -3181,7 +3229,9 @@ impl ProxyDispatcher {
         }
     }
 
-    async fn current(&self) -> Result<Arc<McpRuntime>, GateError> {
+    /// The init gate (`currentDirect`'s typed core): Ready, Initializing
+    /// (awaits the shared init future, 30s gate) or the failure text.
+    pub(crate) async fn current(&self) -> Result<Arc<McpRuntime>, GateError> {
         let shared = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
@@ -3429,7 +3479,7 @@ impl ProxyDispatcher {
     }
 }
 
-enum GateError {
+pub(crate) enum GateError {
     Timeout,
     Failed(String),
     NotInitialized,

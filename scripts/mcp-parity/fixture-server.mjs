@@ -61,25 +61,42 @@ function resultFor(message) {
       };
     case "ping":
       return {};
-    case "tools/list":
-      return {
-        tools: [
-          {
-            name: "echo",
-            description: "Echo the query back",
-            inputSchema: {
-              type: "object",
-              properties: { query: { type: "string" } },
-              required: ["query"],
-            },
+    case "tools/list": {
+      // TE24 keep-alive test knobs (defaults keep the historical shape):
+      // - RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_MS: delay the tools/list
+      //   response to exercise the bounded keep-alive refresh timeout;
+      // - RPI_MCP_FIXTURE_EXTRA_TOOL: add a third tool to the catalog.
+      const tools = [
+        {
+          name: "echo",
+          description: "Echo the query back",
+          inputSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
           },
-          {
-            name: "fail",
-            description: "Always fails",
-            inputSchema: { type: "object", properties: {} },
-          },
-        ],
-      };
+        },
+        {
+          name: "fail",
+          description: "Always fails",
+          inputSchema: { type: "object", properties: {} },
+        },
+      ];
+      if (process.env.RPI_MCP_FIXTURE_EXTRA_TOOL) {
+        tools.push({
+          name: "extra",
+          description: "Appears when RPI_MCP_FIXTURE_EXTRA_TOOL is set",
+          inputSchema: { type: "object", properties: {} },
+        });
+      }
+      const slowMs = Number(process.env.RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_MS ?? "0");
+      if (slowMs > 0) {
+        return new Promise((resolve) => {
+          setTimeout(() => resolve({ tools }), slowMs);
+        });
+      }
+      return { tools };
+    }
     case "tools/call": {
       const name = message.params?.name ?? "";
       if (name === "fail") {

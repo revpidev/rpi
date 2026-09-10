@@ -518,12 +518,14 @@ mod tests {
     fn resolve_env_inherit_env_false_drops_process_env() {
         // #514 (resolveEnv @ 7a7b01b): `inheritEnv: false` keeps only the
         // explicit overrides; a `PATH`-style base entry disappears.
-        std::env::set_var("RPI_MCP_STDIO_TEST", "from-env");
+        // Uniquely-named var: Rust tests share one process, so the
+        // ambient env is mutated by sibling tests.
+        std::env::set_var("RPI_MCP_TE24_INHERIT_TEST", "from-env");
         let definition = ServerEntry(
             json!({
                 "command": "x",
                 "inheritEnv": false,
-                "env": { "ONLY": "override", "RPI_MCP_STDIO_TEST": "$env:RPI_MCP_STDIO_TEST" }
+                "env": { "ONLY": "override", "RPI_MCP_TE24_INHERIT_TEST": "$env:RPI_MCP_TE24_INHERIT_TEST" }
             })
             .as_object()
             .cloned()
@@ -533,8 +535,8 @@ mod tests {
         let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(names.len(), 2, "only the two overrides: {names:?}");
         assert!(names.contains(&"ONLY"));
-        assert!(names.contains(&"RPI_MCP_STDIO_TEST"));
-        std::env::remove_var("RPI_MCP_STDIO_TEST");
+        assert!(names.contains(&"RPI_MCP_TE24_INHERIT_TEST"));
+        std::env::remove_var("RPI_MCP_TE24_INHERIT_TEST");
     }
 
     #[test]

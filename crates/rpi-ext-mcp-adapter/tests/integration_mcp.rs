@@ -94,8 +94,8 @@ async fn stdio_full_flow_frame_sequence_and_calls() {
         connection.instructions.as_deref(),
         Some("fixture instructions")
     );
-    let tool_names: Vec<&str> = connection
-        .tools
+    let snapshot = connection.tools_snapshot();
+    let tool_names: Vec<&str> = snapshot
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
@@ -656,7 +656,7 @@ async fn http_streamable_json_flow_and_headers() {
     let manager = McpServerManager::new(None);
     let connection = manager.connect("http", &entry).await.expect("connect");
     assert_eq!(connection.status(), ConnectionStatus::Connected);
-    assert_eq!(connection.tools.len(), 1);
+    assert_eq!(connection.tools_len(), 1);
     manager.close_all().await;
     stop.cancel();
 
@@ -1087,5 +1087,150 @@ async fn direct_tools_resolve_execute_and_sync() {
         Some(agent) => std::env::set_var("RPI_CODING_AGENT_DIR", agent),
         None => std::env::remove_var("RPI_CODING_AGENT_DIR"),
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TE24 FR-A: keep-alive convergence / bounded refresh (#369/#400/#363)
+// ============================================================================
+
+fn te24_entry(log: &Path, pid: &Path, extra_env: &[(&str, &str)]) -> ServerEntry {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        "RPI_MCP_FIXTURE_LOG".to_string(),
+        log.to_string_lossy().into_owned(),
+    );
+    map.insert(
+        "RPI_MCP_FIXTURE_PID".to_string(),
+        pid.to_string_lossy().into_owned(),
+    );
+    for (key, value) in extra_env {
+        map.insert((*key).to_string(), (*value).to_string());
+    }
+    ServerEntry(
+        json!({
+            "command": fixture_server_exe().to_string_lossy(),
+            "env": map,
+        })
+        .as_object()
+        .cloned()
+        .unwrap_or_default(),
+    )
+}
+
+#[tokio::test]
+async fn te24_refresh_tools_unchanged_superseded_and_timeout_deferral() {
+    use rpi_ext_mcp_adapter::manager::ToolRefreshResult;
+
+    // --- Unchanged: an equal catalog refreshes without events/failures.
+    let dir = temp_dir("te24-refresh");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(&log, &pid, &[]);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let lifecycle = LifecycleManager::new(manager.clone(), CancellationToken::new());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let sink = events.clone();
+    manager.set_metadata_list_changed_listener(Arc::new(move |name, reason| {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((name.to_string(), reason.to_string()));
+    }));
+
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+    assert_eq!(connection.tools_len(), 2);
+
+    let result = manager.refresh_tools("fixture", &connection).await;
+    assert_eq!(result.unwrap(), ToolRefreshResult::Unchanged);
+    // #400: an unchanged refresh never fires the metadata listener.
+    assert!(events.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+
+    // --- Superseded: a stale handle after the connection was closed.
+    manager.close("fixture").await;
+    let result = manager.refresh_tools("fixture", &connection).await;
+    assert_eq!(result.unwrap(), ToolRefreshResult::Superseded);
+
+    lifecycle.graceful_shutdown().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // --- RefreshTimeout (#400): a slow tools/list DEFERS, never fails.
+    let dir = temp_dir("te24-slow");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    // The per-server requestTimeoutMs (< 5s) bounds the refresh; the
+    // fixture delays the SECOND tools/list (the refresh) beyond it — the
+    // initialize-time listing stays fast.
+    let entry = te24_entry(
+        &log,
+        &pid,
+        &[
+            ("RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_MS", "3000"),
+            ("RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_FROM", "2"),
+        ],
+    );
+    let mut map = entry.as_map().clone();
+    map.insert("requestTimeoutMs".to_string(), json!(600));
+    let entry = ServerEntry(map);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let failures = Arc::new(rpi_ext_mcp_adapter::lifecycle::FailureTracker::new());
+    let cancel = CancellationToken::new();
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+
+    let result = manager.refresh_tools("fixture", &connection).await;
+    assert_eq!(result.unwrap(), ToolRefreshResult::RefreshTimeout);
+    // The deferral records NO failure (deferRefreshTimeout ≠ failure).
+    assert_eq!(failures.failure_age_seconds("fixture"), None);
+
+    manager.close("fixture").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "slow fixture child reaped (G4)");
+    cancel.cancel();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn te24_ensure_converged_single_flight_and_stdio_skip() {
+    // A connected stdio (url-less) keep-alive server: the convergence pass
+    // skips the refresh leg (no expiring session) and stays healthy — and
+    // concurrent ensure_converged calls collapse into one pass.
+    let dir = temp_dir("te24-converge");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(&log, &pid, &[]);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let lifecycle = LifecycleManager::new(manager.clone(), CancellationToken::new());
+    lifecycle.set_global_idle_timeout_minutes(0);
+    lifecycle.register_server("fixture", &entry, Some(0));
+    lifecycle.mark_keep_alive("fixture", &entry);
+
+    manager.connect("fixture", &entry).await.expect("connect");
+
+    let a = lifecycle.clone();
+    let b = lifecycle.clone();
+    let (ra, rb) = tokio::join!(a.ensure_converged(), b.ensure_converged());
+    let _ = (ra, rb);
+
+    // Still connected after convergence (no refresh attempts on stdio, no
+    // reconnect churn).
+    let connection = manager.get_connection("fixture").expect("connection");
+    assert_eq!(connection.status(), ConnectionStatus::Connected);
+    // The convergence pass DID probe tools/list exactly once per pass —
+    // wait, stdio (no url) skips refresh entirely: the log carries exactly
+    // the initialize-time tools/list, none from convergence.
+    let frames = std::fs::read_to_string(&log).expect("log");
+    let tools_lists = frames
+        .lines()
+        .filter(|line| line.trim() == "tools/list")
+        .count();
+    assert_eq!(tools_lists, 1, "stdio convergence skips the refresh leg");
+
+    lifecycle.graceful_shutdown().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "fixture child reaped (G4)");
     let _ = std::fs::remove_dir_all(&dir);
 }

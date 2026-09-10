@@ -280,7 +280,7 @@ pub fn create_mcp_status_snapshot(
             if meta > 0 {
                 meta
             } else if connected {
-                connection.as_ref().map(|c| c.tools.len()).unwrap_or(0)
+                connection.as_ref().map(|c| c.tools_len()).unwrap_or(0)
             } else {
                 0
             }

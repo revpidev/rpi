@@ -391,6 +391,7 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
         }
     }
     for event in [
+        "input",
         "session_start",
         "session_shutdown",
         "session_tree",
@@ -807,6 +808,21 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
             pack(&Value::Null)
         }
         Some("event") => match message.get("event").and_then(Value::as_str) {
+            Some("input") => {
+                // `pi.on("input")` (index.ts:683-706 @ 10a45367, R7.2.7.1):
+                // converge the keep-alive fleet before the input is
+                // processed. `current()` doubles as the bounded init wait
+                // (upstream `awaitWithTimeout(initPromise,
+                // INIT_WAIT_TIMEOUT_MS=30s)`); an init failure returns
+                // quietly (upstream `catch { return }`).
+                let dispatcher = state.dispatcher.clone();
+                state.runtime.block_on(async move {
+                    if let Ok(runtime) = dispatcher.current().await {
+                        runtime.lifecycle.ensure_converged().await;
+                    }
+                });
+                pack(&Value::Null)
+            }
             Some("session_start") => {
                 // index.ts:376-414: stop the previous runtime, then
                 // re-initialize against the new session. A fresh session has
@@ -1327,7 +1343,7 @@ fn reconnect_server(
                 proxy::mark_keep_alive_after_connect(runtime, name);
                 let text = format!(
                     "MCP: Reconnected to {name} ({} tools, {} resources)",
-                    connection.tools.len(),
+                    connection.tools_len(),
                     connection.resources.len()
                 );
                 host.notify(&text, "info");

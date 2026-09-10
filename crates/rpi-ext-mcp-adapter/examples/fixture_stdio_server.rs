@@ -19,6 +19,8 @@
 use std::io::{BufRead, Write};
 
 fn main() {
+    // 1-based tools/list counter (SLOW_TOOLS_LIST_FROM knob).
+    let tools_list_count = std::cell::Cell::new(0u64);
     if let Ok(path) = std::env::var("RPI_MCP_FIXTURE_PID") {
         let _ = std::fs::write(path, std::process::id().to_string());
     }
@@ -57,9 +59,13 @@ fn main() {
                 "instructions": "fixture instructions",
             }),
             "ping" => serde_json::json!({}),
-            "tools/list" => serde_json::json!({
-                "tools": [
-                    {
+            "tools/list" => {
+                // TE24 keep-alive test knobs (defaults keep the historical
+                // shape): EXTRA_TOOL grows the catalog (refresh detection),
+                // SLOW_TOOLS_LIST_MS delays the response (bounded refresh
+                // timeout).
+                let mut tools = vec![
+                    serde_json::json!({
                         "name": "echo",
                         "description": "Echo the query back",
                         "inputSchema": {
@@ -67,14 +73,38 @@ fn main() {
                             "properties": { "query": { "type": "string" } },
                             "required": ["query"],
                         },
-                    },
-                    {
+                    }),
+                    serde_json::json!({
                         "name": "fail",
                         "description": "Always fails",
                         "inputSchema": { "type": "object", "properties": {} },
-                    },
-                ],
-            }),
+                    }),
+                ];
+                if std::env::var("RPI_MCP_FIXTURE_EXTRA_TOOL").is_ok() {
+                    tools.push(serde_json::json!({
+                        "name": "extra",
+                        "description": "Appears when RPI_MCP_FIXTURE_EXTRA_TOOL is set",
+                        "inputSchema": { "type": "object", "properties": {} },
+                    }));
+                }
+                // Delay from the Nth tools/list onward (1-based): the
+                // initialize-time listing stays fast so `requestTimeoutMs`
+                // can stay realistic for the handshake.
+                let slow_ms: u64 = std::env::var("RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_MS")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(0);
+                let slow_from: u64 = std::env::var("RPI_MCP_FIXTURE_SLOW_TOOLS_LIST_FROM")
+                    .ok()
+                    .and_then(|raw| raw.parse().ok())
+                    .unwrap_or(1);
+                let seen = tools_list_count.get();
+                tools_list_count.set(seen + 1);
+                if slow_ms > 0 && seen + 1 >= slow_from {
+                    std::thread::sleep(std::time::Duration::from_millis(slow_ms));
+                }
+                serde_json::json!({ "tools": tools })
+            }
             "tools/call" => {
                 let name = message
                     .get("params")

@@ -49,7 +49,9 @@ pub enum ConnectionStatus {
 pub struct ServerConnection {
     pub client: Option<Arc<McpClient>>,
     pub definition: ServerEntry,
-    pub tools: Vec<Value>,
+    /// Authoritative tool catalog; swappable in place by the keep-alive
+    /// refresh (`refreshTools` swaps under this lock; readers snapshot).
+    pub tools: Mutex<Vec<Value>>,
     pub resources: Vec<Value>,
     pub prompts: Vec<Value>,
     pub prompt_discovery_failed: bool,
@@ -66,6 +68,21 @@ pub struct ServerConnection {
 impl ServerConnection {
     pub fn status(&self) -> ConnectionStatus {
         *self.status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Snapshot of the tool catalog (readers clone; the refresh swaps).
+    pub fn tools_snapshot(&self) -> Vec<Value> {
+        self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `tools.len()` without the clone.
+    pub fn tools_len(&self) -> usize {
+        self.tools.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Swap the catalog after a keep-alive refresh detected a change.
+    fn set_tools(&self, tools: Vec<Value>) {
+        *self.tools.lock().unwrap_or_else(|e| e.into_inner()) = tools;
     }
 
     pub fn touch(&self) {
@@ -102,6 +119,25 @@ pub fn supports_oauth(definition: &ServerEntry) -> bool {
 }
 
 /// `McpServerManager` (server-manager.ts:141-1101), P0 cut.
+/// `ToolRefreshResult` (server-manager.ts:172 @ 10a45367).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRefreshResult {
+    Updated,
+    Unchanged,
+    Superseded,
+    RefreshTimeout,
+}
+
+/// `KEEP_ALIVE_REFRESH_TIMEOUT_MS` (server-manager.ts:170 @ 10a45367): the
+/// bounded `tools/list` refresh that doubles as the health probe. A server
+/// slower than this stays healthy (#400) — the refresh is only deferred.
+pub const KEEP_ALIVE_REFRESH_TIMEOUT_MS: Duration = Duration::from_millis(5_000);
+
+/// `MetadataListChangedListener` (server-manager.ts:156-159 @ 10a45367):
+/// fired when a connection's authoritative catalog changes
+/// (`keep-alive-refresh`, `listen-recovered`, …).
+pub type MetadataListChangedListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 pub struct McpServerManager {
     connections: Mutex<HashMap<String, Arc<ServerConnection>>>,
     connect_promises: Mutex<HashMap<String, SharedConnect>>,
@@ -109,6 +145,7 @@ pub struct McpServerManager {
     default_request_timeout: Mutex<Option<Duration>>,
     runtime_cancel: Mutex<CancellationToken>,
     stopped: AtomicBool,
+    metadata_list_changed_listener: Mutex<Option<MetadataListChangedListener>>,
     /// Test hook: credential store used by the HTTP connect path
     /// (production builds the OS-keyring store per attempt). Integration
     /// tests inject a `MemorySecretStore`-backed store to assert the
@@ -125,8 +162,29 @@ impl McpServerManager {
             default_request_timeout: Mutex::new(None),
             runtime_cancel: Mutex::new(CancellationToken::new()),
             stopped: AtomicBool::new(false),
+            metadata_list_changed_listener: Mutex::new(None),
             auth_store_override: Mutex::new(None),
         })
+    }
+
+    /// `setMetadataListChangedListener` (server-manager.ts:231-233 @
+    /// 10a45367).
+    pub fn set_metadata_list_changed_listener(&self, listener: MetadataListChangedListener) {
+        *self
+            .metadata_list_changed_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(listener);
+    }
+
+    fn fire_metadata_list_changed(&self, name: &str, reason: &str) {
+        let listener = self
+            .metadata_list_changed_listener
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(listener) = listener {
+            listener(name, reason);
+        }
     }
 
     /// Test hook (see `auth_store_override`).
@@ -298,6 +356,94 @@ impl McpServerManager {
         }
         self.close(name).await;
         self.connect(name, definition).await
+    }
+
+    /// `refreshTools` (server-manager.ts:397-486 @ 10a45367): the bounded,
+    /// cache-bypassed `tools/list` that doubles as the keep-alive health
+    /// probe. Identity-guarded: a late response from a replaced connection
+    /// is ignored (`Superseded`). A server WITHOUT the tools capability is
+    /// pinged instead; a slow-but-healthy server times out softly
+    /// (`RefreshTimeout` — #400: never marked failed, only deferred).
+    pub async fn refresh_tools(
+        self: &Arc<Self>,
+        name: &str,
+        expected: &Arc<ServerConnection>,
+    ) -> Result<ToolRefreshResult, ProtocolError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Ok(ToolRefreshResult::Superseded);
+        }
+        let current = self.get_connection(name);
+        let is_current = current.as_ref().is_some_and(|c| Arc::ptr_eq(c, expected));
+        if !is_current || expected.status() != ConnectionStatus::Connected {
+            return Ok(ToolRefreshResult::Superseded);
+        }
+
+        // Bounded: min(resolved request timeout, 5s).
+        let timeout = self
+            .request_timeout(&expected.definition)
+            .min(KEEP_ALIVE_REFRESH_TIMEOUT_MS);
+
+        let Some(client) = expected.client.clone() else {
+            return Ok(ToolRefreshResult::Superseded);
+        };
+
+        // No tools capability → ping proves the session usable
+        // (server-manager.ts:421-431).
+        let capabilities = client.server_capabilities();
+        let has_tools = capabilities
+            .as_ref()
+            .is_some_and(|c| c.get("tools").is_some());
+        if !has_tools {
+            match client.call("ping", None, timeout).await {
+                Ok(_) => {}
+                Err(ProtocolError::Timeout) => return Ok(ToolRefreshResult::RefreshTimeout),
+                Err(error) => return Err(error),
+            }
+            let still_current = self
+                .get_connection(name)
+                .is_some_and(|c| Arc::ptr_eq(&c, expected));
+            return Ok(if still_current {
+                ToolRefreshResult::Unchanged
+            } else {
+                ToolRefreshResult::Superseded
+            });
+        }
+
+        match client.fetch_all_tools_shared(timeout).await {
+            Err(ProtocolError::Timeout) => {
+                let still_current = self
+                    .get_connection(name)
+                    .is_some_and(|c| Arc::ptr_eq(&c, expected));
+                Ok(if still_current {
+                    ToolRefreshResult::RefreshTimeout
+                } else {
+                    ToolRefreshResult::Superseded
+                })
+            }
+            Err(error) => Err(error),
+            Ok((tools, _hints)) => {
+                let still_current = self
+                    .get_connection(name)
+                    .is_some_and(|c| Arc::ptr_eq(&c, expected));
+                if !still_current {
+                    return Ok(ToolRefreshResult::Superseded);
+                }
+                let unchanged = {
+                    let current = expected.tools.lock().unwrap_or_else(|e| e.into_inner());
+                    *current == tools
+                };
+                if unchanged {
+                    return Ok(ToolRefreshResult::Unchanged);
+                }
+                // Swap the catalog under the connection's identity and fire
+                // the metadata listener (upstream bumps toolsRevision; the
+                // Rust connection swaps the Vec under this lock — readers
+                // see either the old or the new full list).
+                expected.set_tools(tools);
+                self.fire_metadata_list_changed(name, "keep-alive-refresh");
+                Ok(ToolRefreshResult::Updated)
+            }
+        }
     }
 
     /// `createConnection` (server-manager.ts:328-520), P0 cut.
@@ -645,7 +791,7 @@ fn build_connection(
         instructions: client.instructions(),
         client: Some(client),
         definition: definition.clone(),
-        tools: metadata.tools,
+        tools: Mutex::new(metadata.tools),
         resources: metadata.resources,
         prompts: metadata.prompts,
         prompt_discovery_failed: metadata.prompt_discovery_failed,
@@ -662,7 +808,7 @@ fn needs_auth_connection(definition: &ServerEntry) -> ServerConnection {
     ServerConnection {
         client: None,
         definition: definition.clone(),
-        tools: Vec::new(),
+        tools: Mutex::new(Vec::new()),
         resources: Vec::new(),
         prompts: Vec::new(),
         prompt_discovery_failed: false,

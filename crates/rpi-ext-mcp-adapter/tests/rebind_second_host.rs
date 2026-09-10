@@ -251,9 +251,12 @@ async fn resume_rebinds_second_host_and_republishes_status() {
     assert_eq!(host_b.flags.lock().unwrap().clone(), vec!["mcp-config"]);
     let mut events = host_b.events.lock().unwrap().clone();
     events.sort();
+    // TE24 (R7.2.7.1, index.ts:683 @ 10a45367): the `input` subscription
+    // joined the set (keep-alive convergence before input).
     assert_eq!(
         events,
         vec![
+            "input",
             "session_shutdown",
             "session_start",
             "session_tree",

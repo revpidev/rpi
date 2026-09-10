@@ -271,6 +271,24 @@ impl McpClient {
         }
     }
 
+    /// Server capabilities from the initialize result (clone).
+    pub fn server_capabilities(&self) -> Option<Value> {
+        self.server_capabilities
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// `fetchAllTools` for the keep-alive refresh (server-manager.ts
+    /// `refreshTools`): a fresh, cache-bypassed `tools/list` walk with the
+    /// cache hints from the first page.
+    pub async fn fetch_all_tools_shared(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Vec<Value>, Option<ToolListHints>), ProtocolError> {
+        self.fetch_all_tools(timeout).await
+    }
+
     /// `client.onclose` (server-manager.ts:453-457).
     pub fn set_on_close(&self, handler: Arc<dyn Fn() + Send + Sync>) {
         *self.on_close.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);

@@ -1,27 +1,46 @@
 //! Lifecycle state machine: lazy/eager/keep-alive/lazy-keep-alive modes,
-//! periodic health checks, idle shutdown, graceful shutdown order
-//! (FR-P0-09, design §3.6).
+//! periodic health checks, keep-alive convergence with exponential retry,
+//! idle shutdown, graceful shutdown order (FR-P0-09 / R7.2.7, design §3.6).
 //!
-//! Port of `lifecycle.ts` (`McpLifecycleManager`) @ pi-mcp-adapter v2.24.0
-//! (3d953f90). The 60s failure backoff tracker from `init.ts`
+//! Port of `lifecycle.ts` (`McpLifecycleManager`) @ pi-mcp-adapter v2.32.1
+//! (10a45367) — the TE24 rebase of the convergence machinery:
+//! - `ensureConverged` (:104-116): the single-flight convergence pass over
+//!   keep-alive servers, triggered on `input`, before adapter-triggered
+//!   turns and at the head of every health check;
+//! - `checkKeepAliveConnection` (:125-236): needs-auth → auth-required;
+//!   not connected → connect; connected+url → bounded `tools/list` refresh
+//!   whose TIMEOUT ONLY DEFERS (#400 — a slow-but-healthy server is never
+//!   marked failed); a terminated/expired Streamable session reconnects
+//!   (`shouldReconnectAfterRefresh`); superseded passes hand off;
+//! - exponential retry (`recordRetry` :367-390): 30s × 2^(attempts-1),
+//!   capped at 5min; a failed attempt that is still the current
+//!   connection/status is skipped until `nextAttemptAt` (upstream
+//!   `deferRefreshTimeout` is the same bookkeeping with a debug log);
+//! - `publishConnectedMetadata` (:251-267): post-connect metadata
+//!   publication with identity fencing.
+//!
+//! The 60s failure backoff tracker from `init.ts`
 //! (`recordFailure`/`clearFailure`/`getFailureAgeSeconds`) lives here too —
 //! the design assigns init.ts's lifecycle responsibilities to this module.
 //!
-//! P0 scope notes:
-//! - `hasPendingAuthForServer` is always false (OAuth pending state is P1);
-//!   the skip-reconnect branch is preserved as a hook.
-//! - The health-check interval defaults to 30s and is injectable for tests
-//!   (upstream `startHealthChecks(signal, intervalMs)` parameter).
+//! Port notes:
+//! - upstream fences stale convergence passes by object identity
+//!   (`keepAliveServers.get(name) !== definition`); the Rust port compares
+//!   entry CONTENT (`ServerEntry` equality) — a same-name replacement with
+//!   identical content is behaviorally indistinguishable, a different one
+//!   fences exactly like upstream.
+//! - `hasPendingAuthForServer` stays a hook (OAuth pending state is P1).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
-use crate::manager::{ConnectionStatus, McpServerManager};
+use crate::manager::{ConnectionStatus, McpServerManager, ServerConnection};
 use crate::metadata::ServerEntry;
 
 /// `FAILURE_BACKOFF_MS` (init.ts:39).
@@ -32,6 +51,12 @@ const MAX_FAILURE_MESSAGE_CHARS: usize = 8 * 1024;
 pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Default idle timeout (init.ts:212: `settings.idleTimeout ?? 10` minutes).
 pub const DEFAULT_IDLE_TIMEOUT_MINUTES: u64 = 10;
+/// `KEEP_ALIVE_RETRY_BASE_MS` (lifecycle.ts:15 @ 10a45367).
+pub const KEEP_ALIVE_RETRY_BASE_MS: Duration = Duration::from_secs(30);
+/// `KEEP_ALIVE_RETRY_MAX_MS` (lifecycle.ts:16 @ 10a45367).
+pub const KEEP_ALIVE_RETRY_MAX_MS: Duration = Duration::from_secs(5 * 60);
+/// `KEEP_ALIVE_CHECK_CONCURRENCY` (lifecycle.ts:17 @ 10a45367).
+const KEEP_ALIVE_CHECK_CONCURRENCY: usize = 10;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -69,7 +94,17 @@ impl LifecycleMode {
 type ReconnectCallback = Arc<dyn Fn(&str) + Send + Sync>;
 type ReconnectFailureCallback = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
-/// `McpLifecycleManager` (lifecycle.ts:10-151).
+/// `RetryState` (lifecycle.ts:22-28 @ 10a45367).
+#[derive(Debug, Clone)]
+struct RetryState {
+    attempts: u32,
+    next_attempt_at: u64,
+    connection: Weak<ServerConnection>,
+    status: Option<ConnectionStatus>,
+    warning_reported: bool,
+}
+
+/// `McpLifecycleManager` (lifecycle.ts:28-151 @ 10a45367).
 pub struct LifecycleManager {
     manager: Arc<McpServerManager>,
     keep_alive: Mutex<HashMap<String, ServerEntry>>,
@@ -79,9 +114,14 @@ pub struct LifecycleManager {
     cancel: CancellationToken,
     health_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     check_running: AtomicBool,
+    /// `activeConvergence` single-flight fence (:104-116).
+    convergence_running: AtomicBool,
     stopped: AtomicBool,
+    retry_states: Mutex<HashMap<String, RetryState>>,
     on_reconnect: Mutex<Option<ReconnectCallback>>,
     on_reconnect_failure: Mutex<Option<ReconnectFailureCallback>>,
+    on_health_restored: Mutex<Option<ReconnectCallback>>,
+    on_auth_required: Mutex<Option<ReconnectCallback>>,
     on_idle_shutdown: Mutex<Option<ReconnectCallback>>,
 }
 
@@ -96,9 +136,13 @@ impl LifecycleManager {
             cancel,
             health_task: Mutex::new(None),
             check_running: AtomicBool::new(false),
+            convergence_running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            retry_states: Mutex::new(HashMap::new()),
             on_reconnect: Mutex::new(None),
             on_reconnect_failure: Mutex::new(None),
+            on_health_restored: Mutex::new(None),
+            on_auth_required: Mutex::new(None),
             on_idle_shutdown: Mutex::new(None),
         })
     }
@@ -123,6 +167,22 @@ impl LifecycleManager {
             .unwrap_or_else(|e| e.into_inner()) = Some(callback);
     }
 
+    /// `setHealthRestoredCallback` (lifecycle.ts:47-49 @ 10a45367).
+    pub fn set_health_restored_callback(&self, callback: ReconnectCallback) {
+        *self
+            .on_health_restored
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    }
+
+    /// `setAuthRequiredCallback` (lifecycle.ts:51-53 @ 10a45367).
+    pub fn set_auth_required_callback(&self, callback: ReconnectCallback) {
+        *self
+            .on_auth_required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    }
+
     pub fn set_idle_shutdown_callback(&self, callback: ReconnectCallback) {
         *self
             .on_idle_shutdown
@@ -130,7 +190,7 @@ impl LifecycleManager {
             .unwrap_or_else(|e| e.into_inner()) = Some(callback);
     }
 
-    /// `markKeepAlive` (lifecycle.ts:38-41).
+    /// `markKeepAlive` (lifecycle.ts:59-62).
     pub fn mark_keep_alive(&self, name: &str, definition: &ServerEntry) {
         if definition.is_disabled() {
             return;
@@ -139,9 +199,15 @@ impl LifecycleManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), definition.clone());
+        // A re-registration is a fresh identity — drop stale retry state
+        // (upstream fences by object identity at use sites).
+        self.retry_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 
-    /// `registerServer` (lifecycle.ts:43-47).
+    /// `registerServer` (lifecycle.ts:64-70).
     pub fn register_server(
         &self,
         name: &str,
@@ -157,7 +223,23 @@ impl LifecycleManager {
             .insert(name.to_string(), (definition.clone(), idle_timeout_minutes));
     }
 
-    /// `setGlobalIdleTimeout` (lifecycle.ts:49-51), minutes.
+    /// `unregisterServer` (lifecycle.ts:72-77).
+    pub fn unregister_server(&self, name: &str) {
+        self.all_servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        self.keep_alive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        self.retry_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    /// `setGlobalIdleTimeout` (lifecycle.ts:79-81), minutes.
     pub fn set_global_idle_timeout_minutes(&self, minutes: u64) {
         *self
             .global_idle_timeout
@@ -165,7 +247,7 @@ impl LifecycleManager {
             .unwrap_or_else(|e| e.into_inner()) = Duration::from_secs(minutes * 60);
     }
 
-    /// `getIdleTimeout` (lifecycle.ts:123-127).
+    /// `getIdleTimeout` (lifecycle.ts:343-347).
     fn idle_timeout(&self, name: &str) -> Duration {
         let per_server = self
             .all_servers
@@ -182,7 +264,7 @@ impl LifecycleManager {
         }
     }
 
-    /// `startHealthChecks` (lifecycle.ts:57-86).
+    /// `startHealthChecks` (lifecycle.ts:92-120).
     pub fn start_health_checks(self: &Arc<Self>) {
         if self.cancel.is_cancelled() {
             self.stopped.store(true, Ordering::SeqCst);
@@ -215,62 +297,30 @@ impl LifecycleManager {
         *self.health_task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
     }
 
-    /// `checkConnections` (lifecycle.ts:88-121).
-    async fn check_connections(&self) {
+    /// `ensureConverged` (lifecycle.ts:104-116 @ 10a45367): the
+    /// single-flight convergence pass. Triggered before user input
+    /// (index.ts:683-706), before adapter-triggered turns, and at the head
+    /// of every health check (`checkConnections` :122-124).
+    pub async fn ensure_converged(self: &Arc<Self>) {
         if self.stopped.load(Ordering::SeqCst) || self.cancel.is_cancelled() {
             return;
         }
-        let keep_alive: Vec<(String, ServerEntry)> = self
-            .keep_alive
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (name, definition) in &keep_alive {
-            if definition.is_disabled() {
-                continue;
-            }
-            let connected = self
-                .manager
-                .get_connection(name)
-                .is_some_and(|c| c.status() == ConnectionStatus::Connected);
-            if connected {
-                continue;
-            }
-            // P0: no OAuth pending state (P1); upstream skips reconnect while
-            // an authorization is pending.
-            match self.manager.connect(name, definition).await {
-                Ok(_) => {
-                    if self.stopped.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    debug!(server = %name, "MCP: reconnected keep-alive server");
-                    let callback = self
-                        .on_reconnect
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    if let Some(callback) = callback {
-                        callback(name);
-                    }
-                }
-                Err(error) => {
-                    if self.stopped.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let message = error.to_string();
-                    error!(server = %name, %message, "MCP: failed to reconnect");
-                    let callback = self
-                        .on_reconnect_failure
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    if let Some(callback) = callback {
-                        callback(name, &message);
-                    }
-                }
-            }
+        if self.convergence_running.swap(true, Ordering::SeqCst) {
+            return; // an in-flight pass already converges for us
+        }
+        self.check_keep_alive_connections().await;
+        self.convergence_running.store(false, Ordering::SeqCst);
+    }
+
+    /// `checkConnections` (lifecycle.ts:122-142 @ 10a45367): converge the
+    /// keep-alive fleet FIRST, then sweep idle servers.
+    async fn check_connections(self: &Arc<Self>) {
+        if self.stopped.load(Ordering::SeqCst) || self.cancel.is_cancelled() {
+            return;
+        }
+        self.ensure_converged().await;
+        if self.stopped.load(Ordering::SeqCst) || self.cancel.is_cancelled() {
+            return;
         }
 
         let all: Vec<String> = self
@@ -280,10 +330,15 @@ impl LifecycleManager {
             .keys()
             .cloned()
             .collect();
-        let keep_alive_names: HashSet<&str> =
-            keep_alive.iter().map(|(name, _)| name.as_str()).collect();
+        let keep_alive_names: HashSet<String> = self
+            .keep_alive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         for name in all {
-            if keep_alive_names.contains(name.as_str()) {
+            if keep_alive_names.contains(&name) {
                 continue;
             }
             let timeout = self.idle_timeout(&name);
@@ -304,7 +359,406 @@ impl LifecycleManager {
         }
     }
 
-    /// `gracefulShutdown` (lifecycle.ts:129-150): cancel the health task,
+    /// `checkKeepAliveConnections` (:144-150): bounded-parallelism fan-out.
+    async fn check_keep_alive_connections(self: &Arc<Self>) {
+        let keep_alive: Vec<(String, ServerEntry)> = self
+            .keep_alive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let names: Vec<String> = keep_alive.into_iter().map(|(name, _)| name).collect();
+        let this = self.clone();
+        futures::stream::iter(names.into_iter().map(|name| {
+            let this = this.clone();
+            async move {
+                this.check_keep_alive_connection_inner(&name, true).await;
+            }
+        }))
+        .buffer_unordered(KEEP_ALIVE_CHECK_CONCURRENCY)
+        .collect::<Vec<()>>()
+        .await;
+    }
+
+    /// `checkKeepAliveConnection` (:125-236) + `handleSupersededConnection`
+    /// (:238-249). Public so the `input` handler and the dispatch gate can
+    /// converge a single server on demand.
+    pub async fn check_keep_alive_connection(&self, name: &str) {
+        self.check_keep_alive_connection_inner(name, true).await;
+    }
+
+    /// `retrySuperseded` (:131, :238-249): a superseded pass retries once
+    /// directly; the retry itself never chains another.
+    async fn check_keep_alive_connection_inner(&self, name: &str, retry_superseded: bool) {
+        let definition = {
+            let keep_alive = self.keep_alive.lock().unwrap_or_else(|e| e.into_inner());
+            match keep_alive.get(name) {
+                Some(definition) => definition.clone(),
+                None => return,
+            }
+        };
+        if definition.is_disabled()
+            || self.stopped.load(Ordering::SeqCst)
+            || self.cancel.is_cancelled()
+        {
+            return;
+        }
+        // Identity fence: a replaced/unregistered entry invalidates this
+        // pass (content equality — see module notes).
+        if !self.keep_alive_current(name, &definition) {
+            return;
+        }
+        let connection = self.manager.get_connection(name);
+        if connection
+            .as_ref()
+            .is_some_and(|c| c.status() == ConnectionStatus::NeedsAuth)
+        {
+            // A needs-auth connection needs no retry bookkeeping.
+            self.retry_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(name);
+            return;
+        }
+        if !self.should_attempt_connection(name, connection.as_ref()) {
+            return;
+        }
+        let Some(connection) = connection.filter(|c| c.status() == ConnectionStatus::Connected)
+        else {
+            // P0 hook: no OAuth pending state; upstream skips reconnect
+            // while an authorization is pending.
+            match self.manager.connect(name, &definition).await {
+                Ok(fresh) => {
+                    if self.stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if fresh.status() == ConnectionStatus::NeedsAuth {
+                        self.notify_auth_required(name, &definition);
+                        return;
+                    }
+                    if fresh.status() != ConnectionStatus::Connected {
+                        let message =
+                            format!("MCP server {name} did not return a connected session");
+                        self.report_connection_failure(name, &definition, &message, "reconnect");
+                        return;
+                    }
+                    debug!(server = %name, "MCP: reconnected keep-alive server");
+                    self.publish_connected_metadata(name, &definition).await;
+                    return;
+                }
+                Err(error) => {
+                    if self.stopped.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    self.report_connection_failure(
+                        name,
+                        &definition,
+                        &error.to_string(),
+                        "reconnect",
+                    );
+                }
+            }
+            return;
+        };
+
+        // Connected: refresh the catalog for url transports (stdio servers
+        // have no expiring session; a process that died flips the
+        // connection to closed on the next poll anyway).
+        if definition.get("url").is_none() {
+            return;
+        }
+        let had_session_id = connection
+            .client
+            .as_ref()
+            .is_some_and(|c| c.session_id().is_some());
+        let refresh_result = self.manager.refresh_tools(name, &connection).await;
+        match refresh_result {
+            Ok(crate::manager::ToolRefreshResult::Superseded) => {
+                // Hand off to whatever replaced the connection.
+                self.handle_superseded_connection(name, &definition, retry_superseded)
+                    .await;
+            }
+            Ok(crate::manager::ToolRefreshResult::RefreshTimeout) => {
+                // `deferRefreshTimeout` (:344-348): record the retry, never
+                // mark failed (#400).
+                self.record_retry(name, &definition);
+                debug!(server = %name, "MCP: keep-alive tools/list refresh timed out; retrying after backoff");
+            }
+            Ok(
+                crate::manager::ToolRefreshResult::Updated
+                | crate::manager::ToolRefreshResult::Unchanged,
+            ) => {
+                // A healthy pass clears the retry state and reports
+                // health-restored when a window was active (:230-233).
+                let had_retry = self
+                    .retry_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name)
+                    .is_some();
+                if had_retry {
+                    let callback = self
+                        .on_health_restored
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(callback) = callback {
+                        callback(name);
+                    }
+                }
+            }
+            Err(error) => {
+                if self.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                let current = self.manager.get_connection(name);
+                let superseded = !current
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, &connection))
+                    || connection.status() != ConnectionStatus::Connected;
+                if superseded {
+                    self.handle_superseded_connection(name, &definition, retry_superseded)
+                        .await;
+                    return;
+                }
+                if !should_reconnect_after_refresh(&error, had_session_id) {
+                    self.report_connection_failure(
+                        name,
+                        &definition,
+                        &error.to_string(),
+                        "refresh",
+                    );
+                    return;
+                }
+                // P0 hook: pending OAuth would skip the reconnect.
+                match self.manager.reconnect(name, &definition, &connection).await {
+                    Ok(fresh) => {
+                        if self.stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if fresh.status() == ConnectionStatus::NeedsAuth {
+                            self.notify_auth_required(name, &definition);
+                            return;
+                        }
+                        if fresh.status() != ConnectionStatus::Connected {
+                            let message =
+                                format!("MCP server {name} did not return a connected session");
+                            self.report_connection_failure(
+                                name,
+                                &definition,
+                                &message,
+                                "reconnect",
+                            );
+                            return;
+                        }
+                        debug!(server = %name, "MCP: reconnected stale MCP session");
+                        self.publish_connected_metadata(name, &definition).await;
+                    }
+                    Err(error) => {
+                        if self.stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        self.report_connection_failure(
+                            name,
+                            &definition,
+                            &error.to_string(),
+                            "reconnect",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `handleSupersededConnection` (:238-249).
+    async fn handle_superseded_connection(
+        &self,
+        name: &str,
+        definition: &ServerEntry,
+        retry_superseded: bool,
+    ) {
+        let current = self.manager.get_connection(name);
+        if !self.keep_alive_current(name, definition) {
+            return;
+        }
+        let Some(current) = current else {
+            // No replacement connected yet: one immediate retry of the
+            // pass (upstream `retrySuperseded`).
+            if retry_superseded {
+                Box::pin(self.check_keep_alive_connection_inner(name, false)).await;
+            }
+            return;
+        };
+        match current.status() {
+            ConnectionStatus::Connected => {
+                self.publish_connected_metadata(name, definition).await;
+            }
+            ConnectionStatus::NeedsAuth => {
+                self.notify_auth_required(name, definition);
+            }
+            ConnectionStatus::Closed => {
+                if retry_superseded {
+                    Box::pin(self.check_keep_alive_connection_inner(name, false)).await;
+                }
+            }
+        }
+    }
+
+    /// `publishConnectedMetadata` (:251-267): fire the reconnect callback
+    /// (upstream awaits it — the Rust callbacks are sync hooks) and clear
+    /// the retry state; fence stale passes.
+    async fn publish_connected_metadata(&self, name: &str, definition: &ServerEntry) {
+        if !self.keep_alive_current(name, definition) {
+            return;
+        }
+        let callback = self
+            .on_reconnect
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback(name);
+        }
+        self.retry_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+    }
+
+    /// `notifyAuthRequired` (:269-283).
+    fn notify_auth_required(&self, name: &str, definition: &ServerEntry) {
+        if !self.keep_alive_current(name, definition) {
+            return;
+        }
+        self.retry_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        let callback = self
+            .on_auth_required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback(name);
+        }
+    }
+
+    /// Identity fence — `keepAliveServers.get(name) !== definition`
+    /// (content equality; see module notes).
+    fn keep_alive_current(&self, name: &str, definition: &ServerEntry) -> bool {
+        self.keep_alive
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .is_some_and(|current| current == definition)
+    }
+
+    /// `shouldAttemptConnection` (:311-320): skip until `nextAttemptAt`
+    /// unless the connection/status identity changed (a changed identity
+    /// invalidates the retry state).
+    fn should_attempt_connection(
+        &self,
+        name: &str,
+        connection: Option<&Arc<ServerConnection>>,
+    ) -> bool {
+        let mut retry_states = self.retry_states.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(retry) = retry_states.get(name) else {
+            return true;
+        };
+        let status = connection.map(|c| c.status());
+        let same_connection = match (connection, retry.connection.upgrade()) {
+            (Some(current), Some(retry_connection)) => Arc::ptr_eq(current, &retry_connection),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_connection || retry.status != status {
+            retry_states.remove(name);
+            return true;
+        }
+        now_ms() >= retry.next_attempt_at
+    }
+
+    /// `reportConnectionFailure` (:322-342): record the retry, fire the
+    /// reconnect-failure callback; the loud error fires once per retry
+    /// window (the 503 transient path never reaches here loudly —
+    /// `isTransientHttpConnectError` servers keep `warning_reported`
+    /// semantics upstream; the Rust failure surface is the callback).
+    fn report_connection_failure(
+        &self,
+        name: &str,
+        definition: &ServerEntry,
+        error: &str,
+        action: &str,
+    ) {
+        if !self.record_retry(name, definition) {
+            return;
+        }
+        let callback = self
+            .on_reconnect_failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(callback) = callback {
+            callback(name, error);
+        }
+        let target = match action {
+            "reconnect" => format!("reconnect to {name}"),
+            "publish" => format!("publish metadata for {name}"),
+            _ => format!("refresh {name}"),
+        };
+        let mut retry_states = self.retry_states.lock().unwrap_or_else(|e| e.into_inner());
+        let already_reported = retry_states
+            .get(name)
+            .is_some_and(|retry| retry.warning_reported);
+        if !already_reported {
+            if let Some(retry) = retry_states.get_mut(name) {
+                retry.warning_reported = true;
+            }
+            error!(
+                server = %name,
+                "MCP: Failed to {target}: {}",
+                crate::utils::sanitize_terminal_text(error)
+            );
+        }
+    }
+
+    /// `recordRetry` (:367-390): attempts += 1; next attempt at
+    /// now + min(30s × 2^(attempts-1), 5min).
+    fn record_retry(&self, name: &str, definition: &ServerEntry) -> bool {
+        if !self.keep_alive_current(name, definition) {
+            return false;
+        }
+        let connection = self.manager.get_connection(name);
+        let status = connection.as_ref().map(|c| c.status());
+        let weak = connection.as_ref().map(Arc::downgrade);
+        let mut retry_states = self.retry_states.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = retry_states.get(name);
+        let attempts = previous
+            .map(|retry| retry.attempts.saturating_add(1))
+            .unwrap_or(1);
+        let exponent = (attempts - 1).min(10);
+        let delay = KEEP_ALIVE_RETRY_BASE_MS
+            .saturating_mul(2u32.saturating_pow(exponent))
+            .min(KEEP_ALIVE_RETRY_MAX_MS);
+        let warning_reported = previous
+            .map(|retry| retry.warning_reported)
+            .unwrap_or(false);
+        retry_states.insert(
+            name.to_string(),
+            RetryState {
+                attempts,
+                next_attempt_at: now_ms() + delay.as_millis() as u64,
+                connection: weak.unwrap_or_default(),
+                status,
+                warning_reported,
+            },
+        );
+        true
+    }
+
+    /// `gracefulShutdown` (lifecycle.ts:392-425): cancel the health task,
     /// await an in-flight check, then `closeAll`.
     pub async fn graceful_shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
@@ -317,9 +771,30 @@ impl LifecycleManager {
         if let Some(task) = task {
             let _ = task.await;
         }
+        self.retry_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.manager.close_all().await;
     }
 }
+
+/// `shouldReconnectAfterRefresh` (lifecycle.ts:427-431 @ 10a45367): a
+/// terminated Streamable HTTP session (or SDK NotConnected/ConnectionClosed)
+/// warrants a reconnect; anything else is a real failure.
+fn should_reconnect_after_refresh(
+    error: &crate::protocol::ProtocolError,
+    had_session_id: bool,
+) -> bool {
+    if crate::session_recovery::is_terminated_session(error, had_session_id) {
+        return true;
+    }
+    matches!(error, crate::protocol::ProtocolError::Closed)
+}
+
+// ============================================================================
+// Failure tracker (init.ts half)
+// ============================================================================
 
 /// Fired when a failure window opens or expires (upstream `recordFailure` /
 /// `clearFailure` / the expiry timer all call
@@ -579,5 +1054,58 @@ mod tests {
             Some("lazy-connect")
         );
         assert_eq!(recorded.len(), 3);
+    }
+
+    #[test]
+    fn retry_backoff_schedule_is_exponential_with_cap() {
+        // KEEP_ALIVE_RETRY_BASE/MAX (lifecycle.ts:15-16 @ 10a45367).
+        assert_eq!(KEEP_ALIVE_RETRY_BASE_MS, Duration::from_secs(30));
+        assert_eq!(KEEP_ALIVE_RETRY_MAX_MS, Duration::from_secs(300));
+        let delay = |attempts: u32| {
+            let exponent = (attempts - 1).min(10);
+            KEEP_ALIVE_RETRY_BASE_MS
+                .saturating_mul(2u32.saturating_pow(exponent))
+                .min(KEEP_ALIVE_RETRY_MAX_MS)
+        };
+        assert_eq!(delay(1), Duration::from_secs(30));
+        assert_eq!(delay(2), Duration::from_secs(60));
+        assert_eq!(delay(3), Duration::from_secs(120));
+        assert_eq!(delay(4), Duration::from_secs(240));
+        assert_eq!(delay(5), Duration::from_secs(300), "capped at 5min");
+        assert_eq!(delay(20), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn should_reconnect_after_refresh_classification() {
+        use crate::protocol::ProtocolError;
+        // Terminated Streamable session (404 with session id).
+        assert!(should_reconnect_after_refresh(
+            &ProtocolError::Http {
+                status: 404,
+                message: "Error POSTing to endpoint".to_string()
+            },
+            true
+        ));
+        // No session id → not a terminated-session signal.
+        assert!(!should_reconnect_after_refresh(
+            &ProtocolError::Http {
+                status: 404,
+                message: "Error POSTing to endpoint".to_string()
+            },
+            false
+        ));
+        // SDK ConnectionClosed equivalent.
+        assert!(should_reconnect_after_refresh(
+            &ProtocolError::Closed,
+            false
+        ));
+        // A real HTTP failure.
+        assert!(!should_reconnect_after_refresh(
+            &ProtocolError::Http {
+                status: 500,
+                message: "boom".to_string()
+            },
+            true
+        ));
     }
 }
