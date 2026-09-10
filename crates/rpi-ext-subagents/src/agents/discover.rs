@@ -67,9 +67,13 @@ pub struct AgentConfig {
     pub package_name: Option<String>,
     pub description: String,
     pub aliases: Option<Vec<String>>,
-    /// `None` = frontmatter did not declare `tools` (child inherits host
-    /// defaults); `Some(list)` = explicit allowlist (empty → `--no-tools`).
+    /// `None` = frontmatter did not declare `tools` (or declared the scalar
+    /// `inherit`, #1047/#1049 — host defaults, no tool flags); `Some(list)` =
+    /// explicit allowlist (`[]` from `tools: false` → `--no-tools`).
     pub tools: Option<Vec<String>>,
+    /// #1776 (R7.1.4.2): deny-list applied after the allowlist
+    /// (`--exclude-tools`, host deny-after-allow). Empty = not declared.
+    pub exclude_tools: Vec<String>,
     pub mcp_direct_tools: Vec<String>,
     pub model: Option<String>,
     pub fallback_models: Vec<String>,
@@ -434,8 +438,13 @@ pub fn agent_from_content(
         None => None,
     };
 
-    let raw_tools = super::frontmatter::parse_frontmatter_list(fm.get("tools").map(String::as_str));
+    let raw_tools = super::frontmatter::parse_tools_field(fm.get("tools").map(String::as_str));
     let (tools, mcp_direct_tools) = split_tool_list(raw_tools);
+    // #1776: frontmatter excludeTools is a plain list (agents.ts:1995/2118
+    // @ 0fc0eebb); empty block lists carry no effect.
+    let exclude_tools =
+        super::frontmatter::parse_frontmatter_list(fm.get("excludeTools").map(String::as_str))
+            .unwrap_or_default();
     let default_reads =
         super::frontmatter::parse_frontmatter_list(fm.get("defaultReads").map(String::as_str))
             .unwrap_or_default();
@@ -503,6 +512,7 @@ pub fn agent_from_content(
         description: description.to_string(),
         aliases,
         tools,
+        exclude_tools,
         mcp_direct_tools,
         model: fm.get("model").cloned(),
         fallback_models,
@@ -1074,6 +1084,30 @@ fn apply_custom_overrides(
     }
 }
 
+/// `applyToolsOverride` (agents.ts:1349-1356 @ 0fc0eebb): `"inherit"`
+/// deletes both `tools` and `mcpDirectTools` (undeclared → host defaults);
+/// `false`/list go through the same allowlist split — `false` is an explicit
+/// empty allowlist (`--no-tools`), kept distinct from inheritance (upstream
+/// test "keeps explicit empty builtin tool allowlists distinct from
+/// inherited tools", agent-overrides.test.ts:119-129).
+fn apply_tools_override(agent: &mut AgentConfig, tools_override: &crate::config::ToolsOverride) {
+    match tools_override {
+        crate::config::ToolsOverride::Inherit => {
+            agent.tools = None;
+            agent.mcp_direct_tools = Vec::new();
+        }
+        crate::config::ToolsOverride::Disable => {
+            agent.tools = Some(Vec::new());
+            agent.mcp_direct_tools = Vec::new();
+        }
+        crate::config::ToolsOverride::List(list) => {
+            let (split, mcp) = split_tool_list(Some(list.clone()));
+            agent.tools = split;
+            agent.mcp_direct_tools = mcp;
+        }
+    }
+}
+
 fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOverride) {
     // Builtin overrides replace wholesale (project/user settings win over the
     // shipped definition) — `applyBuiltinOverride` (agents.ts:1011-1043).
@@ -1086,10 +1120,13 @@ fn apply_override_entry(agent: &mut AgentConfig, entry: &crate::config::AgentOve
     if let Some(disabled) = entry.disabled {
         agent.disabled = Some(disabled);
     }
-    if let Some(tools) = &entry.tools {
-        let (split, mcp) = split_tool_list(tools.clone());
-        agent.tools = split;
-        agent.mcp_direct_tools = mcp;
+    if let Some(tools_override) = &entry.tools {
+        apply_tools_override(agent, tools_override);
+    }
+    // #1776: wholesale replace; `false` clears back to undeclared
+    // (`applyBuiltinOverride`, agents.ts:1405).
+    if let Some(exclude) = &entry.exclude_tools {
+        agent.exclude_tools = exclude.clone().unwrap_or_default();
     }
     if let Some(fallback_models) = &entry.fallback_models {
         agent.fallback_models = fallback_models.clone().unwrap_or_default();
@@ -1146,11 +1183,17 @@ fn apply_custom_override_entry(agent: &mut AgentConfig, entry: &crate::config::A
             agent.disabled = Some(disabled);
         }
     }
-    if let Some(tools) = &entry.tools {
+    if let Some(tools_override) = &entry.tools {
         if !agent.has_frontmatter_field(&["tools"]) {
-            let (split, mcp) = split_tool_list(tools.clone());
-            agent.tools = split;
-            agent.mcp_direct_tools = mcp;
+            apply_tools_override(agent, tools_override);
+        }
+    }
+    // #1776: fill-only like the other custom-agent fields (rpi keeps the
+    // v0.48 custom-override model; upstream v0.66 made custom overrides
+    // wholesale in #1796/#1798 — open item 03 附录 C.4-3, out of TE18 scope).
+    if let Some(exclude) = &entry.exclude_tools {
+        if !agent.has_frontmatter_field(&["excludeTools"]) {
+            agent.exclude_tools = exclude.clone().unwrap_or_default();
         }
     }
     if let Some(fallback_models) = &entry.fallback_models {
@@ -1259,14 +1302,14 @@ fn finish_agent_match<'a>(
 mod tests {
     use super::*;
 
-    fn write_agent(dir: &Path, name: &str, frontmatter: &str, body: &str) -> PathBuf {
+    pub(super) fn write_agent(dir: &Path, name: &str, frontmatter: &str, body: &str) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(format!("{name}.md"));
         std::fs::write(&path, format!("---\n{frontmatter}\n---\n{body}")).unwrap();
         path
     }
 
-    fn temp_root(tag: &str) -> PathBuf {
+    pub(super) fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rpi-sub-disc-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1451,7 +1494,10 @@ mod tests {
         user_settings.overrides.insert(
             "researcher".to_string(),
             crate::config::AgentOverride {
-                tools: Some(Some(vec!["read".to_string(), "write".to_string()])),
+                tools: Some(crate::config::ToolsOverride::List(vec![
+                    "read".to_string(),
+                    "write".to_string(),
+                ])),
                 ..Default::default()
             },
         );
@@ -1869,6 +1915,235 @@ mod discovery_robustness_tests {
             discover_agents_with_user_dirs(&cwd, "both", &settings, None, user_agent_dirs())
                 .unwrap();
         assert_eq!(names(&from_public), names(&ambient));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// TE18 (R7.1.4.1/.2): `tools` scalar forms + `excludeTools` on the three
+/// entry points (frontmatter / builtin `agentOverrides` / custom fill-only
+/// overrides). Upstream anchors: the scalar semantics are the override
+/// surface (`parseToolsOverride`/`applyToolsOverride`, agents.ts:946-951 /
+/// 1349-1356 @ 0fc0eebb, #1047/#1049); `excludeTools` is agents.ts:1995 /
+/// 2118 (frontmatter list) and :1405 (override wholesale replace, #1776).
+/// Ported test intents: agent-overrides.test.ts:91-124 (inherit keeps
+/// normal tools; strict elsewhere; empty ≠ inherited; excludeTools applies).
+#[cfg(test)]
+mod te18_tools_tests {
+    use super::tests::{temp_root, write_agent};
+    use super::*;
+    use crate::config::{AgentOverride, SettingsPair, SubagentSettings, ToolsOverride};
+
+    fn agent_with(frontmatter: &str) -> AgentConfig {
+        agent_from_content(
+            &format!("---\n{frontmatter}\n---\nbody"),
+            Path::new("/x/a.md"),
+            AgentSource::User,
+        )
+        .expect("agent parses")
+        .expect("agent present")
+    }
+
+    #[test]
+    fn tools_frontmatter_five_states() {
+        // FR-A vector table (task §4.2): inherit → None (undeclared); false →
+        // Some([]) (--no-tools); list → Some(list); omitted → None; empty
+        // block list → Some([]).
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: inherit").tools,
+            None
+        );
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: false").tools,
+            Some(Vec::new())
+        );
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: read, bash").tools,
+            Some(vec!["read".to_string(), "bash".to_string()])
+        );
+        assert_eq!(agent_with("name: a\ndescription: d").tools, None);
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools:").tools,
+            Some(Vec::new())
+        );
+        // Quoted scalars arrive the same way after quote stripping.
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: \"inherit\"").tools,
+            None
+        );
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: \"false\"").tools,
+            Some(Vec::new())
+        );
+        // Upstream compares after trim but case-sensitively — `Inherit`
+        // stays an ordinary (bogus) list value, gated later by the tool face.
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools: Inherit").tools,
+            Some(vec!["Inherit".to_string()])
+        );
+        // Whitespace around the scalar is trimmed (quoted values keep inner
+        // spacing only).
+        assert_eq!(
+            agent_with("name: a\ndescription: d\ntools:  inherit ").tools,
+            None
+        );
+    }
+
+    #[test]
+    fn exclude_tools_frontmatter_list() {
+        let agent =
+            agent_with("name: a\ndescription: d\ntools: read, bash\nexcludeTools: bash, edit");
+        assert_eq!(
+            agent.exclude_tools,
+            vec!["bash".to_string(), "edit".to_string()]
+        );
+        // Omitted → empty; an empty block list also carries no effect.
+        assert!(agent_with("name: a\ndescription: d")
+            .exclude_tools
+            .is_empty());
+        assert!(agent_with("name: a\ndescription: d\nexcludeTools:")
+            .exclude_tools
+            .is_empty());
+    }
+
+    #[test]
+    fn builtin_override_tools_tri_state() {
+        // agent-overrides.test.ts:91 — "lets a builtin agent inherit Pi's
+        // normal tools from an override".
+        let with = |tools: ToolsOverride| {
+            let mut user = SubagentSettings::default();
+            user.overrides.insert(
+                "researcher".to_string(),
+                AgentOverride {
+                    tools: Some(tools),
+                    ..Default::default()
+                },
+            );
+            discover_agents_with_user_dirs(
+                Path::new("/nonexistent"),
+                "both",
+                &SettingsPair {
+                    user,
+                    ..Default::default()
+                },
+                None,
+                vec![],
+            )
+            .unwrap()
+            .into_iter()
+            .find(|a| a.name == "researcher")
+            .unwrap()
+        };
+        let inherit = with(ToolsOverride::Inherit);
+        assert_eq!(inherit.tools, None, "inherit clears to undeclared");
+        assert!(inherit.mcp_direct_tools.is_empty());
+        // :119 — empty allowlist stays distinct from inherited tools.
+        let disable = with(ToolsOverride::Disable);
+        assert_eq!(disable.tools, Some(Vec::new()));
+        // :105 — strict tools stay unless the role opts into inheritance.
+        let list = with(ToolsOverride::List(vec!["read".to_string()]));
+        assert_eq!(list.tools, Some(vec!["read".to_string()]));
+    }
+
+    #[test]
+    fn builtin_override_exclude_tools_replaces() {
+        // agent-overrides.test.ts:133 — "applies excludeTools settings
+        // overrides to builtin agents" (wholesale replace, unknown names
+        // included).
+        let mut user = SubagentSettings::default();
+        user.overrides.insert(
+            "researcher".to_string(),
+            AgentOverride {
+                exclude_tools: Some(Some(vec!["write".to_string(), "unknown_tool".to_string()])),
+                ..Default::default()
+            },
+        );
+        let found = discover_agents_with_user_dirs(
+            Path::new("/nonexistent"),
+            "both",
+            &SettingsPair {
+                user,
+                ..Default::default()
+            },
+            None,
+            vec![],
+        )
+        .unwrap();
+        let researcher = found.iter().find(|a| a.name == "researcher").unwrap();
+        assert_eq!(
+            researcher.exclude_tools,
+            vec!["write".to_string(), "unknown_tool".to_string()]
+        );
+    }
+
+    #[test]
+    fn custom_override_tools_fill_only_and_exclude() {
+        let root = temp_root("te18-custom");
+        let agents = root.join("agents");
+        write_agent(&agents, "plain", "name: plain\ndescription: d", "body");
+        write_agent(
+            &agents,
+            "declared",
+            "name: declared\ndescription: d\ntools: read",
+            "body",
+        );
+        write_agent(
+            &agents,
+            "excluded-fm",
+            "name: excluded-fm\ndescription: d\nexcludeTools: bash",
+            "body",
+        );
+        let mut user = SubagentSettings::default();
+        user.overrides.insert(
+            "plain".to_string(),
+            AgentOverride {
+                tools: Some(ToolsOverride::Disable),
+                exclude_tools: Some(Some(vec!["grep".to_string()])),
+                ..Default::default()
+            },
+        );
+        // Frontmatter-declared fields win over custom overrides (fill-only;
+        // the v0.48 model rpi keeps — upstream v0.66 made these wholesale in
+        // #1796/#1798, open item 03 附录 C.4-3).
+        user.overrides.insert(
+            "declared".to_string(),
+            AgentOverride {
+                tools: Some(ToolsOverride::List(vec!["bash".to_string()])),
+                ..Default::default()
+            },
+        );
+        user.overrides.insert(
+            "excluded-fm".to_string(),
+            AgentOverride {
+                exclude_tools: Some(Some(vec!["edit".to_string()])),
+                ..Default::default()
+            },
+        );
+        let found = discover_agents_with_user_dirs(
+            &root.join("proj"),
+            "both",
+            &SettingsPair {
+                user,
+                ..Default::default()
+            },
+            None,
+            vec![agents],
+        )
+        .unwrap();
+        let plain = found.iter().find(|a| a.name == "plain").unwrap();
+        assert_eq!(plain.tools, Some(Vec::new()), "override false fills");
+        assert_eq!(plain.exclude_tools, vec!["grep".to_string()]);
+        let declared = found.iter().find(|a| a.name == "declared").unwrap();
+        assert_eq!(
+            declared.tools,
+            Some(vec!["read".to_string()]),
+            "frontmatter wins over fill-only override"
+        );
+        let excluded_fm = found.iter().find(|a| a.name == "excluded-fm").unwrap();
+        assert_eq!(
+            excluded_fm.exclude_tools,
+            vec!["bash".to_string()],
+            "frontmatter excludeTools wins over fill-only override"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

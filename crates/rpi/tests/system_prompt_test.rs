@@ -8,12 +8,18 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
+use rpi::core::resource_loader::no_global_context;
 use rpi::core::system_prompt::{
     build_system_prompt, discover_append_system_prompt_file, discover_system_prompt_file,
     load_context_file_from_dir, load_project_context_files, resolve_prompt_input,
     BuildSystemPromptOptions,
 };
+
+/// Env-var tests mutate process state; serialize them (contract-test
+/// precedent in crates/rpi-ai/tests/contract_bedrock_converse_stream.rs).
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------
 // Temp dir helper (mirrors crates/rpi/src/tools.rs test_helpers::TempDir,
@@ -158,7 +164,7 @@ fn global_then_ancestors_root_side_first() {
     tmp.write("repo/CLAUDE.md", "repo");
     tmp.write("repo/sub/deep/AGENTS.md", "deep");
 
-    let files = load_project_context_files(&cwd, &agent_dir);
+    let files = load_project_context_files(&cwd, &agent_dir, true);
     let ours: Vec<(&str, &str)> = files
         .iter()
         .filter(|f| f.path.starts_with(tmp.path()))
@@ -197,7 +203,7 @@ fn agent_dir_overlapping_ancestor_is_deduplicated() {
     tmp.write("AGENTS.md", "shared");
     tmp.write("repo/AGENTS.md", "repo");
 
-    let files = load_project_context_files(&cwd, tmp.path());
+    let files = load_project_context_files(&cwd, tmp.path(), true);
     let shared: Vec<_> = files.iter().filter(|f| f.content == "shared").collect();
     assert_eq!(shared.len(), 1);
     assert_eq!(files.first().map(|f| f.content.as_str()), Some("shared"));
@@ -209,7 +215,7 @@ fn no_context_files_anywhere_under_tmp() {
     let tmp = TempDir::new();
     let cwd = tmp.path().join("a/b");
     std::fs::create_dir_all(&cwd).expect("mkdir");
-    let files = load_project_context_files(&cwd, &tmp.path().join("agent"));
+    let files = load_project_context_files(&cwd, &tmp.path().join("agent"), true);
     assert!(files.iter().all(|f| !f.path.starts_with(tmp.path())));
 }
 
@@ -328,7 +334,7 @@ fn context_files_injected_byte_exact_into_default_prompt() {
     tmp.write("agent/AGENTS.md", "global rules");
     tmp.write("repo/AGENTS.md", "repo rules");
 
-    let context_files = load_project_context_files(&cwd, &agent_dir);
+    let context_files = load_project_context_files(&cwd, &agent_dir, true);
     let options = BuildSystemPromptOptions {
         custom_prompt: Some("BASE".to_string()),
         append_system_prompt: Some("APPEND".to_string()),
@@ -388,7 +394,7 @@ fn nested_worktree_shadows_main_repo_agents_md() {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
 
-    let files = load_project_context_files(&worktree_root, &agent_dir);
+    let files = load_project_context_files(&worktree_root, &agent_dir, true);
     let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
     // Only the worktree's AGENTS.md should appear; the main repo's copy is
     // shadowed and deduplicated.
@@ -413,7 +419,7 @@ fn nested_worktree_no_shadow_when_filenames_differ() {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
 
-    let files = load_project_context_files(&worktree_root, &agent_dir);
+    let files = load_project_context_files(&worktree_root, &agent_dir, true);
     let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
     // Both should appear since they are different files (different names).
     assert!(contents.contains(&"worktree rules"));
@@ -435,9 +441,74 @@ fn non_worktree_repo_has_no_shadow_dedup() {
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("mkdir agent");
 
-    let files = load_project_context_files(&repo, &agent_dir);
+    let files = load_project_context_files(&repo, &agent_dir, true);
     let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
     // Both files should appear — no shadowing in a regular repo.
     assert!(contents.contains(&"repo rules"));
     assert!(contents.contains(&"parent rules"));
+}
+
+// ---------------------------------------------------------------------------
+// include_global (ADR-0026 decision 2, TE18 FR-H)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn include_global_false_skips_only_the_global_segment() {
+    let tmp = TempDir::new();
+    let agent_dir = tmp.path().join("agent");
+    let cwd = tmp.path().join("repo/sub");
+    std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+    tmp.write("agent/AGENTS.md", "global");
+    tmp.write("repo/AGENTS.md", "repo");
+    tmp.write("repo/sub/AGENTS.md", "sub");
+
+    // include_global=false: ONLY the global agent-dir segment disappears;
+    // the ancestor (project/repo) chain is preserved byte-for-byte.
+    let files = load_project_context_files(&cwd, &agent_dir, false);
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    assert_eq!(contents, ["repo", "sub"], "global skipped, chain kept");
+
+    // Default (true) keeps both — unchanged ordering semantics.
+    let files = load_project_context_files(&cwd, &agent_dir, true);
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    assert_eq!(contents, ["global", "repo", "sub"]);
+}
+
+#[test]
+fn no_global_context_env_gate_matches_only_truthy_values() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for value in ["1", "true", "TRUE", " 1 "] {
+        std::env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
+        assert!(
+            no_global_context(),
+            "value {value:?} should enable the gate"
+        );
+    }
+    for value in ["0", "false", "", "no", "off"] {
+        std::env::set_var("RPI_NO_GLOBAL_CONTEXT", value);
+        assert!(
+            !no_global_context(),
+            "value {value:?} should not enable the gate"
+        );
+    }
+    std::env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    assert!(!no_global_context(), "unset env keeps default inheritance");
+}
+
+#[test]
+fn no_global_context_env_skips_global_segment_end_to_end() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new();
+    let agent_dir = tmp.path().join("agent");
+    let cwd = tmp.path().join("repo");
+    std::fs::create_dir_all(cwd.join(".rpi")).expect("mkdir");
+    tmp.write("agent/AGENTS.md", "global");
+    tmp.write("repo/AGENTS.md", "repo");
+
+    std::env::set_var("RPI_NO_GLOBAL_CONTEXT", "1");
+    let files = load_project_context_files(&cwd, &agent_dir, !no_global_context());
+    std::env::remove_var("RPI_NO_GLOBAL_CONTEXT");
+    let contents: Vec<&str> = files.iter().map(|f| f.content.as_str()).collect();
+    assert_eq!(contents, ["repo"], "env gate skips only the global segment");
 }

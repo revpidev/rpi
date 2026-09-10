@@ -54,7 +54,7 @@ const GENERATED = resolve(
 );
 const MODES =
 	TRACK === "target"
-		? ["args", "frontmatter", "final-output", "fallback", "discovery", "notify"]
+		? ["args", "frontmatter", "final-output", "fallback", "model", "discovery", "notify"]
 		: ["args", "frontmatter", "final-output"];
 
 // Session paths in fixtures.json use the /sess/root placeholder; both legs
@@ -86,11 +86,11 @@ function loadCases(mode) {
 	return cases;
 }
 
-function materialize(mode) {
-	const raw = JSON.stringify(loadCases(mode));
+function materialize(mode, caseSubset) {
+	const raw = JSON.stringify(caseSubset ?? loadCases(mode));
 	const rewritten = raw.replaceAll("/sess/root", `${SESSION_BASE}/sess/root`);
 	const cases = JSON.parse(rewritten);
-	const modeFile = `${CASES_DIR}/cases-${TRACK}-${mode}.json`;
+	const modeFile = `${CASES_DIR}/cases-${TRACK}-${mode}${caseSubset ? "-subset" : ""}.json`;
 	writeFileSync(modeFile, JSON.stringify({ cases }));
 	return modeFile;
 }
@@ -214,6 +214,11 @@ function normalizeOutput(output) {
 		const RPI_ONLY_ENV_KEYS = new Set([
 			"RPI_SUBAGENT_STEER_INBOX",
 			"RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR",
+			// TE18 (ADR-0026): the rpi-side switch for upstream #1560's
+			// in-process `inheritGlobalContext: false` default — no argv/env
+			// counterpart on either pin; its presence is pinned by crate unit
+			// tests + the e2e env dump instead of this diff.
+			"RPI_NO_GLOBAL_CONTEXT",
 		]);
 		for (const key of Object.keys(clone.env).sort()) {
 			if (RPI_ONLY_ENV_KEYS.has(key)) continue;
@@ -262,8 +267,46 @@ const attribution = { "upstream-semantics": [], "rpi-deviation": [] };
 const unattributed = [];
 let ok = true;
 
-function compareMode(mode, report) {
-	const modeFile = materialize(mode);
+// TE18: target-track args face = frozen v0.48 golden cases (upstream leg
+// reads the golden) + [RPI-OWN] inline-expected cases for semantics no
+// upstream recorder has (upstream deleted pi-args.ts before gaining
+// --exclude-tools; ADR-0025 §4). Inline cases compare the Rust leg against
+// the `expected` object shipped in the fixture.
+function compareArgsTarget(report) {
+	const all = loadCases("args");
+	const goldenCases = all.filter((entry) => !entry.expected);
+	const inlineCases = all.filter((entry) => entry.expected);
+	if (goldenCases.length > 0) {
+		compareMode("args", report, goldenCases);
+	}
+	const lines = [];
+	if (inlineCases.length > 0) {
+		const rust = runRust("args", materialize("args", inlineCases));
+		for (const fixture of inlineCases) {
+			const produced = rust.find((entry) => entry.name === fixture.name);
+			if (!produced) {
+				lines.push(`- ${fixture.name}: MISSING FROM RUST LEG`);
+				ok = false;
+				continue;
+			}
+			const diff = diffOutput(fixture.expected, produced.output);
+			if (!diff) {
+				lines.push(`- ${fixture.name}: MATCH (inline [RPI-OWN] golden)`);
+			} else {
+				lines.push(
+					`- ${fixture.name}: MISMATCH (inline [RPI-OWN] golden)\n` +
+						`  expected: ${JSON.stringify(diff.upstream)}\n` +
+						`  rust:     ${JSON.stringify(diff.rust)}`,
+			);
+				ok = false;
+			}
+		}
+		report.push(`## args (inline [RPI-OWN] golden)\n\n${lines.join("\n")}\n`);
+	}
+}
+
+function compareMode(mode, report, caseSubset) {
+	const modeFile = materialize(mode, caseSubset);
 	const upstream = runUpstream(mode, modeFile);
 	const rust = runRust(mode, modeFile);
 	if (upstream.length !== rust.length) {
@@ -311,13 +354,20 @@ function compareMode(mode, report) {
 }
 
 if (RECORD_ARGS_GOLDEN) {
-	const modeFile = materialize("args");
+	// Only the fixtures.json (v0.48-recorded) cases go through the recorder;
+	// TE18 inline-expected cases (excludeTools/global-context semantics) have
+	// no upstream recorder and live in fixtures-target.json with their own
+	// expected objects.
+	const recordable = loadCases("args").filter((entry) => !entry.expected);
+	const modeFile = materialize("args", recordable);
 	const entries = runUpstream("args", modeFile);
 	const golden = {
 		"//":
 			"Frozen argv/env baseline for the subagents target track ([RPI-OWN], ADR-0025 §4): " +
 			"recorded from the pinned v0.48.0 upstream leg (pi-args.ts) before the v0.65 deletion. " +
-			"Regenerate with `node scripts/subagents-parity/run-parity.mjs --record-args-golden`.",
+			"Regenerate with `node scripts/subagents-parity/run-parity.mjs --record-args-golden` " +
+			"(records only the fixtures.json args cases; TE18+ semantics cases carry inline " +
+			"expected objects in fixtures-target.json — see compareArgsTarget).",
 		cases: entries.map((entry) => ({ name: entry.name, output: normalizeOutput(entry.output) })),
 	};
 	writeFileSync(GOLDEN_PATH, JSON.stringify(golden, null, 2) + "\n");
@@ -335,7 +385,11 @@ const report = [
 	"",
 ];
 for (const mode of MODES) {
-	compareMode(mode, report);
+	if (mode === "args" && TRACK === "target") {
+		compareArgsTarget(report);
+	} else {
+		compareMode(mode, report);
+	}
 }
 if (TRACK === "target") {
 	report.push("## Attribution summary", "");

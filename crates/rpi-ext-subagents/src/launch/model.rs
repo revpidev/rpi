@@ -251,9 +251,13 @@ pub fn resolve_base_model_candidate(
     fuzzy_resolve_model(base_model, available_models, preferred_provider)
 }
 
-/// `resolveModelCandidate` (model-fallback.ts:148-163): resolve a possibly
+/// `resolveModelCandidate` (model-fallback.ts:195-209): resolve a possibly
 /// loose model id to canonical `provider/id`; exact registry matches win,
-/// thinking suffix is retried on the base when the whole id misses.
+/// thinking suffix is retried on the base when the whole id misses. The
+/// lenient variant (miss → verbatim passthrough) — retained for parity
+/// surfaces; subagent launches use the strict/required variants above
+/// (#1093). Kept for the target-track parity facade.
+#[allow(dead_code)]
 pub fn resolve_model_candidate(
     model: Option<&str>,
     available_models: Option<&[AvailableModel]>,
@@ -281,6 +285,61 @@ pub fn resolve_model_candidate(
         return Some(format!("{resolved}{suffix}"));
     }
     Some(trimmed.to_string())
+}
+
+/// `resolveSubagentModelCandidate` (model-fallback.ts:210-219 @ 0fc0eebb,
+/// #1093): the strict variant used for subagent launches — an empty/absent
+/// registry keeps the string verbatim (R7.1.4.4), but a non-empty registry
+/// that cannot match the id (whole or thinking-suffix base) yields `None`
+/// instead of passing the raw string through.
+pub fn resolve_subagent_model_candidate(
+    model: &str,
+    available_models: Option<&[AvailableModel]>,
+    preferred_provider: Option<&str>,
+) -> Option<String> {
+    let Some(models) = available_models else {
+        return Some(model.to_string());
+    };
+    if models.is_empty() {
+        return Some(model.to_string());
+    }
+    if let Some(resolved) = resolve_base_model_candidate(model, models, preferred_provider) {
+        return Some(resolved);
+    }
+    let (base, suffix) = split_thinking_suffix(model);
+    if !suffix.is_empty() {
+        if let Some(resolved) = resolve_base_model_candidate(base, models, preferred_provider) {
+            return Some(format!("{resolved}{suffix}"));
+        }
+    }
+    None
+}
+
+/// `resolveRequiredSubagentModelCandidate` (model-fallback.ts:230-238
+/// @ 0fc0eebb, #1093 / R7.1.4.5): the strict resolution with a fail-closed
+/// error — a non-empty registry must match the requested model before the
+/// child spawns, instead of forwarding an invalid `--model` to the child.
+/// The upstream "Did you mean" cross-provider suggestion is not ported
+/// (upstream `suggestAlternateProviderModel` depends on the in-process
+/// registry shape); the model name + registry pointer are kept verbatim.
+pub fn resolve_required_subagent_model_candidate(
+    model: &str,
+    available_models: Option<&[AvailableModel]>,
+    preferred_provider: Option<&str>,
+) -> Result<String, String> {
+    resolve_subagent_model_candidate(model, available_models, preferred_provider)
+        .ok_or_else(|| format!("Unknown subagent model '{model}' in the active Pi model registry."))
+}
+
+/// R7.1.4.4 (TE18 FR-D): the explicit empty-registry branch — fuzzy
+/// resolution is skipped (verbatim passthrough), which must stay visible in
+/// launch diagnostics instead of silently regressing to passthrough.
+/// `Some(text)` only when a registry is unavailable AND a model string was
+/// in play that would otherwise have been fuzzy-resolved.
+pub fn registry_unavailable_diagnostic(has_model_input: bool) -> Option<&'static str> {
+    has_model_input.then_some(
+        "model registry unavailable (ctx.scopedModels empty) -> skipping fuzzy model resolution; passing model strings through verbatim",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +487,12 @@ pub fn parse_model_scope_config(value: Option<&Value>) -> Result<Option<ModelSco
 // Override resolution (model-fallback.ts:180+)
 // ---------------------------------------------------------------------------
 
-/// `resolveSubagentModelOverride` (model-fallback.ts:231-258): resolve the
-/// `--model` override for a spawned child. Empty/`inherit` → parent session
-/// model. Out-of-scope: `Err` for explicit + strict, warn callback otherwise.
+/// `resolveSubagentModelOverride` (model-fallback.ts:362-391 @ 0fc0eebb):
+/// resolve the `--model` override for a spawned child. Empty/`inherit` →
+/// parent session model. An explicit string is strict-resolved; when the
+/// request source is `explicit` the #1093 required check fail-closes on a
+/// registry miss, inherited sources keep the verbatim passthrough. Out of
+/// scope: `Err` for explicit + strict scope, warn callback otherwise.
 pub fn resolve_subagent_model_override(
     requested_model: Option<&str>,
     parent_model: Option<(&str, &str)>,
@@ -449,7 +511,26 @@ pub fn resolve_subagent_model_override(
     let resolved = match explicit {
         None => parent_model.map(|(provider, id)| format!("{provider}/{id}")),
         Some(explicit) => {
-            resolve_model_candidate(Some(explicit), available_models, preferred_provider)
+            let candidate =
+                resolve_subagent_model_candidate(explicit, available_models, preferred_provider);
+            if source == ModelSource::Explicit {
+                // #1093 (R7.1.4.5): explicit requests must exist in a
+                // non-empty registry before spawn — fail closed.
+                Some(candidate.map_or_else(
+                    || {
+                        resolve_required_subagent_model_candidate(
+                            explicit,
+                            available_models,
+                            preferred_provider,
+                        )
+                    },
+                    Ok,
+                )?)
+            } else if let Some(candidate) = candidate {
+                Some(candidate)
+            } else {
+                Some(explicit.to_string())
+            }
         }
     };
     if let Some(resolved) = resolved.as_deref() {
@@ -505,31 +586,102 @@ pub fn resolve_effective_subagent_model(
     )
 }
 
-/// `buildModelCandidates` (model-fallback.ts:285-318): primary + fallbacks,
-/// deduped, resolved against the registry. Fallback entries and (under strict
-/// enforcement) even the primary are scope-checked as inherited models.
+/// How the primary model of a launch was selected (upstream `ModelOrigin`,
+/// model-fallback.ts:422 @ 0fc0eebb): explicit call param, inherited from
+/// the parent session, or agent-configured. Decides where the #1093
+/// required (fail-closed) check applies in the candidate chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelOrigin {
+    Explicit,
+    Inherited,
+    Configured,
+}
+
+/// `resolveModelOrigin` (model-fallback.ts:437-450 @ 0fc0eebb).
+pub fn resolve_model_origin(
+    explicit_model: Option<&str>,
+    agent_model: Option<&str>,
+    parent_model: Option<(&str, &str)>,
+) -> ModelOrigin {
+    // inheritsParentModel: parent present and the effective request
+    // (explicit ?? agent) is empty or the `inherit` sentinel.
+    let effective = explicit_model.or(agent_model).map(str::trim).unwrap_or("");
+    if parent_model.is_some() && (effective.is_empty() || effective == INHERIT_MODEL) {
+        return ModelOrigin::Inherited;
+    }
+    let explicit_trimmed = explicit_model.map(str::trim).unwrap_or("");
+    if !explicit_trimmed.is_empty() && explicit_trimmed != INHERIT_MODEL {
+        return ModelOrigin::Explicit;
+    }
+    ModelOrigin::Configured
+}
+
+/// `buildModelCandidates` (model-fallback.ts:461-541 @ 0fc0eebb, P0 subset
+/// without the exclusion cache / zero-usable exclusion evidence —
+/// modelExclusions are R7.1.10.2/M3): primary + fallbacks, deduped, resolved
+/// against the registry. The primary passes through when it was resolved by
+/// the caller (explicit/inherited origin); a configured primary and fallback
+/// entries go through the strict resolution, misses are skipped with a warn,
+/// and a chain left with no usable candidate re-runs the first skip through
+/// the required check so the launch fails closed (#1093).
 pub fn build_model_candidates(
     primary_model: Option<&str>,
     fallback_models: &[String],
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
     scope: Option<&ModelScopeConfig>,
+    origin: ModelOrigin,
     on_warn: &mut dyn FnMut(&ModelScopeViolation),
 ) -> Result<Vec<String>, String> {
+    if let ModelOrigin::Explicit = origin {
+        // Explicit primaries fail closed immediately (upstream normalizes
+        // them via the required resolution before the chain).
+        if let Some(primary) = primary_model.map(str::trim).filter(|m| !m.is_empty()) {
+            resolve_required_subagent_model_candidate(
+                primary,
+                available_models,
+                preferred_provider,
+            )?;
+        }
+    }
     let mut seen = std::collections::BTreeSet::new();
     let mut candidates: Vec<String> = Vec::new();
     let raw: Vec<Option<&str>> = std::iter::once(primary_model)
         .chain(fallback_models.iter().map(|s: &String| Some(s.as_str())))
         .collect();
+    let mut skipped_primary: Option<String> = None;
+    let mut skipped_fallback: Option<String> = None;
     for (index, raw_entry) in raw.into_iter().enumerate() {
         let Some(raw) = raw_entry else {
             continue;
         };
-        let Some(normalized) =
-            resolve_model_candidate(Some(raw), available_models, preferred_provider)
-        else {
+        let raw = raw.trim();
+        if raw.is_empty() {
             continue;
-        };
+        }
+        let normalized =
+            if index == 0 && matches!(origin, ModelOrigin::Inherited | ModelOrigin::Explicit) {
+                // Already resolved by the caller (or the parent session itself).
+                raw.to_string()
+            } else {
+                match resolve_subagent_model_candidate(raw, available_models, preferred_provider) {
+                    Some(normalized) => normalized,
+                    None => {
+                        if index == 0 {
+                            skipped_primary = Some(raw.to_string());
+                        } else {
+                            if skipped_fallback.is_none() {
+                                skipped_fallback = Some(raw.to_string());
+                            }
+                            tracing::warn!(
+                                model = raw,
+                                "skipping fallback model unavailable in this environment"
+                            );
+                        }
+                        continue;
+                    }
+                }
+            };
         if seen.contains(&normalized) {
             continue;
         }
@@ -547,6 +699,24 @@ pub fn build_model_candidates(
         }
         seen.insert(normalized.clone());
         candidates.push(normalized);
+    }
+    if candidates.is_empty() {
+        // A chain that skipped its only resolvable entry fails closed through
+        // the required check (upstream re-runs the first skip).
+        if let Some(primary) = skipped_primary {
+            resolve_required_subagent_model_candidate(
+                &primary,
+                available_models,
+                preferred_provider,
+            )?;
+        }
+        if let Some(fallback) = skipped_fallback {
+            resolve_required_subagent_model_candidate(
+                &fallback,
+                available_models,
+                preferred_provider,
+            )?;
+        }
     }
     Ok(candidates)
 }
@@ -740,7 +910,7 @@ pub fn format_model_attempt_note(
 mod tests {
     use super::*;
 
-    fn models() -> Vec<AvailableModel> {
+    pub(super) fn models() -> Vec<AvailableModel> {
         vec![
             AvailableModel {
                 full_id: "anthropic/claude-5".into(),
@@ -960,6 +1130,9 @@ mod tests {
             Some(&registry),
             None,
             Some(&scope),
+            // configured origin: the primary is strict-resolved like a
+            // fallback (the test's "claude-5" hits the registry).
+            ModelOrigin::Configured,
             &mut sink,
         )
         .unwrap();
@@ -1107,5 +1280,244 @@ mod tests {
             format_model_attempt_note("openai/x", None, Some(3), None),
             "[fallback] openai/x failed: exit 3."
         );
+    }
+}
+
+/// TE18 (R7.1.4.4/.5, #1093): strict/required model resolution, origin-aware
+/// candidate chains, and the explicit empty-registry diagnostic branch.
+#[cfg(test)]
+mod te18_model_tests {
+    use super::tests::models;
+    use super::*;
+
+    fn sink(_violation: &ModelScopeViolation) {}
+
+    #[test]
+    fn strict_candidate_empty_registry_passes_through() {
+        // R7.1.4.4: an empty/absent registry is NOT "no usable models" —
+        // the string passes verbatim (diagnostic branch, not an error).
+        for registry in [None, Some(&[][..])] {
+            assert_eq!(
+                resolve_subagent_model_candidate("faux/primary", registry, None),
+                Some("faux/primary".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn strict_candidate_registry_hit_and_miss() {
+        let registry = models();
+        // whole-id hit
+        assert_eq!(
+            resolve_subagent_model_candidate("anthropic/claude-5", Some(&registry), None),
+            Some("anthropic/claude-5".to_string())
+        );
+        // shorthand hit canonicalizes
+        assert_eq!(
+            resolve_subagent_model_candidate("claude-5", Some(&registry), None),
+            Some("anthropic/claude-5".to_string())
+        );
+        // thinking-suffix retry on the base
+        assert_eq!(
+            resolve_subagent_model_candidate("claude-5:high", Some(&registry), None),
+            Some("anthropic/claude-5:high".to_string())
+        );
+        // miss → None (strict), never passthrough
+        assert_eq!(
+            resolve_subagent_model_candidate("faux/primary", Some(&registry), None),
+            None
+        );
+    }
+
+    #[test]
+    fn required_candidate_fails_closed_upstream_message() {
+        let registry = models();
+        let error =
+            resolve_required_subagent_model_candidate("faux/primary", Some(&registry), None)
+                .unwrap_err();
+        // Upstream message (model-fallback.ts:235-237 @ 0fc0eebb): model
+        // name + active-registry pointer. (The cross-provider "Did you
+        // mean" suggestion is not ported — in-process registry dependency.)
+        assert_eq!(
+            error,
+            "Unknown subagent model 'faux/primary' in the active Pi model registry."
+        );
+        // Empty registry never fails (passthrough is correct there).
+        assert_eq!(
+            resolve_required_subagent_model_candidate("faux/primary", None, None),
+            Ok("faux/primary".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_override_fails_closed_inherited_passes_through() {
+        let registry = models();
+        // Explicit source + registry miss → Err (#1093).
+        let error = resolve_subagent_model_override(
+            Some("faux/primary"),
+            None,
+            Some(&registry),
+            None,
+            None,
+            ModelSource::Explicit,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("Unknown subagent model"), "{error}");
+        // Inherited source (agent-config models resolve leniently here) →
+        // verbatim passthrough; the fail-closed lands in the candidate chain.
+        assert_eq!(
+            resolve_subagent_model_override(
+                Some("faux/primary"),
+                None,
+                Some(&registry),
+                None,
+                None,
+                ModelSource::Inherited,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("faux/primary".to_string())
+        );
+        // Explicit source + registry hit resolves canonically.
+        assert_eq!(
+            resolve_subagent_model_override(
+                Some("claude-5"),
+                None,
+                Some(&registry),
+                None,
+                None,
+                ModelSource::Explicit,
+                &mut sink,
+            )
+            .unwrap(),
+            Some("anthropic/claude-5".to_string())
+        );
+    }
+
+    #[test]
+    fn origin_classification() {
+        let parent = ("anthropic", "claude-5");
+        assert_eq!(
+            resolve_model_origin(Some("openai/gpt-5.5"), None, Some(parent)),
+            ModelOrigin::Explicit
+        );
+        assert_eq!(
+            resolve_model_origin(None, None, Some(parent)),
+            ModelOrigin::Inherited
+        );
+        assert_eq!(
+            resolve_model_origin(None, Some("inherit"), Some(parent)),
+            ModelOrigin::Inherited
+        );
+        assert_eq!(
+            resolve_model_origin(None, Some("anthropic/claude-5"), Some(parent)),
+            ModelOrigin::Configured
+        );
+        assert_eq!(
+            resolve_model_origin(None, Some("anthropic/claude-5"), None),
+            ModelOrigin::Configured
+        );
+    }
+
+    #[test]
+    fn candidates_origin_aware_required_checks() {
+        let registry = models();
+        // Explicit primary missing from the registry → immediate Err.
+        let error = build_model_candidates(
+            Some("faux/primary"),
+            &[],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Explicit,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("Unknown subagent model"), "{error}");
+        // Configured primary missing → skipped, then fail-closed at the end
+        // when nothing usable remains.
+        let error = build_model_candidates(
+            Some("faux/primary"),
+            &[],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Configured,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(error.contains("Unknown subagent model"), "{error}");
+        // Configured primary missing + usable fallback → primary skipped
+        // (warned), fallback survives.
+        let candidates = build_model_candidates(
+            Some("faux/primary"),
+            &["claude-5".to_string()],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Configured,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(candidates, vec!["anthropic/claude-5".to_string()]);
+        // Primary hit + fallback miss → fallback skipped with a warn, the
+        // chain stays usable (upstream only fail-closes when NOTHING
+        // remains).
+        let candidates = build_model_candidates(
+            Some("anthropic/claude-5"),
+            &["faux/secondary".to_string()],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Explicit,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(candidates, vec!["anthropic/claude-5".to_string()]);
+        // No primary + an unresolvable fallback → the chain is empty, the
+        // skipped fallback fails closed.
+        let error = build_model_candidates(
+            None,
+            &["faux/secondary".to_string()],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Configured,
+            &mut sink,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("Unknown subagent model 'faux/secondary'"),
+            "{error}"
+        );
+        // Inherited primary passes through even when outside the registry
+        // (parent session model is authoritative).
+        let candidates = build_model_candidates(
+            Some("faux/parent-model"),
+            &[],
+            Some(&registry),
+            None,
+            None,
+            ModelOrigin::Inherited,
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(candidates, vec!["faux/parent-model".to_string()]);
+    }
+
+    #[test]
+    fn registry_unavailable_diagnostic_branch() {
+        // The empty-registry branch must be explicit and observable (G3:
+        // the diagnostic text is asserted so passthrough cannot regress
+        // silently).
+        assert!(registry_unavailable_diagnostic(true).is_some());
+        let text = registry_unavailable_diagnostic(true).unwrap();
+        assert!(
+            text.contains("model registry unavailable")
+                && text.contains("skipping fuzzy model resolution"),
+            "{text}"
+        );
+        assert!(registry_unavailable_diagnostic(false).is_none());
     }
 }

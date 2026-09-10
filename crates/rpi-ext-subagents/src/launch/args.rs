@@ -30,6 +30,9 @@ use crate::paths;
 pub const TASK_ARG_LIMIT: usize = 8000;
 pub const SUBAGENT_TASK_DELIVERY_ENV: &str = "RPI_SUBAGENT_TASK_DELIVERY";
 pub const SUBAGENT_CHILD_ENV: &str = "RPI_SUBAGENT_CHILD";
+/// Host-side global-context opt-out (ADR-0026 decision 2; the host reads
+/// the same name in `resource_loader::no_global_context`).
+pub const NO_GLOBAL_CONTEXT_ENV: &str = "RPI_NO_GLOBAL_CONTEXT";
 pub const SUBAGENT_FANOUT_CHILD_ENV: &str = "RPI_SUBAGENT_FANOUT_CHILD";
 pub const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV: &str = "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 pub const SUBAGENT_INHERIT_SKILLS_ENV: &str = "RPI_SUBAGENT_INHERIT_SKILLS";
@@ -136,6 +139,9 @@ pub struct BuildArgsInput {
     pub inherit_skills: bool,
     pub require_read_tool: bool,
     pub tools: Option<Vec<String>>,
+    /// #1776 (R7.1.4.2): deny-list → `--exclude-tools` (host CLI applies
+    /// deny after allow, tools.rs:82); empty = not declared (no flag).
+    pub exclude_tools: Vec<String>,
     pub extensions: Option<Vec<String>>,
     pub subagent_only_extensions: Option<Vec<String>>,
     pub mcp_direct_tools: Vec<String>,
@@ -168,18 +174,34 @@ pub struct LaunchToolPlan {
     pub extension_args: Vec<String>,
 }
 
-/// `resolvePiLaunchToolPlan` (pi-args.ts:374-538) P0 subset: no capability
-/// ceiling, no MCP direct resolution (P2 — `mcp:` names parse but resolve to
-/// nothing), no structured-output internal tool. `self_extension` is the
-/// always-injected runtime extension slot (upstream PROMPT_RUNTIME path →
-/// this cdylib).
+/// `resolvePiLaunchToolPlan` (pi-args.ts:374-538; exclude semantics from
+/// child-tool-plan.ts:367-381 @ 0fc0eebb, #1776/#2034) P0 subset: no
+/// capability ceiling, no MCP direct resolution (P2 — `mcp:` names parse but
+/// resolve to nothing), no structured-output internal tool. `self_extension`
+/// is the always-injected runtime extension slot (upstream PROMPT_RUNTIME
+/// path → this cdylib).
+///
+/// `exclude_tools` is applied to the declared builtin list before the
+/// effective allowlist / fanout authorization / required-tools are derived
+/// (upstream `effectiveDeclaredBuiltinTools`); the raw deny list rides argv
+/// as `--exclude-tools` and the child's host CLI re-applies deny-after-allow
+/// (tools.rs:82) — equivalent end state, one flag surface.
 pub fn resolve_launch_tool_plan(
     tools: Option<&Vec<String>>,
+    exclude_tools: &[String],
     extensions: Option<&Vec<String>>,
     subagent_only_extensions: Option<&Vec<String>>,
     require_read_tool: bool,
     self_extension: Option<&str>,
 ) -> LaunchToolPlan {
+    // #1776: deny entries are trimmed, empties dropped, deduped
+    // (`[...new Set((input.excludeTools ?? []).map(trim).filter(Boolean))]`,
+    // child-tool-plan.ts:367).
+    let exclude_set: std::collections::BTreeSet<&str> = exclude_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
     // Path-shaped entries in `tools` (contain `/` or end with .ts/.js) are
     // extension paths, not builtin tool names (pi-args.ts:385-389, 408-414).
     let is_path_shaped =
@@ -198,19 +220,23 @@ pub fn resolve_launch_tool_plan(
 
     // declaredBuiltinTools (395-406): tools undefined → no constraint; explicit
     // list gets `read` prepended when skills need lazy loading and it's absent.
-    let declared_builtin = match &tools {
+    // The deny list then removes excluded names (effectiveDeclaredBuiltinTools).
+    let declared_builtin: Vec<String> = match &tools {
         None => Vec::new(),
         Some(_) => {
             let needs_read = require_read_tool
                 && !requested_builtin.is_empty()
                 && !requested_builtin.iter().any(|t| t == "read");
-            if needs_read {
+            let base: Vec<String> = if needs_read {
                 let mut with_read = vec!["read".to_string()];
                 with_read.extend(requested_builtin.iter().cloned());
                 with_read
             } else {
                 requested_builtin.clone()
-            }
+            };
+            base.into_iter()
+                .filter(|tool| !exclude_set.contains(tool.as_str()))
+                .collect()
         }
     };
     let fanout_authorized = declared_builtin.iter().any(|t| t == "subagent");
@@ -353,9 +379,10 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         args.push(model_arg.clone());
     }
 
-    // --- tools / extensions (570-595) ---
+    // --- tools / extensions (570-595; exclude after allow, #1776) ---
     let tool_plan = resolve_launch_tool_plan(
         input.tools.as_ref(),
+        &input.exclude_tools,
         input.extensions.as_ref(),
         input.subagent_only_extensions.as_ref(),
         input.require_read_tool,
@@ -368,6 +395,18 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
         } else {
             args.push("--no-tools".into());
         }
+    }
+    // Deny list rides its own flag after the allow branch (deny-after-allow,
+    // host tools.rs:82); an all-empty/blank list never produces the flag.
+    let deny_list: Vec<String> = input
+        .exclude_tools
+        .iter()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if !deny_list.is_empty() {
+        args.push("--exclude-tools".into());
+        args.push(deny_list.join(","));
     }
     if tool_plan.disable_ambient_extensions {
         args.push("--no-extensions".into());
@@ -469,6 +508,13 @@ pub fn build_rpi_args(input: &BuildArgsInput) -> crate::error::Result<BuildArgsR
     env.insert("MCP_DIRECT_TOOLS".into(), Some("__none__".into()));
     let _ = &input.mcp_direct_tools;
     env.insert(SUBAGENT_CHILD_ENV.into(), Some("1".into()));
+    // ADR-0026 decision 3 (TE18 FR-H): children default to NOT inheriting
+    // the operator's global agent-dir context (upstream #1560 default). The
+    // host skips only the global context segment when this env is set
+    // (`resource_loader::no_global_context`); a host that does not know the
+    // switch keeps loading it (old-host fallback — no refusal, no crash).
+    // No user-visible config key in v0.1.4 (ADR-0026 decision 4).
+    env.insert(NO_GLOBAL_CONTEXT_ENV.into(), Some("1".into()));
     env.insert(
         SUBAGENT_FANOUT_CHILD_ENV.into(),
         Some(
@@ -700,21 +746,21 @@ mod tests {
     #[test]
     fn tools_three_branches() {
         // omitted: no --tools flag
-        let plan = resolve_launch_tool_plan(None, None, None, false, None);
+        let plan = resolve_launch_tool_plan(None, &[], None, None, false, None);
         assert!(!plan.explicit_tool_allowlist);
         // empty list: --no-tools
-        let plan = resolve_launch_tool_plan(Some(&Vec::new()), None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&Vec::new()), &[], None, None, false, None);
         assert!(plan.explicit_tool_allowlist);
         assert!(plan.effective_tool_allowlist.is_empty());
         // values: --tools with read auto-added when skills require it
         let tools = vec!["bash".to_string(), "write".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), None, None, true, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, true, None);
         assert_eq!(plan.effective_tool_allowlist, vec!["read", "bash", "write"]);
         assert_eq!(plan.required_child_tools, vec!["read", "bash", "write"]);
         assert!(!plan.fanout_authorized);
         // subagent in tools authorizes fanout
         let tools = vec!["read".to_string(), "subagent".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), None, None, false, None);
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, None);
         assert!(plan.fanout_authorized);
     }
 
@@ -724,6 +770,7 @@ mod tests {
         // present (even empty) disables ambient + lists runtime first
         let plan = resolve_launch_tool_plan(
             Some(&vec!["read".into()]),
+            &[],
             Some(&vec![]),
             None,
             false,
@@ -734,6 +781,7 @@ mod tests {
         // declared extensions are listed after the runtime extension
         let plan = resolve_launch_tool_plan(
             None,
+            &[],
             Some(&vec!["/ext/other.so".into()]),
             None,
             false,
@@ -744,6 +792,7 @@ mod tests {
         // omitted: ambient stays; tool-shaped + subagent-only still listed
         let plan = resolve_launch_tool_plan(
             None,
+            &[],
             None,
             Some(&vec!["/path/to/ext.so".to_string()]),
             false,
@@ -753,7 +802,7 @@ mod tests {
         assert_eq!(plan.extension_args, vec![SELF, "/path/to/ext.so"]);
         // tool entries with path shapes route to extensions, not --tools
         let tools = vec!["read".to_string(), "/abs/tool.so".to_string()];
-        let plan = resolve_launch_tool_plan(Some(&tools), None, None, false, Some(SELF));
+        let plan = resolve_launch_tool_plan(Some(&tools), &[], None, None, false, Some(SELF));
         assert_eq!(plan.effective_tool_allowlist, vec!["read"]);
         assert_eq!(plan.extension_args, vec![SELF, "/abs/tool.so"]);
     }
@@ -836,6 +885,154 @@ mod tests {
         input.session_dir = Some(dir.join("run-0"));
         let result = build_rpi_args(&input).unwrap();
         assert!(result.args.last().unwrap().starts_with('@'));
+        cleanup_temp_dir(&result.temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// TE18 (R7.1.4.1/.2/.6 + ADR-0026): `tools` five states through argv,
+/// `excludeTools` flag assembly/ordering, and the global-context child env.
+#[cfg(test)]
+mod te18_args_tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-args-te18-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn argv_for(tools: Option<Vec<String>>, exclude: Vec<String>) -> Vec<String> {
+        let dir = temp_dir();
+        let input = BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into(), "-p".into()],
+            task: "t".into(),
+            session_enabled: true,
+            session_dir: Some(dir.join("run-0")),
+            inherit_project_context: true,
+            inherit_skills: false,
+            tools,
+            exclude_tools: exclude,
+            ..Default::default()
+        };
+        let result = build_rpi_args(&input).unwrap();
+        cleanup_temp_dir(&result.temp_dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        result.args
+    }
+
+    #[test]
+    fn tools_five_states_argv() {
+        // FR-A: `inherit` (None via parse_tools_field) and omitted produce
+        // byte-identical argv — no tool flags at all. Both runs share one
+        // session dir so the comparison is literally byte-identical.
+        let shared = temp_dir();
+        let argv_for_in = |tools: Option<Vec<String>>, exclude: Vec<String>| {
+            let input = BuildArgsInput {
+                base_args: vec!["--mode".into(), "json".into(), "-p".into()],
+                task: "t".into(),
+                session_enabled: true,
+                session_dir: Some(shared.join("run-0")),
+                inherit_project_context: true,
+                inherit_skills: false,
+                tools,
+                exclude_tools: exclude,
+                ..Default::default()
+            };
+            let result = build_rpi_args(&input).unwrap();
+            cleanup_temp_dir(&result.temp_dir);
+            result.args
+        };
+        let omitted = argv_for_in(None, Vec::new());
+        assert!(!omitted.contains(&"--tools".to_string()));
+        assert!(!omitted.contains(&"--no-tools".to_string()));
+        let inherit = argv_for_in(None, Vec::new());
+        assert_eq!(omitted, inherit);
+        // `false` and an empty block list both emit --no-tools.
+        for tools in [Some(Vec::new()), Some(vec![])] {
+            let argv = argv_for(tools, Vec::new());
+            assert!(argv.contains(&"--no-tools".to_string()), "{argv:?}");
+            assert!(!argv.contains(&"--tools".to_string()));
+        }
+        // Plain lists are unchanged (zero regression on the list path).
+        let argv = argv_for(
+            Some(vec!["read".to_string(), "bash".to_string()]),
+            Vec::new(),
+        );
+        let tools_pos = argv.iter().position(|arg| arg == "--tools").unwrap();
+        assert_eq!(argv[tools_pos + 1], "read,bash");
+        let _ = std::fs::remove_dir_all(&shared);
+    }
+
+    #[test]
+    fn exclude_tools_flag_ordering_and_effective_list() {
+        // Deny rides after the allow branch; the allow flag carries the
+        // post-exclude effective list (upstream effectiveDeclaredBuiltinTools).
+        let argv = argv_for(
+            Some(vec!["read".to_string(), "bash".to_string()]),
+            vec!["bash".to_string()],
+        );
+        let tools_pos = argv.iter().position(|arg| arg == "--tools").unwrap();
+        let exclude_pos = argv
+            .iter()
+            .position(|arg| arg == "--exclude-tools")
+            .unwrap();
+        assert_eq!(argv[tools_pos + 1], "read");
+        assert_eq!(argv[exclude_pos + 1], "bash");
+        assert!(exclude_pos > tools_pos, "{argv:?}");
+        // No allowlist: the deny flag still narrows the child's default set.
+        let argv = argv_for(None, vec!["bash".to_string(), "edit".to_string()]);
+        let exclude_pos = argv
+            .iter()
+            .position(|arg| arg == "--exclude-tools")
+            .unwrap();
+        assert_eq!(argv[exclude_pos + 1], "bash,edit");
+        assert!(!argv.contains(&"--tools".to_string()));
+        // Empty/blank deny lists never produce the flag.
+        let argv = argv_for(
+            Some(vec!["read".to_string()]),
+            vec![String::new(), "  ".to_string()],
+        );
+        assert!(!argv.contains(&"--exclude-tools".to_string()), "{argv:?}");
+        // A fanout tool excluded from its own allowlist no longer authorizes.
+        let plan = resolve_launch_tool_plan(
+            Some(&vec!["subagent".to_string(), "read".to_string()]),
+            &["subagent".to_string()],
+            None,
+            None,
+            false,
+            None,
+        );
+        assert!(!plan.fanout_authorized);
+        assert_eq!(plan.effective_tool_allowlist, vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn child_env_carries_global_context_opt_out() {
+        // ADR-0026 decision 3 (FR-H): every spawned child defaults to not
+        // inheriting the operator's global context file.
+        let dir = temp_dir();
+        let input = BuildArgsInput {
+            base_args: vec!["--mode".into(), "json".into(), "-p".into()],
+            task: "t".into(),
+            session_enabled: true,
+            session_dir: Some(dir.join("run-0")),
+            inherit_project_context: true,
+            inherit_skills: false,
+            ..Default::default()
+        };
+        let result = build_rpi_args(&input).unwrap();
+        assert_eq!(
+            result.env.get(NO_GLOBAL_CONTEXT_ENV),
+            Some(&Some("1".into()))
+        );
         cleanup_temp_dir(&result.temp_dir);
         let _ = std::fs::remove_dir_all(&dir);
     }

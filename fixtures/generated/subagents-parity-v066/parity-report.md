@@ -1,6 +1,6 @@
 # subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)
 
-generated: 2026-09-09T15:48:32.707Z
+generated: 2026-09-10T01:57:16.691Z
 
 ## args
 
@@ -13,6 +13,11 @@ generated: 2026-09-09T15:48:32.707Z
 - no-session: MATCH
 - long-task-file-delivery: MATCH
 - thinking-suffix-preserved: MATCH
+
+## args (inline [RPI-OWN] golden)
+
+- te18-exclude-deny-after-allow: MATCH (inline [RPI-OWN] golden)
+- te18-exclude-without-allowlist: MATCH (inline [RPI-OWN] golden)
 
 ## frontmatter
 
@@ -56,6 +61,24 @@ generated: 2026-09-09T15:48:32.707Z
 - attempt-no-tools-empty-messages: MATCH
 - attempt-empty-output-cold-start: MATCH
 - attempt-matching-message-error: MATCH
+
+## model
+
+- empty-registry-passthrough: MATCH
+- no-registry-passthrough: MATCH
+- explicit-hit-canonicalized: MATCH
+- explicit-thinking-suffix-retry: MATCH
+- explicit-miss-fails-closed: MATCH
+- inherited-miss-passes-through: MATCH
+- inherit-sentinel-resolves-parent: MATCH
+- empty-model-inherits-parent: MATCH
+- candidates-explicit-miss-throws: MATCH
+- candidates-configured-miss-deferred-throw: MATCH
+- candidates-configured-miss-fallback-survives: MATCH
+- candidates-fallback-miss-skipped: MATCH
+- candidates-empty-registry-passthrough: MATCH
+- candidates-inherited-passthrough: MATCH
+- candidates-empty-chain-no-throw: MATCH
 
 ## discovery
 

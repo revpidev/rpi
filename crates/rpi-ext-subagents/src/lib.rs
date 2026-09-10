@@ -180,6 +180,15 @@ pub trait HostContext {
         Vec::new()
     }
 
+    /// Host tool names from `getAllTools` (R7.1.4.3 / #2034, TE18 FR-C):
+    /// `Ok(list)` is the authoritative host set (possibly empty), `Err`
+    /// means the host call failed. Defaults to `Err` — a context that
+    /// cannot answer keeps the pre-spawn gate fail-closed for allowlisted
+    /// agents, exactly like an errored `getAllTools`.
+    fn host_tool_names(&self) -> Result<Vec<String>, String> {
+        Err("host tool face unavailable".to_string())
+    }
+
     /// Async notification channel for background runs (FR-P1-04); `None` in
     /// test fakes disables host notification (result files still land).
     fn async_calls(&self) -> Option<AsyncHostCalls> {
@@ -386,6 +395,27 @@ impl HostContext for HostCallsContext<'_> {
             });
         }
         models
+    }
+
+    /// `getAllTools` projection (R7.1.4.3 / #2034): the host's registered
+    /// tool names. A host error or malformed payload is `Err` so the
+    /// pre-spawn gate fails closed (rpi deliberately diverges from
+    /// upstream's `getHostBuiltinToolNames` fail-open `undefined`).
+    fn host_tool_names(&self) -> Result<Vec<String>, String> {
+        let tools = host_call_ok(self.calls, self.cookie, "getAllTools", json!({}))
+            .ok_or_else(|| "getAllTools host call failed".to_string())?;
+        let entries = tools
+            .as_array()
+            .ok_or_else(|| "getAllTools returned a non-array payload".to_string())?;
+        let mut names = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "getAllTools entry missing name".to_string())?;
+            names.push(name.to_string());
+        }
+        Ok(names)
     }
 }
 
@@ -1318,6 +1348,8 @@ pub mod parity {
         pub inherit_skills: bool,
         pub require_read_tool: bool,
         pub tools: Option<Vec<String>>,
+        /// #1776 (TE18): deny-list → `--exclude-tools`.
+        pub exclude_tools: Vec<String>,
         pub extensions: Option<Vec<String>>,
         pub subagent_only_extensions: Option<Vec<String>>,
         pub prompt_file_stem: Option<String>,
@@ -1359,6 +1391,7 @@ pub mod parity {
             inherit_skills: input.inherit_skills,
             require_read_tool: input.require_read_tool,
             tools: input.tools.clone(),
+            exclude_tools: input.exclude_tools.clone(),
             extensions: input.extensions.clone(),
             subagent_only_extensions: input.subagent_only_extensions.clone(),
             mcp_direct_tools: Vec::new(),
@@ -1411,6 +1444,105 @@ pub mod parity {
         tool_count: u64,
     ) -> bool {
         crate::launch::model::is_retryable_model_failure_attempt(error, messages, tool_count)
+    }
+
+    /// Model-resolution parity facade (TE18 target-track `model` mode,
+    /// R7.1.4.4/.5 — strict/required resolution and origin-aware candidate
+    /// chain against v0.66 `resolveSubagentModelOverride`/`buildModelCandidates`).
+    #[derive(Debug, Clone)]
+    pub struct AvailableModelPublic {
+        pub full_id: String,
+        pub provider: String,
+        pub id: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModelSourcePublic {
+        Explicit,
+        Inherited,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ModelOriginPublic {
+        Explicit,
+        Inherited,
+        Configured,
+    }
+
+    fn to_available(
+        models: Option<&[AvailableModelPublic]>,
+    ) -> Vec<crate::launch::model::AvailableModel> {
+        models
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| crate::launch::model::AvailableModel {
+                        full_id: entry.full_id.clone(),
+                        provider: entry.provider.clone(),
+                        id: entry.id.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Upstream `resolveSubagentModelOverride` shape (scope checks omitted —
+    /// the harness passes no scope).
+    pub fn resolve_subagent_model_override_public(
+        requested_model: Option<&str>,
+        parent_model: Option<&str>,
+        available_models: Option<&[AvailableModelPublic]>,
+        preferred_provider: Option<&str>,
+        source: ModelSourcePublic,
+    ) -> Result<Option<String>, String> {
+        let registry = to_available(available_models);
+        let registry_ref = (!registry.is_empty()).then_some(&registry[..]);
+        let parent_ref = parent_model.and_then(|model| {
+            let (provider, id) = model.split_once('/')?;
+            Some((provider, id))
+        });
+        let source = match source {
+            ModelSourcePublic::Explicit => crate::launch::model::ModelSource::Explicit,
+            ModelSourcePublic::Inherited => crate::launch::model::ModelSource::Inherited,
+        };
+        let mut sink = |_violation: &crate::launch::model::ModelScopeViolation| {};
+        crate::launch::model::resolve_subagent_model_override(
+            requested_model,
+            parent_ref,
+            registry_ref,
+            preferred_provider,
+            None,
+            source,
+            &mut sink,
+        )
+    }
+
+    /// Upstream `buildModelCandidates` shape (scope/exclusions omitted — the
+    /// harness passes neither).
+    pub fn build_model_candidates_public(
+        primary_model: Option<&str>,
+        fallback_models: &[String],
+        available_models: Option<&[AvailableModelPublic]>,
+        preferred_provider: Option<&str>,
+        origin: ModelOriginPublic,
+    ) -> Result<Vec<String>, String> {
+        let registry = to_available(available_models);
+        let registry_ref = (!registry.is_empty()).then_some(&registry[..]);
+        let origin = match origin {
+            ModelOriginPublic::Explicit => crate::launch::model::ModelOrigin::Explicit,
+            ModelOriginPublic::Inherited => crate::launch::model::ModelOrigin::Inherited,
+            ModelOriginPublic::Configured => crate::launch::model::ModelOrigin::Configured,
+        };
+        let mut sink = |_violation: &crate::launch::model::ModelScopeViolation| {};
+        crate::launch::model::build_model_candidates(
+            primary_model,
+            fallback_models,
+            registry_ref,
+            preferred_provider,
+            None,
+            origin,
+            &mut sink,
+        )
     }
 
     /// Discovery parity facade (TE15 target-track discovery leg, R7.1.3).

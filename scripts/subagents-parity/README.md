@@ -70,9 +70,23 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
 
 - 回归轨仍跑 v0.48 `pi-args.ts`（旧轨即现状）；
 - 目标轨改为对**冻结黄金文件** `args-golden-v048.json` 比较——该文件由
-  `--record-args-golden` 从 v0.48 上游腿录制（session 基座占位化为 `<SESSION_BASE>`）；
+  `--record-args-golden` 从 v0.48 上游腿录制（session 基座占位化为 `<SESSION_BASE>`；
+  只重录 fixtures.json 的非内联用例）；
 - M2/M3 因 R7.1.4 系列改动 argv/env 时，由对应任务更新黄金文件并按 G2 登记
-  「旧期望 → 新期望 + 依据」。
+  「旧期望 → 新期望 + 依据」；
+- **TE18 增补**：无上游录制器的新语义（`--exclude-tools` 等上游从未在 argv 面
+  存在的行为）以**内联 [RPI-OWN] 黄金**落在 `fixtures-target.json` 用例的
+  `expected` 字段，由编排器 `compareArgsTarget` 直接对 Rust 腿比较（不经上游腿）；
+  语义正确性由任务 §3.3 规则 + crate 单测钉死，内联黄金防未来回归。
+
+### TE18 新增：model 解析腿（目标轨）
+
+`--track=target` 多跑一个 `model` 模式：共享 fixture（registry/parentModel/origin）
+同时驱动 v0.66 快照的 `resolveSubagentModelOverride` / `buildModelCandidates` 与
+rpi 对应实现（`parity::resolve_subagent_model_override_public` /
+`build_model_candidates_public`），两侧输出 `{resolved|candidates}` 或 `{error}`
+（fail-closed 抛错两侧同形 diff），覆盖空 registry 透传 / 命中规范化 / thinking
+后缀重试 / 未命中 fail-closed（#1093）与 origin 感知候选链。
 
 ## 归因规则（目标轨）
 
@@ -97,8 +111,8 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
 | 文件 | 职责 |
 |------|------|
 | `fixtures.json` | 基线共享用例：9 组 argv/env 输入、6 组 frontmatter 内容、5 组 message 数组 |
-| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量、discovery tree（TE15） |
-| `args-golden-v048.json` | argv/env 冻结黄金文件（[RPI-OWN]） |
+| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量、discovery tree（TE15）、notify（TE17）、**argv 内联 [RPI-OWN] 黄金（TE18：excludeTools 面，无上游录制器，期望内联在用例里）与 model 解析向量（TE18 R7.1.4.4/.5，直接对拍 v0.66 `model-fallback.ts`）** |
+| `args-golden-v048.json` | argv/env 冻结黄金文件（[RPI-OWN]；只覆盖 fixtures.json 的 9 例，`--record-args-golden` 只重录非内联用例） |
 | `expected-target-diffs.json` | 目标轨差异归因清单（R + 承接任务） |
 | `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件、discovery 走 v0.66 `discoverAgents` |
 | `setup-target-source.sh` | 仓库外抽取 v0.66 快照 + 安装其 prod 依赖（external/ 零写入） |
@@ -127,11 +141,12 @@ AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物
    `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`（node 包根传播，rpi 无对应物，
    两个历史名都丢弃）。其余键含 `PI_SUBAGENT_*` → `RPI_SUBAGENT_*`
    改名对齐。
-6. **rpi 专属 env 键丢弃（TE05 新增）**：`RPI_SUBAGENT_STEER_INBOX`、
+6. **rpi 专属 env 键丢弃（TE05 新增；TE18 增补）**：`RPI_SUBAGENT_STEER_INBOX`、
    `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR`——rpi 原生的 steer 收件箱与
-   supervisor 通道目录槽位（FR-P1-04/10），上游等价物在 prompt-runtime
-   扩展内部且 fixture 从不设置；两键在 rpi 侧恒为清空值，逐 case 豁免
-   改为统一从 diff 中剔除。
+   supervisor 通道目录槽位（FR-P1-04/10）；`RPI_NO_GLOBAL_CONTEXT`（TE18 /
+   ADR-0026，上游 #1560 的进程内 `inheritGlobalContext:false` 默认在 rpi 侧的
+   env 开关，两 pin 均无 argv/env 对应物；其存在性由 crate 单测 + e2e env dump
+   钉死而非本 diff）。上述键从 diff 中剔除。
 7. **prompt 临时文件内容不比较**：rpi 在文件头额外前置边界指令块
    （`<active_agent>` 之后、正文之前，TE-D17 机制等价替代）；argv/env
    层面的路径与 flag 一致即可。

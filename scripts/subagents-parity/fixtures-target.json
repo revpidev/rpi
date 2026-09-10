@@ -275,5 +275,454 @@
         "content": "random text without a completion header"
       }
     ]
+  },
+  "args": {
+    "//": "TE18 (R7.1.4.1/.2 + ADR-0026) argv/env cases. No v0.48 recorder exists for these semantics (upstream deleted pi-args.ts in v0.65 and never had --exclude-tools), so each case carries its own [RPI-OWN] expected output, compared against the Rust leg only (run-parity.mjs compareArgsTarget).",
+    "cases": [
+      {
+        "name": "te18-exclude-deny-after-allow",
+        "input": {
+          "task": "narrow",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "tools": [
+            "read",
+            "bash"
+          ],
+          "excludeTools": [
+            "bash"
+          ],
+          "systemPrompt": "You narrow tools.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "excluder",
+          "childAgentName": "excluder",
+          "runId": "0000aa18",
+          "childIndex": 0
+        },
+        "expected": {
+          "ok": true,
+          "argv": [
+            "--mode",
+            "json",
+            "-p",
+            "--session-dir",
+            "<SESSION_BASE>/run-0",
+            "--tools",
+            "read",
+            "--exclude-tools",
+            "bash",
+            "--extension",
+            "<EXT>",
+            "--no-skills",
+            "--system-prompt",
+            "<PROMPT_FILE>",
+            "Task: narrow"
+          ],
+          "env": {
+            "MCP_DIRECT_TOOLS": "__none__",
+            "RPI_NO_GLOBAL_CONTEXT": "1",
+            "RPI_SUBAGENT_CHILD": "1",
+            "RPI_SUBAGENT_CHILD_AGENT": "excluder",
+            "RPI_SUBAGENT_CHILD_INDEX": "0",
+            "RPI_SUBAGENT_FANOUT_CHILD": "0",
+            "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+            "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+            "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+            "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+            "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+            "RPI_SUBAGENT_PARENT_DEPTH": "",
+            "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+            "RPI_SUBAGENT_PARENT_PATH": "",
+            "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+            "RPI_SUBAGENT_PARENT_RUN_ID": "",
+            "RPI_SUBAGENT_PARENT_SESSION": "",
+            "RPI_SUBAGENT_REQUIRED_TOOLS": "[\"read\"]",
+            "RPI_SUBAGENT_RUN_ID": "0000aa18",
+            "RPI_SUBAGENT_STEER_INBOX": "",
+            "RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR": "",
+            "RPI_SUBAGENT_TOOL_DIAGNOSTIC_PATH": "<TMPDIR>/tool-diagnostic.json"
+          }
+        }
+      },
+      {
+        "name": "te18-exclude-without-allowlist",
+        "input": {
+          "task": "deny from defaults",
+          "sessionEnabled": true,
+          "sessionDir": "/sess/root/run-0",
+          "inheritProjectContext": true,
+          "inheritSkills": false,
+          "excludeTools": [
+            "bash",
+            "edit"
+          ],
+          "systemPrompt": "You deny tools.",
+          "systemPromptMode": "replace",
+          "promptFileStem": "excluder",
+          "childAgentName": "excluder",
+          "runId": "0000bb18",
+          "childIndex": 0
+        },
+        "expected": {
+          "ok": true,
+          "argv": [
+            "--mode",
+            "json",
+            "-p",
+            "--session-dir",
+            "<SESSION_BASE>/run-0",
+            "--exclude-tools",
+            "bash,edit",
+            "--extension",
+            "<EXT>",
+            "--no-skills",
+            "--system-prompt",
+            "<PROMPT_FILE>",
+            "Task: deny from defaults"
+          ],
+          "env": {
+            "MCP_DIRECT_TOOLS": "__none__",
+            "RPI_NO_GLOBAL_CONTEXT": "1",
+            "RPI_SUBAGENT_CHILD": "1",
+            "RPI_SUBAGENT_CHILD_AGENT": "excluder",
+            "RPI_SUBAGENT_CHILD_INDEX": "0",
+            "RPI_SUBAGENT_FANOUT_CHILD": "0",
+            "RPI_SUBAGENT_INHERIT_PROJECT_CONTEXT": "1",
+            "RPI_SUBAGENT_INHERIT_SKILLS": "0",
+            "RPI_SUBAGENT_PARENT_CAPABILITY_TOKEN": "",
+            "RPI_SUBAGENT_PARENT_CHILD_INDEX": "",
+            "RPI_SUBAGENT_PARENT_CONTROL_INBOX": "",
+            "RPI_SUBAGENT_PARENT_DEPTH": "",
+            "RPI_SUBAGENT_PARENT_EVENT_SINK": "",
+            "RPI_SUBAGENT_PARENT_PATH": "",
+            "RPI_SUBAGENT_PARENT_ROOT_RUN_ID": "",
+            "RPI_SUBAGENT_PARENT_RUN_ID": "",
+            "RPI_SUBAGENT_PARENT_SESSION": "",
+            "RPI_SUBAGENT_RUN_ID": "0000bb18",
+            "RPI_SUBAGENT_STEER_INBOX": "",
+            "RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR": ""
+          }
+        }
+      }
+    ]
+  },
+  "model": {
+    "//": "TE18 (R7.1.4.4/.5, #1093) model-resolution vectors, diffed against the v0.66 model-fallback.ts (resolveSubagentModelOverride / buildModelCandidates). Both sides emit {resolved|candidates} or {error} (a thrown fail-closed on one side diffs against a value on the other). No scope, no exclusion cache (fresh process).",
+    "cases": [
+      {
+        "name": "empty-registry-passthrough",
+        "kind": "override",
+        "model": "faux/primary",
+        "registry": [],
+        "source": "explicit"
+      },
+      {
+        "name": "no-registry-passthrough",
+        "kind": "override",
+        "model": "faux/primary",
+        "registry": null,
+        "source": "explicit"
+      },
+      {
+        "name": "explicit-hit-canonicalized",
+        "kind": "override",
+        "model": "claude-5",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "explicit-thinking-suffix-retry",
+        "kind": "override",
+        "model": "claude-5:high",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "explicit-miss-fails-closed",
+        "kind": "override",
+        "model": "faux/primary",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "inherited-miss-passes-through",
+        "kind": "override",
+        "model": "faux/primary",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "inherited"
+      },
+      {
+        "name": "inherit-sentinel-resolves-parent",
+        "kind": "override",
+        "model": "inherit",
+        "parentModel": "anthropic/claude-5",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "explicit"
+      },
+      {
+        "name": "empty-model-inherits-parent",
+        "kind": "override",
+        "model": null,
+        "parentModel": "openai/gpt-5.5",
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "source": "inherited"
+      },
+      {
+        "name": "candidates-explicit-miss-throws",
+        "kind": "candidates",
+        "primary": "faux/primary",
+        "fallbacks": [],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "explicit"
+      },
+      {
+        "name": "candidates-configured-miss-deferred-throw",
+        "kind": "candidates",
+        "primary": "faux/primary",
+        "fallbacks": [],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "configured"
+      },
+      {
+        "name": "candidates-configured-miss-fallback-survives",
+        "kind": "candidates",
+        "primary": "faux/primary",
+        "fallbacks": [
+          "claude-5"
+        ],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "configured"
+      },
+      {
+        "name": "candidates-fallback-miss-skipped",
+        "kind": "candidates",
+        "primary": "anthropic/claude-5",
+        "fallbacks": [
+          "faux/secondary"
+        ],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "explicit"
+      },
+      {
+        "name": "candidates-empty-registry-passthrough",
+        "kind": "candidates",
+        "primary": "faux/primary",
+        "fallbacks": [
+          "faux/secondary"
+        ],
+        "registry": [],
+        "origin": "configured"
+      },
+      {
+        "name": "candidates-inherited-passthrough",
+        "kind": "candidates",
+        "primary": "faux/parent-model",
+        "fallbacks": [],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "inherited"
+      },
+      {
+        "name": "candidates-empty-chain-no-throw",
+        "kind": "candidates",
+        "primary": null,
+        "fallbacks": [],
+        "registry": [
+          {
+            "fullId": "anthropic/claude-5",
+            "provider": "anthropic",
+            "id": "claude-5"
+          },
+          {
+            "fullId": "anthropic/claude-5-2025-10-01",
+            "provider": "anthropic",
+            "id": "claude-5-2025-10-01"
+          },
+          {
+            "fullId": "openai/gpt-5.5",
+            "provider": "openai",
+            "id": "gpt-5.5"
+          }
+        ],
+        "origin": "configured"
+      }
+    ]
   }
 }

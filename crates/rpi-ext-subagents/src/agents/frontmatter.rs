@@ -71,6 +71,26 @@ pub fn parse_frontmatter_list(raw: Option<&str>) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// `tools` frontmatter scalar forms (TE18 FR-A, R7.1.4.1 / #1047/#1049).
+///
+/// The scalar semantics come from the upstream override surface
+/// (`parseToolsOverride`/`applyToolsOverride`, agents.ts:946-951/1349-1356
+/// @ 0fc0eebb): `"inherit"` clears the allowlist back to "undeclared"
+/// (host defaults, no tool flags) and `false` is an explicit empty allowlist
+/// (`--no-tools`). Upstream applies them to override entries only; rpi also
+/// recognizes them on agent frontmatter (task §2.1), where the hand-rolled
+/// parser delivers raw strings — both `tools: false` and quoted
+/// `tools: "false"` arrive as `"false"`. Matching upstream, the comparison
+/// is trim + case-sensitive (no lowercasing; `Inherit`/`FALSE` stay ordinary
+/// list values). Every other value keeps the plain-list parse unchanged.
+pub fn parse_tools_field(raw: Option<&str>) -> Option<Vec<String>> {
+    match raw.map(str::trim) {
+        Some("inherit") => None,
+        Some("false") => Some(Vec::new()),
+        other => parse_frontmatter_list(other),
+    }
+}
+
 /// Escape regex special characters (`escapeRegex`, frontmatter.ts:4-6) — kept
 /// inline because the block flush matches a literal whitespace prefix.
 fn escape_regex(s: &str) -> String {

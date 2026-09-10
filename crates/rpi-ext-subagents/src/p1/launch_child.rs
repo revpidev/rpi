@@ -9,7 +9,7 @@
 //! now routes through here so all four consumers cannot drift.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -179,6 +179,11 @@ pub struct RunCtx {
     pub parent_session_id: Option<String>,
     pub parent_model: Option<String>,
     pub registry: Vec<AvailableModel>,
+    /// Host tool names from `getAllTools` (R7.1.4.3 / #2034): `Ok` = the
+    /// authoritative host set (possibly empty), `Err(reason)` = the host
+    /// call failed (the pre-spawn gate fails closed on that). Captured once
+    /// per delegation call alongside the model registry.
+    pub host_builtin_tool_names: Result<Vec<String>, String>,
     /// One id per delegation call; parallel/chain children share it so the
     /// `maxSubagentSpawnsPerRun` cap counts the composite, not per child.
     pub run_id: String,
@@ -284,6 +289,7 @@ impl RunCtx {
             parent_session_id,
             parent_model: host.parent_model(),
             registry: host.scoped_models(),
+            host_builtin_tool_names: host.host_tool_names(),
             run_id,
             artifacts_dir,
             session_root,
@@ -310,6 +316,43 @@ pub struct ChildOutcome {
     pub saved_output_path: Option<PathBuf>,
 }
 
+/// Outcome of the fork attempt (ADR-0026 decision 1, TE18 FR-G): either a
+/// usable fork branch, or the structured reason the run degraded to fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForkOutcome {
+    Forked(PathBuf, Option<String>),
+    Degraded(String),
+}
+
+/// Attempt a fork branch for one child, mapping every unusable path to a
+/// degradation reason (never `Err`): the in-memory parent (V13-02 FR-A R2
+/// wording), the missing parent session, and `create_fork_session` failures
+/// (upstream #1137 keeps explicit `context: "fork"` fail-fast for the
+/// in-memory/missing-parent cases; ADR-0026 broadened degradation to every
+/// path — the e2e scenario-2 expectation change is registered under G2).
+pub fn try_fork_session(ctx: &RunCtx, branch_file: &Path, effective_cwd: &Path) -> ForkOutcome {
+    if let Some(parent) = &ctx.parent_session {
+        if parent.file.is_none() {
+            return ForkOutcome::Degraded(
+                "parent session is in-memory and not yet persisted to disk".to_string(),
+            );
+        }
+    }
+    match session_fork::create_fork_session(
+        ctx.parent_session_file.as_deref(),
+        branch_file,
+        effective_cwd,
+    ) {
+        Ok(resolution) => ForkOutcome::Forked(
+            resolution.session_file,
+            resolution.thinking_override_off.then(|| "off".to_string()),
+        ),
+        Err(error) => {
+            ForkOutcome::Degraded(format!("failed to create forked subagent session: {error}"))
+        }
+    }
+}
+
 /// Launch one child to completion (foreground, with model fallback chain).
 /// Synchronous entry for the single-run path (host dispatch thread).
 pub fn run_child(
@@ -320,7 +363,6 @@ pub fn run_child(
 ) -> Result<ChildOutcome, String> {
     runtime.block_on(run_child_async(spec, agent, ctx))
 }
-
 /// Async core shared by every execution path (single / parallel / chain /
 /// background). Callers on the host dispatch thread wrap this with
 /// `PluginRuntime::block_on`; parallel children call it directly inside one
@@ -340,7 +382,7 @@ pub async fn run_child_async(
         .or(Some(foreground::DEFAULT_FOREGROUND_TIMEOUT_MS));
 
     // Context policy: child > top-level > agent default (unknown → fresh).
-    let context = spec
+    let mut context = spec
         .context
         .or(ctx.top_context)
         .or(agent.default_context)
@@ -354,33 +396,27 @@ pub async fn run_child_async(
     let (session_file, thinking_override) = if let Some(resume_file) = &spec.session_file {
         (Some(resume_file.clone()), None)
     } else if context == ContextMode::Fork {
-        // FR-A R2 (V13-02): `ctx.sessionFile` identified an in-memory parent
-        // (id present, path null) — the parent has not persisted enough
-        // history to fork from yet. Fail fast with the upstream-mirrored
-        // message (substring asserted by e2e_fixed_script.rs scenario 2)
-        // plus the in-memory hint; the plain no-session case keeps the exact
-        // message from create_fork_session.
-        if let Some(parent) = &ctx.parent_session {
-            if parent.file.is_none() {
-                return Err("Failed to create forked subagent session: Forked subagent context requires a persisted parent session (parent session is in-memory and not yet persisted to disk).".into());
-            }
-        }
+        // ADR-0026 decision 1 (TE18 FR-G, upstream #1137): every fork-unusable
+        // path degrades to `fresh` with a structured warning instead of
+        // failing the run — covering the in-memory parent (V13-02 FR-A R2),
+        // the missing parent session, and `create_fork_session` failures.
+        // The effective mode is reflected in the result's `context` field.
         let branch_file = if spec.child_index == 0 {
             ctx.session_root.join("fork.jsonl")
         } else {
             ctx.session_root
                 .join(format!("fork-{}.jsonl", spec.child_index))
         };
-        match session_fork::create_fork_session(
-            ctx.parent_session_file.as_deref(),
-            &branch_file,
-            &effective_cwd,
-        ) {
-            Ok(resolution) => (
-                Some(resolution.session_file),
-                resolution.thinking_override_off.then(|| "off".to_string()),
-            ),
-            Err(error) => return Err(error),
+        match try_fork_session(ctx, &branch_file, &effective_cwd) {
+            ForkOutcome::Forked(file, thinking) => (Some(file), thinking),
+            ForkOutcome::Degraded(reason) => {
+                tracing::warn!(
+                    reason = %reason,
+                    "fork context unavailable; degraded subagent to fresh (ADR-0026)"
+                );
+                context = ContextMode::Fresh;
+                (None, None)
+            }
         }
     } else {
         (None, None)
@@ -403,13 +439,31 @@ pub async fn run_child_async(
     });
     let registry_ref: Option<&[AvailableModel]> =
         (!ctx.registry.is_empty()).then_some(&ctx.registry[..]);
+    // R7.1.4.4 (TE18 FR-D): an empty `ctx.scopedModels` registry is NOT
+    // "no usable models" — model strings pass through verbatim and fuzzy
+    // resolution is explicitly skipped. The branch must stay visible in
+    // diagnostics so a later regression to silent passthrough is caught.
+    if let Some(diagnostic) = model::registry_unavailable_diagnostic(
+        spec.model.is_some()
+            || ctx.top_model.is_some()
+            || agent.model.is_some()
+            || !agent.fallback_models.is_empty(),
+    ) {
+        tracing::warn!(diagnostic, "subagent model resolution degraded");
+    }
+    // Model origin (upstream `resolveModelOrigin`, model-fallback.ts:437-450
+    // @ 0fc0eebb): explicit call param > parent-inherited > agent-configured.
+    // Decides where the required (fail-closed, #1093) check applies.
+    let explicit_model = spec.model.as_deref().or(ctx.top_model.as_deref());
+    let model_origin =
+        model::resolve_model_origin(explicit_model, agent.model.as_deref(), parent_ref);
     let preferred_provider = parent_ref.map(|(provider, _)| provider);
     let scope = ctx.settings.model_scope.as_ref();
     let mut warn_sink = |violation: &model::ModelScopeViolation| {
         tracing::warn!(violation = %violation.message, "model scope violation");
     };
     let resolved = model::resolve_effective_subagent_model(
-        spec.model.as_deref().or(ctx.top_model.as_deref()),
+        explicit_model,
         agent.model.as_deref(),
         parent_ref,
         registry_ref,
@@ -423,6 +477,7 @@ pub async fn run_child_async(
         registry_ref,
         preferred_provider,
         scope,
+        model_origin,
         &mut warn_sink,
     )?;
     let thinking = match thinking_override {
@@ -589,6 +644,23 @@ pub async fn run_child_async(
     let system_prompt = bridge_prompt_source;
     let agent_tools = child_tools;
 
+    // Pre-spawn tool-face gate (R7.1.4.3 / #2034, TE18 FR-C): the declared
+    // builtin allowlist must be covered by the host's tool set before the
+    // child starts — rpi fails closed (ADR-0017 wording) where upstream
+    // silently drops the missing names, so a child never starts with an
+    // allowlist it cannot satisfy. Runs only when an allowlist is declared;
+    // excluded names (post-`--exclude-tools`) are not requirements.
+    if let Some(allowlist) = agent_tools.as_ref() {
+        crate::diagnostic::check_host_tool_face(
+            allowlist,
+            &agent.exclude_tools,
+            ctx.host_builtin_tool_names
+                .as_deref()
+                .map_err(|e| e.as_str()),
+            &agent.name,
+        )?;
+    }
+
     // Fork task preamble (executor 4119-4122).
     let task_text = if context == ContextMode::Fork {
         session_fork::wrap_fork_task(&spec.task, None)
@@ -601,6 +673,7 @@ pub async fn run_child_async(
         agent_system_prompt: system_prompt,
         agent_system_prompt_mode: agent.system_prompt_mode,
         agent_tools: agent_tools.clone(),
+        agent_exclude_tools: agent.exclude_tools.clone(),
         agent_extensions: agent.extensions.clone(),
         agent_subagent_only_extensions: agent.subagent_only_extensions.clone(),
         agent_inherit_project_context: agent.inherit_project_context,
@@ -780,4 +853,130 @@ pub async fn run_child_async(
         result,
         saved_output_path,
     })
+}
+
+/// TE18 FR-G (ADR-0026 decision 1, upstream #1137): every fork-unusable path
+/// degrades to fresh with a structured reason — never `Err`.
+#[cfg(test)]
+mod te18_fork_tests {
+    use super::*;
+
+    fn ctx_with(parent: Option<ParentSession>, parent_file: Option<PathBuf>) -> RunCtx {
+        RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: PathBuf::from("/tmp"),
+            parent_session: parent,
+            parent_session_file: parent_file,
+            parent_session_id: None,
+            parent_model: None,
+            registry: Vec::new(),
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "te18fork1".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: None,
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: std::env::temp_dir(),
+            frame_sink: None,
+            step_status: None,
+            abort_probe: None,
+        }
+    }
+
+    #[test]
+    fn in_memory_parent_degrades_with_reason() {
+        // V13-02 FR-A R2 case: parent has an id but no persisted file.
+        let ctx = ctx_with(
+            Some(ParentSession {
+                file: None,
+                id: "abc".to_string(),
+            }),
+            None,
+        );
+        match try_fork_session(&ctx, Path::new("/tmp/branch.jsonl"), Path::new("/tmp")) {
+            ForkOutcome::Degraded(reason) => {
+                assert!(
+                    reason.contains("in-memory") && reason.contains("not yet persisted to disk"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected degradation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_parent_session_degrades_with_reason() {
+        // No parent session at all: create_fork_session reports the missing
+        // persisted parent; the outcome is still a degradation, never Err.
+        let ctx = ctx_with(None, None);
+        match try_fork_session(&ctx, Path::new("/tmp/branch.jsonl"), Path::new("/tmp")) {
+            ForkOutcome::Degraded(reason) => {
+                assert!(
+                    reason.contains("requires a persisted parent session"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected degradation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_fork_session_failure_degrades_with_reason() {
+        // A persisted-looking parent whose file does not exist: the fork
+        // builder errors, the launch degrades instead of failing.
+        let missing = std::env::temp_dir().join("rpi-sub-te18-missing-parent.jsonl");
+        let ctx = ctx_with(
+            Some(ParentSession {
+                file: Some(missing.clone()),
+                id: "abc".to_string(),
+            }),
+            Some(missing),
+        );
+        match try_fork_session(&ctx, Path::new("/tmp/branch.jsonl"), Path::new("/tmp")) {
+            ForkOutcome::Degraded(reason) => {
+                assert!(
+                    reason.contains("failed to create forked subagent session"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected degradation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn persisted_parent_still_forks() {
+        // Regression guard: a real persisted parent keeps forking (no
+        // degradation) — write a minimal session file with a leaf.
+        let dir = std::env::temp_dir().join(format!("rpi-sub-te18-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent = dir.join("parent.jsonl");
+        std::fs::write(
+            &parent,
+            concat!(
+                r#"{"type":"session","version":3,"id":"p1","timestamp":"2026-09-09T00:00:00.000Z","cwd":"/tmp"}"#,
+                "\n",
+                r#"{"type":"message","role":"user","content":[{"type":"text","text":"hi"}],"timestamp":"2026-09-09T00:00:01.000Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let ctx = ctx_with(
+            Some(ParentSession {
+                file: Some(parent.clone()),
+                id: "p1".to_string(),
+            }),
+            Some(parent),
+        );
+        match try_fork_session(&ctx, &dir.join("branch.jsonl"), Path::new("/tmp")) {
+            ForkOutcome::Forked(file, _) => assert!(file.ends_with("branch.jsonl")),
+            other => panic!("expected a fork, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

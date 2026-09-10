@@ -168,16 +168,28 @@ fn canonicalize_path(path: &Path) -> PathBuf {
 /// of project trust. In a nested linked worktree, a context file that
 /// shadows the worktree's own from the main checkout is skipped
 /// (see [`find_shadowed_context_file`]).
-pub fn load_project_context_files(cwd: &Path, agent_dir: &Path) -> Vec<ContextFile> {
+///
+/// `include_global: false` skips ONLY the global agent-dir segment while the
+/// ancestor (project/repo) chain still loads (ADR-0026 decision 2, TE18
+/// FR-H): subagent children opt out of the operator's global `AGENTS.md`
+/// via the `RPI_NO_GLOBAL_CONTEXT=1` env switch, matching upstream #1560
+/// where in-process children default `inheritGlobalContext` to false.
+pub fn load_project_context_files(
+    cwd: &Path,
+    agent_dir: &Path,
+    include_global: bool,
+) -> Vec<ContextFile> {
     let resolved_cwd = resolve_path(&cwd.to_string_lossy(), &process_cwd());
     let resolved_agent_dir = resolve_path(&agent_dir.to_string_lossy(), &process_cwd());
 
     let mut context_files: Vec<ContextFile> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    if let Some(global_context) = load_context_file_from_dir(&resolved_agent_dir) {
-        seen_paths.insert(global_context.path.clone());
-        context_files.push(global_context);
+    if include_global {
+        if let Some(global_context) = load_context_file_from_dir(&resolved_agent_dir) {
+            seen_paths.insert(global_context.path.clone());
+            context_files.push(global_context);
+        }
     }
 
     let mut ancestor_context_files: Vec<ContextFile> = Vec::new();

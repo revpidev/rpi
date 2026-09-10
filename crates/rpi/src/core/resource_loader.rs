@@ -98,6 +98,19 @@ pub use crate::core::skills::{
 const LOCK_MAX_ATTEMPTS: u32 = 10;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(20);
 
+/// `RPI_NO_GLOBAL_CONTEXT` gate (ADR-0026 decision 2, TE18 FR-H): `1`/`true`
+/// skips only the global agent-dir context segment. rpi-internal switch —
+/// no CLI flag, no settings key; the subagents plugin sets it for spawned
+/// children (upstream #1560: children default `inheritGlobalContext` off).
+pub fn no_global_context() -> bool {
+    std::env::var("RPI_NO_GLOBAL_CONTEXT")
+        .map(|value| {
+            let trimmed = value.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Loaded output (design §6.7)
 // ---------------------------------------------------------------------------
@@ -589,7 +602,12 @@ impl DefaultResourceLoader {
         self.resources.context_files = if self.no_context_files {
             Vec::new()
         } else {
-            load_project_context_files(&self.cwd, &self.agent_dir)
+            // ADR-0026 (TE18 FR-H): `RPI_NO_GLOBAL_CONTEXT=1` skips only the
+            // global agent-dir context segment; the project/repo ancestor
+            // chain still loads. The subagents plugin sets this env for every
+            // spawned child so subagents do not inherit the operator's
+            // global `AGENTS.md` (upstream #1560 default).
+            load_project_context_files(&self.cwd, &self.agent_dir, !no_global_context())
         };
 
         // --- System prompt sources (resource-loader.ts:477-491,

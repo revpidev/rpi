@@ -555,6 +555,20 @@ fn read_json_file(path: &std::path::Path) -> Option<Value> {
     serde_json::from_str(&content).ok()
 }
 
+/// `subagents.agentOverrides.<name>.tools` value (upstream
+/// `BuiltinAgentOverrideConfig["tools"]`, agents.ts:103 #1047/#1049):
+/// `"inherit"` clears the allowlist back to undeclared, `false` is an
+/// explicit empty allowlist, an array is the allowlist.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolsOverride {
+    /// `tools: "inherit"` — host defaults (no tool flags).
+    Inherit,
+    /// `tools: false` — explicit empty allowlist (`--no-tools`).
+    Disable,
+    /// `tools: ["a", …]` — explicit allowlist (`mcp:` entries split out).
+    List(Vec<String>),
+}
+
 /// `subagents.agentOverrides.<name>` entry — the P1 field set of
 /// `BuiltinAgentOverrideConfig` (agents.ts `parseBuiltinOverrideEntry`
 /// L756-898; requirements §3.2 P1 全集). `false` variants clear the agent's
@@ -565,7 +579,10 @@ pub struct AgentOverride {
     /// `model: false` clears the agent's model (upstream semantics).
     pub model: Option<Option<String>>,
     pub disabled: Option<bool>,
-    pub tools: Option<Option<Vec<String>>>,
+    /// #1047/#1049 (R7.1.4.1): `"inherit"` / `false` / list tri-state.
+    pub tools: Option<ToolsOverride>,
+    /// #1776 (R7.1.4.2): deny-list (`false` clears back to undeclared).
+    pub exclude_tools: Option<Option<Vec<String>>>,
     // —— P1 fields (TE05; requirements §3.2 全集) ——
     pub fallback_models: Option<Option<Vec<String>>>,
     /// `thinking: false` clears the agent's thinking level.
@@ -745,8 +762,14 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                         })?);
                     }
                     "tools" => {
+                        // `parseToolsOverride` (agents.ts:946-951 @ 0fc0eebb):
+                        // string "inherit" (after trim), boolean false, or a
+                        // string array; anything else is a settings error.
                         parsed_entry.tools = Some(match field {
-                            Value::Bool(false) => None,
+                            Value::String(value) if value.trim() == "inherit" => {
+                                ToolsOverride::Inherit
+                            }
+                            Value::Bool(false) => ToolsOverride::Disable,
                             Value::Array(items) => {
                                 let mut names = Vec::new();
                                 for item in items {
@@ -757,23 +780,33 @@ pub fn read_subagent_settings(path: &std::path::Path) -> Result<SubagentSettings
                                                     path,
                                                     name,
                                                     "tools",
-                                                    "an array of strings or false",
+                                                    "an array of strings, \"inherit\", or false",
                                                 )
                                             })?
                                             .to_string(),
                                     );
                                 }
-                                Some(names)
+                                ToolsOverride::List(names)
                             }
                             _ => {
                                 return Err(invalid_override_field(
                                     path,
                                     name,
                                     "tools",
-                                    "an array of strings or false",
+                                    "an array of strings, \"inherit\", or false",
                                 ))
                             }
                         });
+                    }
+                    "excludeTools" => {
+                        // #1776: same shape family as other list overrides
+                        // (`parseOverrideStringArrayOrFalse`, agents.ts:1098).
+                        parsed_entry.exclude_tools = Some(parse_override_string_array_or_false(
+                            field,
+                            path,
+                            name,
+                            "excludeTools",
+                        )?);
                     }
                     "fallbackModels" => {
                         parsed_entry.fallback_models = Some(parse_override_string_array_or_false(
@@ -1152,7 +1185,10 @@ mod tests {
         );
         assert_eq!(
             settings.overrides.get("researcher").unwrap().tools,
-            Some(Some(vec!["read".to_string(), "write".to_string()]))
+            Some(ToolsOverride::List(vec![
+                "read".to_string(),
+                "write".to_string()
+            ]))
         );
         assert_eq!(settings.overrides.get("scout").unwrap().model, Some(None));
         let worker = settings.overrides.get("worker").unwrap();
@@ -1292,5 +1328,81 @@ mod tests {
         // still applies (only an explicit project value masks it).
         assert_eq!(model_scope.and_then(|s| s.allow).map(|a| a.len()), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// TE18 (R7.1.4.1/.2): `tools` override tri-state (`"inherit"` / `false` /
+/// array, #1047/#1049 — `parseToolsOverride`, agents.ts:946-951 @ 0fc0eebb)
+/// and the `excludeTools` override list (#1776). Ported intents:
+/// agent-overrides.test.ts:91/119/133/151.
+#[cfg(test)]
+mod te18_override_parse_tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn parse_entry(json: &str) -> Result<AgentOverride, String> {
+        let nonce = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("rpi-sub-cfg-te18-{}-{nonce}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            format!("{{\"subagents\":{{\"agentOverrides\":{{\"researcher\":{json}}}}}}}"),
+        )
+        .unwrap();
+        let settings = read_subagent_settings(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        settings.map(|settings| settings.overrides["researcher"].clone())
+    }
+
+    #[test]
+    fn tools_override_tri_state() {
+        assert_eq!(
+            parse_entry(r#"{"tools":"inherit"}"#).unwrap().tools,
+            Some(ToolsOverride::Inherit)
+        );
+        assert_eq!(
+            parse_entry(r#"{"tools":false}"#).unwrap().tools,
+            Some(ToolsOverride::Disable)
+        );
+        assert_eq!(
+            parse_entry(r#"{"tools":["read","write"]}"#).unwrap().tools,
+            Some(ToolsOverride::List(vec![
+                "read".to_string(),
+                "write".to_string()
+            ]))
+        );
+        // agent-overrides.test.ts:151 — a bare string tool override is a
+        // settings error naming the file/agent/field.
+        let error = parse_entry(r#"{"tools":"read"}"#).unwrap_err();
+        assert!(error.contains("agentOverrides.researcher.tools"), "{error}");
+        assert!(
+            error.contains("an array of strings, \"inherit\", or false"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exclude_tools_override_shapes() {
+        assert_eq!(
+            parse_entry(r#"{"excludeTools":["write","unknown_tool"]}"#)
+                .unwrap()
+                .exclude_tools,
+            Some(Some(vec!["write".to_string(), "unknown_tool".to_string()]))
+        );
+        // `false` clears back to undeclared.
+        assert_eq!(
+            parse_entry(r#"{"excludeTools":false}"#)
+                .unwrap()
+                .exclude_tools,
+            Some(None)
+        );
+        // Non-string entries are settings errors.
+        assert!(parse_entry(r#"{"excludeTools":[1]}"#).is_err());
     }
 }

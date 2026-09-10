@@ -5,6 +5,8 @@
 //! (parse_frontmatter + parse_frontmatter_list), `final-output`
 //! (get_final_output), `fallback` (is_retryable_model_failure; the
 //! context-overflow/attempt functions are TE14 and emit null for now),
+//! `model` (TE18 R7.1.4.4/.5: strict/required resolution + origin-aware
+//! candidate chain, diffed against the v0.66 `model-fallback.ts`),
 //! `discovery` (TE15) and `notify` (TE17 formatSingleCompletion /
 //! parseSubagentNotifyContent), prints one JSON document per line. Invoked
 //! by `scripts/subagents-parity/run-parity.mjs`; never part of `cargo test`.
@@ -82,6 +84,7 @@ fn run_args_case(input: &Value) -> Value {
         inherit_skills: input.get("inheritSkills") == Some(&Value::Bool(true)),
         require_read_tool: input.get("requireReadTool") == Some(&Value::Bool(true)),
         tools: get_list("tools"),
+        exclude_tools: get_list("excludeTools").unwrap_or_default(),
         extensions: get_list("extensions"),
         subagent_only_extensions: get_list("subagentOnlyExtensions"),
         prompt_file_stem: get_str("promptFileStem").map(str::to_string),
@@ -169,6 +172,87 @@ fn run_fallback_case(case: &Value) -> Value {
             ),
         }),
         other => json!({ "error": format!("unknown fallback fixture kind: {other}") }),
+    }
+}
+
+/// Model-resolution vectors (target track, TE18 R7.1.4.4/.5): drive the
+/// strict/required resolution and the origin-aware candidate chain against
+/// the same fixtures the upstream leg feeds to v0.66 `resolveSubagentModelOverride`
+/// / `buildModelCandidates`. Errors surface as `{ "error": … }` so a
+/// fail-closed throw on one side diffs against a value on the other.
+fn run_model_case(case: &Value) -> Value {
+    use rpi_ext_subagents::parity::{AvailableModelPublic, ModelOriginPublic};
+    let registry: Option<Vec<AvailableModelPublic>> = case.get("registry").and_then(|r| {
+        r.as_array().map(|entries| {
+            entries
+                .iter()
+                .map(|entry| AvailableModelPublic {
+                    full_id: entry
+                        .get("fullId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    provider: entry
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    id: entry
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+    });
+    let registry_ref = registry.as_deref();
+    let kind = case.get("kind").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "override" => {
+            let source = match case.get("source").and_then(Value::as_str) {
+                Some("explicit") => rpi_ext_subagents::parity::ModelSourcePublic::Explicit,
+                _ => rpi_ext_subagents::parity::ModelSourcePublic::Inherited,
+            };
+            match rpi_ext_subagents::parity::resolve_subagent_model_override_public(
+                case.get("model").and_then(Value::as_str),
+                case.get("parentModel").and_then(Value::as_str),
+                registry_ref,
+                case.get("preferredProvider").and_then(Value::as_str),
+                source,
+            ) {
+                Ok(resolved) => json!({ "resolved": resolved }),
+                Err(error) => json!({ "error": error }),
+            }
+        }
+        "candidates" => {
+            let origin = match case.get("origin").and_then(Value::as_str) {
+                Some("explicit") => ModelOriginPublic::Explicit,
+                Some("inherited") => ModelOriginPublic::Inherited,
+                _ => ModelOriginPublic::Configured,
+            };
+            match rpi_ext_subagents::parity::build_model_candidates_public(
+                case.get("primary").and_then(Value::as_str),
+                &case
+                    .get("fallbacks")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                registry_ref,
+                case.get("preferredProvider").and_then(Value::as_str),
+                origin,
+            ) {
+                Ok(candidates) => json!({ "candidates": candidates }),
+                Err(error) => json!({ "error": error }),
+            }
+        }
+        other => json!({ "error": format!("unknown model fixture kind: {other}") }),
     }
 }
 
@@ -390,6 +474,7 @@ fn main() {
             }
             "final-output" => run_final_output_case(case.get("messages").unwrap_or(&Value::Null)),
             "fallback" => run_fallback_case(&case),
+            "model" => run_model_case(&case),
             "discovery" => run_discovery_case(&case),
             "notify" => run_notify_case(&case),
             other => {

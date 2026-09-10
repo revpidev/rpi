@@ -167,6 +167,55 @@ function fallbackCase(modelFallback, fixture) {
 // TE17 notify leg (R7.1.7.2): drive the real v0.66 formatSingleCompletion /
 // parseSubagentNotifyContent. The parse projection mirrors the Rust leg's
 // notify_projection (undefined-dropping serializer == null-stripping).
+// TE18 (R7.1.4.4/.5, #1093): model-resolution leg — drive the real v0.66
+// resolveSubagentModelOverride / buildModelCandidates with the shared
+// fixture registry. Throws surface as { error } so a fail-closed throw on
+// this side diffs against a value (or error) from the Rust leg.
+function modelCase(modelFallback, fixture) {
+	const registry = fixture.registry === undefined || fixture.registry === null
+		? undefined
+		: fixture.registry.map((entry) => ({
+				fullId: entry.fullId,
+				provider: entry.provider,
+				id: entry.id,
+		}));
+	const parentModel = typeof fixture.parentModel === "string" && fixture.parentModel.includes("/")
+		? (() => {
+			const [provider, ...rest] = fixture.parentModel.split("/");
+			return { provider, id: rest.join("/") };
+		})()
+		: undefined;
+	if (fixture.kind === "override") {
+		try {
+			const resolved = modelFallback.resolveSubagentModelOverride(
+				fixture.model ?? undefined,
+				parentModel,
+				registry,
+				fixture.preferredProvider ?? undefined,
+				{ source: fixture.source === "explicit" ? "explicit" : "inherited" },
+			);
+			return { resolved };
+		} catch (error) {
+			return { error: String(error?.message ?? error) };
+		}
+	}
+	if (fixture.kind === "candidates") {
+		try {
+			const candidates = modelFallback.buildModelCandidates(
+				fixture.primary ?? undefined,
+				fixture.fallbacks ?? [],
+				registry,
+				fixture.preferredProvider ?? undefined,
+				{ origin: fixture.origin },
+			);
+			return { candidates };
+		} catch (error) {
+			return { error: String(error?.message ?? error) };
+		}
+	}
+	return { error: `unknown model fixture kind: ${fixture.kind}` };
+}
+
 function notifyCase(notify, fixture) {
 	const kind = fixture.kind ?? "format";
 	if (kind === "format") {
@@ -272,7 +321,7 @@ async function main() {
 	const fixturePath = process.argv[3];
 	if (!mode || !fixturePath) {
 		console.error(
-			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback|discovery|notify> <fixture.json>",
+			"usage: upstream-runner.mjs <args|frontmatter|final-output|fallback|model|discovery|notify> <fixture.json>",
 		);
 		process.exit(2);
 	}
@@ -299,6 +348,8 @@ async function main() {
 			output = utils.getFinalOutput(fixture.messages ?? []);
 		} else if (mode === "fallback") {
 			output = fallbackCase(modelFallback, fixture);
+		} else if (mode === "model") {
+			output = modelCase(modelFallback, fixture);
 		} else if (mode === "discovery") {
 			output = await discoveryCase(fixture);
 		} else if (mode === "notify") {

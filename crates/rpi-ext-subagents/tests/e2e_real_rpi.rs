@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 struct FakeHost {
     cwd: PathBuf,
     model: Value,
+    /// Host tool names served by `getAllTools` (TE18 FR-C pre-spawn gate).
+    tools: Vec<String>,
 }
 
 // Safety: the trampoline only dereferences the cookie as `&FakeHost`.
@@ -34,6 +36,9 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
         }
         "ctx.cwd" => json!({ "ok": host.cwd.to_string_lossy() }),
         "ctx.model" => json!({ "ok": host.model }),
+        "getAllTools" => {
+            json!({ "ok": host.tools.iter().map(|name| json!({"name": name})).collect::<Vec<_>>() })
+        }
         _ => json!({ "error": { "kind": "unknownMethod", "message": method } }),
     };
     RVec::from(serde_json::to_vec(&response).unwrap_or_default())
@@ -245,6 +250,14 @@ fn e2e_real_rpi_child_and_stream_fixture() {
     let host = Arc::new(FakeHost {
         cwd: project.clone(),
         model: json!({"provider": "stubpar", "id": "stub-1"}),
+        // Builtin face for the TE18 pre-spawn tool gate (reviewer declares
+        // read/grep/find/ls + intercom — the coordination name is exempt).
+        tools: [
+            "read", "bash", "edit", "write", "grep", "find", "ls", "subagent",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect(),
     });
     let response = rpi_ext_subagents::install_for_test(
         RpiHostCalls {

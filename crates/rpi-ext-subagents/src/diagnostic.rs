@@ -37,6 +37,72 @@ fn requirement_satisfied(required: &str, available: &std::collections::BTreeSet<
         .any(|(name, provider)| name == &required && available.contains(provider))
 }
 
+/// Pre-spawn tool-face gate (R7.1.4.3 / #2034, TE18 FR-C): the declared
+/// allowlist (minus excluded names) must be covered by the host's tool set
+/// before the child launches. rpi fails closed with the ADR-0017 message —
+/// the same diagnostic structure and wording the child-side check writes —
+/// instead of upstream's silent omission; a host-query error also fails
+/// closed (never silently lets the launch through).
+///
+/// Path-shaped `tools` entries (`/`, `.ts`, `.js`) are extension providers,
+/// not registry names, and are not gated (upstream `requestedBuiltinTools`
+/// filter, child-tool-plan.ts:336-341). Supervisor-coordination names
+/// (`contact_supervisor` and its `intercom` alias) are also exempt — the
+/// plugin registers them at runtime inside the child, so they are never in
+/// the parent registry (upstream filters them out of the strict
+/// requirements the same way, child-tool-plan.ts:374-380).
+#[allow(clippy::result_large_err)]
+pub fn check_host_tool_face(
+    allowlist: &[String],
+    exclude_tools: &[String],
+    host_tools: Result<&[String], &str>,
+    agent_name: &str,
+) -> Result<(), String> {
+    let excluded: std::collections::BTreeSet<&str> = exclude_tools
+        .iter()
+        .map(|name| name.trim())
+        .filter(|name| !name.is_empty())
+        .collect();
+    let is_path_shaped =
+        |tool: &str| tool.contains('/') || tool.ends_with(".ts") || tool.ends_with(".js");
+    let is_coordination_name = |tool: &str| tool == "contact_supervisor" || tool == "intercom";
+    let required: Vec<String> = allowlist
+        .iter()
+        .filter(|tool| !is_path_shaped(tool))
+        .filter(|tool| !is_coordination_name(tool))
+        .filter(|tool| !excluded.contains(tool.trim()))
+        .cloned()
+        .collect();
+    if required.is_empty() {
+        return Ok(());
+    }
+    let available = host_tools.map_err(|reason| {
+        // `getAllTools` failed: the parent cannot vouch for the tool face —
+        // refuse the launch instead of spawning blind.
+        format!(
+            "Agent '{agent_name}' requires tools {} but the host tool face is unavailable ({reason}); refusing to start the subagent without verifying its tools.",
+            required.join(", ")
+        )
+    })?;
+    let available_names: std::collections::BTreeSet<&str> =
+        available.iter().map(String::as_str).collect();
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|name| !requirement_satisfied(name, &available_names))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let diagnostic = ChildToolDiagnostic {
+        agent: Some(agent_name.to_string()),
+        required,
+        available: available.to_vec(),
+        missing,
+    };
+    Err(format_child_tool_diagnostic(&diagnostic))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChildToolDiagnostic {
     pub agent: Option<String>,
@@ -195,5 +261,113 @@ mod tests {
         assert!(!path.exists(), "diagnostic removed when nothing is missing");
         assert_eq!(read_child_tool_diagnostic_error(Some(&path)), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod te18_gate_tests {
+    use super::*;
+
+    #[test]
+    fn gate_passes_when_host_covers_the_allowlist() {
+        let host: Vec<String> = ["read", "bash", "write", "grep"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            check_host_tool_face(
+                &["read".to_string(), "bash".to_string()],
+                &[],
+                Ok(&host[..]),
+                "scout"
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn gate_fails_closed_with_adr0017_wording() {
+        let host: Vec<String> = ["read"].iter().map(|s| s.to_string()).collect();
+        // Missing one / missing all — both refuse with the shared ADR-0017
+        // message (same wording source as the child-side diagnostic).
+        for allowlist in [
+            vec!["read".to_string(), "web_search".to_string()],
+            vec!["web_search".to_string(), "other".to_string()],
+        ] {
+            let error =
+                check_host_tool_face(&allowlist, &[], Ok(&host[..]), "researcher").unwrap_err();
+            assert!(
+                error.starts_with("Agent 'researcher' requested unavailable child tools:"),
+                "{error}"
+            );
+            assert!(error.contains("strict allowlist"), "{error}");
+        }
+        let error = check_host_tool_face(
+            &["read".to_string(), "web_search".to_string()],
+            &[],
+            Ok(&host[..]),
+            "researcher",
+        )
+        .unwrap_err();
+        // Only the genuinely absent name is reported.
+        assert!(
+            error.contains("unavailable child tools: web_search.") && !error.contains("read,"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn gate_fails_closed_on_host_query_error() {
+        // `getAllTools` errored — never silently let the launch through.
+        let error = check_host_tool_face(
+            &["read".to_string()],
+            &[],
+            Err("getAllTools host call failed"),
+            "worker",
+        )
+        .unwrap_err();
+        assert!(error.contains("host tool face is unavailable"), "{error}");
+        assert!(error.contains("refusing to start"), "{error}");
+    }
+
+    #[test]
+    fn gate_skips_excluded_path_shaped_and_coordination_names() {
+        let host: Vec<String> = ["read"].iter().map(|s| s.to_string()).collect();
+        // Excluded names are not requirements (post-exclude effective list).
+        assert_eq!(
+            check_host_tool_face(
+                &["read".to_string(), "bash".to_string()],
+                &["bash".to_string()],
+                Ok(&host[..]),
+                "scout"
+            ),
+            Ok(())
+        );
+        // Path-shaped entries are extension providers, not registry names.
+        assert_eq!(
+            check_host_tool_face(
+                &["./tools/search.ts".to_string()],
+                &[],
+                Ok(&host[..]),
+                "scout"
+            ),
+            Ok(())
+        );
+        // Coordination names are registered at runtime inside the child,
+        // never present in the parent registry (child-tool-plan.ts:374-380).
+        assert_eq!(
+            check_host_tool_face(
+                &["contact_supervisor".to_string(), "intercom".to_string()],
+                &[],
+                Ok(&host[..]),
+                "reviewer"
+            ),
+            Ok(())
+        );
+        // No declared allowlist content → nothing to gate.
+        assert_eq!(
+            check_host_tool_face(&[], &[], Err("unavailable"), "worker"),
+            Ok(())
+        );
     }
 }

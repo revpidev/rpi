@@ -14,10 +14,31 @@ use serde_json::{json, Value};
 struct FakeHost {
     cwd: PathBuf,
     model: Value,
+    /// Host tool names served by `getAllTools` (TE18 FR-C pre-spawn gate):
+    /// the builtin set plus the supervisor client the plugin registers in
+    /// the parent session (`contact_supervisor`, the `intercom` alias).
+    tools: Vec<String>,
     /// Authoritative `ctx.sessionFile` answer (V13-02): `Some` = served as
     /// `{"path", "id"}`, `None` = host call error (fallback path). Scenario
     /// 3 and the FR-D dual-instance scenario set it before forking.
     session_file: std::sync::Mutex<Option<Value>>,
+}
+
+fn builtin_host_tools() -> Vec<String> {
+    [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "subagent",
+        "contact_supervisor",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// TE09: host-call observation sinks — `toolUpdate` partial frames and
@@ -74,6 +95,9 @@ extern "C" fn fake_host_call(host_ptr: PluginCookie, request: RVec<u8>) -> RVec<
             json!({ "ok": true })
         }
         "ctx.cwd" => json!({ "ok": host.cwd.to_string_lossy() }),
+        "getAllTools" => {
+            json!({ "ok": host.tools.iter().map(|name| json!({"name": name})).collect::<Vec<_>>() })
+        }
         "ctx.sessionFile" => match host
             .session_file
             .lock()
@@ -155,6 +179,19 @@ impl Sandbox {
             "---\nname: fallbacker\ndescription: TE14 fallback replay guard fixture\nmodel: faux/primary\nfallbackModels: faux/secondary\ntools: read\n---\n\nYou are a fallback fixture agent. Reply briefly.\n",
         )
         .unwrap();
+        // TE18 fixtures: excludeTools argv face (R7.1.4.2) and the pre-spawn
+        // tool-face gate failure (R7.1.4.3 — web_search is not served by the
+        // FakeHost's getAllTools).
+        std::fs::write(
+            agent_dir.join("agents").join("excluder.md"),
+            "---\nname: excluder\ndescription: TE18 excludeTools fixture\ntools: read, bash\nexcludeTools: bash\n---\n\nYou narrow your own tool face.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_dir.join("agents").join("gater.md"),
+            "---\nname: gater\ndescription: TE18 tool-face gate fixture\ntools: read, web_search\n---\n\nYou need a tool the host does not serve.\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(&dump_root).unwrap();
         std::env::set_var("RPI_CODING_AGENT_DIR", &agent_dir);
         std::env::set_var("RPI_SUBAGENT_RPI_BINARY", fixed_child_binary());
@@ -227,6 +264,7 @@ fn e2e_fixed_child_full_pipeline() {
     let host = Arc::new(FakeHost {
         cwd: sandbox.project.clone(),
         model: json!({ "provider": "faux", "id": "faux-1" }),
+        tools: builtin_host_tools(),
         session_file: std::sync::Mutex::new(None),
     });
     let response = rpi_ext_subagents::install_for_test(
@@ -387,16 +425,21 @@ fn e2e_fixed_child_full_pipeline() {
     assert_eq!(meta["usage"]["cost"], 0.42);
     assert_eq!(meta["model"], "faux/fixed-1");
 
-    // ---- Scenario 2: fork fail-fast without a parent session -----------
+    // ---- Scenario 2: fork unavailable degrades to fresh (ADR-0026) ------
+    // G2 (TE18 FR-G): previously fail-fast asserting "Forked subagent
+    // context requires a persisted parent session." — ADR-0026 (upstream
+    // #1137) degraded every fork-unusable path to fresh with a warning;
+    // explicit `context: "fork"` included (user decision 2026-09-08).
     let result = execute(
         json!({ "agent": "worker", "task": "t", "context": "fork", "timeoutMs": 5000, "artifacts": false }),
     );
-    assert_eq!(result["isError"], Value::Bool(true), "{result}");
-    let text = result["content"][0]["text"].as_str().unwrap();
-    assert!(
-        text.contains("Forked subagent context requires a persisted parent session."),
-        "{text}"
+    assert_eq!(result["isError"], Value::Bool(false), "{result}");
+    let single = &result["details"]["results"][0];
+    assert_eq!(
+        single["context"], "fresh",
+        "context reflects the degraded mode"
     );
+    assert_eq!(single["exitCode"], 0);
 
     // ---- Scenario 3: fork from a persisted parent session --------------
     let sessions = sandbox.root.join("sessions");
@@ -1602,6 +1645,74 @@ fn e2e_fixed_child_full_pipeline() {
             "fleet widget removed on the empty snapshot; calls seen: {all_calls:?}"
         );
         rpi_ext_subagents::fleet::set_linger_for_test(u64::MAX);
+    }
+
+    // ---- TE18 Scenario: excludeTools argv + global-context env (FR-B/FR-H) --
+    {
+        let dump = sandbox.dump("exclude-tools");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "agent": "excluder",
+            "task": "narrow tools",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(false), "{result}");
+        let argv_lines: Vec<String> = std::fs::read_to_string(dump.join("argv.txt"))
+            .expect("argv dump")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let find_flag = |flag: &str| argv_lines.iter().position(|arg| arg == flag);
+        // #1776: deny rides its own flag after the allow branch; the allow
+        // list is the post-exclude effective set (bash removed).
+        let tools_pos = find_flag("--tools").expect("excluder declares tools");
+        // Post-exclude effective list (bash removed) + the bridge-appended
+        // contact_supervisor (FR-P1-10 default always — same append as the
+        // scout argv assertion above; coordination names stay in the
+        // allowlist, they are just never strict requirements).
+        assert_eq!(argv_lines[tools_pos + 1], "read,contact_supervisor");
+        let exclude_pos = find_flag("--exclude-tools").expect("excludeTools flag");
+        assert_eq!(argv_lines[exclude_pos + 1], "bash");
+        assert!(
+            exclude_pos > tools_pos,
+            "deny-after-allow ordering: {argv_lines:?}"
+        );
+        // ADR-0026 decision 3: children opt out of the global context file.
+        let env_text = std::fs::read_to_string(dump.join("env.txt")).expect("env dump");
+        assert!(
+            env_text
+                .lines()
+                .any(|line| line == "RPI_NO_GLOBAL_CONTEXT=1"),
+            "child env carries the global-context opt-out: {env_text}"
+        );
+    }
+
+    // ---- TE18 Scenario: pre-spawn tool-face gate fails closed (FR-C) -----
+    {
+        let dump = sandbox.dump("gate-fail");
+        std::env::set_var("RPI_E2E_DUMP_DIR", &dump);
+        std::env::set_var("RPI_E2E_MODE", "ok");
+        let result = execute(json!({
+            "agent": "gater",
+            "task": "needs web_search",
+            "timeoutMs": 30000,
+            "artifacts": false
+        }));
+        assert_eq!(result["isError"], Value::Bool(true), "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        // ADR-0017 wording (same source as the child-side diagnostic), with
+        // the missing name — the child never started.
+        assert!(
+            text.contains("Agent 'gater' requested unavailable child tools: web_search."),
+            "{text}"
+        );
+        assert!(text.contains("strict allowlist"), "{text}");
+        assert!(
+            !dump.join("argv.txt").exists(),
+            "the gate must refuse before spawn: no child dump"
+        );
     }
 
     // Final sweep: nothing left running.
