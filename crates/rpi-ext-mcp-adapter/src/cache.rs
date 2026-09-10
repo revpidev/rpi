@@ -255,6 +255,47 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
     let cwd = crate::utils::resolve_config_path(map.get("cwd"))?.map(Value::String);
     let url = crate::utils::resolve_server_url(map.get("url"))?.map(Value::String);
     let bearer_token = crate::utils::resolve_bearer_token(map)?.map(Value::String);
+    // `requestHeadersCommand` (metadata-cache.ts:98-105 @ 10a45367): the
+    // normalized derivation command joins the identity — env vars in
+    // command/args/env interpolate, timeoutMs rides raw, absent fields
+    // inside the object stay absent (`undefined`).
+    let request_headers_command = match map.get("requestHeadersCommand") {
+        // JS truthiness of `definition.requestHeadersCommand ? ... :
+        // undefined`: null/false/0/"" skip the branch; anything else —
+        // including a malformed non-object — produces the normalized object
+        // (whose absent/undefined members stableStringify drops, so a
+        // truthy non-object degrades to `{}`).
+        Some(config) if !matches!(config, Value::Null | Value::Bool(false)) => {
+            let normalized = config.as_object().map(|obj| {
+                let mut normalized = serde_json::Map::new();
+                if let Some(command) = obj.get("command").and_then(Value::as_str) {
+                    normalized.insert(
+                        "command".to_string(),
+                        Value::String(crate::utils::interpolate_env_vars(command)),
+                    );
+                }
+                if let Some(Value::Array(args)) = obj.get("args") {
+                    let args: Vec<Value> = args
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(|a| Value::String(crate::utils::interpolate_env_vars(a)))
+                        .collect();
+                    normalized.insert("args".to_string(), Value::Array(args));
+                }
+                if let Some(env) = obj.get("env") {
+                    if let Ok(Some(interp)) = crate::utils::interpolate_env_record(Some(env)) {
+                        normalized.insert("env".to_string(), Value::Object(interp));
+                    }
+                }
+                if let Some(timeout) = obj.get("timeoutMs") {
+                    normalized.insert("timeoutMs".to_string(), timeout.clone());
+                }
+                Value::Object(normalized)
+            });
+            Some(normalized.unwrap_or(Value::Object(serde_json::Map::new())))
+        }
+        _ => None,
+    };
 
     let raw = |key: &str| map.get(key).cloned();
 
@@ -269,6 +310,7 @@ pub fn compute_server_hash(definition: &ServerEntry) -> Result<String, AdapterEr
         ("cwd", cwd),
         ("url", url),
         ("headers", headers),
+        ("requestHeadersCommand", request_headers_command),
         ("auth", raw("auth")),
         ("protocolVersion", raw("protocolVersion")),
         ("bearerToken", bearer_token),

@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/config.ts loadMcpConfig @ 7a7b01b, executed by gen-mcp-adapter-fixtures.mjs",
   "note": "imports are expanded by upstream loadMcpConfig but NOT by the P0 rpi port [VARIANT]; no fixture case uses imports-dependent servers.",
   "cases": [
     {
@@ -342,6 +342,105 @@
       }
     },
     {
+      "name": "transport-switch-cleared-fields-v2321",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "toUrl": {
+              "command": "old",
+              "args": [
+                "--old"
+              ],
+              "env": {
+                "OLD": "1"
+              },
+              "cwd": "/old",
+              "pluginDataDir": "/data/old",
+              "literalEnv": true,
+              "inheritEnv": false
+            },
+            "toCommand": {
+              "url": "https://example.test/mcp",
+              "headers": {
+                "Authorization": "Bearer x"
+              },
+              "requestHeadersCommand": {
+                "command": "derive",
+                "args": [
+                  "--flag"
+                ]
+              },
+              "auth": "bearer",
+              "bearerToken": "tok",
+              "bearerTokenEnv": "TOK_ENV",
+              "oauth": {
+                "clientId": "c"
+              },
+              "httpTransport": "sse"
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "toUrl": {
+              "url": "https://other.test/mcp"
+            },
+            "toCommand": {
+              "command": "new"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "toUrl": {
+            "url": "https://other.test/mcp"
+          },
+          "toCommand": {
+            "command": "new"
+          }
+        }
+      }
+    },
+    {
+      "name": "url-change-strips-url-bound-auth-v2321",
+      "layers": {
+        "shared-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://litellm.internal/mcp/",
+              "headers": {
+                "Authorization": "Bearer old"
+              },
+              "requestHeadersCommand": {
+                "command": "derive",
+                "timeoutMs": 500
+              },
+              "bearerToken": "static",
+              "bearerTokenEnv": "TOK",
+              "bearerTokenStore": true
+            }
+          }
+        },
+        "pi-global": {
+          "mcpServers": {
+            "litellm": {
+              "url": "https://attacker.example/mcp/"
+            }
+          }
+        }
+      },
+      "rawLayers": {},
+      "expected": {
+        "mcpServers": {
+          "litellm": {
+            "url": "https://attacker.example/mcp/"
+          }
+        }
+      }
+    },
+    {
       "name": "malformed-entries-dropped",
       "layers": {
         "shared-project": {
@@ -382,6 +481,27 @@
             "command": "x"
           }
         }
+      }
+    },
+    {
+      "name": "jsonc-comments-and-trailing-commas",
+      "layers": {},
+      "rawLayers": {
+        "pi-global": "{\n        // leading comment\n        \"imports\": [\"vscode\",],\n        \"mcpServers\": {\n          \"global\": { \"command\": \"global-server\", },\n        },\n      }",
+        "shared-project": "{\n        /* block\n           comment */\n        \"mcpServers\": {\n          \"project\": { \"command\": \"project-server\", },\n        },\n      }"
+      },
+      "expected": {
+        "mcpServers": {
+          "global": {
+            "command": "global-server"
+          },
+          "project": {
+            "command": "project-server"
+          }
+        },
+        "imports": [
+          "vscode"
+        ]
       }
     }
   ]

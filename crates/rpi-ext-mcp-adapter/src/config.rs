@@ -371,36 +371,79 @@ fn merge_imports(left: Option<&Vec<String>>, right: Option<&Vec<String>>) -> Opt
 }
 
 /// Credential-bearing fields whose value is bound to a specific server
-/// `url` (config.ts:469-474).
-const URL_BOUND_AUTH_FIELDS: [&str; 3] = ["headers", "bearerToken", "bearerTokenEnv"];
+/// `url` (config.ts:521-527 @ 10a45367 + #514): the store-backed bearer
+/// (`bearerTokenStore`) and the per-request derivation command
+/// (`requestHeadersCommand`) joined the original three.
+const URL_BOUND_AUTH_FIELDS: [&str; 5] = [
+    "headers",
+    "bearerToken",
+    "bearerTokenEnv",
+    "bearerTokenStore",
+    "requestHeadersCommand",
+];
 
-/// Fields dropped when an override switches a server to `socket` transport
-/// (config.ts:495-500).
-const SOCKET_SWITCH_CLEARED_FIELDS: [&str; 9] = [
+/// Fields dropped when an override switches a server to `command` transport
+/// (config.ts:539-545 @ 10a45367): the whole url/socket/auth side goes.
+const COMMAND_SWITCH_CLEARED_FIELDS: [&str; 9] = [
+    "url",
+    "headers",
+    "requestHeadersCommand",
+    "auth",
+    "bearerToken",
+    "bearerTokenEnv",
+    "oauth",
+    "httpTransport",
+    "socket",
+];
+
+/// Fields dropped when an override switches a server to `url` transport
+/// (config.ts:546-552 @ 10a45367; `inheritEnv` added by #514/7a7b01b).
+const URL_SWITCH_CLEARED_FIELDS: [&str; 8] = [
     "command",
     "args",
     "env",
     "cwd",
+    "pluginDataDir",
+    "literalEnv",
+    "inheritEnv",
+    "socket",
+];
+
+/// Fields dropped when an override switches a server to `socket` transport
+/// (config.ts:553-566 @ 10a45367; `inheritEnv` added by #514/7a7b01b).
+const SOCKET_SWITCH_CLEARED_FIELDS: [&str; 15] = [
+    "command",
+    "args",
+    "env",
+    "cwd",
+    "pluginDataDir",
+    "literalEnv",
+    "inheritEnv",
     "url",
     "headers",
+    "requestHeadersCommand",
     "auth",
     "bearerToken",
     "bearerTokenEnv",
+    "oauth",
+    "httpTransport",
 ];
 
-/// `mergeServerMaps` (config.ts:476-518) — per-field fold with the two
-/// SECURITY rules:
+/// `mergeServerMaps` (config.ts:527-580 @ 10a45367, + #514/7a7b01b) —
+/// per-field fold with the two SECURITY rules:
 ///
-/// 1. **Transport switch** (config.ts:494-505): an override supplying
-///    `socket` clears all command/url-side fields from the inherited entry;
-///    an override supplying `command`/`url` over an inherited `socket`
-///    entry drops that `socket`.
-/// 2. **Credential/url binding** (config.ts:483-514): when the override
-///    changes `url`, inherited `headers`/`bearerToken`/`bearerTokenEnv` (and
-///    `oauth`, unless it is exactly `false`) are stripped BEFORE the
-///    per-field merge, so credentials bound to the old url cannot follow the
-///    server to an attacker-controlled url. Auth re-supplied by the override
-///    still applies (it is merged last).
+/// 1. **Transport switch** (config.ts:537-566): three symmetric branches —
+///    an override supplying `command` clears the url/socket/auth side, one
+///    supplying `url` clears the command side (incl.
+///    `pluginDataDir`/`literalEnv`/`inheritEnv`), one supplying `socket`
+///    clears both sides. The branch test is `typeof === "string"` (an
+///    empty string still switches).
+/// 2. **Credential/url binding** (config.ts:521-527, 567-574): when the
+///    override changes `url`, inherited URL-bound auth fields (and `oauth`,
+///    unless it is exactly `false`) are stripped BEFORE the per-field merge,
+///    so credentials bound to the old url cannot follow the server to an
+///    attacker-controlled url. Auth re-supplied by the override still
+///    applies (it is merged last).
 pub fn merge_server_maps(
     base: &IndexMap<String, ServerEntry>,
     next: &IndexMap<String, ServerEntry>,
@@ -411,31 +454,34 @@ pub fn merge_server_maps(
         let mut base_entry: Option<Map<String, Value>> = None;
         if let Some(existing) = existing {
             let mut entry = existing.as_map().clone();
-            let definition_socket_is_string =
-                definition.get("socket").is_some_and(Value::is_string);
-            // JS truthiness for the reverse direction: `existing?.socket` —
-            // null/false/0/"" do NOT trigger the clear, other values do.
-            let existing_socket_truthy = match existing.get("socket") {
-                Some(Value::String(s)) => !s.is_empty(),
-                Some(Value::Bool(b)) => *b,
-                Some(Value::Null) | None => false,
-                Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
-                Some(_) => true,
-            };
-            let definition_has_command_or_url =
-                definition.get("command").is_some_and(Value::is_string)
-                    || definition.get("url").is_some_and(Value::is_string);
-            if definition_socket_is_string {
+            // Three symmetric transport-switch branches
+            // (config.ts:537-566 @ 10a45367): `typeof definition.command ===
+            // "string"` → command branch; `else if typeof definition.url ===
+            // "string"` → url branch; `else if typeof definition.socket ===
+            // "string"` → socket branch. The branch test is the TYPE, not
+            // truthiness — an empty string still switches (an empty-string
+            // socket/url/command then fails the "exactly one of"
+            // validation at connect time, same as upstream).
+            if definition.get("command").is_some_and(Value::is_string) {
+                for field in COMMAND_SWITCH_CLEARED_FIELDS {
+                    entry.shift_remove(field);
+                }
+            } else if definition.get("url").is_some_and(Value::is_string) {
+                for field in URL_SWITCH_CLEARED_FIELDS {
+                    entry.shift_remove(field);
+                }
+            } else if definition.get("socket").is_some_and(Value::is_string) {
                 for field in SOCKET_SWITCH_CLEARED_FIELDS {
                     entry.shift_remove(field);
                 }
-            } else if existing_socket_truthy && definition_has_command_or_url {
-                entry.shift_remove("socket");
             }
             base_entry = Some(entry);
         }
         if let (Some(existing), Some(base)) = (existing, base_entry.as_mut()) {
             if let Some(Value::String(new_url)) = definition.get("url") {
+                // `definition.url !== existing.url` — plain strict-equality
+                // against the ORIGINAL entry (missing url ≠ any override
+                // url, so a command→url switch also strips auth).
                 let url_changed = existing.get("url") != Some(&Value::String(new_url.clone()));
                 if url_changed {
                     for field in URL_BOUND_AUTH_FIELDS {
@@ -802,5 +848,140 @@ mod tests {
             Some(vec!["cursor".to_string(), "codex".to_string()])
         );
         assert!(merged.mcp_servers.is_empty());
+    }
+    #[test]
+    fn transport_switch_clears_three_branches_v2321() {
+        // config.ts:537-566 @ 10a45367 (+ #514/7a7b01b for inheritEnv).
+        let base_entry = |extra: Value| {
+            servers(json!({
+                "srv": extra
+            }))
+        };
+        // command switch clears the url/auth side.
+        let merged = merge_server_maps(
+            &base_entry(json!({
+                "url": "https://a.test/mcp", "headers": { "Authorization": "Bearer x" },
+                "requestHeadersCommand": { "command": "derive" }, "auth": "bearer",
+                "bearerToken": "t", "bearerTokenEnv": "E", "oauth": { "clientId": "c" },
+                "httpTransport": "sse",
+            })),
+            &servers(json!({ "srv": { "command": "new" } })),
+        );
+        let entry = merged.get("srv").expect("merged").as_map();
+        for cleared in [
+            "url",
+            "headers",
+            "requestHeadersCommand",
+            "auth",
+            "bearerToken",
+            "bearerTokenEnv",
+            "oauth",
+            "httpTransport",
+        ] {
+            assert!(
+                !entry.contains_key(cleared),
+                "command switch must clear {cleared}: {entry:?}"
+            );
+        }
+        assert_eq!(entry.get("command"), Some(&json!("new")));
+
+        // url switch clears the command side incl. the three #514-era fields.
+        let merged = merge_server_maps(
+            &base_entry(json!({
+                "command": "old", "args": ["--old"], "env": { "OLD": "1" },
+                "cwd": "/old", "pluginDataDir": "/data", "literalEnv": true,
+                "inheritEnv": false,
+            })),
+            &servers(json!({ "srv": { "url": "https://b.test/mcp" } })),
+        );
+        let entry = merged.get("srv").expect("merged").as_map();
+        for cleared in [
+            "command",
+            "args",
+            "env",
+            "cwd",
+            "pluginDataDir",
+            "literalEnv",
+            "inheritEnv",
+        ] {
+            assert!(
+                !entry.contains_key(cleared),
+                "url switch must clear {cleared}: {entry:?}"
+            );
+        }
+        assert_eq!(entry.get("url"), Some(&json!("https://b.test/mcp")));
+
+        // socket switch clears both sides.
+        let merged = merge_server_maps(
+            &base_entry(json!({
+                "command": "old", "env": { "OLD": "1" }, "cwd": "/old",
+                "pluginDataDir": "/data", "literalEnv": true, "inheritEnv": false,
+                "url": "https://a.test/mcp", "headers": { "X": "y" },
+                "requestHeadersCommand": { "command": "d" }, "auth": "bearer",
+                "bearerToken": "t", "bearerTokenEnv": "E", "oauth": { "clientId": "c" },
+                "httpTransport": "sse",
+            })),
+            &servers(json!({ "srv": { "socket": "/s.sock" } })),
+        );
+        let entry = merged.get("srv").expect("merged").as_map();
+        for cleared in [
+            "command",
+            "args",
+            "env",
+            "cwd",
+            "pluginDataDir",
+            "literalEnv",
+            "inheritEnv",
+            "url",
+            "headers",
+            "requestHeadersCommand",
+            "auth",
+            "bearerToken",
+            "bearerTokenEnv",
+            "oauth",
+            "httpTransport",
+        ] {
+            assert!(
+                !entry.contains_key(cleared),
+                "socket switch must clear {cleared}: {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn url_change_strips_five_url_bound_auth_fields() {
+        // URL_BOUND_AUTH_FIELDS @ 10a45367 + #514 era: bearerTokenStore and
+        // requestHeadersCommand join the original three.
+        let base = servers(json!({
+            "litellm": {
+                "url": "https://a.test/mcp",
+                "headers": { "Authorization": "Bearer old" },
+                "requestHeadersCommand": { "command": "derive", "timeoutMs": 500 },
+                "bearerToken": "static", "bearerTokenEnv": "TOK", "bearerTokenStore": true,
+            }
+        }));
+        let next = servers(json!({ "litellm": { "url": "https://b.test/mcp" } }));
+        let merged = merge_server_maps(&base, &next);
+        let entry = merged.get("litellm").expect("merged").as_map();
+        for stripped in [
+            "headers",
+            "bearerToken",
+            "bearerTokenEnv",
+            "bearerTokenStore",
+            "requestHeadersCommand",
+            "oauth",
+        ] {
+            assert!(
+                !entry.contains_key(stripped),
+                "url change must strip {stripped}: {entry:?}"
+            );
+        }
+        // Same url keeps the inherited auth.
+        let same = servers(json!({ "litellm": { "url": "https://a.test/mcp" } }));
+        let merged = merge_server_maps(&base, &same);
+        let entry = merged.get("litellm").expect("merged").as_map();
+        assert!(entry.contains_key("headers"));
+        assert!(entry.contains_key("bearerTokenStore"));
+        assert!(entry.contains_key("requestHeadersCommand"));
     }
 }

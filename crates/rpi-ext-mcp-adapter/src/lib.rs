@@ -17,6 +17,7 @@
 #![allow(non_camel_case_types)]
 
 pub mod approval;
+pub mod bearer_store;
 pub mod cache;
 pub mod commands;
 pub mod config;
@@ -30,6 +31,7 @@ pub mod oauth;
 pub mod protocol;
 pub mod proxy;
 pub mod render;
+pub mod request_headers;
 pub mod runtime;
 pub mod search;
 pub mod session_approvals;
@@ -428,11 +430,13 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
             };
         }
         // Config discovery from the new session's cwd (ctx.cwd through the
-        // NEW binding).
+        // NEW binding; argv override per #515 — a fresh host re-parses the
+        // same process argv).
         let cwd = session_cwd(plugin);
         {
             let mut surface = plugin.direct.lock().unwrap_or_else(|e| e.into_inner());
-            surface.early_config = config::load_mcp_config(None, &cwd);
+            surface.early_config =
+                config::load_mcp_config(crate::utils::get_config_path_from_argv().as_deref(), &cwd);
         }
         sync_tool_surface(plugin);
         update_status_bar(plugin);
@@ -460,7 +464,15 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
     };
     let dispatcher = Arc::new(ProxyDispatcher::new());
     let cwd_hint = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let early_config = config::load_mcp_config(None, &cwd_hint);
+    // #515 (utils.ts:67-88 @ 97253eb): read `--mcp-config[=]path` from the
+    // HOST argv at load time — the host applies extension flag values only
+    // after the final extension load (agent-session-services.ts:81-127), so
+    // a getFlag read here would miss the override and the install-time
+    // prewarm would connect servers from the wrong config layer stack.
+    let early_config = config::load_mcp_config(
+        crate::utils::get_config_path_from_argv().as_deref(),
+        &cwd_hint,
+    );
     let env_override = std::env::var("MCP_DIRECT_TOOLS").ok().and_then(|raw| {
         if raw == "__none__" {
             None

@@ -82,28 +82,57 @@ impl StderrTail {
     }
 }
 
-/// `resolveEnv` (server-manager.ts:1106-1118): process env plus per-server
-/// overrides with `!command` secrets resolved at spawn time. Resolution
-/// failures abort the spawn (upstream `resolveCommandSecret` throws).
-/// `literalEnv` (Agent Plugins, P2) skips interpolation but is accepted for
-/// forward compatibility.
+/// `resolveEnv` (server-manager.ts:1637-1655 @ 10a45367 + #514/7a7b01b):
+/// process env plus per-server overrides with `!command` secrets resolved
+/// at spawn time. Resolution failures abort the spawn (upstream
+/// `resolveCommandSecret` throws). `literalEnv: true` skips interpolation
+/// but keeps the inherited base env; `inheritEnv: false` (#514) DROPS the
+/// inherited process env entirely — only the explicit overrides (and the
+/// SDK platform defaults the Rust spawn provides implicitly, PATH etc.
+/// included via `env_clear` semantics upstream) survive.
 pub fn resolve_env(definition: &ServerEntry) -> Result<Vec<(String, String)>, ProtocolError> {
     // Node's `process.env` decodes non-UTF-8 values lossily (U+FFFD);
     // `vars_os` + `to_string_lossy` matches that instead of panicking on
     // `vars()` when the host environment carries binary values.
-    let mut env: Vec<(String, String)> = std::env::vars_os()
-        .map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
+    // #514: `definition.inheritEnv !== false` gates the copy.
+    let inherit_env = definition.get("inheritEnv") != Some(&Value::Bool(false));
+    let mut env: Vec<(String, String)> = if inherit_env {
+        std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let literal_env = definition.get("literalEnv") == Some(&Value::Bool(true));
+    let overrides: Vec<(String, Value)> = if literal_env {
+        // literalEnv: skip `!command` interpolation entirely (raw values).
+        definition
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(key, value)| {
+                        value
+                            .as_str()
+                            .map(|v| (key.clone(), Value::String(v.to_string())))
+                    })
+                    .collect::<Vec<(String, Value)>>()
+            })
+            .unwrap_or_default()
+    } else {
+        crate::utils::resolve_command_secrets_record(definition.get("env"), &|key| {
+            format!("MCP server stdio env {key:?}")
         })
-        .collect();
-    let overrides = crate::utils::resolve_command_secrets_record(definition.get("env"), &|key| {
-        format!("MCP server stdio env {key:?}")
-    })
-    .map_err(|e| ProtocolError::Transport(e.to_string()))?
-    .unwrap_or_default();
+        .map_err(|e| ProtocolError::Transport(e.to_string()))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<(String, Value)>>()
+    };
     for (key, value) in overrides {
         let value = match value.as_str() {
             Some(v) => v.to_string(),
@@ -484,5 +513,50 @@ mod tests {
             elapsed < SHUTDOWN_GRACE + Duration::from_secs(10),
             "shutdown must not block on a stuck reader, took {elapsed:?}"
         );
+    }
+    #[test]
+    fn resolve_env_inherit_env_false_drops_process_env() {
+        // #514 (resolveEnv @ 7a7b01b): `inheritEnv: false` keeps only the
+        // explicit overrides; a `PATH`-style base entry disappears.
+        std::env::set_var("RPI_MCP_STDIO_TEST", "from-env");
+        let definition = ServerEntry(
+            json!({
+                "command": "x",
+                "inheritEnv": false,
+                "env": { "ONLY": "override", "RPI_MCP_STDIO_TEST": "$env:RPI_MCP_STDIO_TEST" }
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let env = resolve_env(&definition).expect("env resolves");
+        let names: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names.len(), 2, "only the two overrides: {names:?}");
+        assert!(names.contains(&"ONLY"));
+        assert!(names.contains(&"RPI_MCP_STDIO_TEST"));
+        std::env::remove_var("RPI_MCP_STDIO_TEST");
+    }
+
+    #[test]
+    fn resolve_env_literal_env_skips_interpolation() {
+        // literalEnv (server-manager.ts:1637-1655 @ 10a45367): raw merge,
+        // no `!command`/`$env:` resolution.
+        let definition = ServerEntry(
+            json!({
+                "command": "x",
+                "literalEnv": true,
+                "env": { "RAW": "$env:NOT_RESOLVED" }
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+        let env = resolve_env(&definition).expect("env resolves");
+        let raw = env
+            .iter()
+            .find(|(k, _)| k == "RAW")
+            .map(|(_, v)| v.clone())
+            .expect("RAW present");
+        assert_eq!(raw, "$env:NOT_RESOLVED");
     }
 }

@@ -38,6 +38,9 @@ async-trait.workspace = true
 reqwest.workspace = true
 # FR-P0-04: `mcp({ search, regex: true })` mode (workspace baseline).
 regex.workspace = true
+# TE24 R7.2.11.6 (#430): strict direct-tool schema validation
+# (`settings.strictDirectToolArguments`); same workspace baseline as rpi-ai.
+jsonschema.workspace = true
 # FR-P0-07: stdio child process-group SIGKILL on shutdown (G4 no-leftover-
 # process red line; workspace baseline).
 libc.workspace = true

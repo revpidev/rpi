@@ -267,6 +267,52 @@ fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
 }
 
+/// `getConfigPathFromArgv` (utils.ts:67-88 @ 97253eb, #515): read the
+/// `--mcp-config` override straight from the host process argv so the
+/// plugin's LOAD-TIME config discovery sees it (the host applies extension
+/// flag values only after the final extension load —
+/// agent-session-services.ts:81-127; without this the early prewarm would
+/// connect servers from the wrong config).
+///
+/// Semantics (upstream, verbatim):
+/// - scanning stops at a bare `--`;
+/// - `--mcp-config <value>`: the NEXT argv entry is taken only when it does
+///   not start with `-` or `@` (otherwise the override RESETS to unset);
+/// - `--mcp-config=<value>`: the equals form always wins, even empty;
+/// - the LAST occurrence decides.
+///
+/// [RPI-OWN] adaptation: upstream scans from `process.argv[2]` (pi
+/// reserves argv[1]); the rpi CLI takes flags from argv[1], so the scan
+/// starts one earlier. The `-`/`@` rejection and `--` stop match upstream.
+pub fn get_config_path_from_argv() -> Option<String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut config_path: Option<String> = None;
+    let mut index = 0;
+    while index < argv.len() {
+        let arg = argv[index].as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "--mcp-config" {
+            let value = argv.get(index + 1);
+            match value {
+                Some(value) if !value.starts_with('-') && !value.starts_with('@') => {
+                    config_path = Some(value.clone());
+                    index += 1;
+                }
+                _ => config_path = None,
+            }
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--mcp-config=") {
+            config_path = Some(value.to_string());
+        }
+        index += 1;
+    }
+    config_path
+}
+
 /// Truncate to at most `target` UTF-16 code units (JS `slice(0, target)`).
 fn truncate_utf16(text: &str, target: usize) -> &str {
     let mut units = 0;

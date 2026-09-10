@@ -139,25 +139,46 @@ struct AuthServerMetadata {
 /// Discover the authorization server metadata (RFC 8414). Upstream uses
 /// the SDK's `auth()` function which internally does the `.well-known`
 /// fetch; we replicate the relevant fetch here.
-async fn discover_auth_server_metadata(
+/// `loadConfiguredDiscoveryState` (#458, mcp-oauth-provider.ts:187-231 @
+/// 10a45367): with `oauth.authServerMetadataUrl` configured, metadata is
+/// fetched from THAT url (absolute https, validated at config parse) and
+/// the issuer is checked against the metadata url's inferred issuer (or
+/// its origin when the path carries no well-known marker).
+async fn discover_auth_server_metadata_with_override(
     server_url: &str,
     skip_validation: bool,
+    override_url: Option<&str>,
 ) -> Result<AuthServerMetadata, AdapterError> {
-    let parsed = url::Url::parse(server_url)
-        .map_err(|e| AdapterError::InvalidConfigValue(format!("invalid server URL: {e}")))?;
-    let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
-    let origin = format!(
-        "{}://{}{}",
-        parsed.scheme(),
-        parsed.host_str().unwrap_or("localhost"),
-        port_suffix
-    );
-    let metadata_url = format!("{}/.well-known/oauth-authorization-server", origin);
-
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| AdapterError::InvalidConfigValue(format!("HTTP client: {e}")))?;
+
+    let (metadata_url, metadata_origin): (String, Option<String>) = match override_url {
+        Some(configured) => {
+            let parsed = url::Url::parse(configured).map_err(|e| {
+                AdapterError::InvalidConfigValue(format!("invalid authServerMetadataUrl: {e}"))
+            })?;
+            let origin = parsed.origin().ascii_serialization();
+            (configured.to_string(), Some(origin))
+        }
+        None => {
+            let parsed = url::Url::parse(server_url).map_err(|e| {
+                AdapterError::InvalidConfigValue(format!("invalid server URL: {e}"))
+            })?;
+            let port_suffix = parsed.port().map(|p| format!(":{p}")).unwrap_or_default();
+            let origin = format!(
+                "{}://{}{}",
+                parsed.scheme(),
+                parsed.host_str().unwrap_or("localhost"),
+                port_suffix
+            );
+            (
+                format!("{origin}/.well-known/oauth-authorization-server"),
+                Some(origin),
+            )
+        }
+    };
 
     let response = client
         .get(&metadata_url)
@@ -169,6 +190,12 @@ async fn discover_auth_server_metadata(
         })?;
 
     if !response.status().is_success() {
+        if override_url.is_some() {
+            return Err(AdapterError::InvalidConfigValue(format!(
+                "OAuth authServerMetadataUrl request failed with HTTP {}",
+                response.status()
+            )));
+        }
         return Err(AdapterError::InvalidConfigValue(format!(
             "auth server metadata returned {}",
             response.status()
@@ -179,14 +206,103 @@ async fn discover_auth_server_metadata(
         AdapterError::InvalidConfigValue(format!("auth server metadata parse: {e}"))
     })?;
 
-    if !skip_validation && !issuers_match(&metadata.issuer, &origin) {
-        return Err(AdapterError::InvalidConfigValue(format!(
-            "auth server issuer mismatch: {origin} vs {}",
-            metadata.issuer
-        )));
+    if override_url.is_some() {
+        // `validateConfiguredIssuer` (mcp-oauth-provider.ts:187-210):
+        // issuer must be an absolute http(s) URL and must match the
+        // metadata url's inferred issuer (well-known path markers) or,
+        // failing that, its origin.
+        let issuer = metadata.issuer.clone();
+        let parsed_issuer = url::Url::parse(&issuer).map_err(|_| {
+            AdapterError::InvalidConfigValue(
+                "OAuth authorization-server metadata issuer must be an absolute URL".to_string(),
+            )
+        })?;
+        if parsed_issuer.scheme() != "http" && parsed_issuer.scheme() != "https" {
+            return Err(AdapterError::InvalidConfigValue(
+                "OAuth authorization-server metadata issuer must use http:// or https://"
+                    .to_string(),
+            ));
+        }
+        let expected = infer_issuer_from_metadata_url(&metadata_url);
+        let matches = match (&expected, &metadata_origin) {
+            (Some(expected), _) => issuers_match(expected, &issuer),
+            (None, Some(origin)) => issuers_match(origin, &issuer),
+            (None, None) => true,
+        };
+        if !skip_validation && !matches {
+            let expected_text =
+                expected.unwrap_or_else(|| metadata_origin.clone().unwrap_or_default());
+            return Err(AdapterError::InvalidConfigValue(format!(
+                "OAuth authorization-server metadata issuer does not match authServerMetadataUrl: expected {expected_text}"
+            )));
+        }
+        return Ok(metadata);
+    }
+
+    if !skip_validation {
+        if let Some(origin) = metadata_origin.as_deref() {
+            if !issuers_match(&metadata.issuer, origin) {
+                return Err(AdapterError::InvalidConfigValue(format!(
+                    "auth server issuer mismatch: {origin} vs {}",
+                    metadata.issuer
+                )));
+            }
+        }
     }
 
     Ok(metadata)
+}
+
+/// `inferIssuerFromMetadataUrl` (mcp-oauth-provider.ts:169-184 @
+/// 10a45367): RFC 8414/OIDC well-known path markers carry the issuer path.
+fn infer_issuer_from_metadata_url(metadata_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(metadata_url).ok()?;
+    let mut pathname = parsed.path().to_string();
+    while pathname.len() > 1 && pathname.ends_with('/') {
+        pathname.pop();
+    }
+    if pathname.is_empty() {
+        pathname.push('/');
+    }
+    let origin = parsed.origin().ascii_serialization();
+    let oauth_prefix = "/.well-known/oauth-authorization-server";
+    if pathname == oauth_prefix || pathname.starts_with(&format!("{oauth_prefix}/")) {
+        let issuer_path = pathname.strip_prefix(oauth_prefix).unwrap_or("");
+        let issuer_path = if issuer_path.is_empty() {
+            "/"
+        } else {
+            issuer_path
+        };
+        return join_url(&origin, issuer_path);
+    }
+    let oidc_path = "/.well-known/openid-configuration";
+    if pathname == oidc_path || pathname.starts_with(&format!("{oidc_path}/")) {
+        let issuer_path = pathname.strip_prefix(oidc_path).unwrap_or("");
+        let issuer_path = if issuer_path.is_empty() {
+            "/"
+        } else {
+            issuer_path
+        };
+        return join_url(&origin, issuer_path);
+    }
+    if pathname.ends_with(oidc_path) {
+        let issuer_path = &pathname[..pathname.len() - oidc_path.len()];
+        let issuer_path = if issuer_path.is_empty() {
+            "/"
+        } else {
+            issuer_path
+        };
+        return join_url(&origin, issuer_path);
+    }
+    None
+}
+
+/// `new URL(issuerPath, url.origin).toString()` for the absolute/relative
+/// path join in [`infer_issuer_from_metadata_url`].
+fn join_url(origin: &str, issuer_path: &str) -> Option<String> {
+    let base = url::Url::parse(origin).ok()?;
+    let joined = base.join(issuer_path).ok()?;
+    Some(joined.to_string())
 }
 
 /// `issuersMatch` (mcp-oauth-provider.ts:68-72): exact equality modulo a
@@ -205,6 +321,35 @@ struct OAuthConfig {
     scope: Option<String>,
     grant_type: String,
     redirect_uri: Option<String>,
+}
+
+/// The #458 validation ladder, message-for-message
+/// (mcp-auth-flow.ts:243-261).
+fn validate_auth_server_metadata_url(raw: &Value) -> Result<Option<String>, AdapterError> {
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(text) = raw.as_str() else {
+        return Err(AdapterError::InvalidConfigValue(
+            "OAuth authServerMetadataUrl must be a string".to_string(),
+        ));
+    };
+    let interpolated = crate::utils::interpolate_env_vars(text);
+    let trimmed = interpolated.trim();
+    if trimmed.is_empty() {
+        return Err(AdapterError::InvalidConfigValue(
+            "OAuth authServerMetadataUrl must not be empty".to_string(),
+        ));
+    }
+    match url::Url::parse(trimmed) {
+        Err(_) => Err(AdapterError::InvalidConfigValue(
+            "OAuth authServerMetadataUrl must be an absolute https:// URL".to_string(),
+        )),
+        Ok(parsed) if parsed.scheme() != "https" => Err(AdapterError::InvalidConfigValue(
+            "OAuth authServerMetadataUrl must be an absolute https:// URL".to_string(),
+        )),
+        Ok(_) => Ok(Some(trimmed.to_string())),
+    }
 }
 
 fn parse_oauth_config(definition: &ServerEntry) -> OAuthConfig {
@@ -231,6 +376,21 @@ fn parse_oauth_config(definition: &ServerEntry) -> OAuthConfig {
             .and_then(|o| o.get("redirectUri"))
             .and_then(Value::as_str)
             .map(str::to_string),
+    }
+}
+
+/// `config.authServerMetadataUrl` (#458): the VALIDATED value consumed by
+/// the discovery sites (invalid configs fail the auth path with the
+/// upstream messages instead of being silently ignored).
+fn configured_auth_server_metadata_url(
+    definition: &ServerEntry,
+) -> Result<Option<String>, AdapterError> {
+    match definition
+        .get("oauth")
+        .and_then(|o| o.get("authServerMetadataUrl"))
+    {
+        None | Some(Value::Null) => Ok(None),
+        Some(raw) => validate_auth_server_metadata_url(raw),
     }
 }
 
@@ -562,9 +722,13 @@ pub async fn authenticate_with_store(
             // Try refresh token
             if let Some(refresh) = &tokens.refresh_token {
                 if let Some(issuer) = &tokens.issuer {
-                    if let Ok(metadata) = discover_auth_server_metadata(
+                    let metadata_override = configured_auth_server_metadata_url(definition)
+                        .ok()
+                        .flatten();
+                    if let Ok(metadata) = discover_auth_server_metadata_with_override(
                         server_url,
                         options.skip_issuer_metadata_validation,
+                        metadata_override.as_deref(),
                     )
                     .await
                     {
@@ -612,8 +776,13 @@ pub async fn authenticate_with_store(
         }
     }
 
-    let metadata =
-        discover_auth_server_metadata(server_url, options.skip_issuer_metadata_validation).await?;
+    let metadata_override = configured_auth_server_metadata_url(definition)?;
+    let metadata = discover_auth_server_metadata_with_override(
+        server_url,
+        options.skip_issuer_metadata_validation,
+        metadata_override.as_deref(),
+    )
+    .await?;
 
     if config.grant_type == "client_credentials" {
         return authenticate_client_credentials(
@@ -1095,7 +1264,16 @@ pub async fn resolve_access_token(
     let Some(refresh) = tokens.refresh_token else {
         return Ok(None);
     };
-    let metadata = match discover_auth_server_metadata(server_url, false).await {
+    let metadata_override = configured_auth_server_metadata_url(definition)
+        .ok()
+        .flatten();
+    let metadata = match discover_auth_server_metadata_with_override(
+        server_url,
+        false,
+        metadata_override.as_deref(),
+    )
+    .await
+    {
         Ok(metadata) => metadata,
         Err(error) => {
             tracing::debug!(server = server_name, %error, "OAuth token refresh metadata discovery failed");
@@ -1277,5 +1455,90 @@ mod tests {
             "https://a.test.attacker.tld",
             "https://a.test"
         ));
+    }
+    #[test]
+    fn auth_server_metadata_url_validation_ladder() {
+        // #458 (mcp-auth-flow.ts:243-261 @ 10a45367).
+        let entry = |value: serde_json::Value| {
+            ServerEntry(
+                serde_json::json!({ "url": "https://a.test/mcp", "oauth": { "authServerMetadataUrl": value } })
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+        let invalid = |value: serde_json::Value, message: &str| {
+            let error = configured_auth_server_metadata_url(&entry(value)).unwrap_err();
+            assert!(
+                error.to_string().ends_with(message),
+                "expected ...{message}, got {}",
+                error
+            );
+        };
+        invalid(
+            serde_json::json!(42),
+            "OAuth authServerMetadataUrl must be a string",
+        );
+        invalid(
+            serde_json::json!("  "),
+            "OAuth authServerMetadataUrl must not be empty",
+        );
+        invalid(
+            serde_json::json!("not a url"),
+            "OAuth authServerMetadataUrl must be an absolute https:// URL",
+        );
+        invalid(
+            serde_json::json!("http://a.test/.well-known/oauth-authorization-server"),
+            "OAuth authServerMetadataUrl must be an absolute https:// URL",
+        );
+        let ok = configured_auth_server_metadata_url(&entry(serde_json::json!(
+            " https://idp.test/.well-known/oauth-authorization-server "
+        )))
+        .expect("valid")
+        .expect("some");
+        assert_eq!(
+            ok,
+            "https://idp.test/.well-known/oauth-authorization-server"
+        );
+        let absent = configured_auth_server_metadata_url(&ServerEntry(
+            serde_json::json!({ "url": "https://a.test/mcp" })
+                .as_object()
+                .cloned()
+                .unwrap_or_default(),
+        ))
+        .expect("no oauth key");
+        assert_eq!(absent, None);
+    }
+
+    #[test]
+    fn infer_issuer_from_metadata_url_markers() {
+        // mcp-oauth-provider.ts:169-184 @ 10a45367.
+        assert_eq!(
+            infer_issuer_from_metadata_url(
+                "https://idp.test/.well-known/oauth-authorization-server"
+            )
+            .as_deref(),
+            Some("https://idp.test/")
+        );
+        assert_eq!(
+            infer_issuer_from_metadata_url(
+                "https://idp.test/.well-known/oauth-authorization-server/tenant1"
+            )
+            .as_deref(),
+            Some("https://idp.test/tenant1")
+        );
+        let oidc_nested = infer_issuer_from_metadata_url(
+            "https://idp.test/tenants/a/.well-known/openid-configuration",
+        )
+        .expect("some");
+        assert!(
+            oidc_nested == "https://idp.test/tenants/a/"
+                || oidc_nested == "https://idp.test/tenants/a",
+            "nested oidc issuer: {oidc_nested}"
+        );
+        assert_eq!(
+            infer_issuer_from_metadata_url("https://idp.test/custom/metadata").as_deref(),
+            None
+        );
     }
 }

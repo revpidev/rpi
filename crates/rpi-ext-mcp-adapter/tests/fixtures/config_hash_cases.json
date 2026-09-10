@@ -1,5 +1,5 @@
 {
-  "provenance": "external/pi-mcp-adapter/metadata-cache.ts computeServerHash @ 3d953f90, executed by gen-mcp-adapter-fixtures.mjs",
+  "provenance": "external/pi-mcp-adapter/metadata-cache.ts computeServerHash @ 7a7b01b, executed by gen-mcp-adapter-fixtures.mjs",
   "cases": [
     {
       "name": "stdio-basic",
@@ -11,7 +11,7 @@
           "--flag"
         ]
       },
-      "expectedHash": "8572e23023f6f0cc1dae2cdf98f4687e9fbeabc1b434e8fa1ad84f6a79d61084"
+      "expectedHash": "cf7b6450d547c2b3321837a84c7fccd2aeafcb44cf3f9d3b3afeacfe742eb9a5"
     },
     {
       "name": "env-interpolation",
@@ -25,7 +25,7 @@
           "PLAIN": "x"
         }
       },
-      "expectedHash": "a0fbe41f5cfb3d4cfda3f139d4d64b8d3d02edc6d6c40f4efa42eedaa0a8de6b"
+      "expectedHash": "e8b85f48c218a77b7c066ef5c68fc02e04cbbd889a82f77728be77e27f01a2c8"
     },
     {
       "name": "env-brace-forms",
@@ -39,7 +39,7 @@
           "B": "{env:RPI_MCP_FIXTURE_TOKEN}"
         }
       },
-      "expectedHash": "0d5f80c09f978b87c9a16fc0cdf968335c66bf62176bc99d61d4cbb486feae9f"
+      "expectedHash": "9c1716b90deddbba64f06020ac36573fd057fbeeebb56d7fe43611288290b9d1"
     },
     {
       "name": "http-headers-interpolation",
@@ -52,7 +52,7 @@
           "Authorization": "Bearer ${RPI_MCP_FIXTURE_TOKEN}"
         }
       },
-      "expectedHash": "85a1cfc0c0f79a6c0822ed099174545e35c0b30d3463143ee547a449b0c06cc2"
+      "expectedHash": "16db24b2eb64993886abd1249efc799f60e20b8bac7c39f5b3cad39e9e1878a6"
     },
     {
       "name": "bearer-token-env",
@@ -63,7 +63,7 @@
         "url": "https://example.test/mcp",
         "bearerTokenEnv": "RPI_MCP_FIXTURE_TOKEN"
       },
-      "expectedHash": "4b01e005d638045f3d424a14d90aa21287fb18c90de2a0e46248334fa312d297"
+      "expectedHash": "8fc7d3bec345a79292042c11129459cb0db9e40e21b173ead35467aab377b153"
     },
     {
       "name": "bearer-literal-escaped-bang",
@@ -72,7 +72,7 @@
         "url": "https://example.test/mcp",
         "bearerToken": "!!not-a-cmd"
       },
-      "expectedHash": "996326353c98ef6164efbf2ea28df026f386740ea792b584a69c758900571092"
+      "expectedHash": "57d43f8fc227fc63f1dd5311dd61f8a0064eb339f532acaacbedc6cfc72b5b13"
     },
     {
       "name": "bearer-literal-with-interpolation",
@@ -83,7 +83,7 @@
         "url": "https://example.test/mcp",
         "bearerToken": "tok-${RPI_MCP_FIXTURE_TOKEN}"
       },
-      "expectedHash": "bd803a0dc54f3e70b31274de541c8fec60aa6e8f17bda993bce7094a5453b1fc"
+      "expectedHash": "bdd123399d22fb187f45b289ef60c7a639f48bd9d7484e4bbbb292092d6af18d"
     },
     {
       "name": "socket-tilde-expansion",
@@ -93,7 +93,7 @@
       "entry": {
         "socket": "~/mcp.sock"
       },
-      "expectedHash": "1971b3dc0fcf8d23ae7a4571251b22303fd3bf0ba5739a4075026c2ecd05cfe9"
+      "expectedHash": "a1c49e9efb3143f663ee060ab761f5cb4b6d4b95c076213e73f3c648e8c71cb7"
     },
     {
       "name": "cwd-relative-passthrough",
@@ -102,7 +102,7 @@
         "command": "node",
         "cwd": "relative/dir"
       },
-      "expectedHash": "21557ce4c4e765eb8ff6a1f931467733a892d6ba02221ca3021b52f2f4fbb28c"
+      "expectedHash": "83355de87dd6117022ac0ccc0f2a7301c819c6cbf248da6e82532f2390b5d1c6"
     },
     {
       "name": "tool-filters",
@@ -118,7 +118,7 @@
         ],
         "exposeResources": false
       },
-      "expectedHash": "5f84fa6559e410922880b097053da1a0623a04fe8d7f7688ad934154201890c9"
+      "expectedHash": "6ae2625a900104009781eb7bfec77c82b56c48c6e1b628c1bf638fb03702ab4b"
     },
     {
       "name": "protocol-and-oauth-fields",
@@ -131,7 +131,7 @@
           "clientId": "x"
         }
       },
-      "expectedHash": "8fa9158ee98b5352a4c143d36c2dfde6171b7b351b1b69475e4d7081a3920ab5"
+      "expectedHash": "056d0704af96af9ea8653abc3d48e0b4098d26c00edc8b2f06b99e1280f8f482"
     },
     {
       "name": "runtime-fields-ignored-a",
@@ -143,7 +143,7 @@
         "debug": true,
         "requestTimeoutMs": 500
       },
-      "expectedHash": "640c21126120d4b777a98ccd6dd13bbac1944ea6f6d0c35cff3824e8dc4b6bb6",
+      "expectedHash": "c7cd5329512fb9b1605e786af247579d1ff2e23f694488e403295ea142b4e9ce",
       "expectSameAs": "runtime-fields-ignored-b"
     },
     {
@@ -152,7 +152,7 @@
       "entry": {
         "command": "node"
       },
-      "expectedHash": "640c21126120d4b777a98ccd6dd13bbac1944ea6f6d0c35cff3824e8dc4b6bb6"
+      "expectedHash": "c7cd5329512fb9b1605e786af247579d1ff2e23f694488e403295ea142b4e9ce"
     },
     {
       "name": "command-secret-marker-left-literal",
@@ -163,7 +163,7 @@
           "TOKEN": "!echo hi"
         }
       },
-      "expectedHash": "0076983aafaeada83426fbbd1a61a1d5f0a72d0c5acf12bacc14e71bdf7842a5"
+      "expectedHash": "1b424a6e7d3d11681a1eef23cc249ff50effbec4c5ee291b56e1bd250d1facd0"
     },
     {
       "name": "url-env-interpolation",
@@ -173,7 +173,7 @@
       "entry": {
         "url": "https://${RPI_MCP_FIXTURE_HOST}/mcp"
       },
-      "expectedHash": "e1132c0ed4475bba1419ab1f52d83c5041c2f4f8611b24566532752fb5e1fa95"
+      "expectedHash": "211503c5c035663196f90839c226a3f67c2e01ff7719c2ed818860072c96d8ec"
     },
     {
       "name": "unset-env-expands-empty",
@@ -184,7 +184,7 @@
           "MISSING": "$env:RPI_MCP_FIXTURE_DEFINITELY_UNSET"
         }
       },
-      "expectedHash": "fe8ea6075e767e6c743e6d2acba419cd479e905466ec576c8aed2565df1db959"
+      "expectedHash": "fa3b1aeb193b737d0b2560969d99d8baad002f5f40fb5f298641dd8f2ca3ee4f"
     }
   ]
 }

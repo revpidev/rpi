@@ -785,11 +785,17 @@ async fn probe_mcp_endpoint(url: &str) -> Option<String> {
     if let ProbeOutcome::Mcp { classification } = &legacy_post.outcome {
         return Some(classification.clone());
     }
-    ambiguous = ambiguous.or_else(|| ambiguous_not_mcp(&legacy_post.response_status, &legacy_post.content_type));
+    ambiguous = ambiguous
+        .or_else(|| ambiguous_not_mcp(&legacy_post.response_status, &legacy_post.content_type));
     if !POST_ENDPOINT_MISMATCH_STATUSES.contains(&legacy_post.response_status) {
         return ambiguous_not_mcp(&legacy_post.response_status, &legacy_post.content_type)
             .or(ambiguous)
-            .or_else(|| Some(not_mcp(&legacy_post.response_status, &legacy_post.content_type)));
+            .or_else(|| {
+                Some(not_mcp(
+                    &legacy_post.response_status,
+                    &legacy_post.content_type,
+                ))
+            });
     }
 
     // Stage 3: legacy SSE (GET stream)
@@ -910,8 +916,7 @@ async fn probe_stage(response: reqwest::Response, allow_json: bool, is_modern: b
         None
     };
 
-    let outcome = if is_success && content_type.starts_with("text/event-stream")
-    {
+    let outcome = if is_success && content_type.starts_with("text/event-stream") {
         ProbeOutcome::Mcp {
             classification: "endpoint responded with an MCP event stream".to_string(),
         }
@@ -919,9 +924,7 @@ async fn probe_stage(response: reqwest::Response, allow_json: bool, is_modern: b
         match (&envelope, is_modern) {
             // `strategy.kind === "modern" && (envelope.kind === "error" ||
             // envelope.protocolVersion !== MODERN_PROTOCOL_VERSION)`.
-            (Some(Err(())), true) | (Some(Ok(Some(""))), true) => {
-                ProbeOutcome::UnsupportedModern
-            }
+            (Some(Err(())), true) | (Some(Ok(Some(""))), true) => ProbeOutcome::UnsupportedModern,
             _ => ProbeOutcome::Mcp {
                 classification: if is_modern {
                     "endpoint supports stateless MCP 2026-07-28 server/discover".to_string()
@@ -935,7 +938,8 @@ async fn probe_stage(response: reqwest::Response, allow_json: bool, is_modern: b
             classification: if is_modern {
                 "endpoint requires Bearer authentication during MCP 2026-07-28 server/discover probing".to_string()
             } else {
-                "endpoint requires Bearer authentication and responded with a JSON-RPC 2.0 error".to_string()
+                "endpoint requires Bearer authentication and responded with a JSON-RPC 2.0 error"
+                    .to_string()
             },
         }
     } else {
@@ -1228,7 +1232,10 @@ mod tests {
 
         // Missing cwd names the path (server-manager.ts:799-803 @ 10a45367).
         let missing = manager
-            .connect("srv", &entry(json!({ "command": "true", "cwd": "/definitely/not/here" })))
+            .connect(
+                "srv",
+                &entry(json!({ "command": "true", "cwd": "/definitely/not/here" })),
+            )
             .await
             .err()
             .expect("connect fails");
@@ -1238,14 +1245,17 @@ mod tests {
         );
         // Non-directory cwd.
         let not_dir = manager
-            .connect("srv", &entry(json!({ "command": "true", "cwd": file.to_str().unwrap() })))
+            .connect(
+                "srv",
+                &entry(json!({ "command": "true", "cwd": file.to_str().unwrap() })),
+            )
             .await
             .err()
             .expect("connect fails");
         assert!(
-            not_dir.to_string().starts_with(
-                "MCP server \"srv\" configured cwd is not a directory: \""
-            ),
+            not_dir
+                .to_string()
+                .starts_with("MCP server \"srv\" configured cwd is not a directory: \""),
             "got: {not_dir}"
         );
         // The default (session) cwd is diagnosed too, not only an explicit one.
@@ -1264,7 +1274,10 @@ mod tests {
         // A valid directory cwd proceeds to the spawn (a different error:
         // the handshake fails because `true` is not an MCP server).
         let ok_cwd = manager
-            .connect("srv", &entry(json!({ "command": "true", "cwd": dir.to_str().unwrap() })))
+            .connect(
+                "srv",
+                &entry(json!({ "command": "true", "cwd": dir.to_str().unwrap() })),
+            )
             .await
             .err()
             .expect("connect fails");
@@ -1322,7 +1335,8 @@ be required; MCP endpoint shape could not be determined"
             status: 500,
             message: "Error POSTing to endpoint".to_string()
         }));
-        assert!(!is_transient_http_connect_error(&ProtocolError::Unauthorized));
+        assert!(!is_transient_http_connect_error(
+            &ProtocolError::Unauthorized
+        ));
     }
-
 }

@@ -38,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use super::{McpTransport, ProtocolError};
+use crate::bearer_store;
 use crate::metadata::ServerEntry;
 
 /// HTTP statuses that trigger the streamable → legacy SSE fallback
@@ -187,10 +188,14 @@ impl SseDecoder {
 }
 
 /// Resolved HTTP configuration for one server (headers interpolated, command
-/// secrets resolved at connection time — server-manager.ts:721-748).
+/// secrets resolved at connection time — server-manager.ts:1190-1230 @
+/// 10a45367).
 pub struct HttpConfig {
     pub url: url::Url,
     pub headers: Vec<(String, String)>,
+    /// `requestHeadersCommand` (#353): raw config; headers are derived
+    /// per request (fail-closed). `None` for the vast majority of servers.
+    pub request_headers_command: Option<Value>,
 }
 
 pub fn resolve_http_config(definition: &ServerEntry) -> Result<HttpConfig, ProtocolError> {
@@ -237,7 +242,25 @@ pub fn resolve_http_config_with_server(
                 .map_err(|e| ProtocolError::Transport(e.to_string()))?,
             ),
             None => crate::utils::resolve_bearer_token(definition.as_map())
-                .map_err(|e| ProtocolError::Transport(e.to_string()))?,
+                .map_err(|e| ProtocolError::Transport(e.to_string()))?
+                // `bearerTokenStore: true` (#366, server-manager.ts:1204-1207
+                // @ 10a45367): only when neither static key is configured;
+                // URL-bound lookup (a stored record for a different URL
+                // yields no token).
+                .or_else(|| {
+                    let store_only = definition.get("bearerToken").is_none()
+                        && definition.get("bearerTokenEnv").is_none()
+                        && definition.get("bearerTokenStore") == Some(&Value::Bool(true));
+                    store_only
+                        .then(|| {
+                            bearer_store::get_bearer_token_for_url(
+                                bearer_store_backend().as_ref(),
+                                server_name,
+                                url.as_str(),
+                            )
+                        })
+                        .flatten()
+                }),
         };
         if let Some(token) = token {
             let authorization = format!("Bearer {token}");
@@ -251,7 +274,80 @@ pub fn resolve_http_config_with_server(
             }
         }
     }
-    Ok(HttpConfig { url, headers })
+    let request_headers_command = definition
+        .get("requestHeadersCommand")
+        .filter(|value| value.is_object())
+        .cloned();
+    Ok(HttpConfig {
+        url,
+        headers,
+        request_headers_command,
+    })
+}
+
+/// The bearer-store backend (OS keyring in production). Overridable for
+/// tests through the same `SecretStore` abstraction the OAuth store uses.
+fn bearer_store_backend() -> std::sync::Arc<dyn crate::oauth::store::SecretStore> {
+    std::sync::Arc::new(BearerKeyringBackend)
+}
+
+/// Keyring backend under the bearer service name (KeyringBackend pattern
+/// from oauth/store.rs, service `rpi-mcp-adapter.bearer` [VARIANT]).
+struct BearerKeyringBackend;
+
+impl crate::oauth::store::SecretStore for BearerKeyringBackend {
+    fn read(&self, account: &str) -> Option<String> {
+        let entry = keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).ok()?;
+        entry.get_password().ok()
+    }
+
+    fn write(&self, account: &str, payload: &str) -> Result<(), crate::error::AdapterError> {
+        let entry =
+            keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account).map_err(|_| {
+                crate::error::AdapterError::InvalidConfigValue(
+                    "Bearer secure credential storage is unavailable".to_string(),
+                )
+            })?;
+        entry.set_password(payload).map_err(|_| {
+            crate::error::AdapterError::InvalidConfigValue(
+                "Failed to write bearer token to the OS credential store".to_string(),
+            )
+        })
+    }
+
+    fn remove(&self, account: &str) {
+        if let Ok(entry) = keyring::Entry::new(bearer_store::BEARER_SECRET_SERVICE, account) {
+            let _ = entry.delete_credential();
+        }
+    }
+}
+
+/// Apply the per-request derived headers (#353): the command runs on EVERY
+/// request with the exact method/url/body; a failure fails the request
+/// (fail-closed). Derived values override the static config headers
+/// (upstream `headers.set`).
+async fn apply_derived_headers(
+    builder: reqwest::RequestBuilder,
+    config: &HttpConfig,
+    method: &str,
+    body: &str,
+) -> Result<reqwest::RequestBuilder, ProtocolError> {
+    let Some(command) = &config.request_headers_command else {
+        return Ok(builder);
+    };
+    let derived = crate::request_headers::derive_request_headers(
+        command,
+        method,
+        config.url.as_str(),
+        &crate::request_headers::body_to_base64(body),
+    )
+    .await
+    .map_err(ProtocolError::Transport)?;
+    let mut builder = builder;
+    for (name, value) in derived {
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
 }
 
 fn apply_headers(
@@ -365,6 +461,16 @@ impl StreamableHttpTransport {
                 &extra,
             )
             .header("accept", "text/event-stream");
+            // #353: GET streams derive headers too (empty body); a
+            // fail-closed derivation failure ends this stream attempt.
+            match apply_derived_headers(request, &this.config, "GET", "").await {
+                Ok(with_headers) => request = with_headers,
+                Err(error) => {
+                    debug!(%error, "MCP streamable GET header derivation failed");
+                    this.schedule_standalone_reconnect(attempt).await;
+                    return;
+                }
+            }
             // SDK resumability: replay the last seen event id.
             if let Some(last_event_id) = this
                 .last_event_id
@@ -474,6 +580,15 @@ impl StreamableHttpTransport {
             {
                 request = request.header("last-event-id", last_event_id);
             }
+            // #353: replay GETs derive headers too (empty body).
+            let request = match apply_derived_headers(request, &self.config, "GET", "").await {
+                Ok(with_headers) => with_headers,
+                Err(error) => {
+                    debug!(%error, "MCP streamable replay header derivation failed");
+                    attempt += 1;
+                    continue;
+                }
+            };
             let response = tokio::select! {
                 _ = self.cancel.cancelled() => return,
                 sent = request.send() => match sent {
@@ -575,13 +690,17 @@ impl McpTransport for StreamableHttpTransport {
             message.get("method").and_then(Value::as_str) == Some("notifications/initialized");
         let has_request = message.get("id").is_some() && message.get("method").is_some();
 
+        let body = serde_json::to_string(&message).unwrap_or_else(|_| "null".to_string());
         let mut builder = self.client.post(self.config.url.clone());
         builder = apply_headers(builder, &self.config, &self.extra_headers(is_handshake));
         builder = builder
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream");
+        // #353: derived headers see the exact outbound request (body
+        // included) and override static config headers; fail-closed.
+        builder = apply_derived_headers(builder, &self.config, "POST", &body).await?;
         let response = builder
-            .body(serde_json::to_string(&message).unwrap_or_else(|_| "null".to_string()))
+            .body(body)
             .send()
             .await
             .map_err(|e| ProtocolError::Transport(format!("http send: {e}")))?;
@@ -729,6 +848,8 @@ impl LegacySseTransport {
             &[],
         )
         .header("accept", "text/event-stream");
+        // #353: the initial SSE GET derives headers as well.
+        let request = apply_derived_headers(request, &transport.config, "GET", "").await?;
         let response = request
             .send()
             .await
@@ -823,10 +944,14 @@ impl McpTransport for LegacySseTransport {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .ok_or(ProtocolError::Closed)?;
-        let builder = apply_headers(self.client.post(endpoint), &self.config, &[])
+        let builder = apply_headers(self.client.post(endpoint.clone()), &self.config, &[])
             .header("content-type", "application/json");
+        let body = serde_json::to_string(&message).unwrap_or_else(|_| "null".to_string());
+        // #353: the legacy SSE POSTs derive headers from the exact request
+        // too (upstream wraps the connection-wide fetch).
+        let builder = apply_derived_headers(builder, &self.config, "POST", &body).await?;
         let response = builder
-            .body(serde_json::to_string(&message).unwrap_or_else(|_| "null".to_string()))
+            .body(body)
             .send()
             .await
             .map_err(|e| ProtocolError::Transport(format!("sse send: {e}")))?;
@@ -997,6 +1122,7 @@ mod tests {
         let config = HttpConfig {
             url: url::Url::parse(&format!("http://{addr}/mcp")).expect("url"),
             headers: Vec::new(),
+            request_headers_command: None,
         };
         let (transport, mut rx) = StreamableHttpTransport::new(config);
         // The server never closes the stream, so a `send` that awaits the

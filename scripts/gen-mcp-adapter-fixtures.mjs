@@ -605,6 +605,45 @@ const CONFIG_CASES = [
     },
   },
   {
+    // TE24 (v2.32.1 three-branch merge + #514): the url-switch clears the
+    // command side including pluginDataDir/literalEnv/inheritEnv; the
+    // command-switch clears the url/auth side including
+    // requestHeadersCommand; the socket-switch clears both.
+    name: "transport-switch-cleared-fields-v2321",
+    layers: {
+      "shared-global": { mcpServers: {
+        toUrl: {
+          command: "old", args: ["--old"], env: { OLD: "1" }, cwd: "/old",
+          pluginDataDir: "/data/old", literalEnv: true, inheritEnv: false,
+        },
+        toCommand: {
+          url: "https://example.test/mcp", headers: { Authorization: "Bearer x" },
+          requestHeadersCommand: { command: "derive", args: ["--flag"] },
+          auth: "bearer", bearerToken: "tok", bearerTokenEnv: "TOK_ENV",
+          oauth: { clientId: "c" }, httpTransport: "sse",
+        },
+      } },
+      "pi-global": { mcpServers: {
+        toUrl: { url: "https://other.test/mcp" },
+        toCommand: { command: "new" },
+      } },
+    },
+  },
+  {
+    // TE24 (#514/#366/#353): a url change strips the URL-bound auth fields —
+    // now including requestHeadersCommand and bearerTokenStore.
+    name: "url-change-strips-url-bound-auth-v2321",
+    layers: {
+      "shared-global": { mcpServers: { litellm: {
+        url: URL_A,
+        headers: { Authorization: "Bearer old" },
+        requestHeadersCommand: { command: "derive", timeoutMs: 500 },
+        bearerToken: "static", bearerTokenEnv: "TOK", bearerTokenStore: true,
+      } } },
+      "pi-global": { mcpServers: { litellm: { url: URL_B } } },
+    },
+  },
+  {
     name: "malformed-entries-dropped",
     layers: {
       "shared-project": { mcpServers: {

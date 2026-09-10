@@ -285,10 +285,20 @@ pub fn resolve_direct_tools(
             .collect()
     };
 
-    if emitted.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
+    // #358/#412 (direct-tools.ts:288-290 @ 10a45367): the advisory is
+    // gated by `warnOnLargeDirectTools !== false` and its text explains
+    // how to hide it.
+    let advisory_enabled = config
+        .settings
+        .as_ref()
+        .and_then(|s| s.get("warnOnLargeDirectTools"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if advisory_enabled && emitted.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
         warn!(
             count = emitted.len(),
-            "MCP: many direct tools resolved; each direct tool adds prompt context — prefer targeted sets of 5-20 tools"
+            "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered. Set settings.warnOnLargeDirectTools to false to hide this advisory.",
+            emitted.len()
         );
     }
     emitted
@@ -576,6 +586,143 @@ pub async fn execute_direct_tool(
     params: &Value,
 ) -> Value {
     let config = &runtime.config;
+
+    // #430 (direct-tools.ts:40-89 @ 10a45367,
+    // `settings.strictDirectToolArguments: true`): recover one model-
+    // emitted JSON layer for schema-declared object/array properties, then
+    // validate the complete input against the advertised schema. Upstream
+    // runs this in `prepareArguments` (host-side, throws TypeError); the
+    // ABI has no prepare channel (candidate gap, extension-abi.md §8.5),
+    // so the equivalent boundary is the executor entry — same failure
+    // message, surfaced as an error result (details.error =
+    // `invalid_args`, re-flagged isError by the tool_result hook).
+    let strict_args = config
+        .settings
+        .as_ref()
+        .and_then(|s| s.get("strictDirectToolArguments"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if strict_args {
+        match prepare_direct_tool_arguments(&spec.input_schema, params) {
+            Ok(prepared) => {
+                return execute_direct_tool_inner(runtime, spec, &prepared, config).await;
+            }
+            Err(message) => {
+                return json!({
+                    "content": [{ "type": "text", "text": message }],
+                    "details": {
+                        "error": "invalid_args",
+                        "server": spec.server_name,
+                        "message": message,
+                    },
+                });
+            }
+        }
+    }
+    execute_direct_tool_inner(runtime, spec, params, config).await
+}
+
+/// `prepareDirectToolArguments` (direct-tools.ts:40-89 @ 10a45367):
+/// one-layer JSON recovery + strict schema validation.
+fn prepare_direct_tool_arguments(
+    input_schema: &Option<Value>,
+    args: &Value,
+) -> Result<Value, String> {
+    let Some(schema) = input_schema else {
+        return Ok(args.clone());
+    };
+    let Some(object_schema) = schema.as_object() else {
+        return Ok(args.clone());
+    };
+    if object_schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Ok(args.clone());
+    }
+
+    // One-layer recovery: string values for schema-declared object/array
+    // properties that parse to the declared shape are replaced.
+    let mut prepared = args.clone();
+    if let (Some(input), Some(properties)) = (args.as_object(), object_schema.get("properties")) {
+        if let Some(properties) = properties.as_object() {
+            for (name, property_schema) in properties {
+                let Some(current) = input.get(name) else {
+                    continue;
+                };
+                let Some(text) = current.as_str() else {
+                    continue;
+                };
+                let Some(property_schema) = property_schema.as_object() else {
+                    continue;
+                };
+                let expected_type = property_schema.get("type").and_then(Value::as_str);
+                if expected_type != Some("object") && expected_type != Some("array") {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    let matches = match expected_type {
+                        Some("array") => parsed.is_array(),
+                        Some("object") => parsed.is_object(),
+                        _ => false,
+                    };
+                    if matches {
+                        if let Some(map) = prepared.as_object_mut() {
+                            map.insert(name.clone(), parsed);
+                        }
+                    }
+                }
+                // Parse failures and shape mismatches fall through to the
+                // validation below (upstream comment: "Validation below
+                // reports malformed or shape-incompatible values").
+            }
+        }
+    }
+
+    // Strict validation (upstream TypeBox `Check`/`Errors`; the jsonschema
+    // crate is the workspace validator — same draft family).
+    let validator = match jsonschema::validator_for(schema) {
+        Ok(validator) => validator,
+        Err(_) => return Ok(prepared), // unvalidatable schema: pass through
+    };
+    if validator.is_valid(&prepared) {
+        return Ok(prepared);
+    }
+    let errors: Vec<String> = validator
+        .iter_errors(&prepared)
+        .map(|error| error.to_string())
+        .collect();
+    let total = errors.len();
+    let issues: Vec<Value> = errors
+        .iter()
+        .take(8)
+        .map(|message| {
+            json!({
+                // TypeBox reports `instancePath`/`keyword`/`message`; the
+                // jsonschema crate's Display carries the path + keyword in
+                // the message text (first-8 + total + truncated keep the
+                // upstream envelope shape).
+                "instancePath": "/",
+                "keyword": "type",
+                "message": message,
+            })
+        })
+        .collect();
+    let payload = json!({
+        "issues": issues,
+        "total": total,
+        "truncated": total > 8,
+    });
+    Err(format!(
+        "MCP direct tool arguments do not match the advertised input schema: {payload}"
+    ))
+}
+
+async fn execute_direct_tool_inner(
+    runtime: &crate::proxy::McpRuntime,
+    spec: &DirectToolSpec,
+    params: &Value,
+    config: &crate::metadata::McpConfig,
+) -> Value {
+    // The non-strict path's `config` binding is the same runtime config;
+    // re-bound here so the inner body keeps one variable.
     let Some(definition) = config.mcp_servers.get(&spec.server_name) else {
         let message = format!("MCP server \"{}\" not connected", spec.server_name);
         return json!({
@@ -717,6 +864,15 @@ pub async fn execute_direct_tool(
     }
 
     let guard_options = crate::guard::resolve_guard_options(config.settings.as_ref());
+    // #430 (direct-tools.ts:501/551/566/583 @ 10a45367,
+    // `settings.directToolResultDetails: "bounded"`): keep the raw MCP
+    // result in `details.mcpResult` (bounded by the guard's 16 KiB cap).
+    let bounded_details = config
+        .settings
+        .as_ref()
+        .and_then(|s| s.get("directToolResultDetails"))
+        .and_then(Value::as_str)
+        == Some("bounded");
     let request_timeout = runtime.manager.request_timeout(definition);
     runtime.manager.touch(&spec.server_name);
     runtime.manager.increment_in_flight(&spec.server_name);
@@ -832,7 +988,13 @@ pub async fn execute_direct_tool(
                 } else {
                     content
                 };
-                let guarded = crate::guard::guard_mcp_output(content, &guard_options);
+                let guarded = crate::guard::guard_mcp_output(
+                    content,
+                    &crate::guard::GuardOptions {
+                        raw_mcp_result: bounded_details.then(|| value.clone()),
+                        ..guard_options.clone()
+                    },
+                );
                 let mut details = json!({
                     "server": spec.server_name,
                     "resourceUri": spec.resource_uri,
@@ -887,7 +1049,13 @@ pub async fn execute_direct_tool(
             } else {
                 content
             };
-            let guarded = crate::guard::guard_mcp_output(content, &guard_options);
+            let guarded = crate::guard::guard_mcp_output(
+                content,
+                &crate::guard::GuardOptions {
+                    raw_mcp_result: bounded_details.then(|| value.clone()),
+                    ..guard_options.clone()
+                },
+            );
             let mut details = json!({
                 "server": spec.server_name,
                 "tool": spec.original_name,
@@ -1653,5 +1821,67 @@ mod tests {
             definition["definition"]["description"],
             json!("(no description)")
         );
+    }
+    #[test]
+    fn prepare_direct_tool_arguments_recovers_one_json_layer() {
+        // direct-tools.ts:40-89 @ 10a45367.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "payload": { "type": "object" },
+                "items": { "type": "array" },
+                "name": { "type": "string" },
+            },
+            "required": ["name"],
+        });
+        // A string-encoded object for a schema-declared object property is
+        // recovered in place.
+        let args = json!({ "name": "x", "payload": "{\"k\": 1}" });
+        let prepared = prepare_direct_tool_arguments(&Some(schema.clone()), &args).expect("valid");
+        assert_eq!(prepared["payload"], json!({ "k": 1 }));
+        // A string-encoded array for an array property too.
+        let args = json!({ "name": "x", "items": "[1, 2]" });
+        let prepared = prepare_direct_tool_arguments(&Some(schema.clone()), &args).expect("valid");
+        assert_eq!(prepared["items"], json!([1, 2]));
+        // A JSON string for a STRING property stays a string (no recovery).
+        let args = json!({ "name": "x" });
+        let prepared = prepare_direct_tool_arguments(&Some(schema.clone()), &args).expect("valid");
+        assert_eq!(prepared["name"], json!("x"));
+    }
+
+    #[test]
+    fn prepare_direct_tool_arguments_rejects_schema_violations() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "count": { "type": "number" } },
+            "required": ["count"],
+        });
+        let error = prepare_direct_tool_arguments(&Some(schema.clone()), &json!({ "wrong": true }))
+            .unwrap_err();
+        assert!(
+            error
+                .starts_with("MCP direct tool arguments do not match the advertised input schema:"),
+            "{error}"
+        );
+        // The envelope keeps the TypeBox shape: issues/total/truncated.
+        let tail = error
+            .split_once("advertised input schema: ")
+            .map(|(_, tail)| tail)
+            .unwrap_or_default();
+        let parsed: Value = serde_json::from_str(tail).expect("envelope is JSON");
+        assert!(parsed
+            .get("issues")
+            .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty())));
+        assert!(parsed
+            .get("total")
+            .is_some_and(|v| v.as_u64().is_some_and(|t| t > 0)));
+        assert!(parsed.get("truncated").is_some());
+        // Non-object schemas pass through untouched (no validation).
+        let passthrough = prepare_direct_tool_arguments(
+            &Some(json!({ "type": "string" })),
+            &json!({ "anything": 1 }),
+        )
+        .expect("non-object schema passes");
+        assert_eq!(passthrough, json!({ "anything": 1 }));
     }
 }
