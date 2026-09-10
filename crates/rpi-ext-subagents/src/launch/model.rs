@@ -254,9 +254,10 @@ pub fn resolve_base_model_candidate(
 /// `resolveModelCandidate` (model-fallback.ts:195-209): resolve a possibly
 /// loose model id to canonical `provider/id`; exact registry matches win,
 /// thinking suffix is retried on the base when the whole id misses. The
-/// lenient variant (miss → verbatim passthrough) — retained for parity
-/// surfaces; subagent launches use the strict/required variants above
-/// (#1093). Kept for the target-track parity facade.
+/// lenient variant (miss → verbatim passthrough) — kept as the semantic
+/// reference for the M3/TE19 model face (R7.1.10.2, modelExclusions);
+/// subagent launches use the strict/required variants above (#1093), and
+/// this function currently has no production caller (unit tests only).
 #[allow(dead_code)]
 pub fn resolve_model_candidate(
     model: Option<&str>,

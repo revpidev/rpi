@@ -651,14 +651,26 @@ pub async fn run_child_async(
     // allowlist it cannot satisfy. Runs only when an allowlist is declared;
     // excluded names (post-`--exclude-tools`) are not requirements.
     if let Some(allowlist) = agent_tools.as_ref() {
-        crate::diagnostic::check_host_tool_face(
+        if let Err(error) = crate::diagnostic::check_host_tool_face(
             allowlist,
             &agent.exclude_tools,
             ctx.host_builtin_tool_names
                 .as_deref()
                 .map_err(|e| e.as_str()),
             &agent.name,
-        )?;
+        ) {
+            // A pre-spawn rejection never launched a process: give the
+            // spawn-budget slot back so misconfigured agents cannot starve
+            // valid siblings in the same composite run (review round 1,
+            // observation 3).
+            let mut memory = crate::tool::FOREGROUND_RUN_MEMORY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = memory.spawns_by_run.get_mut(&ctx.run_id) {
+                *count = count.saturating_sub(1);
+            }
+            return Err(error);
+        }
     }
 
     // Fork task preamble (executor 4119-4122).
@@ -978,5 +990,97 @@ mod te18_fork_tests {
             other => panic!("expected a fork, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Review round 1, observation 3: a pre-spawn gate rejection must not consume
+/// the composite run's spawn budget (the slot is returned before the Err).
+#[cfg(test)]
+mod te18_gate_budget_tests {
+    use super::*;
+    use crate::agents::discover::AgentSource;
+
+    #[test]
+    fn gate_rejection_returns_the_spawn_budget_slot() {
+        let runtime = crate::PluginRuntime::new().expect("plugin runtime");
+        let ctx = RunCtx {
+            settings: Default::default(),
+            config: Default::default(),
+            base_cwd: std::env::temp_dir(),
+            parent_session: None,
+            parent_session_file: None,
+            parent_session_id: None,
+            parent_model: None,
+            registry: Vec::new(),
+            // Empty host set: every declared builtin tool is missing.
+            host_builtin_tool_names: Ok(Vec::new()),
+            run_id: "te18budget".to_string(),
+            top_model: None,
+            top_thinking: None,
+            top_context: None,
+            top_timeout_ms: Some(30_000),
+            top_turn_budget: None,
+            top_tool_budget: None,
+            usage_budget: None,
+            artifacts_dir: None,
+            session_root: std::env::temp_dir(),
+            frame_sink: None,
+            step_status: None,
+            abort_probe: None,
+        };
+        let agent = AgentConfig {
+            name: "gater".to_string(),
+            local_name: "gater".to_string(),
+            package_name: None,
+            description: "d".to_string(),
+            aliases: None,
+            tools: Some(vec!["web_search".to_string()]),
+            exclude_tools: Vec::new(),
+            mcp_direct_tools: Vec::new(),
+            model: None,
+            fallback_models: Vec::new(),
+            thinking: crate::agents::discover::ThinkingSpec::Unset,
+            system_prompt_mode: "replace",
+            inherit_project_context: true,
+            inherit_skills: false,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            system_prompt: String::new(),
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/gater.md"),
+            skills: Vec::new(),
+            extensions: None,
+            subagent_only_extensions: None,
+            output: None,
+            default_reads: Vec::new(),
+            default_progress: false,
+            max_subagent_depth: None,
+            disabled: None,
+            acceptance_role: None,
+            memory: None,
+            frontmatter_fields: Default::default(),
+        };
+        let spec = ChildSpec {
+            task: "needs web_search".to_string(),
+            child_index: 0,
+            ..Default::default()
+        };
+        let Err(error) = run_child(&spec, &agent, &ctx, &runtime) else {
+            panic!("gate rejects the missing tool");
+        };
+        assert!(
+            error.contains("requested unavailable child tools: web_search"),
+            "{error}"
+        );
+        // The budget slot was returned — the counter is back to zero.
+        let memory = crate::tool::FOREGROUND_RUN_MEMORY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            memory.spawns_by_run.get("te18budget"),
+            Some(&0),
+            "gate rejection must not consume the spawn budget"
+        );
     }
 }
