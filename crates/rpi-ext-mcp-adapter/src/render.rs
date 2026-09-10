@@ -193,10 +193,61 @@ pub fn format_mcp_tool_result_lines(
     collect_collapsed_result_lines(content, max_collapsed_lines, max_collapsed_chars)
 }
 
-/// `renderMcpToolResult` (tool-result-renderer.ts:269-297), mapped onto a
-/// ComponentTree text node. Pure and synchronous: only the result/options/
-/// context JSON is consulted.
-pub fn render_mcp_tool_result(result: &Value, options: &Value, context: &Value) -> Value {
+/// `CompactMcpToolResult` (tool-result-renderer.ts:70-112 @ 10a45367)
+/// mapped onto a static ComponentTree: first body line carries the
+/// `title preview → ` prefix; a hidden remainder (truncation marker or
+/// overflow) appends the muted ` … (Ctrl+O to expand)` hint. Width-derived
+/// clipping stays the TUI's job — the static text keeps the full lines and
+/// the marker.
+fn compact_row_text(title: &str, input_preview: &str, display: &McpToolResultDisplay) -> String {
+    let mut lines: Vec<String> = display
+        .lines
+        .iter()
+        .filter(|line| {
+            // The line-cap marker is folded into the hidden hint instead.
+            !(display.truncated && line.as_str() == "…")
+        })
+        .cloned()
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let mut prefix = String::new();
+    if !title.is_empty() {
+        prefix = format!("{title} ");
+        if !input_preview.is_empty() {
+            prefix = format!("{prefix}{input_preview} ");
+        }
+        prefix = format!("{prefix}→ ");
+    }
+    let mut rendered = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                format!("{prefix}{line}")
+            } else {
+                line.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    if display.truncated {
+        rendered.push(" … (Ctrl+O to expand)".to_string());
+    }
+    rendered.join("\n")
+}
+
+/// `renderMcpToolResult` (tool-result-renderer.ts:435-460 @ 10a45367),
+/// mapped onto a ComponentTree text node. Pure and synchronous: only the
+/// result/options/context JSON plus the caller-resolved render options and
+/// the per-call compact state (seeded by `renderToolCall`) are consulted.
+pub fn render_mcp_tool_result(
+    result: &Value,
+    options: &Value,
+    context: &Value,
+    render_options: &McpToolRenderOptions,
+    compact_state: Option<&McpToolRenderState>,
+) -> Value {
     let is_partial = options.get("isPartial").and_then(Value::as_bool) == Some(true);
     if is_partial {
         return json!({ "type": "text", "props": { "text": "Running MCP tool..." } });
@@ -209,11 +260,42 @@ pub fn render_mcp_tool_result(result: &Value, options: &Value, context: &Value) 
     let expanded = options.get("expanded").and_then(Value::as_bool) == Some(true)
         || context.get("isError").and_then(Value::as_bool) == Some(true)
         || has_error_details;
+
+    // #349: the compact default renders a single self-contained row built
+    // from the call-time state (title + bounded input preview) and the
+    // collapsed result lines (1-3).
+    if !expanded && render_options.result_rendering == McpToolResultRendering::Compact {
+        let display = format_mcp_tool_result_lines(
+            result,
+            false,
+            render_options.collapsed_result_lines,
+            DEFAULT_MAX_COLLAPSED_CHARS,
+        );
+        let details_identity = format_mcp_tool_result_identity(details);
+        let title = compact_state
+            .and_then(|state| state.compact_title.clone())
+            .filter(|title| !title.is_empty())
+            .or(details_identity)
+            .unwrap_or_default();
+        let input_preview = compact_state
+            .and_then(|state| state.compact_input_preview.clone())
+            .unwrap_or_default();
+        let text = compact_row_text(&title, &input_preview, &display);
+        return json!({
+            "type": "column",
+            "props": {},
+            "children": [json!({
+                "type": "text",
+                "props": { "text": text, "fg": "toolOutput" },
+            })],
+        });
+    }
+
     let identity = format_mcp_tool_result_identity(details);
     let display = format_mcp_tool_result_lines(
         result,
         expanded,
-        DEFAULT_MAX_COLLAPSED_LINES,
+        render_options.collapsed_result_lines,
         DEFAULT_MAX_COLLAPSED_CHARS,
     );
 
@@ -238,6 +320,92 @@ pub fn render_mcp_tool_result(result: &Value, options: &Value, context: &Value) 
 }
 
 // ===== Tool-call renderer (renderCall, TE09 FR-E) =====
+
+/// `McpToolResultRendering` (tool-result-renderer.ts:38 @ 10a45367).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpToolResultRendering {
+    #[default]
+    Compact,
+    Boxed,
+}
+
+/// `McpToolRenderOptions` (tool-result-renderer.ts:40-43 @ 10a45367):
+/// settings-resolved rendering knobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpToolRenderOptions {
+    pub result_rendering: McpToolResultRendering,
+    pub collapsed_result_lines: usize,
+}
+
+/// `DEFAULT_MAX_COMPACT_INPUT_CHARS` (tool-result-renderer.ts:34 @
+/// 10a45367).
+pub const DEFAULT_MAX_COMPACT_INPUT_CHARS: usize = 240;
+/// `DEFAULT_BOXED_COLLAPSED_LINES` (:35) / `DEFAULT_COMPACT_COLLAPSED_LINES`
+/// (:36): the boxed row keeps the historical 3-line default; the compact
+/// row defaults to a single line (#349 — the only user-visible default
+/// change of the rebase, `changes/` documents the `toolResultRendering:
+/// "boxed"` escape hatch).
+pub const DEFAULT_BOXED_COLLAPSED_LINES: usize = 3;
+pub const DEFAULT_COMPACT_COLLAPSED_LINES: usize = 1;
+
+/// `McpToolRenderState` (tool-result-renderer.ts:26-29 @ 10a45367): the
+/// per-tool-call render state the call render seeds and the result row
+/// consumes (compact title / bounded input preview). The upstream state
+/// rides the TUI render context; the plugin ABI context carries
+/// `toolCallId`, so the plugin keeps the map keyed by it (see
+/// `lib.rs`'s render dispatch).
+#[derive(Debug, Clone, Default)]
+pub struct McpToolRenderState {
+    pub compact_title: Option<String>,
+    pub compact_input_preview: Option<String>,
+}
+
+/// `resolveMcpToolRenderOptions` (tool-result-renderer.ts:270-279 @
+/// 10a45367): `toolResultRendering === "boxed"` selects the legacy row
+/// (anything else — including unset — is the compact default);
+/// `collapsedResultLines` accepts exactly 1|2|3.
+pub fn resolve_mcp_tool_render_options(
+    settings: Option<&serde_json::Map<String, Value>>,
+) -> McpToolRenderOptions {
+    let result_rendering = match settings {
+        Some(settings)
+            if settings.get("toolResultRendering").and_then(Value::as_str) == Some("boxed") =>
+        {
+            McpToolResultRendering::Boxed
+        }
+        _ => McpToolResultRendering::Compact,
+    };
+    let collapsed = settings
+        .and_then(|s| s.get("collapsedResultLines"))
+        .and_then(Value::as_u64);
+    let default_lines = match result_rendering {
+        McpToolResultRendering::Boxed => DEFAULT_BOXED_COLLAPSED_LINES,
+        McpToolResultRendering::Compact => DEFAULT_COMPACT_COLLAPSED_LINES,
+    };
+    McpToolRenderOptions {
+        result_rendering,
+        collapsed_result_lines: match collapsed {
+            Some(lines @ 1..=3) => lines as usize,
+            _ => default_lines,
+        },
+    }
+}
+
+/// `formatCompactInputPreview` (tool-result-renderer.ts:268-270 @
+/// 10a45367): the call lines minus the title, space-joined, whitespace
+/// collapsed, bounded to 240 UTF-16 units.
+pub fn format_compact_input_preview(lines: &[String], max_chars: usize) -> String {
+    let joined = lines
+        .iter()
+        .skip(1)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_text(&joined, max_chars)
+}
 
 /// `truncateText` (tool-result-renderer.ts:99-102): keep the first
 /// `max_chars - 1` UTF-16 code units and append `…`. BOTH the budget check
@@ -407,6 +575,39 @@ pub fn render_tool_call_lines(lines: &[String]) -> Value {
 /// `renderMcpProxyToolCall` (tool-result-renderer.ts:171-174): format the
 /// proxy args into call lines and render them. The default input budget is
 /// the upstream constant (call sites never override it).
+/// `renderToolCall` (tool-result-renderer.ts:282-296 @ 10a45367): seed the
+/// per-call compact state, and — on the compact default with a final,
+/// non-expanded, non-error context — render NOTHING (the compact result
+/// row carries the whole tool call; upstream `EmptyComponent`). The static
+/// ABI equivalent of an empty component is a childless `column`.
+pub fn render_tool_call_with_state(
+    lines: &[String],
+    options: &McpToolRenderOptions,
+    context: Option<&Value>,
+    state: Option<&mut McpToolRenderState>,
+) -> Value {
+    if let Some(state) = state {
+        state.compact_title = Some(lines.first().cloned().unwrap_or_else(|| "mcp".to_string()));
+        state.compact_input_preview = Some(format_compact_input_preview(
+            lines,
+            DEFAULT_MAX_COMPACT_INPUT_CHARS,
+        ));
+    }
+    if options.result_rendering == McpToolResultRendering::Compact
+        && context.is_some_and(|context| {
+            context.get("isPartial").and_then(Value::as_bool) != Some(true)
+                && context.get("expanded").and_then(Value::as_bool) != Some(true)
+                && context.get("isError").and_then(Value::as_bool) != Some(true)
+        })
+    {
+        return json!({ "type": "column", "props": {}, "children": [] });
+    }
+    render_tool_call_lines(lines)
+}
+
+/// `renderMcpProxyToolCall` (tool-result-renderer.ts:171-174): format the
+/// proxy args into call lines and render them. The default input budget is
+/// the upstream constant (call sites never override it).
 pub fn render_mcp_proxy_tool_call(args: &Value) -> Value {
     render_tool_call_lines(&format_mcp_proxy_tool_call_lines(
         args,
@@ -432,31 +633,188 @@ mod tests {
         json!({ "type": "text", "text": text })
     }
 
-    fn call(text: &str, expanded: bool) -> Value {
+    fn boxed_options() -> McpToolRenderOptions {
+        McpToolRenderOptions {
+            result_rendering: McpToolResultRendering::Boxed,
+            collapsed_result_lines: DEFAULT_BOXED_COLLAPSED_LINES,
+        }
+    }
+
+    fn default_options() -> McpToolRenderOptions {
+        resolve_mcp_tool_render_options(None)
+    }
+
+    fn call_boxed(text: &str, expanded: bool) -> Value {
         render_mcp_tool_result(
             &json!({ "content": [text_block(text)] }),
             &json!({ "expanded": expanded, "isPartial": false }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         )
     }
 
     #[test]
+    fn compact_default_single_line_row_with_state_title() {
+        // #349: the DEFAULT rendering is the compact row - one collapsed
+        // result line carrying the call-time title + input preview.
+        let options = default_options();
+        assert_eq!(options.result_rendering, McpToolResultRendering::Compact);
+        assert_eq!(options.collapsed_result_lines, 1);
+        let state = McpToolRenderState {
+            compact_title: Some("mcp call echo @ demo".to_string()),
+            compact_input_preview: Some("{\"q\": \"x\"}".to_string()),
+        };
+        let tree = render_mcp_tool_result(
+            &json!({ "content": [text_block("one\ntwo\nthree\nfour")] }),
+            &json!({ "expanded": false, "isPartial": false }),
+            &json!({ "isError": false }),
+            &options,
+            Some(&state),
+        );
+        let text = tree["children"][0]["props"]["text"].as_str().expect("row");
+        assert_eq!(
+            text,
+            "mcp call echo @ demo {\"q\": \"x\"} \u{2192} one\n \u{2026} (Ctrl+O to expand)"
+        );
+        // Without state the title falls back to the details identity.
+        let tree = render_mcp_tool_result(
+            &json!({
+                "content": [text_block("one")],
+                "details": { "mode": "call", "server": "demo", "tool": "echo" }
+            }),
+            &json!({ "expanded": false, "isPartial": false }),
+            &json!({ "isError": false }),
+            &options,
+            None,
+        );
+        let text = tree["children"][0]["props"]["text"].as_str().expect("row");
+        assert_eq!(text, "MCP demo/echo \u{2192} one");
+        // Errors never take the compact row (upstream forces expansion).
+        let tree = render_mcp_tool_result(
+            &json!({
+                "content": [text_block("boom")],
+                "details": { "error": "call_failed" }
+            }),
+            &json!({ "expanded": false, "isPartial": false }),
+            &json!({ "isError": false }),
+            &options,
+            Some(&state),
+        );
+        assert_eq!(tree["type"], json!("text"), "error results stay boxed");
+    }
+
+    #[test]
+    fn compact_input_preview_joins_and_collapses_whitespace() {
+        // formatCompactInputPreview (:268-270): title dropped, rest joined,
+        // whitespace collapsed, 240-unit bound.
+        let lines = vec![
+            "mcp call demo_search".to_string(),
+            "{\n  \"q\": \"  spaced  \"\n}".to_string(),
+        ];
+        assert_eq!(
+            format_compact_input_preview(&lines, DEFAULT_MAX_COMPACT_INPUT_CHARS),
+            "{ \"q\": \" spaced \" }"
+        );
+        let long: Vec<String> = vec!["mcp".into(), "y".repeat(600)];
+        let preview = format_compact_input_preview(&long, DEFAULT_MAX_COMPACT_INPUT_CHARS);
+        assert!(preview.encode_utf16().count() <= DEFAULT_MAX_COMPACT_INPUT_CHARS);
+        assert!(preview.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn render_options_resolution_accepts_only_valid_collapsed_lines() {
+        // resolveMcpToolRenderOptions (:270-279).
+        assert_eq!(
+            resolve_mcp_tool_render_options(None),
+            McpToolRenderOptions {
+                result_rendering: McpToolResultRendering::Compact,
+                collapsed_result_lines: 1,
+            }
+        );
+        let boxed = json!({ "toolResultRendering": "boxed" })
+            .as_object()
+            .cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(boxed.as_ref()).result_rendering,
+            McpToolResultRendering::Boxed
+        );
+        assert_eq!(
+            resolve_mcp_tool_render_options(boxed.as_ref()).collapsed_result_lines,
+            3,
+            "boxed default stays 3"
+        );
+        let invalid_lines = json!({ "collapsedResultLines": 4 }).as_object().cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(invalid_lines.as_ref()).collapsed_result_lines,
+            1,
+            "4 is not accepted; compact default applies"
+        );
+        let valid = json!({ "collapsedResultLines": 2, "toolResultRendering": "boxed" })
+            .as_object()
+            .cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(valid.as_ref()).collapsed_result_lines,
+            2
+        );
+        let junk = json!({ "toolResultRendering": "weird", "collapsedResultLines": "x" })
+            .as_object()
+            .cloned();
+        assert_eq!(
+            resolve_mcp_tool_render_options(junk.as_ref()).result_rendering,
+            McpToolResultRendering::Compact,
+            "unknown rendering value falls to the compact default"
+        );
+    }
+
+    #[test]
+    fn compact_final_renders_empty_component_on_call() {
+        // shouldUseCompactFinalRender: compact + final + !expanded + !error
+        // -> the call part renders nothing (EmptyComponent equivalent).
+        let options = default_options();
+        let context = json!({ "isPartial": false, "expanded": false, "isError": false });
+        let mut state = McpToolRenderState::default();
+        let tree = render_tool_call_with_state(
+            &["mcp call demo".to_string(), "{\"q\":1}".to_string()],
+            &options,
+            Some(&context),
+            Some(&mut state),
+        );
+        assert_eq!(tree["type"], json!("column"));
+        assert_eq!(tree["children"].as_array().map(Vec::len), Some(0));
+        // The state was seeded before the empty short-circuit.
+        assert_eq!(state.compact_title.as_deref(), Some("mcp call demo"));
+        assert!(state.compact_input_preview.is_some());
+        // A partial call render keeps the classic lines.
+        let partial_context = json!({ "isPartial": true, "expanded": false, "isError": false });
+        let mut state = McpToolRenderState::default();
+        let tree = render_tool_call_with_state(
+            &["mcp call demo".to_string()],
+            &options,
+            Some(&partial_context),
+            Some(&mut state),
+        );
+        assert_eq!(tree["type"], json!("column"));
+        assert!(tree["children"].as_array().is_some_and(|c| !c.is_empty()));
+    }
+
+    #[test]
     fn collapsed_caps_at_three_lines_with_expand_hint() {
-        let tree = call("one\ntwo\nthree\nfour", false);
+        let tree = call_boxed("one\ntwo\nthree\nfour", false);
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "one\ntwo\nthree\n…\n(Ctrl+O to expand)");
     }
 
     #[test]
     fn short_output_collapses_without_hint() {
-        let tree = call("one\ntwo", false);
+        let tree = call_boxed("one\ntwo", false);
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "one\ntwo");
     }
 
     #[test]
     fn expanded_shows_all_lines_without_hint() {
-        let tree = call("one\ntwo\nthree\nfour", true);
+        let tree = call_boxed("one\ntwo\nthree\nfour", true);
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "one\ntwo\nthree\nfour");
     }
@@ -467,6 +825,8 @@ mod tests {
             &json!({ "content": [] }),
             &json!({ "expanded": false, "isPartial": false }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         );
         assert_eq!(tree["props"]["text"], json!("(empty result)"));
     }
@@ -474,7 +834,7 @@ mod tests {
     #[test]
     fn char_budget_truncates_last_line() {
         let long = "x".repeat(9000);
-        let tree = call(&long, false);
+        let tree = call_boxed(&long, false);
         let text = tree["props"]["text"].as_str().unwrap();
         // 8000-char budget consumed by the single line, then the
         // CollapsibleText footer "…\n(Ctrl+O to expand)" (line cap not
@@ -493,6 +853,8 @@ mod tests {
             }),
             &json!({ "expanded": false, "isPartial": false }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         );
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "MCP demo/echo\nok");
@@ -526,6 +888,8 @@ mod tests {
             }),
             &json!({ "expanded": false, "isPartial": false }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         );
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "one\ntwo\nthree\nfour");
@@ -537,6 +901,8 @@ mod tests {
             &json!({ "content": [text_block("one\ntwo\nthree\nfour")] }),
             &json!({ "expanded": false, "isPartial": false }),
             &json!({ "isError": true }),
+            &boxed_options(),
+            None,
         );
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "one\ntwo\nthree\nfour");
@@ -548,6 +914,8 @@ mod tests {
             &json!({ "content": [text_block("ignored")] }),
             &json!({ "expanded": false, "isPartial": true }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         );
         assert_eq!(tree["props"]["text"], json!("Running MCP tool..."));
     }
@@ -564,6 +932,8 @@ mod tests {
             }),
             &json!({ "expanded": false, "isPartial": false }),
             &json!({ "isError": false }),
+            &boxed_options(),
+            None,
         );
         let text = tree["props"]["text"].as_str().unwrap();
         assert_eq!(text, "a\n[image: image/png]\nb\n…\n(Ctrl+O to expand)");

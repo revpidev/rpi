@@ -37,9 +37,11 @@ pub mod search;
 pub mod session_approvals;
 pub mod session_recovery;
 pub mod status;
+pub mod truncate;
 pub mod tsshape;
 pub mod utils;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use abi_stable::prefix_type::PrefixTypeTrait;
@@ -112,6 +114,33 @@ struct DirectSurface {
 }
 
 static STATE: OnceLock<PluginState> = OnceLock::new();
+
+/// Per-tool-call compact render state (R7.2.10.1/#349,
+/// `McpToolRenderState` upstream rides the TUI render context): the ABI
+/// context carries `toolCallId`, so the plugin owns the map — seeded by
+/// `renderCall`, consumed (and dropped) by the final `renderResult`.
+static COMPACT_RENDER_STATE: OnceLock<Mutex<HashMap<String, render::McpToolRenderState>>> =
+    OnceLock::new();
+
+fn compact_render_states() -> &'static Mutex<HashMap<String, render::McpToolRenderState>> {
+    COMPACT_RENDER_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Resolve the render options from the CURRENT runtime config
+/// (`resolveMcpToolRenderOptions(config.settings)`; fresh per dispatch so a
+/// `/reload` with changed settings applies without reinstall).
+fn current_render_options() -> render::McpToolRenderOptions {
+    let settings = STATE.get().and_then(|state| {
+        state
+            .dispatcher
+            .try_runtime()
+            .map(|runtime| runtime.config.settings.clone())
+    });
+    render::resolve_mcp_tool_render_options(match settings.as_ref() {
+        Some(settings) => settings.as_ref(),
+        None => None,
+    })
+}
 
 /// ToolSurface over host calls (design §3.8: unregisterTool first, active
 /// tools fallback).
@@ -772,35 +801,94 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
         // the proxy "mcp" tool gets the proxy call lines, every direct tool
         // renders its own (prefixed) name as displayName.
         Some("render") => {
+            let render_options = current_render_options();
+            let tool_call_id = message
+                .get("context")
+                .and_then(|c| c.get("toolCallId"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
             match (
                 message.get("what").and_then(Value::as_str),
                 message.get("toolName").and_then(Value::as_str),
             ) {
                 (Some("toolResult"), _) => {
+                    // Consume the compact state on the FINAL render (partials
+                    // keep it for the upcoming final row).
+                    let is_partial = message
+                        .get("options")
+                        .and_then(|o| o.get("isPartial"))
+                        .and_then(Value::as_bool)
+                        == Some(true);
+                    let compact_state = tool_call_id.and_then(|id| {
+                        let mut states = compact_render_states()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        if is_partial {
+                            states.get(&id).cloned()
+                        } else {
+                            states.remove(&id)
+                        }
+                    });
                     let tree = render::render_mcp_tool_result(
                         message.get("result").unwrap_or(&Value::Null),
                         message.get("options").unwrap_or(&Value::Null),
                         message.get("context").unwrap_or(&Value::Null),
+                        &render_options,
+                        compact_state.as_ref(),
                     );
                     return pack(&tree);
                 }
                 (Some("toolCall"), Some("mcp")) => {
-                    let tree = render::render_mcp_proxy_tool_call(
-                        message
-                            .get("context")
-                            .and_then(|c| c.get("args"))
-                            .unwrap_or(&Value::Null),
-                    );
+                    let args = message
+                        .get("context")
+                        .and_then(|c| c.get("args"))
+                        .unwrap_or(&Value::Null);
+                    let context = message.get("context").unwrap_or(&Value::Null);
+                    if let Some(id) = &tool_call_id {
+                        let mut states = compact_render_states()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let entry = states.entry(id.clone()).or_default();
+                        let lines = render::format_mcp_proxy_tool_call_lines(
+                            args,
+                            render::DEFAULT_MAX_CALL_INPUT_CHARS,
+                        );
+                        let tree = render::render_tool_call_with_state(
+                            &lines,
+                            &render_options,
+                            Some(context),
+                            Some(entry),
+                        );
+                        return pack(&tree);
+                    }
+                    let tree = render::render_mcp_proxy_tool_call(args);
                     return pack(&tree);
                 }
                 (Some("toolCall"), Some(display_name)) => {
-                    let tree = render::render_mcp_direct_tool_call(
-                        display_name,
-                        message
-                            .get("context")
-                            .and_then(|c| c.get("args"))
-                            .unwrap_or(&Value::Null),
-                    );
+                    let args = message
+                        .get("context")
+                        .and_then(|c| c.get("args"))
+                        .unwrap_or(&Value::Null);
+                    let context = message.get("context").unwrap_or(&Value::Null);
+                    if let Some(id) = &tool_call_id {
+                        let mut states = compact_render_states()
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let entry = states.entry(id.clone()).or_default();
+                        let lines = render::format_mcp_direct_tool_call_lines(
+                            display_name,
+                            args,
+                            render::DEFAULT_MAX_CALL_INPUT_CHARS,
+                        );
+                        let tree = render::render_tool_call_with_state(
+                            &lines,
+                            &render_options,
+                            Some(context),
+                            Some(entry),
+                        );
+                        return pack(&tree);
+                    }
+                    let tree = render::render_mcp_direct_tool_call(display_name, args);
                     return pack(&tree);
                 }
                 _ => {}

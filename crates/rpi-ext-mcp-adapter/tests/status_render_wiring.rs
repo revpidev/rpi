@@ -199,7 +199,10 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
         "direct tool definition must carry renderResult: {echo_defs:?}"
     );
 
-    // 渲染分发（host_call.rs:263-281 的回程）：折叠 + identity 行。
+    // 渲染分发（host_call.rs:263-281 的回程）——TE24 后的 COMPACT 默认
+    // (G2: 旧期望 boxed「identity + 3 行折叠 + 提示」→ 新期望紧凑单行
+    // 行,依据 #349/10a45367 上游默认变化;`toolResultRendering:"boxed"`
+    // 回旧行)。无 toolCallId 状态时 title 回退 details identity。
     let message = json!({
         "kind": "render",
         "what": "toolResult",
@@ -215,11 +218,11 @@ async fn status_bar_and_render_result_are_wired_to_the_host() {
         RVec::from(serde_json::to_vec(&message).expect("json")),
     );
     let tree: Value = serde_json::from_slice(&reply[..]).expect("component tree");
-    assert_eq!(tree["type"], json!("text"));
-    assert_eq!(
-        tree["props"]["text"],
-        json!("MCP demo/echo\none\ntwo\nthree\n…\n(Ctrl+O to expand)")
-    );
+    assert_eq!(tree["type"], json!("column"));
+    let text = tree["children"][0]["props"]["text"]
+        .as_str()
+        .expect("compact row text");
+    assert_eq!(text, "MCP demo/echo → one\n … (Ctrl+O to expand)");
 
     // 其他 what → null（宿主按错误处理，不触发）。
     let message = json!({ "kind": "render", "what": "toolCall", "context": {} });

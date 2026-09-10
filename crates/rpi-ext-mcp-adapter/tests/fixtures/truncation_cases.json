@@ -1,0 +1,425 @@
+{
+  "cases": [
+    {
+      "content": "line\nline\nline\n",
+      "contentSha256": "0b3ed69ca643edb6acc6fb43a1b9a235d7e773d43818396d4e05ead684e8f7c9",
+      "expected": {
+        "content": "line\nline\nline\n",
+        "expectedContentSha256": "0b3ed69ca643edb6acc6fb43a1b9a235d7e773d43818396d4e05ead684e8f7c9",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 100,
+        "maxLines": 3,
+        "outputBytes": 15,
+        "outputLines": 3,
+        "totalBytes": 15,
+        "totalLines": 3,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 100,
+      "maxLines": 3,
+      "name": "case-0"
+    },
+    {
+      "content": "line\nline\nline\n",
+      "contentSha256": "0b3ed69ca643edb6acc6fb43a1b9a235d7e773d43818396d4e05ead684e8f7c9",
+      "expected": {
+        "content": "line\nline",
+        "expectedContentSha256": "d39a27a2975956fc2a81ac5510d88368193f7cceb9d23382417716c860390e95",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 100,
+        "maxLines": 2,
+        "outputBytes": 9,
+        "outputLines": 2,
+        "totalBytes": 15,
+        "totalLines": 3,
+        "truncated": true,
+        "truncatedBy": "lines"
+      },
+      "maxBytes": 100,
+      "maxLines": 2,
+      "name": "case-1"
+    },
+    {
+      "content": "aé🙂\nb",
+      "contentSha256": "947657b8efe3bc4f2bbc7ad993b54af709bc1386c8bf6e57f2e60b89c79eda50",
+      "expected": {
+        "content": "aé🙂\nb",
+        "expectedContentSha256": "947657b8efe3bc4f2bbc7ad993b54af709bc1386c8bf6e57f2e60b89c79eda50",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 100,
+        "maxLines": 10,
+        "outputBytes": 9,
+        "outputLines": 2,
+        "totalBytes": 9,
+        "totalLines": 2,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 100,
+      "maxLines": 10,
+      "name": "case-2"
+    },
+    {
+      "content": "aé🙂\nb",
+      "contentSha256": "947657b8efe3bc4f2bbc7ad993b54af709bc1386c8bf6e57f2e60b89c79eda50",
+      "expected": {
+        "content": "aé🙂\nb",
+        "expectedContentSha256": "947657b8efe3bc4f2bbc7ad993b54af709bc1386c8bf6e57f2e60b89c79eda50",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 9,
+        "maxLines": 10,
+        "outputBytes": 9,
+        "outputLines": 2,
+        "totalBytes": 9,
+        "totalLines": 2,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 9,
+      "maxLines": 10,
+      "name": "case-3"
+    },
+    {
+      "content": "aé🙂\nb",
+      "contentSha256": "947657b8efe3bc4f2bbc7ad993b54af709bc1386c8bf6e57f2e60b89c79eda50",
+      "expected": {
+        "content": "",
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": true,
+        "lastLinePartial": false,
+        "maxBytes": 5,
+        "maxLines": 10,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 9,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 5,
+      "maxLines": 10,
+      "name": "case-4"
+    },
+    {
+      "content": "éé\nabc",
+      "contentSha256": "fb4705753cfab451873719e5f079be9ad7725e56569f8033ff04b3808a0d8c5b",
+      "expected": {
+        "content": "éé",
+        "expectedContentSha256": "f13c007a1d8e6e1300b5957a143810cdd3555825466cf5d2617b1ac2fd8bd76b",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 4,
+        "maxLines": 10,
+        "outputBytes": 4,
+        "outputLines": 1,
+        "totalBytes": 8,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 4,
+      "maxLines": 10,
+      "name": "case-5"
+    },
+    {
+      "content": "éé\nabc",
+      "contentSha256": "fb4705753cfab451873719e5f079be9ad7725e56569f8033ff04b3808a0d8c5b",
+      "expected": {
+        "content": "",
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": true,
+        "lastLinePartial": false,
+        "maxBytes": 3,
+        "maxLines": 10,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 8,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 3,
+      "maxLines": 10,
+      "name": "case-6"
+    },
+    {
+      "content": "éé\nabc",
+      "contentSha256": "fb4705753cfab451873719e5f079be9ad7725e56569f8033ff04b3808a0d8c5b",
+      "expected": {
+        "content": "",
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": true,
+        "lastLinePartial": false,
+        "maxBytes": 2,
+        "maxLines": 10,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 8,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 2,
+      "maxLines": 10,
+      "name": "case-7"
+    },
+    {
+      "content": "only",
+      "contentSha256": "f905b19542ed08c9a9c26543cca32e5711d207dcffb81b4cdb44ce0b989431c9",
+      "expected": {
+        "content": "only",
+        "expectedContentSha256": "f905b19542ed08c9a9c26543cca32e5711d207dcffb81b4cdb44ce0b989431c9",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 10,
+        "maxLines": 10,
+        "outputBytes": 4,
+        "outputLines": 1,
+        "totalBytes": 4,
+        "totalLines": 1,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 10,
+      "maxLines": 10,
+      "name": "case-8"
+    },
+    {
+      "content": "",
+      "contentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "expected": {
+        "content": "",
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 10,
+        "maxLines": 10,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 0,
+        "totalLines": 0,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 10,
+      "maxLines": 10,
+      "name": "case-9"
+    },
+    {
+      "content": "\n",
+      "contentSha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+      "expected": {
+        "content": "\n",
+        "expectedContentSha256": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 10,
+        "maxLines": 10,
+        "outputBytes": 1,
+        "outputLines": 1,
+        "totalBytes": 1,
+        "totalLines": 1,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 10,
+      "maxLines": 10,
+      "name": "case-10"
+    },
+    {
+      "content": null,
+      "contentSha256": "29927e273accc68286005017f7fa6e4f27bddb4db3083ff8b8d4c3667905b7fa",
+      "expected": {
+        "content": null,
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": true,
+        "lastLinePartial": false,
+        "maxBytes": 1024,
+        "maxLines": 100,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 300000,
+        "totalLines": 1,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 1024,
+      "maxLines": 100,
+      "name": "case-11"
+    },
+    {
+      "content": "entry-0\nentry-1\nentry-2\nentry-3\nentry-4\nentry-5\nentry-6\nentry-7\nentry-8\nentry-9\nentry-10\nentry-11\nentry-12\nentry-13\nentry-14\nentry-15\nentry-16\nentry-17\nentry-18\nentry-19\nentry-20\nentry-21\nentry-22\nentry-23\nentry-24\nentry-25\nentry-26\nentry-27\nentry-28\nentry-29\nentry-30\nentry-31\nentry-32\nentry-33\nentry-34\nentry-35\nentry-36\nentry-37\nentry-38\nentry-39",
+      "contentSha256": "27aeecd8b5f9c56b0ac8c047f13025199398210b995cfa528e31838d70c529b2",
+      "expected": {
+        "content": "entry-0\nentry-1\nentry-2\nentry-3\nentry-4\nentry-5\nentry-6\nentry-7\nentry-8\nentry-9",
+        "expectedContentSha256": "0bd5e86f9f4f9c044230b3959f59b6adfc91c0deb6944c81b218958e33753b65",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 10000,
+        "maxLines": 10,
+        "outputBytes": 79,
+        "outputLines": 10,
+        "totalBytes": 349,
+        "totalLines": 40,
+        "truncated": true,
+        "truncatedBy": "lines"
+      },
+      "maxBytes": 10000,
+      "maxLines": 10,
+      "name": "case-12"
+    },
+    {
+      "content": "entry-0\nentry-1\nentry-2\nentry-3\nentry-4\nentry-5\nentry-6\nentry-7\nentry-8\nentry-9\nentry-10\nentry-11\nentry-12\nentry-13\nentry-14\nentry-15\nentry-16\nentry-17\nentry-18\nentry-19\nentry-20\nentry-21\nentry-22\nentry-23\nentry-24\nentry-25\nentry-26\nentry-27\nentry-28\nentry-29\nentry-30\nentry-31\nentry-32\nentry-33\nentry-34\nentry-35\nentry-36\nentry-37\nentry-38\nentry-39",
+      "contentSha256": "27aeecd8b5f9c56b0ac8c047f13025199398210b995cfa528e31838d70c529b2",
+      "expected": {
+        "content": "entry-0\nentry-1\nentry-2\nentry-3\nentry-4\nentry-5\nentry-6",
+        "expectedContentSha256": "f60395d99a81b677c47f747579edbfe0c92f7cfb5e60512a75903e3d546af400",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 60,
+        "maxLines": 100,
+        "outputBytes": 55,
+        "outputLines": 7,
+        "totalBytes": 349,
+        "totalLines": 40,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 60,
+      "maxLines": 100,
+      "name": "case-13"
+    },
+    {
+      "content": "first\r\nsecond",
+      "contentSha256": "d930e679a8ca94308fb7400eea7b82500cc7ea08eff0c1484e065e4a5f6145d0",
+      "expected": {
+        "content": "first\r\nsecond",
+        "expectedContentSha256": "d930e679a8ca94308fb7400eea7b82500cc7ea08eff0c1484e065e4a5f6145d0",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 100,
+        "maxLines": 10,
+        "outputBytes": 13,
+        "outputLines": 2,
+        "totalBytes": 13,
+        "totalLines": 2,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 100,
+      "maxLines": 10,
+      "name": "case-14"
+    },
+    {
+      "content": "👩‍💻\nb",
+      "contentSha256": "92fe415f4fe05eb36d3463887af2ff41c34f99ec9ff8f3e0881aa2d25f71e669",
+      "expected": {
+        "content": "👩‍💻\nb",
+        "expectedContentSha256": "92fe415f4fe05eb36d3463887af2ff41c34f99ec9ff8f3e0881aa2d25f71e669",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 100,
+        "maxLines": 10,
+        "outputBytes": 13,
+        "outputLines": 2,
+        "totalBytes": 13,
+        "totalLines": 2,
+        "truncated": false,
+        "truncatedBy": null
+      },
+      "maxBytes": 100,
+      "maxLines": 10,
+      "name": "case-15"
+    },
+    {
+      "content": "👩‍💻\nb",
+      "contentSha256": "92fe415f4fe05eb36d3463887af2ff41c34f99ec9ff8f3e0881aa2d25f71e669",
+      "expected": {
+        "content": "",
+        "expectedContentSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "firstLineExceedsLimit": true,
+        "lastLinePartial": false,
+        "maxBytes": 8,
+        "maxLines": 10,
+        "outputBytes": 0,
+        "outputLines": 0,
+        "totalBytes": 13,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 8,
+      "maxLines": 10,
+      "name": "case-16"
+    },
+    {
+      "content": "👩‍💻\nb",
+      "contentSha256": "92fe415f4fe05eb36d3463887af2ff41c34f99ec9ff8f3e0881aa2d25f71e669",
+      "expected": {
+        "content": "👩‍💻",
+        "expectedContentSha256": "427274538f1f24ef137872891551ffb4263f6edd90c80c533534578e8a5a9893",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 11,
+        "maxLines": 10,
+        "outputBytes": 11,
+        "outputLines": 1,
+        "totalBytes": 13,
+        "totalLines": 2,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 11,
+      "maxLines": 10,
+      "name": "case-17"
+    },
+    {
+      "content": "héllo wörld\nhéllo wörld\nhéllo wörld\n",
+      "contentSha256": "f84b49f4023b720e29890f2fc783242150394298a90b7defb2946d299298fd50",
+      "expected": {
+        "content": "héllo wörld",
+        "expectedContentSha256": "a1003f7d04a4115711d0b48a2eaf1359ce565d2d2a6fd65098dfcffadeeef59f",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 26,
+        "maxLines": 10,
+        "outputBytes": 13,
+        "outputLines": 1,
+        "totalBytes": 42,
+        "totalLines": 3,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 26,
+      "maxLines": 10,
+      "name": "case-18"
+    },
+    {
+      "content": "héllo wörld\nhéllo wörld\nhéllo wörld\n",
+      "contentSha256": "f84b49f4023b720e29890f2fc783242150394298a90b7defb2946d299298fd50",
+      "expected": {
+        "content": "héllo wörld",
+        "expectedContentSha256": "a1003f7d04a4115711d0b48a2eaf1359ce565d2d2a6fd65098dfcffadeeef59f",
+        "firstLineExceedsLimit": false,
+        "lastLinePartial": false,
+        "maxBytes": 25,
+        "maxLines": 10,
+        "outputBytes": 13,
+        "outputLines": 1,
+        "totalBytes": 42,
+        "totalLines": 3,
+        "truncated": true,
+        "truncatedBy": "bytes"
+      },
+      "maxBytes": 25,
+      "maxLines": 10,
+      "name": "case-19"
+    }
+  ],
+  "provenance": "generated by running the HOST crates/rpi/src/tools/truncate.rs truncate_head directly (scripts note: TE24 task file §4.3; regen: /tmp host-truncate-gen project include!s the host file); dual-direction golden for crates/rpi-ext-mcp-adapter/src/truncate.rs"
+}

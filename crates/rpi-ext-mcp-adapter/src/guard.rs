@@ -19,7 +19,14 @@ pub const DEFAULT_MCP_OUTPUT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MCP_DETAILS_MAX_BYTES: usize = 16 * 1024;
 
 const KEY_PREVIEW_LIMIT: usize = 20;
-const KEY_MAX_CHARS: usize = 120;
+/// `KEY_MAX_BYTES` (mcp-output-guard.ts:15 @ 10a45367): byte cap for
+/// summary keys (the old port was char-based).
+const KEY_MAX_BYTES: usize = 120;
+/// `STRUCTURED_CONTENT_PRESERVE_MAX_BYTES` (mcp-output-guard.ts:14):
+/// bounded `details.mcpResult.structuredContent` preservation (#430).
+const STRUCTURED_CONTENT_PRESERVE_MAX_BYTES: usize = 4 * 1024;
+/// `STRUCTURED_CONTENT_FIELD_PRESERVE_MAX_BYTES` (mcp-output-guard.ts:15).
+const STRUCTURED_CONTENT_FIELD_PRESERVE_MAX_BYTES: usize = 512;
 const CONTENT_SUMMARY_LIMIT: usize = 20;
 
 /// `McpOutputGuardOptions` (mcp-output-guard.ts:41-58).
@@ -218,28 +225,13 @@ fn truncate_string_to_bytes(value: &str, max_bytes: usize) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// `truncateHead` (mcp-output-guard.ts:218-241).
-fn truncate_head(text: &str, max_bytes: usize, max_lines: usize) -> String {
-    let mut output: Vec<String> = Vec::new();
-    let mut bytes = 0usize;
-    for line in text.split('\n') {
-        if output.len() >= max_lines {
-            break;
-        }
-        let separator_bytes = usize::from(!output.is_empty());
-        let line_bytes = byte_length(line);
-        if bytes + separator_bytes + line_bytes > max_bytes {
-            let remaining = max_bytes.saturating_sub(bytes + separator_bytes);
-            if remaining > 0 {
-                output.push(truncate_string_to_bytes(line, remaining));
-            }
-            break;
-        }
-        output.push(line.to_string());
-        bytes += separator_bytes + line_bytes;
-    }
-    output.join("\n")
-}
+// #500 (4444b49, mcp-output-guard.ts @ Unreleased): the adapter's own
+// byte-loop `truncateHead` is REPLACED by the host truncation semantics
+// (`crate::truncate::truncate_head`, itself a verbatim port of the host
+// `crates/rpi/src/tools/truncate.rs`) — never partial lines, first-line
+// classification, and the host `formatSize` spelling (B/KB/MB, not the
+// adapter's old " B"/" KiB").
+use crate::truncate::{format_size, truncate_head, TruncateOptions, TruncationResult};
 
 /// `Number.prototype.toLocaleString()` for the integers the notice prints
 /// (en-US grouping).
@@ -255,27 +247,35 @@ fn to_locale_string(n: usize) -> String {
     out
 }
 
-/// `formatSize` (mcp-output-guard.ts:404-408).
-fn format_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
-/// `formatTruncationNotice` (mcp-output-guard.ts:251-261).
+/// `formatTruncationNotice` (#500, mcp-output-guard.ts:259-273 @ 4444b49):
+/// the classification reason line + the host size format.
 fn format_truncation_notice(
-    stats: (usize, usize),
+    truncation: &TruncationResult,
     full_output_path: Option<&str>,
     write_error: Option<&str>,
 ) -> String {
+    let reason = if truncation.first_line_exceeds_limit {
+        format!(
+            "First line exceeds {} limit",
+            format_size(truncation.max_bytes)
+        )
+    } else if truncation.truncated_by == Some(crate::truncate::TruncatedBy::Lines) {
+        format!(
+            "Truncated: showing {} of {} lines ({} line limit)",
+            truncation.output_lines, truncation.total_lines, truncation.max_lines
+        )
+    } else {
+        format!(
+            "Truncated: {} lines shown ({} limit)",
+            truncation.output_lines,
+            format_size(truncation.max_bytes)
+        )
+    };
     let base = format!(
-        "[MCP text output truncated: original {} lines / {}.",
-        to_locale_string(stats.1),
-        format_size(stats.0)
+        "[MCP text output truncated: original {} lines / {}. {}.",
+        to_locale_string(truncation.total_lines),
+        format_size(truncation.total_bytes),
+        reason
     );
     match full_output_path {
         Some(path) => format!(
@@ -376,15 +376,94 @@ fn safe_stringify(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
+/// `truncateKey` (mcp-output-guard.ts:412-416 @ 10a45367): byte cap with
+/// the `…` suffix budgeted in.
 fn truncate_key(key: &str) -> String {
-    if key.chars().count() <= KEY_MAX_CHARS {
-        key.to_string()
-    } else {
-        format!(
-            "{}…",
-            key.chars().take(KEY_MAX_CHARS - 1).collect::<String>()
-        )
+    if byte_length(key) <= KEY_MAX_BYTES {
+        return key.to_string();
     }
+    let suffix = "…";
+    format!(
+        "{}{suffix}",
+        truncate_string_to_bytes(key, KEY_MAX_BYTES - byte_length(suffix))
+    )
+}
+
+/// `uniqueBoundedKeys` (mcp-output-guard.ts:418-430 @ 10a45367): truncate
+/// each key, then disambiguate collisions with `~N` ordinals (the suffix
+/// budget shrinks the truncated prefix).
+fn unique_bounded_keys(keys: Vec<String>) -> Vec<String> {
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    keys.into_iter()
+        .map(|key| {
+            let mut candidate = truncate_key(&key);
+            let mut ordinal = 2;
+            while used.contains(&candidate) {
+                let suffix = format!("~{ordinal}");
+                candidate = format!(
+                    "{}{suffix}",
+                    truncate_string_to_bytes(
+                        &key,
+                        KEY_MAX_BYTES.saturating_sub(byte_length(&suffix))
+                    )
+                );
+                ordinal += 1;
+            }
+            used.insert(candidate.clone());
+            candidate
+        })
+        .collect()
+}
+
+/// `serializedObjectEntryBytes` (mcp-output-guard.ts:432-434): the byte
+/// cost of `{key: value}` minus the empty-object base, +1 separator when
+/// not first.
+fn serialized_object_entry_bytes(key: &str, value: &Value, has_previous: bool) -> usize {
+    let serialized = safe_stringify(&json!({ key: value }));
+    serialized.len().saturating_sub(byte_length("{}")) + usize::from(has_previous)
+}
+
+/// `summarizeStructuredContent` (mcp-output-guard.ts:373-399 @ 10a45367,
+/// #430): preserve small fields verbatim (≤512 B each, ≤4 KiB total),
+/// summarize the rest; previews carry unique bounded keys.
+fn summarize_structured_content(value: &Value) -> Value {
+    let Some(record) = value.as_object() else {
+        return summarize_value(value);
+    };
+    let key_count = record.len();
+    let entries: Vec<(&String, &Value)> = record.iter().take(KEY_PREVIEW_LIMIT).collect();
+    let preview_keys = unique_bounded_keys(
+        entries
+            .iter()
+            .map(|(key, _)| (*key).clone())
+            .collect::<Vec<String>>(),
+    );
+    let mut fields = serde_json::Map::new();
+    let mut preserved_bytes = byte_length("{}");
+    for (key, field) in &entries {
+        let field_bytes = byte_length(&safe_stringify(field));
+        let candidate = if field_bytes <= STRUCTURED_CONTENT_FIELD_PRESERVE_MAX_BYTES {
+            (*field).clone()
+        } else {
+            summarize_value(field)
+        };
+        let entry_bytes = serialized_object_entry_bytes(key, &candidate, !fields.is_empty());
+        if preserved_bytes + entry_bytes > STRUCTURED_CONTENT_PRESERVE_MAX_BYTES {
+            continue;
+        }
+        fields.insert((*key).clone(), candidate);
+        preserved_bytes += entry_bytes;
+    }
+    json!({
+        "preservedFields": Value::Object(fields),
+        "summary": {
+            "type": "object",
+            "estimatedBytes": estimate_value_bytes(value, 0),
+            "keyCount": key_count,
+            "keysPreview": preview_keys,
+            "omitted": true,
+        },
+    })
 }
 
 fn estimate_value_bytes(value: &Value, depth: usize) -> usize {
@@ -416,7 +495,7 @@ fn summarize_value(value: &Value) -> Value {
             "type": "array",
             "estimatedBytes": estimate_value_bytes(value, 0),
             "keyCount": keys.len(),
-            "keysPreview": keys.iter().take(KEY_PREVIEW_LIMIT).map(|k| truncate_key(k)).collect::<Vec<_>>(),
+            "keysPreview": unique_bounded_keys(keys.into_iter().take(KEY_PREVIEW_LIMIT).collect()),
             "omitted": true,
         });
     }
@@ -432,7 +511,7 @@ fn summarize_value(value: &Value) -> Value {
         "type": if value.is_array() { "array" } else { "object" },
         "estimatedBytes": estimate_value_bytes(value, 0),
         "keyCount": keys.len(),
-        "keysPreview": keys.iter().take(KEY_PREVIEW_LIMIT).map(|k| truncate_key(k)).collect::<Vec<_>>(),
+        "keysPreview": unique_bounded_keys(keys.into_iter().take(KEY_PREVIEW_LIMIT).cloned().collect()),
         "omitted": true,
     })
 }
@@ -523,7 +602,10 @@ fn summarize_mcp_result(result: &Value, raw: &str, raw_bytes: usize) -> Value {
     }
     if let Some(record) = record {
         if record.contains_key("structuredContent") {
-            summary["structuredContent"] = summarize_value(&record["structuredContent"]);
+            // #430: bounded structured preservation instead of a plain
+            // omission summary.
+            summary["structuredContent"] =
+                summarize_structured_content(&record["structuredContent"]);
         }
         if record.contains_key("_meta") {
             summary["meta"] = summarize_value(&record["_meta"]);
@@ -609,28 +691,71 @@ pub fn guard_mcp_output(content: Vec<Value>, options: &GuardOptions) -> GuardedO
         .collect::<Vec<_>>()
         .join("\n");
     let composed_output = format!("{prefix}{text_output}{suffix}");
-    let stats = text_stats(&composed_output);
+    // #500: the host truncation classifies (never partial lines; a
+    // first-line overflow empties the preview with
+    // `firstLineExceedsLimit`).
+    let truncation = truncate_head(
+        &composed_output,
+        Some(TruncateOptions {
+            max_bytes,
+            max_lines,
+        }),
+    );
 
     let mut guarded_content = add_affixes(normalized, prefix, suffix);
     let mut output_guard: Option<Value> = None;
 
-    if stats.0 > max_bytes || stats.1 > max_lines {
+    if truncation.truncated {
         let (full_output_path, write_error) = save_artifact("output", &composed_output);
-        let notice =
-            format_truncation_notice(stats, full_output_path.as_deref(), write_error.as_deref());
-        let (budget_bytes, budget_lines) = reserve_budget(max_bytes, max_lines, &notice);
-        let preview = truncate_head(&composed_output, budget_bytes, budget_lines);
-        let final_text = format!("{preview}\n\n{notice}");
+        let initial_notice = format_truncation_notice(
+            &truncation,
+            full_output_path.as_deref(),
+            write_error.as_deref(),
+        );
+        let (budget_bytes, budget_lines) = reserve_budget(max_bytes, max_lines, &initial_notice);
+        let preview = truncate_head(
+            &composed_output,
+            Some(TruncateOptions {
+                max_bytes: budget_bytes,
+                max_lines: budget_lines,
+            }),
+        );
+        // The FINAL notice reports the delivered preview's counts (upstream
+        // recomposes with `{...truncation, outputLines: preview.outputLines,
+        // outputBytes: preview.outputBytes}`).
+        let mut notice_source = truncation.clone();
+        notice_source.output_lines = preview.output_lines;
+        notice_source.output_bytes = preview.output_bytes;
+        let notice = format_truncation_notice(
+            &notice_source,
+            full_output_path.as_deref(),
+            write_error.as_deref(),
+        );
+        let final_text = format!("{}\n\n{notice}", preview.content);
         let final_stats = text_stats(&final_text);
 
         guarded_content = vec![json!({ "type": "text", "text": final_text })];
         guarded_content.extend(image_blocks.iter().cloned());
         let mut guard_details = json!({
             "truncated": true,
-            "originalBytes": stats.0,
+            "originalBytes": truncation.total_bytes,
             "returnedBytes": final_stats.0,
-            "originalLines": stats.1,
+            "originalLines": truncation.total_lines,
             "returnedLines": final_stats.1,
+            // #500 host-classification fields.
+            "truncatedBy": match truncation.truncated_by {
+                Some(crate::truncate::TruncatedBy::Lines) => "lines",
+                Some(crate::truncate::TruncatedBy::Bytes) => "bytes",
+                None => Value::Null.as_str().unwrap_or("bytes"),
+            },
+            "totalLines": truncation.total_lines,
+            "totalBytes": truncation.total_bytes,
+            "outputLines": preview.output_lines,
+            "outputBytes": preview.output_bytes,
+            "lastLinePartial": truncation.last_line_partial,
+            "firstLineExceedsLimit": truncation.first_line_exceeds_limit,
+            "maxLines": truncation.max_lines,
+            "maxBytes": truncation.max_bytes,
         });
         if !image_blocks.is_empty() {
             guard_details["imageBlocksPassedThrough"] = json!(image_blocks.len());
@@ -835,9 +960,150 @@ mod tests {
 
     #[test]
     fn locale_grouping_in_notice() {
+        // TE24 (#500): the notice uses the HOST formatSize spelling
+        // (G2: 旧期望 "512 B"/"50.0 KiB" → 新期望 "512B"/"50.0KB",
+        // 依据 4444b49 reuse host truncation semantics)。
         assert_eq!(to_locale_string(2001), "2,001");
         assert_eq!(to_locale_string(999), "999");
-        assert_eq!(format_size(512), "512 B");
-        assert_eq!(format_size(50 * 1024), "50.0 KiB");
+        assert_eq!(format_size(512), "512B");
+        assert_eq!(format_size(50 * 1024), "50.0KB");
+        assert_eq!(format_size(1024 * 1024), "1.0MB");
+    }
+    #[test]
+    fn truncation_notice_carries_host_reason_line() {
+        // #500 (4444b49): the notice reports the host classification.
+        let line_limit = TruncationResult {
+            content: "a".into(),
+            truncated: true,
+            truncated_by: Some(crate::truncate::TruncatedBy::Lines),
+            total_lines: 30,
+            total_bytes: 300,
+            output_lines: 7,
+            output_bytes: 60,
+            last_line_partial: false,
+            first_line_exceeds_limit: false,
+            max_lines: 10,
+            max_bytes: 10_000,
+        };
+        assert!(
+            format_truncation_notice(&line_limit, Some("/tmp/x"), None)
+                .contains("Truncated: showing 7 of 30 lines (10 line limit)"),
+            "{:?}",
+            format_truncation_notice(&line_limit, Some("/tmp/x"), None)
+        );
+        let byte_limit = TruncationResult {
+            truncated_by: Some(crate::truncate::TruncatedBy::Bytes),
+            max_bytes: 1500,
+            ..line_limit.clone()
+        };
+        assert!(
+            format_truncation_notice(&byte_limit, None, Some("disk full"))
+                .contains("Truncated: 7 lines shown (1.5KB limit)")
+        );
+        let first_line = TruncationResult {
+            content: String::new(),
+            output_lines: 0,
+            output_bytes: 0,
+            first_line_exceeds_limit: true,
+            max_bytes: 5,
+            ..byte_limit.clone()
+        };
+        assert!(format_truncation_notice(&first_line, None, None)
+            .contains("First line exceeds 5B limit"));
+    }
+
+    #[test]
+    fn guard_first_line_overflow_leaves_no_partial_line() {
+        // #500 test-vector port: the first line exceeding the byte cap
+        // delivers an EMPTY preview with the dedicated notice.
+        let options = GuardOptions {
+            max_bytes: Some(5),
+            max_lines: Some(10),
+            ..GuardOptions::default()
+        };
+        let guarded = guard_mcp_output(
+            vec![json!({ "type": "text", "text": format!("{}\nsmall", "x".repeat(10)) })],
+            &options,
+        );
+        let guard = guarded.output_guard.expect("guard details");
+        assert_eq!(guard["truncated"], json!(true));
+        assert_eq!(guard["truncatedBy"], json!("bytes"));
+        assert_eq!(guard["firstLineExceedsLimit"], json!(true));
+        assert_eq!(guard["outputLines"], json!(0));
+        assert_eq!(guard["outputBytes"], json!(0));
+        let text = guarded.content[0]["text"].as_str().expect("text");
+        assert!(!text.contains("xxxxxxxxxx"), "no partial first line");
+        assert!(text.contains("First line exceeds 5B limit"));
+    }
+
+    #[test]
+    fn guard_line_truncation_reports_delivered_preview_counts() {
+        // #500: "Truncated: showing 7 of 30 lines (10 line limit)" — the
+        // notice carries the DELIVERED preview line count (7 = 10 budget
+        // minus the notice's own lines).
+        let text = (0..30)
+            .map(|i| format!("entry-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let options = GuardOptions {
+            max_bytes: Some(10_000),
+            max_lines: Some(10),
+            ..GuardOptions::default()
+        };
+        let guarded = guard_mcp_output(vec![json!({ "type": "text", "text": text })], &options);
+        let guard = guarded.output_guard.expect("guard details");
+        assert_eq!(guard["truncatedBy"], json!("lines"));
+        assert_eq!(guard["outputLines"], json!(7));
+        let text = guarded.content[0]["text"].as_str().expect("text");
+        assert!(text.contains("Truncated: showing 7 of 30 lines (10 line limit)"));
+        let _ = std::fs::remove_file(guard["fullOutputPath"].as_str().unwrap_or_default());
+    }
+
+    #[test]
+    fn structured_content_preserves_bounded_fields() {
+        // #430 (summarizeStructuredContent, mcp-output-guard.ts:373-399):
+        // small fields stay verbatim inside preservedFields; oversized
+        // fields are summarized; the whole object keeps a 4 KiB budget.
+        let small = json!({ "rows": [1, 2, 3] });
+        let summarized = summarize_structured_content(&small);
+        assert_eq!(
+            summarized["preservedFields"]["rows"],
+            json!([1, 2, 3]),
+            "small field preserved verbatim"
+        );
+        assert_eq!(summarized["summary"]["omitted"], json!(true));
+
+        // An oversized field (>512 B) is summarized inside preservedFields.
+        let big_field = json!({ "blob": "x".repeat(600) });
+        let summarized = summarize_structured_content(&big_field);
+        assert!(
+            summarized["preservedFields"]["blob"].get("omitted") == Some(&json!(true)),
+            "oversized field summarized: {}",
+            summarized["preservedFields"]["blob"]
+        );
+
+        // The 4 KiB total budget: many 100-B fields stop being preserved.
+        let mut many = serde_json::Map::new();
+        for i in 0..80 {
+            many.insert(format!("k{i:02}"), json!(format!("{}", "v".repeat(90))));
+        }
+        let summarized = summarize_structured_content(&Value::Object(many));
+        let preserved = summarized["preservedFields"].as_object().expect("object");
+        assert!(preserved.len() < 80, "4 KiB budget caps preservation");
+    }
+
+    #[test]
+    fn unique_bounded_keys_disambiguate_collisions() {
+        // uniqueBoundedKeys (mcp-output-guard.ts:418-430): two distinct
+        // long keys truncating to the same prefix get ~2/~3 suffixes.
+        let key_a = format!("a{}z", "m".repeat(200));
+        let key_b = format!("a{}y", "m".repeat(200));
+        let keys = unique_bounded_keys(vec![key_a.clone(), key_b.clone(), key_a.clone() + "2"]);
+        assert_eq!(keys.len(), 3);
+        assert_ne!(keys[0], keys[1], "colliding prefixes disambiguated");
+        assert!(keys.iter().all(|k| byte_length(k) <= KEY_MAX_BYTES));
+        // Exact duplicates also get ordinals.
+        let dupes = unique_bounded_keys(vec!["same".to_string(), "same".to_string()]);
+        assert_eq!(dupes, vec!["same".to_string(), "same~2".to_string()]);
     }
 }
