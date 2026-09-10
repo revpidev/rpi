@@ -39,6 +39,10 @@ fn main() {
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    // Server-initiated notifications queued while handling a line (the
+    // listen acknowledgement / proactive list_changed), flushed after the
+    // response (or immediately for notification-only handling).
+    let mut notifications: Vec<serde_json::Value> = Vec::new();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -50,14 +54,73 @@ fn main() {
         let method = message.get("method").and_then(|m| m.as_str()).unwrap_or("");
         log(method);
         let id = message.get("id").cloned();
-        let Some(id) = id else { continue }; // notifications: no response
+        let flush_notifications = |queue: &mut Vec<serde_json::Value>| {
+            let mut out = stdout.lock();
+            for notification in queue.drain(..) {
+                let _ = serde_json::to_writer(&mut out, &notification);
+                let _ = writeln!(out);
+            }
+            let _ = out.flush();
+        };
+        let Some(id) = id else {
+            // Notifications from the client (no response expected); the
+            // match arms may queue server-initiated notifications.
+            handle_notification(&message, &mut notifications);
+            flush_notifications(&mut notifications);
+            continue;
+        };
         let result = match method {
-            "initialize" => serde_json::json!({
-                "protocolVersion": "2025-03-26",
-                "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
-                "serverInfo": { "name": "fixture", "version": "0.1" },
-                "instructions": "fixture instructions",
-            }),
+            "initialize" => {
+                // TE24 listen knobs: MODERN_2026 negotiates the 2026-07-28
+                // era with listChanged capabilities (drives
+                // subscriptions/listen); NOTIFY_TOOLS_CHANGED proactively
+                // sends notifications/tools/list_changed after the
+                // initialized notification.
+                let modern = std::env::var("RPI_MCP_FIXTURE_MODERN_2026").is_ok();
+                let capabilities = if modern {
+                    serde_json::json!({
+                        "tools": { "listChanged": true },
+                        "resources": { "listChanged": true },
+                        "prompts": { "listChanged": true },
+                    })
+                } else {
+                    serde_json::json!({ "tools": {}, "resources": {}, "prompts": {} })
+                };
+                serde_json::json!({
+                    "protocolVersion": if modern { "2026-07-28" } else { "2025-03-26" },
+                    "capabilities": capabilities,
+                    "serverInfo": { "name": "fixture", "version": "0.1" },
+                    "instructions": "fixture instructions",
+                })
+            }
+            "notifications/initialized" => {
+                // `initialized` normally arrives as a NOTIFICATION (no id);
+                // a request-shaped variant (some SDKs) answers empty and
+                // the proactive list_changed rides the shared handler.
+                serde_json::Value::Null
+            }
+            "subscriptions/listen" => {
+                // #468: acknowledge with the subscription id mirror, then
+                // hold the stream open (graceful close = a later RESULT for
+                // the same string id, which the test never triggers).
+                let listen_id = message
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                notifications.push(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {
+                        "_meta": { "io.modelcontextprotocol/subscriptionId": listen_id },
+                        "notifications": message
+                            .get("params")
+                            .and_then(|p| p.get("notifications"))
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    },
+                }));
+                serde_json::Value::Null
+            }
             "ping" => serde_json::json!({}),
             "tools/list" => {
                 // TE24 keep-alive test knobs (defaults keep the historical
@@ -150,10 +213,48 @@ fn main() {
                 continue;
             }
         };
+        // The listen acknowledgment rides BEFORE the (empty) response on
+        // the wire — both are written together here; the SUBSCRIPTIONS arm
+        // returns Null (rendered as an empty result below).
         let response = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let mut out = stdout.lock();
-        let _ = serde_json::to_writer(&mut out, &response);
-        let _ = writeln!(out);
-        let _ = out.flush();
+        {
+            let mut out = stdout.lock();
+            for notification in notifications.drain(..) {
+                let _ = serde_json::to_writer(&mut out, &notification);
+                let _ = writeln!(out);
+            }
+            let _ = serde_json::to_writer(&mut out, &response);
+            let _ = writeln!(out);
+            let _ = out.flush();
+        }
+    }
+}
+
+/// Notification-only handling (no id on the wire): with
+/// NOTIFY_TOOLS_CHANGED_DELAY_MS set, schedule the proactive
+/// notifications/tools/list_changed on a writer thread — the delay models
+/// a real server changing its catalog WELL after the handshake completes
+/// (an immediate push would race the client's connection publication and
+/// be dropped, exactly like upstream's handler guard).
+fn handle_notification(message: &serde_json::Value, _notifications: &mut Vec<serde_json::Value>) {
+    if message.get("method").and_then(|m| m.as_str()) == Some("notifications/initialized") {
+        let delay_ms: u64 = std::env::var("RPI_MCP_FIXTURE_NOTIFY_TOOLS_CHANGED_DELAY_MS")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(0);
+        if delay_ms > 0 {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                let notification = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/tools/list_changed",
+                });
+                let _ = serde_json::to_writer(&mut out, &notification);
+                let _ = writeln!(out);
+                let _ = out.flush();
+            });
+        }
     }
 }

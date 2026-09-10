@@ -152,11 +152,51 @@ pub struct DiscoveredMetadata {
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, ProtocolError>>>>>;
 type NotificationHandler = Arc<dyn Fn(Value) + Send + Sync>;
 
+/// One in-flight `subscriptions/listen` (protocol.rs #468): `ack` resolves
+/// the opening (the server-honored filter), `closed` settles on graceful
+/// close / remote cancel / teardown.
+pub struct ListenEntry {
+    ack: Option<tokio::sync::oneshot::Sender<Result<Value, ProtocolError>>>,
+    closed: Option<tokio::sync::oneshot::Sender<String>>,
+}
+
+/// `McpSubscription` handle (SDK `listen()` result, close half): sends
+/// `notifications/cancelled` for the listen id and drops the state.
+pub struct ListenHandle {
+    client: Arc<McpClient>,
+    id: String,
+}
+
+impl ListenHandle {
+    /// SDK `close()`: abort + `notifications/cancelled` (unconditional
+    /// belt-and-braces pair; the Rust transport aborts by dropping the
+    /// state, the cancel rides the wire).
+    pub async fn close(&self) {
+        self.client
+            .listen_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+        let _ = self
+            .client
+            .notify(
+                "notifications/cancelled",
+                Some(json!({ "requestId": self.id })),
+            )
+            .await;
+    }
+}
+
 /// The JSON-RPC client over one transport (`Protocol` + legacy `Client`).
 pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     pending: PendingMap,
     next_id: AtomicU64,
+    next_listen_id: AtomicU64,
+    /// `subscriptions/listen` state keyed by the STRING listen id
+    /// (`listen:N`, R7.2.8.4/#468): ack waiter + closed waiter. Demuxed in
+    /// [`Self::dispatch_incoming`] before the numeric-id pending map.
+    listen_states: Arc<Mutex<HashMap<String, ListenEntry>>>,
     negotiated_version: Mutex<Option<String>>,
     server_capabilities: Mutex<Option<Value>>,
     server_info: Mutex<Option<Value>>,
@@ -180,6 +220,8 @@ impl McpClient {
             transport,
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: AtomicU64::new(0),
+            next_listen_id: AtomicU64::new(0),
+            listen_states: Arc::new(Mutex::new(HashMap::new())),
             negotiated_version: Mutex::new(None),
             server_capabilities: Mutex::new(None),
             server_info: Mutex::new(None),
@@ -212,8 +254,39 @@ impl McpClient {
     }
 
     fn dispatch_incoming(&self, message: Value) {
-        let id = message.get("id").and_then(Value::as_u64);
         let is_response = message.get("result").is_some() || message.get("error").is_some();
+        // `subscriptions/listen` responses carry STRING ids (`listen:N`);
+        // a RESULT is the spec's graceful-close signal, an ERROR is the
+        // pre-ack rejection (SDK `_onresponse` demux).
+        if is_response {
+            if let Some(listen_id) = message.get("id").and_then(Value::as_str) {
+                let entry = self
+                    .listen_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(listen_id);
+                if let Some(mut entry) = entry {
+                    if let Some(error) = message.get("error") {
+                        let outcome = Err(ProtocolError::Rpc {
+                            code: error.get("code").and_then(Value::as_i64).unwrap_or(0),
+                            message: error
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown error")
+                                .to_string(),
+                            data: error.get("data").cloned(),
+                        });
+                        if let Some(ack) = entry.ack.take() {
+                            let _ = ack.send(outcome);
+                        }
+                    } else if let Some(closed) = entry.closed.take() {
+                        let _ = closed.send("graceful".to_string());
+                    }
+                    return;
+                }
+            }
+        }
+        let id = message.get("id").and_then(Value::as_u64);
         if let (Some(id), true) = (id, is_response) {
             let sender = self
                 .pending
@@ -253,6 +326,60 @@ impl McpClient {
                 });
                 return;
             }
+            // `notifications/subscriptions/acknowledged` / inbound
+            // `notifications/cancelled` referencing a LIVE listen id are
+            // consumed here (SDK `_onnotification` demux); unmatched ones
+            // fall through to the normal handler.
+            let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+            if method == "notifications/subscriptions/acknowledged" {
+                let subscription_id = message
+                    .get("params")
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|meta| meta.get("io.modelcontextprotocol/subscriptionId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(subscription_id) = subscription_id {
+                    let entry = self
+                        .listen_states
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_mut(&subscription_id)
+                        .map(|entry| {
+                            (
+                                entry.ack.take(),
+                                message
+                                    .get("params")
+                                    .and_then(|p| p.get("notifications"))
+                                    .cloned()
+                                    .unwrap_or_else(|| json!({})),
+                            )
+                        });
+                    if let Some((Some(ack), honored)) = entry {
+                        let _ = ack.send(Ok(honored));
+                        return;
+                    }
+                }
+            }
+            if method == "notifications/cancelled" {
+                let cancelled_id = message
+                    .get("params")
+                    .and_then(|p| p.get("requestId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(cancelled_id) = cancelled_id {
+                    let entry = self
+                        .listen_states
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&cancelled_id);
+                    if let Some(mut entry) = entry {
+                        if let Some(closed) = entry.closed.take() {
+                            let _ = closed.send("remote".to_string());
+                        }
+                        return;
+                    }
+                }
+            }
             let handler = self
                 .notification_handler
                 .lock()
@@ -287,6 +414,119 @@ impl McpClient {
         timeout: Duration,
     ) -> Result<(Vec<Value>, Option<ToolListHints>), ProtocolError> {
         self.fetch_all_tools(timeout).await
+    }
+
+    /// `listen(filter, options)` (SDK Client.listen, R7.2.8.4/#468): open a
+    /// `subscriptions/listen` stream on a MODERN (2026-07-28) connection.
+    /// Resolves when the server's `notifications/subscriptions/acknowledged`
+    /// arrives (the honored filter); a legacy connection errors with the
+    /// era message (unsolicited delivery still applies there).
+    pub async fn open_listen(
+        self: &Arc<Self>,
+        filter: Value,
+        timeout: Duration,
+    ) -> Result<ListenHandle, ProtocolError> {
+        let negotiated = self
+            .negotiated_version
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match negotiated.as_deref() {
+            Some(crate::oauth::MODERN_PROTOCOL_VERSION) => {}
+            other => {
+                return Err(ProtocolError::Protocol(format!(
+                    "subscriptions/listen requires a 2026-07-28-era connection (negotiated: {}). \
+                     On a 2025-era connection, change notifications are delivered unsolicited.",
+                    other.unwrap_or("none")
+                )));
+            }
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(ProtocolError::Closed);
+        }
+
+        let listen_id = format!(
+            "listen:{}",
+            self.next_listen_id.fetch_add(1, Ordering::SeqCst)
+        );
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, _closed_rx) = tokio::sync::oneshot::channel();
+        self.listen_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                listen_id.clone(),
+                ListenEntry {
+                    ack: Some(ack_tx),
+                    closed: Some(closed_tx),
+                },
+            );
+
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": listen_id,
+            "method": "subscriptions/listen",
+            "params": { "notifications": filter },
+        });
+        if let Err(error) = self.transport.send(request).await {
+            self.listen_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&listen_id);
+            return Err(error);
+        }
+
+        // Ack phase bounded by the caller's timeout (SDK
+        // DEFAULT_REQUEST_TIMEOUT_MSEC); a timeout tears the request down.
+        match tokio::time::timeout(timeout, ack_rx).await {
+            Ok(Ok(Ok(_honored))) => Ok(ListenHandle {
+                client: self.clone(),
+                id: listen_id,
+            }),
+            Ok(Ok(Err(error))) => {
+                self.listen_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&listen_id);
+                Err(error)
+            }
+            Ok(Err(_dropped)) => {
+                self.listen_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&listen_id);
+                Err(ProtocolError::Closed)
+            }
+            Err(_elapsed) => {
+                self.listen_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&listen_id);
+                let cancelled = json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/cancelled",
+                    "params": { "requestId": listen_id, "reason": "Listen ack timed out" },
+                });
+                let _ = self.transport.send(cancelled).await;
+                Err(ProtocolError::Timeout)
+            }
+        }
+    }
+
+    /// `fetchAllPrompts` for the list-changed refresh (public seam).
+    pub async fn fetch_all_prompts_shared(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Vec<Value>, bool), ProtocolError> {
+        self.fetch_all_prompts(timeout).await
+    }
+
+    /// `fetchAllResources` for the list-changed refresh (public seam).
+    pub async fn fetch_all_resources_shared(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, ProtocolError> {
+        self.fetch_all_resources(timeout).await
     }
 
     /// `client.onclose` (server-manager.ts:453-457).

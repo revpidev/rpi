@@ -293,7 +293,12 @@ pub fn create_mcp_status_snapshot(
             if rc.is_some() {
                 rc
             } else if connected {
-                Some(connection.as_ref().map(|c| c.resources.len()).unwrap_or(0))
+                Some(
+                    connection
+                        .as_ref()
+                        .map(|c| c.resources_snapshot().len())
+                        .unwrap_or(0),
+                )
             } else {
                 None
             }

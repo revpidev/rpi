@@ -1432,7 +1432,7 @@ fn reconnect_server(
                 let text = format!(
                     "MCP: Reconnected to {name} ({} tools, {} resources)",
                     connection.tools_len(),
-                    connection.resources.len()
+                    connection.resources_snapshot().len()
                 );
                 host.notify(&text, "info");
                 text

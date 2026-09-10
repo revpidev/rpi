@@ -100,8 +100,8 @@ async fn stdio_full_flow_frame_sequence_and_calls() {
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
     assert_eq!(tool_names, ["echo", "fail"]);
-    assert_eq!(connection.resources.len(), 1);
-    assert_eq!(connection.prompts.len(), 1);
+    assert_eq!(connection.resources_snapshot().len(), 1);
+    assert_eq!(connection.prompts_snapshot().len(), 1);
 
     let client = connection.client.clone().expect("client");
     let result = client
@@ -1232,5 +1232,148 @@ async fn te24_ensure_converged_single_flight_and_stdio_skip() {
     lifecycle.graceful_shutdown().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!pid_alive(&pid), "fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
+// TE24 R7.2.8.4: catalog listen (#468)
+// ============================================================================
+
+#[tokio::test]
+async fn te24_catalog_listen_opens_and_list_changed_refreshes() {
+    use std::sync::Mutex as StdMutex;
+
+    let dir = temp_dir("te24-listen");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    // Modern era + listChanged capabilities + a proactive
+    // notifications/tools/list_changed after `initialized`.
+    let entry = te24_entry(
+        &log,
+        &pid,
+        &[
+            ("RPI_MCP_FIXTURE_MODERN_2026", "1"),
+            ("RPI_MCP_FIXTURE_NOTIFY_TOOLS_CHANGED_DELAY_MS", "500"),
+        ],
+    );
+    // The 2026-07-28 era needs the pinned/auto negotiation mode.
+    let mut map = entry.as_map().clone();
+    map.insert("protocolVersion".to_string(), json!("2026-07-28"));
+    let entry = ServerEntry(map);
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let events: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    manager.set_metadata_list_changed_listener(Arc::new(move |name, reason| {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((name.to_string(), reason.to_string()));
+    }));
+
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+    assert_eq!(connection.tools_len(), 2);
+
+    // (a) The catalog listen opened: the fixture saw subscriptions/listen.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frames = std::fs::read_to_string(&log).unwrap_or_default();
+        if frames.contains("subscriptions/listen") || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let frames = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        frames
+            .lines()
+            .any(|line| line.trim() == "subscriptions/listen"),
+        "modern connection opened a catalog listen: {frames}"
+    );
+
+    // (b) The proactive notifications/tools/list_changed drove the
+    // era-transparent refresh: the metadata listener fired with the
+    // upstream reason string.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let fired = events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(name, reason)| name == "fixture" && reason == "tools-list-changed");
+        if fired || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let recorded = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        recorded
+            .iter()
+            .any(|(name, reason)| name == "fixture" && reason == "tools-list-changed"),
+        "list_changed refresh fired the metadata listener: {recorded:?}"
+    );
+
+    manager.close_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "listen fixture child reaped (G4)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn te24_legacy_connection_skips_listen_and_still_refreshes() {
+    use std::sync::Mutex as StdMutex;
+
+    // 2025-era: no subscriptions/listen on the wire, but the UNSOLICITED
+    // notifications/tools/list_changed still refreshes (era-transparent).
+    let dir = temp_dir("te24-legacy-notify");
+    let log = dir.join("frames.log");
+    let pid = dir.join("server.pid");
+    let entry = te24_entry(
+        &log,
+        &pid,
+        &[("RPI_MCP_FIXTURE_NOTIFY_TOOLS_CHANGED_DELAY_MS", "500")],
+    );
+
+    let manager = McpServerManager::new(Some(dir.to_string_lossy().into_owned()));
+    let events: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    manager.set_metadata_list_changed_listener(Arc::new(move |name, reason| {
+        sink.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((name.to_string(), reason.to_string()));
+    }));
+    let connection = manager.connect("fixture", &entry).await.expect("connect");
+    assert_eq!(connection.tools_len(), 2);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let fired = events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(name, reason)| name == "fixture" && reason == "tools-list-changed");
+        if fired || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let frames = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !frames
+            .lines()
+            .any(|line| line.trim() == "subscriptions/listen"),
+        "legacy connection never sends subscriptions/listen: {frames}"
+    );
+    let recorded = events.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(
+        recorded
+            .iter()
+            .any(|(name, reason)| name == "fixture" && reason == "tools-list-changed"),
+        "unsolicited list_changed still refreshes: {recorded:?}"
+    );
+
+    manager.close_all().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pid_alive(&pid), "legacy fixture child reaped (G4)");
     let _ = std::fs::remove_dir_all(&dir);
 }

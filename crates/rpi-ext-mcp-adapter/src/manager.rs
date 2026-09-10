@@ -11,7 +11,7 @@
 //! transport initializes through the `protocolVersion` mode of the server
 //! entry (TE-D12).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -52,8 +52,9 @@ pub struct ServerConnection {
     /// Authoritative tool catalog; swappable in place by the keep-alive
     /// refresh (`refreshTools` swaps under this lock; readers snapshot).
     pub tools: Mutex<Vec<Value>>,
-    pub resources: Vec<Value>,
-    pub prompts: Vec<Value>,
+    /// Refresh-swappable catalog halves (list-changed #468); readers snapshot.
+    pub resources: Mutex<Vec<Value>>,
+    pub prompts: Mutex<Vec<Value>>,
     pub prompt_discovery_failed: bool,
     pub instructions: Option<String>,
     pub last_used_at: AtomicU64,
@@ -80,9 +81,35 @@ impl ServerConnection {
         self.tools.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Swap the catalog after a keep-alive refresh detected a change.
+    /// Snapshot of the resource catalog.
+    pub fn resources_snapshot(&self) -> Vec<Value> {
+        self.resources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Snapshot of the prompt catalog.
+    pub fn prompts_snapshot(&self) -> Vec<Value> {
+        self.prompts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Swap the catalog after a keep-alive/list-changed refresh.
     fn set_tools(&self, tools: Vec<Value>) {
         *self.tools.lock().unwrap_or_else(|e| e.into_inner()) = tools;
+    }
+
+    /// Swap the prompt catalog (`promptDiscoveryFailed` resets).
+    fn set_prompts(&self, prompts: Vec<Value>) {
+        *self.prompts.lock().unwrap_or_else(|e| e.into_inner()) = prompts;
+    }
+
+    /// Swap the resource catalog.
+    fn set_resources(&self, resources: Vec<Value>) {
+        *self.resources.lock().unwrap_or_else(|e| e.into_inner()) = resources;
     }
 
     pub fn touch(&self) {
@@ -146,6 +173,13 @@ pub struct McpServerManager {
     runtime_cancel: Mutex<CancellationToken>,
     stopped: AtomicBool,
     metadata_list_changed_listener: Mutex<Option<MetadataListChangedListener>>,
+    /// Servers with a live catalog `subscriptions/listen` (R7.2.8.4/#468);
+    /// cleared on close so a reconnect re-opens.
+    listen_open: Mutex<HashSet<String>>,
+    /// Weak self for client callbacks registered BEFORE the handshake (the
+    /// notification handler must be live when `notifications/initialized`
+    /// lands — the fixture-style proactive list_changed fires right after).
+    self_weak: Mutex<Option<std::sync::Weak<McpServerManager>>>,
     /// Test hook: credential store used by the HTTP connect path
     /// (production builds the OS-keyring store per attempt). Integration
     /// tests inject a `MemorySecretStore`-backed store to assert the
@@ -155,7 +189,7 @@ pub struct McpServerManager {
 
 impl McpServerManager {
     pub fn new(default_cwd: Option<String>) -> Arc<Self> {
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             connections: Mutex::new(HashMap::new()),
             connect_promises: Mutex::new(HashMap::new()),
             default_cwd,
@@ -163,8 +197,21 @@ impl McpServerManager {
             runtime_cancel: Mutex::new(CancellationToken::new()),
             stopped: AtomicBool::new(false),
             metadata_list_changed_listener: Mutex::new(None),
+            listen_open: Mutex::new(HashSet::new()),
+            self_weak: Mutex::new(None),
             auth_store_override: Mutex::new(None),
-        })
+        });
+        *manager.self_weak.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&manager));
+        manager
+    }
+
+    fn self_weak(&self) -> std::sync::Weak<McpServerManager> {
+        self.self_weak
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
     }
 
     /// `setMetadataListChangedListener` (server-manager.ts:231-233 @
@@ -331,11 +378,214 @@ impl McpServerManager {
                 }
             }));
         }
+        // Publish BEFORE opening the catalog listen (R7.2.8.4/#468): the
+        // notification handler went live pre-handshake, so an eager
+        // list_changed that lands while the listen opens must find the
+        // connection in the map to refresh against.
         self.connections
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(name.to_string(), connection.clone());
+        if let Some(client) = &connection.client {
+            self.ensure_catalog_listen(name, &connection, client).await;
+        }
         Ok(connection)
+    }
+
+    /// `listChanged` handlers (server-manager.ts:1041-1145 @ 10a45367): a
+    /// `notifications/*_list_changed` refreshes that catalog under the
+    /// connection identity and fires the metadata listener with the
+    /// upstream reason strings.
+    fn wire_client_notifications(&self, name: &str, client: &Arc<McpClient>) {
+        let manager = self.self_weak();
+        let name = name.to_string();
+        client.on_notification(Arc::new(move |message| {
+            let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+            let Some(manager) = manager.upgrade() else {
+                return;
+            };
+            let (kind, refresh) = match method {
+                "notifications/tools/list_changed" => ("tools-list-changed", true),
+                "notifications/prompts/list_changed" => ("prompts-list-changed", true),
+                "notifications/resources/list_changed" => ("resources-list-changed", true),
+                // Resource bodies changed: the read cache faces eviction in
+                // a future batch (prepareResourceUse); a debug trace keeps
+                // the channel observable without re-listing.
+                "notifications/resources/updated" => {
+                    tracing::debug!(
+                        server = %name,
+                        "MCP: notifications/resources/updated received"
+                    );
+                    return;
+                }
+                _ => return,
+            };
+            if !refresh {
+                return;
+            }
+            let name = name.clone();
+            manager.runtime_spawn(name.clone(), kind.to_string());
+        }));
+    }
+
+    /// Spawn the catalog refresh for one list-changed notification (the
+    /// notification handler is sync; the refresh re-fetches through the
+    /// manager's own seams).
+    fn runtime_spawn(self: &Arc<Self>, name: String, reason: String) {
+        let manager = self.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                manager.refresh_after_list_changed(&name, &reason).await;
+            });
+        }
+    }
+
+    /// The refresh half of `handleToolsListChanged` etc.: re-fetch the
+    /// changed catalog under the CURRENT connection identity, swap, fire.
+    async fn refresh_after_list_changed(self: &Arc<Self>, name: &str, reason: &str) {
+        let Some(connection) = self.get_connection(name) else {
+            return;
+        };
+        if connection.status() != ConnectionStatus::Connected {
+            return;
+        }
+        let Some(client) = connection.client.clone() else {
+            return;
+        };
+        let timeout = self.request_timeout(&connection.definition);
+        match reason {
+            "tools-list-changed" => {
+                match client.fetch_all_tools_shared(timeout).await {
+                    Ok((tools, _hints)) => {
+                        // Unconditional swap + fire (handleToolsListChanged
+                        // :1089-1108 — no deep-equal short-circuit).
+                        connection.set_tools(tools);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            server = %name,
+                            %error,
+                            "MCP: tools/list_changed refresh failed"
+                        );
+                        return;
+                    }
+                }
+            }
+            "prompts-list-changed" => match client.fetch_all_prompts_shared(timeout).await {
+                Ok((prompts, failed)) => {
+                    if failed {
+                        return;
+                    }
+                    connection.set_prompts(prompts);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        server = %name,
+                        %error,
+                        "MCP: prompts/list_changed refresh failed"
+                    );
+                    return;
+                }
+            },
+            "resources-list-changed" => match client.fetch_all_resources_shared(timeout).await {
+                Ok(resources) => connection.set_resources(resources),
+                Err(error) => {
+                    tracing::debug!(
+                        server = %name,
+                        %error,
+                        "MCP: resources/list_changed refresh failed"
+                    );
+                    return;
+                }
+            },
+            _ => return,
+        }
+        // Identity guard after the awaits (a replacement connection won).
+        let still_current = self
+            .get_connection(name)
+            .is_some_and(|current| Arc::ptr_eq(&current, &connection));
+        if !still_current {
+            return;
+        }
+        self.fire_metadata_list_changed(name, reason);
+    }
+
+    /// `ensureListen` (server-manager.ts:570-616 @ 10a45367, catalog leg):
+    /// on a MODERN connection with advertised listChanged capabilities,
+    /// open `subscriptions/listen` with the catalog filter once per server.
+    /// Failures stay quiet (legacy servers reject; the unsolicited channel
+    /// covers the 2025 era).
+    pub async fn ensure_catalog_listen(
+        self: &Arc<Self>,
+        name: &str,
+        connection: &Arc<ServerConnection>,
+        client: &Arc<McpClient>,
+    ) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if connection.status() != ConnectionStatus::Connected {
+            return;
+        }
+        // `catalogListenFilter` (server-manager.ts:511-516).
+        let capabilities = client.server_capabilities();
+        let Some(capabilities) = capabilities.as_ref() else {
+            return;
+        };
+        let mut filter = serde_json::Map::new();
+        if capabilities
+            .pointer("/tools/listChanged")
+            .is_some_and(|v| v == &Value::Bool(true))
+        {
+            filter.insert("toolsListChanged".to_string(), Value::Bool(true));
+        }
+        if capabilities
+            .pointer("/prompts/listChanged")
+            .is_some_and(|v| v == &Value::Bool(true))
+        {
+            filter.insert("promptsListChanged".to_string(), Value::Bool(true));
+        }
+        if capabilities
+            .pointer("/resources/listChanged")
+            .is_some_and(|v| v == &Value::Bool(true))
+        {
+            filter.insert("resourcesListChanged".to_string(), Value::Bool(true));
+        }
+        if filter.is_empty() {
+            return;
+        }
+        {
+            let mut open = self.listen_open.lock().unwrap_or_else(|e| e.into_inner());
+            if open.contains(name) {
+                return;
+            }
+            open.insert(name.to_string());
+        }
+        // The listen handle lives for the connection's lifetime; closing
+        // the server drops it (the child/process teardown ends the stream).
+        // Errors clear the marker so a later pass retries.
+        let timeout = self
+            .request_timeout(&connection.definition)
+            .min(crate::manager::KEEP_ALIVE_REFRESH_TIMEOUT_MS.max(Duration::from_secs(60)));
+        match client.open_listen(Value::Object(filter), timeout).await {
+            Ok(_handle) => {
+                tracing::debug!(server = %name, "MCP: catalog listen opened");
+                // Intentionally leaked per connection: the handle's close
+                // fires from close()/shutdown teardown.
+                std::mem::forget(_handle);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    server = %name,
+                    %error,
+                    "MCP: catalog listen not opened (legacy-era or rejected)"
+                );
+                self.listen_open
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
+            }
+        }
     }
 
     /// `reconnect` (server-manager.ts:281-326): identity-guarded — only tear
@@ -507,6 +757,10 @@ impl McpServerManager {
                 connect_stdio(definition, self.default_cwd.as_deref()).await?;
             let stderr_tail = transport.child().stderr_tail.clone();
             let client = McpClient::new(Arc::new(transport), incoming);
+            // R7.2.8.4: the notification handler must be live BEFORE the
+            // handshake (a server may push list_changed right after
+            // `initialized`).
+            self.wire_client_notifications(name, &client);
             let mode =
                 crate::protocol::parse_protocol_version_mode(definition.get("protocolVersion"));
             match client
@@ -620,6 +874,8 @@ impl McpServerManager {
     ) -> Result<ServerConnection, ProtocolError> {
         let (transport, incoming) = StreamableHttpTransport::new(config);
         let client = McpClient::new(transport, incoming);
+        // R7.2.8.4: live before the handshake (see the stdio branch note).
+        self.wire_client_notifications(name, &client);
         let mode = crate::protocol::parse_protocol_version_mode(definition.get("protocolVersion"));
         match client
             .initialize_with_version(name, request_timeout, mode)
@@ -642,6 +898,8 @@ impl McpServerManager {
     ) -> Result<ServerConnection, ProtocolError> {
         let (transport, incoming) = LegacySseTransport::connect(config).await?;
         let client = McpClient::new(transport, incoming);
+        // R7.2.8.4: live before the handshake (see the stdio branch note).
+        self.wire_client_notifications(name, &client);
         let mode = crate::protocol::parse_protocol_version_mode(definition.get("protocolVersion"));
         match client
             .initialize_with_version(name, request_timeout, mode)
@@ -658,6 +916,10 @@ impl McpServerManager {
     /// `close` (server-manager.ts:974-1006): mark closed, remove from the
     /// table first so a late close can never clobber a fresh connection.
     pub async fn close(&self, name: &str) {
+        self.listen_open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
         let connection = self
             .connections
             .lock()
@@ -792,8 +1054,8 @@ fn build_connection(
         client: Some(client),
         definition: definition.clone(),
         tools: Mutex::new(metadata.tools),
-        resources: metadata.resources,
-        prompts: metadata.prompts,
+        resources: Mutex::new(metadata.resources),
+        prompts: Mutex::new(metadata.prompts),
         prompt_discovery_failed: metadata.prompt_discovery_failed,
         last_used_at: AtomicU64::new(now_ms()),
         in_flight: AtomicUsize::new(0),
@@ -809,8 +1071,8 @@ fn needs_auth_connection(definition: &ServerEntry) -> ServerConnection {
         client: None,
         definition: definition.clone(),
         tools: Mutex::new(Vec::new()),
-        resources: Vec::new(),
-        prompts: Vec::new(),
+        resources: Mutex::new(Vec::new()),
+        prompts: Mutex::new(Vec::new()),
         prompt_discovery_failed: false,
         instructions: None,
         last_used_at: AtomicU64::new(now_ms()),

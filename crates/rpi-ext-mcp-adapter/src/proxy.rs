@@ -554,7 +554,7 @@ pub fn update_server_metadata(state: &McpRuntime, server_name: &str) {
     }
     let prefix = state.config.global_tool_prefix();
     let tools = wire_tools(&connection.tools_snapshot());
-    let resources = wire_resources(&connection.resources);
+    let resources = wire_resources(&connection.resources_snapshot());
     let result = {
         let known_metadata = state
             .tool_metadata
@@ -579,11 +579,14 @@ pub fn update_server_metadata(state: &McpRuntime, server_name: &str) {
         .resource_counts
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(server_name.to_string(), connection.resources.len());
+        .insert(
+            server_name.to_string(),
+            connection.resources_snapshot().len(),
+        );
     if !connection.prompt_discovery_failed {
         let prompts = crate::cache::reconstruct_prompt_metadata(
             server_name,
-            &prompt_values_to_cached(&connection.prompts),
+            &prompt_values_to_cached(&connection.prompts_snapshot()),
             prefix,
             Some(definition),
         );
@@ -650,7 +653,7 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
 
     let tools = serialize_tools(&wire_tools(&connection.tools_snapshot()));
     let mut resources = if definition.exposes_resources() {
-        serialize_resources(&wire_resources(&connection.resources))
+        serialize_resources(&wire_resources(&connection.resources_snapshot()))
     } else {
         Vec::new()
     };
@@ -661,7 +664,7 @@ pub fn update_metadata_cache(state: &McpRuntime, server_name: &str) {
             None
         }
     } else {
-        Some(prompt_values_to_cached(&connection.prompts))
+        Some(prompt_values_to_cached(&connection.prompts_snapshot()))
     };
     if definition.exposes_resources()
         && resources.is_empty()
