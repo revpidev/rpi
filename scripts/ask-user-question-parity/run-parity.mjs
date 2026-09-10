@@ -247,7 +247,9 @@ function compareGoldenFrames(report) {
 		return false;
 	}
 	const committed = readdirSync(GOLDEN_DIR).filter((file) => file.endsWith(".jsonl")).sort();
-	const lines = [];
+	const lines = [
+		"- baseline: self-baseline (fresh Rust frames vs the committed `golden-frames/*.jsonl`; no upstream renderer exists)",
+	];
 	let allMatch = true;
 	for (const file of committed) {
 		const expected = readFileSync(resolve(GOLDEN_DIR, file), "utf-8").trimEnd();

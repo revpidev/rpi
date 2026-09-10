@@ -17,6 +17,9 @@
 use std::collections::BTreeSet;
 
 use rpi_ext_ask_user_question::golden;
+use rpi_ext_host::interactive_ui::{
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_FRAME_ROWS, DEFAULT_MAX_LINE_BYTES,
+};
 
 fn golden_dir() -> String {
     format!(
@@ -75,4 +78,52 @@ fn golden_frames_match_committed_baseline() {
 #[test]
 fn golden_frames_are_stable_across_runs() {
     assert_eq!(golden::renders(), golden::renders());
+}
+
+/// G11 限额面：the dialog frames never approach the host limits, so the
+/// component path can never trip `frameTooLarge` (R-U3.5; the limits and the
+/// rejection matrix themselves are host-side, V14-21).
+#[test]
+fn golden_frames_stay_below_the_abi_frame_limits() {
+    for render in golden::renders() {
+        for frame in &render.frames {
+            assert!(
+                frame.lines.len() <= DEFAULT_MAX_FRAME_ROWS,
+                "{}: rows {} > {}",
+                render.file,
+                frame.lines.len(),
+                DEFAULT_MAX_FRAME_ROWS
+            );
+            for line in &frame.lines {
+                assert!(
+                    line.len() <= DEFAULT_MAX_LINE_BYTES,
+                    "{}: line bytes {} > {}",
+                    render.file,
+                    line.len(),
+                    DEFAULT_MAX_LINE_BYTES
+                );
+            }
+            let bytes = serde_json::to_vec(&golden::frame_json(frame)).expect("frame json");
+            assert!(
+                bytes.len() < DEFAULT_MAX_FRAME_BYTES,
+                "{}: frame bytes {} >= {}",
+                render.file,
+                bytes.len(),
+                DEFAULT_MAX_FRAME_BYTES
+            );
+        }
+    }
+    // Structural margin sanity: the largest fixture frame is a few hundred
+    // bytes, three orders of magnitude below the 1 MiB budget.
+    let max_bytes = golden::renders()
+        .iter()
+        .flat_map(|render| render.frames.iter())
+        .map(|frame| {
+            serde_json::to_vec(&golden::frame_json(frame))
+                .expect("frame json")
+                .len()
+        })
+        .max()
+        .expect("frames");
+    assert!(max_bytes < 100 * 1024, "largest frame: {max_bytes} bytes");
 }
