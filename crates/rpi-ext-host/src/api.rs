@@ -27,8 +27,8 @@ use serde_json::Value;
 
 use crate::error::ExtError;
 use crate::interactive_ui::{
-    ComponentEvent, ComponentFrame, ComponentHandle, InteractiveUiError, InteractiveUiErrorKind,
-    MountOptions,
+    ComponentEvent, ComponentFrame, ComponentHandle, DisposeReason, InteractiveUiError,
+    InteractiveUiErrorKind, MountOptions,
 };
 use crate::types::{
     ArgumentCompletionsFn, CommandHandlerFn, ComponentTree, EntryRenderFn, ExtSourceInfo,
@@ -898,6 +898,22 @@ pub trait UiBridge: Send + Sync {
         _language: Option<&str>,
     ) -> Result<Option<String>, InteractiveUiError> {
         Err(interactive_ui_unsupported("ui.editExternal"))
+    }
+
+    /// Carrier-failure cleanup (V14-22 C2; R-U6.2): a guest died mid-component
+    /// (wasm fuel exhaustion / trap), so the host force-unmounts whatever the
+    /// owner has mounted without waiting for a protocol call the dead guest
+    /// can no longer make. Returns the unmounted handle when one was active.
+    ///
+    /// This is a **host-internal** seam (not a wire method): the wasm carrier
+    /// invokes it from the guest thread when `rpi_dispatch` traps. Bridges
+    /// without interactive components keep the no-op default.
+    fn abort_active_component(
+        &self,
+        _owner: &str,
+        _reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        None
     }
 
     /// Identity of the no-op bridge: upstream computes

@@ -27,4 +27,7 @@ pub mod runner;
 pub mod types;
 pub mod wasm;
 
+#[cfg(test)]
+mod test_bridge;
+
 pub use error::ExtError;

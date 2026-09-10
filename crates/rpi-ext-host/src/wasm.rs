@@ -26,6 +26,7 @@ pub mod ui_dispatch;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use wasmtime::AsContextMut;
 
 use crate::api::ExtensionApi;
 
@@ -505,6 +506,10 @@ pub async fn instantiate_and_init(
                 }
             };
             let response = handle_host_call(caller.data_mut(), &bytes);
+            // V14-22 C2 (R-U7.2): every host call re-enters the guest with a
+            // fresh fuel budget, so "每次 host-call 一次 fuel 预算" is per
+            // host-call segment rather than cumulative across a dispatch.
+            let _ = caller.as_context_mut().set_fuel(CALL_FUEL);
             pack_response(&mut caller, response)
         };
         if let Err(error) = linker.func_wrap("rpi", "rpi_host_call", host_call) {
@@ -554,7 +559,7 @@ pub async fn instantiate_and_init(
                     let _ = store.set_fuel(CALL_FUEL);
                     let result = init
                         .call(&mut store, ())
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| format_wasm_error(&e))
                         .and_then(|packed| read_packed(&mut store, &instance, packed));
                     let _ = respond.send(result);
                 }
@@ -569,10 +574,24 @@ pub async fn instantiate_and_init(
                         .and_then(|(ptr, len)| {
                             dispatch
                                 .call(&mut store, (ptr, len))
-                                .map_err(|e| e.to_string())
+                                .map_err(|e| format_wasm_error(&e))
                         })
                         .and_then(|packed| read_packed(&mut store, &instance, packed));
                     store.data().in_command.set(false);
+                    // V14-22 C2 (R-U6.2): a guest that burns its fuel or
+                    // traps mid-dispatch is dead — force-unmount its active
+                    // interactive component (it can never dispose it) and
+                    // surface the structured guest-error kind.
+                    let result = match result {
+                        Err(message) => match classify_guest_failure(&message) {
+                            Some(kind) => {
+                                abort_component_after_guest_failure(store.data(), kind);
+                                Err(format!("{kind}: {message}"))
+                            }
+                            None => Err(message),
+                        },
+                        ok => ok,
+                    };
                     let _ = respond.send(result);
                 }
                 GuestCommand::Shutdown => break,
@@ -615,6 +634,56 @@ pub async fn instantiate_and_init(
         return Err(format!("{kind}: {message}"));
     }
     Ok(guest)
+}
+
+/// Classify a wasm dispatch failure into the R-U6.2 guest-error kinds
+/// (V14-22 C2): fuel exhaustion is its own kind, every other wasm trap is a
+/// `handlerError`. Non-trap failures (missing export, bad JSON, dropped
+/// response) stay unclassified and keep their plain message.
+fn classify_guest_failure(message: &str) -> Option<&'static str> {
+    if message.contains("fuel") {
+        Some("fuelExhausted")
+    } else if message.contains("wasm trap") {
+        Some("handlerError")
+    } else {
+        None
+    }
+}
+
+/// Render a wasmtime call error with its full cause chain. The top-level
+/// `Display` is only the backtrace context ("error while executing at wasm
+/// backtrace"); the trap reason — "all fuel consumed by WebAssembly",
+/// "wasm trap: ..." — lives in the cause chain, which
+/// [`classify_guest_failure`] needs.
+fn format_wasm_error(error: &wasmtime::Error) -> String {
+    let mut parts = Vec::new();
+    for cause in error.chain() {
+        parts.push(cause.to_string());
+    }
+    parts.join(": ")
+}
+
+/// Force-unmount the owner's interactive component after a carrier-level
+/// guest failure (V14-22 C2; R-U6.2). Reached through the same
+/// `ExtensionContext` the guest used, so the namespaced bridge stamps the
+/// owner consistently. Runs on the guest thread; failures are ignored — the
+/// caller is already on the error path.
+fn abort_component_after_guest_failure(state: &HostState, kind: &str) {
+    let Ok(ui) = state.api.context().ui() else {
+        return;
+    };
+    let owner = state.api.extension().path.clone();
+    if let Some(handle) =
+        ui.abort_active_component(&owner, crate::interactive_ui::DisposeReason::ToolAbort)
+    {
+        tracing::info!(
+            target: "rpi::ext_ui",
+            owner = %owner,
+            handle = handle.0,
+            kind,
+            "carrier failure: force-unmounted interactive component"
+        );
+    }
 }
 
 /// Allocate + write guest memory via its `rpi_alloc`.
@@ -698,4 +767,136 @@ fn pack_response(caller: &mut wasmtime::Caller<'_, HostState>, bytes: Vec<u8>) -
         return 0;
     }
     ((ptr as u64) << 32) | (len as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::api::{ExtensionApi, LoadedExtension};
+    use crate::interactive_ui::DisposeReason;
+    use crate::test_bridge::TestUiBridge;
+    use crate::types::ExtensionMode;
+
+    /// Minimal ABI v1 guest skeleton: `rpi_extension_init` returns
+    /// `{"ok":true}` without host calls; `rpi_dispatch` body is replaced by
+    /// each fixture below.
+    fn guest_wat(dispatch_body: &str) -> String {
+        format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (global $heap (mut i32) (i32.const 4096))
+  (func (export "rpi_alloc") (param $len i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+    (local.get $ptr))
+  (func (export "rpi_dealloc") (param i32 i32) nop)
+  (func $strlen (param $ptr i32) (result i32)
+    (local $n i32)
+    (block $done
+      (loop $scan
+        (br_if $done (i32.eqz (i32.load8_u (i32.add (local.get $ptr) (local.get $n)))))
+        (local.set $n (i32.add (local.get $n) (i32.const 1)))
+        (br $scan)))
+    (local.get $n))
+  (func $pack (param $ptr i32) (result i64)
+    (i64.or
+      (i64.shl (i64.extend_i32_u (local.get $ptr)) (i64.const 32))
+      (i64.extend_i32_u (call $strlen (local.get $ptr)))))
+  (func (export "rpi_extension_init") (result i64)
+    (call $pack (i32.const 16)))
+  (func (export "rpi_dispatch") (param i32 i32) (result i64)
+    {dispatch_body})
+  (data (i32.const 16) "{{\"ok\":true}}\00")
+)
+"#
+        )
+    }
+
+    async fn guest(wat: &str, path: &str) -> (WasmGuest, Arc<TestUiBridge>) {
+        let runtime = crate::api::ExtensionRuntime::new();
+        let bridge = Arc::new(TestUiBridge::new());
+        runtime.set_ui_bridge(
+            Some(Arc::clone(&bridge) as Arc<dyn crate::api::UiBridge>),
+            ExtensionMode::Tui,
+        );
+        let extension = Arc::new(LoadedExtension::new(path, path));
+        let api = ExtensionApi::for_extension(extension, runtime, "/wasm-c2-cwd");
+        let module = compile_module(wat.as_bytes()).expect("compile fixture");
+        let guest = instantiate_and_init(&module, api, HashSet::from([Capability::Ui]))
+            .await
+            .expect("guest init");
+        (guest, bridge)
+    }
+
+    /// V14-22 FR-A/FR-G (R-U6.2 / R-U7.2): fuel exhaustion inside a wasm
+    /// dispatch surfaces as the structured `fuelExhausted` kind and
+    /// force-unmounts the extension's interactive component (the dead guest
+    /// can never dispose it), without crashing the host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_fuel_exhaustion_reports_kind_and_aborts_component() {
+        let (guest, bridge) = guest(
+            &guest_wat("(loop $l (br $l)) (unreachable)"),
+            "wasm-fuel-fixture",
+        )
+        .await;
+        let error = guest
+            .forward()
+            .dispatch(
+                json!({"kind": "toolExecute", "toolName": "fixture", "toolCallId": "1"}),
+                false,
+            )
+            .await
+            .expect_err("fuel trap");
+        assert!(error.starts_with("fuelExhausted: "), "{error}");
+        assert_eq!(
+            bridge.aborts(),
+            vec![("wasm-fuel-fixture".to_owned(), DisposeReason::ToolAbort)]
+        );
+    }
+
+    /// V14-22 FR-A/FR-G (R-U6.2): any other wasm trap is classified
+    /// `handlerError` and also force-unmounts before the error reaches the
+    /// tool caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_trap_reports_handler_error_and_aborts_component() {
+        let (guest, bridge) = guest(&guest_wat("unreachable"), "wasm-trap-fixture").await;
+        let error = guest
+            .forward()
+            .dispatch(
+                json!({"kind": "toolExecute", "toolName": "fixture", "toolCallId": "1"}),
+                false,
+            )
+            .await
+            .expect_err("trap");
+        assert!(error.starts_with("handlerError: "), "{error}");
+        assert!(error.contains("wasm trap"), "{error}");
+        assert_eq!(
+            bridge.aborts(),
+            vec![("wasm-trap-fixture".to_owned(), DisposeReason::ToolAbort)]
+        );
+    }
+
+    /// Negative control: a well-behaved dispatch neither aborts nor gets a
+    /// structured kind prefix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wasm_successful_dispatch_does_not_abort() {
+        let (guest, bridge) =
+            guest(&guest_wat("(call $pack (i32.const 16))"), "wasm-ok-fixture").await;
+        let value = guest
+            .forward()
+            .dispatch(
+                json!({"kind": "toolExecute", "toolName": "fixture", "toolCallId": "1"}),
+                false,
+            )
+            .await
+            .expect("dispatch");
+        assert_eq!(value, json!({"ok": true}));
+        assert!(bridge.aborts().is_empty());
+    }
 }

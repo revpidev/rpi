@@ -5,12 +5,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "interactive-ui-parity"
+path = "src/bin/interactive_ui_parity.rs"
+
 [dependencies]
 rpi-ai.workspace = true
 rpi-agent.workspace = true
+# V14-22 dual-carrier parity harness: scripted UiBridge + the host loaders
+# that drive the native/wasm fixture guests.
+rpi-ext-host.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 tokio-util.workspace = true
 futures.workspace = true
 async-trait.workspace = true

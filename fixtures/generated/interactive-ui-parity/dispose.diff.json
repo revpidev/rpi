@@ -1,0 +1,59 @@
+{
+  "scenario": "dispose",
+  "matched": true,
+  "documentedConstraint": "mountOptions.maxFrameBytes: wasm carrier caps the frame budget at 512 KiB (design §4.4)",
+  "native": {
+    "frames": [
+      {
+        "lines": [
+          "\u001b[1mev=1\u001b[0m in=0 tick=0 wake=0",
+          "\u001b[36mlast=-\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      },
+      {
+        "lines": [
+          "\u001b[1mev=2\u001b[0m in=1 tick=0 wake=0",
+          "\u001b[36mlast=a\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      },
+      {
+        "lines": [
+          "\u001b[1mev=3\u001b[0m in=1 tick=0 wake=0",
+          "\u001b[36mlast=a\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      }
+    ],
+    "terminal": null,
+    "scriptExhausted": false
+  },
+  "wasm": {
+    "frames": [
+      {
+        "lines": [
+          "\u001b[1mev=1\u001b[0m in=0 tick=0 wake=0",
+          "\u001b[36mlast=-\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      },
+      {
+        "lines": [
+          "\u001b[1mev=2\u001b[0m in=1 tick=0 wake=0",
+          "\u001b[36mlast=a\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      },
+      {
+        "lines": [
+          "\u001b[1mev=3\u001b[0m in=1 tick=0 wake=0",
+          "\u001b[36mlast=a\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+          "wide 漢字 tail"
+        ]
+      }
+    ],
+    "terminal": null,
+    "scriptExhausted": false
+  }
+}

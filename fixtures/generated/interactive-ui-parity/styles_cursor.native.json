@@ -1,0 +1,107 @@
+{
+  "scenario": "styles_cursor",
+  "carrier": "native",
+  "mountOptions": {
+    "overlay": true,
+    "tickMs": 250,
+    "keysWhenHidden": [
+      "ctrl+g"
+    ],
+    "cursor": true,
+    "maxFrameBytes": 1048576,
+    "label": "parity"
+  },
+  "frames": [
+    {
+      "lines": [
+        "\u001b[1mev=1\u001b[0m in=0 tick=0 wake=0",
+        "\u001b[36mlast=-\u001b[0m w=100 h=30 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ]
+    },
+    {
+      "lines": [
+        "\u001b[1mev=2\u001b[0m in=1 tick=0 wake=0",
+        "\u001b[36mlast=c\u001b[0m w=100 h=30 hidden=false focus=false theme=",
+        "cur\u001b_pi:c\u0007sor"
+      ],
+      "cursor": {
+        "row": 2,
+        "col": 1
+      }
+    },
+    {
+      "lines": [
+        "\u001b[1mev=3\u001b[0m in=1 tick=1 wake=0",
+        "\u001b[36mlast=c\u001b[0m w=100 h=30 hidden=false focus=false theme=",
+        "cur\u001b_pi:c\u0007sor"
+      ],
+      "cursor": {
+        "row": 2,
+        "col": 1
+      }
+    },
+    {
+      "lines": [
+        "\u001b[1mev=4\u001b[0m in=1 tick=2 wake=0",
+        "\u001b[36mlast=c\u001b[0m w=100 h=30 hidden=false focus=false theme=",
+        "cur\u001b_pi:c\u0007sor"
+      ],
+      "cursor": {
+        "row": 2,
+        "col": 1
+      }
+    },
+    {
+      "lines": [
+        "\u001b[1mev=5\u001b[0m in=2 tick=2 wake=0",
+        "\u001b[36mlast=q\u001b[0m w=100 h=30 hidden=false focus=false theme=",
+        "cur\u001b_pi:c\u0007sor"
+      ],
+      "done": {
+        "events": 5,
+        "inputs": [
+          "c",
+          "q"
+        ],
+        "ticks": 2,
+        "wakes": 0,
+        "hidden": false,
+        "disposed": null
+      }
+    }
+  ],
+  "terminal": {
+    "events": 5,
+    "inputs": [
+      "c",
+      "q"
+    ],
+    "ticks": 2,
+    "wakes": 0,
+    "hidden": false,
+    "disposed": null
+  },
+  "scriptExhausted": false,
+  "toolResult": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"events\":5,\"inputs\":[\"c\",\"q\"],\"ticks\":2,\"wakes\":0,\"hidden\":false,\"disposed\":null}"
+      }
+    ],
+    "details": {
+      "terminal": {
+        "events": 5,
+        "inputs": [
+          "c",
+          "q"
+        ],
+        "ticks": 2,
+        "wakes": 0,
+        "hidden": false,
+        "disposed": null
+      }
+    }
+  }
+}

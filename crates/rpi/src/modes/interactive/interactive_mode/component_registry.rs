@@ -53,6 +53,10 @@ pub(crate) const DEFAULT_DISPOSE_GRACE: Duration = Duration::from_millis(500);
 /// time signal.
 pub(crate) const EVENT_QUEUE_CAPACITY: usize = 256;
 
+/// Host tick floor (design §3.2: "默认下限 250ms"): a guest asking for a
+/// shorter `tickMs` is clamped to this interval.
+pub(crate) const MIN_TICK_MS: u64 = 250;
+
 const DIAGNOSTIC_CAPACITY: usize = 64;
 
 /// One mount/unmount/error record (R-U12.1 diagnostics; also the test
@@ -139,6 +143,10 @@ pub(crate) struct MountState {
     done: Mutex<Option<Value>>,
     last_resize: Mutex<Option<(usize, usize)>>,
     input_listener: Mutex<Option<u64>>,
+    /// Host tick timer (V14-22 C2; R-U5.1). `None` when `tickMs == 0` or no
+    /// runtime was current at mount; cancelled by [`MountState::close`].
+    tick_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    tick_cancel: tokio_util::sync::CancellationToken,
     mount: Arc<dyn ComponentMountPoint>,
     diagnostics: Arc<Mutex<VecDeque<ComponentDiagnostic>>>,
     dispose_grace: Duration,
@@ -177,6 +185,8 @@ impl MountState {
             done: Mutex::new(None),
             last_resize: Mutex::new(None),
             input_listener: Mutex::new(None),
+            tick_task: Mutex::new(None),
+            tick_cancel: tokio_util::sync::CancellationToken::new(),
             mount,
             diagnostics,
             dispose_grace,
@@ -515,12 +525,80 @@ impl MountState {
         self.mount.request_render();
     }
 
+    /// Effective tick interval (V14-22 C2; R-U5.1): `tickMs` clamped to the
+    /// 250 ms floor (design §3.2). `None` when `tickMs == 0` asked for no
+    /// timer.
+    fn tick_interval(&self) -> Option<Duration> {
+        (self.options.tick_ms > 0)
+            .then(|| Duration::from_millis(self.options.tick_ms.max(MIN_TICK_MS)))
+    }
+
+    /// Start the host tick timer (R-U5.1). The task pushes `Tick` while the
+    /// component is visible; hiding suppresses delivery and showing resumes
+    /// it (design §3.7 — `tick` is a time signal, not a counter). Requires a
+    /// current tokio runtime; without one no timer is started (the host TUI
+    /// always runs on one).
+    fn start_tick_task(self: &Arc<Self>) {
+        let Some(interval) = self.tick_interval() else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let cancel = self.tick_cancel.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let task = handle.spawn(async move {
+            let mut ticker =
+                tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let Some(state) = weak.upgrade() else { break };
+                        state.push_tick();
+                    }
+                }
+            }
+        });
+        *self
+            .tick_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(task);
+    }
+
+    /// Push one host `tick` unless delivery is paused (hidden, disposing or
+    /// unmounted) — R-U5.1: 隐藏时暂停、显示时恢复.
+    fn push_tick(&self) {
+        if self.is_closed()
+            || self.disposing.load(Ordering::SeqCst)
+            || self.hidden.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        self.push_event(ComponentEvent::Tick);
+    }
+
+    /// Stop the tick timer if one is running (idempotent).
+    fn stop_tick_task(&self) {
+        self.tick_cancel.cancel();
+        if let Some(task) = self
+            .tick_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
+
     /// Idempotent unmount (R-U1.4 / R-U6.4): hide the mount point, drop the
     /// hidden-key listener, wake a blocked poll and record the `done` value.
     fn close(&self, done: Option<Value>) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.stop_tick_task();
         if let Some(id) = self
             .input_listener
             .lock()
@@ -965,6 +1043,7 @@ impl ComponentRegistry {
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
+        state.start_tick_task();
         mount.request_render();
         Ok(handle)
     }
@@ -1023,6 +1102,40 @@ impl ComponentRegistry {
         let state = self.lookup(owner, handle)?;
         state.set_hidden(hidden);
         Ok(())
+    }
+
+    /// `ui.wakeComponent` (FR-C / R-U5.2): push a `render` event so a parked
+    /// `pollComponent` returns immediately. Thread-safe by construction
+    /// (mutex queue + `Notify`), so a native guest may call it from any
+    /// thread; the wasm carrier has no background thread and uses `tick`
+    /// instead (design §4.4).
+    pub(crate) fn wake(
+        &self,
+        owner: &str,
+        handle: ComponentHandle,
+    ) -> Result<(), InteractiveUiError> {
+        let state = self.lookup(owner, handle)?;
+        state.push_event(ComponentEvent::Render);
+        Ok(())
+    }
+
+    /// Carrier-failure cleanup (V14-22 C2; R-U6.2): force-unmount `owner`'s
+    /// active component without protocol delivery — the guest died
+    /// (wasm fuel exhaustion / trap) and can never dispose it. Returns the
+    /// unmounted handle when one was active.
+    pub(crate) fn abort_owner(
+        &self,
+        owner: &str,
+        reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        let state = self.active_state()?;
+        if state.owner != owner || state.is_closed() {
+            return None;
+        }
+        state.log("error", Some(format!("carrierFailure:{}", reason.as_str())));
+        state.close(None);
+        self.remember_closed(state.handle);
+        Some(state.handle)
     }
 
     /// `ui.disposeComponent` (FR-F / R-U1.4 / R-U6.4): idempotent.
@@ -2223,6 +2336,223 @@ mod interactive_component {
                 theme: serde_json::json!({"name": "light"})
             }
         );
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    // -- §4.2 tick / wake / hidden / abort --------------------------------
+
+    /// Non-blocking drain of the active component's queue (paused-clock
+    /// tick tests must not await a poll that may never complete).
+    fn take_events(registry: &ComponentRegistry) -> Vec<ComponentEvent> {
+        let mut events = Vec::new();
+        if let Some(state) = registry.active_state() {
+            while let Some(event) = state.pop_event() {
+                events.push(event);
+            }
+        }
+        events
+    }
+
+    /// Let spawned tasks run (the tick task must register its timer before
+    /// the paused clock can advance it).
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Advance the paused clock by `ms` and let the tick task run.
+    async fn advance_and_settle(ms: u64) {
+        settle().await;
+        tokio::time::advance(std::time::Duration::from_millis(ms)).await;
+        settle().await;
+    }
+
+    /// V14-22 FR-B (R-U5.1): `tickMs > 0` delivers periodic `Tick`; hiding
+    /// pauses delivery and showing resumes it; `tickMs == 0` never ticks.
+    #[tokio::test(start_paused = true)]
+    async fn component_registry_tick_lifecycle_hidden_pause_and_resume() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        // 100ms requested → clamped to the 250ms floor (design §3.2).
+        let handle = mount_overlay(
+            &registry,
+            &mount,
+            MountOptions {
+                tick_ms: 100,
+                ..MountOptions::default()
+            },
+        );
+        // No tick before one full interval (`interval_at`, not immediate).
+        advance_and_settle(MIN_TICK_MS - 1).await;
+        assert!(take_events(&registry).is_empty());
+
+        advance_and_settle(1).await;
+        assert_eq!(take_events(&registry), vec![ComponentEvent::Tick]);
+
+        // Visible: a second period delivers another tick.
+        advance_and_settle(MIN_TICK_MS).await;
+        assert_eq!(take_events(&registry), vec![ComponentEvent::Tick]);
+
+        // Hidden: delivery pauses while the timer keeps running.
+        registry.set_hidden("ext", handle, true).expect("hide");
+        assert_eq!(
+            take_events(&registry),
+            vec![ComponentEvent::Visibility { hidden: true }]
+        );
+        advance_and_settle(MIN_TICK_MS * 3).await;
+        assert!(take_events(&registry).is_empty(), "hidden pauses ticks");
+
+        // Shown again: delivery resumes (fresh period from the show point).
+        registry.set_hidden("ext", handle, false).expect("show");
+        assert_eq!(
+            take_events(&registry),
+            vec![ComponentEvent::Visibility { hidden: false }]
+        );
+        advance_and_settle(MIN_TICK_MS).await;
+        assert_eq!(take_events(&registry), vec![ComponentEvent::Tick]);
+
+        // Unmount stops the timer (a leak assertion: no events after close).
+        registry.dispose("ext", handle).expect("dispose");
+        advance_and_settle(MIN_TICK_MS * 2).await;
+        assert!(take_events(&registry).is_empty());
+        assert_eq!(registry.live_counts(), (0, 0));
+    }
+
+    /// V14-22 FR-B: `tickMs == 0` never starts a timer.
+    #[tokio::test(start_paused = true)]
+    async fn component_registry_tick_ms_zero_never_ticks() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        advance_and_settle(MIN_TICK_MS * 4).await;
+        assert!(take_events(&registry).is_empty());
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    /// V14-22 FR-C (R-U5.2): `wakeComponent` pushes a `render` event and a
+    /// parked `pollComponent` returns immediately; unknown handles error.
+    #[tokio::test]
+    async fn component_registry_wake_unblocks_parked_poll() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+
+        // Park a poll (it must stay pending until an event arrives).
+        {
+            let parked = registry.poll("ext", handle);
+            tokio::pin!(parked);
+            assert!(futures::poll!(parked.as_mut()).is_pending());
+
+            registry.wake("ext", handle).expect("wake");
+            assert_eq!(parked.await.unwrap(), ComponentEvent::Render);
+        }
+
+        // `wake` from a background thread (native任意线程, R-U5.3/R-U7.3).
+        let registry = Arc::new(registry);
+        let registry_bg = Arc::clone(&registry);
+        let thread = std::thread::spawn(move || registry_bg.wake("ext", handle));
+        assert!(thread.join().expect("thread").is_ok());
+        assert_eq!(take_events(&registry), vec![ComponentEvent::Render]);
+
+        let error = registry.wake("ext", ComponentHandle(99)).unwrap_err();
+        assert_eq!(error.kind, InteractiveUiErrorKind::InvalidRequest);
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    /// V14-22 FR-C / R-U6.2: carrier failure (wasm fuel/trap) force-unmounts
+    /// the owner's component without protocol delivery.
+    #[test]
+    fn component_registry_abort_owner_force_unmounts() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        assert!(mount.last_overlay().live.load(Ordering::SeqCst));
+
+        assert_eq!(
+            registry.abort_owner("ext", DisposeReason::ToolAbort),
+            Some(handle)
+        );
+        assert!(!mount.last_overlay().live.load(Ordering::SeqCst));
+        assert_eq!(registry.active_handle(), None);
+        // Idempotent: the slot is gone, so a repeat is a no-op.
+        assert_eq!(registry.abort_owner("ext", DisposeReason::ToolAbort), None);
+        // A foreign owner never matches (R-U8.2).
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        assert_eq!(
+            registry.abort_owner("other", DisposeReason::ToolAbort),
+            None
+        );
+        assert_eq!(registry.active_handle(), Some(handle));
+        registry.dispose("ext", handle).expect("dispose");
+        // The failure is diagnosable (R-U12.1).
+        let diagnostics = registry.diagnostics();
+        assert!(diagnostics.iter().any(|record| record.kind == "error"
+            && record.detail.as_deref() == Some("carrierFailure:toolAbort")));
+    }
+
+    /// V14-22 FR-G (R-U7.2): the wasm carrier's 512 KiB budget (clamped by
+    /// the dispatch layer before the bridge) rejects an oversize total
+    /// fail-visibly, keeping the previous frame.
+    #[test]
+    fn component_registry_wasm_budget_rejects_oversize_total() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let options = MountOptions {
+            max_frame_bytes: rpi_ext_host::interactive_ui::WASM_DEFAULT_MAX_FRAME_BYTES,
+            ..MountOptions::default()
+        };
+        let handle = mount_overlay(&registry, &mount, options);
+        registry
+            .render(
+                "ext",
+                handle,
+                ComponentFrame::lines(vec!["prev".to_owned()]),
+            )
+            .expect("previous frame");
+        // 20 × 30 KiB = 600 KiB > 512 KiB; each line and the row count stay
+        // inside their own caps so the total-bytes branch is the one hit.
+        let line = "x".repeat(30 * 1024);
+        let oversize = ComponentFrame::lines(vec![line; 20]);
+        let error = registry
+            .render("ext", handle, oversize)
+            .expect_err("total > 512 KiB");
+        assert!(error.message.contains("maxFrameBytes"), "{error}");
+        assert_eq!(render_entry(&registry, 80), vec!["prev".to_owned()]);
+        // Just under the cap (510 KiB) still passes the carrier boundary.
+        let at_limit = ComponentFrame::lines(vec!["y".repeat(30 * 1024); 17]);
+        registry.render("ext", handle, at_limit).expect("under cap");
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    /// V14-22 FR-D (R-U5.3): rendering is synchronous and never waits on a
+    /// pending poll; a render does not wake the parked guest (only events do).
+    #[tokio::test]
+    async fn component_registry_render_is_synchronous_and_does_not_wake_poll() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        {
+            let parked = registry.poll("ext", handle);
+            tokio::pin!(parked);
+            assert!(futures::poll!(parked.as_mut()).is_pending());
+
+            // The synchronous render returns without the guest being
+            // involved and produces no event for the parked poll.
+            registry
+                .render(
+                    "ext",
+                    handle,
+                    ComponentFrame::lines(vec!["frame".to_owned()]),
+                )
+                .expect("render");
+            assert!(
+                futures::poll!(parked.as_mut()).is_pending(),
+                "render must not produce a poll event"
+            );
+        }
+        // The submitted frame is live for the host compositor.
+        assert_eq!(render_entry(&registry, 80), vec!["frame".to_owned()]);
         registry.dispose("ext", handle).expect("dispose");
     }
 }

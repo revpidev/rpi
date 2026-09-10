@@ -1,0 +1,98 @@
+{
+  "scenario": "basic",
+  "carrier": "wasm",
+  "mountOptions": {
+    "overlay": true,
+    "tickMs": 250,
+    "keysWhenHidden": [
+      "ctrl+g"
+    ],
+    "cursor": true,
+    "maxFrameBytes": 524288,
+    "label": "parity"
+  },
+  "frames": [
+    {
+      "lines": [
+        "\u001b[1mev=1\u001b[0m in=0 tick=0 wake=0",
+        "\u001b[36mlast=-\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ]
+    },
+    {
+      "lines": [
+        "\u001b[1mev=2\u001b[0m in=1 tick=0 wake=0",
+        "\u001b[36mlast=a\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ]
+    },
+    {
+      "lines": [
+        "\u001b[1mev=3\u001b[0m in=2 tick=0 wake=0",
+        "\u001b[36mlast=b\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ]
+    },
+    {
+      "lines": [
+        "\u001b[1mev=4\u001b[0m in=2 tick=1 wake=0",
+        "\u001b[36mlast=b\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ]
+    },
+    {
+      "lines": [
+        "\u001b[1mev=5\u001b[0m in=3 tick=1 wake=0",
+        "\u001b[36mlast=q\u001b[0m w=80 h=24 hidden=false focus=false theme=",
+        "wide 漢字 tail"
+      ],
+      "done": {
+        "events": 5,
+        "inputs": [
+          "a",
+          "b",
+          "q"
+        ],
+        "ticks": 1,
+        "wakes": 0,
+        "hidden": false,
+        "disposed": null
+      }
+    }
+  ],
+  "terminal": {
+    "events": 5,
+    "inputs": [
+      "a",
+      "b",
+      "q"
+    ],
+    "ticks": 1,
+    "wakes": 0,
+    "hidden": false,
+    "disposed": null
+  },
+  "scriptExhausted": false,
+  "toolResult": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"events\":5,\"inputs\":[\"a\",\"b\",\"q\"],\"ticks\":1,\"wakes\":0,\"hidden\":false,\"disposed\":null}"
+      }
+    ],
+    "details": {
+      "terminal": {
+        "events": 5,
+        "inputs": [
+          "a",
+          "b",
+          "q"
+        ],
+        "ticks": 1,
+        "wakes": 0,
+        "hidden": false,
+        "disposed": null
+      }
+    }
+  }
+}

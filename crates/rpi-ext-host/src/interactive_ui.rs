@@ -75,6 +75,14 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 1_048_576;
 pub const DEFAULT_MAX_FRAME_ROWS: usize = 5_000;
 /// Default per-line byte limit (design §2.6: single line ≤ 32 KiB).
 pub const DEFAULT_MAX_LINE_BYTES: usize = 32 * 1024;
+/// wasm (L1) default frame byte cap (design §4.2/§4.4: total ≤ 512 KiB).
+///
+/// The host enforces this stricter bound on the wasm carrier even when a
+/// guest asks for a larger `maxFrameBytes` (R-U7.2); native guests keep
+/// [`DEFAULT_MAX_FRAME_BYTES`].
+pub const WASM_DEFAULT_MAX_FRAME_BYTES: usize = 512 * 1024;
+/// wasm (L1) frame row cap (design §4.2/§4.4: rows ≤ 2000).
+pub const WASM_DEFAULT_MAX_FRAME_ROWS: usize = 2_000;
 /// Cursor marker stripped by the host (rpi-tui `CURSOR_MARKER`,
 /// `tui.rs:163`); a frame may embed it instead of `cursor:{row,col}`.
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
@@ -693,6 +701,226 @@ impl ComponentFrame {
 }
 
 // ============================================================================
+// Lightweight line / ANSI builders (V14-22 C2; R-U7.2 / R-U9.4)
+// ============================================================================
+//
+// wasm guests cannot link `rpi-tui` (the carrier matrix marks it ❌, design
+// §4.4), so the SDK ships a dependency-free line assembler: plain text with
+// SGR styling that the host composites verbatim. The helpers live in both
+// protocol mirrors and behave identically, so guest rendering code can move
+// between carriers unchanged.
+
+/// SGR colour value for [`AnsiStyle`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnsiColor {
+    /// 16-colour code (`0..=7` → `30..=37`/`40..=47`; `8..=15` →
+    /// `90..=97`/`100..=107`; values are taken modulo 16).
+    Basic(u8),
+    /// 256-colour palette index (`38;5;N` / `48;5;N`).
+    Indexed(u8),
+    /// Truecolor (`38;2;R;G;B` / `48;2;R;G;B`).
+    Rgb(u8, u8, u8),
+}
+
+/// Text style for [`AnsiStyle::apply`] / [`LineBuilder`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnsiStyle {
+    /// Bold (`SGR 1`).
+    pub bold: bool,
+    /// Dim (`SGR 2`).
+    pub dim: bool,
+    /// Italic (`SGR 3`).
+    pub italic: bool,
+    /// Underline (`SGR 4`).
+    pub underline: bool,
+    /// Foreground colour.
+    pub fg: Option<AnsiColor>,
+    /// Background colour.
+    pub bg: Option<AnsiColor>,
+}
+
+impl AnsiStyle {
+    /// A plain style (no attributes, no colours).
+    pub const fn new() -> Self {
+        Self {
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            fg: None,
+            bg: None,
+        }
+    }
+
+    /// Builder: enable bold.
+    pub const fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    /// Builder: enable dim.
+    pub const fn dim(mut self) -> Self {
+        self.dim = true;
+        self
+    }
+
+    /// Builder: enable italic.
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+
+    /// Builder: enable underline.
+    pub const fn underline(mut self) -> Self {
+        self.underline = true;
+        self
+    }
+
+    /// Builder: set the foreground colour.
+    pub const fn fg(mut self, color: AnsiColor) -> Self {
+        self.fg = Some(color);
+        self
+    }
+
+    /// Builder: set the background colour.
+    pub const fn bg(mut self, color: AnsiColor) -> Self {
+        self.bg = Some(color);
+        self
+    }
+
+    /// Whether this style emits no SGR sequence at all.
+    pub const fn is_plain(&self) -> bool {
+        !self.bold
+            && !self.dim
+            && !self.italic
+            && !self.underline
+            && self.fg.is_none()
+            && self.bg.is_none()
+    }
+
+    /// The SGR prefix for this style (e.g. `"\x1b[1;38;5;196m"`); empty for
+    /// a plain style.
+    pub fn sgr(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.bold {
+            parts.push("1".to_owned());
+        }
+        if self.dim {
+            parts.push("2".to_owned());
+        }
+        if self.italic {
+            parts.push("3".to_owned());
+        }
+        if self.underline {
+            parts.push("4".to_owned());
+        }
+        if let Some(color) = self.fg {
+            parts.extend(color_sgr(color, false));
+        }
+        if let Some(color) = self.bg {
+            parts.extend(color_sgr(color, true));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!("\x1b[{}m", parts.join(";"))
+        }
+    }
+
+    /// Wrap `text` in this style's SGR prefix and a reset suffix; a plain
+    /// style returns `text` unchanged.
+    pub fn apply(&self, text: &str) -> String {
+        let sgr = self.sgr();
+        if sgr.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{sgr}{text}\x1b[0m")
+        }
+    }
+}
+
+/// The SGR parameter list for a colour (`38;5;N` / `48;2;R;G;B` / basic).
+fn color_sgr(color: AnsiColor, background: bool) -> Vec<String> {
+    match color {
+        AnsiColor::Basic(value) => {
+            let value = value % 16;
+            let code = if value < 8 {
+                (if background { 40 } else { 30 }) + value
+            } else {
+                (if background { 100 } else { 90 }) + (value - 8)
+            };
+            vec![code.to_string()]
+        }
+        AnsiColor::Indexed(index) => {
+            vec![
+                (if background { "48" } else { "38" }).to_owned(),
+                "5".to_owned(),
+                index.to_string(),
+            ]
+        }
+        AnsiColor::Rgb(red, green, blue) => {
+            vec![
+                (if background { "48" } else { "38" }).to_owned(),
+                "2".to_owned(),
+                red.to_string(),
+                green.to_string(),
+                blue.to_string(),
+            ]
+        }
+    }
+}
+
+/// Line assembler: concatenates styled spans into one frame line without
+/// linking `rpi-tui` (R-U7.2).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineBuilder {
+    spans: Vec<(String, AnsiStyle)>,
+}
+
+impl LineBuilder {
+    /// An empty line.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append `text` with `style`.
+    pub fn push(&mut self, text: impl Into<String>, style: AnsiStyle) -> &mut Self {
+        self.spans.push((text.into(), style));
+        self
+    }
+
+    /// Append plain (unstyled) `text`.
+    pub fn plain(&mut self, text: impl Into<String>) -> &mut Self {
+        self.push(text, AnsiStyle::new())
+    }
+
+    /// Number of spans appended so far.
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    /// Whether no span was appended.
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
+    /// Build the final line (SGR sequences included).
+    pub fn build(&self) -> String {
+        let mut line = String::new();
+        for (text, style) in &self.spans {
+            line.push_str(&style.apply(text));
+        }
+        line
+    }
+}
+
+impl std::fmt::Display for LineBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.build())
+    }
+}
+
+// ============================================================================
 // Lifecycle states (design §2.3)
 // ============================================================================
 
@@ -1050,6 +1278,16 @@ pub trait Component {
     fn on_focus(&mut self) {}
     /// Component lost focus to a host dialog.
     fn on_blur(&mut self) {}
+    /// Explicit hardware-cursor position for the next frame (R-U3.2).
+    ///
+    /// `None` (default) leaves cursor placement to a
+    /// [`CURSOR_MARKER`] embedded in [`Self::render`]; `Some` is the
+    /// equivalent of the frame's `cursor:{row,col}` field and wins over an
+    /// embedded marker.
+    fn cursor(&self) -> Option<ComponentCursor> {
+        None
+    }
+
     /// Host tick (R-U5.1).
     fn on_tick(&mut self) {}
     /// Resize to the content area dimensions (R-U3.3).
@@ -1103,7 +1341,7 @@ pub fn run_component<C: Component, H: HostCall + ?Sized>(
                 component.on_dispose(*reason);
                 let frame = ComponentFrame {
                     lines: component.render(width),
-                    cursor: None,
+                    cursor: component.cursor(),
                     done: component
                         .done()
                         .map_or(DoneValue::Absent, DoneValue::Present),
@@ -1115,7 +1353,7 @@ pub fn run_component<C: Component, H: HostCall + ?Sized>(
         }
         let frame = ComponentFrame {
             lines: component.render(width),
-            cursor: None,
+            cursor: component.cursor(),
             done: component
                 .done()
                 .map_or(DoneValue::Absent, DoneValue::Present),
@@ -1594,6 +1832,50 @@ mod tests {
             run_component(&host, ScriptedComponent::new(99), MountOptions::default()).unwrap();
         assert_eq!(result, Value::Null);
         assert_eq!(host.calls()[2].0, METHOD_RENDER_COMPONENT);
+    }
+
+    #[test]
+    fn interactive_ui_line_builders_and_carrier_limits() {
+        // Plain styles are a passthrough (no SGR noise).
+        assert_eq!(AnsiStyle::new().sgr(), "");
+        assert_eq!(AnsiStyle::new().apply("plain"), "plain");
+        assert!(AnsiStyle::new().is_plain());
+
+        // Attribute order is fixed: bold/dim/italic/underline/fg/bg.
+        let styled = AnsiStyle::new()
+            .bold()
+            .underline()
+            .fg(AnsiColor::Indexed(196))
+            .bg(AnsiColor::Basic(4));
+        assert_eq!(styled.sgr(), "\x1b[1;4;38;5;196;44m");
+        assert_eq!(styled.apply("x"), "\x1b[1;4;38;5;196;44mx\x1b[0m");
+
+        // Basic colours: 0..=7 normal, 8..=15 bright, modulo 16.
+        assert_eq!(AnsiStyle::new().fg(AnsiColor::Basic(2)).sgr(), "\x1b[32m");
+        assert_eq!(AnsiStyle::new().bg(AnsiColor::Basic(9)).sgr(), "\x1b[101m");
+        assert_eq!(AnsiStyle::new().fg(AnsiColor::Basic(17)).sgr(), "\x1b[31m");
+        assert_eq!(
+            AnsiStyle::new().fg(AnsiColor::Rgb(1, 2, 3)).sgr(),
+            "\x1b[38;2;1;2;3m"
+        );
+        assert_eq!(
+            AnsiStyle::new().bg(AnsiColor::Rgb(1, 2, 3)).sgr(),
+            "\x1b[48;2;1;2;3m"
+        );
+
+        // LineBuilder concatenates spans in order.
+        let mut line = LineBuilder::new();
+        assert!(line.is_empty());
+        line.plain("ab").push("CD", AnsiStyle::new().bold());
+        assert_eq!(line.len(), 2);
+        assert_eq!(line.build(), "ab\x1b[1mCD\x1b[0m");
+        assert_eq!(line.to_string(), line.build());
+
+        // Carrier limit constants (R-U7.2): wasm is stricter than native.
+        assert_eq!(WASM_DEFAULT_MAX_FRAME_BYTES, 512 * 1024);
+        assert_eq!(WASM_DEFAULT_MAX_FRAME_ROWS, 2_000);
+        const { assert!(WASM_DEFAULT_MAX_FRAME_BYTES < DEFAULT_MAX_FRAME_BYTES) };
+        const { assert!(WASM_DEFAULT_MAX_FRAME_ROWS < DEFAULT_MAX_FRAME_ROWS) };
     }
 
     #[test]

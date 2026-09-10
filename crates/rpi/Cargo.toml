@@ -65,6 +65,9 @@ libc.workspace = true
 
 [dev-dependencies]
 rpi-test-support.workspace = true
+# V14-22 C2 tick tests: `#[tokio::test(start_paused = true)]` +
+# `tokio::time::advance` (deterministic host-timer assertions).
+tokio = { workspace = true, features = ["test-util"] }
 # T18 self-update e2e: fake release server on a loopback socket (no real
 # network), same pattern as the rpi-ai OAuth mock servers.
 axum.workspace = true

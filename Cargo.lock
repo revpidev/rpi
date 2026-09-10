@@ -3239,6 +3239,7 @@ dependencies = [
  "futures",
  "rpi-agent",
  "rpi-ai",
+ "rpi-ext-host",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",

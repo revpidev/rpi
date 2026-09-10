@@ -376,6 +376,14 @@ impl UiBridge for NamespacedUiBridge {
             .await
     }
 
+    fn abort_active_component(
+        &self,
+        _owner: &str,
+        reason: crate::interactive_ui::DisposeReason,
+    ) -> Option<crate::interactive_ui::ComponentHandle> {
+        self.inner.abort_active_component(&self.namespace, reason)
+    }
+
     fn is_noop(&self) -> bool {
         self.inner.is_noop()
     }
@@ -752,6 +760,14 @@ impl UiBridge for UiPromptBridge {
         language: Option<&str>,
     ) -> Result<Option<String>, crate::interactive_ui::InteractiveUiError> {
         self.inner.edit_external(owner, text, language).await
+    }
+
+    fn abort_active_component(
+        &self,
+        owner: &str,
+        reason: crate::interactive_ui::DisposeReason,
+    ) -> Option<crate::interactive_ui::ComponentHandle> {
+        self.inner.abort_active_component(owner, reason)
     }
 
     fn is_noop(&self) -> bool {

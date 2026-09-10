@@ -46,6 +46,16 @@ fn parse_ui_args<T: serde::de::DeserializeOwned>(
     serde_json::from_value(args).map_err(|error| ("invalidRequest", format!("{method}: {error}")))
 }
 
+/// Whether the calling guest runs on the wasm (L1) carrier (V14-22 C2).
+///
+/// Native (L0) plugins share this dispatch path, so the carrier-specific
+/// execution constraints of R-U7.2 / design §4.2/§4.4 (stricter frame
+/// limits, no background-thread `wakeComponent`) are applied here from the
+/// per-call dispatch target.
+fn is_wasm_carrier(state: &HostState) -> bool {
+    matches!(state.forward, crate::wasm::DispatchTarget::Wasm(_))
+}
+
 /// Interactive custom UI ABI dispatch (ADR-0024 §2.1). The blocking calls
 /// (`pollComponent`, `editExternal`) park the guest thread through the same
 /// [`block_on`] mechanism as `ui.select`; the host runtime keeps running.
@@ -64,7 +74,16 @@ fn dispatch_interactive_ui(
     let owner = state.api.extension().path.clone();
     match method {
         crate::interactive_ui::METHOD_MOUNT_COMPONENT => {
-            let args: MountComponentArgs = parse_ui_args(method, args)?;
+            let mut args: MountComponentArgs = parse_ui_args(method, args)?;
+            if is_wasm_carrier(state) {
+                // R-U7.2 / design §4.4: the wasm carrier's total frame budget
+                // is stricter than native even when the guest asks for more
+                // (fuel / memory amplification guard).
+                args.options.max_frame_bytes = args
+                    .options
+                    .max_frame_bytes
+                    .min(crate::interactive_ui::WASM_DEFAULT_MAX_FRAME_BYTES);
+            }
             let ui = Arc::clone(ui);
             let handle = block_on(&state.async_handle, async move {
                 ui.mount_component(&owner, args.options).await
@@ -83,6 +102,22 @@ fn dispatch_interactive_ui(
         }
         crate::interactive_ui::METHOD_RENDER_COMPONENT => {
             let args: RenderComponentArgs = parse_ui_args(method, args)?;
+            if is_wasm_carrier(state) {
+                // R-U7.2 / design §4.4: rows ≤ 2000 on wasm. Rejecting before
+                // the registry keeps the previous frame (fail-visible,
+                // R-U3.5) and mirrors the registry's `frameTooLarge`
+                // `invalidRequest` shape.
+                let rows = args.frame.lines.len();
+                if rows > crate::interactive_ui::WASM_DEFAULT_MAX_FRAME_ROWS {
+                    return err(
+                        "invalidRequest",
+                        format!(
+                            "frameTooLarge: rows {rows} > {}",
+                            crate::interactive_ui::WASM_DEFAULT_MAX_FRAME_ROWS
+                        ),
+                    );
+                }
+            }
             ui.render_component(&owner, args.handle, args.frame)
                 .map_err(ui_error)?;
             Ok(json!({ "ok": true }))
@@ -94,6 +129,15 @@ fn dispatch_interactive_ui(
             Ok(json!({ "ok": true }))
         }
         crate::interactive_ui::METHOD_WAKE_COMPONENT => {
+            if is_wasm_carrier(state) {
+                // A wasm guest has no background thread to wake a parked poll
+                // from (design §4.2/§4.4); async refresh uses `tickMs`.
+                // `unknownMethod` is the R-U9.2 probe signal for absence.
+                return err(
+                    "unknownMethod",
+                    "ui.wakeComponent: not supported by the wasm carrier (use tickMs)",
+                );
+            }
             let args: WakeComponentArgs = parse_ui_args(method, args)?;
             ui.wake_component(&owner, args.handle).map_err(ui_error)?;
             Ok(json!({ "ok": true }))
@@ -381,6 +425,103 @@ mod tests {
             tool_aborts: Default::default(),
         };
         (state, runtime)
+    }
+
+    /// Same host state but on the wasm (L1) carrier (V14-22 C2 tests): the
+    /// dispatch target drives the carrier-specific execution constraints.
+    fn host_state_wasm(capabilities: HashSet<Capability>) -> (HostState, tokio::runtime::Runtime) {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:c0>", "<inline:c0>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let state = HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(crate::wasm::WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+        };
+        (state, runtime)
+    }
+
+    /// V14-22 FR-A/FR-C/FR-G (R-U7.2): the wasm carrier clamps the frame
+    /// budget to the stricter wasm default, rejects >2000-row frames before
+    /// the bridge (fail-visible) and answers `unknownMethod` for
+    /// `wakeComponent` (no background thread — use `tickMs`).
+    #[test]
+    fn interactive_ui_wasm_carrier_limits_and_wake_constraint() {
+        let bridge = Arc::new(ScriptedC1Bridge::new());
+        let (mut state, _runtime) = host_state_wasm(HashSet::from([Capability::Ui]));
+        state
+            .api
+            .runtime()
+            .set_ui_bridge(Some(bridge.clone()), ExtensionMode::Tui);
+
+        // The guest asks for 1 MiB; the wasm carrier caps it at 512 KiB.
+        dispatch(
+            &mut state,
+            "ui.mountComponent",
+            serde_json::json!({ "options": { "maxFrameBytes": 1048576 } }),
+        )
+        .expect("mount dispatch");
+        let calls = bridge.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].2["maxFrameBytes"], 524_288, "{calls:?}");
+
+        // Rows > 2000 are rejected before the bridge; the previous frame is
+        // untouched (R-U3.5 fail-visible).
+        let oversize = serde_json::json!({
+            "handle": 7,
+            "lines": vec!["x"; crate::interactive_ui::WASM_DEFAULT_MAX_FRAME_ROWS + 1],
+        });
+        let (kind, message) =
+            dispatch(&mut state, "ui.renderComponent", oversize).expect_err("oversize");
+        assert_eq!(kind, "invalidRequest");
+        assert!(
+            message.contains("frameTooLarge: rows 2001 > 2000"),
+            "{message}"
+        );
+        assert_eq!(bridge.calls().len(), 1, "oversize frame reached the bridge");
+
+        // Exactly the carrier cap passes the gate (host registry limits are
+        // exercised in the rpi crate).
+        let at_limit = serde_json::json!({
+            "handle": 7,
+            "lines": vec!["x"; crate::interactive_ui::WASM_DEFAULT_MAX_FRAME_ROWS],
+        });
+        dispatch(&mut state, "ui.renderComponent", at_limit).expect("at limit");
+        assert_eq!(bridge.calls().len(), 2);
+
+        // `wakeComponent`: no background thread on wasm (design §4.4).
+        let (kind, message) = dispatch(
+            &mut state,
+            "ui.wakeComponent",
+            serde_json::json!({ "handle": 7 }),
+        )
+        .expect_err("wake unsupported");
+        assert_eq!(kind, "unknownMethod");
+        assert!(message.contains("wasm carrier"), "{message}");
+        assert_eq!(bridge.calls().len(), 2, "wake reached the bridge");
+
+        // The same mount on the native carrier keeps the full 1 MiB budget.
+        let native_bridge = Arc::new(ScriptedC1Bridge::new());
+        let (mut native, _native_runtime) = host_state(HashSet::from([Capability::Ui]));
+        native
+            .api
+            .runtime()
+            .set_ui_bridge(Some(native_bridge.clone()), ExtensionMode::Tui);
+        dispatch(
+            &mut native,
+            "ui.mountComponent",
+            serde_json::json!({ "options": { "maxFrameBytes": 1048576 } }),
+        )
+        .expect("native mount");
+        assert_eq!(native_bridge.calls()[0].2["maxFrameBytes"], 1_048_576);
     }
 
     /// V14-20 FR-E (R-U9.2): all seven C0-frozen methods answer

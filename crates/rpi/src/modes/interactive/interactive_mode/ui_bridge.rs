@@ -799,16 +799,26 @@ impl UiBridge for InteractiveUiBridge {
 
     fn wake_component(
         &self,
-        _owner: &str,
-        _handle: ComponentHandle,
+        owner: &str,
+        handle: ComponentHandle,
     ) -> Result<(), InteractiveUiError> {
-        // C1 ships the queue/`Notify` infrastructure; the method is wired in
-        // C2 together with the native background-thread and wasm tick paths
-        // (V14-21 §2.2).
-        Err(InteractiveUiError::new(
-            InteractiveUiErrorKind::UnknownMethod,
-            "ui.wakeComponent: lands with C2 (native background threads + wasm tick)",
-        ))
+        // V14-22 C2 (R-U5.2): queue a `render` event for a parked poll. The
+        // registry queue + `Notify` are thread-safe, so a native guest may
+        // call this from any thread; wasm guests use `tickMs` instead
+        // (design §4.4, enforced at the dispatch layer).
+        self.detached()?.component_registry.wake(owner, handle)
+    }
+
+    fn abort_active_component(
+        &self,
+        owner: &str,
+        reason: rpi_ext_host::interactive_ui::DisposeReason,
+    ) -> Option<ComponentHandle> {
+        // C2 carrier-failure seam (R-U6.2): the wasm guest died mid-component
+        // (fuel/trap); force-unmount without protocol delivery. Weak UI keeps
+        // this safe during teardown.
+        self.ui()
+            .and_then(|ui| ui.component_registry.abort_owner(owner, reason))
     }
 
     fn dispose_component(

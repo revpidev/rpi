@@ -16,6 +16,7 @@ pub mod diff;
 pub mod error;
 pub mod faux;
 pub mod normalize;
+pub mod ui_host;
 pub mod vt;
 
 pub use diff::{diff_event_sequence, diff_events_normalized, diff_jsonl, diff_text, DiffFailure};

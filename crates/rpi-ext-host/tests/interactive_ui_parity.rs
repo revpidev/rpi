@@ -155,6 +155,80 @@ fn interactive_ui_parity_method_table_and_constants() {
     assert_eq!(native::DEFAULT_MAX_LINE_BYTES, wasm::DEFAULT_MAX_LINE_BYTES);
     assert_eq!(native::DEFAULT_MAX_FRAME_BYTES, 1_048_576);
     assert_eq!(native::CURSOR_MARKER, "\x1b_pi:c\x07");
+
+    // V14-22 C2: the wasm carrier limits exist in both mirrors and are
+    // strictly tighter than the native defaults (design §4.4 / R-U7.2).
+    assert_eq!(
+        native::WASM_DEFAULT_MAX_FRAME_BYTES,
+        wasm::WASM_DEFAULT_MAX_FRAME_BYTES
+    );
+    assert_eq!(
+        native::WASM_DEFAULT_MAX_FRAME_ROWS,
+        wasm::WASM_DEFAULT_MAX_FRAME_ROWS
+    );
+    assert_eq!(native::WASM_DEFAULT_MAX_FRAME_BYTES, 512 * 1024);
+    assert_eq!(native::WASM_DEFAULT_MAX_FRAME_ROWS, 2_000);
+    const { assert!(native::WASM_DEFAULT_MAX_FRAME_BYTES < native::DEFAULT_MAX_FRAME_BYTES) };
+    const { assert!(native::WASM_DEFAULT_MAX_FRAME_ROWS < native::DEFAULT_MAX_FRAME_ROWS) };
+}
+
+/// V14-22 FR-E / R-U9.4 (G11 item 7): the lightweight line/ANSI builders are
+/// behaviourally identical in both mirrors (same input → same SGR bytes).
+#[test]
+fn interactive_ui_parity_line_builders() {
+    let native_colors = [
+        native::AnsiColor::Basic(2),
+        native::AnsiColor::Basic(9),
+        native::AnsiColor::Indexed(196),
+        native::AnsiColor::Rgb(1, 2, 3),
+    ];
+    let wasm_colors = [
+        wasm::AnsiColor::Basic(2),
+        wasm::AnsiColor::Basic(9),
+        wasm::AnsiColor::Indexed(196),
+        wasm::AnsiColor::Rgb(1, 2, 3),
+    ];
+    for (native_color, wasm_color) in native_colors.into_iter().zip(wasm_colors) {
+        let native_style = native::AnsiStyle::new().bold().underline().fg(native_color);
+        let wasm_style = wasm::AnsiStyle::new().bold().underline().fg(wasm_color);
+        assert_eq!(native_style.sgr(), wasm_style.sgr());
+        assert_eq!(native_style.apply("x"), wasm_style.apply("x"));
+    }
+    // Plain styles are a passthrough on both sides.
+    assert_eq!(
+        native::AnsiStyle::new().apply("x"),
+        wasm::AnsiStyle::new().apply("x")
+    );
+    assert_eq!(native::AnsiStyle::new().sgr(), "");
+    assert!(native::AnsiStyle::new().is_plain());
+    assert!(wasm::AnsiStyle::new().is_plain());
+
+    let mut native_line = native::LineBuilder::new();
+    native_line.plain("ab").push(
+        "CD",
+        native::AnsiStyle::new()
+            .bold()
+            .fg(native::AnsiColor::Indexed(196)),
+    );
+    let mut wasm_line = wasm::LineBuilder::new();
+    wasm_line.plain("ab").push(
+        "CD",
+        wasm::AnsiStyle::new()
+            .bold()
+            .fg(wasm::AnsiColor::Indexed(196)),
+    );
+    assert_eq!(native_line.build(), wasm_line.build());
+    assert_eq!(native_line.build(), "ab\x1b[1;38;5;196mCD\x1b[0m");
+    assert_eq!(native_line.len(), wasm_line.len());
+    assert_eq!(native_line.is_empty(), wasm_line.is_empty());
+
+    // A styled line survives the frame wire shape unchanged (host renders it
+    // verbatim; the wasm guest produces the same bytes).
+    let json = assert_same_json!(
+        native::ComponentFrame::lines(vec![native_line.build()]),
+        wasm::ComponentFrame::lines(vec![wasm_line.build()])
+    );
+    assert_cross_parse!(json.as_str(), native::ComponentFrame, wasm::ComponentFrame);
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +1020,77 @@ fn interactive_ui_parity_run_component_trace() {
         Err(("invalidRequest".to_owned(), "unknownHandle: 9".to_owned()))
     );
     assert_eq!(native_calls, wasm_calls);
+}
+
+// ---------------------------------------------------------------------------
+// Component::cursor() callback (V14-22 additive SDK seam)
+// ---------------------------------------------------------------------------
+
+/// Implements both `Component` traits; `cursor()` returns an explicit
+/// position so the frame's `cursor` field is exercised on both carriers.
+struct CursorScripted;
+
+impl native::Component for CursorScripted {
+    fn render(&mut self, _width: usize) -> Vec<String> {
+        vec!["cursor-frame".to_owned()]
+    }
+    fn handle_input(&mut self, _data: &str) {}
+    fn cursor(&self) -> Option<native::ComponentCursor> {
+        Some(native::ComponentCursor { row: 1, col: 2 })
+    }
+    fn done(&mut self) -> Option<Value> {
+        Some(json!({"cursor": true}))
+    }
+}
+
+impl wasm::Component for CursorScripted {
+    fn render(&mut self, _width: usize) -> Vec<String> {
+        vec!["cursor-frame".to_owned()]
+    }
+    fn handle_input(&mut self, _data: &str) {}
+    fn cursor(&self) -> Option<wasm::ComponentCursor> {
+        Some(wasm::ComponentCursor { row: 1, col: 2 })
+    }
+    fn done(&mut self) -> Option<Value> {
+        Some(json!({"cursor": true}))
+    }
+}
+
+#[test]
+fn interactive_ui_parity_component_cursor_callback() {
+    let replies = vec![
+        Reply::Ok(json!({"handle": 3})),
+        Reply::Ok(json!({"event": {"type": "resize", "width": 40, "height": 10}})),
+        Reply::Ok(json!({"ok": true})),
+    ];
+    let native_host = FakeHost::new(replies.clone());
+    let native_result = native::run_component(
+        &native_host,
+        CursorScripted,
+        native::MountOptions::default(),
+    )
+    .map_err(|error| (error.kind.as_str().to_owned(), error.message));
+    let wasm_host = FakeHost::new(replies);
+    let wasm_result =
+        wasm::run_component(&wasm_host, CursorScripted, wasm::MountOptions::default())
+            .map_err(|error| (error.kind.as_str().to_owned(), error.message));
+
+    assert_eq!(native_result, wasm_result);
+    assert_eq!(native_result, Ok(json!({"cursor": true})));
+    assert_eq!(native_host.calls(), wasm_host.calls());
+    assert_eq!(native_host.calls().len(), 3);
+    assert_eq!(
+        native_host.calls()[2],
+        (
+            "ui.renderComponent".to_owned(),
+            json!({
+                "handle": 3,
+                "lines": ["cursor-frame"],
+                "cursor": {"row": 1, "col": 2},
+                "done": {"cursor": true},
+            })
+        )
+    );
 }
 
 // ---------------------------------------------------------------------------
