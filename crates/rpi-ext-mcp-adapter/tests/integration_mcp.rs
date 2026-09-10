@@ -453,6 +453,27 @@ async fn proxy_end_to_end_five_modes() {
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
         assert!(text.starts_with("Invalid args JSON: "), "{text}");
 
+        // #417 (index.ts:1085-1096 @ 9f81a75): gateway params nested inside
+        // `args` without a top-level gateway mode fail with guidance — both
+        // the object form carrying gateway keys and a plain payload object
+        // (previously the latter fell through to `status`).
+        for nested_args in [
+            json!({ "args": { "tool": "fixture_echo", "args": { "q": "hello" }, "server": "fixture" } }),
+            json!({ "args": "{\"q\": \"hello\"}" }),
+        ] {
+            let result = dispatcher.execute(&nested_args, &[]).await;
+            assert_eq!(
+                result["details"]["error"],
+                json!("invalid_args"),
+                "{nested_args}"
+            );
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            assert!(
+                text.starts_with("Gateway params were nested inside `args`; pass them top-level"),
+                "{text}"
+            );
+        }
+
         dispatcher.shutdown().await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!pid_alive(&pid), "proxy shutdown reaps children (G4)");

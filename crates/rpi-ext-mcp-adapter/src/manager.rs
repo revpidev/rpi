@@ -331,6 +331,31 @@ impl McpServerManager {
         let request_timeout = self.request_timeout(definition);
 
         if definition.get_str("command").is_some() {
+            // #442 (server-manager.ts:799-803 @ 10a45367): diagnose a
+            // missing / non-directory `cwd` BEFORE the spawn, so the error
+            // names the misconfigured path instead of blaming the
+            // executable ("failed to spawn …: Not a directory").
+            // `statSync(cwd, { throwIfNoEntry: false })` = `fs::metadata`
+            // (follows symlinks; ENOENT → fall through).
+            let cwd = crate::utils::resolve_config_path(definition.get("cwd"))
+                .ok()
+                .flatten()
+                .or_else(|| self.default_cwd.clone());
+            if let Some(cwd) = cwd {
+                match std::fs::metadata(&cwd) {
+                    Err(_) => {
+                        return Err(ProtocolError::Transport(format!(
+                            "MCP server \"{name}\" configured cwd does not exist: \"{cwd}\""
+                        )));
+                    }
+                    Ok(stats) if !stats.is_dir() => {
+                        return Err(ProtocolError::Transport(format!(
+                            "MCP server \"{name}\" configured cwd is not a directory: \"{cwd}\""
+                        )));
+                    }
+                    Ok(_) => {}
+                }
+            }
             // V13-07 S1: `!command` secret resolution runs on the blocking pool.
             let (transport, incoming) =
                 connect_stdio(definition, self.default_cwd.as_deref()).await?;
@@ -680,16 +705,21 @@ fn invalidate_stored_oauth_token(
     }
 }
 
-/// `probeMcpEndpoint` (mcp-probe.ts:172-186): one unauthenticated
-/// metadata-only request to classify an HTTP endpoint's protocol shape.
-/// Returns a human-readable classification string.
+/// `probeMcpEndpoint` (mcp-probe.ts:172-186 @ 10a45367): one
+/// unauthenticated metadata-only request to classify an HTTP endpoint's
+/// protocol shape. Returns a human-readable classification string.
 ///
 /// Port of the three-stage probe strategy: modern (`server/discover` +
 /// `2026-07-28`) → legacy-post (`initialize`) → legacy-sse (GET stream).
 /// TE-D05: enriches HTTP connection failure error messages.
+///
+/// #415 (@ 10a45367): ambiguous statuses (202/401/503) report "endpoint
+/// shape could not be determined" instead of "does not appear to speak
+/// MCP", and the modern stage only falls back to the legacy strategies on
+/// `unsupported-modern` or the 400/401/404/405/406/415 fallback matrix.
 async fn probe_mcp_endpoint(url: &str) -> Option<String> {
     let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(PROBE_TIMEOUT_SECS))
         .build()
     {
         Ok(c) => c,
@@ -715,10 +745,19 @@ async fn probe_mcp_endpoint(url: &str) -> Option<String> {
         .send()
         .await
         .ok()?;
+    let modern = probe_stage(modern_response, true, true).await;
+    if let ProbeOutcome::Mcp { classification } = &modern.outcome {
+        return Some(classification.clone());
+    }
+    let mut ambiguous = ambiguous_not_mcp(&modern.response_status, &modern.content_type);
 
-    let classification = classify_probe_response(modern_response, true).await;
-    if let Some(classification) = classification {
-        return Some(classification);
+    // `unsupported-modern` (an ok JSON-RPC envelope that is an error or
+    // carries a non-2026-07-28 protocolVersion) OR a fallback-matrix status
+    // continues to the legacy strategies; anything else stops here.
+    if !matches!(modern.outcome, ProbeOutcome::UnsupportedModern)
+        && !MODERN_FALLBACK_STATUSES.contains(&modern.response_status)
+    {
+        return ambiguous.or_else(|| Some(not_mcp(&modern.response_status, &modern.content_type)));
     }
 
     // Stage 2: legacy POST (initialize)
@@ -734,7 +773,7 @@ async fn probe_mcp_endpoint(url: &str) -> Option<String> {
                 "params": {
                     "protocolVersion": "2025-06-18",
                     "capabilities": {},
-                    "clientInfo": { "name": "rpi-mcp-probe", "version": "1.0.0" }
+                    "clientInfo": { "name": "rpi-mcp-probe", "version": "2.1.2" }
                 }
             })
             .to_string(),
@@ -742,10 +781,15 @@ async fn probe_mcp_endpoint(url: &str) -> Option<String> {
         .send()
         .await
         .ok()?;
-
-    let classification = classify_probe_response(legacy_response, false).await;
-    if let Some(classification) = classification {
-        return Some(classification);
+    let legacy_post = probe_stage(legacy_response, true, false).await;
+    if let ProbeOutcome::Mcp { classification } = &legacy_post.outcome {
+        return Some(classification.clone());
+    }
+    ambiguous = ambiguous.or_else(|| ambiguous_not_mcp(&legacy_post.response_status, &legacy_post.content_type));
+    if !POST_ENDPOINT_MISMATCH_STATUSES.contains(&legacy_post.response_status) {
+        return ambiguous_not_mcp(&legacy_post.response_status, &legacy_post.content_type)
+            .or(ambiguous)
+            .or_else(|| Some(not_mcp(&legacy_post.response_status, &legacy_post.content_type)));
     }
 
     // Stage 3: legacy SSE (GET stream)
@@ -755,21 +799,153 @@ async fn probe_mcp_endpoint(url: &str) -> Option<String> {
         .send()
         .await
         .ok()?;
+    let sse = probe_stage(sse_response, false, false).await;
+    match sse.outcome {
+        ProbeOutcome::Mcp { classification } => Some(classification),
+        _ => ambiguous_not_mcp(&sse.response_status, &sse.content_type)
+            .or(ambiguous)
+            .or_else(|| Some(not_mcp(&sse.response_status, &sse.content_type))),
+    }
+}
 
-    let content_type = sse_response
+/// `PROBE_TIMEOUT_MS` (mcp-probe.ts:1 @ 10a45367).
+const PROBE_TIMEOUT_SECS: u64 = 5;
+/// `MODERN_FALLBACK_STATUSES` (mcp-probe.ts:7 @ 10a45367).
+const MODERN_FALLBACK_STATUSES: [u16; 6] = [400, 401, 404, 405, 406, 415];
+/// `POST_ENDPOINT_MISMATCH_STATUSES` (mcp-probe.ts:8 @ 10a45367).
+const POST_ENDPOINT_MISMATCH_STATUSES: [u16; 4] = [404, 405, 406, 415];
+/// `AMBIGUOUS_STATUSES` (mcp-probe.ts:9 @ 10a45367) — #415: 202/401/503 get
+/// the "endpoint shape could not be determined" flavors.
+const AMBIGUOUS_STATUSES: [u16; 3] = [202, 401, 503];
+
+/// One probe stage's consumed response summary + outcome
+/// (`classifyResponse` returns the outcome; `notMcp`/`ambiguousNotMcp`
+/// consume the response afterwards — upstream keeps the `Response` object,
+/// the Rust port snapshots the fields those helpers read).
+struct ProbeStage {
+    response_status: u16,
+    content_type: String,
+    outcome: ProbeOutcome,
+}
+
+enum ProbeOutcome {
+    Mcp { classification: String },
+    UnsupportedModern,
+    Unrecognized,
+}
+
+/// `notMcp` (mcp-probe.ts:143-156 @ 10a45367): the non-MCP classification
+/// with the #415 status flavors.
+fn not_mcp(status: &u16, content_type: &str) -> String {
+    let description = format!(
+        "endpoint returned {} ({})",
+        probe_response_kind(content_type),
+        status
+    );
+    let suffix = match *status {
+        503 => " — server is temporarily unavailable; MCP endpoint shape could not be determined",
+        202 => " — MCP endpoint shape could not be determined",
+        401 => " — authentication may be required; MCP endpoint shape could not be determined",
+        _ => " — this URL does not appear to speak MCP",
+    };
+    format!("{description}{suffix}")
+}
+
+/// `ambiguousNotMcp` (mcp-probe.ts:158-160 @ 10a45367): the not-MCP
+/// classification only for the ambiguous statuses.
+fn ambiguous_not_mcp(status: &u16, content_type: &str) -> Option<String> {
+    AMBIGUOUS_STATUSES
+        .contains(status)
+        .then(|| not_mcp(status, content_type))
+}
+
+/// Run one probe request + `classifyResponse` (mcp-probe.ts:120-155 @
+/// 10a45367). `is_modern` marks the `server/discover` strategy (its
+/// classifications and the unsupported-modern check differ); the SSE
+/// strategy sets `allow_json = false` but still inspects 401 bodies for
+/// the Bearer-challenge classification.
+async fn probe_stage(response: reqwest::Response, allow_json: bool, is_modern: bool) -> ProbeStage {
+    let status = response.status().as_u16();
+    let content_type = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if sse_response.status().is_success() && content_type.starts_with("text/event-stream") {
-        return Some("endpoint responded with an MCP event stream".to_string());
-    }
+        .unwrap_or("")
+        .to_lowercase();
+    // Read before the body consume (`Response::text` takes `self`).
+    let bearer_challenge = is_bearer_challenge(&response);
+    let is_success = response.status().is_success();
 
-    Some(format!(
-        "endpoint returned {} ({}) — this URL does not appear to speak MCP",
-        probe_response_kind(content_type),
-        sse_response.status().as_u16()
-    ))
+    // `getJsonRpcEnvelopeInfo` — parsed only when the strategy allows JSON
+    // or the status is 401 (the Bearer-challenge classification reads the
+    // body). `None` = not a JSON-RPC 2.0 envelope.
+    let envelope: Option<Result<Option<&'static str>, ()>> = if allow_json || status == 401 {
+        response
+            .text()
+            .await
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| {
+                if value.get("jsonrpc") != Some(&json!("2.0")) {
+                    return None;
+                }
+                if let Some(result) = value.get("result") {
+                    let is_modern_version = result.get("protocolVersion").and_then(Value::as_str)
+                        == Some(crate::oauth::MODERN_PROTOCOL_VERSION);
+                    return Some(Ok(if is_modern_version {
+                        Some(crate::oauth::MODERN_PROTOCOL_VERSION)
+                    } else {
+                        // A non-string or mismatched protocolVersion: keep a
+                        // marker that is != MODERN so the modern check
+                        // rejects it (upstream compares `!== MODERN`).
+                        Some("")
+                    }));
+                }
+                if value.get("error").is_some() {
+                    return Some(Err(()));
+                }
+                None
+            })
+    } else {
+        None
+    };
+
+    let outcome = if is_success && content_type.starts_with("text/event-stream")
+    {
+        ProbeOutcome::Mcp {
+            classification: "endpoint responded with an MCP event stream".to_string(),
+        }
+    } else if is_success && allow_json && envelope.is_some() {
+        match (&envelope, is_modern) {
+            // `strategy.kind === "modern" && (envelope.kind === "error" ||
+            // envelope.protocolVersion !== MODERN_PROTOCOL_VERSION)`.
+            (Some(Err(())), true) | (Some(Ok(Some(""))), true) => {
+                ProbeOutcome::UnsupportedModern
+            }
+            _ => ProbeOutcome::Mcp {
+                classification: if is_modern {
+                    "endpoint supports stateless MCP 2026-07-28 server/discover".to_string()
+                } else {
+                    "endpoint responded with a JSON-RPC 2.0 envelope".to_string()
+                },
+            },
+        }
+    } else if status == 401 && bearer_challenge && envelope.is_some() {
+        ProbeOutcome::Mcp {
+            classification: if is_modern {
+                "endpoint requires Bearer authentication during MCP 2026-07-28 server/discover probing".to_string()
+            } else {
+                "endpoint requires Bearer authentication and responded with a JSON-RPC 2.0 error".to_string()
+            },
+        }
+    } else {
+        ProbeOutcome::Unrecognized
+    };
+    ProbeStage {
+        response_status: status,
+        content_type,
+        outcome,
+    }
 }
 
 /// `responseKind` (mcp-probe.ts:105-110): "HTML" for text/html, the bare
@@ -804,77 +980,31 @@ fn is_bearer_challenge(response: &reqwest::Response) -> bool {
         })
 }
 
-/// `classifyResponse` (mcp-probe.ts:121-155): check if the response
-/// indicates an MCP endpoint. Consumes the response body. Returns
-/// `None` for the "unrecognized" outcome (caller falls through to the next
-/// probe stage).
-async fn classify_probe_response(response: reqwest::Response, is_modern: bool) -> Option<String> {
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-
-    // SSE stream → MCP
-    if response.status().is_success() && content_type.starts_with("text/event-stream") {
-        return Some("endpoint responded with an MCP event stream".to_string());
-    }
-
-    // JSON-RPC envelope check (allowJson strategies; 401 also inspected for
-    // the Bearer-challenge classification).
-    let status = response.status().as_u16();
-    let bearer_challenge = is_bearer_challenge(&response);
-    if response.status().is_success() || status == 401 {
-        if let Ok(text) = response.text().await {
-            if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                if value.get("jsonrpc") == Some(&json!("2.0")) {
-                    if let Some(result) = value.get("result") {
-                        // Modern stage: an error envelope or a mismatched
-                        // protocolVersion is "unsupported-modern" (fall
-                        // through to the legacy stages).
-                        if is_modern
-                            && result.get("protocolVersion").and_then(Value::as_str)
-                                != Some(crate::oauth::MODERN_PROTOCOL_VERSION)
-                        {
-                            return None;
-                        }
-                        return Some(if is_modern {
-                            "endpoint supports stateless MCP 2026-07-28 server/discover".to_string()
-                        } else {
-                            "endpoint responded with a JSON-RPC 2.0 envelope".to_string()
-                        });
-                    }
-                    if value.get("error").is_some() {
-                        if is_modern {
-                            return None; // unsupported-modern
-                        }
-                        if status == 401 && bearer_challenge {
-                            return Some(
-                                "endpoint requires Bearer authentication and responded with a \
-                                 JSON-RPC 2.0 error"
-                                    .to_string(),
-                            );
-                        }
-                        return None;
-                    }
-                }
-            }
-        }
-    }
-
-    None
+/// `isTransientHttpConnectError` (server-manager.ts:181-189 @ 10a45367,
+/// #411/#424): a 503 anywhere in the error chain is an availability
+/// blip. The Rust port surfaces transport HTTP statuses as
+/// `ProtocolError::Http { status }` (no wrapped cause chain), so the
+/// direct match is the whole chain walk.
+fn is_transient_http_connect_error(error: &ProtocolError) -> bool {
+    matches!(error, ProtocolError::Http { status: 503, .. })
 }
 
-/// `enrichHttpConnectionError` (server-manager.ts:522-530): append a
-/// probe-based classification suffix to the HTTP connection failure message.
-/// The probe itself must NOT carry credentials — it is a metadata-only
-/// unauthenticated request (G4 red line).
+/// `enrichHttpConnectionError` (server-manager.ts:978-988 @ 10a45367):
+/// append a probe-based classification suffix to the HTTP connection
+/// failure message — except for a transient 503, which gets the dedicated
+/// availability suffix WITHOUT running the probe (no amplified requests,
+/// no "not MCP" misdiagnosis). The probe itself must NOT carry credentials
+/// — it is a metadata-only unauthenticated request (G4 red line).
 async fn enrich_http_connection_error(
     definition: &ServerEntry,
     error: ProtocolError,
 ) -> ProtocolError {
     let original_message = error.to_string();
+    if is_transient_http_connect_error(&error) {
+        return ProtocolError::Transport(format!(
+            "{original_message} — endpoint is temporarily unavailable (HTTP 503)"
+        ));
+    }
     let url = match crate::utils::resolve_server_url(definition.get("url")) {
         Ok(Some(url)) => url,
         _ => return error,
@@ -1086,4 +1216,113 @@ mod tests {
         ));
         assert!(!should_fallback_to_sse(500, ProtocolVersionMode::Legacy));
     }
+    // ===== TE24 FR-B: stdio cwd diagnostics (#442) =====
+
+    #[tokio::test]
+    async fn stdio_cwd_diagnostics_distinguish_missing_and_not_a_directory() {
+        let manager = McpServerManager::new(None);
+        let dir = std::env::temp_dir().join("rpi-te24-cwd-diag");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").expect("write");
+
+        // Missing cwd names the path (server-manager.ts:799-803 @ 10a45367).
+        let missing = manager
+            .connect("srv", &entry(json!({ "command": "true", "cwd": "/definitely/not/here" })))
+            .await
+            .err()
+            .expect("connect fails");
+        assert_eq!(
+            missing.to_string(),
+            "MCP server \"srv\" configured cwd does not exist: \"/definitely/not/here\""
+        );
+        // Non-directory cwd.
+        let not_dir = manager
+            .connect("srv", &entry(json!({ "command": "true", "cwd": file.to_str().unwrap() })))
+            .await
+            .err()
+            .expect("connect fails");
+        assert!(
+            not_dir.to_string().starts_with(
+                "MCP server \"srv\" configured cwd is not a directory: \""
+            ),
+            "got: {not_dir}"
+        );
+        // The default (session) cwd is diagnosed too, not only an explicit one.
+        let manager_default = McpServerManager::new(Some(file.to_str().unwrap().to_string()));
+        let by_default = manager_default
+            .connect("srv", &entry(json!({ "command": "true" })))
+            .await
+            .err()
+            .expect("connect fails");
+        assert!(
+            by_default
+                .to_string()
+                .contains("configured cwd is not a directory"),
+            "got: {by_default}"
+        );
+        // A valid directory cwd proceeds to the spawn (a different error:
+        // the handshake fails because `true` is not an MCP server).
+        let ok_cwd = manager
+            .connect("srv", &entry(json!({ "command": "true", "cwd": dir.to_str().unwrap() })))
+            .await
+            .err()
+            .expect("connect fails");
+        assert!(
+            !ok_cwd.to_string().contains("configured cwd"),
+            "valid cwd must not trip the diagnostic: {ok_cwd}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ===== TE24 FR-B: probe classification flavors (#415) =====
+
+    #[test]
+    fn probe_not_mcp_status_flavors() {
+        // mcp-probe.ts:143-156 @ 10a45367.
+        assert_eq!(
+            not_mcp(&503, "text/html"),
+            "endpoint returned HTML (503) — server is temporarily unavailable; \
+MCP endpoint shape could not be determined"
+        );
+        assert_eq!(
+            not_mcp(&202, "application/json"),
+            "endpoint returned application/json (202) — MCP endpoint shape could not be determined"
+        );
+        assert_eq!(
+            not_mcp(&401, ""),
+            "endpoint returned an untyped response (401) — authentication may \
+be required; MCP endpoint shape could not be determined"
+        );
+        assert_eq!(
+            not_mcp(&404, "text/html"),
+            "endpoint returned HTML (404) — this URL does not appear to speak MCP"
+        );
+    }
+
+    #[test]
+    fn probe_ambiguous_statuses_only_cover_202_401_503() {
+        // mcp-probe.ts:158-160 @ 10a45367.
+        for status in [202u16, 401, 503] {
+            assert!(ambiguous_not_mcp(&status, "text/html").is_some());
+        }
+        for status in [200u16, 400, 404, 500] {
+            assert!(ambiguous_not_mcp(&status, "text/html").is_none());
+        }
+    }
+
+    #[test]
+    fn probe_transient_503_classification() {
+        // #411/#424: a 503 stays an availability error.
+        assert!(is_transient_http_connect_error(&ProtocolError::Http {
+            status: 503,
+            message: "Error POSTing to endpoint".to_string()
+        }));
+        assert!(!is_transient_http_connect_error(&ProtocolError::Http {
+            status: 500,
+            message: "Error POSTing to endpoint".to_string()
+        }));
+        assert!(!is_transient_http_connect_error(&ProtocolError::Unauthorized));
+    }
+
 }

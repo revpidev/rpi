@@ -3315,6 +3315,36 @@ impl ProxyDispatcher {
             }
         }
 
+        // #417 (index.ts:1085-1096 @ 9f81a75): gateway params nested inside
+        // `args` were previously dispatched inconsistently (an object with
+        // a gateway key was silently unwrapped; without one the dispatch
+        // fell through to `status`). Upstream now rejects EVERY `args`
+        // without a top-level gateway mode with the guidance message.
+        // The ABI has no throw channel, so the message rides a normal
+        // result (same TE-D04 pattern as `invalid_args` above).
+        let has_gateway_mode = [
+            params.get("tool"),
+            params.get("connect"),
+            params.get("describe"),
+            params.get("instructions"),
+            params.get("search"),
+            params.get("server"),
+            params.get("action"),
+        ]
+        .iter()
+        .any(|value| value.is_some_and(|v| !v.is_null()));
+        if !has_gateway_mode && params.get("args").is_some_and(|v| !v.is_null()) {
+            let message = concat!(
+                "Gateway params were nested inside `args`; pass them top-level ",
+                "(for example, mcp({ search: \"...\" }) or mcp({ tool: \"...\", args: {} }))."
+            )
+            .to_string();
+            return text_result(
+                message.clone(),
+                json!({ "error": "invalid_args", "message": message }),
+            );
+        }
+
         let runtime = match self.current().await {
             Ok(runtime) => runtime,
             Err(GateError::Timeout) => {
