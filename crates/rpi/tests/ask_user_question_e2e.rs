@@ -800,10 +800,14 @@ fn find_jsonl(dir: &Path) -> Option<PathBuf> {
         .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
 }
 
-/// FR-A/R-Q5.1/Q5.4/Q5.6: two questions — a multi-select (Space + Next row)
-/// then a single-select — Tab-free auto-advance onto the Submit tab, the
-/// global note (`n` on Submit) and Submit; the envelope carries the multi
-/// answer, the option answer and the global note.
+/// FR-A/R-Q5.1/Q5.4/Q5.6: two questions — a multi-select (Space + Next
+/// row) then a single-select — auto-advance onto q2, explicit `Tab`/
+/// `Shift+Tab` tab hopping through the real pipeline, the global note
+/// (`n` on Submit) and Submit; the envelope carries the multi answer, the
+/// option answer and the global note. (`↑` and the per-question notes
+/// editor stay covered by the TE30/TE31 key matrix + golden frames; every
+/// key this e2e drives reaches the component through the real input
+/// pipeline.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_multi_question_multi_select_notes_submit() {
     let params = json!({
@@ -842,10 +846,17 @@ async fn tui_multi_question_multi_select_notes_submit() {
     fixture.term.feed("\x1b[B"); // ↓ Type something.
     fixture.term.feed("\x1b[B"); // ↓ Next
     fixture.term.feed("\r");
-    // q2: auto-advanced; Enter picks Alpha and auto-advances to Submit.
+    // q2: auto-advanced. Exercise the explicit tab keys through the real
+    // pipeline before answering (R-Q5.1): Tab hops q2 → the Submit tab,
+    // Shift+Tab wraps back onto q2.
     await_screen(&fixture.term, "H2", Duration::from_secs(10)).await;
+    fixture.term.feed("\t");
+    // Submit tab: answers review + Submit/Cancel rows.
+    await_screen(&fixture.term, "Submit", Duration::from_secs(10)).await;
+    fixture.term.feed("\x1b[Z");
+    await_screen(&fixture.term, "Pick one?", Duration::from_secs(10)).await;
+    // Enter picks Alpha and auto-advances to Submit.
     fixture.term.feed("\r");
-    // Submit tab (R-Q5.1): answers review + Submit/Cancel rows.
     await_screen(&fixture.term, "Submit", Duration::from_secs(10)).await;
     // Global note via `n` on the Submit tab (R-Q5.6), then commit + submit.
     fixture.term.feed("n");
