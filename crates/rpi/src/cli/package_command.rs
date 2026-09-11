@@ -2471,12 +2471,24 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn bare_update_on_binary_without_new_version_exits_0() {
         // T18 (ADR-0011 §4/§7, D-054): bare `rpi update` on a Binary
         // install no longer exits 1 — nothing to do is a clean exit 0
         // (the "Extensions are skipped" note is printed, not asserted
         // here: it goes to stdout).
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B2/N1 补齐)：self 探测路径须固定
+        // RPI_OFFLINE 缺席，防 environment 测试并发写翻转结果。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let transport = StubTransport::responds(Ok(Some(format!(r#"{{"version": "{VERSION}"}}"#))));
         let code = run_update_in(
             &args(&["update"]),
@@ -2491,8 +2503,20 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn bare_update_on_binary_with_new_version_self_updates() {
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B2/N1 补齐)：self 探测路径须固定
+        // RPI_OFFLINE 缺席，防 environment 测试并发写翻转结果。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let transport = StubTransport::newer_version();
         let (exe, seam) = binary_seam(&dirs, "99.0.0", b"new-binary");
         let code = run_update_in(
@@ -2509,8 +2533,20 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_self_endpoint_failures_exit_1() {
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B2/N1 补齐)：self 探测路径须固定
+        // RPI_OFFLINE 缺席，防 environment 测试并发写翻转结果。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         // Non-OK response → "Could not determine latest rpi version."
         let code = run_update_in(
             &args(&["update", "--self"]),
@@ -2538,8 +2574,20 @@ mod update_cli_tests {
     // ---- T14-W6a: configurable version-check endpoint (ADR-0002 §8) ----
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_self_probes_the_settings_configured_endpoint() {
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B2/N1 补齐)：self 探测路径须固定
+        // RPI_OFFLINE 缺席，防 environment 测试并发写翻转结果。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         std::fs::write(
             dirs.agent_dir.join("settings.json"),
             r#"{"versionCheckUrl": "https://mirror.test/latest-version"}"#,
