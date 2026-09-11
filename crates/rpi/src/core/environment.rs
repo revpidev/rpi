@@ -282,22 +282,29 @@ pub const ENV_MODEL: &str = "RPI_MODEL";
 /// `PI_REASONING_LEVEL` (bash.ts:174) — Rpi rename.
 pub const ENV_REASONING_LEVEL: &str = "RPI_REASONING_LEVEL";
 
+/// Test-only process-env serialization, shared crate-wide: the process
+/// environment is global state, so env-writing tests (e.g. `set_offline_env`)
+/// and readers that branch on env flags (e.g. `package_command`'s offline
+/// version-probe short-circuit via `is_offline_mode_enabled`) must hold the
+/// same lock or they race across parallel test threads (V14-21 independent
+/// tracking item F1, closed in v0.1.4 M7).
 #[cfg(test)]
-mod tests {
-    //! Env-manipulating tests are serialized through `ENV_LOCK` to avoid
-    //! cross-test interference (the process environment is global state).
-    use super::*;
+pub(crate) mod test_env {
     use std::sync::{Mutex, MutexGuard};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restore the named variables to their prior values on drop.
-    struct EnvGuard {
+    /// Pin the named variables for the guard's lifetime: sets each to the
+    /// given value (`None` removes it), holds the shared `ENV_LOCK` for the
+    /// duration, and restores the prior values on drop.
+    pub(crate) struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
     }
 
     impl EnvGuard {
-        fn set(vars: &[(&'static str, Option<&str>)]) -> (MutexGuard<'static, ()>, Self) {
+        pub(crate) fn set(
+            vars: &[(&'static str, Option<&str>)],
+        ) -> (MutexGuard<'static, ()>, Self) {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let saved = vars
                 .iter()
@@ -323,6 +330,15 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Env-manipulating tests are serialized through the shared
+    //! [`test_env::ENV_LOCK`] (see its module doc) to avoid cross-test
+    //! interference (the process environment is global state).
+    use super::test_env::EnvGuard;
+    use super::*;
 
     // Port of isTruthyEnvFlag (main.ts:95-98 / telemetry.ts:3-6).
     #[test]

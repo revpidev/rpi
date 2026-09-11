@@ -2093,6 +2093,14 @@ mod update_cli_tests {
     /// RC 通道的 self 更新计划（FR-B/FR-C）：探测推导端点；force 重装。
     #[tokio::test]
     async fn self_update_plan_pre_release_channel_probes_rc_endpoint() {
+        // Pin the offline flag absent under the crate env lock: the probe
+        // short-circuits entirely when `RPI_OFFLINE` is truthy, and env-
+        // writing tests in `core::environment` used to race this read
+        // (V14-21 tracking item F1).
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let transport =
             StubTransport::responds(Ok(Some(r#"{"version": "99.0.0-rc.2"}"#.to_string())));
         let plan = get_self_update_plan(
@@ -2115,6 +2123,11 @@ mod update_cli_tests {
     /// 通道同版本 no-op；端点禁用两通道同样报错。
     #[tokio::test]
     async fn self_update_plan_channel_selection_matrix() {
+        // Same offline pin as the RC-endpoint test above (V14-21 F1).
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         // stable 通道 → stable 端点（现状 URL，零回归钉死）。
         let transport = StubTransport::newer_version();
         get_self_update_plan(
@@ -2348,6 +2361,12 @@ mod update_cli_tests {
 
     #[tokio::test]
     async fn update_self_up_to_date_exits_0_without_runner() {
+        // The update-self path probes the version endpoint through
+        // `is_offline_mode_enabled()` — pin it absent (V14-21 F1).
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let dirs = TestDirs::new();
         let runner = FakeRunner::npm_view_latest();
         let transport = StubTransport::responds(Ok(Some(format!(r#"{{"version": "{VERSION}"}}"#))));
@@ -2369,6 +2388,11 @@ mod update_cli_tests {
         // T18 (ADR-0011 §7, D-054): the Binary branch no longer prints the
         // releases page and exits 1 — it downloads, verifies the sha256,
         // atomically replaces the executable, and updates the manifest.
+        // Offline pin: the probe must actually run (V14-21 F1).
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let dirs = TestDirs::new();
         let transport = StubTransport::newer_version();
         let (exe, seam) = binary_seam(&dirs, "99.0.0", b"new-binary");
@@ -2391,6 +2415,12 @@ mod update_cli_tests {
 
     #[tokio::test]
     async fn update_self_force_reinstalls_same_version_on_binary() {
+        // Offline pin (V14-21 F1): the probe must run for --force to reach
+        // the reinstall branch.
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let dirs = TestDirs::new();
         let transport = StubTransport::responds(Ok(Some(format!(r#"{{"version": "{VERSION}"}}"#))));
         // --force makes the plan run even at the latest version; the

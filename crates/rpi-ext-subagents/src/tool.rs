@@ -876,6 +876,29 @@ fn dispatch_async(
         crate::runner::background::AsyncBody::Steps { steps, .. } => steps.len() as u64,
     };
 
+    // Fanout self-extension preflight (TE18 tracking item 1, v0.1.4 M7):
+    // reject the misconfiguration BEFORE the session spawn budget is
+    // reserved — the in-depth child-argv check stays as defense in depth
+    // (same message, single source in `launch_child`).
+    let body_agent_names: Vec<String> = match &body {
+        crate::runner::background::AsyncBody::Single { spec } => vec![spec.agent_name.clone()],
+        crate::runner::background::AsyncBody::Tasks { entries, .. } => entries
+            .iter()
+            .map(|entry| entry.spec.agent_name.clone())
+            .collect(),
+        crate::runner::background::AsyncBody::Steps { steps, .. } => steps
+            .iter()
+            .map(|step| step.agent_name.clone())
+            .collect(),
+    };
+    if let Some(error) = crate::p1::launch_child::preflight_self_extension(
+        &body_agent_names,
+        agents,
+        crate::launch::binary::resolve_self_extension_path().as_deref(),
+    ) {
+        return ToolOutcome::error(error);
+    }
+
     // Budget preflight (ADR-0019 §4): session spawn ledger first (releases on
     // nothing — spawns are cumulative), then the active-async capacity slot.
     let spawn_ledger = crate::runner::background::SpawnBudgetLedger::open(

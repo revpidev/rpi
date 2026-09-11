@@ -2905,9 +2905,20 @@ mod tests {
     }
 
     /// `ModelRuntime::login`'s post-login refresh runs under a bounded
-    /// signal (D-053): cancelling the interaction signal (the login dialog's
-    /// cancel) aborts a hanging remote-catalog fetch instead of freezing the
-    /// login flow forever.
+    /// signal (D-053): the interaction signal (the login dialog's cancel)
+    /// propagates into the refresh budget. Since T23 the scoped post-login
+    /// refresh is OFFLINE (`allow_network: false`, model-runtime.ts:525-528
+    /// parity), so a hanging network fetch can no longer be constructed
+    /// through this entry point — the hang-abort path is covered by
+    /// `refresh_aborts_hanging_catalog_fetch_via_signal` (direct refresh)
+    /// and `login_hung_refresh_aborts_via_configured_timeout` (budget
+    /// timeout). This test pins the remaining invariant deterministically:
+    /// the offline sync completes and commits the credential, and a cancel
+    /// landing after completion cannot fail the login. (The old fixed
+    /// `sleep(200ms)`-then-cancel raced the offline sync window under
+    /// parallel load — a mid-refresh cancel aborts it and fails the login —
+    /// which was the observed flake; TE30 tracking item T1, hardened in
+    /// v0.1.4 M7 by sequencing on completion instead of wall time.)
     #[tokio::test]
     async fn login_interaction_cancel_aborts_hanging_post_login_refresh() {
         const ENV_KEY: &str = "RPI_TEST_MODEL_RUNTIME_LOGIN_KEY";
@@ -2971,14 +2982,18 @@ mod tests {
                 .login("login-hang-test", AuthType::ApiKey, &interaction)
                 .await
         });
-        // Let the login reach the hanging refresh (store + refresh start).
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        signal.cancel();
-        let credential = tokio::time::timeout(std::time::Duration::from_secs(5), login)
+        // Sequence on completion, not wall time: await the (fast, offline)
+        // post-login sync with a load-tolerant budget, THEN cancel — a
+        // dialog cancel landing after the sync must not be able to fail the
+        // committed login. The old fixed sleep-then-cancel window is what
+        // flaked under parallel load (a mid-sync cancel aborts the refresh
+        // and legitimately fails the login).
+        let credential = tokio::time::timeout(std::time::Duration::from_secs(30), login)
             .await
-            .expect("interaction cancel must unblock the login")
+            .expect("offline post-login sync must complete")
             .expect("login task")
-            .expect("login succeeds despite the aborted refresh");
+            .expect("login commits the credential");
+        signal.cancel();
         assert!(matches!(credential, Credential::ApiKey(_)));
         std::env::remove_var(ENV_KEY);
     }

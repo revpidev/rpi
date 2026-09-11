@@ -412,6 +412,54 @@ pub fn run_child(
 /// background). Callers on the host dispatch thread wrap this with
 /// `PluginRuntime::block_on`; parallel children call it directly inside one
 /// runtime `block_on` — never nest `block_on` on the same runtime.
+/// Fanout authorization predicate (#1587, child-tool-plan.ts:329-333):
+/// the explicit `tools` allowlist naming `subagent`, OR
+/// `allowNestedSubagents: true` while `excludeTools` does not name it.
+/// Shared by the child-argv check below and the dispatch-time budget
+/// preflight in `tool.rs` (TE18 independent tracking item 1 closure,
+/// v0.1.4 M7: the misconfiguration must fail BEFORE the session spawn
+/// budget is reserved, not after).
+pub fn agent_authorizes_nested_fanout(agent: &crate::agents::discover::AgentConfig) -> bool {
+    agent
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t == "subagent"))
+        || (agent.allow_nested_subagents == Some(true)
+            && !agent.exclude_tools.iter().any(|t| t == "subagent"))
+}
+
+/// The fanout self-extension precondition error (single source for the
+/// dispatch-time preflight and the in-depth child-argv check).
+pub fn self_extension_missing_error() -> String {
+    "This agent authorizes nested subagents (tools includes \"subagent\") but the subagents extension library path could not be resolved for child injection. Set RPI_SUBAGENT_EXTENSION_PATH to the installed librpi_ext_subagents shared library.".to_string()
+}
+
+/// Dispatch-time preflight (TE18 independent tracking item 1 closure,
+/// v0.1.4 M7): when the self-extension path cannot be resolved and any
+/// referenced agent authorizes nested fanout, reject the run BEFORE the
+/// session spawn budget is reserved — previously each attempt burned
+/// budget before failing in the child-argv builder, so a missing
+/// `RPI_SUBAGENT_EXTENSION_PATH` eventually surfaced as budget exhaustion
+/// instead of the actionable config error. Unknown agent names are left to
+/// their own existing failure paths.
+pub fn preflight_self_extension(
+    agent_names: &[String],
+    agents: &[crate::agents::discover::AgentConfig],
+    self_extension: Option<&std::path::Path>,
+) -> Option<String> {
+    if self_extension.is_some() {
+        return None;
+    }
+    for name in agent_names {
+        if let Ok(Some(agent)) = crate::agents::discover::resolve_agent_name(agents, name) {
+            if agent_authorizes_nested_fanout(agent) {
+                return Some(self_extension_missing_error());
+            }
+        }
+    }
+    None
+}
+
 pub async fn run_child_async(
     spec: &ChildSpec,
     agent: &AgentConfig,
@@ -700,18 +748,11 @@ pub async fn run_child_async(
     // `subagent`, OR `allowNestedSubagents: true` while `excludeTools`
     // does not name it (child-tool-plan.ts:329-333 — the flag authorizes
     // nested fanout without replacing inherited tools/extensions).
-    let fanout_authorized = agent
-        .tools
-        .as_ref()
-        .is_some_and(|tools| tools.iter().any(|t| t == "subagent"))
-        || (agent.allow_nested_subagents == Some(true)
-            && !agent.exclude_tools.iter().any(|t| t == "subagent"));
+    let fanout_authorized = agent_authorizes_nested_fanout(agent);
     let self_extension = crate::launch::binary::resolve_self_extension_path()
         .map(|p| p.to_string_lossy().to_string());
     if fanout_authorized && self_extension.is_none() {
-        return Err(
-            "This agent authorizes nested subagents (tools includes \"subagent\") but the subagents extension library path could not be resolved for child injection. Set RPI_SUBAGENT_EXTENSION_PATH to the installed librpi_ext_subagents shared library.".to_string(),
-        );
+        return Err(self_extension_missing_error());
     }
 
     let child_max_depth = budget::resolve_child_max_depth(
@@ -1135,6 +1176,48 @@ mod te18_fork_tests {
 mod te18_gate_budget_tests {
     use super::*;
     use crate::agents::discover::AgentSource;
+
+    /// TE18 independent tracking item 1 (v0.1.4 M7): the fanout
+    /// self-extension misconfiguration must be rejected at dispatch time —
+    /// before the session spawn budget is reserved. With the resolved path
+    /// injected (None = misconfigured install), a fanout-authorized agent
+    /// yields the actionable config error; a plain agent passes the
+    /// preflight untouched.
+    #[test]
+    fn preflight_self_extension_rejects_fanout_before_budget() {
+        let fanout_agent = crate::agents::discover::agent_from_content(
+            "---\nname: fanout\ndescription: d\ntools:\n  - subagent\n---\nbody",
+            std::path::Path::new("/x/fanout.md"),
+            AgentSource::User,
+        )
+        .expect("agent parses")
+        .expect("agent present");
+        let plain_agent = crate::agents::discover::agent_from_content(
+            "---\nname: plain\ndescription: d\ntools:\n  - web_search\n---\nbody",
+            std::path::Path::new("/x/plain.md"),
+            AgentSource::User,
+        )
+        .expect("agent parses")
+        .expect("agent present");
+        let agents = vec![fanout_agent, plain_agent];
+
+        assert!(agent_authorizes_nested_fanout(&agents[0]));
+        assert!(!agent_authorizes_nested_fanout(&agents[1]));
+
+        let names_all = vec!["plain".to_string(), "fanout".to_string()];
+        let names_plain = vec!["plain".to_string()];
+        let resolved = Some(std::path::Path::new("/opt/lib/librpi_ext_subagents.so"));
+
+        // Missing path: the fanout agent is rejected with the actionable
+        // config error; the plain agent passes untouched.
+        let error = preflight_self_extension(&names_all, &agents, None)
+            .expect("fanout misconfiguration rejected before budget");
+        assert_eq!(error, self_extension_missing_error());
+        assert!(preflight_self_extension(&names_plain, &agents, None).is_none());
+
+        // Path resolved: nothing is rejected either way.
+        assert!(preflight_self_extension(&names_all, &agents, resolved).is_none());
+    }
 
     #[test]
     fn gate_rejection_returns_the_spawn_budget_slot() {

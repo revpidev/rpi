@@ -547,7 +547,7 @@ async fn parity_pipeline_scenarios() {
     // (same fixed temp dir, cleared up front like the generator does).
     const SKIP_RESULT: [&str; 0] = [];
     const ASTRAL_VARIANT: [&str; 1] = ["maxchars-astral-variant"];
-    let download_dir = std::path::Path::new("/tmp/smart-fetch-parity-downloads");
+    let download_dir = std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR);
     let _ = std::fs::remove_dir_all(download_dir);
 
     let mut failures = Vec::new();
@@ -773,6 +773,12 @@ async fn parity_pipeline_scenarios() {
         failures.len(),
         failures.join("\n")
     );
+
+    // Mirror the generator's trailing cleanup (`gen-fixtures.mjs` rmSync at
+    // the end): the download sandbox is scratch, not evidence — leaving the
+    // last run's bytes behind only invites cross-run confusion (V14-22
+    // tracking-item hygiene closure).
+    let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
 }
 
 /// TE08 FR-P2-C: replay the batch-progress fixtures (concurrency 1 on both
@@ -866,8 +872,19 @@ async fn parity_batch_progress_snapshots() {
         };
 
         // Concurrency 1 mirrors the generator's `batchConcurrency: 1`.
+        // The download sandbox (V14-22 independent-tracking-item closure,
+        // M7): the generator routes the attachment scenario's bytes through
+        // `DOWNLOAD_TEMP_DIR` (`gen-fixtures.mjs`), which the recorded
+        // normalized request never carries (per-entry `tempDir` is not a
+        // schema param upstream). Mirror it through the tool defaults so the
+        // replay's bytes land in the cleared sandbox instead of the DEFAULT
+        // product temp dir — before this, every run dropped another
+        // `data[-N].bin` into `$TMPDIR/smart-fetch-rpi` (never cleaned; the
+        // EEXIST retry budget made the workspace gate go red after ~100
+        // accumulated files). The comparison normalizes `tempDir` away below.
         let defaults = batch::resolve_fetch_tool_defaults(&FetchToolConfig {
             batch_concurrency: Some(1.0),
+            temp_dir: Some(PARITY_DOWNLOAD_TEMP_DIR.to_string()),
             ..FetchToolConfig::default()
         });
 
@@ -898,8 +915,12 @@ async fn parity_batch_progress_snapshots() {
 
         // The final result shape (request options ride per item like the
         // generator's `request` field — compare status/progress/result).
+        // Upstream records the params-level options; the replay's defaults
+        // inject the download sandbox, so strip `tempDir` (upstream's
+        // recorded request never carries it — see the fixture).
         let mut actual_result =
             serde_json::to_value(batch_result_parity_json(&result)).unwrap_or(Value::Null);
+        strip_request_temp_dir(&mut actual_result);
         mask_file_paths(&mut actual_result);
         let mut expected_result = output.get("result").cloned().unwrap_or(Value::Null);
         mask_file_paths(&mut expected_result);
@@ -916,10 +937,44 @@ async fn parity_batch_progress_snapshots() {
         failures.len(),
         failures.join("\\n")
     );
+
+    // Same trailing-cleanup contract as the generator / the replay above.
+    let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
 }
 
 fn _request_url(request: &HttpRequest) -> String {
     request.url.clone()
+}
+
+/// The generator's fixed download sandbox (`gen-fixtures.mjs`
+/// `DOWNLOAD_TEMP_DIR`): cleared up front and removed at the end of every
+/// replay that can produce file results.
+const PARITY_DOWNLOAD_TEMP_DIR: &str = "/tmp/smart-fetch-parity-downloads";
+
+/// Remove `tempDir` from recorded per-item request options: upstream's
+/// normalized request never carries it (per-entry `tempDir` is not a schema
+/// param), while the replay routes downloads through the sandbox via the
+/// tool defaults (see `parity_batch_progress_snapshots`).
+fn strip_request_temp_dir(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                if key == "request" {
+                    if let Some(request) = entry.as_object_mut() {
+                        request.remove("tempDir");
+                    }
+                } else {
+                    strip_request_temp_dir(entry);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                strip_request_temp_dir(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The comparison shape for a batch result: per-item status/progress with

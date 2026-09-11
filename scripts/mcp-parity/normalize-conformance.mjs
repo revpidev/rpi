@@ -15,6 +15,12 @@
 //   retry timing jitter (details.actualDelayMs) → dropped; the boolean
 //     withinTolerance / tooEarly / slightlyLate / veryLate verdicts remain
 //     as the stable evidence that the retry delay was respected.
+//   checks array → stable-sorted by normalized content: the referee emits
+//     independent checks (e.g. sse-retry's outgoing-response vs
+//     outgoing-sse-event) from concurrent tasks, so their arrival order
+//     jitters between runs even when every check passes identically (TE24
+//     independent tracking item H1, closed in v0.1.4 M7). Sorting the
+//     normalized checks makes the archived file byte-stable across reruns.
 //
 // Non-JSON files (stdout.txt / stderr.txt) get the textual substitutions
 // only (ports), since that is all the referee puts there.
@@ -51,6 +57,14 @@ if (inPath.endsWith(".json")) {
       delete check.details.actualDelayMs;
     }
   }
+  // Stable order by normalized content (see header note): two runs that
+  // pass the same checks must produce byte-identical archives regardless
+  // of the referee's concurrent emission order.
+  document.sort((a, b) => {
+    const left = JSON.stringify(a);
+    const right = JSON.stringify(b);
+    return left < right ? -1 : left > right ? 1 : 0;
+  });
   out = JSON.stringify(document, null, 2) + "\n";
 } else {
   out = normalizeText(raw);
