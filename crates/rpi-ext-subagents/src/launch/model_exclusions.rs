@@ -248,8 +248,17 @@ fn is_auth_exclusion(entry: &ModelExclusion) -> bool {
 fn auth_store_mtime() -> Option<u64> {
     let path = crate::paths::get_agent_dir().join("auth.json");
     let metadata = std::fs::metadata(path).ok()?;
-    use std::os::unix::fs::MetadataExt;
-    Some(metadata.mtime() as u64)
+    // Cross-platform mtime seconds (Windows has no `MetadataExt::mtime`;
+    // rc.6 CI caught the unconditional unix import — only the second
+    // granularity matters for the auth-store-changed comparison).
+    Some(
+        metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs(),
+    )
 }
 
 fn ensure_loaded(store: &mut Store) {
