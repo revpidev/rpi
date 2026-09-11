@@ -2236,8 +2236,21 @@ mod update_cli_tests {
     // ---- extensions target ----
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_extensions_runs_npm_install_and_skips_self() {
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B3 补齐)：extensions 分支构造
+        // DefaultPackageManager 时读 is_offline_mode_enabled()，offline 门
+        // 会静默跳过 npm 更新使断言翻转——固定 RPI_OFFLINE 缺席。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let runner = FakeRunner::npm_view_latest();
         let transport = StubTransport::newer_version();
         // Configure one user package.
@@ -2272,8 +2285,21 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_single_extension_by_source() {
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B3 补齐)：extensions 分支构造
+        // DefaultPackageManager 时读 is_offline_mode_enabled()，offline 门
+        // 会静默跳过 npm 更新使断言翻转——固定 RPI_OFFLINE 缺席。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let runner = FakeRunner::npm_view_latest();
         let transport = StubTransport::newer_version();
         let mut settings_manager = SettingsManager::create(
@@ -2322,10 +2348,23 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_extensions_skips_untrusted_project_packages() {
         // `useSavedProjectTrustOnly: true`: without a trust.json entry the
         // project settings stay invisible (no prompt, ever).
         let dirs = TestDirs::new();
+        // Offline pin (V14-21 F1, M7 复核 B3 补齐)：extensions 分支构造
+        // DefaultPackageManager 时读 is_offline_mode_enabled()，offline 门
+        // 会静默跳过 npm 更新使断言翻转——固定 RPI_OFFLINE 缺席。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         std::fs::create_dir_all(dirs.cwd.join(".rpi")).unwrap();
         std::fs::write(
             dirs.cwd.join(".rpi/settings.json"),
