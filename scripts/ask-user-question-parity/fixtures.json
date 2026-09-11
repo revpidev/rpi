@@ -4882,6 +4882,40 @@
 					"lines": [],
 					"maxInnerWidth": 80
 				}
+			},
+			{
+				"name": "box-hidden-wide",
+				"input": {
+					"fn": "renderBorderedBox",
+					"lines": [
+						"one",
+						"two"
+					],
+					"width": 40,
+					"hidden": 3
+				}
+			},
+			{
+				"name": "box-hidden-two-digit",
+				"input": {
+					"fn": "renderBorderedBox",
+					"lines": [
+						"x"
+					],
+					"width": 46,
+					"hidden": 12
+				}
+			},
+			{
+				"name": "strip-fences-osc",
+				"input": {
+					"fn": "stripFenceMarkers",
+					"lines": [
+						"```\u001b]8;;https://example.com\u0007link\u001b]8;;\u0007",
+						"\u001b]0;title\u0007plain",
+						"keep"
+					]
+				}
 			}
 		]
 	}

@@ -221,6 +221,8 @@ pub fn strip_fence_markers(lines: &[String]) -> Vec<String> {
 }
 
 /// `ANSI_SGR_RE` + `ANSI_OSC8_RE` combined strip (test/fence probe helper).
+/// Upstream strips SGR plus **only OSC 8** hyperlink payloads; any other OSC
+/// prefix passes through untouched.
 fn strip_sgr_and_osc8(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
@@ -236,24 +238,29 @@ fn strip_sgr_and_osc8(text: &str) -> String {
                         }
                     }
                 }
-                // OSC 8 hyperlink: ESC ] 8 ; ... (BEL | ESC \)
+                // OSC 8 hyperlink: ESC ] 8 ; ... (BEL | ESC \). Other
+                // OSC payloads are NOT stripped (the upstream regex is
+                // OSC8-only).
                 Some(']') => {
-                    chars.next();
-                    let mut terminated = false;
-                    while let Some(next) = chars.next() {
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // consume ']'
+                    let is_osc8 = lookahead.next() == Some('8') && lookahead.next() == Some(';');
+                    if !is_osc8 {
+                        out.push(character);
+                        continue;
+                    }
+                    chars.next(); // consume ']'
+                    for next in chars.by_ref() {
                         if next == '\u{7}' {
-                            terminated = true;
                             break;
                         }
                         if next == '\u{1b}' {
                             if chars.peek() == Some(&'\\') {
                                 chars.next();
                             }
-                            terminated = true;
                             break;
                         }
                     }
-                    let _ = terminated;
                 }
                 _ => out.push(character),
             }
@@ -285,10 +292,15 @@ pub fn render_bordered_box(
     }
     if hidden > 0 {
         let indicator = format!(" ✂ ── {hidden} lines hidden ── ");
+        // Upstream measures `indicator.length`/`leftFill.length` in UTF-16
+        // units — i.e. CHARACTER counts (every glyph here is BMP). Rust
+        // `.len()` would be BYTES (`─` = 3 bytes) and swallow the right fill;
+        // count characters instead.
         let indicator_len = indicator.chars().count();
         let space = dash_span.saturating_sub(indicator_len);
-        let left_fill = "─".repeat(space / 2);
-        let right_fill = "─".repeat(dash_span.saturating_sub(left_fill.len() + indicator_len));
+        let left_fill_count = space / 2;
+        let left_fill = "─".repeat(left_fill_count);
+        let right_fill = "─".repeat(dash_span.saturating_sub(left_fill_count + indicator_len));
         out.push(color(&format!("└{left_fill}{indicator}{right_fill}┘")));
     } else {
         out.push(color(&format!("└{}┘", "─".repeat(dash_span))));
@@ -299,6 +311,13 @@ pub fn render_bordered_box(
 /// `computeBoxDimensions` — inner width and total box width from content
 /// lines (trailing whitespace is stripped before measuring; the floor is
 /// `BOX_MIN_CONTENT_WIDTH`).
+///
+/// Boundary note: upstream measures after `/\s+$/` (JS `\s`: strips
+/// U+FEFF, does **not** strip U+0085); Rust `trim_end()` uses Unicode
+/// `White_Space` (strips U+0085, does **not** strip U+FEFF). The sets only
+/// diverge on lines ending in U+0085/U+FEFF — comrak-rendered markdown
+/// emits neither — so the parity fixtures (ASCII whitespace) pin the common
+/// behavior and the divergence stays theoretical.
 pub fn compute_box_dimensions(content_lines: &[String], max_inner_width: usize) -> (usize, usize) {
     let mut widest = BOX_MIN_CONTENT_WIDTH.min(max_inner_width);
     for line in content_lines {
@@ -667,8 +686,12 @@ fn render_padded_preview_lines(
             if line.is_empty() {
                 return line;
             }
+            // Upstream `Math.max(PREVIEW_PADDING_LEFT, Math.min(boxAlignedPad,
+            // colWidth - visibleWidth(line)))` — the box sits right-aligned
+            // inside the column (a line wider than the box slides left only
+            // when the column itself runs out).
             let pad = PREVIEW_PADDING_LEFT
-                .min(box_aligned_pad.min(col_width.saturating_sub(visible_width(&line))));
+                .max(box_aligned_pad.min(col_width.saturating_sub(visible_width(&line))));
             let content = truncate_to_width(&line, col_width.saturating_sub(pad), "", false);
             format!("{}{content}", spaces(pad))
         })

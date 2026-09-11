@@ -344,7 +344,7 @@ function main() {
 	mkdirSync(GENERATED, { recursive: true });
 
 	const report = [
-		"# ask-user-question parity report (TE28/TE29/TE30 G3/G12)",
+		"# ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)",
 		"",
 		`generated: ${new Date().toISOString()}`,
 		`upstream submodule: ${UPSTREAM.replace(`${REPO}/`, "")}`,

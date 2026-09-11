@@ -69,3 +69,6 @@
 {"name":"dims-trailing-ws","output":{"innerWidth":40,"boxWidth":44}}
 {"name":"dims-ansi","output":{"innerWidth":40,"boxWidth":44}}
 {"name":"dims-empty","output":{"innerWidth":40,"boxWidth":44}}
+{"name":"box-hidden-wide","output":{"lines":["┌──────────────────────────────────────┐","│ one                                  │","│ two                                  │","└─────── ✂ ── 3 lines hidden ── ───────┘"]}}
+{"name":"box-hidden-two-digit","output":{"lines":["┌────────────────────────────────────────────┐","│ x                                          │","└───────── ✂ ── 12 lines hidden ── ──────────┘"]}}
+{"name":"strip-fences-osc","output":{"lines":["\u001b]0;title\u0007plain","keep"]}}

@@ -1,6 +1,6 @@
-# ask-user-question parity report (TE28/TE29/TE30 G3/G12)
+# ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
 
-generated: 2026-09-11T05:13:04.150Z
+generated: 2026-09-11T05:39:06.015Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
 submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
 typebox: 1.3.6
@@ -243,6 +243,9 @@ typebox: 1.3.6
 - dims-trailing-ws: MATCH
 - dims-ansi: MATCH
 - dims-empty: MATCH
+- box-hidden-wide: MATCH
+- box-hidden-two-digit: MATCH
+- strip-fences-osc: MATCH
 
 ## golden-frames
 
