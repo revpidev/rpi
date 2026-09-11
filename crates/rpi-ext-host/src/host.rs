@@ -267,6 +267,15 @@ impl NativeExtensionHost {
         let spec = read(&self.last_load).clone();
         let previous_flags = self.runtime().flag_values();
 
+        // V14-23 C3 (R-U1.5 / design §3.6): the extension set is about to be
+        // replaced — deliver `dispose{extensionUnload}` to any mounted
+        // interactive component BEFORE the old runtime goes stale, so the
+        // guest gets its grace window while its dispatch loop still works.
+        // Owner-less: every extension is being unloaded at once.
+        if let Some((bridge, _mode)) = read(&self.last_ui).clone() {
+            bridge
+                .begin_forced_dispose(None, crate::interactive_ui::DisposeReason::ExtensionUnload);
+        }
         // Old runtime goes stale (loader.ts:201-205).
         self.runtime().invalidate(None);
         // `clearExtensionCache` (loader.ts:151-155).
@@ -357,7 +366,16 @@ impl NativeExtensionHost {
     /// this to break host → bridge → mode-resource reference cycles (the
     /// RPC bridge holds the stdout sender; the interactive bridge holds the
     /// UI weakly).
+    ///
+    /// V14-23 C3: detaching the bridge also ends the guest's ability to
+    /// finish any mounted component's protocol, so an active component
+    /// gets `dispose{extensionUnload}` first (idempotent no-op when the
+    /// session-shutdown / reload paths already disposed it).
     pub fn clear_ui(&self) {
+        if let Some((bridge, _mode)) = read(&self.last_ui).clone() {
+            bridge
+                .begin_forced_dispose(None, crate::interactive_ui::DisposeReason::ExtensionUnload);
+        }
         *write(&self.last_ui) = None;
         self.runtime().clear_ui_bridge();
     }
@@ -499,5 +517,55 @@ impl NativeExtensionHost {
     /// `assertActive` (runner.ts:548-552).
     pub fn assert_active(&self) -> Result<(), ExtError> {
         self.core().assert_active()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::NativeExtensionHost;
+    use crate::api::UiBridge;
+    use crate::interactive_ui::DisposeReason;
+    use crate::test_bridge::TestUiBridge;
+    use crate::types::ExtensionMode;
+
+    /// V14-23 C3 (R-U1.5 / design §3.6): the extension-unload paths —
+    /// `host.reload()` (the `/reload` extension replacement) and
+    /// `clear_ui()` (session dispose detaching the bridge) — deliver
+    /// `dispose{extensionUnload}` through the bound bridge before the
+    /// runtime goes stale. The live registry (rpi crate) dedups a second
+    /// delivery; this test pins the seam contract on the host side.
+    #[tokio::test]
+    async fn component_dispose_extension_unload_fires_on_reload_and_clear_ui() {
+        let dir = std::env::temp_dir().join(format!("rpi-ext-host-c3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp cwd");
+        let host = Arc::new(NativeExtensionHost::new(&dir.to_string_lossy()));
+        let bridge = Arc::new(TestUiBridge::new());
+        host.set_ui(
+            Some(Arc::clone(&bridge) as Arc<dyn UiBridge>),
+            ExtensionMode::Tui,
+        );
+        assert!(bridge.aborts().is_empty());
+
+        host.reload().await;
+        let aborts = bridge.aborts();
+        assert_eq!(
+            aborts,
+            vec![("<any>".to_owned(), DisposeReason::ExtensionUnload)],
+            "reload must dispose with extensionUnload"
+        );
+
+        // clear_ui (session dispose) fires the seam again — owner-less, same
+        // reason; the live registry treats it as an idempotent no-op.
+        host.clear_ui();
+        let aborts = bridge.aborts();
+        assert_eq!(aborts.len(), 2, "{aborts:?}");
+        assert_eq!(
+            aborts[1],
+            ("<any>".to_owned(), DisposeReason::ExtensionUnload)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

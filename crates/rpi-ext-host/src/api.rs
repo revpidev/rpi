@@ -871,7 +871,7 @@ pub trait UiBridge: Send + Sync {
 
     /// `ui.wakeComponent` (R-U5.2): wake a blocked `pollComponent` with a
     /// `render` event. C1 keeps the queue/`Notify` infrastructure but the
-    /// method itself lands with C2 (native background threads + wasm tick).
+    /// method itself landed with C2 (native background threads + wasm tick).
     fn wake_component(
         &self,
         _owner: &str,
@@ -890,7 +890,12 @@ pub trait UiBridge: Send + Sync {
         Err(interactive_ui_unsupported("ui.disposeComponent"))
     }
 
-    /// `ui.editExternal` (R-U11): host external editor; lands with C3.
+    /// `ui.editExternal` (R-U11, V14-23 C3): host external editor — pause the
+    /// TUI, edit `text` in the configured external editor, return the edited
+    /// text or `None` when the user cancelled (non-zero editor exit). No
+    /// configuration / launch failure is a structured error that never
+    /// blocks the TUI (R-U11.2); a bridge without an interactive UI keeps
+    /// the `unknownMethod` default (R-U9.2 probe signal).
     async fn edit_external(
         &self,
         _owner: &str,
@@ -911,6 +916,27 @@ pub trait UiBridge: Send + Sync {
     fn abort_active_component(
         &self,
         _owner: &str,
+        _reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        None
+    }
+
+    /// Host-forced dispose with protocol delivery (R-U1.5; V14-23 C3):
+    /// unlike [`UiBridge::abort_active_component`] the guest receives
+    /// `dispose{reason}` and a bounded grace window to submit a final
+    /// frame before the host force-unmounts. `owner` scopes the dispose to
+    /// one extension's component (tool-abort path); `None` disposes the
+    /// active component regardless of owner (session shutdown / extension
+    /// unload paths, where every extension loses its UI access at once).
+    /// Returns the disposed handle when a matching component was active.
+    ///
+    /// This is a **host-internal** seam (not a wire method): session
+    /// lifecycle and tool-abort paths call it when the guest's ability to
+    /// finish the component protocol is about to end. Bridges without
+    /// interactive components keep the no-op default.
+    fn begin_forced_dispose(
+        &self,
+        _owner: Option<&str>,
         _reason: DisposeReason,
     ) -> Option<ComponentHandle> {
         None
@@ -1967,7 +1993,11 @@ impl LoadedExtension {
 /// stem of the extension's path, restricted to identifier-safe characters
 /// so the `{namespace}:{key}` form stays a plain, greppable string.
 /// Synthetic paths (`<inline:…>`) collapse to their inner source name.
-fn extension_namespace(extension_path: &str) -> String {
+/// Widget-key namespace for one extension (TE11 FR-E.1): the stem of its
+/// path (inline stubs keep their `<name:…>` head). Also the interactive-UI
+/// component `owner` stamped by [`crate::bridges::NamespacedUiBridge`] and
+/// the host-forced dispose paths (V14-23 C3).
+pub(crate) fn extension_namespace(extension_path: &str) -> String {
     let stem = if extension_path.starts_with('<') && extension_path.ends_with('>') {
         extension_path[1..extension_path.len() - 1]
             .split(':')

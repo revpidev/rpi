@@ -384,6 +384,17 @@ impl UiBridge for NamespacedUiBridge {
         self.inner.abort_active_component(&self.namespace, reason)
     }
 
+    fn begin_forced_dispose(
+        &self,
+        owner: Option<&str>,
+        reason: crate::interactive_ui::DisposeReason,
+    ) -> Option<crate::interactive_ui::ComponentHandle> {
+        // Owner-scoped disposes are stamped with the namespace (same rule
+        // as the wire methods); a global dispose (None) stays global.
+        let owner = owner.map(|_| self.namespace.as_str());
+        self.inner.begin_forced_dispose(owner, reason)
+    }
+
     fn is_noop(&self) -> bool {
         self.inner.is_noop()
     }
@@ -768,6 +779,14 @@ impl UiBridge for UiPromptBridge {
         reason: crate::interactive_ui::DisposeReason,
     ) -> Option<crate::interactive_ui::ComponentHandle> {
         self.inner.abort_active_component(owner, reason)
+    }
+
+    fn begin_forced_dispose(
+        &self,
+        owner: Option<&str>,
+        reason: crate::interactive_ui::DisposeReason,
+    ) -> Option<crate::interactive_ui::ComponentHandle> {
+        self.inner.begin_forced_dispose(owner, reason)
     }
 
     fn is_noop(&self) -> bool {

@@ -821,6 +821,21 @@ impl UiBridge for InteractiveUiBridge {
             .and_then(|ui| ui.component_registry.abort_owner(owner, reason))
     }
 
+    fn begin_forced_dispose(
+        &self,
+        owner: Option<&str>,
+        reason: rpi_ext_host::interactive_ui::DisposeReason,
+    ) -> Option<ComponentHandle> {
+        // C3 host-forced dispose seam (R-U1.5): deliver `dispose{reason}`
+        // plus the grace window (tool abort is owner-scoped; session
+        // shutdown / extension unload dispose the active component).
+        let ui = self.ui()?;
+        match owner {
+            Some(owner) => ui.component_registry.dispose_owner(owner, reason),
+            None => ui.component_registry.dispose_active(reason),
+        }
+    }
+
     fn dispose_component(
         &self,
         owner: &str,
@@ -832,13 +847,13 @@ impl UiBridge for InteractiveUiBridge {
     async fn edit_external(
         &self,
         _owner: &str,
-        _text: &str,
-        _language: Option<&str>,
+        text: &str,
+        language: Option<&str>,
     ) -> Result<Option<String>, InteractiveUiError> {
-        // P1, lands with C3 (R-U11).
-        Err(InteractiveUiError::new(
-            InteractiveUiErrorKind::UnknownMethod,
-            "ui.editExternal: lands with C3",
-        ))
+        // R-U11 (V14-23 C3): host external editor. Reuses the `Ctrl+G` flow
+        // (settings chain, TUI stop/start); failures are structured errors
+        // that never block the TUI (R-U11.2).
+        let ui = self.detached()?;
+        ui.edit_text_external(text, language).await
     }
 }

@@ -184,6 +184,10 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
             let tool_name = name.clone();
             let execute_updates = state.tool_updates.clone();
             let execute_aborts = state.tool_aborts.clone();
+            // The component owner identity the wire calls stamp
+            // (`NamespacedUiBridge`), precomputed for the tool-abort watcher
+            // below (V14-23 C3).
+            let owner_namespace = crate::api::extension_namespace(&state.api.extension().path);
             let render_call = state.forward.clone();
             let render_result = state.forward.clone();
             let has_render_call = definition
@@ -218,11 +222,12 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                             _ => rpi_agent::types::ToolExecutionMode::Parallel,
                         },
                     ),
-                    execute: Arc::new(move |request, _ctx| {
+                    execute: Arc::new(move |request, ctx| {
                         let forward = forward_exec.clone();
                         let tool_name = tool_name.clone();
                         let tool_updates = execute_updates.clone();
                         let tool_aborts = execute_aborts.clone();
+                        let watcher_owner = owner_namespace.clone();
                         Box::pin(async move {
                             let tool_call_id = request.tool_call_id.clone();
                             // ADR-0015: stash the agent's on_update sink so
@@ -249,6 +254,33 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .insert(tool_call_id.clone(), request.signal.clone());
+                            // V14-23 C3 (R-U1.5 / design §3.6): when the
+                            // turn is aborted, the extension's mounted
+                            // interactive component (e.g. a dialog mounted by
+                            // this very tool) receives `dispose{toolAbort}`
+                            // and its grace window. Owner-scoped so an
+                            // aborted extension never disposes another
+                            // extension's component; a stale runtime (post
+                            // reload) makes `ui()` fail — the extensionUnload
+                            // path owns that case. The watcher dies with the
+                            // dispatch; without an ambient runtime there is
+                            // no abort to observe.
+                            let abort_watcher = {
+                                let signal = request.signal.clone();
+                                let watcher_ctx = ctx.clone();
+                                let owner = watcher_owner;
+                                tokio::runtime::Handle::try_current().ok().map(|handle| {
+                                    handle.spawn(async move {
+                                        signal.cancelled().await;
+                                        if let Ok(ui) = watcher_ctx.ui() {
+                                            ui.begin_forced_dispose(
+                                                Some(&owner),
+                                                crate::interactive_ui::DisposeReason::ToolAbort,
+                                            );
+                                        }
+                                    })
+                                })
+                            };
                             let result = forward
                                 .dispatch(
                                     json!({
@@ -260,6 +292,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                                     false,
                                 )
                                 .await;
+                            if let Some(watcher) = abort_watcher {
+                                watcher.abort();
+                            }
                             tool_aborts
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
@@ -1182,6 +1217,194 @@ mod tests {
             assert!(
                 matches!(required_capability(method), Requires(Capability::Ui)),
                 "{method}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod c3_dispose_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use serde_json::{json, Value};
+    use tokio_util::sync::CancellationToken;
+
+    use super::dispatch;
+    use crate::api::{ExtensionApi, ExtensionRuntime, LoadedExtension};
+    use crate::interactive_ui::DisposeReason;
+    use crate::test_bridge::TestUiBridge;
+    use crate::types::{ExtensionMode, ToolExecuteRequest};
+    use crate::wasm::{Capability, DispatchTarget, GuestCommand, HostState, WasmForward};
+
+    fn wasm_host_state(
+        capabilities: HashSet<Capability>,
+    ) -> (
+        HostState,
+        tokio::runtime::Runtime,
+        std::sync::mpsc::Receiver<GuestCommand>,
+        Arc<TestUiBridge>,
+    ) {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:c0>", "<inline:c0>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bridge = Arc::new(TestUiBridge::new());
+        api.runtime()
+            .set_ui_bridge(Some(bridge.clone()), ExtensionMode::Tui);
+        let state = HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+        };
+        (state, runtime, rx, bridge)
+    }
+
+    /// V14-23 C3 (R-U1.5 / design §3.6): cancelling the tool execution's
+    /// abort token delivers `dispose{toolAbort}` to the extension's mounted
+    /// component through the bridge — owner-stamped with the extension
+    /// namespace, before the tool dispatch returns. A completed tool (no
+    /// cancellation) never fires the dispose.
+    #[test]
+    fn component_dispose_tool_abort_watcher_fires_on_cancel() {
+        let (mut state, runtime, rx, bridge) = wasm_host_state(HashSet::from([Capability::Tools]));
+
+        dispatch(
+            &mut state,
+            "registerTool",
+            json!({"definition": {
+                "name": "dialog_tool",
+                "label": "Dialog Tool",
+                "description": "mounts a component",
+                "parameters": {"type": "object"},
+            }}),
+        )
+        .expect("registerTool dispatch");
+        let tools = state.api.extension().tools();
+        let execute = tools
+            .get("dialog_tool")
+            .expect("registered tool")
+            .definition
+            .execute
+            .clone();
+
+        // Cancellation case: the "guest" cancels the run signal while the
+        // toolExecute dispatch is in flight, then answers.
+        {
+            let signal = CancellationToken::new();
+            let cancel_signal = signal.clone();
+            let bridge_probe = bridge.clone();
+            let guest = runtime.spawn(async move {
+                while let Ok(command) = rx.recv() {
+                    let GuestCommand::Dispatch {
+                        message, respond, ..
+                    } = command
+                    else {
+                        continue;
+                    };
+                    let message: Value = serde_json::from_slice(&message).expect("guest message");
+                    if message["kind"] == "toolExecute" {
+                        // The user aborts the turn mid-tool.
+                        cancel_signal.cancel();
+                        // Let the watcher observe the cancellation BEFORE the
+                        // tool returns (deterministic, no scheduler race).
+                        for _ in 0..200 {
+                            if !bridge_probe.aborts().is_empty() {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        respond
+                            .send(Ok(json!({
+                                "content": [{"type": "text", "text": "aborted-but-returned"}],
+                                "details": null,
+                            })))
+                            .expect("respond");
+                        // Exit after one round-trip: a worker blocked in
+                        // `rx.recv()` cannot park and would deadlock runtime
+                        // shutdown while the sender still lives in HostState.
+                        break;
+                    }
+                }
+            });
+            let request = ToolExecuteRequest {
+                tool_call_id: "call_1".to_owned(),
+                params: json!({}),
+                signal,
+                on_update: None,
+            };
+            let ctx = state.api.context();
+            let result = runtime
+                .block_on(async { execute(request, ctx).await })
+                .expect("tool result after abort");
+            let text = match result.content.first() {
+                Some(rpi_ai::types::ToolResultContent::Text(text)) => text.text.clone(),
+                other => panic!("expected text content: {other:?}"),
+            };
+            assert_eq!(text, "aborted-but-returned");
+            guest.abort();
+
+            let aborts = bridge.aborts();
+            assert_eq!(
+                aborts,
+                vec![("inline".to_owned(), DisposeReason::ToolAbort)],
+                "owner = the registering extension's namespace, reason = toolAbort"
+            );
+        }
+
+        // No-cancellation case: a normally completing tool never disposes.
+        {
+            let (mut state2, runtime2, rx2, bridge2) =
+                wasm_host_state(HashSet::from([Capability::Tools]));
+            dispatch(
+                &mut state2,
+                "registerTool",
+                json!({"definition": {"name": "plain_tool", "parameters": {"type": "object"}}}),
+            )
+            .expect("registerTool");
+            let tools = state2.api.extension().tools();
+            let execute = tools
+                .get("plain_tool")
+                .expect("registered")
+                .definition
+                .execute
+                .clone();
+            // One round-trip then exit (same shutdown-hazard note as above).
+            let guest = runtime2.spawn(async move {
+                if let Ok(GuestCommand::Dispatch { respond, .. }) = rx2.recv() {
+                    let _ = respond.send(Ok(json!({
+                        "content": [{"type": "text", "text": "done"}],
+                        "details": null,
+                    })));
+                }
+            });
+            let request = ToolExecuteRequest {
+                tool_call_id: "call_2".to_owned(),
+                params: json!({}),
+                signal: CancellationToken::new(),
+                on_update: None,
+            };
+            let ctx = state2.api.context();
+            let result = runtime2
+                .block_on(async { execute(request, ctx).await })
+                .expect("tool result");
+            let text = match result.content.first() {
+                Some(rpi_ai::types::ToolResultContent::Text(text)) => text.text.clone(),
+                other => panic!("expected text content: {other:?}"),
+            };
+            assert_eq!(text, "done");
+            guest.abort();
+            assert!(
+                bridge2.aborts().is_empty(),
+                "no cancellation → no dispose: {:?}",
+                bridge2.aborts()
             );
         }
     }

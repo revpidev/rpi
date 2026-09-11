@@ -261,6 +261,19 @@ impl UiBridge for TestUiBridge {
         None
     }
 
+    fn begin_forced_dispose(
+        &self,
+        owner: Option<&str>,
+        reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        self.record("forcedDispose");
+        self.aborts
+            .lock()
+            .unwrap()
+            .push((owner.unwrap_or("<any>").to_owned(), reason));
+        None
+    }
+
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }

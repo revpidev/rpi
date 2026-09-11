@@ -1798,8 +1798,9 @@ impl InteractiveUi {
         // ADR-0024 C1 (R-U1.5): a mounted interactive component belongs to
         // the session that mounted it; a rebind (session switch/reload)
         // delivers `dispose{sessionReload}` and force-unmounts after the
-        // grace. The rest of the host-forced matrix (tool abort / shutdown /
-        // extension unload) is wired in C3.
+        // grace. The rest of the host-forced matrix — tool abort
+        // (`PendingToolAborts` watcher), session shutdown (`shutdown`),
+        // extension unload (`clear_ui`/`reload`) — landed with C3 (V14-23).
         self.component_registry
             .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionReload);
         *self
@@ -5587,6 +5588,15 @@ impl InteractiveMode {
         }
         self.is_shutting_down = true;
 
+        // ADR-0024 C3 (R-U1.5 / design §3.6): the session is going away —
+        // deliver `dispose{sessionShutdown}` to a mounted interactive
+        // component up front, while the extension runtime still works. The
+        // mode does not wait for the guest (design §3.6 宿主退出不等待组件):
+        // the grace timer force-unmounts on its own schedule.
+        self.ui_state
+            .component_registry
+            .dispose_active(rpi_ext_host::interactive_ui::DisposeReason::SessionShutdown);
+
         // Stop the driver thread (bounded by DRIVER_PUMP_CAP).
         self.driver_stop.store(true, Ordering::Relaxed);
         if let Some(driver) = self.driver.take() {
@@ -5764,6 +5774,41 @@ mod tests {
 
     fn chat_children(ui: &InteractiveUi) -> usize {
         lock(&ui.chat_container).children.len()
+    }
+
+    /// V14-23 C3 (R-U1.5 / design §3.6): mode shutdown delivers
+    /// `dispose{sessionShutdown}` to a component mounted through the live
+    /// mount surface — the guest gets its grace window while the runtime
+    /// still works; the mode itself never waits for it (宿主退出不等待组件).
+    #[tokio::test]
+    async fn shutdown_delivers_session_shutdown_dispose_to_mounted_component() {
+        use rpi_ext_host::interactive_ui::{ComponentEvent, DisposeReason, MountOptions};
+        let (mut mode, _terminal, _session) = mode_harness().await;
+        let mount = Arc::new(UiMountPoint::new(&mode.ui_state));
+        let handle = mode
+            .ui_state
+            .component_registry
+            .mount("ext-shutdown-test", MountOptions::default(), mount)
+            .expect("mount through the live surface");
+
+        mode.shutdown().await;
+
+        // The dispose event was delivered to the guest's queue.
+        let event = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            mode.ui_state
+                .component_registry
+                .poll("ext-shutdown-test", handle),
+        )
+        .await
+        .expect("dispose event delivered on shutdown")
+        .expect("poll");
+        assert_eq!(
+            event,
+            ComponentEvent::Dispose {
+                reason: DisposeReason::SessionShutdown
+            }
+        );
     }
 
     /// M1 anchor: `init()` (install telemetry) and `run()` (startup version

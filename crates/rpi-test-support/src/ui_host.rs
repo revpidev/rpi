@@ -351,7 +351,7 @@ impl UiBridge for ScriptedUiBridge {
     ) -> Result<Option<String>, InteractiveUiError> {
         Err(InteractiveUiError::new(
             InteractiveUiErrorKind::UnknownMethod,
-            "ui.editExternal: C3",
+            "ui.editExternal: unsupported by this scripted host",
         ))
     }
 
@@ -360,6 +360,17 @@ impl UiBridge for ScriptedUiBridge {
         _owner: &str,
         _reason: DisposeReason,
     ) -> Option<ComponentHandle> {
+        let mut state = self.lock();
+        state.active.take().map(ComponentHandle)
+    }
+
+    fn begin_forced_dispose(
+        &self,
+        _owner: Option<&str>,
+        _reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        // Host-forced dispose (V14-23 C3): the scripted host has no grace
+        // machinery — model it as the force-close the grace would end on.
         let mut state = self.lock();
         state.active.take().map(ComponentHandle)
     }

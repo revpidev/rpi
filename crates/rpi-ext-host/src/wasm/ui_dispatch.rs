@@ -198,8 +198,9 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
     // identity (`NamespacedUiBridge`) and owns the component registry; host
     // modes without an interactive UI answer `unknownMethod` (the R-U9.2
     // probe signal) **before** args are validated, so a probe never depends
-    // on the method's argument shape. `wakeComponent`/`editExternal` are
-    // forwarded too and answer `unknownMethod` until C2/C3 land.
+    // on the method's argument shape. All seven methods are forwarded
+    // (C1–C3 landed; the carrier constraint for `wakeComponent` on wasm is
+    // applied above).
     if crate::interactive_ui::is_interactive_ui_method(method) {
         if !ui.supports_interactive_ui() {
             return err(
@@ -545,8 +546,8 @@ mod tests {
     }
 
     /// Scripted `UiBridge` for the C1 dispatch tests: records the owner and
-    /// args, answers the five C1 methods, keeps `wake`/`editExternal` at
-    /// `unknownMethod` (C2/C3 scope).
+    /// args, answers the interactive-UI methods (C1–C3; `editExternal`
+    /// resolves `None` = cancelled, `wake` is a recorded no-op).
     struct ScriptedC1Bridge {
         calls: std::sync::Mutex<Vec<(String, String, Value)>>,
     }
@@ -714,32 +715,37 @@ mod tests {
 
         fn wake_component(
             &self,
-            _owner: &str,
-            _handle: crate::interactive_ui::ComponentHandle,
+            owner: &str,
+            handle: crate::interactive_ui::ComponentHandle,
         ) -> Result<(), crate::interactive_ui::InteractiveUiError> {
-            Err(crate::interactive_ui::InteractiveUiError::new(
-                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod,
-                "ui.wakeComponent: lands with C2",
-            ))
+            self.calls.lock().unwrap().push((
+                "wake".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "handle": handle.0 }),
+            ));
+            Ok(())
         }
 
         async fn edit_external(
             &self,
-            _owner: &str,
-            _text: &str,
-            _language: Option<&str>,
+            owner: &str,
+            text: &str,
+            language: Option<&str>,
         ) -> Result<Option<String>, crate::interactive_ui::InteractiveUiError> {
-            Err(crate::interactive_ui::InteractiveUiError::new(
-                crate::interactive_ui::InteractiveUiErrorKind::UnknownMethod,
-                "ui.editExternal: lands with C3",
-            ))
+            self.calls.lock().unwrap().push((
+                "editExternal".to_owned(),
+                owner.to_owned(),
+                serde_json::json!({ "text": text, "language": language }),
+            ));
+            Ok(None)
         }
     }
 
-    /// V14-21 FR-A…FR-H: the five C1 methods parse args, stamp the
-    /// extension namespace as owner and wrap results in the §2.1 envelopes;
-    /// `wake`/`editExternal` stay `unknownMethod`; invalid args are
-    /// `invalidRequest` **before** any state is created (probe path).
+    /// V14-21 FR-A…FR-H + V14-22/V14-23 tails: the methods parse args,
+    /// stamp the extension namespace as owner and wrap results in the §2.1
+    /// envelopes; `wake`/`editExternal` forward to the bridge since C2/C3;
+    /// invalid args are `invalidRequest` **before** any state is created
+    /// (probe path).
     #[test]
     fn component_registry_dispatch_c1_methods() {
         let bridge = Arc::new(ScriptedC1Bridge::new());
@@ -786,19 +792,25 @@ mod tests {
         )
         .expect("dispose dispatch");
 
-        // C2/C3 methods stay unknownMethod with their own message.
-        for (method, args) in [
-            ("ui.wakeComponent", serde_json::json!({ "handle": 7 })),
-            ("ui.editExternal", serde_json::json!({ "text": "draft" })),
-        ] {
-            let (kind, message) = dispatch(&mut state, method, args).expect_err("unimplemented");
-            assert_eq!(kind, "unknownMethod", "{method}");
-            assert!(message.contains("lands with C"), "{method}: {message}");
-        }
+        // C2/C3 methods forward to the bridge with the §2.1 envelopes
+        // (`wake`: {ok:true}; `editExternal`: cancelled → {text:null}).
+        dispatch(
+            &mut state,
+            "ui.wakeComponent",
+            serde_json::json!({ "handle": 7 }),
+        )
+        .expect("wake dispatch");
+        let edited = dispatch(
+            &mut state,
+            "ui.editExternal",
+            serde_json::json!({ "text": "draft", "language": "markdown" }),
+        )
+        .expect("editExternal dispatch");
+        assert_eq!(edited, serde_json::json!({ "text": null }));
 
         // The owner stamped by the namespaced context, not the caller's.
         let calls = bridge.calls();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 7);
         assert_eq!(calls[0].0, "mount");
         assert!(calls[0].1.contains("inline"), "{calls:?}");
         assert_eq!(
@@ -811,12 +823,20 @@ mod tests {
             calls[2].2,
             serde_json::json!({ "handle": 7, "lines": ["line"] })
         );
+        assert_eq!(
+            calls[6],
+            (
+                "editExternal".to_owned(),
+                calls[6].1.clone(),
+                serde_json::json!({ "text": "draft", "language": "markdown" })
+            )
+        );
 
         // Probe (R-U9.2): empty args fail validation before any mount.
         let (kind, _) =
             dispatch(&mut state, "ui.mountComponent", serde_json::json!({})).expect_err("probe");
         assert_eq!(kind, "invalidRequest");
-        assert_eq!(bridge.calls().len(), 5, "probe must not reach the bridge");
+        assert_eq!(bridge.calls().len(), 7, "probe must not reach the bridge");
     }
 
     /// V14-20 FR-E (R-U8.1): the capability gate runs before the dispatch,

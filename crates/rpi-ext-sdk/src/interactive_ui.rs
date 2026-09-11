@@ -41,7 +41,7 @@ pub const METHOD_SET_COMPONENT_HIDDEN: &str = "ui.setComponentHidden";
 pub const METHOD_WAKE_COMPONENT: &str = "ui.wakeComponent";
 /// `ui.disposeComponent` — guest-side unmount.
 pub const METHOD_DISPOSE_COMPONENT: &str = "ui.disposeComponent";
-/// `ui.editExternal` — host external editor (P1; lands with C3).
+/// `ui.editExternal` — host external editor (landed with C3 / V14-23).
 pub const METHOD_EDIT_EXTERNAL: &str = "ui.editExternal";
 
 /// The seven additive host-calls frozen by C0, in method-table order.
@@ -918,7 +918,7 @@ impl std::fmt::Display for LineBuilder {
 // ============================================================================
 
 /// Component lifecycle state (design §2.3). C0 freezes the state set; the
-/// host runtime that drives it lands with C1.
+/// host runtime that drives it landed with C1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentState {
     /// Mounted and focused: all keys route as `input`, frames render, ticks run.
@@ -992,7 +992,7 @@ pub struct DisposeComponentArgs {
     pub handle: ComponentHandle,
 }
 
-/// `ui.editExternal` args (P1; lands with C3).
+/// `ui.editExternal` args (landed with C3 / V14-23).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditExternalArgs {

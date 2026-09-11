@@ -16,10 +16,11 @@
 //! - [`ComponentMountPoint`] — the mount surface, so tests can drive a fake
 //!   overlay/editor and fake terminal size (R-U12.2).
 //!
-//! Out of C1 scope (per V14-21 §2.2): `ui.wakeComponent` (queue/`Notify`
-//! infrastructure is in place, the method answers `unknownMethod` until C2),
-//! `tick` delivery (C2), `ui.editExternal` (C3) and the full host-forced
-//! dispose matrix (C3).
+//! Out of C1 scope (per V14-21 §2.2): `ui.editExternal` (C3 — lives in
+//! `external_editor.rs` behind the mode bridge) and the host-forced
+//! dispose matrix (delivered in C3 through [`ComponentRegistry::dispose_active`]
+//! / [`ComponentRegistry::dispose_owner`] and the `UiBridge::begin_forced_dispose`
+//! seam). `ui.wakeComponent` (C2) and `tick` delivery (C2) have landed.
 //!
 //! [RPI-OWN]: the polling/line-frame mechanism has no upstream counterpart;
 //! `Component::render(width)`/`handle_input(data)` mirror upstream
@@ -47,6 +48,12 @@ use serde_json::Value;
 /// Dispose grace (R-U6.3): how long the guest may take to submit a final
 /// frame before the host force-unmounts (`dispose{timeout}`).
 pub(crate) const DEFAULT_DISPOSE_GRACE: Duration = Duration::from_millis(500);
+
+/// Optional component lifecycle limit (R-U8.3 / design §3.7: 可配，默认
+/// 关闭). `None` = unlimited; `Some(limit)` delivers `dispose{timeout}`
+/// once a component has been mounted for `limit`. A leak guard for guests
+/// that never finish on their own.
+pub(crate) type LifecycleLimit = Option<Duration>;
 
 /// Event queue cap (R-U8.3 / design §3.7). `input` overflow is fail-visible
 /// (unmount + structured error); `tick` may be dropped because it is only a
@@ -592,6 +599,29 @@ impl MountState {
         }
     }
 
+    /// Optional lifecycle ceiling (V14-23 C3; R-U8.3 / design §3.7): after
+    /// `limit` of mounted life the component receives `dispose{timeout}`
+    /// (and the usual grace after it). `None` (default) mounts no timer.
+    /// The task holds a `Weak`, so it dies with the state; a closed state
+    /// makes `begin_dispose` an idempotent no-op.
+    fn start_lifecycle_timer(self: &Arc<Self>, limit: LifecycleLimit) {
+        let Some(limit) = limit else {
+            return;
+        };
+        let weak = Arc::downgrade(self);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            tokio::time::sleep(limit).await;
+            if let Some(state) = weak.upgrade() {
+                if !state.is_closed() && !state.disposing.load(Ordering::SeqCst) {
+                    state.begin_dispose(DisposeReason::Timeout);
+                }
+            }
+        });
+    }
+
     /// Idempotent unmount (R-U1.4 / R-U6.4): hide the mount point, drop the
     /// hidden-key listener, wake a blocked poll and record the `done` value.
     fn close(&self, done: Option<Value>) {
@@ -782,22 +812,22 @@ fn render_frame(frame: &FrameBuffer, width: usize) -> Vec<String> {
 
 /// Validate a frame against the limits (R-U3.5): rows ≤ 5000, single line
 /// ≤ 32 KiB, total (lines + `done` JSON) ≤ `maxFrameBytes`. The previous
-/// frame is kept on failure (fail-visible).
+/// frame is kept on failure (fail-visible). The error carries the full
+/// frame metrics (rows / max single-line bytes / total bytes) so the
+/// `frameTooLarge` diagnostic satisfies R-U12.1's 超限附帔度量.
 fn validate_frame(
     frame: &ComponentFrame,
     max_frame_bytes: usize,
 ) -> Result<(), InteractiveUiError> {
-    if frame.lines.len() > DEFAULT_MAX_FRAME_ROWS {
-        return Err(InteractiveUiError::frame_too_large(format!(
-            "rows {} > {DEFAULT_MAX_FRAME_ROWS}",
-            frame.lines.len()
-        )));
-    }
+    // R-U12.1 超限附帔度量: every rejection carries the full frame metrics.
+    let rows = frame.lines.len();
+    let max_line_bytes = frame.lines.iter().map(|line| line.len()).max().unwrap_or(0);
     let mut total = 0usize;
     for (index, line) in frame.lines.iter().enumerate() {
         if line.len() > DEFAULT_MAX_LINE_BYTES {
             return Err(InteractiveUiError::frame_too_large(format!(
-                "line {index} bytes {} > {DEFAULT_MAX_LINE_BYTES}",
+                "line {index} bytes {} > {DEFAULT_MAX_LINE_BYTES}; \
+                 metrics rows={rows} maxLineBytes={max_line_bytes}",
                 line.len()
             )));
         }
@@ -806,9 +836,15 @@ fn validate_frame(
     if let Some(done) = frame.done.value() {
         total = total.saturating_add(serde_json::to_string(done).map_or(0, |json| json.len()));
     }
+    let metrics = format!("metrics rows={rows} maxLineBytes={max_line_bytes} totalBytes={total}");
+    if rows > DEFAULT_MAX_FRAME_ROWS {
+        return Err(InteractiveUiError::frame_too_large(format!(
+            "rows {rows} > {DEFAULT_MAX_FRAME_ROWS}; {metrics}"
+        )));
+    }
     if total > max_frame_bytes {
         return Err(InteractiveUiError::frame_too_large(format!(
-            "total bytes {total} > maxFrameBytes {max_frame_bytes}"
+            "total bytes {total} > maxFrameBytes {max_frame_bytes}; {metrics}"
         )));
     }
     Ok(())
@@ -871,6 +907,8 @@ pub(crate) struct ComponentRegistry {
     recently_closed: Mutex<VecDeque<u64>>,
     diagnostics: Arc<Mutex<VecDeque<ComponentDiagnostic>>>,
     dispose_grace: Duration,
+    /// Optional per-component lifecycle limit (R-U8.3; default off).
+    lifecycle_limit: LifecycleLimit,
 }
 
 impl Default for ComponentRegistry {
@@ -892,6 +930,20 @@ impl ComponentRegistry {
             recently_closed: Mutex::new(VecDeque::new()),
             diagnostics: Arc::new(Mutex::new(VecDeque::new())),
             dispose_grace,
+            lifecycle_limit: None,
+        }
+    }
+
+    /// Configuration hook for the per-component lifecycle limit
+    /// (R-U8.3 "可配，防泄漏"; default `None` = off). Hosts that want a
+    /// ceiling set one; expiry delivers `dispose{timeout}` (design §3.7).
+    /// No host wires a ceiling yet (default off), so the hook is exercised
+    /// by the lifecycle tests.
+    #[allow(dead_code)]
+    pub(crate) fn with_lifecycle_limit(lifecycle_limit: LifecycleLimit) -> Self {
+        Self {
+            lifecycle_limit,
+            ..Self::new()
         }
     }
 
@@ -1044,6 +1096,7 @@ impl ComponentRegistry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
         state.start_tick_task();
+        state.start_lifecycle_timer(self.lifecycle_limit);
         mount.request_render();
         Ok(handle)
     }
@@ -1169,6 +1222,27 @@ impl ComponentRegistry {
             return None;
         }
         state.begin_dispose(reason);
+        self.remember_closed(state.handle);
+        Some(state.handle)
+    }
+
+    /// Owner-scoped host-forced dispose (V14-23 C3; R-U1.5): same protocol
+    /// delivery as [`ComponentRegistry::dispose_active`] but only when the
+    /// active component belongs to `owner` — the tool-abort path must not
+    /// tear down another extension's dialog (design §3.6).
+    pub(crate) fn dispose_owner(
+        &self,
+        owner: &str,
+        reason: DisposeReason,
+    ) -> Option<ComponentHandle> {
+        let state = self.active_state()?;
+        if state.owner != owner || state.is_closed() {
+            return None;
+        }
+        state.begin_dispose(reason);
+        // R-U6.4: a guest `disposeComponent` racing (or following) the
+        // forced dispose must stay an idempotent no-op, not unknownHandle.
+        self.remember_closed(state.handle);
         Some(state.handle)
     }
 
@@ -2553,6 +2627,275 @@ mod interactive_component {
         }
         // The submitted frame is live for the host compositor.
         assert_eq!(render_entry(&registry, 80), vec!["frame".to_owned()]);
+        registry.dispose("ext", handle).expect("dispose");
+    }
+
+    // -- §4.8 C3 cleanup matrix (V14-23; R-U6.1/R-U6.4/R-U12.2) ----------
+
+    /// Every §2.1 end path leaves no residue: overlay unmounted, hidden-key
+    /// listener removed, tick delivery stopped, handle terminal, and a
+    /// repeated trigger is an idempotent no-op. The paused clock drives both
+    /// the dispose grace and the tick interval deterministically.
+    #[tokio::test(start_paused = true)]
+    async fn interactive_component_cleanup_covers_all_end_paths() {
+        type Trigger = Box<dyn Fn(&ComponentRegistry, ComponentHandle)>;
+        // The repeat closures re-fire the same end path on the closed
+        // component and discard the result — idempotence means "no panic,
+        // no resurrect", not a specific return value.
+        let cases: Vec<(&str, Trigger, Trigger)> = vec![
+            (
+                "done-frame",
+                Box::new(|registry, handle| {
+                    registry
+                        .render(
+                            "ext",
+                            handle,
+                            ComponentFrame::lines(vec!["bye".to_owned()])
+                                .with_done(serde_json::json!({"submitted": true})),
+                        )
+                        .expect("done frame");
+                }),
+                Box::new(|registry, handle| {
+                    let _ = registry.render(
+                        "ext",
+                        handle,
+                        ComponentFrame::lines(vec!["bye again".to_owned()]).with_done(Value::Null),
+                    );
+                }),
+            ),
+            (
+                "guest-dispose",
+                Box::new(|registry, handle| {
+                    registry.dispose("ext", handle).expect("guest dispose");
+                }),
+                Box::new(|registry, handle| {
+                    registry
+                        .dispose("ext", handle)
+                        .unwrap_or_else(|error| panic!("repeat dispose: {error}"));
+                }),
+            ),
+            (
+                "tool-abort",
+                Box::new(|registry, handle| {
+                    assert_eq!(
+                        registry.dispose_owner("ext", DisposeReason::ToolAbort),
+                        Some(handle)
+                    );
+                }),
+                Box::new(|registry, _handle| {
+                    let _ = registry.dispose_owner("ext", DisposeReason::ToolAbort);
+                }),
+            ),
+            (
+                "session-shutdown",
+                Box::new(|registry, handle| {
+                    assert_eq!(
+                        registry.dispose_active(DisposeReason::SessionShutdown),
+                        Some(handle)
+                    );
+                }),
+                Box::new(|registry, _handle| {
+                    let _ = registry.dispose_active(DisposeReason::SessionShutdown);
+                }),
+            ),
+            (
+                "session-reload",
+                Box::new(|registry, handle| {
+                    assert_eq!(
+                        registry.dispose_active(DisposeReason::SessionReload),
+                        Some(handle)
+                    );
+                }),
+                Box::new(|registry, _handle| {
+                    let _ = registry.dispose_active(DisposeReason::SessionReload);
+                }),
+            ),
+            (
+                "extension-unload",
+                Box::new(|registry, handle| {
+                    assert_eq!(
+                        registry.dispose_active(DisposeReason::ExtensionUnload),
+                        Some(handle)
+                    );
+                }),
+                Box::new(|registry, _handle| {
+                    let _ = registry.dispose_active(DisposeReason::ExtensionUnload);
+                }),
+            ),
+            (
+                "carrier-trap",
+                Box::new(|registry, handle| {
+                    assert_eq!(
+                        registry.abort_owner("ext", DisposeReason::ToolAbort),
+                        Some(handle)
+                    );
+                }),
+                Box::new(|registry, _handle| {
+                    let _ = registry.abort_owner("ext", DisposeReason::ToolAbort);
+                }),
+            ),
+        ];
+        for (name, trigger, repeat) in cases {
+            let registry =
+                ComponentRegistry::with_dispose_grace(std::time::Duration::from_millis(30));
+            let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+            let options = MountOptions {
+                tick_ms: 100, // clamped to the 250ms floor
+                keys_when_hidden: vec!["ctrl+]".to_owned()],
+                label: Some("cleanup".to_owned()),
+                ..MountOptions::default()
+            };
+            let handle = mount_overlay(&registry, &mount, options);
+            assert_eq!(mount.listener_count(), 1, "{name}");
+            assert!(mount.last_overlay().live.load(Ordering::SeqCst), "{name}");
+
+            trigger(&registry, handle);
+            // Re-triggering the same end path is an idempotent no-op
+            // (R-U6.4) — no panic, no second unmount, no resurrect.
+            repeat(&registry, handle);
+            repeat(&registry, handle);
+
+            // Advance past the grace (30ms) AND past a full tick period
+            // (250ms): the force-close runs and a live tick timer would
+            // still have fired at least once.
+            advance_and_settle(600).await;
+
+            // Overlay unmounted + focus released (the fake records `hide`).
+            let overlay = mount.last_overlay();
+            assert!(!overlay.live.load(Ordering::SeqCst), "{name}: overlay live");
+            assert!(
+                !overlay.focused.load(Ordering::SeqCst),
+                "{name}: focus held"
+            );
+            // Hidden-key listener removed.
+            assert_eq!(mount.listener_count(), 0, "{name}: listener leaked");
+            // No active component.
+            assert_eq!(registry.live_counts(), (0, 0), "{name}: slot not freed");
+            // Drain what the end path legitimately queued for the guest
+            // (the dispose event itself); no `tick` may ever appear in it.
+            let queued = take_events(&registry);
+            assert!(
+                !queued
+                    .iter()
+                    .any(|event| matches!(event, ComponentEvent::Tick)),
+                "{name}: tick delivered after close: {queued:?}"
+            );
+            // And nothing new arrives afterwards (tick timer stopped).
+            advance_and_settle(600).await;
+            assert!(take_events(&registry).is_empty(), "{name}: residual events");
+            // The handle is terminal for every method (design §2.3).
+            let error = registry
+                .render("ext", handle, ComponentFrame::lines(Vec::new()))
+                .expect_err("terminal handle");
+            assert!(error.message.contains("unknownHandle"), "{name}: {error}");
+            assert!(registry.set_hidden("ext", handle, true).is_err());
+            // Idempotent dispose still fine.
+            registry
+                .dispose("ext", handle)
+                .unwrap_or_else(|error| panic!("{name}: idempotent dispose: {error}"));
+        }
+    }
+
+    /// Leak assertion: after a force-close and registry drop, no spawned
+    /// task (grace timer, tick timer) keeps the [`MountState`] alive — both
+    /// hold `Weak` handles only (R-U6.1 无残留线程/任务).
+    #[tokio::test(start_paused = true)]
+    async fn interactive_component_cleanup_no_state_leak_after_force_close() {
+        let registry = ComponentRegistry::with_dispose_grace(std::time::Duration::from_millis(30));
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let options = MountOptions {
+            tick_ms: 100,
+            ..MountOptions::default()
+        };
+        let handle = mount_overlay(&registry, &mount, options);
+        let state = registry.active_state().expect("active state");
+        let weak = Arc::downgrade(&state);
+        drop(state);
+
+        assert_eq!(
+            registry.dispose_active(DisposeReason::SessionShutdown),
+            Some(handle)
+        );
+        advance_and_settle(60).await;
+        assert_eq!(registry.live_counts(), (0, 0));
+        // Drop the registry (the active slot is the last strong holder
+        // besides our probe) and let spawned tasks settle: the grace task
+        // and the tick task must not keep the state alive.
+        drop(registry);
+        settle().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "MountState leaked after force-close"
+        );
+    }
+
+    /// R-U8.3 / design §3.7: the optional lifecycle limit (default OFF)
+    /// delivers `dispose{timeout}` at expiry, then force-unmounts after the
+    /// grace — the anti-leak ceiling for guests that never finish.
+    #[tokio::test(start_paused = true)]
+    async fn interactive_component_cleanup_lifecycle_timeout_disposes() {
+        // Default: no ceiling — the component outlives any advance.
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        advance_and_settle(60_000).await;
+        assert_eq!(
+            registry.live_counts(),
+            (1, 0),
+            "default has no lifecycle ceiling"
+        );
+        registry.dispose("ext", handle).expect("dispose");
+
+        // Configured: expiry → dispose{timeout} → grace → force-unmount.
+        let registry =
+            ComponentRegistry::with_lifecycle_limit(Some(std::time::Duration::from_millis(500)));
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        advance_and_settle(499).await;
+        assert_eq!(registry.live_counts(), (1, 0), "under the ceiling");
+        advance_and_settle(2).await;
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Dispose {
+                reason: DisposeReason::Timeout
+            }
+        );
+        // Grace (default 500ms) passes without a final frame → force close.
+        advance_and_settle(600).await;
+        assert_eq!(registry.live_counts(), (0, 0));
+        assert!(!mount.last_overlay().live.load(Ordering::SeqCst));
+        let diagnostics = registry.diagnostics();
+        assert!(
+            diagnostics.iter().any(|record| record.kind == "timeout"),
+            "{diagnostics:?}"
+        );
+    }
+
+    /// The tool-abort dispose is owner-scoped (design §3.6): a foreign
+    /// owner's abort must not tear down another extension's component.
+    #[tokio::test]
+    async fn interactive_component_cleanup_dispose_owner_is_scoped() {
+        let registry = ComponentRegistry::new();
+        let mount = Arc::new(FakeMountPoint::with_size(80, 24));
+        let handle = mount_overlay(&registry, &mount, MountOptions::default());
+        // Foreign owner: no-op, the component stays live.
+        assert_eq!(
+            registry.dispose_owner("other", DisposeReason::ToolAbort),
+            None
+        );
+        assert_eq!(registry.live_counts(), (1, 0));
+        assert!(mount.last_overlay().live.load(Ordering::SeqCst));
+        // Owning extension: delivered.
+        assert_eq!(
+            registry.dispose_owner("ext", DisposeReason::ToolAbort),
+            Some(handle)
+        );
+        assert_eq!(
+            registry.poll("ext", handle).await.unwrap(),
+            ComponentEvent::Dispose {
+                reason: DisposeReason::ToolAbort
+            }
+        );
         registry.dispose("ext", handle).expect("dispose");
     }
 }

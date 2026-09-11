@@ -5,8 +5,9 @@
 //! `handleOpenExternalEditor` (interactive-mode.ts:3846-3866).
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use rpi_ext_host::interactive_ui::{InteractiveUiError, InteractiveUiErrorKind};
 use rpi_tui::tui::TuiStopOptions;
 
 use crate::modes::interactive::interactive_mode::InteractiveUi;
@@ -108,6 +109,131 @@ impl InteractiveUi {
         self.ui.start();
         self.ui.request_render(true);
     }
+
+    /// `ui.editExternal` (R-U11 / V14-23 C3): the interactive-UI-ABI variant
+    /// of the host external-editor flow. Resolves the configured editor
+    /// (same chain as `Ctrl+G`: settings `externalEditor` → `$VISUAL` →
+    /// `$EDITOR` → platform default), then edits `text` in a 0600 temp file.
+    /// Returns the edited text, or `None` when the user cancelled (editor
+    /// exited non-zero — the `:cq`/Ctrl+C contract of the prompt flow).
+    /// No configuration / launch / prepare failures are structured errors
+    /// that never block the TUI (R-U11.2).
+    ///
+    /// Runs the blocking editor wait on `spawn_blocking`: the host-call
+    /// parks the CALLING guest thread (`block_on`), never a runtime worker.
+    pub(crate) async fn edit_text_external(
+        self: &Arc<Self>,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<Option<String>, InteractiveUiError> {
+        let command = self
+            .session()
+            .settings_manager(|settings| settings.get_external_editor_command());
+        let text = text.to_owned();
+        let language = language.map(str::to_owned);
+        let ui = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            ui.edit_text_external_blocking(&command, &text, language.as_deref())
+        })
+        .await
+        .map_err(|error| {
+            InteractiveUiError::new(
+                InteractiveUiErrorKind::Call,
+                format!("editExternal: editor task failed: {error}"),
+            )
+        })?
+    }
+
+    /// Blocking body of [`InteractiveUi::edit_text_external`] (runs off the
+    /// runtime on `spawn_blocking`). Same shape as
+    /// [`InteractiveUi::handle_open_external_editor_real`]: stop TUI → edit
+    /// → read back / cancel / structured error → cleanup + restart TUI.
+    fn edit_text_external_blocking(
+        &self,
+        command: &str,
+        text: &str,
+        language: Option<&str>,
+    ) -> Result<Option<String>, InteractiveUiError> {
+        let call_error =
+            |message: String| InteractiveUiError::new(InteractiveUiErrorKind::Call, message);
+        let editor_parts: Vec<&str> = command.split_whitespace().collect();
+        let Some((program, editor_args)) = editor_parts.split_first() else {
+            // R-U11.2 无配置: rpi's resolver always falls back to a platform
+            // default, so this arm is defensive (an explicitly blank
+            // `externalEditor` with no $VISUAL/$EDITOR and a future resolver
+            // change would land here) — still a structured error, never a
+            // blocked TUI.
+            return Err(call_error(
+                "editExternal: no external editor configured".to_owned(),
+            ));
+        };
+
+        // Per-call unique dir (two extensions may edit concurrently) with a
+        // 0600 file (R-U11.2: 临时文件 0600、用后清理).
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!("rpi-edit-{}-{unique}", std::process::id()));
+        let file_path = dir.join(edit_file_name(language));
+        let prepare = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(&file_path, text)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare {
+            return Err(call_error(format!(
+                "editExternal: failed to prepare editor file: {error}"
+            )));
+        }
+
+        // Stop the TUI so the terminal is released to the editor
+        // (same contract as the prompt flow, interactive-mode.ts:3849).
+        self.ui.stop(TuiStopOptions::default());
+        // Printed while the TUI is stopped, so it lands on the live terminal
+        // (external-editor.ts:19-20 shape).
+        println!("Launching external editor: {command}\nPi will resume when the editor exits.");
+
+        let exit_code = spawn_and_wait(program, editor_args, &file_path);
+        let result = match exit_code {
+            Some(0) => std::fs::read_to_string(&file_path)
+                .map(|edited| Some(edited.strip_suffix('\n').unwrap_or(&edited).to_string()))
+                .map_err(|error| {
+                    call_error(format!("editExternal: failed to read edited text: {error}"))
+                }),
+            // Non-zero exit = user cancel (external-editor.ts:33-35 discard
+            // branch): `{text: null}` per R-U11.1, the TUI is restored below.
+            Some(_) => Ok(None),
+            None => Err(call_error(format!(
+                "editExternal: failed to launch external editor: {program}"
+            ))),
+        };
+
+        // Shared finally-path: cleanup + TUI restart on every outcome.
+        let _ = std::fs::remove_dir_all(&dir);
+        self.ui.start();
+        self.ui.request_render(true);
+        result
+    }
+}
+
+/// Temp-file name for a `ui.editExternal` call: the sanitized `language` as
+/// the extension (editor syntax highlighting; advisory only), `txt` fallback.
+fn edit_file_name(language: Option<&str>) -> String {
+    let extension = language
+        .map(str::to_ascii_lowercase)
+        .filter(|language| {
+            !language.is_empty()
+                && language.len() <= 8
+                && language.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .unwrap_or_else(|| "txt".to_owned());
+    format!("edit.{extension}")
 }
 
 /// Spawn the editor with `file_path` appended and block for its exit code
@@ -269,5 +395,175 @@ mod tests {
         assert!(terminal.is_started(), "TUI must be restarted");
         let dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
         assert!(!dir.exists(), "temp editor dir must be cleaned up");
+    }
+
+    // =========================================================================
+    // `ui.editExternal` (V14-23 C3, R-U11): the ABI variant of the flow —
+    // 0600 temp file, editor exit codes, structured errors, TUI restore.
+    // =========================================================================
+
+    /// Bare mode harness (no `$VISUAL` juggling): the blocking body takes
+    /// the editor command as a parameter, so most cases inject it directly.
+    async fn mode_harness_bare() -> (InteractiveMode, Arc<TestTerminal>) {
+        let terminal = Arc::new(TestTerminal::new());
+        let harness = build_test_session().await;
+        let TestSession { _tmp, runtime, .. } = harness;
+        let mode = InteractiveMode::with_terminal(
+            runtime,
+            InteractiveModeOptions::default(),
+            Box::new(TestTerminal::clone(&terminal)),
+        );
+        (mode, terminal)
+    }
+
+    /// No `rpi-edit-{pid}-*` temp dirs left behind (R-U11.2 用后清理).
+    fn no_edit_temp_dirs_left() -> bool {
+        let prefix = format!("rpi-edit-{}", std::process::id());
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .all(|entry| !entry.file_name().to_string_lossy().starts_with(&prefix))
+            })
+            .unwrap_or(true)
+    }
+
+    /// R-U11.1 success: edited text returned, trailing newline stripped,
+    /// temp file 0600 (unix), language maps the file name, temp cleaned up,
+    /// TUI restarted.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // temp-dir scan serialized via ENV_LOCK
+    async fn edit_external_returns_edited_text_and_cleans_up() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mode, terminal) = mode_harness_bare().await;
+        let ui = &mode.ui_state;
+        let tmp = TempDir::new();
+        let mode_side = tmp.path().join("mode.txt");
+        let name_side = tmp.path().join("name.txt");
+        let script = fake_editor_script(
+            &tmp,
+            &format!(
+                "stat -c %a \"$1\" > {}; basename \"$1\" > {}; echo edited > \"$1\"",
+                mode_side.display(),
+                name_side.display()
+            ),
+        );
+
+        let result = ui
+            .edit_text_external_blocking(
+                script.to_str().unwrap_or_default(),
+                "original",
+                Some("markdown"),
+            )
+            .expect("edited");
+        assert_eq!(result.as_deref(), Some("edited"));
+        // TUI stopped for the editor and restarted afterwards.
+        assert!(terminal.is_started(), "TUI must be restarted");
+        // Temp dir removed after use (unique per call).
+        assert!(no_edit_temp_dirs_left(), "temp edit dir must be cleaned up");
+        // R-U11.2: the temp file was 0600 while it existed.
+        #[cfg(unix)]
+        {
+            let mode_bits = std::fs::read_to_string(&mode_side).unwrap_or_default();
+            assert_eq!(mode_bits.trim(), "600", "temp file must be 0600");
+        }
+        // The sanitized language named the file: lowercase ASCII-alnum
+        // `markdown` (≤8 chars) is used verbatim as the extension.
+        let file_name = std::fs::read_to_string(&name_side).unwrap_or_default();
+        assert_eq!(file_name.trim(), "edit.markdown");
+    }
+
+    /// R-U11.1 cancel: a non-zero editor exit resolves `{text: null}` — same
+    /// discard contract as the prompt flow (external-editor.ts:33-35).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // temp-dir scan serialized via ENV_LOCK
+    async fn edit_external_cancelled_returns_none() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mode, terminal) = mode_harness_bare().await;
+        let ui = &mode.ui_state;
+        let tmp = TempDir::new();
+        let script = fake_editor_script(&tmp, "echo partial > \"$1\"\nexit 3");
+
+        let result = ui
+            .edit_text_external_blocking(script.to_str().unwrap_or_default(), "keep me", None)
+            .expect("cancel is not an error");
+        assert_eq!(result, None);
+        assert!(terminal.is_started(), "TUI must be restarted after cancel");
+        assert!(no_edit_temp_dirs_left());
+    }
+
+    /// R-U11.2 无配置: a blank resolved command is a structured `call` error
+    /// and never stops the TUI (rpi's resolver always falls back to a
+    /// platform default, so this arm is defensive).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // temp-dir scan serialized via ENV_LOCK
+    async fn edit_external_no_config_is_structured_error() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mode, terminal) = mode_harness_bare().await;
+        let ui = &mode.ui_state;
+
+        let error = ui
+            .edit_text_external_blocking("   ", "draft", None)
+            .expect_err("no config");
+        assert_eq!(
+            error.kind,
+            rpi_ext_host::interactive_ui::InteractiveUiErrorKind::Call
+        );
+        assert!(
+            error.message.contains("no external editor configured"),
+            "{error}"
+        );
+        // The failure path returns before the TUI is ever stopped, so the
+        // resume `start` never runs either (the harness TUI starts out
+        // stopped; a stop→start roundtrip would leave it started).
+        assert!(
+            !terminal.is_started(),
+            "no-config must not run the TUI stop/start roundtrip"
+        );
+        assert!(no_edit_temp_dirs_left());
+    }
+
+    /// R-U11.2 启动失败: a spawn failure is a structured `call` error; the
+    /// TUI is restored (stop → start roundtrip), not blocked.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // temp-dir scan serialized via ENV_LOCK
+    async fn edit_external_spawn_failure_is_structured_error() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (mode, terminal) = mode_harness_bare().await;
+        let ui = &mode.ui_state;
+        let tmp = TempDir::new();
+        let missing = tmp.path().join("definitely-missing-editor.sh");
+
+        let error = ui
+            .edit_text_external_blocking(missing.to_str().unwrap_or_default(), "draft", None)
+            .expect_err("spawn failure");
+        assert_eq!(
+            error.kind,
+            rpi_ext_host::interactive_ui::InteractiveUiErrorKind::Call
+        );
+        assert!(
+            error.message.contains("failed to launch external editor"),
+            "{error}"
+        );
+        assert!(terminal.is_started(), "TUI must be restarted");
+        assert!(no_edit_temp_dirs_left());
+    }
+
+    /// Full async path (`ui.editExternal` host-call shape): settings→env
+    /// resolution + `spawn_blocking` editor wait through the real bridge
+    /// surface (`edit_text_external`).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // test env-guard held across awaits
+    async fn edit_external_full_path_resolves_configured_editor() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new();
+        let script = fake_editor_script(&tmp, "echo from-visual > \"$1\"");
+        let (mode, terminal, _tmp_keep, _restore) = harness_with_editor(&script).await;
+        let ui = Arc::clone(&mode.ui_state);
+
+        let result = ui.edit_text_external("draft", None).await.expect("edited");
+        assert_eq!(result.as_deref(), Some("from-visual"));
+        assert!(terminal.is_started(), "TUI must be restarted");
+        assert!(no_edit_temp_dirs_left());
     }
 }
