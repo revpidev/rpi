@@ -1,8 +1,7 @@
 # subagents target-track recorded fixtures（pi-subagents v0.66.0）
 
-> **目标轨，pin 未切换**（TE13，ADR-0025 状态「提议」）。本目录的锚点取自
-> `external/pi-subagents` @ `0fc0eebb9604970c506708b7508d6aa38921fde2`（v0.66.0，只读复核）；
-> `external/` 未被写入、submodule HEAD 仍为旧 pin `56f97234`（v0.48.0，TE27 才切换）。
+> **pin 已随 TE27 切换（2026-09-11，ADR-0025 已采纳）**：`external/pi-subagents` submodule HEAD 即
+> `0fc0eebb9604970c506708b7508d6aa38921fde2`（v0.66.0），本目录锚点即当前基线（TE13 录制时为仓库外只读快照，`external/` 零写入）。
 
 ## 用途与消费者
 

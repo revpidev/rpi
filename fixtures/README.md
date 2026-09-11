@@ -10,7 +10,7 @@
 fixtures/
 ├── README.md                # This file: runbook + itemized parity baseline list
 ├── generate-fixtures.mjs    # Generation script (pinned commit + fixed prompt scripts)
-├── subagents-v066/          # TE13 目标轨录制 fixture（目标轨，pin 未切换；见该目录 README）
+├── subagents-v066/          # subagents 目标轨录制 fixture（pin 已随 TE27 切换，本目录锚点即当前基线；见该目录 README）
 └── generated/
     ├── <scenario>/
     │   ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
