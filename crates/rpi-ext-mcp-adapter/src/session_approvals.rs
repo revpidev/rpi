@@ -6,12 +6,15 @@
 //! at the pinned v2.32.1 tag `10a45367`) plus the `getToolApprovalIdentity`
 //! consumer in `tool-approval.ts` @ `928c30c`.
 //!
-//! rpi has no `ctx.sessionManager.getBranch()` host-call (04-design §6.1), so
-//! the read side is the documented transitional path: `ctx.sessionFile.path`
-//! straight JSONL read, replayed per `customType` (R7.2.2.3). The active
-//! branch is walked from the leaf id the host reports on `session_tree`
-//! (agent-session.ts:3288-3295 @ 9841914), or from the last entry on
-//! session load (the host's own `build_index` leaf semantics).
+//! rpi reads the active branch through the additive `ctx.sessionEntries`
+//! host-call first (ADR-0027 / TE33 — the cross-ABI equivalent of upstream's
+//! in-memory `getBranch()`), covering file **and** in-memory (`--no-session`)
+//! sessions; hosts that predate the method answer `unknownMethod` and the
+//! documented transitional path runs instead: `ctx.sessionFile.path`
+//! straight JSONL read, replayed per `customType` (R7.2.2.3/R7.2.2.5). There
+//! the active branch is walked from the leaf id the host reports on
+//! `session_tree` (agent-session.ts:3288-3295 @ 9841914), or from the last
+//! entry on session load (the host's own `build_index` leaf semantics).
 //!
 //! Security red line (G4): entries carry only names and SHA-256 hashes; raw
 //! arguments are never serialized into a session entry.
@@ -304,7 +307,31 @@ pub fn approval_entries_from_branch(branch: &[&Value]) -> Vec<SessionApprovalEnt
     entries
 }
 
-/// Read + replay the approvals of one session file's active branch.
+/// Replay the `mcp-approval-v1` tool grants from a `ctx.sessionEntries`
+/// reply (ADR-0027 / TE33): the host has already resolved the active branch
+/// from memory and filtered it by `customType`, so this pass only re-applies
+/// the strict entry validation — foreign custom types and malformed payloads
+/// are skipped without losing the valid grants (`isApprovalCustomEntry` /
+/// `isSessionApprovalEntry` skip semantics, session-approvals.ts:186-190
+/// @ 928c30c; task §4.2 A6).
+pub fn approval_entries_from_session_entries(entries: &[Value]) -> Vec<SessionApprovalEntry> {
+    let mut grants = Vec::new();
+    for entry in entries {
+        if entry.get("customType").and_then(Value::as_str) != Some(MCP_APPROVAL_CUSTOM_TYPE) {
+            tracing::debug!("MCP: skipping non-approval session entry");
+            continue;
+        }
+        match parse_session_approval_entry(entry.get("data").unwrap_or(&Value::Null)) {
+            Some(grant) => grants.push(grant),
+            None => tracing::debug!("MCP: skipping unrecognized session approval entry"),
+        }
+    }
+    grants
+}
+
+/// Read + replay the approvals of one session file's active branch (the
+/// TE21 transitional read side — old hosts without the session-entries ABI;
+/// 04-design §6.2 fallback).
 pub fn read_session_approval_entries(
     path: &Path,
     leaf_id: Option<&str>,
@@ -602,5 +629,53 @@ mod tests {
         let keys = restored_approval_keys(&[entry.clone(), entry.clone()]);
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&identity.cache_key));
+    }
+
+    /// TE33 A6: the `ctx.sessionEntries` reply pass keeps the valid grants
+    /// and skips foreign custom types / malformed payloads without losing
+    /// the rest (session-approvals.ts:186-190 skip semantics).
+    #[test]
+    fn abi_reply_skips_invalid_entries_and_keeps_valid_grants() {
+        let identity = get_tool_approval_identity(
+            "demo",
+            &tool("search", json!({"type": "object"})),
+            &json!({"query": "a"}),
+        );
+        let entry = SessionApprovalEntry::allow_for_session(
+            "demo",
+            "search",
+            &identity.definition_hash,
+            &identity.args_hash,
+        );
+        let good = json!({
+            "id": "e1",
+            "parentId": null,
+            "timestamp": "2026-09-11T00:00:00.000Z",
+            "customType": MCP_APPROVAL_CUSTOM_TYPE,
+            "data": entry_to_value(&entry),
+        });
+        // Smuggled raw arguments → strict-entry reject.
+        let mut bad_payload = good.clone();
+        bad_payload["data"]["args"] = json!({"query": "a"});
+        // A custom entry of another extension must not be replayed even if
+        // its payload coincidentally parses.
+        let foreign = json!({
+            "id": "e2",
+            "parentId": "e1",
+            "timestamp": "2026-09-11T00:00:00.000Z",
+            "customType": "other-custom",
+            "data": entry_to_value(&entry),
+        });
+        // A null `data` (entry without payload) is skipped, not a panic.
+        let null_data = json!({
+            "id": "e3",
+            "parentId": "e1",
+            "timestamp": "2026-09-11T00:00:00.000Z",
+            "customType": MCP_APPROVAL_CUSTOM_TYPE,
+            "data": null,
+        });
+        let grants =
+            approval_entries_from_session_entries(&[good, bad_payload, foreign, null_data]);
+        assert_eq!(grants, vec![entry]);
     }
 }

@@ -617,7 +617,8 @@ fn install(calls: RpiHostCalls, cookie: PluginCookie) -> Value {
                     }));
                     // R7.2.2.3: bind the session-approval sink/dialog and
                     // restore the active branch's grants (index.ts:214-227
-                    // `restoreCurrentSessionApprovals` + init.ts:181-243).
+                    // `restoreCurrentSessionApprovals` + init.ts:181-243;
+                    // ABI first, JSONL fallback — `restore_session_approvals`).
                     runtime.approval.set_sink(Arc::new(HostSessionApprovalSink));
                     let approval_ui: Option<Arc<dyn approval::ApprovalHandler>> =
                         if ui_can_render_panel(plugin) {
@@ -951,12 +952,13 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                 pack(&Value::Null)
             }
             Some("session_tree") => {
-                // R7.2.2.3: branch navigation → rebuild the approval set for
-                // the target branch (index.ts:728-745 @ 928c30c). The leaf id
-                // rides the `session_tree` payload (TE21 host parity fix);
-                // `newLeafId: null` means an empty branch. When the runtime is
-                // still initializing, the leaf is kept for the on_ready
-                // restore.
+                // R7.2.2.3/.5: branch navigation → rebuild the approval set
+                // for the target branch (index.ts:728-745 @ 928c30c). The
+                // leaf id rides the `session_tree` payload (TE21 host parity
+                // fix; consumed by the JSONL fallback path — the ABI path
+                // reads the host's own active branch) and `newLeafId: null`
+                // means an empty branch. When the runtime is still
+                // initializing, the leaf is kept for the on_ready restore.
                 let payload = message.get("payload");
                 let explicit_null = payload
                     .and_then(|payload| payload.get("newLeafId"))
@@ -1037,18 +1039,83 @@ fn ui_can_render_panel(state: &PluginState) -> bool {
     host.can_render_panel()
 }
 
-/// Active-branch approval restore (index.ts:214-227
-/// `restoreCurrentSessionApprovals` @ 928c30c): read the authoritative
-/// `ctx.sessionFile` path and replay the `mcp-approval-v1` entries of the
-/// branch (04-design §6.1 transitional path — no branch-read ABI). Fail-soft:
-/// an in-memory/unreadable session clears the set (upstream catch → empty
-/// branch).
+/// Active-branch approval restore (`restoreCurrentSessionApprovals`,
+/// index.ts:217-229 @ 928c30c): **ABI first, JSONL fallback**
+/// (ADR-0027 / TE33, R7.2.2.5).
+///
+/// - ABI path: `ctx.sessionEntries {customType:"mcp-approval-v1"}` — the
+///   authoritative in-memory active branch, covering file **and in-memory**
+///   (`--no-session`) sessions alike (TE-D41 closed on this path) and
+///   winning over any file tail (multi-process hosts are read from memory,
+///   not the JSONL tip). No `limit` is sent: restore wants every grant on
+///   the branch (task §8.3-1; recorded in §7).
+/// - Old hosts answer `unknownMethod` → the TE21 transitional JSONL read
+///   (`ctx.sessionFile.path` + `session_tree.newLeafId` branch walk,
+///   04-design §6.2); in-memory sessions stay fail-closed clear there
+///   (documented TE-D41 fallback limitation).
+/// - Any other ABI error — or a reply that is not an entry array — clears
+///   the set with a debug log: the same posture as upstream's `getBranch()`
+///   catch (index.ts:225-228) and the TE21 IO-error path; never a panic and
+///   never silently wider than the branch.
+///
+/// Probing is per call — nothing is cached, so every restore re-detects ABI
+/// availability and a host reload/switch re-probes naturally (task §4.2 A8).
 fn restore_session_approvals(
     state: &PluginState,
     runtime: &proxy::McpRuntime,
     leaf_id: Option<&str>,
 ) {
-    let channel = state.channel();
+    match read_active_branch_approvals(&state.channel(), leaf_id) {
+        BranchApprovalRead::Entries(entries) => runtime.approval.restore(&entries),
+        BranchApprovalRead::Unavailable => runtime.approval.restore(&[]),
+    }
+}
+
+/// The outcome of one active-branch approval read.
+enum BranchApprovalRead {
+    /// A source served the branch (ABI or JSONL): replay these grants.
+    Entries(Vec<session_approvals::SessionApprovalEntry>),
+    /// No source could serve it (ABI error other than `unknownMethod`,
+    /// malformed reply, absent/unreadable JSONL): the restore clears
+    /// (fail-closed).
+    Unavailable,
+}
+
+fn read_active_branch_approvals(
+    channel: &HostChannel,
+    leaf_id: Option<&str>,
+) -> BranchApprovalRead {
+    // ABI first (ADR-0027): the host replays the active branch from memory.
+    let reply = host_call(
+        &channel.calls(),
+        channel.cookie,
+        "ctx.sessionEntries",
+        json!({"customType": session_approvals::MCP_APPROVAL_CUSTOM_TYPE}),
+    );
+    if let Some(error) = reply.get("error") {
+        if error.get("kind").and_then(Value::as_str) != Some("unknownMethod") {
+            tracing::debug!("MCP: could not read session approvals over the ABI: {error}");
+            return BranchApprovalRead::Unavailable;
+        }
+        // `unknownMethod` → old host; fall through to the JSONL read below.
+    } else {
+        return match reply.get("ok").and_then(Value::as_array) {
+            Some(entries) => BranchApprovalRead::Entries(
+                session_approvals::approval_entries_from_session_entries(entries),
+            ),
+            None => {
+                // A conformant host always answers an entry array (V14-25);
+                // a null/absent `ok` is a protocol anomaly → fail-closed.
+                tracing::debug!("MCP: malformed ctx.sessionEntries reply");
+                BranchApprovalRead::Unavailable
+            }
+        };
+    }
+
+    // TE21 transitional path (old hosts, 04-design §6.2): straight JSONL
+    // read of the authoritative `ctx.sessionFile` path. In-memory sessions
+    // have no file to replay and clear here (documented TE-D41 fallback
+    // limitation; upstream rebuilds from memory instead).
     let info = host_call_ok(
         &channel.calls(),
         channel.cookie,
@@ -1061,14 +1128,13 @@ fn restore_session_approvals(
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty());
     let Some(path) = path else {
-        runtime.approval.restore(&[]);
-        return;
+        return BranchApprovalRead::Unavailable;
     };
     match session_approvals::read_session_approval_entries(std::path::Path::new(path), leaf_id) {
-        Ok(entries) => runtime.approval.restore(&entries),
+        Ok(entries) => BranchApprovalRead::Entries(entries),
         Err(error) => {
             tracing::debug!("MCP: could not read session approvals: {error}");
-            runtime.approval.restore(&[]);
+            BranchApprovalRead::Unavailable
         }
     }
 }
