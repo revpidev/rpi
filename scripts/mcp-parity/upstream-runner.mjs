@@ -2,7 +2,8 @@
 // Cross-implementation parity: UPSTREAM (Node) side runner (design §5.2).
 //
 // Drives the pinned upstream `McpServerManager`
-// (external/pi-mcp-adapter/server-manager.ts @ 3d953f90) against the shared
+// (external/pi-mcp-adapter/server-manager.ts @ 10a45367 since the TE27 pin
+// switch) against the shared
 // fixture server and prints one normalized JSON result document to stdout:
 //
 //   { transport, frames: [...], results: {...}, status, error? }

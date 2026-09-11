@@ -1,6 +1,9 @@
-// Orchestrator of the subagents parity harness (TE04 G3; dual-track TE13).
+// Orchestrator of the subagents parity harness (TE04 G3; dual-track TE13;
+// target track made the default by TE27 when the submodule pin switched to
+// v0.66.0 — the old-pin regression track's lifecycle ended there, its
+// historical reports are kept under fixtures/generated/subagents-parity/).
 //
-//   node scripts/subagents-parity/run-parity.mjs [--track=regression|target]
+//   node scripts/subagents-parity/run-parity.mjs [--track=target|regression]
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
 // The Rust leg is built by this script and copied to a private path before
@@ -8,14 +11,7 @@
 // the unsuffixed target/debug/examples/parity_runner belongs to whichever
 // crate built last (the mcp harness would shadow it otherwise).
 //
-// Track `regression` (default; byte-compatible with the pre-TE13 harness):
-//   1. Runs the pinned upstream v0.48 modules (tsx) on the shared fixtures.
-//   2. Runs the Rust parity_runner example on the same fixtures.
-//   3. Normalizes both sides and diffs; writes
-//      fixtures/generated/subagents-parity/parity-report.md.
-//   Non-zero exit = any case mismatched.
-//
-// Track `target` (pi-subagents v0.66.0, ADR-0025):
+// Track `target` (default since TE27; pi-subagents v0.66.0, ADR-0025):
 //   1. argv/env: Rust vs the frozen v0.48 golden ([RPI-OWN], ADR-0025 §4;
 //      upstream deleted `pi-args.ts` in v0.65).
 //   2. frontmatter/final-output/fallback: Rust vs the v0.66 snapshot modules
@@ -27,6 +23,16 @@
 //      (`upstream-semantics` vs `rpi-deviation`, each with R + owner task);
 //      writes fixtures/generated/subagents-parity-v066/parity-report.md.
 //   Non-zero exit = any UNATTRIBUTED diff.
+//
+// Track `regression` (retired by TE27; kept for archaeology — requires the
+// old-pin worktree, i.e. `git -C external/pi-subagents checkout 56f97234`
+// followed by restoring the v0.66.0 pin afterwards):
+//   1. Runs the pinned upstream v0.48 modules (tsx) on the shared fixtures.
+//   2. Runs the Rust parity_runner example on the same fixtures.
+//   3. Normalizes both sides and diffs; writes
+//      fixtures/generated/subagents-parity/parity-report.md.
+//   Non-zero exit = any case mismatched (expects the rpi crate at v0.48
+//   semantics — will not hold after the rebase batches).
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -39,7 +45,7 @@ const GOLDEN_PATH = `${HERE}/args-golden-v048.json`;
 const TARGET_MANIFEST = `${HERE}/expected-target-diffs.json`;
 
 const TRACK_FLAG = process.argv.find((arg) => arg.startsWith("--track="));
-const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "regression";
+const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "target";
 if (!["regression", "target"].includes(TRACK)) {
 	console.error(`unknown track: ${TRACK}`);
 	process.exit(2);

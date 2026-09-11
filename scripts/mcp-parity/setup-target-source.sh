@@ -4,7 +4,9 @@
 # ADR-0025 §9). Read-only against external/: `git archive` reads the object
 # database only (no checkout, no worktree), so
 # `git -C external/pi-mcp-adapter status --porcelain` stays empty and the
-# submodule HEAD keeps v2.24.0 until TE27.
+# submodule HEAD is untouched. Since the TE27 pin switch the submodule HEAD
+# IS this target pin (v2.32.1), so the snapshot is now an independent
+# reference copy rather than a pre-switch stand-in.
 #
 # The snapshot doubles as the out-of-tree dependency root: the parity hooks
 # (parity-hooks.mjs) resolve bare specifiers against

@@ -1,17 +1,18 @@
 # mcp-parity 目标轨骨架与重录清单（TE13 交付；实际重录归 TE23/TE24）
 
-> **目标轨，pin 未切换**（TE13，ADR-0025 状态「提议」）。目标 pin：
-> `external/pi-mcp-adapter` @ `10a45367e033a32026987a75d6f401e37340c86f`（v2.32.1，90 commits）。
-> `external/` 零写入；submodule HEAD 仍为 `3d953f90`（v2.24.0，TE27 才切换）。
+> **pin 已切换（TE27，2026-09-11；ADR-0025 已采纳）**：`external/pi-mcp-adapter` @
+> `10a45367e033a32026987a75d6f401e37340c86f`（v2.32.1，90 commits）。
+> 本文件保留作目标轨历史记录；缺省驱动（submodule 工作树）即 v2.32.1，快照路径
+> `/tmp/rpi-mcp-parity-target-v2321` 仅作独立对照源使用。
 
 ## 1. 骨架就位内容（TE13 已完成）
 
 | 项 | 落点 | 说明 |
 |----|------|------|
-| 上游根可切换 | `run-mcp-parity.mjs` / `run-oauth-parity.mjs` / `render-call-upstream.mjs` | 均读 `RPI_MCP_PARITY_UPSTREAM`，缺省 = 旧 pin（回归轨零变化） |
+| 上游根可切换 | `run-mcp-parity.mjs` / `run-oauth-parity.mjs` / `render-call-upstream.mjs` | 均读 `RPI_MCP_PARITY_UPSTREAM`，缺省 = submodule 工作树（TE27 起 = v2.32.1） |
 | 目标源码/依赖外置 | `setup-target-source.sh` | `git archive` 抽取 v2.32.1 到 `/tmp/rpi-mcp-parity-target-v2321` 并用其 lockfile `npm ci`（external/ 零写入） |
-| conformance 基线重生成入口 | 本文件 §3 + `run-parity-suite.sh conformance` | 基线文件仍是 v2.24.0 的 `conformance-baseline.yml`；重生成归 TE24 |
-| 行为对拍新增面清单 | 本文件 §4 | 审批作用域/退避可见性/503·202·401 分类/嵌套参数/OAuth 401 |
+| conformance 基线重生成入口 | 本文件 §3 + `run-parity-suite.sh conformance` | 基线为 rpi 客户端预期失败清单（与上游 tag 无关；重生成入口 TE24 已验收） |
+| 行为对拍新增面清单 | 本文件 §4 | 审批作用域/退避可见性/503·202·401 分类/嵌套参数/OAuth 401（均已由 TE21/TE22 落地验收） |
 
 **本骨架不做**：不切换默认驱动、不重录 `conformance-baseline.yml`、不重录任何 golden
 向量、不改 crate 实现——这些分别属 TE23/TE24/TE21/TE22（G10「对拍先于实现」的落地顺序见

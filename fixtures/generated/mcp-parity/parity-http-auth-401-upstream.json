@@ -4,5 +4,5 @@
   "frames": [],
   "results": {},
   "status": "error",
-  "error": "Error: fetch failed — probe: endpoint returned an untyped response (401) — this URL does not appear to speak MCP"
+  "error": "Error: fetch failed — probe: endpoint returned an untyped response (401) — authentication may be required; MCP endpoint shape could not be determined"
 }

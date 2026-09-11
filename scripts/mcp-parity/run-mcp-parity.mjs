@@ -22,8 +22,9 @@
 //                         (default /tmp/rpi-mcp-parity-deps; created by
 //                         scripts/mcp-parity/setup-deps.sh)
 //   RPI_MCP_PARITY_UPSTREAM  upstream source root (default
-//                         external/pi-mcp-adapter @ v2.24.0; target track:
-//                         the v2.32.1 snapshot from setup-target-source.sh)
+//                         external/pi-mcp-adapter @ v2.32.1 — the submodule
+//                         pin switched to v2.32.1 in TE27 (ADR-0025), so the
+//                         default IS the rebased target baseline)
 //   RPI_MCP_PARITY_CARGO  cargo binary (default `cargo`)
 //
 // Exits non-zero when any scenario's documents differ. Reports are written
@@ -39,11 +40,12 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
-// Default = regression track (old pin). The target track sets
-// RPI_MCP_PARITY_UPSTREAM to the v2.32.1 snapshot from setup-target-source.sh
-// (ADR-0025 §9); the driver files already receive it via env.
+// Default = the submodule worktree, which since the TE27 pin switch IS
+// v2.32.1 (10a45367). The pre-switch regression track (old pin 3d953f90)
+// ended its lifecycle there; driving it now requires checking out the old
+// pin manually.
 const UPSTREAM = process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi-mcp-adapter");
-const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "3d953f90";
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "10a45367";
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 
@@ -178,6 +180,31 @@ function normalizeDiscoveryOrder(frames) {
   return out;
 }
 
+// Upstream v2.32.1 advertises the MCP UI extension capability
+// (`io.modelcontextprotocol/ui`, server-manager.ts initialize params) on
+// every transport. rpi deliberately does not implement MCP UI/Glimpse —
+// it is on the rebase P2 [DEFER] list (rpi-docs v0.1.4
+// 03-extensions-requirements.md §6: "MCP UI/Glimpse/UI capability 广告";
+// gates.md G4 red line). Normalize the deferred capability advertisement
+// out of the initialize frame for comparison only — transcripts on disk
+// stay verbatim, so the intentional difference remains visible in the
+// side documents.
+const DEFERRED_UI_EXTENSION = "io.modelcontextprotocol/ui";
+function normalizeDeferredUiCapability(frames) {
+  return frames.map((frame) => {
+    const extensions = frame?.params?.capabilities?.extensions;
+    if (!extensions || !(DEFERRED_UI_EXTENSION in extensions)) return frame;
+    const nextExtensions = { ...extensions };
+    delete nextExtensions[DEFERRED_UI_EXTENSION];
+    const nextCapabilities = { ...frame.params.capabilities };
+    delete nextCapabilities.extensions;
+    if (Object.keys(nextExtensions).length > 0) {
+      nextCapabilities.extensions = nextExtensions;
+    }
+    return { ...frame, params: { ...frame.params, capabilities: nextCapabilities } };
+  });
+}
+
 mkdirSync(outDir, { recursive: true });
 const report = [];
 let failed = 0;
@@ -238,8 +265,10 @@ for (const scenario of SCENARIOS) {
       writeFileSync(join(outDir, `parity-${scenario.name}-upstream.json`), JSON.stringify(upstream.document, null, 2) + "\n");
       writeFileSync(join(outDir, `parity-${scenario.name}-rpi.json`), JSON.stringify(rust.document, null, 2) + "\n");
       const framesMatch = deepEqual(
-        normalizeDiscoveryOrder(upstream.document.frames ?? []),
-        normalizeDiscoveryOrder(rust.document.frames ?? []),
+        normalizeDeferredUiCapability(
+          normalizeDiscoveryOrder(upstream.document.frames ?? []),
+        ),
+        normalizeDeferredUiCapability(normalizeDiscoveryOrder(rust.document.frames ?? [])),
       );
       const resultsMatch = deepEqual(upstream.document.results, rust.document.results);
       // auth-401 expected-diff (P0 scope cut, FR-P0-08): upstream's 401
@@ -279,7 +308,9 @@ const lines = [
   `Upstream: pi-mcp-adapter @ ${UPSTREAM_PIN} (server-manager.ts, McpServerManager)`,
   `rpi: crates/rpi-ext-mcp-adapter @ ${spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim()} (uncommitted working tree)`,
   "",
-  "Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server.",
+  "Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server; " +
+    "contiguous discovery-request runs order-insensitive; deferred P2 `io.modelcontextprotocol/ui` " +
+    "capability advertisement excluded (rpi-docs 03-extensions-requirements §6, rebase P2 [DEFER]).",
   "",
   "| Scenario | Verdict | Detail |",
   "| --- | --- | --- |",

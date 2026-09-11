@@ -28,7 +28,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "..", "..");
 const UPSTREAM =
   process.env.RPI_MCP_PARITY_UPSTREAM ?? join(REPO, "external", "pi-mcp-adapter");
-const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "3d953f90";
+const UPSTREAM_PIN = process.env.RPI_MCP_PARITY_UPSTREAM_PIN ?? "10a45367"; // TE27 pin switch (v2.32.1)
 const DEPS = process.env.RPI_MCP_PARITY_DEPS ?? "/tmp/rpi-mcp-parity-deps";
 const CARGO = process.env.RPI_MCP_PARITY_CARGO ?? "cargo";
 const OUT_DIR =

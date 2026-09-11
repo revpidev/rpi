@@ -1,6 +1,6 @@
 [package]
 name = "rpi-ext-mcp-adapter"
-description = "MCP client adapter extension (L0 native plugin) — port of pi-mcp-adapter @ v2.24.0 (3d953f90)"
+description = "MCP client adapter extension (L0 native plugin) — port of pi-mcp-adapter @ v2.32.1 (10a45367; v0.1.4 rebase)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

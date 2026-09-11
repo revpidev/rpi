@@ -4,7 +4,8 @@
 # pinned submodules stay pristine (G4 red line).
 #
 # The upstream package.json + package-lock.json (external/pi-mcp-adapter @
-# 3d953f90) are copied verbatim into the deps dir and installed with
+# 10a45367, since the TE27 pin switch) are copied verbatim into the deps dir
+# and installed with
 # `npm ci`, so the FULL transitive closure is exactly the one upstream
 # pinned and tested against — including tsx (upstream modules use
 # non-erasable TypeScript syntax: constructor parameter properties) and the

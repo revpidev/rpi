@@ -15,14 +15,18 @@ fixtures/
     ├── <scenario>/
     │   ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
     │   └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
-    └── subagents-parity-v066/  # TE13 目标轨对拍报告（回归轨报告在 subagents-parity/）
+    └── subagents-parity-v066/  # subagents 目标轨对拍报告（pin 切换后唯一活跃轨）
 ```
 
-> **插件重定基目标轨（TE13，目标轨、pin 未切换）**：`fixtures/subagents-v066/` 与
-> `fixtures/generated/subagents-parity-v066/` 的锚点取自 `external/pi-subagents` @
-> `0fc0eebb`（v0.66.0）；`external/` 未被写入，submodule HEAD 仍为 `56f97234`（v0.48.0），
-> pin 切换属 TE27（ADR-0025 状态「提议」）。mcp 侧目标轨骨架与重录清单见
-> `scripts/mcp-parity/TARGET-TRACK.md`（实际重录归 TE23/TE24）。
+> **插件重定基（已生效，TE27 2026-09-11）**：`external/pi-subagents` @ `0fc0eebb`（v0.66.0）、
+> `external/pi-mcp-adapter` @ `10a45367`（v2.32.1）——pin 随 TE27 原子切换（ADR-0025 已采纳，见 rpi-docs `adr/0025-extension-upstream-rebase.md`）；
+> `external/pi` @ `9841914` 与 `external/agent-smart-fetch` @ `b0111612` 不变。
+> `fixtures/subagents-v066/` 与 `fixtures/generated/subagents-parity-v066/` 锚点即当前基线。
+> **旧 tag 回归轨（subagents v0.48.0 / mcp v2.24.0）生命周期随 pin 切换结束**：历史报告保留于
+> `fixtures/generated/subagents-parity/`（subagents，零回归红线使命完成）与
+> `fixtures/generated/mcp-parity/` 的 tag 前归档版本，不删除；驱动旧轨需要旧 pin 工作树
+> （`git -C external/pi-subagents checkout 56f97234`，用后复位）。
+> mcp 侧目标轨记录见 `scripts/mcp-parity/TARGET-TRACK.md`（重录已由 TE23/TE24 完成，黄金按 v2.32.1/`7a7b01b` 快照）。
 
 ## 2. Runbook (repeatable generation)
 

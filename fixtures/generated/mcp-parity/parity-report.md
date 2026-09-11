@@ -1,10 +1,10 @@
 # MCP adapter cross-implementation parity report (design §5.2)
 
-Generated: 2026-09-10T08:21:50.127Z (rerun: `node scripts/mcp-parity/run-mcp-parity.mjs`)
-Upstream: pi-mcp-adapter @ 3d953f90 (server-manager.ts, McpServerManager)
-rpi: crates/rpi-ext-mcp-adapter @ c925c9b (uncommitted working tree)
+Generated: 2026-09-11T06:38:22.423Z (rerun: `node scripts/mcp-parity/run-mcp-parity.mjs`)
+Upstream: pi-mcp-adapter @ 10a45367 (server-manager.ts, McpServerManager)
+rpi: crates/rpi-ext-mcp-adapter @ bee63d6 (uncommitted working tree)
 
-Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server.
+Normalization: JSON-RPC ids → `$id`; frame transcripts recorded by the shared fixture server; contiguous discovery-request runs order-insensitive; deferred P2 `io.modelcontextprotocol/ui` capability advertisement excluded (rpi-docs 03-extensions-requirements §6, rebase P2 [DEFER]).
 
 | Scenario | Verdict | Detail |
 | --- | --- | --- |

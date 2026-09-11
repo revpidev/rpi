@@ -5,7 +5,8 @@
 # Read-only against external/: `git archive` reads the object database only
 # (no checkout, no `git worktree add`), so
 # `git -C external/pi-subagents status --porcelain` stays empty and the
-# submodule HEAD keeps the old pin until TE27. Nothing is written under the
+# submodule HEAD is untouched. Since the TE27 pin switch the submodule HEAD
+# IS this target pin (v0.66.0). Nothing is written under the
 # repository; the snapshot and its npm deps live under /tmp.
 #
 # The snapshot's own production deps are installed out-of-repo because

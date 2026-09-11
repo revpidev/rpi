@@ -1,7 +1,7 @@
 // Module resolution hooks for the parity drivers
 // (scripts/mcp-parity/upstream-*.mjs).
 //
-// The pinned upstream (`external/pi-mcp-adapter` @ 3d953f90) is imported
+// The pinned upstream (`external/pi-mcp-adapter` @ 10a45367 since TE27) is imported
 // directly and its bare imports are resolved against an OUT-OF-TREE
 // dependency install (see scripts/mcp-parity/README.md) — nothing is ever
 // written into `external/` (G4 red line).

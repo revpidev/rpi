@@ -1,7 +1,7 @@
 # MCP adapter cross-implementation parity harness (design §5.2)
 
 同一 fixture MCP 服务器驱动两侧客户端——上游钉死版 Node `McpServerManager`
-（`rpi/external/pi-mcp-adapter` @ `3d953f90`，只读）与本 crate 的 Rust
+（`rpi/external/pi-mcp-adapter` @ `10a45367`（v2.32.1，TE27 pin 切换后基线），只读）与本 crate 的 Rust
 manager——并 diff 归一化后的帧序列与结果 JSON。任何差异都归因于客户端实现
 本身（两侧 fixture 服务器逐字节同构）。
 
@@ -23,7 +23,7 @@ node scripts/mcp-parity/run-mcp-parity.mjs     # 全场景，非零退出码 = �
 
 ## 目标轨（TE13 骨架，ADR-0025）
 
-默认 = 回归轨（旧 pin `3d953f90` / v2.24.0）。目标轨把上游根切到 v2.32.1
+默认 = submodule 工作树（TE27 pin 切换后 = `10a45367` / v2.32.1，即重定基目标基线）。旧 pin 回归轨（`3d953f90` / v2.24.0）生命周期随 TE27 结束；如需考古复跑，把上游根切到旧 pin 工作树
 仓库外快照（`external/` 零写入）：
 
 ```bash

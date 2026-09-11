@@ -7,11 +7,12 @@
 
 | 轨 | 上游 | 用途 | 报告目录 |
 |----|------|------|----------|
-| `regression`（默认） | 旧 pin v0.48.0（`external/pi-subagents` @ `56f97234`，只读） | 保证现有实现行为不回归 | `fixtures/generated/subagents-parity/` |
-| `target` | 新 pin v0.66.0（`0fc0eebb`，仓库外快照） | 新语义对拍与 golden 重录（ADR-0025） | `fixtures/generated/subagents-parity-v066/` |
+| `target`（**默认，TE27 起**） | 新 pin v0.66.0（`0fc0eebb`，仓库外快照；submodule 已随 TE27 切至该 pin） | 新语义对拍与 golden 重录（ADR-0025） | `fixtures/generated/subagents-parity-v066/` |
+| `regression`（**已退役，TE27**） | 旧 pin v0.48.0（`56f97234`，需手动 checkout 旧 pin 工作树） | 保证 v0.48 基线零回归（使命已完成） | `fixtures/generated/subagents-parity/`（历史报告保留） |
 
-旧轨保留至 pin 切换完成（TE27，ADR-0025 §8/§9）；两轨 fixture 输入分离：基线用例在
-`fixtures.json`，目标轨新增用例在 `fixtures-target.json`（目标轨按模式拼接两者）。
+旧轨生命周期随 TE27 pin 切换结束（04 §1.3）：rpi 实现已落 v0.66 语义，旧轨黄金不再成立；
+复跑旧轨需 `git -C external/pi-subagents checkout 56f97234`（用后复位 `0fc0eebb`）。
+两轨 fixture 输入分离：基线用例在 `fixtures.json`，目标轨新增用例在 `fixtures-target.json`（目标轨按模式拼接两者）。
 
 ## 运行
 
@@ -22,13 +23,12 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# 回归轨（默认；与 TE13 前的 harness 逐项一致，零回归红线）
-node scripts/subagents-parity/run-parity.mjs
-# 等价写法：node scripts/subagents-parity/run-parity.mjs --track=regression
+# 回归轨（已退役；复跑需旧 pin 工作树）
+node scripts/subagents-parity/run-parity.mjs --track=regression
 
-# 目标轨（v0.66.0）
+# 目标轨（v0.66.0，默认）
 bash scripts/subagents-parity/setup-target-source.sh   # 抽取仓库外快照 + 其 prod 依赖
-node scripts/subagents-parity/run-parity.mjs --track=target
+node scripts/subagents-parity/run-parity.mjs            # TE27 起默认 target 轨
 
 # 重录 argv/env 冻结基线（[RPI-OWN]，ADR-0025 §4）
 node scripts/subagents-parity/run-parity.mjs --record-args-golden
@@ -39,7 +39,7 @@ Rust 腿由 `run-parity.mjs` 自己构建（cargo 缓存命中时近零开销）
 归最后构建的 crate 所有，mcp harness 会把它覆盖掉（TE13 实测发现的 harness 缺陷）。
 私有拷贝使两套 harness 互不干扰，example 名称与既有文档保持兼容。
 
-退出码：回归轨非 0 = 有差异；目标轨非 0 = 存在**未归因**差异。
+退出码：目标轨非 0 = 存在**未归因**差异；回归轨（已退役）非 0 = 有差异。
 
 ### 目标轨 discovery 腿（TE15，R7.1.3）
 
