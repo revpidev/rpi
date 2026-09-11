@@ -217,7 +217,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "ea27f62b-163c-4580-b891-aed674fcbf0d",
+        "mcp-session-id": "session-$uuid",
         "x-accel-buffering": "no"
       },
       "body": "event: message\ndata: {\"method\":\"elicitation/create\",\"params\":{\"message\":\"Test client default value handling - please accept with defaults\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"User name\",\"default\":\"John Doe\"},\"age\":{\"type\":\"integer\",\"description\":\"User age\",\"default\":30},\"score\":{\"type\":\"number\",\"description\":\"User score\",\"default\":95.5},\"status\":{\"type\":\"string\",\"description\":\"User status\",\"enum\":[\"active\",\"inactive\",\"pending\"],\"default\":\"active\"},\"verified\":{\"type\":\"boolean\",\"description\":\"Verification status\",\"default\":true}},\"required\":[]}},\"jsonrpc\":\"2.0\",\"id\":0}\n\n"
@@ -239,7 +239,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "ea27f62b-163c-4580-b891-aed674fcbf0d",
+        "mcp-session-id": "session-$uuid",
         "x-accel-buffering": "no",
         "content-length": 192
       },
@@ -262,7 +262,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "ea27f62b-163c-4580-b891-aed674fcbf0d",
+        "mcp-session-id": "session-$uuid",
         "x-accel-buffering": "no"
       },
       "body": "event: message\ndata: {\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Elicitation error: MCP error -32601: Method not found\"}]},\"jsonrpc\":\"2.0\",\"id\":2}\n\n"
@@ -284,7 +284,7 @@
         "cache-control": "no-cache, no-transform",
         "connection": "keep-alive",
         "content-type": "text/event-stream",
-        "mcp-session-id": "ea27f62b-163c-4580-b891-aed674fcbf0d",
+        "mcp-session-id": "session-$uuid",
         "x-accel-buffering": "no",
         "content-length": 256
       },

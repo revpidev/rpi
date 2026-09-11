@@ -1,6 +1,6 @@
 # ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
 
-generated: 2026-09-11T11:28:19.483Z
+generated: 2026-09-11T14:34:31.155Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
 submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
 typebox: 1.3.6

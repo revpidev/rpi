@@ -28,17 +28,17 @@
       "method": "notifications/initialized"
     },
     {
-      "method": "tools/list",
-      "jsonrpc": "2.0",
-      "id": "$id"
-    },
-    {
       "method": "resources/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },
     {
       "method": "prompts/list",
+      "jsonrpc": "2.0",
+      "id": "$id"
+    },
+    {
+      "method": "tools/list",
       "jsonrpc": "2.0",
       "id": "$id"
     },

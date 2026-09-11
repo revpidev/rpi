@@ -12,6 +12,9 @@
 //   ISO-8601 timestamps (check.timestamp)      → "$ts"
 //   host header ephemeral port localhost:NNNNN → "localhost:$port"
 //   mcp-session-id "session-<epoch-millis>"    → "session-$epoch"
+//   mcp-session-id "<uuid>" (Streamable HTTP)   → "session-$uuid" (the
+//     UUID form churns every rerun just like the epoch form; TE24 O5's
+//     first-line note, closed with the H1 sort in v0.1.4 M7)
 //   retry timing jitter (details.actualDelayMs) → dropped; the boolean
 //     withinTolerance / tooEarly / slightlyLate / veryLate verdicts remain
 //     as the stable evidence that the retry delay was respected.
@@ -35,9 +38,13 @@ if (!inPath || !outPath) {
 
 const PORT_RE = /\b(?:localhost|127\.0\.0\.1):\d{2,5}\b/g;
 const SESSION_RE = /\bsession-\d{9,}\b/g;
+const UUID_SESSION_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g;
 
 function normalizeText(text) {
-  return text.replace(PORT_RE, "localhost:$port").replace(SESSION_RE, "session-$epoch");
+  return text
+    .replace(PORT_RE, "localhost:$port")
+    .replace(SESSION_RE, "session-$epoch")
+    .replace(UUID_SESSION_RE, "session-$uuid");
 }
 
 const raw = readFileSync(inPath, "utf8");

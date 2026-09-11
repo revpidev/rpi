@@ -2092,6 +2092,12 @@ mod update_cli_tests {
 
     /// RC 通道的 self 更新计划（FR-B/FR-C）：探测推导端点；force 重装。
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn self_update_plan_pre_release_channel_probes_rc_endpoint() {
         // Pin the offline flag absent under the crate env lock: the probe
         // short-circuits entirely when `RPI_OFFLINE` is truthy, and env-
@@ -2122,6 +2128,12 @@ mod update_cli_tests {
     /// 通道选择矩阵：stable 通道探测 stable 端点（现状零回归）；RC
     /// 通道同版本 no-op；端点禁用两通道同样报错。
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn self_update_plan_channel_selection_matrix() {
         // Same offline pin as the RC-endpoint test above (V14-21 F1).
         let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
@@ -2360,6 +2372,12 @@ mod update_cli_tests {
     // Binary install method) ----
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_self_up_to_date_exits_0_without_runner() {
         // The update-self path probes the version endpoint through
         // `is_offline_mode_enabled()` — pin it absent (V14-21 F1).
@@ -2384,6 +2402,12 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_self_newer_version_on_binary_install_self_updates() {
         // T18 (ADR-0011 §7, D-054): the Binary branch no longer prints the
         // releases page and exits 1 — it downloads, verifies the sha256,
@@ -2414,6 +2438,12 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_self_force_reinstalls_same_version_on_binary() {
         // Offline pin (V14-21 F1): the probe must run for --force to reach
         // the reinstall branch.

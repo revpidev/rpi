@@ -886,10 +886,9 @@ fn dispatch_async(
             .iter()
             .map(|entry| entry.spec.agent_name.clone())
             .collect(),
-        crate::runner::background::AsyncBody::Steps { steps, .. } => steps
-            .iter()
-            .map(|step| step.agent_name.clone())
-            .collect(),
+        crate::runner::background::AsyncBody::Steps { steps, .. } => {
+            steps.iter().map(|step| step.agent_name.clone()).collect()
+        }
     };
     if let Some(error) = crate::p1::launch_child::preflight_self_extension(
         &body_agent_names,
