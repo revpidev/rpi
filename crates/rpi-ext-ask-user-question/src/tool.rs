@@ -386,8 +386,8 @@ mod tests {
             let label = if method == "events.emit" {
                 format!(
                     "events.emit:{}:{}",
-                    args["event"].as_str().unwrap_or("?"),
-                    args["payload"]["active"]
+                    args["channel"].as_str().unwrap_or("?"),
+                    args["data"]["active"]
                 )
             } else {
                 method.to_owned()
@@ -516,13 +516,13 @@ mod tests {
                 "ctx.hasUI"
             ]
         );
-        assert_eq!(calls[1].1["event"], "rpiv:ask-user:prompt");
+        assert_eq!(calls[1].1["channel"], "rpiv:ask-user:prompt");
         assert_eq!(
-            calls[1].1["payload"]["questions"][0]["options"][0]["hasPreview"],
+            calls[1].1["data"]["questions"][0]["options"][0]["hasPreview"],
             json!(false)
         );
-        assert_eq!(calls[3].1["payload"], json!({ "active": true }));
-        assert_eq!(calls[5].1["payload"], json!({ "active": false }));
+        assert_eq!(calls[3].1["data"], json!({ "active": true }));
+        assert_eq!(calls[5].1["data"], json!({ "active": false }));
     }
 
     /// RPC hosts route to the dialog walker: `ctx.mode == "rpc"` + both
@@ -639,8 +639,8 @@ mod tests {
             .expect("text")
             .contains("host dialog failed"));
         let calls = host.calls();
-        assert_eq!(calls[0].1["payload"], json!({ "active": true }));
-        assert_eq!(calls[2].1["payload"], json!({ "active": false }));
+        assert_eq!(calls[0].1["data"], json!({ "active": true }));
+        assert_eq!(calls[2].1["data"], json!({ "active": false }));
     }
 
     /// Non-RPC host whose component mount answers `unknownMethod` falls to
@@ -818,7 +818,7 @@ mod tests {
         params["questions"][0]["options"][0]["label"] = json!("A\r");
         let _ = execute(&host, &params);
         let calls = host.calls();
-        let payload = &calls[1].1["payload"];
+        let payload = &calls[1].1["data"];
         assert_eq!(payload["questions"][0]["question"], "Pick\none?");
         assert_eq!(payload["questions"][0]["options"][0]["label"], "A");
     }
@@ -889,8 +889,8 @@ mod tests {
         emit_blocked(&host, true).expect("blocked true");
         emit_blocked(&host, false).expect("blocked false");
         let calls = host.calls();
-        assert_eq!(calls[0].1["event"], "rpiv:ask-user:blocked");
-        assert_eq!(calls[0].1["payload"], json!({"active": true}));
-        assert_eq!(calls[1].1["payload"], json!({"active": false}));
+        assert_eq!(calls[0].1["channel"], "rpiv:ask-user:blocked");
+        assert_eq!(calls[0].1["data"], json!({"active": true}));
+        assert_eq!(calls[1].1["data"], json!({"active": false}));
     }
 }

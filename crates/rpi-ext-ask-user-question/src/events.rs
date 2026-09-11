@@ -58,19 +58,26 @@ pub fn build_blocked_payload(active: bool) -> Value {
 }
 
 /// Emit [`ASK_USER_PROMPT_EVENT`] through the host (`events.emit`).
+///
+/// Wire form follows the rpi ABI (`{"channel", "data"}` —
+/// `extension-abi.md` §3, the `pi.events.emit(channel, payload)` upstream
+/// shape; `rpi-ext-subagents` precedent) rather than the JS call-site names.
+/// Found by the V14-24 pilot e2e: the earlier `{"event", "payload"}` args
+/// never reached the `rpiv:ask-user:*` channels on a real host.
 pub fn emit_prompt(host: &dyn HostCall, params: &QuestionParams) -> Result<(), crate::HostError> {
     host.call(
         "events.emit",
-        json!({ "event": ASK_USER_PROMPT_EVENT, "payload": build_prompt_payload(params) }),
+        json!({ "channel": ASK_USER_PROMPT_EVENT, "data": build_prompt_payload(params) }),
     )
     .map(|_| ())
 }
 
-/// Emit [`ASK_USER_BLOCKED_EVENT`] through the host (`events.emit`).
+/// Emit [`ASK_USER_BLOCKED_EVENT`] through the host (`events.emit`);
+/// same `channel`/`data` wire form as [`emit_prompt`].
 pub fn emit_blocked(host: &dyn HostCall, active: bool) -> Result<(), crate::HostError> {
     host.call(
         "events.emit",
-        json!({ "event": ASK_USER_BLOCKED_EVENT, "payload": build_blocked_payload(active) }),
+        json!({ "channel": ASK_USER_BLOCKED_EVENT, "data": build_blocked_payload(active) }),
     )
     .map(|_| ())
 }
