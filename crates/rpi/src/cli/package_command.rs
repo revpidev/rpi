@@ -2589,7 +2589,19 @@ mod update_cli_tests {
     }
 
     #[tokio::test]
+    // Holding the std env lock across `.await` is intentional: the pin
+    // must span the whole async body; every #[tokio::test] owns its
+    // current-thread runtime/thread and the lock is never acquired
+    // while already held (no nesting) — blocking only serializes
+    // env-sensitive tests.
+    #[allow(clippy::await_holding_lock)]
     async fn update_all_runs_extensions_then_self() {
+        // Offline pin (V14-21 F1, M7 复核 B1 补齐)：`update --all` 的 self
+        // 分支探测版本端点，须固定 RPI_OFFLINE 缺席。
+        let (_env_lock, _env_guard) = crate::core::environment::test_env::EnvGuard::set(&[(
+            crate::core::environment::ENV_OFFLINE,
+            None,
+        )]);
         let dirs = TestDirs::new();
         let runner = FakeRunner::npm_view_latest();
         let transport = StubTransport::newer_version();
