@@ -50,9 +50,11 @@ pub fn render(
     let number_width = (question.options.len() + 1).max(1).to_string().len();
     let mut lines: Vec<String> = Vec::new();
     let mut cursor = None;
+    let mut focused_range: Option<(usize, usize)> = None;
 
     for (index, option) in question.options.iter().enumerate() {
         let active = focused && index == state.option_index;
+        let row_start = lines.len();
         let pointer = if active {
             ACTIVE_POINTER
         } else {
@@ -94,10 +96,14 @@ pub fn render(
                 ));
             }
         }
+        if active {
+            focused_range = Some((row_start, lines.len()));
+        }
     }
 
     // `Type something.` row (always present on multi-select).
     let other_index = question.options.len();
+    let other_row_start = lines.len();
     let other_active = focused && state.option_index == other_index;
     let other_pointer = if other_active {
         ACTIVE_POINTER
@@ -154,9 +160,11 @@ pub fn render(
             });
         }
     }
+    let other_row_end = lines.len();
 
     // `Next` sentinel (no number/checkbox; `Submit` on the last question).
     let next_index = question.options.len() + 1;
+    let next_row_start = lines.len();
     let next_active = focused && state.option_index == next_index;
     let next_label = if is_last_question {
         MULTI_SUBMIT_LABEL.to_owned()
@@ -174,8 +182,18 @@ pub fn render(
         next_label
     };
     lines.push(truncate_line(&format!("{next_pointer}{next_label}"), width));
+    if other_active {
+        focused_range = Some((other_row_start, other_row_end));
+    }
+    if next_active {
+        focused_range = Some((next_row_start, lines.len()));
+    }
 
-    BodyRender { lines, cursor }
+    BodyRender {
+        lines,
+        cursor,
+        focused_range,
+    }
 }
 
 /// Number of body rows a question produces for the Next label decision

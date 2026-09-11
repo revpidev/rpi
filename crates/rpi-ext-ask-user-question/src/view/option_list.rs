@@ -30,6 +30,10 @@ pub struct BodyRender {
     pub lines: Vec<String>,
     /// `(line index, visible column)` of the input cursor.
     pub cursor: Option<(usize, usize)>,
+    /// `(start, end)` line range of the focused row (exclusive end) when the
+    /// list owns focus — the dialog scroll window centers on it (upstream
+    /// `focusedItemRowRange`).
+    pub focused_range: Option<(usize, usize)>,
 }
 
 /// Active-row pointer.
@@ -63,9 +67,11 @@ pub fn render(
     let number_width = items.len().max(1).to_string().len();
     let mut lines: Vec<String> = Vec::new();
     let mut cursor = None;
+    let mut focused_range: Option<(usize, usize)> = None;
 
     for (index, item) in items.iter().enumerate() {
         let active = focused && index == state.option_index;
+        let row_start = lines.len();
         let pointer = if active {
             ACTIVE_POINTER
         } else {
@@ -139,9 +145,17 @@ pub fn render(
                 lines.push(format!("{continuation}{}", theme.muted(&segment)));
             }
         }
+
+        if active {
+            focused_range = Some((row_start, lines.len()));
+        }
     }
 
-    BodyRender { lines, cursor }
+    BodyRender {
+        lines,
+        cursor,
+        focused_range,
+    }
 }
 
 /// The confirmed-indicator selector is keyed by `state.current_tab`; this

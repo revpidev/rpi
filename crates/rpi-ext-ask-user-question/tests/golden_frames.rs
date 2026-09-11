@@ -1,8 +1,8 @@
-//! Golden-frame baseline test (TE30 G3).
+//! Golden-frame baseline test (TE30 G3 / TE31 rich-interaction pass).
 //!
 //! Re-renders the fixture matrix (single / four questions / multi-select /
-//! input draft / Submit × 80/100/120) and compares it byte-for-byte against
-//! the committed JSONL in
+//! input draft / Submit / preview pane / notes editor / collapse-reopen ×
+//! 80/100/120) and compares it byte-for-byte against the committed JSONL in
 //! `fixtures/generated/ask-user-question-parity/golden-frames/`.
 //!
 //! A mismatch means the dialog rendering changed; re-record deliberately with
@@ -34,8 +34,8 @@ fn golden_frames_match_committed_baseline() {
     let renders = golden::renders();
     assert_eq!(
         renders.len(),
-        15,
-        "5 scenarios x 3 widths (single / four / multi / input / submit)"
+        24,
+        "8 scenarios x 3 widths (single / four / multi / input / submit / preview / notes / collapse)"
     );
 
     let mut expected_files: BTreeSet<String> = BTreeSet::new();

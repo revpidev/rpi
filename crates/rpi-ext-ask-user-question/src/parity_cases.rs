@@ -131,6 +131,198 @@ pub fn replay_keys_case(input: &Value, key_matrix: &[Value]) -> Value {
     serde_json::json!({ "actions": actions })
 }
 
+/// TE31 `preview` group replay: the pure preview layout/box functions over
+/// the same fixture inputs the upstream leg drives.
+pub fn replay_preview_case(input: &Value) -> Value {
+    let kind = input.get("fn").and_then(Value::as_str).unwrap_or("");
+    let number = |key: &str| input.get(key).and_then(Value::as_u64).unwrap_or_default() as usize;
+    let items: Vec<QuestionItem> = input
+        .get("items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let items_by_tab: Vec<Vec<QuestionItem>> = input
+        .get("itemsByTab")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .map(|tab| {
+                    tab.as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let question = |key: &str| -> Option<QuestionData> {
+        input
+            .get(key)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    };
+    let questions: Vec<QuestionData> = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(|questions| {
+            questions
+                .iter()
+                .filter_map(|q| serde_json::from_value(q.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let tabs: Vec<bool> = input
+        .get("tabs")
+        .and_then(Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .map(|tab| {
+                    tab.get("multiSelect")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let lines: Vec<String> = input
+        .get("lines")
+        .and_then(Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    match kind {
+        "decideLayout" => serde_json::json!({
+            "mode": crate::view::preview::decide_layout(number("terminalWidth"), number("paneWidth")).as_str(),
+        }),
+        "adaptiveLeftWidth" => serde_json::json!({
+            "left": crate::view::preview::adaptive_left_width(
+                &items,
+                number("totalForNumbering"),
+                number("paneWidth"),
+            ),
+        }),
+        "crossTabMaxLeftWidth" => serde_json::json!({
+            "left": cross_tab_max_left_width_stub(&tabs, &items_by_tab, number("paneWidth")),
+        }),
+        "previewSourceWidth" => serde_json::json!({
+            "width": crate::view::preview::preview_source_width(
+                &question("question").unwrap_or_else(empty_question),
+            ),
+        }),
+        "crossTabPreviewBudget" => serde_json::json!({
+            "budget": crate::view::preview::cross_tab_preview_budget(&questions, number("paneWidth")),
+        }),
+        "crossTabLeftWidthWithDonation" => serde_json::json!({
+            "left": cross_tab_donation_stub(&tabs, &items_by_tab, &questions, number("paneWidth")),
+        }),
+        "columnWidths" => {
+            let (left_width, right_width, gap) =
+                crate::view::preview::column_widths(number("paneWidth"), number("adaptiveLeft"));
+            serde_json::json!({ "leftWidth": left_width, "rightWidth": right_width, "gap": gap })
+        }
+        "bodyWidths" => {
+            let mode = match input.get("mode").and_then(Value::as_str) {
+                Some("stacked") => crate::view::preview::PreviewLayoutMode::Stacked,
+                _ => crate::view::preview::PreviewLayoutMode::SideBySide,
+            };
+            let (options_width, preview_width) = crate::view::preview::body_widths(
+                number("paneWidth"),
+                mode,
+                number("adaptiveLeft"),
+            );
+            serde_json::json!({ "optionsWidth": options_width, "previewWidth": preview_width })
+        }
+        "constants" => serde_json::json!({
+            "PREVIEW_MIN_WIDTH": crate::view::preview::PREVIEW_MIN_WIDTH,
+            "PREVIEW_COLUMN_GAP": crate::view::preview::PREVIEW_COLUMN_GAP,
+            "PREVIEW_PADDING_LEFT": crate::view::preview::PREVIEW_PADDING_LEFT,
+            "STACKED_GAP_ROWS": crate::view::preview::STACKED_GAP_ROWS,
+            "MIN_LEFT": crate::view::preview::MIN_LEFT,
+            "MAX_LEFT_RATIO": crate::view::preview::MAX_LEFT_RATIO,
+            "MIN_PREVIEW_WIDTH": crate::view::preview::MIN_PREVIEW_WIDTH,
+            "CONFIRMED_OVERHEAD": crate::view::preview::CONFIRMED_OVERHEAD,
+            "BORDER_VERTICAL_OVERHEAD": crate::view::preview::BORDER_VERTICAL_OVERHEAD,
+            "BORDER_HORIZONTAL_OVERHEAD": crate::view::preview::BORDER_HORIZONTAL_OVERHEAD,
+            "BORDER_INNER_PADDING_HORIZONTAL": crate::view::preview::BORDER_INNER_PADDING_HORIZONTAL,
+            "BOX_MIN_CONTENT_WIDTH": crate::view::preview::BOX_MIN_CONTENT_WIDTH,
+        }),
+        "stripFenceMarkers" => serde_json::json!({
+            "lines": crate::view::preview::strip_fence_markers(&lines),
+        }),
+        "renderBorderedBox" => {
+            let identity = |text: &str| text.to_owned();
+            serde_json::json!({
+                "lines": crate::view::preview::render_bordered_box(
+                    &lines,
+                    number("width"),
+                    identity,
+                    number("hidden"),
+                ),
+            })
+        }
+        "computeBoxDimensions" => {
+            let (inner_width, box_width) =
+                crate::view::preview::compute_box_dimensions(&lines, number("maxInnerWidth"));
+            serde_json::json!({ "innerWidth": inner_width, "boxWidth": box_width })
+        }
+        _ => Value::Null,
+    }
+}
+
+/// [`crate::view::preview::cross_tab_max_left_width`] with the JS leg's
+/// `{multiSelect}`-only tab view (the Rust signature reads full questions;
+/// the derivation is identical — only the label list matters).
+fn cross_tab_max_left_width_stub(
+    tabs: &[bool],
+    items_by_tab: &[Vec<QuestionItem>],
+    pane_width: usize,
+) -> usize {
+    // JS iterates `tabs.length`; `itemsByTab[i] ?? []` covers short lists.
+    let mut max = crate::view::preview::MIN_LEFT;
+    for index in 0..tabs.len() {
+        let items = items_by_tab.get(index).cloned().unwrap_or_default();
+        let tab_width = crate::view::preview::adaptive_left_width(&items, items.len(), pane_width);
+        max = max.max(tab_width);
+    }
+    max
+}
+
+/// A minimal empty question (fixture fallback).
+fn empty_question() -> QuestionData {
+    QuestionData {
+        question: String::new(),
+        header: String::new(),
+        options: Vec::new(),
+        multi_select: None,
+    }
+}
+
+/// [`crate::view::preview::cross_tab_left_width_with_donation`] over the
+/// `{multiSelect}`-only tab view (same reasoning as
+/// [`cross_tab_max_left_width_stub`]).
+fn cross_tab_donation_stub(
+    tabs: &[bool],
+    items_by_tab: &[Vec<QuestionItem>],
+    questions: &[QuestionData],
+    pane_width: usize,
+) -> usize {
+    let _ = tabs;
+    crate::view::preview::cross_tab_left_width_with_donation(questions, items_by_tab, pane_width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

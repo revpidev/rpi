@@ -13,6 +13,7 @@ pub mod dialog;
 pub mod inline_input;
 pub mod multi_select;
 pub mod option_list;
+pub mod preview;
 pub mod submit;
 pub mod tab_bar;
 pub mod theme;

@@ -1,6 +1,6 @@
 # ask-user-question parity report (TE28/TE29/TE30 G3/G12)
 
-generated: 2026-09-10T14:08:32.189Z
+generated: 2026-09-11T05:13:04.150Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
 submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
 typebox: 1.3.6
@@ -17,7 +17,10 @@ typebox: 1.3.6
 - rpc-fallback.ts: 14997c0b37294a466665b9661529522112de56891bf380dae81346d299396a29
 - state/state-reducer.ts: 8ed9bdf4596c884fdf36d4411f6c1852ca236d5d9f161c1252961fed5dc18145
 - state/key-router.ts: c77a98c1435e1c3bcb0a658079ccd1e4e54968f2bb7631f7057ed2be05b4ee6e
+- view/components/preview/preview-layout-decider.ts: 7baf9ecd1db8af8383d2f792d69d4fd9b22623a7cbd29e1a95bc9fd480796a3b
+- view/components/preview/preview-box-renderer.ts: 20b900ead8a0e71f005aadb18c00103b2dff87391ec8c8011ebd3c47540a8c33
 - external/pi/packages/tui/src/keys.ts (pi-tui stub): b972facce4233a4623239fc38029e28cae15d0fb326558c0c09dc02cf4345fa7
+- external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31): 014e017a0cb45d8f4e07af6e472c282c6dec7c5856a335a3e3beeb6054f385d3
 
 ## schema
 
@@ -167,9 +170,86 @@ typebox: 1.3.6
 - answered_option_confirmed: MATCH
 - empty_questions: MATCH
 
+## preview
+
+- decide-40x80: MATCH
+- decide-40x99: MATCH
+- decide-40x100: MATCH
+- decide-40x101: MATCH
+- decide-40x120: MATCH
+- decide-80x80: MATCH
+- decide-80x99: MATCH
+- decide-80x100: MATCH
+- decide-80x101: MATCH
+- decide-80x120: MATCH
+- decide-99x80: MATCH
+- decide-99x99: MATCH
+- decide-99x100: MATCH
+- decide-99x101: MATCH
+- decide-99x120: MATCH
+- decide-100x80: MATCH
+- decide-100x99: MATCH
+- decide-100x100: MATCH
+- decide-100x101: MATCH
+- decide-100x120: MATCH
+- decide-101x80: MATCH
+- decide-101x99: MATCH
+- decide-101x100: MATCH
+- decide-101x101: MATCH
+- decide-101x120: MATCH
+- decide-120x80: MATCH
+- decide-120x99: MATCH
+- decide-120x100: MATCH
+- decide-120x101: MATCH
+- decide-120x120: MATCH
+- decide-200x80: MATCH
+- decide-200x99: MATCH
+- decide-200x100: MATCH
+- decide-200x101: MATCH
+- decide-200x120: MATCH
+- adaptive-short: MATCH
+- adaptive-medium-100: MATCH
+- adaptive-medium-120: MATCH
+- adaptive-long-cap: MATCH
+- adaptive-narrow-available: MATCH
+- adaptive-empty: MATCH
+- cross-tab-max: MATCH
+- cross-tab-max-empty: MATCH
+- source-width-none: MATCH
+- source-width-single-line: MATCH
+- source-width-multi-line: MATCH
+- source-width-multi: MATCH
+- budget-no-previews: MATCH
+- budget-wide: MATCH
+- budget-capped: MATCH
+- budget-multi-tab: MATCH
+- donation-basic: MATCH
+- donation-narrow-preview: MATCH
+- donation-wide-labels: MATCH
+- column-widths-typical: MATCH
+- column-widths-clamp: MATCH
+- column-widths-tiny: MATCH
+- body-widths-stacked: MATCH
+- body-widths-side: MATCH
+- constants: MATCH
+- strip-fences: MATCH
+- box-basic: MATCH
+- box-pad-truncate: MATCH
+- box-hidden: MATCH
+- box-hidden-narrow: MATCH
+- box-min-width: MATCH
+- dims-floor: MATCH
+- dims-wide-cap: MATCH
+- dims-trailing-ws: MATCH
+- dims-ansi: MATCH
+- dims-empty: MATCH
+
 ## golden-frames
 
 - baseline: self-baseline (fresh Rust frames vs the committed `golden-frames/*.jsonl`; no upstream renderer exists)
+- collapse_reopen-100.jsonl: MATCH (4 frames)
+- collapse_reopen-120.jsonl: MATCH (4 frames)
+- collapse_reopen-80.jsonl: MATCH (4 frames)
 - four_questions-100.jsonl: MATCH (6 frames)
 - four_questions-120.jsonl: MATCH (6 frames)
 - four_questions-80.jsonl: MATCH (6 frames)
@@ -179,6 +259,12 @@ typebox: 1.3.6
 - multi_select-100.jsonl: MATCH (8 frames)
 - multi_select-120.jsonl: MATCH (8 frames)
 - multi_select-80.jsonl: MATCH (8 frames)
+- notes_editor-100.jsonl: MATCH (7 frames)
+- notes_editor-120.jsonl: MATCH (7 frames)
+- notes_editor-80.jsonl: MATCH (7 frames)
+- preview_pane-100.jsonl: MATCH (4 frames)
+- preview_pane-120.jsonl: MATCH (4 frames)
+- preview_pane-80.jsonl: MATCH (4 frames)
 - single_select-100.jsonl: MATCH (5 frames)
 - single_select-120.jsonl: MATCH (5 frames)
 - single_select-80.jsonl: MATCH (5 frames)

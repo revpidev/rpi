@@ -281,7 +281,7 @@ pub mod parity {
         WIDTHS as GOLDEN_WIDTHS,
     };
     pub use crate::i18n::{match_locale, parse_locale_env, I18n, SUPPORTED_LOCALES};
-    pub use crate::parity_cases::{replay_keys_case, replay_state_case};
+    pub use crate::parity_cases::{replay_keys_case, replay_preview_case, replay_state_case};
     pub use crate::reconcile::reconcile_active_tools;
     pub use crate::rpc_fallback::{
         build_preview_block, format_option_line, has_dialog_ui, parse_index, run_rpc_questionnaire,

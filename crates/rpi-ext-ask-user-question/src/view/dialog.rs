@@ -1,10 +1,12 @@
-//! Dialog layout assembly + footer hints.
+//! Dialog layout assembly + footer hints + scroll window.
 //!
-//! Port of upstream `view/dialog-builder.ts` @ `338b264c` for the Q2 surface:
-//! sticky question heading, tab bar (multi-question), the active body
-//! (single-select options / multi-select / Submit review), and one clipped
-//! footer hint line. The bordered `DialogView` chrome, terminal-height scroll
-//! math and overflow indicators are Q3 (FR-Q3-B/C).
+//! Port of upstream `view/dialog-builder.ts` @ `338b264c`: sticky tab bar +
+//! heading, the active body (single-select options — composed with the
+//! markdown preview pane per the 100-column breakpoint when previews exist —
+//! / multi-select / Submit review), the notes editor when open, and one
+//! clipped footer hint line. When the natural frame is taller than the
+//! terminal, the body scrolls between the sticky regions and overflow
+//! indicators (`↑`/`↓`/`↕`, dim) mark the clipped direction (FR-Q3-B).
 
 use crate::config::format_key_spec_for_display;
 use crate::i18n::I18n;
@@ -12,8 +14,9 @@ use crate::state::build::QuestionItem;
 use crate::state::reducer::QuestionnaireState;
 use crate::state::row_intent::RowKind;
 use crate::tool::types::QuestionData;
+use crate::view::inline_input;
 use crate::view::theme::Theme;
-use crate::view::{multi_select, option_list, submit, tab_bar, truncate_line, RenderedFrame};
+use crate::view::{multi_select, preview, submit, tab_bar, truncate_line, RenderedFrame};
 
 /// Hint literals (canonical-English fallbacks of the `hint.*` locale keys).
 pub const HINT_PART_ENTER: &str = "Enter to select";
@@ -33,10 +36,23 @@ pub const HINT_PART_TAB: &str = "Tab to switch questions";
 pub const HINT_PART_CANCEL: &str = "Esc to cancel";
 /// `{key} to collapse`.
 pub const HINT_PART_COLLAPSE_TEMPLATE: &str = "{key} to collapse";
+/// `{key} to expand · Esc to cancel` (`hint.expand_line`; the collapsed row).
+pub const COLLAPSED_HINT_TEMPLATE: &str = "{key} to expand · Esc to cancel";
 /// `n to add a note` (Submit-tab hint).
 pub const REVIEW_GLOBAL_HINT: &str = "n to add a note";
 /// Collapse key sentinel meaning "no shortcut".
 pub const COLLAPSE_KEY_OFF: &str = "off";
+/// `notes.header` canonical English.
+pub const NOTES_HEADER: &str = "Notes:";
+/// `notes.global_header` canonical English.
+pub const NOTES_GLOBAL_HEADER: &str = "Global note:";
+
+/// Overflow indicator glyphs (dim).
+pub const OVERFLOW_UP: &str = "↑";
+/// Down indicator.
+pub const OVERFLOW_DOWN: &str = "↓";
+/// Both directions (single-row middle).
+pub const OVERFLOW_BOTH: &str = "↕";
 
 /// Inputs for one dialog frame.
 pub struct DialogModel<'a> {
@@ -54,10 +70,20 @@ pub struct DialogModel<'a> {
     pub input_text: &'a str,
     /// Cursor char offset inside `input_text`.
     pub input_cursor: Option<usize>,
+    /// Live notes-editor draft (when `state.notes_visible`).
+    pub notes_text: &'a str,
+    /// Cursor char offset inside `notes_text`.
+    pub notes_cursor: Option<usize>,
     /// Resolved collapse key spec (`"ctrl+]"`, `"alt+o"`, or `"off"`).
     pub collapse_key: &'a str,
-    /// Frame width in columns.
+    /// Frame width in columns (the pane width).
     pub width: usize,
+    /// Terminal width in columns (the preview breakpoint gate; the overlay
+    /// is 100% wide so this defaults to the pane width).
+    pub terminal_width: usize,
+    /// Available content height; frames taller than this scroll between the
+    /// sticky regions (`None` disables the scroll window).
+    pub height: Option<usize>,
 }
 
 /// `buildHintText` — the question-tab footer.
@@ -113,8 +139,32 @@ pub fn build_submit_hint_text(state: &QuestionnaireState, i18n: &I18n) -> String
     parts.join(" · ")
 }
 
+/// `buildCollapsedRender` — the single dim row shown while collapsed. The rpi
+/// host hides the overlay entirely (R-U4.2), so this row matters only as the
+/// visible fallback when `setComponentHidden` cannot run; it keeps the
+/// upstream shape (`buildCollapsedRender`, `COLLAPSED_HINT_TEMPLATE`).
+pub fn collapsed_row(collapse_key: &str, i18n: &I18n, theme: &Theme) -> String {
+    let hint = if collapse_key == COLLAPSE_KEY_OFF || collapse_key.is_empty() {
+        i18n.t("hint.cancel", HINT_PART_CANCEL).to_owned()
+    } else {
+        i18n.t("hint.expand_line", COLLAPSED_HINT_TEMPLATE)
+            .replace("{key}", &format_key_spec_for_display(collapse_key))
+    };
+    theme.dim(&format!(" {hint} "))
+}
+
 /// Render one dialog frame at `width`.
 pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
+    if model.state.collapsed {
+        return RenderedFrame {
+            lines: vec![truncate_line(
+                &collapsed_row(model.collapse_key, model.i18n, model.theme),
+                model.width,
+            )],
+            cursor: None,
+        };
+    }
+
     let is_multi = model.questions.len() > 1;
     let active_question = model.state.current_tab;
     let mut lines: Vec<String> = Vec::new();
@@ -131,6 +181,9 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         lines.push(String::new());
     }
 
+    // Everything above the body is sticky; the body (+ notes) scrolls.
+    let mut focused_range: Option<(usize, usize)> = None;
+
     if is_multi && active_question == model.questions.len() {
         // Submit tab.
         lines.push(truncate_line(
@@ -143,6 +196,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         lines.extend(submit::render_answers(
             model.state,
             model.questions,
+            model.i18n,
             model.theme,
             model.width,
         ));
@@ -154,19 +208,26 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             model.theme,
             model.width,
         ));
-        lines.extend(submit::render_picker(
-            model.state,
-            model.i18n,
-            model.theme,
-            model.width,
-        ));
+        let picker_start = lines.len();
+        let picker = submit::render_picker(model.state, model.i18n, model.theme, model.width);
+        lines.extend(picker.lines);
+        if let Some((start, end)) = picker.focused_range {
+            focused_range = Some((picker_start + start, picker_start + end));
+        }
+        if model.state.notes_visible {
+            let (range, notes_cursor) = push_notes_editor(model, &mut lines, true);
+            if let Some(range) = range {
+                focused_range = Some(range);
+            }
+            cursor = cursor.or(notes_cursor);
+        }
         lines.push(truncate_line(
             &model
                 .theme
                 .dim(&build_submit_hint_text(model.state, model.i18n)),
             model.width,
         ));
-        return RenderedFrame { lines, cursor };
+        return finish(model, lines, cursor, focused_range, picker_start);
     }
 
     let Some(question) = model.questions.get(active_question) else {
@@ -190,6 +251,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         .get(active_question)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let body_start = lines.len();
     let body = if question.multi_select == Some(true) {
         multi_select::render(
             model.state,
@@ -202,22 +264,34 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             active_question + 1 == model.questions.len(),
         )
     } else {
-        option_list::render(
+        preview::compose(
             model.state,
             question,
             items,
+            model.questions,
+            model.items_by_tab,
             model.i18n,
             model.theme,
             model.input_text,
             model.input_cursor,
+            model.terminal_width,
             model.width,
         )
     };
-    let body_start = lines.len();
     if let Some((row, column)) = body.cursor {
         cursor = Some((body_start + row, column));
     }
+    if let Some((start, end)) = body.focused_range {
+        focused_range = Some((body_start + start, body_start + end));
+    }
     lines.extend(body.lines);
+    if model.state.notes_visible {
+        let (range, notes_cursor) = push_notes_editor(model, &mut lines, false);
+        if let Some(range) = range {
+            focused_range = Some(range);
+        }
+        cursor = cursor.or(notes_cursor);
+    }
     lines.push(String::new());
     lines.push(truncate_line(
         &model.theme.dim(&build_hint_text(
@@ -230,7 +304,149 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         model.width,
     ));
 
+    finish(model, lines, cursor, focused_range, body_start)
+}
+
+/// Append the notes editor (header + wrapped buffer + cursor) below the
+/// body; returns the editor's line range (the scroll focus while open) and
+/// the editor's cursor position.
+type NotesRange = Option<(usize, usize)>;
+type NotesCursor = Option<(usize, usize)>;
+
+fn push_notes_editor(
+    model: &DialogModel<'_>,
+    lines: &mut Vec<String>,
+    global: bool,
+) -> (NotesRange, NotesCursor) {
+    let header = if global {
+        model
+            .i18n
+            .t("notes.global_header", NOTES_GLOBAL_HEADER)
+            .to_owned()
+    } else {
+        model.i18n.t("notes.header", NOTES_HEADER).to_owned()
+    };
+    lines.push(truncate_line(
+        &model.theme.accent_bold(&header),
+        model.width,
+    ));
+    lines.push(String::new());
+    let start = lines.len();
+    let rendered = inline_input::render_inline_input(
+        model.notes_text,
+        model.notes_cursor,
+        "",
+        "",
+        model.width.max(1),
+        |line| model.theme.fg(model.theme.text, line),
+    );
+    let cursor = rendered.cursor.map(|(row, column)| (start + row, column));
+    lines.extend(rendered.lines);
+    (Some((start.saturating_sub(2), lines.len())), cursor)
+}
+
+/// Apply the scroll window (when configured and needed) and produce the
+/// final frame.
+fn finish(
+    model: &DialogModel<'_>,
+    lines: Vec<String>,
+    cursor: Option<(usize, usize)>,
+    focused_range: Option<(usize, usize)>,
+    top_fixed: usize,
+) -> RenderedFrame {
+    let Some(height) = model.height else {
+        return RenderedFrame { lines, cursor };
+    };
+    let bottom_fixed = 1usize;
+    let (lines, cursor) = apply_scroll_window(
+        lines,
+        cursor,
+        focused_range,
+        top_fixed,
+        bottom_fixed,
+        height,
+        model.theme,
+    );
     RenderedFrame { lines, cursor }
+}
+
+/// `computeScrollStart` + `decorateOverflow` — the 3-region partition:
+/// sticky top (`top_fixed` lines) + window over the middle + sticky footer
+/// (`bottom_fixed` lines). The window centers on the focused row
+/// (top-anchored without focus); the first/last window rows carry the
+/// overflow indicators.
+pub fn apply_scroll_window(
+    lines: Vec<String>,
+    cursor: Option<(usize, usize)>,
+    focused_range: Option<(usize, usize)>,
+    top_fixed: usize,
+    bottom_fixed: usize,
+    height: usize,
+    theme: &Theme,
+) -> (Vec<String>, Option<(usize, usize)>) {
+    let total = lines.len();
+    if total <= height || height == 0 {
+        return (lines, cursor);
+    }
+    // Safety clamp: the sticky regions never leave the terminal.
+    let top_fixed = top_fixed.min(height);
+    let bottom_fixed = bottom_fixed.min(height.saturating_sub(top_fixed));
+    let middle_rows = total.saturating_sub(top_fixed + bottom_fixed);
+    let available = height.saturating_sub(top_fixed + bottom_fixed);
+    if available == 0 {
+        // Terminal too small for any middle content — chrome only.
+        let mut chrome: Vec<String> = lines[..top_fixed].to_vec();
+        chrome.extend_from_slice(&lines[total - bottom_fixed..]);
+        chrome.truncate(height);
+        return (chrome, None);
+    }
+
+    // Scroll start, centered on the focused row (upstream computeScrollStart).
+    let scroll_start = match focused_range {
+        None => 0,
+        Some((start, end)) => {
+            let focused_height = end.saturating_sub(start);
+            let ideal = (start as i64) - ((available.saturating_sub(focused_height)) / 2) as i64;
+            ideal
+                .clamp(0, (middle_rows.saturating_sub(available)) as i64)
+                .max(0) as usize
+        }
+    };
+
+    let window_start = top_fixed + scroll_start;
+    let window_end = (window_start + available).min(total - bottom_fixed);
+    let mut middle: Vec<String> = lines[window_start..window_end].to_vec();
+    let has_up = scroll_start > 0;
+    let has_down = window_end < total - bottom_fixed;
+    if has_up && has_down && middle.len() == 1 {
+        middle[0] = theme.dim(OVERFLOW_BOTH);
+    } else {
+        if has_up && !middle.is_empty() {
+            middle[0] = theme.dim(OVERFLOW_UP);
+        }
+        if has_down && !middle.is_empty() {
+            let last = middle.len() - 1;
+            middle[last] = theme.dim(OVERFLOW_DOWN);
+        }
+    }
+
+    let mut out: Vec<String> = lines[..top_fixed].to_vec();
+    out.extend(middle);
+    out.extend_from_slice(&lines[total - bottom_fixed..]);
+
+    // Remap or drop the cursor: rows inside the window shift by the scroll
+    // offset; clipped rows lose the cursor.
+    let cursor = cursor.and_then(|(row, column)| {
+        let absolute_row = row;
+        if absolute_row < top_fixed {
+            return Some((absolute_row, column));
+        }
+        if absolute_row >= window_start && absolute_row < window_end {
+            return Some((top_fixed + (absolute_row - window_start), column));
+        }
+        None
+    });
+    (out, cursor)
 }
 
 /// Sentinel label lookup used by tests (dialog re-exports the table lookup).
@@ -283,8 +499,12 @@ mod tests {
             theme,
             input_text,
             input_cursor: None,
+            notes_text: "",
+            notes_cursor: None,
             collapse_key,
             width,
+            terminal_width: width,
+            height: None,
         }
     }
 
@@ -358,6 +578,169 @@ mod tests {
         let editing = build_submit_hint_text(&editing, &i18n);
         assert!(!editing.contains("n to add a note"), "{editing}");
         assert!(editing.contains("Shift+Enter for newline"), "{editing}");
+    }
+
+    #[test]
+    fn collapsed_frame_is_one_dim_expand_hint_row() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![question(false)];
+        let items = vec![build_items_for_question(&questions[0], &i18n)];
+        let mut state = QuestionnaireState::initial();
+        state.collapsed = true;
+        let frame = render(&model(
+            &state, &questions, &items, &i18n, &theme, "", "ctrl+]", 80,
+        ));
+        let plain = strip_ansi(&frame.lines[0]);
+        assert_eq!(frame.lines.len(), 1);
+        assert_eq!(plain, " Ctrl+] to expand · Esc to cancel ");
+        // "off" falls back to the cancel-only line (upstream parity).
+        let off = collapsed_row("off", &i18n, &theme);
+        assert_eq!(strip_ansi(&off), " Esc to cancel ");
+    }
+
+    #[test]
+    fn notes_editor_renders_header_buffer_and_cursor_below_the_body() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![question(false)];
+        let items = vec![build_items_for_question(&questions[0], &i18n)];
+        let mut state = QuestionnaireState::initial();
+        state.notes_visible = true;
+        let mut m = model(&state, &questions, &items, &i18n, &theme, "", "ctrl+]", 60);
+        m.notes_text = "line one\nline two";
+        m.notes_cursor = Some(8);
+        let frame = render(&m);
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        let header = plain
+            .iter()
+            .position(|line| line == "Notes:")
+            .expect("notes header");
+        assert_eq!(plain[header + 1], "");
+        assert_eq!(plain[header + 2], "line one");
+        assert_eq!(plain[header + 3], "line two");
+        assert!(frame.cursor.is_some(), "notes editor reports a cursor");
+        // The hint builder swaps the notes part for the newline part; at this
+        // width the frame's clipped footer keeps only the core prefix.
+        let hint = build_hint_text(questions.first(), false, &state, "ctrl+]", &i18n);
+        assert!(hint.contains("Shift+Enter for newline"), "{hint}");
+        assert!(!hint.contains("n to add notes"), "{hint}");
+        let footer = plain.last().expect("hint");
+        assert!(footer.starts_with("Enter to select"), "{footer}");
+        assert!(!footer.contains("n to add notes"), "{footer}");
+    }
+
+    #[test]
+    fn submit_tab_notes_editor_uses_the_global_header() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![question(false), question(false)];
+        let items = vec![
+            build_items_for_question(&questions[0], &i18n),
+            build_items_for_question(&questions[1], &i18n),
+        ];
+        let mut state = QuestionnaireState::initial();
+        state.current_tab = 2;
+        state.notes_visible = true;
+        let m = model(&state, &questions, &items, &i18n, &theme, "", "ctrl+]", 60);
+        let frame = render(&m);
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        assert!(plain.iter().any(|line| line == "Global note:"), "{plain:?}");
+    }
+
+    #[test]
+    fn scroll_window_marks_clip_directions_and_keeps_the_footer() {
+        let theme = Theme::dark();
+        let mut lines: Vec<String> = (0..30).map(|index| index.to_string()).collect();
+        lines.push(String::new());
+        lines.push("hint".to_owned()); // footer (bottom_fixed = 1… the blank is middle)
+                                       // No focus: top-anchored window — only the bottom is clipped.
+        let (out, _) = apply_scroll_window(lines.clone(), None, None, 2, 1, 10, &theme);
+        assert_eq!(out.len(), 10);
+        assert_eq!(strip_ansi(&out[0]), "0");
+        assert_eq!(strip_ansi(&out[1]), "1");
+        assert_eq!(strip_ansi(&out[2]), "2", "nothing above the window");
+        assert_eq!(strip_ansi(&out[8]), "↓", "content below is clipped");
+        assert_eq!(strip_ansi(&out[9]), "hint", "sticky footer survives");
+        // Focus near the bottom: the window scrolls down — only the top is
+        // clipped.
+        let (out, _) = apply_scroll_window(lines.clone(), None, Some((26, 27)), 2, 1, 10, &theme);
+        assert_eq!(strip_ansi(&out[2]), "↑", "content above is clipped");
+        assert_eq!(strip_ansi(&out[9]), "hint", "sticky footer survives");
+        // Fits → unchanged.
+        let short = vec!["a".to_owned(), "b".to_owned()];
+        let (out, _) = apply_scroll_window(short.clone(), None, None, 1, 1, 10, &theme);
+        assert_eq!(out, short);
+    }
+
+    #[test]
+    fn scroll_window_single_row_middle_shows_both_arrow() {
+        let theme = Theme::dark();
+        let lines: Vec<String> = (0..12).map(|index| index.to_string()).collect();
+        // height 12 - top 4 - bottom 4 = 4 middle rows, 1 visible: focus at
+        // middle row 1 → both directions clipped → combined ↕.
+        let (out, _) = apply_scroll_window(lines, None, Some((1, 2)), 4, 4, 9, &theme);
+        assert_eq!(strip_ansi(&out[4]), "↕");
+    }
+
+    #[test]
+    fn scroll_window_remaps_and_clips_the_cursor() {
+        let theme = Theme::dark();
+        let lines: Vec<String> = (0..20).map(|index| index.to_string()).collect();
+        // Cursor inside the window shifts by the scroll offset.
+        let (out, cursor) = apply_scroll_window(lines.clone(), Some((5, 2)), None, 2, 1, 8, &theme);
+        assert_eq!(
+            cursor,
+            Some((5, 2)),
+            "row 5 stays at window row 5 (start 0)"
+        );
+        assert_eq!(out.len(), 8);
+        // Cursor in the sticky header region survives (the header never
+        // scrolls); a cursor below the window is dropped.
+        let (_, cursor) = apply_scroll_window(lines.clone(), Some((1, 2)), None, 2, 1, 8, &theme);
+        assert_eq!(cursor, Some((1, 2)));
+        let (_, cursor) =
+            apply_scroll_window(lines, Some((15, 2)), Some((14, 15)), 2, 1, 8, &theme);
+        // Focus (14,15) centers the window there; row 15 sits inside.
+        assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn tall_frames_scroll_with_overflow_indicator_via_render() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let long_description = "word ".repeat(30);
+        let questions = vec![QuestionData {
+            question: "Pick one?".to_owned(),
+            header: "H".to_owned(),
+            options: vec![
+                OptionData {
+                    label: "A".to_owned(),
+                    description: long_description.clone(),
+                    preview: None,
+                },
+                OptionData {
+                    label: "B".to_owned(),
+                    description: long_description,
+                    preview: None,
+                },
+            ],
+            multi_select: None,
+        }];
+        let items = vec![build_items_for_question(&questions[0], &i18n)];
+        let state = QuestionnaireState::initial();
+        let mut m = model(&state, &questions, &items, &i18n, &theme, "", "off", 80);
+        m.height = Some(8);
+        let frame = render(&m);
+        assert_eq!(frame.lines.len(), 8, "frame clamps to the height");
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        assert!(plain
+            .iter()
+            .any(|line| line == "↓" || line == "↑" || line == "↕"));
+        assert!(
+            plain.last().expect("hint").starts_with("Enter to select"),
+            "sticky footer survives"
+        );
     }
 
     fn strip_ansi(text: &str) -> String {

@@ -120,6 +120,41 @@ fn multi_select_question() -> QuestionData {
     }
 }
 
+fn preview_option(label: &str, description: &str, preview: &str) -> OptionData {
+    OptionData {
+        label: label.to_owned(),
+        description: description.to_owned(),
+        preview: Some(preview.to_owned()),
+    }
+}
+
+/// Single-select question whose options carry markdown previews — the Q3
+/// preview-pane scenarios (side-by-side at 100/120, stacked at 80).
+fn preview_question() -> QuestionData {
+    QuestionData {
+        question: "Which layout should the settings page use?".to_owned(),
+        header: "Layout".to_owned(),
+        options: vec![
+            preview_option(
+                "Sidebar",
+                "Persistent navigation rail",
+                "# Sidebar\n\n- Nav pinned left\n- Collapsible groups\n- `width: 240px`",
+            ),
+            preview_option(
+                "Tabs",
+                "Top-level tab strip",
+                "# Tabs\n\n```\n[General] [Privacy] [About]\n```\n\nTop strip, one pane visible",
+            ),
+            preview_option(
+                "Stacked",
+                "Single scrolling column",
+                "# Stacked\n\nPlain sections, no chrome",
+            ),
+        ],
+        multi_select: None,
+    }
+}
+
 /// Scenario name, questions, and the key script (each event yields one frame).
 fn scenarios() -> Vec<(&'static str, Vec<QuestionData>, Vec<&'static str>)> {
     vec![
@@ -168,6 +203,41 @@ fn scenarios() -> Vec<(&'static str, Vec<QuestionData>, Vec<&'static str>)> {
                 "", "\r", // answer Q1
                 "\t", "\t", "\t", // Submit tab (Q1 answered, Q2-Q4 open)
                 "\x1b[B",
+            ],
+        ),
+        // Q3: preview pane — the same key script lands in side-by-side at
+        // 100/120 and stacked at 80 (the 100-column breakpoint).
+        (
+            "preview_pane",
+            vec![preview_question()],
+            vec![
+                "", "\x1b[B", // onto Tabs
+                "\x1b[B", // onto Stacked
+                "\x1b[A", // back to Tabs
+            ],
+        ),
+        // Q3: notes editor — open, type (incl. a newline), close, confirm.
+        (
+            "notes_editor",
+            vec![single_question()],
+            vec![
+                "", "n",   // open the notes editor
+                "buy", // type
+                "\n",  // shift+enter newline
+                "now", // second line
+                "\r",  // enter: commit + close notes
+                "\r",  // confirm the option answer
+            ],
+        ),
+        // Q3: collapse → hidden (single collapsed row) → reopen → answer.
+        (
+            "collapse_reopen",
+            vec![single_question()],
+            vec![
+                "",
+                "\x1d", // ctrl+]: collapse (hidden — the collapsed row is the visible fallback)
+                "\x1d", // ctrl+]: reopen
+                "\r",   // confirm
             ],
         ),
     ]
@@ -292,6 +362,98 @@ mod tests {
 
         // Frames are deterministic across runs.
         assert_eq!(renders, super::renders());
+    }
+
+    #[test]
+    fn preview_scenarios_split_by_the_100_column_breakpoint() {
+        let renders = renders();
+        let stacked = renders
+            .iter()
+            .find(|render| render.file == "preview_pane-80.jsonl")
+            .expect("preview_pane-80");
+        let side = renders
+            .iter()
+            .find(|render| render.file == "preview_pane-120.jsonl")
+            .expect("preview_pane-120");
+        // Stacked: the bordered box sits below the option rows.
+        let first_stacked = stacked.frames.first().expect("frame");
+        let plain: Vec<String> = first_stacked
+            .lines
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .filter(|c| *c != '\u{1b}' && *c != '[' && !c.is_ascii_digit() && *c != ';')
+                    .collect::<String>()
+            })
+            .collect();
+        let _ = plain;
+        let box_row = first_stacked
+            .lines
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("stacked box");
+        let rows = first_stacked
+            .lines
+            .iter()
+            .position(|line| line.contains("Type something."))
+            .expect("option rows");
+        assert!(box_row > rows, "preview below options at 80 cols");
+        // Side-by-side: the box shares its first row band with the options.
+        let first_side = side.frames.first().expect("frame");
+        let box_row = first_side
+            .lines
+            .iter()
+            .position(|line| line.contains('┌'))
+            .expect("side-by-side box");
+        assert!(
+            first_side.lines[box_row].contains("1."),
+            "options and preview share rows: {}",
+            first_side.lines[box_row]
+        );
+    }
+
+    #[test]
+    fn collapse_scenario_hidden_frame_is_the_collapsed_row() {
+        let renders = renders();
+        let scenario = renders
+            .iter()
+            .find(|render| render.file == "collapse_reopen-100.jsonl")
+            .expect("collapse_reopen-100");
+        // Frame 1 (after ctrl+]) is the single collapsed hint row.
+        let hidden = &scenario.frames[1];
+        assert_eq!(hidden.lines.len(), 1, "collapsed fallback row");
+        assert!(hidden.lines[0].contains("to expand"), "{:?}", hidden.lines);
+        // Frame 2 (after ctrl+] again) is the full dialog again.
+        let reopened = &scenario.frames[2];
+        assert!(reopened.lines.len() > 5);
+        assert!(reopened
+            .lines
+            .iter()
+            .any(|line| line.contains("Which library")));
+        // Frame 3 (confirm) carries done.
+        assert!(scenario.frames[3].done.is_some());
+    }
+
+    #[test]
+    fn notes_scenario_reports_the_editor_cursor_and_commits_the_note() {
+        let renders = renders();
+        let scenario = renders
+            .iter()
+            .find(|render| render.file == "notes_editor-80.jsonl")
+            .expect("notes_editor-80");
+        // The open frame shows the notes header + buffer and a cursor.
+        let open = &scenario.frames[1];
+        assert!(open.lines.iter().any(|line| line.contains("Notes:")));
+        assert!(open.cursor.is_some(), "editor reports a cursor");
+        // The final frame merges the note into the answer.
+        let done = scenario
+            .frames
+            .last()
+            .expect("done")
+            .done
+            .as_ref()
+            .expect("done");
+        assert_eq!(done["answers"][0]["notes"], "buy\nnow");
     }
 
     #[test]

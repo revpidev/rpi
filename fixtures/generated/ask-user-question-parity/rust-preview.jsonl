@@ -1,0 +1,71 @@
+{"name":"decide-40x80","output":{"mode":"stacked"}}
+{"name":"decide-40x99","output":{"mode":"stacked"}}
+{"name":"decide-40x100","output":{"mode":"stacked"}}
+{"name":"decide-40x101","output":{"mode":"stacked"}}
+{"name":"decide-40x120","output":{"mode":"stacked"}}
+{"name":"decide-80x80","output":{"mode":"stacked"}}
+{"name":"decide-80x99","output":{"mode":"stacked"}}
+{"name":"decide-80x100","output":{"mode":"stacked"}}
+{"name":"decide-80x101","output":{"mode":"stacked"}}
+{"name":"decide-80x120","output":{"mode":"stacked"}}
+{"name":"decide-99x80","output":{"mode":"stacked"}}
+{"name":"decide-99x99","output":{"mode":"stacked"}}
+{"name":"decide-99x100","output":{"mode":"stacked"}}
+{"name":"decide-99x101","output":{"mode":"stacked"}}
+{"name":"decide-99x120","output":{"mode":"stacked"}}
+{"name":"decide-100x80","output":{"mode":"stacked"}}
+{"name":"decide-100x99","output":{"mode":"stacked"}}
+{"name":"decide-100x100","output":{"mode":"side-by-side"}}
+{"name":"decide-100x101","output":{"mode":"side-by-side"}}
+{"name":"decide-100x120","output":{"mode":"side-by-side"}}
+{"name":"decide-101x80","output":{"mode":"stacked"}}
+{"name":"decide-101x99","output":{"mode":"stacked"}}
+{"name":"decide-101x100","output":{"mode":"side-by-side"}}
+{"name":"decide-101x101","output":{"mode":"side-by-side"}}
+{"name":"decide-101x120","output":{"mode":"side-by-side"}}
+{"name":"decide-120x80","output":{"mode":"stacked"}}
+{"name":"decide-120x99","output":{"mode":"stacked"}}
+{"name":"decide-120x100","output":{"mode":"side-by-side"}}
+{"name":"decide-120x101","output":{"mode":"side-by-side"}}
+{"name":"decide-120x120","output":{"mode":"side-by-side"}}
+{"name":"decide-200x80","output":{"mode":"stacked"}}
+{"name":"decide-200x99","output":{"mode":"stacked"}}
+{"name":"decide-200x100","output":{"mode":"side-by-side"}}
+{"name":"decide-200x101","output":{"mode":"side-by-side"}}
+{"name":"decide-200x120","output":{"mode":"side-by-side"}}
+{"name":"adaptive-short","output":{"left":30}}
+{"name":"adaptive-medium-100","output":{"left":30}}
+{"name":"adaptive-medium-120","output":{"left":30}}
+{"name":"adaptive-long-cap","output":{"left":45}}
+{"name":"adaptive-narrow-available","output":{"left":30}}
+{"name":"adaptive-empty","output":{"left":30}}
+{"name":"cross-tab-max","output":{"left":30}}
+{"name":"cross-tab-max-empty","output":{"left":30}}
+{"name":"source-width-none","output":{"width":0}}
+{"name":"source-width-single-line","output":{"width":10}}
+{"name":"source-width-multi-line","output":{"width":23}}
+{"name":"source-width-multi","output":{"width":23}}
+{"name":"budget-no-previews","output":{"budget":45}}
+{"name":"budget-wide","output":{"budget":93}}
+{"name":"budget-capped","output":{"budget":73}}
+{"name":"budget-multi-tab","output":{"budget":65}}
+{"name":"donation-basic","output":{"left":60}}
+{"name":"donation-narrow-preview","output":{"left":50}}
+{"name":"donation-wide-labels","output":{"left":50}}
+{"name":"column-widths-typical","output":{"leftWidth":50,"rightWidth":68,"gap":2}}
+{"name":"column-widths-clamp","output":{"leftWidth":97,"rightWidth":1,"gap":2}}
+{"name":"column-widths-tiny","output":{"leftWidth":7,"rightWidth":1,"gap":2}}
+{"name":"body-widths-stacked","output":{"optionsWidth":80,"previewWidth":80}}
+{"name":"body-widths-side","output":{"optionsWidth":50,"previewWidth":67}}
+{"name":"constants","output":{"PREVIEW_MIN_WIDTH":100,"PREVIEW_COLUMN_GAP":2,"PREVIEW_PADDING_LEFT":1,"STACKED_GAP_ROWS":1,"MIN_LEFT":30,"MAX_LEFT_RATIO":0.5,"MIN_PREVIEW_WIDTH":45,"CONFIRMED_OVERHEAD":2,"BORDER_VERTICAL_OVERHEAD":2,"BORDER_HORIZONTAL_OVERHEAD":2,"BORDER_INNER_PADDING_HORIZONTAL":1,"BOX_MIN_CONTENT_WIDTH":40}}
+{"name":"strip-fences","output":{"lines":["let x = 1;","text","code body","trailing"]}}
+{"name":"box-basic","output":{"lines":["┌─────────┐","│ hello   │","│ world   │","└─────────┘"]}}
+{"name":"box-pad-truncate","output":{"lines":["┌────────────┐","│ ab         │","│ a very lon\u001b[0m │","│            │","└────────────┘"]}}
+{"name":"box-hidden","output":{"lines":["┌──────────────────┐","│ one              │","│ two              │","└ ✂ ── 3 lines hidden ── ┘"]}}
+{"name":"box-hidden-narrow","output":{"lines":["┌──────┐","│ one  │","└ ✂ ── 99 lines hidden ── ┘"]}}
+{"name":"box-min-width","output":{"lines":["┌────┐","│ x  │","└────┘"]}}
+{"name":"dims-floor","output":{"innerWidth":40,"boxWidth":44}}
+{"name":"dims-wide-cap","output":{"innerWidth":60,"boxWidth":64}}
+{"name":"dims-trailing-ws","output":{"innerWidth":40,"boxWidth":44}}
+{"name":"dims-ansi","output":{"innerWidth":40,"boxWidth":44}}
+{"name":"dims-empty","output":{"innerWidth":40,"boxWidth":44}}

@@ -43,7 +43,7 @@ const RUST_RUNNER = resolve(REPO, "target/debug/examples/parity_runner");
 const VENDORED_LOCALES = resolve(REPO, "crates/rpi-ext-ask-user-question/locales");
 const GENERATED = resolve(REPO, "fixtures/generated/ask-user-question-parity");
 const PINNED_COMMIT = "338b264c1ca4fd8828cc849b632f4f7ad88d2e78";
-const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc", "state", "keys"];
+const GROUPS = ["schema", "normalize", "validate", "envelope", "row-intent", "rpc", "state", "keys", "preview"];
 const UPSTREAM_MODULES = [
 	"tool/types.ts",
 	"tool/normalize-params.ts",
@@ -56,10 +56,19 @@ const UPSTREAM_MODULES = [
 	// TE30: dialog state machine + key router.
 	"state/state-reducer.ts",
 	"state/key-router.ts",
+	// TE31: preview layout math + bordered-box renderer (pure; the markdown
+	// body cache / block renderer need the pi-tui Markdown component and stay
+	// Rust-side golden-tested instead).
+	"view/components/preview/preview-layout-decider.ts",
+	"view/components/preview/preview-box-renderer.ts",
 ];
 // The `@earendil-works/pi-tui` import in key-router.ts is stubbed with the
 // pinned upstream keys module (self-contained; no other tui sources needed).
+// TE31: the preview modules additionally need `visibleWidth`/
+// `truncateToWidth` from the pinned upstream utils module (plus its
+// `get-east-asian-width` dependency, installed at the pi-tui pin).
 const PI_TUI_KEYS = resolve(REPO, "external/pi/packages/tui/src/keys.ts");
+const PI_TUI_UTILS = resolve(REPO, "external/pi/packages/tui/src/utils.ts");
 const GOLDEN_DIR = resolve(GENERATED, "golden-frames");
 
 function sha256(path) {
@@ -84,8 +93,18 @@ function typeboxPin() {
 	}
 }
 
+/** pi-tui's `get-east-asian-width` pin (utils.ts dependency, TE31). */
+function eastAsianWidthPin() {
+	try {
+		const pkg = JSON.parse(readFileSync(resolve(REPO, "external/pi/packages/tui/package.json"), "utf-8"));
+		return pkg.dependencies?.["get-east-asian-width"] ?? "1.6.0";
+	} catch {
+		return "1.6.0";
+	}
+}
+
 function ensureDeps() {
-	if (existsSync(TSX)) return;
+	if (existsSync(TSX) && existsSync(resolve(DEPS, "node_modules/get-east-asian-width"))) return;
 	console.log(`[parity] installing tsx + typebox into ${DEPS} (one-time)`);
 	mkdirSync(DEPS, { recursive: true });
 	writeFileSync(
@@ -94,7 +113,7 @@ function ensureDeps() {
 	);
 	const result = run(
 		"npm",
-		["install", "--no-save", "tsx@4", `typebox@${typeboxPin()}`],
+		["install", "--no-save", "tsx@4", `typebox@${typeboxPin()}`, `get-east-asian-width@${eastAsianWidthPin()}`],
 		{ cwd: DEPS },
 	);
 	if (result.status !== 0 || !existsSync(TSX)) {
@@ -105,26 +124,38 @@ function ensureDeps() {
 function materializeSnapshot() {
 	mkdirSync(resolve(SNAPSHOT, "tool"), { recursive: true });
 	mkdirSync(resolve(SNAPSHOT, "state"), { recursive: true });
+	mkdirSync(resolve(SNAPSHOT, "view/components/preview"), { recursive: true });
 	const hashes = [];
 	for (const module of UPSTREAM_MODULES) {
 		const from = resolve(UPSTREAM, module);
 		const to = resolve(SNAPSHOT, module);
+		mkdirSync(dirname(to), { recursive: true });
 		copyFileSync(from, to);
 		hashes.push({ module, sha256: sha256(from) });
 	}
-	// Stub `@earendil-works/pi-tui` for the snapshot key-router import: a
-	// verbatim copy of the pinned upstream keys module, resolved by Node from
-	// the deps node_modules (external/ stays read-only).
+	// Stub `@earendil-works/pi-tui` for the snapshot imports: verbatim copies
+	// of the pinned upstream keys + utils modules, resolved by Node from the
+	// deps node_modules (external/ stays read-only; utils.ts's
+	// `get-east-asian-width` import resolves from the deps install).
 	const stubDir = resolve(DEPS, "node_modules/@earendil-works/pi-tui");
 	mkdirSync(stubDir, { recursive: true });
 	writeFileSync(
 		resolve(stubDir, "package.json"),
 		`${JSON.stringify({ name: "@earendil-works/pi-tui", version: "0.0.0-harness", type: "module", main: "index.ts" }, null, 2)}\n`,
 	);
-	copyFileSync(PI_TUI_KEYS, resolve(stubDir, "index.ts"));
+	copyFileSync(PI_TUI_KEYS, resolve(stubDir, "keys.ts"));
+	copyFileSync(PI_TUI_UTILS, resolve(stubDir, "utils.ts"));
+	writeFileSync(
+		resolve(stubDir, "index.ts"),
+		'export * from "./keys.ts";\nexport * from "./utils.ts";\n',
+	);
 	hashes.push({
 		module: "external/pi/packages/tui/src/keys.ts (pi-tui stub)",
 		sha256: sha256(PI_TUI_KEYS),
+	});
+	hashes.push({
+		module: "external/pi/packages/tui/src/utils.ts (pi-tui stub, TE31)",
+		sha256: sha256(PI_TUI_UTILS),
 	});
 	return hashes;
 }

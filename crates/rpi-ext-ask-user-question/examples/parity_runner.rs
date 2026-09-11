@@ -5,17 +5,18 @@
 //!
 //! Prints one `{"name", "output"}` JSON line per fixture case; `run-parity.mjs`
 //! diffs the lines against the upstream tsx leg. Groups: `schema`,
-//! `normalize`, `validate`, `envelope`, `row-intent`, `rpc`.
+//! `normalize`, `validate`, `envelope`, `row-intent`, `rpc`, `state`, `keys`,
+//! `preview` (TE31).
 
 use std::fs;
 
 use rpi_ext_ask_user_question::parity::{
     golden_frame_json, golden_renders, has_dialog_ui, labels_by_kind_json, meta,
-    normalize_question_params, question_params_schema, replay_keys_case, replay_state_case,
-    reserved_label_set, run_rpc_questionnaire, sentinels_to_append, validate_questionnaire,
-    DialogOutcome, DialogUi, HostUi, OptionData, QuestionData, QuestionParams, QuestionnaireResult,
-    RowKind, ValidationResult, MAX_HEADER_LENGTH, MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS,
-    MIN_OPTIONS, RESERVED_LABELS,
+    normalize_question_params, question_params_schema, replay_keys_case, replay_preview_case,
+    replay_state_case, reserved_label_set, run_rpc_questionnaire, sentinels_to_append,
+    validate_questionnaire, DialogOutcome, DialogUi, HostUi, OptionData, QuestionData,
+    QuestionParams, QuestionnaireResult, RowKind, ValidationResult, MAX_HEADER_LENGTH,
+    MAX_LABEL_LENGTH, MAX_OPTIONS, MAX_QUESTIONS, MIN_OPTIONS, RESERVED_LABELS,
 };
 use serde_json::{json, Value};
 
@@ -195,6 +196,11 @@ fn keys_output(input: &Value, key_matrix: &[Value]) -> Value {
     replay_keys_case(input, key_matrix)
 }
 
+/// TE31 `preview` group replay (the pure layout/box functions).
+fn preview_output(input: &Value) -> Value {
+    replay_preview_case(input)
+}
+
 /// `golden` group: print one line per scenario/width frame
 /// (`gen-golden-frames.mjs` splits them into JSONL files; ignored by the
 /// diff-based groups).
@@ -267,6 +273,7 @@ fn main() {
             "rpc" => rpc_output(&input),
             "state" => state_output(&input),
             "keys" => keys_output(&input, &key_matrix),
+            "preview" => preview_output(&input),
             other => panic!("unknown group: {other}"),
         };
         println!("{}", json!({"name": name, "output": output}));

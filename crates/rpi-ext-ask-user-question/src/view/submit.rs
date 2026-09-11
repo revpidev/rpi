@@ -16,8 +16,9 @@ use crate::i18n::I18n;
 use crate::state::reducer::QuestionnaireState;
 use crate::tool::envelope::{format_answer_scalar, FormatAnswerVariant};
 use crate::tool::types::{QuestionAnswer, QuestionData};
+use crate::view::option_list::BodyRender;
 use crate::view::theme::Theme;
-use crate::view::{truncate_line, visible_columns};
+use crate::view::truncate_line;
 
 /// `SUBMIT_LABEL` (canonical-English fallback of `submit.label`).
 pub const SUBMIT_LABEL: &str = "Submit answers";
@@ -29,6 +30,8 @@ pub const REVIEW_HEADING: &str = "Review your answers";
 pub const READY_PROMPT: &str = "Ready to submit your answers?";
 /// `INCOMPLETE_WARNING_PREFIX`.
 pub const INCOMPLETE_WARNING_PREFIX: &str = "⚠ Answer remaining questions before submitting:";
+/// `review.note_label` canonical English (the global-note review entry).
+pub const REVIEW_NOTE_LABEL: &str = "Note";
 
 /// Display label for one question (`header` or `Qn`).
 fn question_label(question: &QuestionData, index: usize) -> String {
@@ -39,15 +42,38 @@ fn question_label(question: &QuestionData, index: usize) -> String {
     }
 }
 
-/// Render the answer summary body (upstream `SubmitTabStrategy.bodyComponent`).
+/// Render the answer summary body (upstream `SubmitTabStrategy.bodyComponent`):
+/// per-question rows plus the committed global-note entry (`● Note` + text,
+/// hidden while the global-note editor is open — upstream
+/// `tab-content-strategy.ts:204-208`).
 pub fn render_answers(
     state: &QuestionnaireState,
     questions: &[QuestionData],
+    i18n: &I18n,
     theme: &Theme,
     width: usize,
 ) -> Vec<String> {
-    let _ = state;
-    render_answer_rows(&state.answers, questions, theme, width)
+    let mut lines = render_answer_rows(&state.answers, questions, theme, width);
+    let global_note = state
+        .notes_by_tab
+        .get(&questions.len())
+        .filter(|note| !note.is_empty());
+    if let Some(note) = global_note {
+        if !state.notes_visible {
+            lines.push(truncate_line(
+                &format!(
+                    " ● {}",
+                    theme.muted(i18n.t("review.note_label", REVIEW_NOTE_LABEL))
+                ),
+                width,
+            ));
+            lines.push(truncate_line(
+                &format!("   → {}", theme.fg(theme.text, note)),
+                width,
+            ));
+        }
+    }
+    lines
 }
 
 fn render_answer_rows(
@@ -103,13 +129,14 @@ pub fn render_prompt(
     truncate_line(&text, width)
 }
 
-/// Render the two-row picker (row 0 = Submit, row 1 = Cancel).
+/// Render the two-row picker (row 0 = Submit, row 1 = Cancel) with the
+/// focused-row range for the dialog scroll window.
 pub fn render_picker(
     state: &QuestionnaireState,
     i18n: &I18n,
     theme: &Theme,
     width: usize,
-) -> Vec<String> {
+) -> BodyRender {
     let labels = [
         i18n.t("submit.label", SUBMIT_LABEL),
         i18n.t("submit.cancel", CANCEL_LABEL),
@@ -118,7 +145,6 @@ pub fn render_picker(
     for (index, label) in labels.iter().enumerate() {
         let active = state.submit_choice_index == index;
         let pointer = if active { "→ " } else { "  " };
-        let pointer_width = visible_columns(pointer);
         let text = if active {
             theme.accent_bold(label)
         } else {
@@ -128,9 +154,15 @@ pub fn render_picker(
             &format!("{pointer}{}. {text}", index + 1),
             width,
         ));
-        let _ = pointer_width;
     }
-    lines
+    BodyRender {
+        focused_range: Some((
+            state.submit_choice_index.min(1),
+            state.submit_choice_index.min(1) + 1,
+        )),
+        cursor: None,
+        lines,
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +197,7 @@ mod tests {
 
     #[test]
     fn answers_render_label_scalar_and_notes() {
+        let i18n = I18n::for_locale("en");
         let theme = Theme::dark();
         let questions = questions();
         let mut state = QuestionnaireState::initial();
@@ -192,7 +225,7 @@ mod tests {
                 preview: None,
             },
         );
-        let plain: Vec<String> = render_answers(&state, &questions, &theme, 80)
+        let plain: Vec<String> = render_answers(&state, &questions, &i18n, &theme, 80)
             .iter()
             .map(|line| strip_ansi(line))
             .collect();
@@ -201,6 +234,30 @@ mod tests {
         assert_eq!(plain[2], "     notes: my note");
         assert_eq!(plain[3], " ● Q2");
         assert_eq!(plain[4], "   → B");
+    }
+
+    #[test]
+    fn committed_global_note_lists_as_a_note_entry() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = questions();
+        let mut state = QuestionnaireState::initial();
+        state
+            .notes_by_tab
+            .insert(questions.len(), "global words".to_owned());
+        let plain: Vec<String> = render_answers(&state, &questions, &i18n, &theme, 80)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        assert_eq!(plain[0], " ● Note");
+        assert_eq!(plain[1], "   → global words");
+        // The entry hides while the global-note editor is open.
+        state.notes_visible = true;
+        let plain: Vec<String> = render_answers(&state, &questions, &i18n, &theme, 80)
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect();
+        assert!(plain.is_empty());
     }
 
     #[test]
@@ -237,17 +294,25 @@ mod tests {
         let theme = Theme::dark();
         let state = QuestionnaireState::initial();
         let plain: Vec<String> = render_picker(&state, &i18n, &theme, 80)
+            .lines
             .iter()
             .map(|line| strip_ansi(line))
             .collect();
         assert_eq!(plain, vec!["→ 1. Submit answers", "  2. Cancel"]);
+        assert_eq!(state_submit_range(&state), Some((0, 1)));
         let mut cancel = QuestionnaireState::initial();
         cancel.submit_choice_index = 1;
         let plain: Vec<String> = render_picker(&cancel, &i18n, &theme, 80)
+            .lines
             .iter()
             .map(|line| strip_ansi(line))
             .collect();
         assert_eq!(plain, vec!["  1. Submit answers", "→ 2. Cancel"]);
+        assert_eq!(state_submit_range(&cancel), Some((1, 2)));
+    }
+
+    fn state_submit_range(state: &QuestionnaireState) -> Option<(usize, usize)> {
+        render_picker(state, &I18n::for_locale("en"), &Theme::dark(), 80).focused_range
     }
 
     fn strip_ansi(text: &str) -> String {

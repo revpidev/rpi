@@ -187,7 +187,12 @@ pub fn execute(host: &dyn HostCall, params: &Value) -> Value {
     // `ctx.ui.custom()` resolving undefined — and falls through to the
     // `resolveUndefinedResult` contract below (dialog primitives → walker,
     // otherwise `no_custom_ui`).
-    resolve_undefined_result_with(host, &typed, &I18n::detect())
+    resolve_undefined_result_with(
+        host,
+        &typed,
+        &I18n::detect(),
+        crate::emit_terminal_attention_stdout,
+    )
 }
 
 /// `runRpcPath` — the RPC walker bracketed by the blocked-event pair, with
@@ -227,17 +232,21 @@ fn run_rpc_path_with(
 /// questions.
 ///
 /// The component attempt is bracketed by the `rpiv:ask-user:blocked` event
-/// pair (upstream `try/finally`); the fallback walker below runs bare, like
-/// upstream's `resolveUndefinedResult`. The terminal BEL between
-/// `blocked:true` and the mount is Q3 (FR-Q3-G); Q2 only keeps the event
-/// bracket.
+/// pair (upstream `try/finally`); the terminal BEL sits between
+/// `blocked:true` and the mount (FR-Q3-G, `emitTerminalAttention()` in
+/// `execute`'s `try` — the emitter is injected so tests pin the ordering
+/// without touching stdout).
 fn resolve_undefined_result_with(
     host: &dyn HostCall,
     typed: &QuestionParams,
     i18n: &I18n,
+    emit_bel: impl FnOnce(),
 ) -> Value {
     emit_blocked_or_warn(host, true);
-    let component = crate::state::session::run(host, typed, i18n, &crate::config::load_config());
+    let component = {
+        emit_bel();
+        crate::state::session::run(host, typed, i18n, &crate::config::load_config())
+    };
     emit_blocked_or_warn(host, false);
 
     match component {
@@ -635,9 +644,9 @@ mod tests {
     }
 
     /// Non-RPC host whose component mount answers `unknownMethod` falls to
-    /// the bare walker: the component attempt carries the blocked bracket
-    /// (upstream `try/finally` around `ctx.ui.custom`), the fallback walker
-    /// itself runs bare inside `resolveUndefinedResult`.
+    /// the bare walker: the component attempt carries the blocked bracket +
+    /// BEL (upstream `try { emitTerminalAttention(); … } finally`), the
+    /// fallback walker itself runs bare inside `resolveUndefinedResult`.
     #[test]
     fn component_unknown_method_falls_back_to_walker_bare() {
         let host = host_script(vec![
@@ -792,7 +801,7 @@ mod tests {
             ("ctx.hasUI", Ok(json!(true))),
             ("ui.select", Ok(json!("2. B — b"))),
         ]);
-        let fallback = resolve_undefined_result_with(&fallback_host, &params, &i18n);
+        let fallback = resolve_undefined_result_with(&fallback_host, &params, &i18n, || {});
 
         assert_eq!(rpc, fallback);
         assert_eq!(
@@ -823,6 +832,55 @@ mod tests {
             .expect("text")
             .starts_with("Error: invalid ask_user_question parameters"));
         assert_eq!(host.calls().len(), 0, "no host call before params parse");
+    }
+
+    /// FR-Q3-G: the component path emits exactly one BEL between
+    /// `blocked:true` and the mount (upstream `try { emitTerminalAttention();
+    /// ctx.ui.custom(...) } finally { blocked:false }`).
+    #[test]
+    fn component_path_blocked_and_bel_bracket_order() {
+        let host = FakeHost::default();
+        {
+            let mut queue = host.replies.lock().expect("queue");
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:true
+            queue.push((
+                "ui.mountComponent".to_owned(),
+                Err(HostError {
+                    kind: "unknownMethod".to_owned(),
+                    message: "unknown host call: ui.mountComponent".to_owned(),
+                }),
+            ));
+            queue.push(("events.emit".to_owned(), Ok(json!(null)))); // blocked:false
+            queue.push(("ctx.hasUI".to_owned(), Ok(json!(false)))); // dialog probe
+        }
+        let timeline: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let recording = RecordingHost {
+            inner: &host,
+            timeline: &timeline,
+        };
+        let mut bel_count = 0;
+        let params: QuestionParams = serde_json::from_value(valid_params()).expect("params");
+        let result =
+            resolve_undefined_result_with(&recording, &params, &I18n::for_locale("en"), || {
+                bel_count += 1;
+                timeline.lock().expect("timeline").push("BEL".to_owned());
+            });
+        assert_eq!(
+            bel_count, 1,
+            "exactly one BEL between blocked:true and the mount"
+        );
+        // unknownMethod → no dialogs → no_custom_ui envelope.
+        assert_eq!(result["details"]["error"], json!("no_custom_ui"));
+        assert_eq!(
+            timeline.lock().expect("timeline").clone(),
+            vec![
+                "events.emit:rpiv:ask-user:blocked:true",
+                "BEL",
+                "ui.mountComponent",
+                "events.emit:rpiv:ask-user:blocked:false",
+                "ctx.hasUI", // the no_custom_ui probe
+            ]
+        );
     }
 
     #[test]

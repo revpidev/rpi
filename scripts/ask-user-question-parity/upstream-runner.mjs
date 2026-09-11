@@ -23,6 +23,10 @@ const rpcFallback = await import(`${SNAPSHOT}/rpc-fallback.ts`);
 const stateReducer = await import(`${SNAPSHOT}/state/state-reducer.ts`);
 const keyRouter = await import(`${SNAPSHOT}/state/key-router.ts`);
 const i18nBridge = await import(`${SNAPSHOT}/state/i18n-bridge.ts`);
+// TE31: the preview layout decider + bordered-box renderer (pure functions;
+// resolved from the snapshot like every other driven module).
+const previewDecider = await import(`${SNAPSHOT}/view/components/preview/preview-layout-decider.ts`);
+const previewBox = await import(`${SNAPSHOT}/view/components/preview/preview-box-renderer.ts`);
 // Stubbed `@earendil-works/pi-tui`: the harness materializes a package whose
 // entry is a verbatim copy of `external/pi/packages/tui/src/keys.ts` @
 // 9841914c. The snapshot's own bare import resolves it from the deps
@@ -228,6 +232,79 @@ async function rpcCase(input) {
 	return { calls, result };
 }
 
+/** TE31 `preview` group: the pure preview layout/box functions. */
+function previewCase(input) {
+	switch (input.fn) {
+		case "decideLayout":
+			return { mode: previewDecider.decideLayout(input.terminalWidth, input.paneWidth) };
+		case "adaptiveLeftWidth":
+			return {
+				left: previewDecider.adaptiveLeftWidth(
+					input.items,
+					input.totalForNumbering,
+					input.paneWidth,
+				),
+			};
+		case "crossTabMaxLeftWidth":
+			return {
+				left: previewDecider.crossTabMaxLeftWidth(
+					input.tabs,
+					input.itemsByTab,
+					input.paneWidth,
+				),
+			};
+		case "previewSourceWidth":
+			return { width: previewDecider.previewSourceWidth(input.question) };
+		case "crossTabPreviewBudget":
+			return { budget: previewDecider.crossTabPreviewBudget(input.questions, input.paneWidth) };
+		case "crossTabLeftWidthWithDonation":
+			return {
+				left: previewDecider.crossTabLeftWidthWithDonation(
+					input.tabs,
+					input.itemsByTab,
+					input.questions,
+					input.paneWidth,
+				),
+			};
+		case "columnWidths":
+			return jsonClone(previewDecider.columnWidths(input.paneWidth, input.adaptiveLeft));
+		case "bodyWidths":
+			return jsonClone(
+				previewDecider.bodyWidths(input.paneWidth, input.mode, input.adaptiveLeft),
+			);
+		case "constants":
+			return {
+				PREVIEW_MIN_WIDTH: previewDecider.PREVIEW_MIN_WIDTH,
+				PREVIEW_COLUMN_GAP: previewDecider.PREVIEW_COLUMN_GAP,
+				PREVIEW_PADDING_LEFT: previewDecider.PREVIEW_PADDING_LEFT,
+				STACKED_GAP_ROWS: previewDecider.STACKED_GAP_ROWS,
+				MIN_LEFT: previewDecider.MIN_LEFT,
+				MAX_LEFT_RATIO: previewDecider.MAX_LEFT_RATIO,
+				MIN_PREVIEW_WIDTH: previewDecider.MIN_PREVIEW_WIDTH,
+				CONFIRMED_OVERHEAD: previewDecider.CONFIRMED_OVERHEAD,
+				BORDER_VERTICAL_OVERHEAD: previewBox.BORDER_VERTICAL_OVERHEAD,
+				BORDER_HORIZONTAL_OVERHEAD: previewBox.BORDER_HORIZONTAL_OVERHEAD,
+				BORDER_INNER_PADDING_HORIZONTAL: previewBox.BORDER_INNER_PADDING_HORIZONTAL,
+				BOX_MIN_CONTENT_WIDTH: previewBox.BOX_MIN_CONTENT_WIDTH,
+			};
+		case "stripFenceMarkers":
+			return { lines: previewBox.stripFenceMarkers(input.lines) };
+		case "renderBorderedBox":
+			return {
+				lines: previewBox.renderBorderedBox(
+					input.lines,
+					input.width,
+					(s) => s,
+					input.hidden ?? 0,
+				),
+			};
+		case "computeBoxDimensions":
+			return jsonClone(previewBox.computeBoxDimensions(input.lines, input.maxInnerWidth));
+		default:
+			throw new Error(`unknown preview fn: ${input.fn}`);
+	}
+}
+
 async function main() {
 	const group = process.argv[2];
 	const fixturePath = process.argv[3];
@@ -257,6 +334,8 @@ async function main() {
 			output = stateCase(fixture.input);
 		} else if (group === "keys") {
 			output = keysCase(fixture.input, fixtures.keys?.keyMatrix ?? []);
+		} else if (group === "preview") {
+			output = previewCase(fixture.input);
 		} else {
 			throw new Error(`unknown group: ${group}`);
 		}
