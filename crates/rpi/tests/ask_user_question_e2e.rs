@@ -919,6 +919,152 @@ async fn tui_type_something_custom_answer_with_ctrl_u() {
     assert_eq!(result["details"]["answers"][0]["answer"], json!("custom"));
 }
 
+/// FR-A/R-Q3.3/R-Q3.4/R-Q5.6 (TE32 §3.1 scenarios 2/3/5): three questions —
+/// q1 multi-select confirmed with an EMPTY selection (Next row, zero
+/// toggles) → `"(no input)"`; q2 deliberately skipped via Tab; q3 answered
+/// with a per-question note (`n` on the question tab). Partial submit: the
+/// unanswered q2 produces no segment, empty multi still does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tui_partial_submit_empty_multi_and_question_note() {
+    let params = json!({
+        "questions": [
+            {
+                "question": "Pick many?",
+                "header": "H1",
+                "multiSelect": true,
+                "options": [
+                    {"label": "One", "description": "1"},
+                    {"label": "Two", "description": "2"}
+                ]
+            },
+            {
+                "question": "Skip me?",
+                "header": "H2",
+                "options": [
+                    {"label": "C", "description": "see"},
+                    {"label": "D", "description": "dee"}
+                ]
+            },
+            {
+                "question": "Pick one?",
+                "header": "H3",
+                "options": [
+                    {"label": "Alpha", "description": "alpha option"},
+                    {"label": "Beta", "description": "beta option"}
+                ]
+            }
+        ]
+    });
+    let Some(mut fixture) = TuiFixture::boot("partial", &params).await else {
+        return;
+    };
+    await_screen(&fixture.term, "Pick many?", Duration::from_secs(10)).await;
+
+    // q1: no Space toggles — ↓×3 onto the Next sentinel row (One → Two →
+    // Type something. → Next), Enter confirms the empty selection
+    // (R-Q5.4: an empty multi selection is submittable) and auto-advances
+    // onto q2.
+    fixture.term.feed("\x1b[B"); // ↓ Two
+    fixture.term.feed("\x1b[B"); // ↓ Type something.
+    fixture.term.feed("\x1b[B"); // ↓ Next
+    fixture.term.feed("\r");
+    await_screen(&fixture.term, "Skip me?", Duration::from_secs(10)).await;
+
+    // q2 stays unanswered — Tab hops straight onto q3 (partial submit,
+    // R-Q3.4).
+    fixture.term.feed("\t");
+    await_screen(&fixture.term, "Pick one?", Duration::from_secs(10)).await;
+
+    // Per-question note on the question tab (R-Q5.6): `n` opens the notes
+    // editor (`Notes:` header), printable keys build it, Enter commits and
+    // closes it.
+    fixture.term.feed("n");
+    await_screen(&fixture.term, "Notes:", Duration::from_secs(10)).await;
+    for character in "kept for later".chars() {
+        fixture.term.feed(&character.to_string());
+    }
+    await_screen(&fixture.term, "kept for later", Duration::from_secs(10)).await;
+    fixture.term.feed("\r"); // commit the note (Enter exits notes mode)
+    fixture.term.feed("\r"); // Enter picks Alpha, auto-advances to Submit
+    await_screen(&fixture.term, "Submit", Duration::from_secs(10)).await;
+    fixture.term.feed("\r"); // Submit row
+
+    let (result, _bus) = fixture.finish().await;
+    assert_eq!(result["details"]["cancelled"], json!(false));
+    // Envelope: q1 empty multi keeps its segment with the placeholder,
+    // q2 produces none, q3 carries the `user notes:` suffix.
+    assert_eq!(
+        result["content"][0]["text"],
+        concat!(
+            "User has answered your questions: \"Pick many?\"=\"(no input)\". ",
+            "\"Pick one?\"=\"Alpha\". user notes: kept for later. ",
+            "You can now continue with the user's answers in mind."
+        )
+    );
+    // details: q1 (questionIndex 0) = empty multi, q3 (questionIndex 2) =
+    // option + notes; no entry for the skipped q2 (questionIndex 1).
+    let answers = &result["details"]["answers"];
+    assert_eq!(answers.as_array().map(Vec::len), Some(2), "{answers:?}");
+    assert_eq!(answers[0]["questionIndex"], json!(0));
+    assert_eq!(answers[0]["kind"], json!("multi"));
+    // Parity-pinned details shape for an empty multi selection
+    // (`answered_multi_empty_placeholder` fixture): `answer: null`,
+    // `selected: []` — the `(no input)` placeholder only enters the
+    // envelope text.
+    assert_eq!(answers[0]["answer"], Value::Null);
+    assert_eq!(answers[0]["selected"], json!([]));
+    assert_eq!(answers[1]["questionIndex"], json!(2));
+    assert_eq!(answers[1]["kind"], json!("option"));
+    assert_eq!(answers[1]["answer"], json!("Alpha"));
+    assert_eq!(answers[1]["notes"], json!("kept for later"));
+    assert!(
+        !answers
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|entry| entry["questionIndex"] == json!(1)),
+        "the skipped q2 must not produce an answers entry: {answers:?}"
+    );
+}
+
+/// FR-A/R-Q5.5 (TE32 §3.1 scenario 4): the `Type something.` inline editor
+/// inserts a literal newline on Shift+Enter (fed as the xterm
+/// modifyOtherKeys sequence `ESC [ 27;2;13~` — unambiguous shift+enter
+/// regardless of the kitty-protocol state, rpi-tui keys.rs) and the custom
+/// answer carries the embedded newline through the envelope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tui_type_something_shift_enter_multiline() {
+    let Some(mut fixture) = TuiFixture::boot("multiline", &pick_one_params()).await else {
+        return;
+    };
+    fixture.term.feed("\x1b[B"); // ↓ Beta
+    fixture.term.feed("\x1b[B"); // ↓ Type something.
+    for character in "line one".chars() {
+        fixture.term.feed(&character.to_string());
+    }
+    await_screen(&fixture.term, "line one", Duration::from_secs(10)).await;
+    fixture.term.feed("\x1b[27;2;13~"); // Shift+Enter → newline (R-Q5.11)
+    for character in "line two".chars() {
+        fixture.term.feed(&character.to_string());
+    }
+    await_screen(&fixture.term, "line two", Duration::from_secs(10)).await;
+    fixture.term.feed("\r");
+
+    let (result, _bus) = fixture.finish().await;
+    assert_eq!(
+        result["content"][0]["text"],
+        concat!(
+            "User has answered your questions: \"Pick one?\"=\"line one\nline two\". ",
+            "You can now continue with the user's answers in mind."
+        )
+    );
+    assert_eq!(result["details"]["answers"][0]["kind"], json!("custom"));
+    assert_eq!(
+        result["details"]["answers"][0]["answer"],
+        json!("line one\nline two")
+    );
+}
+
 /// FR-A/R-Q5.7 + TE-D38: collapse hides the overlay with a one-time notify,
 /// a normal key (Esc) while hidden is NOT delivered (hidden Esc cannot
 /// cancel), the collapse key reopens the dialog, and the submit lands.
