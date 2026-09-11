@@ -105,6 +105,72 @@ impl ContextActions for SessionContextActions {
         })
     }
 
+    /// `ctx.sessionEntries` (rpi additive, ADR-0027): the active branch
+    /// (root→leaf) `type:"custom"` entries of the bound session, read-only
+    /// via `SessionManager::get_branch` — the same in-memory structure for
+    /// file-backed and `--no-session` hosts (upstream
+    /// `ctx.sessionManager.getBranch()`, index.ts:217-229 @ 928c30c).
+    /// Projection walks the RAW stored entry (the persistence source of
+    /// truth), so malformed-but-navigable custom entries round-trip
+    /// verbatim instead of being dropped by the typed view. Filtering
+    /// order per ADR-0027: `type:"custom"` → exact `customType` → tail
+    /// `limit`. Fail-closed `[]` when the session is gone or no branch is
+    /// active (`leaf_id = None`).
+    fn get_session_entries(
+        &self,
+        custom_type: Option<&str>,
+        limit: Option<u64>,
+    ) -> Vec<rpi_ext_host::types::SessionEntryInfo> {
+        let Some(session) = self.session() else {
+            return Vec::new();
+        };
+        let manager = session.session_manager();
+        let manager = manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries: Vec<rpi_ext_host::types::SessionEntryInfo> = manager
+            .get_branch(None)
+            .iter()
+            .filter(|entry| entry.type_tag() == "custom")
+            .filter(|entry| {
+                custom_type.is_none_or(|want| {
+                    entry.raw_value().get("customType").and_then(Value::as_str) == Some(want)
+                })
+            })
+            .map(|entry| {
+                let raw = entry.raw_value();
+                rpi_ext_host::types::SessionEntryInfo {
+                    id: raw
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    parent_id: raw
+                        .get("parentId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    timestamp: raw
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    custom_type: raw
+                        .get("customType")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    // "data" is the entry payload verbatim (null when the
+                    // entry carries none — the raw record omits the key
+                    // rather than storing null).
+                    data: raw.get("data").cloned().unwrap_or(Value::Null),
+                }
+            })
+            .collect();
+        if let Some(limit) = limit {
+            let keep = (limit as usize).min(entries.len());
+            entries.drain(..entries.len() - keep);
+        }
+        entries
+    }
+
     /// `compact` — fire-and-forget with the callback pair
     /// (agent-session.ts:2423-2433).
     fn compact(&self, options: CompactOptions) {

@@ -1043,6 +1043,19 @@ pub trait ContextActions: Send + Sync {
     fn get_session_file(&self) -> Option<crate::types::SessionFileInfo> {
         None
     }
+
+    /// `ctx.sessionEntries` (rpi additive, ADR-0027): read-only `custom`
+    /// entries of the active branch (root→leaf). `custom_type` filters by
+    /// exact match; `limit` (already validated positive and capped by the
+    /// dispatch layer at [`crate::types::SESSION_ENTRIES_MAX_LIMIT`]) keeps
+    /// the filtered tail. Default empty — unbound hosts fail closed (`[]`).
+    fn get_session_entries(
+        &self,
+        _custom_type: Option<&str>,
+        _limit: Option<u64>,
+    ) -> Vec<crate::types::SessionEntryInfo> {
+        Vec::new()
+    }
 }
 
 /// `withSession` callback (types.ts:358): receives the
@@ -1636,6 +1649,21 @@ impl ExtensionContext {
         Ok(self
             .context_actions()?
             .and_then(|actions| actions.get_session_file()))
+    }
+
+    /// `ctx.sessionEntries` (rpi additive, ADR-0027) — read-only `custom`
+    /// entries of the active branch (root→leaf order), filtered by exact
+    /// `customType` and tail-limited by `limit`. Default empty when
+    /// unbound (fail-closed `[]`).
+    pub fn session_entries(
+        &self,
+        custom_type: Option<&str>,
+        limit: Option<u64>,
+    ) -> Result<Vec<crate::types::SessionEntryInfo>, ExtError> {
+        Ok(self
+            .context_actions()?
+            .map(|actions| actions.get_session_entries(custom_type, limit))
+            .unwrap_or_default())
     }
 }
 

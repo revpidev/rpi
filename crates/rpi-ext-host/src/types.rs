@@ -615,6 +615,29 @@ pub struct SessionFileInfo {
     pub id: String,
 }
 
+/// `ctx.sessionEntries` item (rpi additive host-call, ADR-0027): one
+/// `type:"custom"` entry of the active branch, projected read-only from
+/// the stored entry — `{id, parentId, timestamp, customType, data}`.
+/// `data` is the entry's payload verbatim (`null` when the entry carries
+/// none); message/tool_result conversation entries are never returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEntryInfo {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp: String,
+    pub custom_type: String,
+    pub data: Value,
+}
+
+/// Host-side cap on the `limit` argument of `ctx.sessionEntries`
+/// (ADR-0027: the host MAY bound `limit`; values above are truncated to
+/// the cap — V14-25 §8.3 open question 1, resolved at 10_000, comfortably
+/// ≥ the suggested 1000 while bounding per-call response size). Applies
+/// to explicit limits only; the unfiltered result set is the branch's
+/// custom entries, which are already bounded by the session itself.
+pub const SESSION_ENTRIES_MAX_LIMIT: u64 = 10_000;
+
 /// `MessageEndEventResult` (types.ts:1086-1089). The replacement must keep
 /// the original role (enforced in runner.rs, runner.ts:837-844).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

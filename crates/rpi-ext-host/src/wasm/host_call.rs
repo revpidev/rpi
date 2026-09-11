@@ -106,7 +106,8 @@ pub fn required_capability(method: &str) -> CapabilityRequirement {
         | "ctx.modelRegistry.getApiKeyAndHeaders"
         | "ctx.setRuntimeApiKey"
         | "ctx.removeRuntimeApiKey"
-        | "ctx.sessionFile" => Requires(Capability::Session),
+        | "ctx.sessionFile"
+        | "ctx.sessionEntries" => Requires(Capability::Session),
         _ => UnknownMethod,
     }
 }
@@ -871,6 +872,25 @@ pub(crate) fn dispatch(state: &mut HostState, method: &str, args: Value) -> Call
                 });
             Ok(serde_json::to_value(info).unwrap_or(Value::Null))
         }
+        "ctx.sessionEntries" => {
+            // rpi additive (ADR-0027): read-only `custom` entries of the
+            // active branch. Both arguments are optional; invalid values
+            // (non-string `customType`, non-positive/non-integer `limit`)
+            // are treated as absent, and an explicit `limit` is capped at
+            // SESSION_ENTRIES_MAX_LIMIT. Unbound hosts fail closed with [].
+            let custom_type = str_arg(&args, "customType");
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit.min(ext::SESSION_ENTRIES_MAX_LIMIT));
+            let entries = state
+                .api
+                .context()
+                .session_entries(custom_type, limit)
+                .map_err(|e| (error_kind(&e), e.to_string()))?;
+            Ok(serde_json::to_value(entries).unwrap_or(Value::Array(Vec::new())))
+        }
         "ctx.getSystemPrompt" => Ok(json!(state
             .api
             .context()
@@ -1212,6 +1232,11 @@ mod tests {
             required_capability("ctx.sessionFile"),
             Requires(Capability::Session)
         ));
+        // ADR-0027 addition is Session-gated too (same family as ctx.*).
+        assert!(matches!(
+            required_capability("ctx.sessionEntries"),
+            Requires(Capability::Session)
+        ));
         // v0.1.4 C0 interactive UI additions are all `ui`-gated, additive.
         for method in crate::interactive_ui::INTERACTIVE_UI_METHODS {
             assert!(
@@ -1219,6 +1244,210 @@ mod tests {
                 "{method}"
             );
         }
+    }
+}
+
+/// V14-25 (ADR-0027): `ctx.sessionEntries` dispatch-level behavior — arg
+/// parsing/validation/clamping at the ABI boundary, fail-closed `[]` for
+/// unbound hosts, and the capability gate. Branch/filter/order semantics
+/// against a real `SessionManager` live in
+/// `rpi/tests/extension_ctx_session_entries_test.rs`.
+#[cfg(test)]
+mod session_entries_tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use serde_json::{json, Value};
+
+    use super::dispatch;
+    use crate::api::{
+        CompactOptions, ContextActions, ContextUsage, ExtensionApi, ExtensionRuntime,
+        LoadedExtension,
+    };
+    use crate::types::SessionEntryInfo;
+    use crate::wasm::{Capability, DispatchTarget, HostState, WasmForward};
+
+    /// ContextActions recorder: captures the (customType, limit) pair the
+    /// dispatch layer hands to the trait boundary.
+    struct RecordingActions {
+        calls: std::sync::Mutex<Vec<(Option<String>, Option<u64>)>>,
+    }
+
+    #[async_trait]
+    impl ContextActions for RecordingActions {
+        fn get_model(&self) -> Option<Value> {
+            None
+        }
+        fn is_idle(&self) -> bool {
+            true
+        }
+        fn is_project_trusted(&self) -> bool {
+            true
+        }
+        fn get_signal(&self) -> Option<tokio_util::sync::CancellationToken> {
+            None
+        }
+        fn abort(&self) {}
+        fn has_pending_messages(&self) -> bool {
+            false
+        }
+        fn shutdown(&self) {}
+        fn get_context_usage(&self) -> Option<ContextUsage> {
+            None
+        }
+        fn compact(&self, _options: CompactOptions) {}
+        fn get_system_prompt(&self) -> String {
+            String::new()
+        }
+        fn get_system_prompt_options(&self) -> Value {
+            Value::Null
+        }
+        fn get_session_entries(
+            &self,
+            custom_type: Option<&str>,
+            limit: Option<u64>,
+        ) -> Vec<SessionEntryInfo> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((custom_type.map(str::to_owned), limit));
+            vec![SessionEntryInfo {
+                id: "stub".to_owned(),
+                parent_id: None,
+                timestamp: String::new(),
+                custom_type: custom_type.unwrap_or_default().to_owned(),
+                data: Value::Null,
+            }]
+        }
+    }
+
+    fn host_state(capabilities: HashSet<Capability>) -> HostState {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let api = ExtensionApi::for_extension(
+            Arc::new(LoadedExtension::new("<inline:v14-25>", "<inline:v14-25>")),
+            ExtensionRuntime::new(),
+            "/test-cwd",
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        HostState {
+            api,
+            capabilities,
+            async_handle: runtime.handle().clone(),
+            forward: DispatchTarget::Wasm(WasmForward { tx }),
+            in_command: std::cell::Cell::new(false),
+            tool_updates: Default::default(),
+            tool_aborts: Default::default(),
+        }
+    }
+
+    /// A5 (dispatch level): a host with no bound ContextActions fails
+    /// closed with `[]`, not an error.
+    #[test]
+    fn ctx_session_entries_unbound_answers_empty_array() {
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        let value =
+            dispatch(&mut state, "ctx.sessionEntries", json!({})).expect("unbound host answers []");
+        assert_eq!(value, json!([]));
+    }
+
+    /// Arg contract at the trait boundary: optional `customType`/`limit`,
+    /// non-positive / non-integer / non-string values treated as absent,
+    /// explicit limits clamped to SESSION_ENTRIES_MAX_LIMIT.
+    #[test]
+    fn ctx_session_entries_arg_parsing_and_clamp() {
+        let actions = Arc::new(RecordingActions {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions.clone() as Arc<dyn ContextActions>));
+
+        dispatch(
+            &mut state,
+            "ctx.sessionEntries",
+            json!({"customType": "mcp-approval-v1", "limit": 100}),
+        )
+        .expect("filtered call");
+        dispatch(&mut state, "ctx.sessionEntries", json!({})).expect("empty-object call is legal");
+        dispatch(
+            &mut state,
+            "ctx.sessionEntries",
+            json!({"limit": 0, "customType": 42}),
+        )
+        .expect("invalid values are treated as absent");
+        dispatch(&mut state, "ctx.sessionEntries", json!({"limit": u64::MAX}))
+            .expect("oversized limit is clamped, not rejected");
+
+        let calls = calls(&actions);
+        assert_eq!(
+            calls,
+            vec![
+                (Some("mcp-approval-v1".to_owned()), Some(100)),
+                (None, None),
+                (None, None),
+                (None, Some(crate::types::SESSION_ENTRIES_MAX_LIMIT)),
+            ],
+            "limit 0 / non-string customType are absent; limit clamps at the host cap"
+        );
+    }
+
+    /// The reply serializes the trait result through the `{"ok": [...]}`
+    /// envelope shape (camelCase fields, verbatim data).
+    #[test]
+    fn ctx_session_entries_serializes_the_entry_shape() {
+        let actions = Arc::new(RecordingActions {
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut state = host_state(HashSet::from([Capability::Session]));
+        state
+            .api
+            .runtime()
+            .set_context_actions(Some(actions.clone() as Arc<dyn ContextActions>));
+        let value = dispatch(
+            &mut state,
+            "ctx.sessionEntries",
+            json!({"customType": "mcp-approval-v1"}),
+        )
+        .expect("call");
+        assert_eq!(
+            value,
+            json!([{
+                "id": "stub",
+                "parentId": null,
+                "timestamp": "",
+                "customType": "mcp-approval-v1",
+                "data": null,
+            }]),
+            "camelCase wire shape with data: null when the entry carries none"
+        );
+    }
+
+    /// A9: without capability `session` the guest-call gate (checked in
+    /// `handle_host_call` before dispatch) rejects with `capabilityDenied`.
+    #[test]
+    fn ctx_session_entries_requires_session_capability() {
+        let mut state = host_state(HashSet::from([Capability::Tools]));
+        let response = crate::wasm::handle_host_call(
+            &mut state,
+            b"{\"call\": \"ctx.sessionEntries\", \"args\": {}}",
+        );
+        let response: Value = serde_json::from_slice(&response).expect("envelope JSON");
+        assert_eq!(
+            response["error"]["kind"],
+            json!("capabilityDenied"),
+            "full envelope: {response}"
+        );
+    }
+
+    fn calls(actions: &RecordingActions) -> Vec<(Option<String>, Option<u64>)> {
+        actions
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
