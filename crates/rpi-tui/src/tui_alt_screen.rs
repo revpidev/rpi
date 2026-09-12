@@ -1353,6 +1353,31 @@ impl TuiAltScreen {
         self.lock_inner().stop_internal(options);
     }
 
+    /// Non-blocking [`TuiAltScreen::stop`] for the panic/signal recovery path
+    /// (`recovery.rs`): returns `false` without restoring when the inner lock
+    /// is held (e.g. the panicking thread holds it mid-render), so the caller
+    /// can fall back to a fixed restore sequence instead of deadlocking.
+    /// Mirrors [`TuiMainScreen::try_stop`]; poisoning recovers like
+    /// [`lock_shared`].
+    pub(crate) fn try_stop(&self, options: TuiStopOptions) -> bool {
+        use std::sync::TryLockError;
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        inner.stop_internal(options);
+        true
+    }
+
+    /// Enqueue a full [`TuiAltScreen::stop`] for the recovery fallback
+    /// (`recovery.rs`), mirroring [`TuiMainScreen::queue_stop`]: the op runs
+    /// on the next pending-op drain, writing the complete restore sequence
+    /// and short-circuiting later renders.
+    pub(crate) fn queue_stop(&self, options: TuiStopOptions) {
+        lock_shared(&self.pending).push(Box::new(move |inner| inner.stop_internal(options)));
+    }
+
     /// Upstream `requestRender(force)` (tui.ts:765-774 @ 4181f66); `force`
     /// resets the render state first (tui-alt-screen.ts:344-349).
     pub fn request_render(&self, force: bool) {

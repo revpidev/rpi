@@ -321,6 +321,41 @@ impl TuiHandle {
         }
     }
 
+    /// Non-blocking [`TuiHandle::stop`] for the panic/signal recovery path
+    /// (`recovery.rs`): never blocks on the handle lock nor the renderer
+    /// lock. Returns `false` without restoring when either lock is held
+    /// (e.g. the panicking thread holds it mid-render), so the caller can
+    /// fall back to a fixed restore sequence instead of deadlocking. Covers
+    /// both renderer variants (`Renderer::Main` / `Renderer::Alt`).
+    pub fn try_stop(&self, options: TuiStopOptions) -> bool {
+        use std::sync::TryLockError;
+        let renderer = match self.inner.try_lock() {
+            Ok(guard) => match &*guard {
+                Renderer::Main(tui) => RendererClone::Main(tui.clone()),
+                Renderer::Alt(tui) => RendererClone::Alt(tui.clone()),
+            },
+            Err(TryLockError::Poisoned(poisoned)) => match &*poisoned.into_inner() {
+                Renderer::Main(tui) => RendererClone::Main(tui.clone()),
+                Renderer::Alt(tui) => RendererClone::Alt(tui.clone()),
+            },
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        match renderer {
+            RendererClone::Main(tui) => tui.try_stop(options),
+            RendererClone::Alt(tui) => tui.try_stop(options),
+        }
+    }
+
+    /// Enqueue a full stop for the recovery fallback (`recovery.rs`),
+    /// mirroring the renderer-level `queue_stop` helpers: runs on the next
+    /// pending-op drain when the recovery path could not take the lock.
+    pub fn queue_stop(&self, options: TuiStopOptions) {
+        match self.renderer_clone() {
+            RendererClone::Main(tui) => tui.queue_stop(options),
+            RendererClone::Alt(tui) => tui.queue_stop(options),
+        }
+    }
+
     /// Upstream `renderNow(force)` (tui.ts:310).
     pub fn render_now(&self, force: bool) {
         match self.renderer_clone() {

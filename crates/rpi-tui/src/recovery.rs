@@ -37,6 +37,7 @@
 use std::io::{self, Write};
 
 use crate::tui::TuiStopOptions;
+use crate::tui_handle::TuiHandle;
 use crate::tui_main_screen::TuiMainScreen;
 
 /// Fixed best-effort restore sequence for the locked-TuiMainScreen fallback in
@@ -100,6 +101,44 @@ pub fn install_panic_hook(tui: &TuiMainScreen) {
         restore_terminal(&tui);
         previous_hook(panic_info);
     }));
+}
+
+/// [`install_panic_hook`] for a [`TuiHandle`] — the production wiring used
+/// by the interactive mode (`run_interactive_mode`), covering both renderer
+/// variants incl. the alt-screen/fullscreen mode via
+/// [`restore_terminal_handle`]. Same chaining contract as
+/// [`install_panic_hook`] (install once per process; re-installing chains).
+pub fn install_panic_hook_for_handle(handle: &TuiHandle) {
+    let previous_hook = std::panic::take_hook();
+    let handle = handle.clone();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal_handle(&handle);
+        previous_hook(panic_info);
+    }));
+}
+
+/// [`restore_terminal`] dispatching through a [`TuiHandle`]: tries the
+/// non-blocking full stop on whichever renderer is live, falls back to the
+/// fixed restore sequence (which exits alt-screen via `\x1b[?1049l`) when
+/// the lock is held, and queues a full stop op for the event loop to drain.
+/// [`restore_terminal`] for a [`TuiHandle`] — covers both renderer variants
+/// (`Renderer::Main` regular mode and `Renderer::Alt` fullscreen/alt-screen
+/// mode). `TuiHandle::try_stop` is non-blocking end-to-end (handle lock +
+/// renderer lock); when either is held by the panicking thread the fixed
+/// fallback sequence below runs instead, and its `\x1b[?1049l` prefix also
+/// exits a fullscreen alt-screen, so both variants are covered on the
+/// fallback path too.
+pub fn restore_terminal_handle(handle: &TuiHandle) {
+    if handle.try_stop(TuiStopOptions::default()) {
+        return;
+    }
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(MINIMAL_RESTORE_SEQUENCE.as_bytes());
+    let _ = stdout.flush();
+    // The locked case cannot consult `was_raw`; a TUI that was started put
+    // the terminal into raw mode, so disabling is the right default.
+    let _ = crossterm::terminal::disable_raw_mode();
+    handle.queue_stop(TuiStopOptions::default());
 }
 
 /// Spawn a tokio task that restores the terminal on SIGTERM/SIGHUP and then
@@ -189,6 +228,11 @@ mod tests {
         }
     }
 
+    /// Serializes the tests that replace the process-global panic hook —
+    /// cargo runs tests on parallel threads by default and concurrent
+    /// set_hook/take_hook pairs would chain onto the wrong hook.
+    static HOOK_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
     /// §8.5 / T11 self-test: after an induced panic the terminal restore
     /// sequence must already be written before the chained (default-output)
     /// hook runs. Runs the full real path: `TuiMainScreen::start` on a
@@ -196,6 +240,7 @@ mod tests {
     /// thread (caught via `join`).
     #[test]
     fn panic_hook_restores_terminal_before_chained_hook() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _hook_guard = PanicHookGuard;
         let writer = SharedWriter::default();
         let terminal = ProcessTerminal::with_writer(writer.clone());
@@ -259,5 +304,61 @@ mod tests {
         ] {
             assert!(MINIMAL_RESTORE_SEQUENCE.contains(sequence));
         }
+    }
+
+    /// P0-1 wiring regression: the production entry (`run_interactive_mode`)
+    /// installs the handle-oriented hook, so the same guarantee must hold
+    /// through a [`TuiHandle`] wrapping the regular renderer.
+    #[test]
+    fn panic_hook_for_handle_restores_terminal_regular_mode() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _hook_guard = PanicHookGuard;
+        let writer = SharedWriter::default();
+        let terminal = ProcessTerminal::with_writer(writer.clone());
+        let tui = TuiMainScreen::new(Box::new(terminal));
+        let handle = crate::tui_handle::TuiHandle::from_main(tui);
+        handle.start();
+        install_panic_hook_for_handle(&handle);
+
+        let panicked =
+            std::thread::spawn(|| panic!("intentional handle-variant recovery test panic"))
+                .join()
+                .is_err();
+        assert!(panicked, "the induced panic must propagate to join");
+
+        let bytes = writer.bytes();
+        assert!(bytes.contains("\x1b[?25h"), "cursor shown: {bytes:?}");
+        assert!(
+            bytes.contains("\x1b[?2004l"),
+            "bracketed paste off: {bytes:?}"
+        );
+    }
+
+    /// P0-1 wiring regression, alt-screen variant: a panic while the
+    /// fullscreen renderer is live must leave the main screen (`\x1b[?1049l`)
+    /// with the cursor visible — the fallback sequence and the full stop
+    /// both exit the alternate screen.
+    #[test]
+    fn panic_hook_for_handle_restores_terminal_alt_screen_mode() {
+        let _serial = HOOK_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _hook_guard = PanicHookGuard;
+        let writer = SharedWriter::default();
+        let terminal = ProcessTerminal::with_writer(writer.clone());
+        let alt = crate::tui_alt_screen::TuiAltScreen::new(Box::new(terminal));
+        let handle = crate::tui_handle::TuiHandle::from_alt(alt);
+        handle.start();
+        install_panic_hook_for_handle(&handle);
+
+        let panicked = std::thread::spawn(|| panic!("intentional alt-screen recovery test panic"))
+            .join()
+            .is_err();
+        assert!(panicked, "the induced panic must propagate to join");
+
+        let bytes = writer.bytes();
+        assert!(
+            bytes.contains("\x1b[?1049l"),
+            "alt screen exited: {bytes:?}"
+        );
+        assert!(bytes.contains("\x1b[?25h"), "cursor shown: {bytes:?}");
     }
 }

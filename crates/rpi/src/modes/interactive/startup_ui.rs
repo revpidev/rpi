@@ -124,6 +124,11 @@ pub(crate) async fn run_first_time_setup_with_terminal(
     // DSR replies are delivered by `pump` (startup-ui.ts starts the TUI
     // before detecting, lines 186-188).
     ui.start();
+    // §8.5: a panic inside the setup window (theme detection, component
+    // render) must not leave the terminal in raw mode. Chained hook — the
+    // interactive mode installs its own after this window closes; stop on
+    // this already-stopped TUI is a no-op then.
+    rpi_tui::recovery::install_panic_hook_for_handle(&ui);
     let stop = Arc::new(AtomicBool::new(false));
     let driver_ui = ui.clone();
     let driver_stop = Arc::clone(&stop);
@@ -133,7 +138,17 @@ pub(crate) async fn run_first_time_setup_with_terminal(
             while !driver_stop.load(Ordering::Relaxed) {
                 driver_ui.pump(Some(Duration::from_millis(50)));
             }
-        })?;
+        });
+    // §8.5: every error path after `ui.start()` must restore the terminal
+    // (stop the TUI / disable raw mode) before propagating — the caller
+    // (`run_interactive_mode`) only logs and continues on a failed setup.
+    let driver = match driver {
+        Ok(driver) => driver,
+        Err(error) => {
+            ui.stop(TuiStopOptions::default());
+            return Err(error.into());
+        }
+    };
 
     let detected = detect_terminal_theme_for_auto(&ui, 100).await;
     let detected_name = match detected {
@@ -141,12 +156,21 @@ pub(crate) async fn run_first_time_setup_with_terminal(
         TerminalColorScheme::Light => "light",
     };
 
+    let setup_theme = match load_theme(detected_name, None) {
+        Ok(theme) => Arc::new(theme),
+        Err(error) => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = driver.join();
+            ui.stop(TuiStopOptions::default());
+            return Err(error);
+        }
+    };
     let (submit_tx, submit_rx) = tokio::sync::oneshot::channel();
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let mut submit_tx = Some(submit_tx);
     let mut cancel_tx = Some(cancel_tx);
     let component = Arc::new(Mutex::new(FirstTimeSetupComponent::new(
-        Arc::new(load_theme(detected_name, None)?),
+        setup_theme,
         get_available_themes()
             .into_iter()
             .map(|info| info.name)

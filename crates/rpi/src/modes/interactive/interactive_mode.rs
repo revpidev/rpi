@@ -329,6 +329,13 @@ pub async fn run_interactive_mode(
         }
     }
     let mut mode = InteractiveMode::new(runtime, options);
+    // §8.5 hard requirement (coding-standards "终端状态恢复"): a panic in
+    // any component render / extension callback / tool execution must not
+    // leave the terminal in raw mode or the alternate screen. The hook
+    // covers both renderer variants (regular `TuiMainScreen` and fullscreen
+    // `TuiAltScreen`) and chains onto whatever hook is current (the
+    // first-time-setup UI installs its own below while it is live).
+    rpi_tui::recovery::install_panic_hook_for_handle(&mode.ui);
     register_signal_handlers(mode.shutdown_sender());
     mode.run().await;
     0
