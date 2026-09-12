@@ -86,7 +86,7 @@ node scripts/mcp-parity/run-render-call-parity.mjs
 - `fixture-server.mjs`：共享 fixture 服务器（stdio / http × 4 profile），帧
   转录到 `RPI_MCP_FIXTURE_LOG`（`RPI_MCP_FIXTURE_LOG_FRAMES=1` 记完整帧）。
 - `upstream-runner.mjs`：上游侧驱动（tsx 直跑钉死 TS 源码）。
-- `parity_runner.rs`（crate example）：rpi 侧驱动，同一步骤序列。
+- `mcp_adapter_parity_runner.rs`（crate example）：rpi 侧驱动，同一步骤序列（P2-9 唯一命名）。
 - `parity-hooks.mjs`：裸依赖解析到外置目录 + host 包 stub（上游仅类型
   import；`@earendil-works/pi-ai/compat` 的值 import `complete` 提供抛错
   stub——parity 场景不注册 sampling）。

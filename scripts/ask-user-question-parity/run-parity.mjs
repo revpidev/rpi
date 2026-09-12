@@ -5,14 +5,12 @@
 // 1. Verifies the pinned submodule HEAD (external/rpiv-mono @ 338b264c) and
 //    materializes a read-only snapshot of the six upstream pure-function
 //    modules into the deps dir (external/ is never written).
-// 2. Builds this crate's `parity_runner` example. Three workspace crates
-//    (ask-user-question / mcp-adapter / subagents) ship an example with that
-//    name, so cargo's shared `target/debug/examples/parity_runner` is
-//    whichever built last — building it here makes the harness independent of
-//    build order (mcp-parity precedent; cargo emits an output-filename
-//    collision warning for the shared path).
+// 2. Builds this crate's `ask_user_question_parity_runner` example. All
+//    workspace parity examples are uniquely named (P2-9), so cargo's shared
+//    target/debug/examples directory has no same-name collision; building
+//    here keeps the harness independent of build order anyway.
 // 3. Runs the upstream modules (tsx) on the shared fixtures.
-// 4. Runs the Rust parity_runner example on the same fixtures.
+// 4. Runs the Rust ask_user_question_parity_runner example on the same fixtures.
 // 5. Normalizes both sides (key-order-insensitive deep compare) and diffs.
 // 6. Checks the vendored locale tables byte-for-byte against the submodule.
 // 7. Writes fixtures/generated/ask-user-question-parity/{parity-report.md,
@@ -39,7 +37,7 @@ const UPSTREAM = resolve(REPO, "external/rpiv-mono/packages/rpiv-ask-user-questi
 const DEPS = process.env.RPI_ASKQ_PARITY_DEPS ?? "/tmp/rpi-ask-user-question-parity-deps";
 const SNAPSHOT = resolve(DEPS, "snapshot");
 const TSX = resolve(DEPS, "node_modules/.bin/tsx");
-const RUST_RUNNER = resolve(REPO, "target/debug/examples/parity_runner");
+const RUST_RUNNER = resolve(REPO, "target/debug/examples/ask_user_question_parity_runner");
 const VENDORED_LOCALES = resolve(REPO, "crates/rpi-ext-ask-user-question/locales");
 const GENERATED = resolve(REPO, "fixtures/generated/ask-user-question-parity");
 const PINNED_COMMIT = "338b264c1ca4fd8828cc849b632f4f7ad88d2e78";
@@ -179,23 +177,23 @@ function runUpstream(group) {
 function buildRustRunner() {
 	const result = run(
 		"cargo",
-		["build", "-p", "rpi-ext-ask-user-question", "--example", "parity_runner"],
+		["build", "-p", "rpi-ext-ask-user-question", "--example", "ask_user_question_parity_runner"],
 		{ cwd: REPO },
 	);
 	if (result.status !== 0) {
-		throw new Error(`cargo build parity_runner failed:\n${result.stderr}\n${result.stdout}`);
+		throw new Error(`cargo build ask_user_question_parity_runner failed:\n${result.stderr}\n${result.stdout}`);
 	}
 }
 
 function runRust(group) {
 	if (!existsSync(RUST_RUNNER)) {
 		throw new Error(
-			`missing ${RUST_RUNNER}; build it first: cargo build -p rpi-ext-ask-user-question --example parity_runner`,
+			`missing ${RUST_RUNNER}; build it first: cargo build -p rpi-ext-ask-user-question --example ask_user_question_parity_runner`,
 		);
 	}
 	const result = run(RUST_RUNNER, [group, resolve(HERE, "fixtures.json")]);
 	if (result.status !== 0) {
-		throw new Error(`rust parity_runner (${group}) failed:\n${result.stderr}\n${result.stdout}`);
+		throw new Error(`rust ask_user_question_parity_runner (${group}) failed:\n${result.stderr}\n${result.stdout}`);
 	}
 	return result.stdout
 		.trim()

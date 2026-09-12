@@ -14,7 +14,7 @@ node scripts/ask-user-question-parity/run-parity.mjs
 The orchestrator builds this crate's `parity_runner` example itself before the
 Rust leg: three workspace crates (ask-user-question / mcp-adapter / subagents)
 ship an example with that name, so cargo's shared
-`target/debug/examples/parity_runner` is whichever was built last. The in-script
+the example is uniquely named (`ask_user_question_parity_runner`, P2-9), so `target/debug/examples/` has no same-name collision. The in-script
 build makes the harness independent of workspace build order (mcp-parity
 precedent); the manual `cargo build -p rpi-ext-ask-user-question --example
 parity_runner` step is therefore optional.
@@ -30,7 +30,7 @@ Report: `fixtures/generated/ask-user-question-parity/parity-report.md` (plus
 | `upstream-runner.mjs` | Imports the upstream TS modules via `tsx` and prints one JSON line per case |
 | `run-parity.mjs` | Verifies the submodule pin, materializes the snapshot (+ the `@earendil-works/pi-tui` keys stub), runs both legs, normalizes, diffs, checks the golden-frame baseline, writes the report |
 | `gen-golden-frames.mjs` | Re-records `golden-frames/*.jsonl` from the native fixture component (run deliberately; the files are committed) |
-| `examples/parity_runner.rs` (in the crate) | Rust leg over the same fixtures via the `parity` facade |
+| `examples/ask_user_question_parity_runner.rs` (in the crate) | Rust leg over the same fixtures via the `parity` facade |
 
 ## Snapshot policy (external/ stays read-only)
 

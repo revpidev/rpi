@@ -5,7 +5,7 @@
 // For each scenario, drives BOTH clients against the SAME fixture server
 // and diffs the normalized documents:
 //   upstream side: upstream-runner.mjs  → pinned McpServerManager (Node)
-//   rpi side:      cargo example parity_runner → this crate's manager
+//   rpi side:      cargo example mcp_adapter_parity_runner → this crate's manager
 // Frame transcripts are recorded by the fixture server itself (normalized
 // to `$id`), so the diff isolates client-implementation differences.
 //
@@ -77,7 +77,7 @@ if (!existsSync(tsxLoader)) {
 }
 
 // Build the Rust runner once.
-const build = spawnSync(CARGO, ["build", "-p", "rpi-ext-mcp-adapter", "--example", "parity_runner"], {
+const build = spawnSync(CARGO, ["build", "-p", "rpi-ext-mcp-adapter", "--example", "mcp_adapter_parity_runner"], {
   cwd: REPO,
   encoding: "utf8",
 });
@@ -85,7 +85,7 @@ if (build.status !== 0) {
   console.error(build.stdout + build.stderr);
   process.exit(2);
 }
-const rustRunner = join(REPO, "target", "debug", "examples", "parity_runner");
+const rustRunner = join(REPO, "target", "debug", "examples", "mcp_adapter_parity_runner");
 
 function runSide(command, argsList, env, label) {
   const result = spawnSync(command, argsList, {
@@ -252,7 +252,7 @@ for (const scenario of SCENARIOS) {
         RPI_MCP_PARITY_SERVER_URL: serverUrl,
         RPI_MCP_PARITY_FIXTURE_SERVER: join(HERE, "fixture-server.mjs"),
       },
-      "parity_runner",
+      "mcp_adapter_parity_runner",
     );
 
     let verdict;

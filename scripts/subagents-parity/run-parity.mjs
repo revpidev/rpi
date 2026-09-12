@@ -7,8 +7,8 @@
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
 //
 // The Rust leg is built by this script and copied to a private path before
-// execution: both plugin crates ship an example named `parity_runner`, and
-// the unsuffixed target/debug/examples/parity_runner belongs to whichever
+// execution: both plugin crates ship an example named `subagents_parity_runner`, and
+// the unsuffixed target/debug/examples/subagents_parity_runner belongs to whichever
 // crate built last (the mcp harness would shadow it otherwise).
 //
 // Track `target` (default since TE27; pi-subagents v0.66.0, ADR-0025):
@@ -28,7 +28,7 @@
 // old-pin worktree, i.e. `git -C external/pi-subagents checkout 56f97234`
 // followed by restoring the v0.66.0 pin afterwards):
 //   1. Runs the pinned upstream v0.48 modules (tsx) on the shared fixtures.
-//   2. Runs the Rust parity_runner example on the same fixtures.
+//   2. Runs the Rust subagents_parity_runner example on the same fixtures.
 //   3. Normalizes both sides and diffs; writes
 //      fixtures/generated/subagents-parity/parity-report.md.
 //   Non-zero exit = any case mismatched (expects the rpi crate at v0.48
@@ -148,29 +148,30 @@ function runRust(mode, modeFile) {
 		}),
 	});
 	if (result.status !== 0) {
-		throw new Error(`rust parity_runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);
+		throw new Error(`rust subagents_parity_runner (${mode}) failed:\n${result.stderr}\n${result.stdout}`);
 	}
 	return parseLines(result.stdout, `rust ${mode}`);
 }
 
 let rustRunnerPath;
-// Both rpi-ext-subagents and rpi-ext-mcp-adapter ship an example named
-// `parity_runner`; cargo writes the unsuffixed `target/debug/examples/
-// parity_runner` for whichever crate built last, so the mcp harness can
-// shadow this one. Build ours and copy it to a private path in the same
-// step (the copy is what we execute), keeping the documented example name.
+// P2-9: the workspace's parity examples are uniquely named
+// (`subagents_parity_runner` / `mcp_adapter_parity_runner` /
+// `ask_user_question_parity_runner`), so cargo's shared
+// target/debug/examples directory no longer collides. The private-path copy
+// is kept: it pins the exact binary this run executes regardless of any
+// concurrent builds.
 function ensureRustRunner() {
 	if (rustRunnerPath) return rustRunnerPath;
 	const build = spawnSync(
 		"cargo",
-		["build", "-p", "rpi-ext-subagents", "--example", "parity_runner"],
+		["build", "-p", "rpi-ext-subagents", "--example", "subagents_parity_runner"],
 		{ cwd: REPO, encoding: "utf-8" },
 	);
 	if (build.status !== 0) {
-		throw new Error(`cargo build of the parity_runner example failed:\n${build.stderr}`);
+		throw new Error(`cargo build of the subagents_parity_runner example failed:\n${build.stderr}`);
 	}
 	rustRunnerPath = `${CASES_DIR}/subagents-parity_runner`;
-	copyFileSync(resolve(REPO, "target/debug/examples/parity_runner"), rustRunnerPath);
+	copyFileSync(resolve(REPO, "target/debug/examples/subagents_parity_runner"), rustRunnerPath);
 	return rustRunnerPath;
 }
 

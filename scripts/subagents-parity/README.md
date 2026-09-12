@@ -35,7 +35,7 @@ node scripts/subagents-parity/run-parity.mjs --record-args-golden
 ```
 
 Rust 腿由 `run-parity.mjs` 自己构建（cargo 缓存命中时近零开销）并**拷贝到私有路径后执行**：
-两个插件 crate 都有名为 `parity_runner` 的 example，`target/debug/examples/parity_runner`
+各插件 crate 的 parity example 名称唯一（本 crate 为 `subagents_parity_runner`），`target/debug/examples/` 不再发生同名碰撞（P2-9）
 归最后构建的 crate 所有，mcp harness 会把它覆盖掉（TE13 实测发现的 harness 缺陷）。
 私有拷贝使两套 harness 互不干扰，example 名称与既有文档保持兼容。
 
@@ -116,7 +116,7 @@ rpi 对应实现（`parity::resolve_subagent_model_override_public` /
 | `expected-target-diffs.json` | 目标轨差异归因清单（R + 承接任务） |
 | `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件、discovery 走 v0.66 `discoverAgents` |
 | `setup-target-source.sh` | 仓库外抽取 v0.66 快照 + 安装其 prod 依赖（external/ 零写入） |
-| `examples/parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`）；由编排器构建并私有拷贝后执行 |
+| `examples/subagents_parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`）；由编排器构建并私有拷贝后执行 |
 | `run-parity.mjs` | 编排 + 归一化 diff + 归因 + 报告落盘；物化 fixture 与 Rust 二进制拷贝落仓库外临时目录 |
 
 `PI_CODING_AGENT_PACKAGE_ROOT=/tmp` 短路上游 `resolvePiPackageRoot` 的

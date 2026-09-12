@@ -2,7 +2,7 @@
 //
 //   node scripts/ask-user-question-parity/gen-golden-frames.mjs
 //
-// Runs the crate's `parity_runner golden` command (the native fixture
+// Runs the crate's `ask_user_question_parity_runner golden` command (the native fixture
 // component rendered at 80/100/120 columns) and writes one JSONL file per
 // scenario/width into
 // `fixtures/generated/ask-user-question-parity/golden-frames/`.
@@ -17,13 +17,13 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
-const RUNNER = resolve(REPO, "target/debug/examples/parity_runner");
+const RUNNER = resolve(REPO, "target/debug/examples/ask_user_question_parity_runner");
 const GOLDEN_DIR = resolve(REPO, "fixtures/generated/ask-user-question-parity/golden-frames");
 
 if (!existsSync(RUNNER)) {
 	const build = spawnSync(
 		"cargo",
-		["build", "-p", "rpi-ext-ask-user-question", "--example", "parity_runner"],
+		["build", "-p", "rpi-ext-ask-user-question", "--example", "ask_user_question_parity_runner"],
 		{ cwd: REPO, encoding: "utf-8" },
 	);
 	if (build.status !== 0) {
