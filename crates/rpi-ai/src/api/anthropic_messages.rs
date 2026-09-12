@@ -29,7 +29,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -41,6 +40,7 @@ use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
 };
 use crate::api::sse::{ServerSentEvent, SseDecoder};
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, CacheRetention, Context, DoneReason, ErrorReason, Message,
@@ -1324,6 +1324,14 @@ impl<'a> StreamProcessor<'a> {
         if !ANTHROPIC_MESSAGE_EVENTS.contains(&event_name) {
             return Ok(());
         }
+        // P2-4: tolerate keep-alive/dispatch events that carry a known
+        // event name but no `data` payload (e.g. `event: ping\ndata:\n\n`
+        // from Anthropic-compatible gateways). An empty string can never
+        // decode to a valid message event — skip instead of hard-failing
+        // the whole stream (upstream JSON.parse("") would throw).
+        if sse.data.trim().is_empty() {
+            return Ok(());
+        }
         let event = parse_json_with_repair(&sse.data).map_err(|error| {
             format!(
                 "Could not parse Anthropic SSE event {event_name}: {error}; data={}; raw={}",
@@ -1919,21 +1927,24 @@ async fn run(
     // responses never expire; only a silent stream does.
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
-    while let Some(chunk) = byte_stream.next().await {
-        if options
-            .stream
-            .signal
-            .as_ref()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            return Err("Request was aborted".to_owned());
-        }
+    loop {
+        // P1-5: race the body read against the abort token — upstream hands
+        // the signal to fetch (cancellation interrupts the body read
+        // immediately); a check only after a chunk arrives would stall on an
+        // idle body until the idle timeout (5 min default, unbounded when
+        // disabled).
+        let chunk =
+            match next_chunk_or_cancelled(&mut byte_stream, options.stream.signal.as_ref()).await {
+                StreamNext::Item(chunk) => chunk,
+                StreamNext::Cancelled => return Err("Request was aborted".to_owned()),
+            };
+        let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| error.to_string())?;
-        for sse in decoder.feed(&bytes) {
+        for sse in decoder.feed(&bytes)? {
             processor.handle_sse(&sse, events)?;
         }
     }
-    for sse in decoder.finish() {
+    for sse in decoder.finish().unwrap() {
         processor.handle_sse(&sse, events)?;
     }
     processor.finish(options.stream.signal.as_ref())
@@ -3193,14 +3204,14 @@ pub(crate) mod tests {
             let mut processor = StreamProcessor::new(&mut output, model, false, None);
             let mut decoder = SseDecoder::new();
             let mut result = Ok(());
-            for sse in decoder.feed(bytes) {
+            for sse in decoder.feed(bytes).unwrap() {
                 if let Err(error) = processor.handle_sse(&sse, &events) {
                     result = Err(error);
                     break;
                 }
             }
             if result.is_ok() {
-                for sse in decoder.finish() {
+                for sse in decoder.finish().unwrap() {
                     if let Err(error) = processor.handle_sse(&sse, &events) {
                         result = Err(error);
                         break;

@@ -40,10 +40,10 @@
 
 use std::collections::HashMap;
 
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
     tagged_tool_call, AssistantContent, AssistantMessage, AssistantMessageDiagnostic,
@@ -868,10 +868,19 @@ async fn run(
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
 
-    while let Some(chunk) = byte_stream.next().await {
-        if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
-            return Err(StreamFailure::plain("Request was aborted"));
-        }
+    loop {
+        // P1-5: race the body read against the abort token — upstream hands
+        // the signal to fetch (cancellation interrupts the body read
+        // immediately); a check only after a chunk arrives would stall on an
+        // idle body until the idle timeout (5 min default, unbounded when
+        // disabled).
+        let chunk = match next_chunk_or_cancelled(&mut byte_stream, signal.as_ref()).await {
+            StreamNext::Item(chunk) => chunk,
+            StreamNext::Cancelled => {
+                return Err(StreamFailure::plain("Request was aborted"));
+            }
+        };
+        let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| StreamFailure::plain(error.to_string()))?;
         let parsed = reader.feed(&bytes).map_err(StreamFailure::plain)?;
         if push_converted(&mut converter, events, parsed) {

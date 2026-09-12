@@ -184,24 +184,70 @@ impl FileAuthStorageBackend {
     }
 
     /// Write helper — `AUTH_FILE_WRITE_OPTIONS = { mode: 0o600 }`: explicit
-    /// permission bits at creation plus a post-write chmod (never
-    /// umask-dependent), matching upstream `writeFileSync` + `chmodSync`.
+    /// permission bits at creation (never umask-dependent), matching
+    /// upstream `writeFileSync` semantics for new files.
+    ///
+    /// P2-5 hardening (deliberate deviation from upstream's in-place
+    /// `writeFileSync`): write to a sibling temp file, fsync, then `rename`
+    /// over the target — a crash mid-write can no longer truncate the store
+    /// to a partial file. The temp file inherits the EXISTING file's
+    /// permission bits when one exists (admin-configured modes/ACLs must
+    /// survive the rewrite, auth-storage.ts:24-25 @ c49906ec7, #7779); a
+    /// new file is created 0o600.
     fn write_file(&self, content: &str) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let parent = self
+            .auth_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let file_name = self
+            .auth_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "auth.json".to_string());
+        let tmp_path = parent.join(format!(".{file_name}.tmp-{}", std::process::id()));
+
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            // 0o600 baseline for new stores; re-applied from the existing
+            // file below when one is present.
             options.mode(0o600);
         }
-        let mut file = options.open(&self.auth_path)?;
-        use std::io::Write;
+        let mut file = options.open(&tmp_path)?;
         file.write_all(content.as_bytes())?;
         file.sync_all()?;
         drop(file);
-        // No post-write chmod: the explicit mode applies only on creation
-        // (auth-storage.ts:24-25 @ c49906ec7, #7779) — overwriting an
-        // existing file must preserve admin-configured permissions/ACLs.
+
+        #[cfg(unix)]
+        {
+            // Preserve an existing file's permission bits (see doc note).
+            if let Ok(existing) = std::fs::metadata(&self.auth_path) {
+                let _ = std::fs::set_permissions(&tmp_path, existing.permissions());
+            }
+        }
+
+        // Rename is atomic within the same directory; the old contents
+        // stay intact until the new ones are fully on disk.
+        std::fs::rename(&tmp_path, &self.auth_path)?;
+
+        // Best-effort directory fsync so the rename itself is durable
+        // (directory fsync is unsupported via std on some platforms —
+        // ignore failures).
+        #[cfg(unix)]
+        {
+            if let Ok(dir) = std::fs::File::open(&parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &parent;
+        }
         Ok(())
     }
 

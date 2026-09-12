@@ -32,7 +32,6 @@
 
 use std::collections::HashMap;
 
-use futures::StreamExt;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -46,6 +45,7 @@ use crate::api::copilot_headers::{build_copilot_dynamic_headers, has_copilot_vis
 use crate::api::openai_prompt_cache::clamp_openai_prompt_cache_key;
 use crate::api::simple_options::{build_base_options, MIN_ANSWER_TOKENS};
 use crate::api::sse::{ServerSentEvent, SseDecoder};
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
     AssistantContent, AssistantMessage, CacheControlFormat, CacheRetention, ChatTemplateKwargValue,
@@ -1937,6 +1937,12 @@ impl<'a> CompletionsProcessor<'a> {
         if sse.data.trim() == "[DONE]" {
             return Ok(SseOutcome::Done);
         }
+        // P2-4: tolerate keep-alive/dispatch events with no `data` payload
+        // (empty string can never decode to a valid chunk — skip instead of
+        // hard-failing the stream).
+        if sse.data.trim().is_empty() {
+            return Ok(SseOutcome::Chunk);
+        }
         let chunk: Value = serde_json::from_str(&sse.data).map_err(|error| {
             format!(
                 "Could not parse OpenAI SSE chunk: {error}; data={}",
@@ -2691,16 +2697,21 @@ async fn run(
     // message must still round-trip. Collected here so the `?`-style early
     // returns keep that guarantee.
     let mut result: Result<(), String> = Ok(());
-    'body: while let Some(chunk) = byte_stream.next().await {
-        if options
-            .stream
-            .signal
-            .as_ref()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            result = Err("Request was aborted".to_owned());
-            break;
-        }
+    'body: loop {
+        // P1-5: race the body read against the abort token — upstream hands
+        // the signal to fetch (cancellation interrupts the body read
+        // immediately); a check only after a chunk arrives would stall on an
+        // idle body until the idle timeout (5 min default, unbounded when
+        // disabled).
+        let chunk =
+            match next_chunk_or_cancelled(&mut byte_stream, options.stream.signal.as_ref()).await {
+                StreamNext::Item(chunk) => chunk,
+                StreamNext::Cancelled => {
+                    result = Err("Request was aborted".to_owned());
+                    break;
+                }
+            };
+        let Some(chunk) = chunk else { break };
         let bytes = match chunk.map_err(|error| error.to_string()) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -2708,7 +2719,7 @@ async fn run(
                 break;
             }
         };
-        for sse in decoder.feed(&bytes) {
+        for sse in decoder.feed(&bytes)? {
             match processor.handle_sse(&sse, events) {
                 Ok(SseOutcome::Done) => {
                     saw_done = true;
@@ -2723,7 +2734,7 @@ async fn run(
         }
     }
     if result.is_ok() && !saw_done {
-        for sse in decoder.finish() {
+        for sse in decoder.finish().unwrap() {
             match processor.handle_sse(&sse, events) {
                 Ok(SseOutcome::Done) => break,
                 Ok(SseOutcome::Chunk) => {}
@@ -5172,7 +5183,7 @@ mod build_and_stream_tests {
             let mut decoder = SseDecoder::new();
             let mut result: Result<(), String> = Ok(());
             let mut saw_done = false;
-            for sse in decoder.feed(bytes) {
+            for sse in decoder.feed(bytes).unwrap() {
                 match processor.handle_sse(&sse, &events) {
                     Ok(SseOutcome::Chunk) => {}
                     Ok(SseOutcome::Done) => {
@@ -5186,7 +5197,7 @@ mod build_and_stream_tests {
                 }
             }
             if result.is_ok() && !saw_done {
-                for sse in decoder.finish() {
+                for sse in decoder.finish().unwrap() {
                     match processor.handle_sse(&sse, &events) {
                         Ok(SseOutcome::Chunk) => {}
                         Ok(SseOutcome::Done) => break,

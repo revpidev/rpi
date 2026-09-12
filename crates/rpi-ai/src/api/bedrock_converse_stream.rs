@@ -59,7 +59,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use futures::StreamExt;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -73,6 +72,7 @@ use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
     clamp_reasoning,
 };
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageDiagnostic, AssistantRole, CacheRetention,
@@ -1920,16 +1920,21 @@ async fn run(
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
     let mut outcome: Result<(), String> = Ok(());
-    'stream: while let Some(chunk) = byte_stream.next().await {
-        if options
-            .stream
-            .signal
-            .as_ref()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            outcome = Err("Request was aborted".to_owned());
-            break 'stream;
-        }
+    'stream: loop {
+        // P1-5: race the body read against the abort token — upstream hands
+        // the signal to fetch (cancellation interrupts the body read
+        // immediately); a check only after a chunk arrives would stall on an
+        // idle body until the idle timeout (5 min default, unbounded when
+        // disabled).
+        let chunk =
+            match next_chunk_or_cancelled(&mut byte_stream, options.stream.signal.as_ref()).await {
+                StreamNext::Item(chunk) => chunk,
+                StreamNext::Cancelled => {
+                    outcome = Err("Request was aborted".to_owned());
+                    break 'stream;
+                }
+            };
+        let Some(chunk) = chunk else { break };
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {

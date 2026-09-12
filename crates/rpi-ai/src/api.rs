@@ -23,4 +23,5 @@ pub mod openrouter_images;
 pub mod pi_messages;
 pub mod simple_options;
 pub mod sse;
+pub mod stream_cancel;
 pub mod stream_timeouts;

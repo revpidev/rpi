@@ -10,6 +10,13 @@
 //! event. [`SseDecoder::finish`] processes the unterminated tail and flushes a
 //! trailing event, matching the upstream generator's end-of-stream behavior.
 
+/// P2-4: hard cap on a single SSE line (an unterminated line grows the
+/// decoder buffer without bound — a misbehaving gateway streaming bytes
+/// without a newline would balloon host memory until the idle timeout).
+/// 1 MiB is orders of magnitude above any legitimate provider event
+/// (typical SSE events are < 64 KiB).
+pub const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
 /// A dispatched server-sent event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSentEvent {
@@ -164,21 +171,26 @@ impl SseDecoder {
         }
     }
 
-    /// Feeds a chunk of the response body; returns the events completed by it.
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<ServerSentEvent> {
+    /// Feeds a chunk of the response body; returns the events completed by
+    /// it. Errors when the unterminated line tail exceeds
+    /// [`MAX_SSE_LINE_BYTES`] (P2-4 — a malformed stream must not balloon
+    /// host memory until the idle timeout).
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<ServerSentEvent>, String> {
         self.utf8_tail.extend_from_slice(bytes);
         let decoded = self.decode_bytes(false);
         self.buffer.push_str(&decoded);
+        self.check_line_bound()?;
         let mut events = Vec::new();
         self.drain_lines(&mut events);
-        events
+        Ok(events)
     }
 
     /// End-of-stream flush: decode the byte tail, process the unterminated
     /// line tail, and dispatch a trailing event if one is pending.
-    pub fn finish(mut self) -> Vec<ServerSentEvent> {
+    pub fn finish(mut self) -> Result<Vec<ServerSentEvent>, String> {
         let decoded = self.decode_bytes(true);
         self.buffer.push_str(&decoded);
+        self.check_line_bound()?;
         let mut events = Vec::new();
         self.drain_lines(&mut events);
         if !self.buffer.is_empty() {
@@ -190,7 +202,20 @@ impl SseDecoder {
         if let Some(event) = flush_sse_event(&mut self.state) {
             events.push(event);
         }
-        events
+        Ok(events)
+    }
+
+    /// P2-4: the unterminated tail must stay bounded — a stream of bytes
+    /// with no newline ever arriving would otherwise grow the line buffer
+    /// without limit.
+    fn check_line_bound(&self) -> Result<(), String> {
+        if self.buffer.len() > MAX_SSE_LINE_BYTES {
+            return Err(format!(
+                "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes without a newline — \
+                 malformed stream"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -202,9 +227,9 @@ mod tests {
         let mut decoder = SseDecoder::new();
         let mut events = Vec::new();
         for chunk in chunks {
-            events.extend(decoder.feed(chunk));
+            events.extend(decoder.feed(chunk).unwrap());
         }
-        events.extend(decoder.finish());
+        events.extend(decoder.finish().unwrap());
         events
     }
 
@@ -281,5 +306,38 @@ mod tests {
     fn test_invalid_utf8_replaced() {
         let events = feed_all(&[b"data: a\xffb\n\n"]);
         assert_eq!(events[0].data, "a\u{FFFD}b");
+    }
+}
+
+#[cfg(test)]
+mod line_bound_tests {
+    use super::*;
+
+    /// P2-4: a stream of bytes with no newline ever arriving must error at
+    /// the 1 MiB line cap instead of growing the buffer unboundedly.
+    #[test]
+    fn unterminated_line_over_cap_errors() {
+        let mut decoder = SseDecoder::new();
+        // Fill below the cap first — still fine.
+        let chunk = "x".repeat(64 * 1024);
+        assert!(decoder.feed(chunk.as_bytes()).is_ok());
+        // Cross the cap without any newline.
+        let big = "y".repeat(MAX_SSE_LINE_BYTES);
+        let result = decoder.feed(big.as_bytes());
+        assert!(
+            result.is_err(),
+            "over-cap unterminated line must error, not buffer"
+        );
+    }
+
+    /// Legitimate large events below the cap still decode normally.
+    #[test]
+    fn large_line_below_cap_decodes() {
+        let mut decoder = SseDecoder::new();
+        let payload = "a".repeat(512 * 1024);
+        let line = format!("data: {payload}\n\n");
+        let events = decoder.feed(line.as_bytes()).expect("below cap");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, payload);
     }
 }

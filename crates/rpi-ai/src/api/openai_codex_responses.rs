@@ -1449,7 +1449,7 @@ async fn run(
         };
         let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| CodexError::Transport(error.to_string()))?;
-        for sse in decoder.feed(&bytes) {
+        for sse in decoder.feed(&bytes).map_err(CodexError::Other)? {
             let data = sse.data.trim();
             if data.is_empty() || data == "[DONE]" {
                 continue;
@@ -1472,7 +1472,7 @@ async fn run(
         }
     }
     if !terminal_seen {
-        for sse in decoder.finish() {
+        for sse in decoder.finish().map_err(CodexError::Other)? {
             let data = sse.data.trim();
             if data.is_empty() || data == "[DONE]" {
                 continue;

@@ -44,7 +44,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use futures::StreamExt;
 use serde_json::{json, Value};
 use url::Url;
 
@@ -58,6 +57,7 @@ use crate::api::openai_responses_shared::{
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
     AssistantMessage, Context, DoneReason, ErrorReason, Model, ModelThinkingLevel, ProviderHeaders,
@@ -584,19 +584,28 @@ async fn run(
     // api::stream_timeouts).
     let mut byte_stream =
         crate::api::stream_timeouts::wrap(response.bytes_stream(), options.stream.timeout_ms);
-    while let Some(chunk) = byte_stream.next().await {
-        if options
-            .stream
-            .signal
-            .as_ref()
-            .is_some_and(|signal| signal.is_cancelled())
-        {
-            return Err("Request was aborted".to_owned());
-        }
+    loop {
+        // P1-5: race the body read against the abort token — upstream hands
+        // the signal to fetch (cancellation interrupts the body read
+        // immediately); a check only after a chunk arrives would stall on an
+        // idle body until the idle timeout (5 min default, unbounded when
+        // disabled).
+        let chunk =
+            match next_chunk_or_cancelled(&mut byte_stream, options.stream.signal.as_ref()).await {
+                StreamNext::Item(chunk) => chunk,
+                StreamNext::Cancelled => return Err("Request was aborted".to_owned()),
+            };
+        let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| error.to_string())?;
-        for sse in decoder.feed(&bytes) {
+        for sse in decoder.feed(&bytes)? {
             // No `[DONE]` sentinel on the Responses API: a terminal
             // `response.completed`/`response.failed` event ends the stream.
+            // P2-4: skip payload-less keep-alive events (an empty string can
+            // never decode to a valid event — upstream JSON.parse("").
+            // would throw and kill the whole stream).
+            if sse.data.trim().is_empty() {
+                continue;
+            }
             let event: Value = serde_json::from_str(&sse.data).map_err(|error| {
                 format!(
                     "Could not parse Azure OpenAI Responses SSE event: {error}; data={}",
@@ -606,7 +615,11 @@ async fn run(
             processor.handle_event(&event, events)?;
         }
     }
-    for sse in decoder.finish() {
+    for sse in decoder.finish()? {
+        // P2-4: skip payload-less trailing events (see feed loop).
+        if sse.data.trim().is_empty() {
+            continue;
+        }
         let event: Value = serde_json::from_str(&sse.data).map_err(|error| {
             format!(
                 "Could not parse Azure OpenAI Responses SSE event: {error}; data={}",

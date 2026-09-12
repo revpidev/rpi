@@ -242,6 +242,13 @@ pub struct EventStreamDecoder {
     buffer: Vec<u8>,
 }
 
+/// P2-4: hard cap on the wire-declared frame length. `total_len` is a
+/// u32 read straight off the stream — a corrupted or hostile value (up to
+/// 4 GiB) would previously balloon the buffer while the decoder waited for
+/// the "complete" frame. 16 MiB is orders of magnitude above any real
+/// Bedrock Converse Stream frame (typical frames are < 128 KiB).
+pub const MAX_EVENT_STREAM_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 impl EventStreamDecoder {
     pub fn new() -> Self {
         Self { buffer: Vec::new() }
@@ -257,6 +264,16 @@ impl EventStreamDecoder {
             return None;
         }
         let message_length = read_u32(&self.buffer, 0) as usize;
+        // P2-4: reject a wire-declared length above the frame cap before
+        // buffering towards it (the value is attacker/corruption
+        // controlled — see [`MAX_EVENT_STREAM_FRAME_BYTES`]).
+        if message_length > MAX_EVENT_STREAM_FRAME_BYTES {
+            self.buffer.clear();
+            return Some(Err(format!(
+                "Event stream frame length {message_length} exceeds the \
+                 {MAX_EVENT_STREAM_FRAME_BYTES}-byte cap — malformed stream"
+            )));
+        }
         if self.buffer.len() < message_length {
             return None;
         }
@@ -430,5 +447,27 @@ mod tests {
         frame[last] ^= 0xFF;
         let error = split_message(&frame).expect_err("crc error");
         assert!(error.contains("message checksum"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod frame_cap_tests {
+    use super::*;
+
+    /// P2-4: a wire-declared frame length above the cap errors immediately
+    /// instead of buffering up to the declared length.
+    #[test]
+    fn oversized_declared_length_errors_without_buffering() {
+        let mut decoder = EventStreamDecoder::new();
+        // total_len = u32::MAX (prelude first u32, big-endian), plus noise.
+        let mut bytes = vec![0xFF, 0xFF, 0xFF, 0xFF];
+        bytes.extend_from_slice(&[0u8; 8]);
+        decoder.feed(&bytes);
+        match decoder.next_message() {
+            Some(Err(message)) => assert!(message.contains("exceeds"), "{message}"),
+            other => panic!("expected capped error, got {other:?}"),
+        }
+        // The buffer was drained — no further growth.
+        assert!(decoder.buffer.is_empty());
     }
 }

@@ -1391,7 +1391,7 @@ async fn run(
                 }
             }
         })?;
-        for sse in decoder.feed(&bytes) {
+        for sse in decoder.feed(&bytes)? {
             if processor.handle_sse(&sse, events)? == SseOutcome::Done {
                 // `[DONE]` terminates the stream (`parseMistralEvent`).
                 processor.finish(events);
@@ -1399,7 +1399,7 @@ async fn run(
             }
         }
     }
-    for sse in decoder.finish() {
+    for sse in decoder.finish().unwrap() {
         processor.handle_sse(&sse, events)?;
     }
     processor.finish(events);
@@ -1637,12 +1637,12 @@ mod tests {
         let mut output = initial_output(model);
         let mut processor = StreamProcessor::new(&mut output, model);
         let mut decoder = SseDecoder::new();
-        for sse in decoder.feed(sse_payload.as_bytes()) {
+        for sse in decoder.feed(sse_payload.as_bytes()).unwrap() {
             if processor.handle_sse(&sse, &events).expect("sse") == SseOutcome::Done {
                 break;
             }
         }
-        for sse in decoder.finish() {
+        for sse in decoder.finish().unwrap() {
             processor.handle_sse(&sse, &events).expect("sse");
         }
         processor.finish(&events);
@@ -2317,10 +2317,10 @@ mod tests {
         let mut output = initial_output(model);
         let mut processor = StreamProcessor::new(&mut output, model);
         let mut decoder = SseDecoder::new();
-        for sse in decoder.feed(sse_payload.as_bytes()) {
+        for sse in decoder.feed(sse_payload.as_bytes()).unwrap() {
             processor.handle_sse(&sse, &events)?;
         }
-        for sse in decoder.finish() {
+        for sse in decoder.finish().unwrap() {
             processor.handle_sse(&sse, &events)?;
         }
         Ok(())
