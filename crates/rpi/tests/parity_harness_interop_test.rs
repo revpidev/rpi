@@ -631,27 +631,6 @@ async fn harness_retained_tail_session_loads_in_session_manager() {
     // Main path opens: entries/leaf agree, both walk forms agree, context agrees.
     let sm = SessionManager::open(&file_path, None, None).expect("main path open");
     let sm_entries = sm.get_entries();
-    // TEMP CI PROBE (remove after diagnosis)
-    if sm_entries.len() != harness_entries.len() {
-        let dump = |label: &str, n: usize, types: Vec<String>| {
-            eprintln!("PROBE {label}: len={n} types={types:?}");
-        };
-        let h_types: Vec<String> = harness_entries
-            .iter()
-            .map(|e| format!("{:?}", e.type_tag()))
-            .collect();
-        dump("harness", harness_entries.len(), h_types);
-        let s_types: Vec<String> = sm_entries
-            .iter()
-            .map(|e| format!("{:?}", e.type_tag()))
-            .collect();
-        dump("sm", sm_entries.len(), s_types);
-        let raw = std::fs::read_to_string(&file_path).unwrap_or_default();
-        eprintln!(
-            "PROBE file lines={}",
-            raw.lines().filter(|l| !l.trim().is_empty()).count()
-        );
-    }
     assert_eq!(sm_entries.len(), harness_entries.len());
     for (expected, actual) in harness_entries.iter().zip(&sm_entries) {
         assert_eq!(expected, actual.known().expect("typed entry"));
