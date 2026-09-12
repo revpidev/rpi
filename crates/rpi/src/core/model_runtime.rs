@@ -3245,7 +3245,27 @@ mod tests {
                 ))),
                 oauth: None,
             },
-            models: vec![],
+            // One concrete model so the provider contributes a catalog
+            // entry on its OWN — the old `vec![]` made the trailing
+            // non-empty assert depend on ambient API keys in the dev
+            // shell (built-in providers with auth), which do not exist on
+            // a CI runner (observed on the rc.11 ci.yml maiden run).
+            models: vec![Model {
+                id: "concurrent-avail-model".to_owned(),
+                name: "Concurrent Avail Model".to_owned(),
+                api: ApiKind::from("openai-completions"),
+                provider: "concurrent-avail".to_owned(),
+                base_url: "https://example.test/v1".to_owned(),
+                reasoning: false,
+                thinking_level_map: None,
+                input: vec![rpi_ai::types::InputModality::Text],
+                cost: rpi_ai::types::ModelCost::default(),
+                context_window: 1000,
+                max_tokens: 100,
+                headers: None,
+                compat: None,
+                sampling_params: None,
+            }],
             api: ProviderApi::Single(Arc::new(rpi_ai::api::openai_completions::OpenAiCompletions)),
             ..Default::default()
         });
@@ -3279,9 +3299,9 @@ mod tests {
             );
         }
 
-        // The snapshot must not be empty — the provider has auth configured.
-        // (The built-in providers may or may not have auth depending on env,
-        // but the custom provider definitely does.)
+        // The snapshot must not be empty — the custom provider carries its
+        // own model and its auth comes from the pinned env key (no ambient
+        // API keys required; see the `models` note above).
         let snapshot = runtime.get_available_snapshot();
         assert!(
             !snapshot.is_empty(),

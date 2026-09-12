@@ -725,6 +725,13 @@ fn create_error_message(model: &Model, failure: StreamFailure, aborted: bool) ->
 /// The streaming body: everything that runs inside upstream's async IIFE.
 /// Terminal `done`/`error` events are pushed before returning; `Err` carries
 /// the upstream `Error.message`.
+///
+/// `result_large_err` allow: `StreamFailure` (message + the structured
+/// response error) is crate-private and threaded through every helper in
+/// this adapter; boxing it would ripple through the whole error plumbing
+/// for zero behavioral gain. Pinned here when clippy 1.98 raised the
+/// threshold check on CI (local gate runs 1.97).
+#[allow(clippy::result_large_err)]
 async fn run(
     model: &Model,
     context: &Context,
