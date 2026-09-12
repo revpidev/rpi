@@ -511,12 +511,56 @@ fn kill_hook_process(pid: u32) {
 
 /// `normalizeSyntheticPath` (worktree.ts:297-315): relative only, no escapes,
 /// not repo root; synthetic paths are unlinked before diffs/cleanup.
+///
+/// P1-3: the validation is load-bearing, not documentation — a
+/// `worktreeSetupHook` returning an absolute path or a `..` escape must be
+/// rejected (skipped with a warning) instead of unlinking outside the
+/// worktree: `Path::join` replaces the base entirely for absolute inputs
+/// and `..` components escape it. Mirrors the upstream checks verbatim
+/// (empty / absolute / worktree root / `..` escape → error).
+fn normalize_synthetic_path(worktree_path: &Path, raw_path: &str) -> Option<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        tracing::warn!("synthetic path cannot be empty: {raw_path:?} — skipped");
+        return None;
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        tracing::warn!("synthetic path must be relative: {raw_path:?} — skipped");
+        return None;
+    }
+    // Reject escapes before touching the filesystem (upstream uses
+    // path.resolve + path.relative; the component walk is the Rust
+    // equivalent without requiring the path to exist).
+    let mut resolved = worktree_path.to_path_buf();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => resolved.push(part),
+            std::path::Component::ParentDir => {
+                tracing::warn!("synthetic path escapes the worktree root: {raw_path:?} — skipped");
+                return None;
+            }
+            // Prefix/root cannot appear for a relative input, but stay
+            // fail-closed if one ever slips through.
+            _ => {
+                tracing::warn!("synthetic path must be relative: {raw_path:?} — skipped");
+                return None;
+            }
+        }
+    }
+    if resolved == worktree_path {
+        tracing::warn!("synthetic path cannot target the worktree root: {raw_path:?} — skipped");
+        return None;
+    }
+    Some(resolved)
+}
+
 fn remove_synthetic_paths(worktree: &WorktreeInfo) {
     for raw in &worktree.synthetic_paths {
-        let path = worktree.path.join(raw);
-        if path == worktree.path {
+        let Some(path) = normalize_synthetic_path(&worktree.path, raw) else {
             continue;
-        }
+        };
         if path.is_dir() && !path.is_symlink() {
             let _ = std::fs::remove_dir_all(&path);
         } else {
@@ -1556,5 +1600,99 @@ mod tests {
             json!(true)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod synthetic_path_tests {
+    use super::*;
+
+    fn worktree() -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "rpi-sub-syn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        (base.clone(), base)
+    }
+
+    #[test]
+    fn normalize_accepts_relative_paths_only() {
+        let (base, _) = worktree();
+        assert_eq!(
+            normalize_synthetic_path(&base, "node_modules"),
+            Some(base.join("node_modules"))
+        );
+        assert_eq!(
+            normalize_synthetic_path(&base, "./build/out"),
+            Some(base.join("build/out"))
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_absolute_root_and_escapes() {
+        let (base, _) = worktree();
+        // Absolute paths replace the join base entirely (Path::join) — must
+        // be rejected (upstream: "synthetic path must be relative").
+        assert_eq!(normalize_synthetic_path(&base, "/etc"), None);
+        #[cfg(windows)]
+        assert_eq!(normalize_synthetic_path(&base, "C:\\Windows"), None);
+        // Empty / whitespace-only.
+        assert_eq!(normalize_synthetic_path(&base, ""), None);
+        assert_eq!(normalize_synthetic_path(&base, "   "), None);
+        // Worktree root itself.
+        assert_eq!(normalize_synthetic_path(&base, "."), None);
+        // Escapes via `..`.
+        assert_eq!(normalize_synthetic_path(&base, ".."), None);
+        assert_eq!(normalize_synthetic_path(&base, "../sibling"), None);
+        assert_eq!(normalize_synthetic_path(&base, "a/../../escape"), None);
+    }
+
+    /// P1-3 regression: a hostile/buggy `worktreeSetupHook` stdout must not
+    /// be able to delete directories outside the worktree.
+    #[test]
+    fn remove_synthetic_paths_never_escapes_the_worktree() {
+        let (base, _) = worktree();
+        // Sentinel OUTSIDE the worktree that a raw `join`-then-delete would
+        // reach via the absolute path / `..` escape forms below.
+        let outside = std::env::temp_dir().join(format!(
+            "rpi-sub-syn-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.txt"), "sentinel").unwrap();
+        // Legitimate synthetic dir inside the worktree IS removed.
+        std::fs::create_dir_all(base.join("build")).unwrap();
+        std::fs::write(base.join("build/out.txt"), "x").unwrap();
+
+        let info = WorktreeInfo {
+            path: base.clone(),
+            agent_cwd: base.clone(),
+            branch: "b".to_string(),
+            index: 0,
+            node_modules_linked: false,
+            synthetic_paths: vec![
+                outside.to_string_lossy().into_owned(), // absolute → skip
+                "../outside-escape".to_string(),        // escape → skip
+                "build".to_string(),                    // legit → removed
+            ],
+        };
+        remove_synthetic_paths(&info);
+
+        assert!(
+            outside.join("keep.txt").exists(),
+            "sentinel outside the worktree must survive"
+        );
+        assert!(!base.join("build").exists(), "legit synthetic dir removed");
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
