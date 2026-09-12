@@ -5,8 +5,9 @@ Release checklist. The order is pinned by ADR-0011 ("端点与 Release 同步约
 ## Checklist
 
 1. **Bump the workspace version** — `version` under `[workspace.package]` in `Cargo.toml` — and merge to `main`.
-2. **Tag the release**: `git tag v<version>` and push the tag. The tag triggers `.github/workflows/build.yml`, which builds all six targets and publishes the assets to the GitHub Release. The release notes are attached automatically from `changes/v<version>.md` (the changelog single source of truth), normalized by `scripts/unwrap-release-notes.py` — since the 2026-09-05 formatting convention the source files use single-line paragraphs, and the script stays as an idempotent reflow safeguard for any legacy or pasted hard-wrapped text (GitHub renders release bodies with hard line breaks) — make sure that file is final before tagging; a tag re-push refreshes both the assets and the notes.
-3. **Wait for all six target assets + their `.sha256` sidecars** (12 files) to appear on the Release page, and verify before proceeding:
+2. **Sync the changelog surfaces (stable releases)**: `changes/v<version>.md` is the single source of truth, but two downstream surfaces are compiled/published from it and must be synced in the same commit — (a) `CHANGELOG.md` at the repo root (embedded into the binary via `include_str!` in `core/changelog.rs`, driving `/changelog` and the new-version notice), and (b) the `revpi.dev` changelog page (`rpi-pages/changelog.html`, whose section for the version must match `changes/`). RC entries fold into `changes/v<stable>.md` at stable time — fold them into both downstream surfaces then.
+3. **Tag the release**: `git tag v<version>` and push the tag. The tag triggers `.github/workflows/build.yml`, which builds all six targets and publishes the assets to the GitHub Release. The release notes are attached automatically from `changes/v<version>.md` (the changelog single source of truth), normalized by `scripts/unwrap-release-notes.py` — since the 2026-09-05 formatting convention the source files use single-line paragraphs, and the script stays as an idempotent reflow safeguard for any legacy or pasted hard-wrapped text (GitHub renders release bodies with hard line breaks) — make sure that file is final before tagging; a tag re-push refreshes both the assets and the notes.
+4. **Wait for all six target assets + their `.sha256` sidecars** (12 files) to appear on the Release page, and verify before proceeding:
 
    | Target | Asset |
    |---|---|
@@ -17,7 +18,7 @@ Release checklist. The order is pinned by ADR-0011 ("端点与 Release 同步约
    | `aarch64-unknown-linux-musl` | `rpi-<version>-aarch64-unknown-linux-musl.tar.gz` |
    | `aarch64-unknown-linux-gnu` | `rpi-<version>-aarch64-unknown-linux-gnu.tar.gz` |
 
-4. **Update the version endpoint** — only after step 3 is complete. In the `rpi-pages` repository, then commit and push (Git integration deploys):
+5. **Update the version endpoint** — only after step 4 is complete. In the `rpi-pages` repository, then commit and push (Git integration deploys):
 
    ```bash
    python3 scripts/generate-site.py --version <version>

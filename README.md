@@ -16,7 +16,7 @@ Rpi is a terminal AI coding agent written in Rust, derived from the [Pi coding a
 - ⚡ **Single Rust binary** — statically linked, no runtime required; copy it to any machine and it starts in milliseconds.
 - 🖥️ **A complete terminal experience** — multi-turn conversation, streaming output, syntax highlighting, slash commands, Unicode-aware rendering.
 - 🛠️ **Gets real work done** — built-in tools (read files, edit code, run commands), long-conversation context compaction that never interrupts the flow, HTML session export, and one-click share links.
-- ☁️ **38 model providers built in** — OpenAI, Anthropic, Claude Code, Google, Mistral, DeepSeek, Groq, OpenRouter, Bedrock, Vertex, Codex, Qwen, Kimi, and more, with a remote model catalog served from `revpi.dev`.
+- ☁️ **40 model providers built in** — OpenAI, Anthropic, Claude Code, Google, Mistral, DeepSeek, Groq, OpenRouter, Bedrock, Vertex, Codex, Qwen, Kimi, and more, with a remote model catalog served from `revpi.dev`.
 - 🔌 **Extensible** — plugins as Wasm (L1) or native dynamic libraries (L0); skills, prompt templates, and themes.
 - 🔒 **Privacy under your control** — everything runs locally; every network endpoint can be disabled (see [Configuration](#configuration)).
 

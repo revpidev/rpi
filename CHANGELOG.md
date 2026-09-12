@@ -11,13 +11,28 @@
   - **TUI**：鼠标分发基础设施全套 + 选择修复族（双击选词/右键粘贴去重/hover 不改选择）；全屏 transcript 搜索与跳转指示（#8800）；滚动条重设计 + 验证式复制（OSC 52 + 回读 + toast）；LaTeX/表格渲染修复族；working indicator 内嵌 editor 边框；thinking 切换就地更新；终端能力覆盖三 env（`RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + `terminal.*` 设置）与 SSH 下 Alt+Enter 双超时（#7899）；rpi-tui 与配置 env 离婚（`c505f4c19`，`RPI_TUI_DEBUG_REDRAW`/`rpi-tui-*.log` 改名，二进制行为不变）。
 - **M5 收口**：主题校验拆分移植（eb3e9feed——库路径 lenient cast + 应用层安装式校验器）；fixtures 全量重录钉死 9841914；偏离 D-092…D-100 全闭环（3 登记 + 5 核销 + 2 未触发转正）。
 
-### 插件重定基（pin 已随 TE27 切换生效：subagents v0.66.0 / mcp-adapter v2.32.1，ADR-0025；最终汇总由 M7 收口）
+### 插件重定基（pin 已随 TE27 切换生效：subagents v0.66.0 / mcp-adapter v2.32.1，ADR-0025）
 
 - **BREAKING：mcp direct 工具命名**（TE23，R7.2.4 / #342/#346/#463/#455）：server 前缀保留 provider-valid `-`/`_`，含 `-`/`_` 的 server 名 direct/proxy 工具名改变（`my-server` 不再生成 `my_2d_server_<tool>`）；工具名候选集改「原始名优先 + legacy 兜底」，server 级调用优先解析原始上游工具名并对歧义 fail-closed。兼容指引：`settings.toolPrefix: "none"` 或 per-server `toolPrefix: "none"` 改用裸工具名，或按新前缀名更新引用；**不做新旧双注册**。分域细节见 `changes/v0.1.4.md`。
 
+### 交互式自定义 UI ABI（V14-20–V14-25，ADR-0024/ADR-0027）
+
+- **扩展可挂载交互组件的宿主 ABI（native + wasm 双载体）**（[RPI-OWN]——上游 `ctx.ui.custom()`/`Component` 为同进程对象契约，rpi 以行帧 + 轮询 JSON ABI 等价重建）：7 个 additive `ui.*` host-call、组件注册表与 overlay/editor 区域挂载、行帧合成与输入分发、隐藏态与对话框 blur/focus、帧限额与 wasm fuel 预算（trap 结构化 `fuelExhausted`/`handlerError` + 强制卸载，宿主不崩溃）、七结束路径清理矩阵、`ui.editExternal` 外部编辑器链；双载体一致性 harness 零差异。
+- **`ctx.sessionEntries` additive host-call**（ADR-0027）：活动分支 custom entries 只读（fail-closed）；mcp 审批恢复已迁移消费（TE33，ABI 优先 + JSONL 旧宿主降级）。
+
+### 新插件：rpiv-ask-user-question（TE28–TE32）
+
+- **结构化 ask_user_question 工具**（第一方插件，上游 rpiv-mono @ v2.9.0+）：模型在需求不清时发起 1–4 题问卷（选项/预览/多选/备注），交互终端经交互式 UI ABI 渲染底部 tabbed overlay；RPC/ACP 宿主降级为宿主原生逐题 walker；非交互运行从工具列表摘除。契约面与上游逐字节对拍（231 条断言全 MATCH）；对话框高度稳定两轮修复（rc.8/rc.10，垫行基准恒非 input-mode + 垫行移至页脚块之前，总高恒定、hint 贴底）；随宿主 Release 锁步发布 `.rpix` 并入 registry 索引。
+
+### 发布前审查修复（rc.11）
+
+- **P0**：交互模式 panic hook 接线（主屏/alt-screen 双变体，任一 panic 后终端必恢复）；首次设置流程错误路径 raw mode 泄漏修复。
+- **P1**：`read` 负 `limit` 回归 JS 语义不 panic；Windows bash 工具 kill/超时收敛；subagents `syntheticPaths` 越界校验（不再可能删除 worktree 外目录）；并行工具批 panic 补发 `tool_execution_end`；mcp adapter Ready/on_ready 竞态窗口消除（门禁抖动根因）；8 个 SSE adapter 取消立即中断体读。
+- **P2 加固**：wasm guest 内存 128 MiB 上限；SSE/Bedrock 帧上限 fail-fast；空 `data` 事件容错；`auth.json` 原子写；会话 `parent_id` 环防护；smart-fetch 响应体 32 MiB 上限（登记偏离）；compaction `session_id` 上游语义；`--rc` 无预发布降级已是最新；扩展名单组件校验；`parity_runner` 唯一命名等（全项见 `changes/v0.1.4.md`）。
+
 ### 内部
 
-- workspace 版本 bump 0.1.4 + Cargo.lock 同步；全量门禁 5685 用例零失败。
+- workspace 版本 bump 0.1.4 + Cargo.lock 同步；全量门禁零失败（用例数以 `changes/v0.1.4.md` 终态为准）。
 - parity-checklist §3.8 v0.1.4 增量映射补录；rpi-pages changelog/latest-version 同步。
 
 ## [0.1.3] - 2026-09-03

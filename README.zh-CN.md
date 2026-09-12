@@ -16,7 +16,7 @@ Rpi 是一个用 Rust 编写的终端 AI 编程助手，源自 [Pi coding agent]
 - ⚡ **Rust 单二进制** —— 静态链接、无运行时依赖；拷到机器上就能跑，启动毫秒级。
 - 🖥️ **完整的终端体验** —— 多轮对话、流式输出、代码语法高亮、斜杠命令、Unicode 感知渲染。
 - 🛠️ **真正能干活** —— 内置读文件、改代码、执行命令等工具；长对话自动压缩上下文不中断；会话可导出 HTML，或一键生成链接分享。
-- ☁️ **38 家模型服务商内置** —— OpenAI、Anthropic、Claude Code、Google、Mistral、DeepSeek、Groq、OpenRouter、Bedrock、Vertex、Codex、Qwen、Kimi 等，模型目录由 `revpi.dev` 在线提供。
+- ☁️ **40 家模型服务商内置** —— OpenAI、Anthropic、Claude Code、Google、Mistral、DeepSeek、Groq、OpenRouter、Bedrock、Vertex、Codex、Qwen、Kimi 等，模型目录由 `revpi.dev` 在线提供。
 - 🔌 **插件可扩展** —— Wasm（L1）/ 原生动态库（L0）两种插件形态；支持 skills、提示模板、主题。
 - 🔒 **隐私由你掌控** —— 一切本地运行；每个网络端点都可关闭（见[配置](#配置)）。
 
