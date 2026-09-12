@@ -3206,10 +3206,26 @@ mod tests {
     /// Concurrent `get_available` calls must not corrupt the snapshot — the
     /// seq-gating ensures only the latest pass publishes
     /// (queueAvailabilityRefresh, model-runtime.ts:316-329).
+    ///
+    /// Env pinning (M7 convention, see `test_env::ENV_LOCK`): the
+    /// availability compute reads `RPI_OFFLINE` (`modelNetworkEnabled`) and
+    /// the provider's env key — both are process-global. Without the shared
+    /// lock a parallel test pinning `RPI_OFFLINE` (the 13 package_command
+    /// sites) can flip the compute mid-flight and publish an empty snapshot
+    /// (first observed on the 2-core CI runner, rc.11 ci.yml maiden run).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn concurrent_get_available_calls_produce_consistent_snapshot() {
+        use crate::core::environment::test_env::EnvGuard;
         const ENV_KEY: &str = "RPI_TEST_CONCURRENT_AVAIL_KEY";
-        std::env::set_var(ENV_KEY, "test-key");
+        // Holding the std env lock across `.await` is intentional (same
+        // contract as the package_command sites): every #[tokio::test] owns
+        // its thread; the lock is never nested — blocking only serializes
+        // env-sensitive tests.
+        let (_env_lock, _env_guard) = EnvGuard::set(&[
+            (ENV_KEY, Some("test-key")),
+            (crate::core::environment::ENV_OFFLINE, None),
+        ]);
         let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
             credentials: None,
             auth_path: None,
@@ -3271,7 +3287,7 @@ mod tests {
             !snapshot.is_empty(),
             "snapshot must contain available models after concurrent refresh"
         );
-        std::env::remove_var(ENV_KEY);
+        // EnvGuard drop restores ENV_KEY / RPI_OFFLINE.
     }
 
     /// `get_error` lists per-provider catalog failures from the availability
