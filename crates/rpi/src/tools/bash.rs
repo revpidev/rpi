@@ -26,6 +26,11 @@ pub const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
 pub const MAX_TIMEOUT_SECONDS: f64 = MAX_TIMEOUT_MS as f64 / 1000.0;
 const BASH_UPDATE_THROTTLE_MS: u64 = 100;
 const EXIT_STDIO_GRACE_MS: u64 = 100;
+/// P1-2: bounded wait for a killed child to actually exit. The kill is
+/// fire-and-forget on every platform (upstream shell.ts:216-240); if the
+/// OS-level kill fails or lags (Windows `taskkill` is asynchronous), the
+/// loop must still return instead of hanging on `child.wait()` forever.
+const KILL_GRACE_MS: u64 = 5_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BashExecError {
@@ -197,7 +202,41 @@ fn kill_process_tree(pid: u32) {
         let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
     }
 }
-#[cfg(not(unix))]
+
+/// Windows port of `killProcessTree` (shell.ts:216-240): `taskkill /F /T
+/// /PID` from the trusted System32 absolute path so cleanup does not depend
+/// on PATH, spawned with output ignored. `taskkill` is asynchronous — the
+/// kill takes effect shortly after the spawn returns — so the caller's
+/// `child.wait()` arm also gets a bounded grace (`KILL_GRACE_MS`) instead
+/// of waiting for the killed child forever.
+///
+/// The invocation is split into a pure builder (compiled + unit tested on
+/// every platform) and the Windows-only spawn below.
+#[cfg(any(windows, test))]
+fn windows_taskkill_invocation(pid: u32) -> (std::path::PathBuf, [String; 4]) {
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let taskkill = std::path::Path::new(&system_root)
+        .join("System32")
+        .join("taskkill.exe");
+    (
+        taskkill,
+        ["/F".into(), "/T".into(), "/PID".into(), pid.to_string()],
+    )
+}
+
+#[cfg(windows)]
+fn kill_process_tree(pid: u32) {
+    use std::process::{Command, Stdio};
+    let (taskkill, args) = windows_taskkill_invocation(pid);
+    let _ = Command::new(taskkill)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn kill_process_tree(_pid: u32) {}
 
 fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<u64>, BashExecError> {
@@ -337,12 +376,25 @@ impl BashOperations for LocalBashOperations {
         let mut stdout_ended = false;
         let mut stderr_ended = false;
         let mut pending_data: Option<Vec<u8>> = None;
+        // Set when the kill was issued; bounds the remaining `child.wait()`
+        // with `KILL_GRACE_MS` (P1-2 — Windows taskkill is asynchronous and
+        // the wait previously never returned on that platform).
+        let mut killed_at: Option<tokio::time::Instant> = None;
         tokio::pin! { let timeout_fut = match timeout_ms { Some(ms) => futures::future::Either::Left(tokio::time::sleep(Duration::from_millis(ms))), None => futures::future::Either::Right(std::future::pending()), }; }
         loop {
+            let kill_deadline = killed_at.map(|at| at + Duration::from_millis(KILL_GRACE_MS));
+            let kill_grace_fut = async {
+                match kill_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::pin!(kill_grace_fut);
             tokio::select! {
                 biased;
-                _ = options.signal.cancelled(), if !aborted && !timed_out => { aborted = true; if let Some(p) = pid { kill_process_tree(p); } }
-                _ = &mut timeout_fut, if !timed_out && !aborted => { timed_out = true; if let Some(p) = pid { kill_process_tree(p); } }
+                _ = options.signal.cancelled(), if !aborted && !timed_out => { aborted = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
+                _ = &mut timeout_fut, if !timed_out && !aborted => { timed_out = true; if let Some(p) = pid { kill_process_tree(p); } killed_at = Some(tokio::time::Instant::now()); }
+                _ = &mut kill_grace_fut, if killed_at.is_some() && !exited => { tracing::warn!(grace_ms = KILL_GRACE_MS, "killed child did not exit within grace; abandoning wait"); break; }
                 result = child.wait(), if !exited => { exited = true; exit_code = result.ok().and_then(|s| s.code()); }
                 msg = rx.recv() => { match msg { Some(IoMsg::Data(b)) => { pending_data = Some(b); } Some(IoMsg::StdoutEof) => { stdout_ended = true; } Some(IoMsg::StderrEof) => { stderr_ended = true; } None => { stdout_ended = true; stderr_ended = true; } } }
             }
@@ -679,4 +731,40 @@ pub fn create_bash_tool(ctx: &ToolContext, options: BashToolOptions) -> Arc<dyn 
         parameters_value: params,
         description_str: desc.to_string(),
     })
+}
+
+#[cfg(test)]
+mod kill_tests {
+    use super::*;
+
+    /// P1-2: the Windows kill must use the trusted System32 absolute path
+    /// (never PATH) with force/tree/pid flags, mirroring upstream
+    /// `killProcessTree` (shell.ts:216-240). The builder is pure and unit
+    /// tested on every platform; only the spawn is `cfg(windows)`.
+    #[test]
+    fn windows_taskkill_invocation_uses_system32_and_force_tree_flags() {
+        let (taskkill, args) = windows_taskkill_invocation(4242);
+        // Component-wise: on Windows `Path::join` emits `\` separators; the
+        // Linux unit test sees `/` — the trusted absolute System32 prefix and
+        // the exe name are what matter.
+        let components: Vec<_> = taskkill
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            components.contains(&"System32".to_string()),
+            "System32 dir: {taskkill:?}"
+        );
+        assert!(taskkill.ends_with("taskkill.exe"), "exe name: {taskkill:?}");
+        assert_eq!(
+            args,
+            [
+                "/F".to_string(),
+                "/T".to_string(),
+                "/PID".to_string(),
+                "4242".to_string()
+            ],
+            "force + tree + pid"
+        );
+    }
 }

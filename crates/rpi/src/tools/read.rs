@@ -316,10 +316,22 @@ impl AgentTool for ReadTool {
         let selected_content: String;
 
         if let Some(lim) = limit {
+            // JS `Math.min(startLine + limit, allLines.length)` then
+            // `allLines.slice(startLine, endLine)` (read.ts:280-286): a JS
+            // slice with end < start returns `[]` instead of failing, so a
+            // model-controlled negative / NaN-ish `limit` yields an empty
+            // selection. The direct `all_lines[start_line..end_line]`
+            // porting panicked on `end < start` — clamp to the JS semantics
+            // (same shape as the harness reader, harness/tools/read.rs) and
+            // never panic on out-of-range model input.
             let end_line_raw = (start_line_raw + lim).min(total_file_lines as f64);
-            let end_line = end_line_raw as usize;
-            selected_content = all_lines[start_line..end_line].join("\n");
-            user_limited_lines = Some(end_line - start_line);
+            let end_line = end_line_raw.max(start_line_raw) as usize;
+            selected_content = if end_line > start_line {
+                all_lines[start_line..end_line].join("\n")
+            } else {
+                String::new()
+            };
+            user_limited_lines = Some(end_line.saturating_sub(start_line));
         } else {
             selected_content = all_lines[start_line..].join("\n");
             user_limited_lines = None;
@@ -577,6 +589,58 @@ mod tests {
         assert!(text.contains("line 10"));
         assert!(!text.contains("line 11"));
         assert!(text.contains("[90 more lines in file. Use offset=11 to continue.]"));
+    }
+
+    // ---- P1-1 regression: model-controlled out-of-range limit must not
+    // panic. JS `slice(start, end)` with end < start yields `[]`; the port
+    // must clamp the same way (negative / NaN / ±inf / i64 extremes).
+    #[tokio::test]
+    async fn test_negative_limit_returns_empty_selection() {
+        let dir = TestDir::new();
+        dir.write("neg.txt", "line 1\nline 2\nline 3");
+        let tool = create_read_tool(&ctx(dir.path()), ReadToolOptions::default());
+        let result = read_file_params(&*tool, json!({ "path": "neg.txt", "limit": -5 })).await;
+        let text = text_of(&result);
+        assert!(
+            !text.contains("line 1") && !text.contains("line 2"),
+            "negative limit must select no file content: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extreme_limits_do_not_panic() {
+        let dir = TestDir::new();
+        dir.write("extreme.txt", "line 1\nline 2\nline 3");
+        let tool = create_read_tool(&ctx(dir.path()), ReadToolOptions::default());
+        // Finite negatives clamp to an empty selection (JS slice semantics);
+        // non-finite values cannot be represented in JSON and arrive as
+        // `null` → treated as "no limit" (whole file) — both must return a
+        // result, never panic.
+        for limit in [
+            -0.0_f64,
+            -1.0_f64,
+            -9_007_199_254_740_993.0_f64, // beyond i64 range
+            9_007_199_254_740_993.0_f64,
+            1.0e308_f64,
+        ] {
+            let result =
+                read_file_params(&*tool, json!({ "path": "extreme.txt", "limit": limit })).await;
+            let text = text_of(&result);
+            if limit.is_sign_negative() {
+                assert!(
+                    !text.contains("line 1"),
+                    "limit {limit} selects nothing: {text:?}"
+                );
+            } else {
+                assert!(text.contains("line 1"), "limit {limit} still reads");
+            }
+        }
+        for limit in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // json! serializes non-finite f64 as null → no limit → whole file.
+            let result =
+                read_file_params(&*tool, json!({ "path": "extreme.txt", "limit": limit })).await;
+            assert!(text_of(&result).contains("line 1"), "limit {limit} = null");
+        }
     }
 
     // ---- should handle offset + limit together ----
