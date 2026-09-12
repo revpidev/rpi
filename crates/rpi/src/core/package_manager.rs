@@ -2632,6 +2632,28 @@ impl DefaultPackageManager {
                         });
                         return Ok(());
                     }
+                    // P2-7: `--rc` on an index with no prerelease versions
+                    // (the natural rc-graduation window: the extension's rc
+                    // line is superseded by stable entries only) degrades to
+                    // an "already up to date" note instead of a hard error,
+                    // matching the documented `rpi update --extensions --rc`
+                    // semantics — a stable-only index simply has nothing for
+                    // the rc channel to do.
+                    Err(error)
+                        if channel == UpdateChannel::PreRelease
+                            && Self::is_registry_no_installable_version(&error) =>
+                    {
+                        self.emit_progress(&ProgressEvent {
+                            kind: ProgressKind::Start,
+                            action: ProgressAction::Update,
+                            source: source.to_string(),
+                            message: Some(format!(
+                                "{source} is already up to date (no pre-release versions \
+                                 published)"
+                            )),
+                        });
+                        return Ok(());
+                    }
                     Err(error) => return Err(error),
                 };
                 let installed = self
@@ -2698,6 +2720,14 @@ impl DefaultPackageManager {
     /// guards the coupling.
     fn is_registry_not_found(error: &str) -> bool {
         error.starts_with("No extension named")
+    }
+
+    /// P2-7: the channel-filtered resolution found no candidate (rc channel
+    /// on a stable-only index, or an empty index). Binds to the
+    /// "No installable version" / "No version ... matches" messages that
+    /// `extension_registry::resolve_registry_entry` builds.
+    fn is_registry_no_installable_version(error: &str) -> bool {
+        error.starts_with("No installable version of") || error.starts_with("No version of")
     }
 
     /// `installParsedSource` (package-manager.ts:1347-1356).

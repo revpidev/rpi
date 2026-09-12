@@ -105,6 +105,7 @@ extern "C" fn host_call_trampoline(cookie: PluginCookie, request: RVec<u8>) -> R
         in_command: std::cell::Cell::new(with_in_command(|cell| cell.get())),
         tool_updates: context.tool_updates.clone(),
         tool_aborts: context.tool_aborts.clone(),
+        memory_limiter: crate::wasm::MemoryLimiter,
     };
     let response = crate::wasm::handle_host_call(&mut state, &request[..]);
     RVec::from(response)

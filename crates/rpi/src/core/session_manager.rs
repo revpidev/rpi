@@ -812,7 +812,14 @@ fn build_session_path<'a>(
     };
 
     let mut path = Vec::new();
+    // P2-6 hardening: a corrupted `parent_id` chain that loops back on
+    // itself (a << b, b << a) would walk forever — stop at the first
+    // revisit instead (upstream has the same theoretical hazard).
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     loop {
+        if !visited.insert(current.id()) {
+            break;
+        }
         path.push(current);
         current = match current.parent_id().and_then(|pid| by_id.get(pid)) {
             Some(parent) => parent,
@@ -2285,7 +2292,14 @@ pub fn path_to_root_or_compaction(
     if current.is_none() {
         return Err(RpiError::Session(format!("Entry {leaf_id} not found")));
     }
+    // P2-6 hardening: a `parent_id` cycle in the stored history would walk
+    // forever — stop at the first revisit instead of looping (the path up
+    // to the cycle is still usable; upstream has the same hazard).
+    let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
     while let Some(entry) = current {
+        if !visited.insert(entry.id()) {
+            break;
+        }
         path.push(entry);
         if stop_at_entry_id.as_deref() == Some(entry.id()) {
             break;

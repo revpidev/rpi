@@ -283,6 +283,39 @@ impl ResponseBody {
             }
         }
     }
+
+    /// P2-3: bounded `read_all` — the unbounded shape (`await
+    /// response.text()` upstream and here) buffers whatever the server
+    /// sends; a hostile or misbehaving endpoint can balloon host memory.
+    /// Streams incrementally and fails fast at `max_bytes` (inner `Err`
+    /// carries the overrun size). (Deliberate hardening deviation from
+    /// upstream — registered in the parity notes.)
+    pub async fn read_all_bounded(
+        self,
+        max_bytes: usize,
+    ) -> Result<Result<String, usize>, wreq::Error> {
+        use futures::StreamExt;
+        match self {
+            ResponseBody::Full(bytes) => {
+                if bytes.len() > max_bytes {
+                    return Ok(Err(bytes.len()));
+                }
+                Ok(Ok(String::from_utf8_lossy(&bytes).into_owned()))
+            }
+            ResponseBody::Stream(response) => {
+                let mut stream = response.bytes_stream();
+                let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    buffer.extend_from_slice(&chunk);
+                    if buffer.len() > max_bytes {
+                        return Ok(Err(buffer.len()));
+                    }
+                }
+                Ok(Ok(String::from_utf8_lossy(&buffer).into_owned()))
+            }
+        }
+    }
 }
 
 impl HttpResponse {

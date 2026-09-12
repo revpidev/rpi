@@ -927,6 +927,24 @@ impl ExtractedRpix {
     }
 }
 
+/// P2-8 defense-in-depth: extension names become path components under the
+/// extensions root. Registry index entries and `github:` release metadata
+/// are remote-controlled inputs — reject anything that is not a single
+/// safe component (no separators, no `..`, no NUL, no reserved dot prefix,
+/// bounded length) before it reaches a `Path::join`.
+pub fn ensure_safe_extension_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err(format!("Invalid extension name: {name:?}"));
+    }
+    if name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(format!("Invalid extension name: {name:?}"));
+    }
+    if name.trim() != name || name.starts_with('.') {
+        return Err(format!("Invalid extension name: {name:?}"));
+    }
+    Ok(())
+}
+
 /// Design §7.2 step 7, first half: extract to `<name>.tmp-<pid>/`, verify
 /// the per-file SHA256SUMS, and check the manifest name/version against
 /// the expectation. Any failure removes the temporary directory.
@@ -936,6 +954,7 @@ pub fn extract_and_verify_rpix(
     expected_name: &str,
     expected_version: &str,
 ) -> Result<ExtractedRpix, String> {
+    ensure_safe_extension_name(expected_name)?;
     std::fs::create_dir_all(extensions_root).map_err(|e| e.to_string())?;
     let temp_dir = extensions_root.join(format!("{expected_name}.tmp-{}", std::process::id()));
     if temp_dir.exists() {
@@ -979,6 +998,7 @@ pub fn activate_rpix(
     name: &str,
     marker_source: Option<&str>,
 ) -> Result<PathBuf, String> {
+    ensure_safe_extension_name(name)?;
     if let Some(source) = marker_source {
         std::fs::write(
             extracted.temp_dir.join(GITHUB_INSTALL_MARKER_FILE),
@@ -1755,5 +1775,42 @@ mod tests {
             ]
         );
         assert!(parse_sha256sums("garbage").is_err());
+    }
+}
+
+#[cfg(test)]
+mod safe_name_tests {
+    use super::*;
+
+    #[test]
+    fn safe_names_pass() {
+        for name in [
+            "rpi-statusline",
+            "rpiv_ask_user_question",
+            "a".repeat(128).as_str(),
+        ] {
+            assert!(ensure_safe_extension_name(name).is_ok(), "{name}");
+        }
+    }
+
+    /// P2-8: registry/github metadata is remote-controlled — a name that is
+    /// not a single safe component must never reach a `Path::join` under the
+    /// extensions root.
+    #[test]
+    fn unsafe_names_rejected() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            " padded ",
+            ".hidden",
+            "a.".repeat(200).as_str(),
+        ] {
+            assert!(ensure_safe_extension_name(name).is_err(), "{name:?}");
+        }
     }
 }

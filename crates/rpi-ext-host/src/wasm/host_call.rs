@@ -1338,6 +1338,7 @@ mod session_entries_tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
         }
     }
 
@@ -1492,6 +1493,7 @@ mod c3_dispose_tests {
             in_command: std::cell::Cell::new(false),
             tool_updates: Default::default(),
             tool_aborts: Default::default(),
+            memory_limiter: crate::wasm::MemoryLimiter,
         };
         (state, runtime, rx, bridge)
     }

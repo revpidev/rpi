@@ -791,6 +791,18 @@ async fn parity_batch_progress_snapshots() {
     let scenarios = fixtures.as_array().cloned().unwrap_or_default();
     assert!(!scenarios.is_empty(), "batch-progress fixtures missing");
 
+    // P2-13: clean the shared download dir BEFORE the run (residue from a
+    // previously failed batch must not leak into this one) and ensure the
+    // trailing cleanup happens even when the final assert fails below.
+    struct DownloadDirGuard;
+    impl Drop for DownloadDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
+        }
+    }
+    let _download_dir_guard = DownloadDirGuard;
+    let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
+
     let mut failures: Vec<String> = Vec::new();
     for scenario in &scenarios {
         let name = scenario.get("name").and_then(Value::as_str).unwrap_or("");
@@ -938,8 +950,8 @@ async fn parity_batch_progress_snapshots() {
         failures.join("\\n")
     );
 
-    // Same trailing-cleanup contract as the generator / the replay above.
-    let _ = std::fs::remove_dir_all(std::path::Path::new(PARITY_DOWNLOAD_TEMP_DIR));
+    // Trailing cleanup now lives in the guard's Drop (P2-13) — it runs
+    // regardless of the assert above.
 }
 
 fn _request_url(request: &HttpRequest) -> String {

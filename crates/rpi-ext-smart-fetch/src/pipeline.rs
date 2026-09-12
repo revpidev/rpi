@@ -932,8 +932,38 @@ impl FetchPipeline {
         }
 
         context.phase = FetchErrorPhase::Loading;
-        let raw_body = match response.body.read_all().await {
-            Ok(body) => body,
+        // P2-3: bounded body read — upstream buffers `await response.text()`
+        // with no ceiling; a hostile endpoint must not balloon host memory.
+        // 32 MiB is far above any legitimate page/JSON body smart-fetch
+        // extracts (registered hardening deviation).
+        const SMART_FETCH_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+        let raw_body = match response
+            .body
+            .read_all_bounded(SMART_FETCH_MAX_BODY_BYTES)
+            .await
+        {
+            Ok(Ok(body)) => body,
+            Ok(Err(size)) => {
+                hooks.emit_status("error");
+                hooks.emit_progress("error", 1.0, "error");
+                return FetchOutcome::Error(FetchError {
+                    error: format!(
+                        "response body exceeds the {SMART_FETCH_MAX_BODY_BYTES}-byte cap \
+                         ({size} bytes received)"
+                    ),
+                    code: None,
+                    phase: Some(context.phase),
+                    retryable: Some(false),
+                    timeout_ms: None,
+                    url: Some(context.url.clone()),
+                    final_url: Some(final_url.clone()),
+                    status_code: Some(response.status),
+                    status_text: None,
+                    mime_type: None,
+                    content_length: None,
+                    downloaded_bytes: None,
+                });
+            }
             Err(error) => {
                 // Body-read failures classify like upstream's transport
                 // throws (extract.ts:1696-1701) — the catch pair fires.

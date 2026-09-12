@@ -96,6 +96,37 @@ fn engine() -> wasmtime::Engine {
         .clone()
 }
 
+/// Hard memory ceiling for one wasm guest (P2-2): `consume_fuel` bounds
+/// CPU, not memory — without a limiter a guest can `memory.grow` until the
+/// host RSS is exhausted. 128 MiB per guest is orders of magnitude above
+/// any legitimate first-party extension footprint while capping the
+/// worst case for accidental or hostile growth.
+pub(crate) const WASM_GUEST_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
+
+/// [`wasmtime::ResourceLimiter`] implementation for the per-guest memory
+/// cap (P2-2).
+pub struct MemoryLimiter;
+
+impl wasmtime::ResourceLimiter for MemoryLimiter {
+    fn memory_growing(
+        &mut self,
+        current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool, wasmtime::Error> {
+        Ok(desired <= WASM_GUEST_MEMORY_LIMIT.max(current))
+    }
+
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        _desired: usize,
+        _maximum: Option<usize>,
+    ) -> Result<bool, wasmtime::Error> {
+        Ok(true)
+    }
+}
+
 /// Compile guest bytes (WAT or wasm binary) into a module.
 pub fn compile_module(bytes: &[u8]) -> Result<wasmtime::Module, String> {
     wasmtime::Module::new(&engine(), bytes).map_err(|e| e.to_string())
@@ -387,6 +418,8 @@ pub struct HostState {
     pub tool_updates: PendingToolUpdates,
     /// Per-extension in-flight abort signals (see [`PendingToolAborts`]).
     pub tool_aborts: PendingToolAborts,
+    /// P2-2: per-guest linear-memory cap (see [`MemoryLimiter`]).
+    pub memory_limiter: MemoryLimiter,
 }
 
 /// The `rpi_host_call` response envelopes.
@@ -456,6 +489,11 @@ pub async fn instantiate_and_init(
     let module = module.clone();
 
     let join = std::thread::spawn(move || {
+        // P2-2: cap the guest's linear memory growth via a resource limiter —
+        // `consume_fuel` bounds CPU only, and without a limiter a guest can
+        // `memory.grow` until the host RSS is exhausted. 128 MiB per guest
+        // is orders of magnitude above any legitimate first-party extension
+        // footprint while capping accidental or hostile growth.
         let mut store = wasmtime::Store::new(
             &engine(),
             HostState {
@@ -466,8 +504,10 @@ pub async fn instantiate_and_init(
                 in_command: std::cell::Cell::new(false),
                 tool_updates: PendingToolUpdates::default(),
                 tool_aborts: PendingToolAborts::default(),
+                memory_limiter: MemoryLimiter,
             },
         );
+        store.limiter(|state| &mut state.memory_limiter);
         let mut linker = wasmtime::Linker::new(store.engine());
         let host_call = |mut caller: wasmtime::Caller<'_, HostState>, ptr: u32, len: u32| -> u64 {
             let bytes = match caller.get_export("memory") {
