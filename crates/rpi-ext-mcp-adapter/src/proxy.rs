@@ -3172,6 +3172,11 @@ pub struct ProxyDispatcher {
     /// `Initializing` carries the attempt it belongs to, so a stale driver
     /// completion/drop can never converge a newer attempt's state.
     init_generation: std::sync::atomic::AtomicU64,
+    hooks_complete: std::sync::atomic::AtomicBool,
+}
+
+thread_local! {
+    static IN_ON_READY_HOOK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl Default for ProxyDispatcher {
@@ -3187,6 +3192,7 @@ impl ProxyDispatcher {
             hooks: Mutex::new(DispatcherHooks::default()),
             init_wait_timeout: Mutex::new(INIT_WAIT_TIMEOUT),
             init_generation: std::sync::atomic::AtomicU64::new(0),
+            hooks_complete: std::sync::atomic::AtomicBool::new(true),
         }
     }
 
@@ -3216,6 +3222,8 @@ impl ProxyDispatcher {
             InitState::Ready(_) | InitState::Initializing { .. } => return,
             _ => {}
         }
+        self.hooks_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let generation = self.next_generation();
         *state = InitState::Initializing { future, generation };
     }
@@ -3235,6 +3243,8 @@ impl ProxyDispatcher {
             InitState::Ready(_) | InitState::Initializing { .. } => return None,
             _ => {}
         }
+        self.hooks_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let generation = self.next_generation();
         let handle = self.spawn_init_driver(&future, generation);
         *state = InitState::Initializing { future, generation };
@@ -3244,9 +3254,43 @@ impl ProxyDispatcher {
     /// Peek at the ready runtime without waiting (surface sync at install /
     /// metadata-update time).
     pub fn try_runtime(&self) -> Option<Arc<McpRuntime>> {
+        let in_hook = IN_ON_READY_HOOK.with(|flag| flag.get());
         match &*self.state.lock().unwrap_or_else(|e| e.into_inner()) {
-            InitState::Ready(runtime) => Some(runtime.clone()),
+            InitState::Ready(runtime)
+                if in_hook
+                    || self
+                        .hooks_complete
+                        .load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                Some(runtime.clone())
+            }
             _ => None,
+        }
+    }
+
+    /// P1-7: bounded wait for the on_ready surface sync. The gate fast paths
+    /// can observe `Ready` in the microseconds between publication and hook
+    /// completion; park briefly (1ms slices, bounded by the gate timeout,
+    /// aborted when the state leaves Ready) instead of returning a runtime
+    /// whose approvals/surface are not restored yet.
+    async fn await_hooks_complete(&self) {
+        let bound = *self
+            .init_wait_timeout
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let deadline = std::time::Instant::now() + bound;
+        while !self
+            .hooks_complete
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let still_ready = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                matches!(&*state, InitState::Ready(_))
+            };
+            if !still_ready || std::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -3296,8 +3340,12 @@ impl ProxyDispatcher {
             .on_ready
             .clone();
         if let Some(hook) = hook {
+            IN_ON_READY_HOOK.with(|flag| flag.set(true));
             hook();
+            IN_ON_READY_HOOK.with(|flag| flag.set(false));
         }
+        self.hooks_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn fire_on_connect_sync(&self) {
@@ -3331,6 +3379,8 @@ impl ProxyDispatcher {
             InitState::Ready(_) | InitState::Initializing { .. } => return,
             _ => {}
         }
+        self.hooks_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let future: InitFuture =
             async move { initialize_mcp(&cwd, config_path.as_deref(), None).await }
                 .map(Ok::<Arc<McpRuntime>, Arc<String>>)
@@ -3420,6 +3470,8 @@ impl ProxyDispatcher {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *state, InitState::NotStarted)
         };
+        self.hooks_complete
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         match old {
             InitState::Ready(runtime) => {
                 runtime.owner_cancel.cancel();
@@ -3440,32 +3492,51 @@ impl ProxyDispatcher {
     /// The init gate (`currentDirect`'s typed core): Ready, Initializing
     /// (awaits the shared init future, 30s gate) or the failure text.
     pub(crate) async fn current(&self) -> Result<Arc<McpRuntime>, GateError> {
-        let (shared, generation) = {
+        let (shared, generation, ready_runtime) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
-                InitState::Ready(runtime) => return Ok(runtime.clone()),
+                InitState::Ready(runtime) => (None, 0, Some(runtime.clone())),
                 InitState::Failed(message) => return Err(GateError::Failed(message.to_string())),
                 InitState::NotStarted => return Err(GateError::NotInitialized),
-                InitState::Initializing { future, generation } => (future.clone(), *generation),
+                InitState::Initializing { future, generation } => {
+                    (Some(future.clone()), *generation, None)
+                }
             }
         };
+        // P1-7: park until the on_ready surface sync completed (the Ready
+        // publication alone is not observable completeness).
+        if let Some(runtime) = ready_runtime {
+            self.await_hooks_complete().await;
+            return Ok(runtime);
+        }
+        let shared = shared.expect("ready handled above");
         let bound = *self
             .init_wait_timeout
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match tokio::time::timeout(bound, shared).await {
             Ok(Ok(runtime)) => {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 // Guarded like `current_direct`: the background driver may
                 // have published Ready already (and a shutdown may have reset
                 // the gate) while this awaiter was parked on its shared clone.
                 // The generation fence ignores an awaiter from a superseded
                 // attempt (round-2 review O1).
-                if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
-                {
-                    *state = InitState::Ready(runtime.clone());
-                    drop(state);
+                let won_transition = {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+                    {
+                        *state = InitState::Ready(runtime.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if won_transition {
                     self.fire_on_ready();
+                } else {
+                    // Lost the race: the winner's on_ready may still be
+                    // mid-flight — park for it (P1-7).
+                    self.await_hooks_complete().await;
                 }
                 Ok(runtime)
             }
@@ -3484,10 +3555,10 @@ impl ProxyDispatcher {
     /// by a background task, so this wait is bounded by the time init itself
     /// takes to complete.
     pub async fn current_direct(&self) -> Result<Arc<McpRuntime>, Value> {
-        let (shared, generation) = {
+        let (shared, generation, ready_runtime) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             match &*state {
-                InitState::Ready(runtime) => return Ok(runtime.clone()),
+                InitState::Ready(runtime) => (None, 0, Some(runtime.clone())),
                 InitState::Failed(message) => {
                     return Err(json!({
                         "content": [{ "type": "text", "text": format!("MCP initialization failed: {message}") }],
@@ -3500,17 +3571,36 @@ impl ProxyDispatcher {
                         "details": { "error": "not_initialized" },
                     }));
                 }
-                InitState::Initializing { future, generation } => (future.clone(), *generation),
+                InitState::Initializing { future, generation } => {
+                    (Some(future.clone()), *generation, None)
+                }
             }
         };
+        // P1-7: park until the on_ready surface sync completed (the Ready
+        // publication alone is not observable completeness).
+        if let Some(runtime) = ready_runtime {
+            self.await_hooks_complete().await;
+            return Ok(runtime);
+        }
+        let shared = shared.expect("ready handled above");
         match shared.await {
             Ok(runtime) => {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
-                {
-                    *state = InitState::Ready(runtime.clone());
-                    drop(state);
+                let won_transition = {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if matches!(&*state, InitState::Initializing { generation: current, .. } if *current == generation)
+                    {
+                        *state = InitState::Ready(runtime.clone());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if won_transition {
                     self.fire_on_ready();
+                } else {
+                    // Lost the race: the winner's on_ready may still be
+                    // mid-flight — park for it (P1-7).
+                    self.await_hooks_complete().await;
                 }
                 Ok(runtime)
             }

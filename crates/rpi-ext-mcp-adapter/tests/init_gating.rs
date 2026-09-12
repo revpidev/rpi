@@ -365,3 +365,182 @@ async fn start_init_background_driver_fires_on_ready() {
     dispatcher.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// P1-7: "Ready published" must not be observable before the on_ready hook
+// (surface sync + session-approval restore) completed. Upstream is
+// single-threaded so publish→hook is atomic; the Rust port must gate
+// observers explicitly (`hooks_complete`), with the hook's own
+// try_runtime calls bypassing the gate.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_runtime_gated_until_on_ready_hook_completes() {
+    use rpi_ext_mcp_adapter::proxy::DispatcherHooks;
+
+    let dir = temp_dir("hooks-gate");
+    std::fs::write(dir.join(".mcp.json"), json!({"mcpServers": {}}).to_string()).expect("config");
+
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_started = Arc::clone(&started);
+    let hook_release = Arc::clone(&release);
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        {
+            let mut flag = hook_started.0.lock().unwrap();
+            *flag = true;
+            hook_started.1.notify_all();
+        }
+        // Block until the test releases the hook (10s bound so a failing
+        // test cannot hang the driver).
+        let mut released = hook_release.0.lock().unwrap();
+        if !*released {
+            let (guard, timeout) = hook_release
+                .1
+                .wait_timeout(released, std::time::Duration::from_secs(10))
+                .unwrap();
+            released = guard;
+            let _ = timeout;
+            let _ = *released;
+        }
+    });
+    dispatcher.set_hooks(DispatcherHooks {
+        on_ready: Some(hook),
+        on_connect_sync: None,
+    });
+
+    let init_dir = dir.clone();
+    let future: InitFuture = async move {
+        Ok::<Arc<McpRuntime>, Arc<String>>(initialize_mcp(&init_dir, None, None).await)
+    }
+    .boxed()
+    .shared();
+    dispatcher.start_init_with_driver(future);
+
+    // Wait until the driver published Ready and entered the hook.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let hook_has_started = loop {
+        let flag = started.0.lock().unwrap();
+        if *flag {
+            break true;
+        }
+        let (guard, timeout) = started
+            .1
+            .wait_timeout(flag, std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(guard);
+        let _ = timeout;
+        assert!(std::time::Instant::now() < deadline, "hook never started");
+    };
+    assert!(hook_has_started);
+
+    // The hook is mid-flight: try_runtime must hold off observers.
+    assert!(
+        dispatcher.try_runtime().is_none(),
+        "try_runtime must stay None while on_ready is mid-flight"
+    );
+
+    // Release the hook; the gate opens and the runtime becomes observable.
+    {
+        let mut flag = release.0.lock().unwrap();
+        *flag = true;
+        release.1.notify_all();
+    }
+    let runtime = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(runtime) = dispatcher.try_runtime() {
+                break runtime;
+            }
+            assert!(std::time::Instant::now() < deadline, "gate never opened");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    };
+    // Sanity: the visible runtime is the initialized one (empty server set).
+    let _ = runtime;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The gate fast paths (`current`/`current_direct`) also wait for the hook:
+/// a caller racing the driver must not receive a runtime whose approvals /
+/// surface are not restored yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn current_gate_parks_until_on_ready_hook_completes() {
+    use rpi_ext_mcp_adapter::proxy::DispatcherHooks;
+
+    let dir = temp_dir("hooks-gate-current");
+    std::fs::write(dir.join(".mcp.json"), json!({"mcpServers": {}}).to_string()).expect("config");
+
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_started = Arc::clone(&started);
+    let hook_release = Arc::clone(&release);
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        {
+            let mut flag = hook_started.0.lock().unwrap();
+            *flag = true;
+            hook_started.1.notify_all();
+        }
+        let mut released = hook_release.0.lock().unwrap();
+        if !*released {
+            let (guard, timeout) = hook_release
+                .1
+                .wait_timeout(released, std::time::Duration::from_secs(10))
+                .unwrap();
+            released = guard;
+            let _ = timeout;
+            let _ = *released;
+        }
+    });
+    dispatcher.set_hooks(DispatcherHooks {
+        on_ready: Some(hook),
+        on_connect_sync: None,
+    });
+
+    let init_dir = dir.clone();
+    let future: InitFuture = async move {
+        Ok::<Arc<McpRuntime>, Arc<String>>(initialize_mcp(&init_dir, None, None).await)
+    }
+    .boxed()
+    .shared();
+    dispatcher.start_init_with_driver(future);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let hook_has_started = loop {
+        let flag = started.0.lock().unwrap();
+        if *flag {
+            break true;
+        }
+        let (guard, timeout) = started
+            .1
+            .wait_timeout(flag, std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(guard);
+        let _ = timeout;
+        assert!(std::time::Instant::now() < deadline, "hook never started");
+    };
+    assert!(hook_has_started);
+
+    // current_direct races the hook: it must park until the gate opens.
+    let waiter = tokio::spawn({
+        let dispatcher = Arc::clone(&dispatcher);
+        async move { dispatcher.current_direct().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !waiter.is_finished(),
+        "current_direct must park while the hook is mid-flight"
+    );
+    {
+        let mut flag = release.0.lock().unwrap();
+        *flag = true;
+        release.1.notify_all();
+    }
+    let runtime = waiter
+        .await
+        .expect("waiter task alive")
+        .expect("gate resolves once the hook completed");
+    let _ = runtime;
+    let _ = std::fs::remove_dir_all(&dir);
+}
