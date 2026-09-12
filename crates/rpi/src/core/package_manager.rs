@@ -8238,7 +8238,7 @@ mod registry_tests {
 
     /// The untracked-install skip in [`DefaultPackageManager::update_registry_entry`]
     /// matches errors by message; bind the prefix to what
-    /// `resolve_registry_install` actually builds so drift fails here.
+    /// `resolve_registry_install_with_channel` actually builds so drift fails here.
     #[test]
     fn test_is_registry_not_found_binds_to_resolve_error() {
         let dirs = TestDirs::new();
