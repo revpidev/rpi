@@ -517,7 +517,7 @@ mod tests {
                     "outputLines": 12,
                     "totalLines": 50
                 },
-                "fullOutputPath": "/tmp/pi-bash-abc.log"
+                "fullOutputPath": "/tmp/rpi-bash-abc.log"
             })),
         };
         let context = context(&state);
@@ -539,7 +539,7 @@ mod tests {
         assert!(!stripped.contains("line7\n") || stripped.matches("line7").count() <= 1);
         // Warnings line.
         assert!(stripped
-            .contains("[Full output: /tmp/pi-bash-abc.log. Truncated: showing 12 of 50 lines]"));
+            .contains("[Full output: /tmp/rpi-bash-abc.log. Truncated: showing 12 of 50 lines]"));
         // Timing line: `Took` once settled (startedAt set by render_call).
         renderer.render_call(&json!({"command": "lscpu"}), &theme, &context);
         let component = renderer
@@ -565,7 +565,7 @@ mod tests {
         let theme = theme();
         let state = RendererStateSlot::default();
         let renderer = BashToolRenderer;
-        let long_path = format!("/tmp/pi-bash-{}.log", "76d578ae3f748c37".repeat(6));
+        let long_path = format!("/tmp/rpi-bash-{}.log", "76d578ae3f748c37".repeat(6));
         let result = ToolResultState {
             content: vec![],
             is_error: false,
@@ -602,7 +602,7 @@ mod tests {
         }
         let stripped = strip_ansi(&component.render(79).join("\n"));
         assert!(stripped.contains("Full output:"), "stripped: {stripped}");
-        assert!(stripped.contains("/tmp/pi-bash-"), "stripped: {stripped}");
+        assert!(stripped.contains("/tmp/rpi-bash-"), "stripped: {stripped}");
         // The full path survives the wrap (not truncated away).
         assert!(
             stripped.contains("76d578ae3f748c37"),

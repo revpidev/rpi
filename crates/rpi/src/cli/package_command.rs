@@ -58,7 +58,7 @@ use std::sync::Arc;
 /// `usage_lines_start_with_app_name` test binds the two so a rename cannot
 /// silently leave the help text stale (T14 review N-1).
 pub const UPDATE_USAGE: &str =
-    "rpi update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
+    "rpi update [source|self|rpi] [--self|--extensions|--models|--all] [--extension <source>] [--rc] [--approve|--no-approve] [--force] [--yes]";
 
 /// `UpdateTarget` (package-manager-cli.ts:35).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,7 +213,7 @@ pub fn parse_update_args(args: &[String]) -> ParsedUpdate {
             source: Some(extension_source),
         });
     } else if let Some(positional) = source {
-        if positional == "self" || positional == "pi" {
+        if positional == "self" || positional == "rpi" {
             parsed.target = Some(if extensions_flag {
                 UpdateTarget::All
             } else {
@@ -250,30 +250,30 @@ pub fn update_help() -> String {
         r#"Usage:
   {UPDATE_USAGE}
 
-Update pi, installed packages, or model catalogs.
+Update rpi, installed packages, or model catalogs.
 
 Options:
-  --self                  Update pi only (default when no target is given)
+  --self                  Update rpi only (default when no target is given)
   --extensions            Update installed packages only
   --models                Refresh model catalogs only
-  --all                   Update pi and installed packages
+  --all                   Update rpi and installed packages
   --extension <source>    Update one package only
   --rc                    Update to the latest pre-release (RC) version;
                           applies to --self/--extensions/--all, no effect on
                           --models
   -a, --approve           Trust project-local files for this command
   -na, --no-approve       Ignore project-local files for this command
-  --force                 Reinstall pi even if the current version is latest
+  --force                 Reinstall rpi even if the current version is latest
   --yes                   Skip the native (L0) extension confirmation prompt
                           (registry/github: extension installs and updates)
 
 Short forms:
-  {APP_NAME} update                Update pi only
-  {APP_NAME} update --all          Update pi and all extensions
-  {APP_NAME} update --rc           Update pi to the latest RC version
+  {APP_NAME} update                Update rpi only
+  {APP_NAME} update --all          Update rpi and all extensions
+  {APP_NAME} update --rc           Update rpi to the latest RC version
   {APP_NAME} update --models       Refresh model catalogs only
   {APP_NAME} update <source>       Update one package
-  {APP_NAME} update pi             Update pi only (self works as alias to pi)
+  {APP_NAME} update rpi            Update rpi only (self works as alias to rpi)
 "#
     )
 }
@@ -1384,7 +1384,7 @@ mod tests {
     #[test]
     fn update_defaults_to_self() {
         assert_eq!(target(&["update"]), Some(UpdateTarget::Self_));
-        assert_eq!(target(&["update", "pi"]), Some(UpdateTarget::Self_));
+        assert_eq!(target(&["update", "rpi"]), Some(UpdateTarget::Self_));
         assert_eq!(target(&["update", "self"]), Some(UpdateTarget::Self_));
     }
 
@@ -2276,7 +2276,7 @@ mod update_cli_tests {
         // (package-manager-cli.ts:368-369); explicit targets do not.
         assert!(parse(&["update"]).show_extensions_skipped_note);
         assert!(!parse(&["update", "--self"]).show_extensions_skipped_note);
-        assert!(!parse(&["update", "pi"]).show_extensions_skipped_note);
+        assert!(!parse(&["update", "rpi"]).show_extensions_skipped_note);
         assert!(!parse(&["update", "--all"]).show_extensions_skipped_note);
     }
 

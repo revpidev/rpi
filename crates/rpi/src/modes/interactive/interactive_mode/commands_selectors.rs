@@ -889,7 +889,7 @@ fn show_ambient_auth_dialog(ui: &Arc<InteractiveUi>, provider: &AuthSelectorProv
         }));
         dialog_guard.show_info(
             &format!(
-                "{} is configured outside pi.",
+                "{} is configured outside rpi.",
                 provider.method_name.as_deref().unwrap_or("Authentication")
             ),
             vec![],
@@ -2630,7 +2630,7 @@ impl InteractiveUi {
     pub(crate) fn handle_paste_image_impl(&self) {
         if let Some(bytes) = read_clipboard_image_png() {
             let file_path =
-                std::env::temp_dir().join(format!("pi-clipboard-{}.png", clipboard_uuid()));
+                std::env::temp_dir().join(format!("rpi-clipboard-{}.png", clipboard_uuid()));
             if std::fs::write(&file_path, bytes).is_ok() {
                 lock(&self.editor).insert_text_at_cursor(&file_path.display().to_string());
                 self.render_handle.request_render();
@@ -3680,7 +3680,7 @@ mod tests {
         let ui = &mode.ui_state;
         ui.handle_paste_image();
 
-        // The PNG bytes are written to `pi-clipboard-{uuid}.png` under the
+        // The PNG bytes are written to `rpi-clipboard-{uuid}.png` under the
         // temp dir and the path is inserted at the cursor
         // (interactive-mode.ts:2633-2640).
         let inserted = lock(&ui.editor).get_text();
@@ -3690,7 +3690,7 @@ mod tests {
             "inserted absolute temp path: {inserted}"
         );
         assert!(
-            inserted.contains("pi-clipboard-") && inserted.ends_with(".png"),
+            inserted.contains("rpi-clipboard-") && inserted.ends_with(".png"),
             "uuid file name: {inserted}"
         );
         let bytes = std::fs::read(&inserted).expect("clipboard image file must exist");

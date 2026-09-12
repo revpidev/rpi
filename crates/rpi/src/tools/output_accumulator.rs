@@ -41,7 +41,7 @@ impl Default for OutputAccumulatorOptions {
             max_bytes: DEFAULT_MAX_BYTES,
             // Upstream: Math.max(maxBytes * 2, 1) = 102400
             max_rolling_bytes: DEFAULT_MAX_BYTES * 2,
-            temp_file_prefix: "pi-output".to_string(),
+            temp_file_prefix: "rpi-output".to_string(),
         }
     }
 }
@@ -101,7 +101,7 @@ pub struct OutputAccumulator {
 impl OutputAccumulator {
     /// Create a new accumulator with the given options.
     ///
-    /// The bash tool passes `{ temp_file_prefix: "pi-bash", .. }`.
+    /// The bash tool passes `{ temp_file_prefix: "rpi-bash", .. }`.
     pub fn new(options: OutputAccumulatorOptions) -> Self {
         Self {
             max_lines: options.max_lines,
@@ -618,7 +618,7 @@ mod tests {
     #[test]
     fn test_bash_prefix_temp_file() {
         let mut acc = OutputAccumulator::new(OutputAccumulatorOptions {
-            temp_file_prefix: "pi-bash".to_string(),
+            temp_file_prefix: "rpi-bash".to_string(),
             max_bytes: 5,
             ..OutputAccumulatorOptions::default()
         });
@@ -629,7 +629,7 @@ mod tests {
         assert!(snap.full_output_path.is_some());
         if let Some(ref path) = snap.full_output_path {
             let name = path.file_name().unwrap().to_string_lossy();
-            assert!(name.starts_with("pi-bash-"), "temp file name: {name}");
+            assert!(name.starts_with("rpi-bash-"), "temp file name: {name}");
             assert!(name.ends_with(".log"));
             let _ = std::fs::remove_file(path);
         }

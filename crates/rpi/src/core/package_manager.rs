@@ -1,6 +1,6 @@
 //! Port of `packages/coding-agent/src/core/package-manager.ts` @ pi 0.84.1+
 //! (4181f66) — package sources (npm/git/local), install/remove, settings
-//! persistence, identity dedupe, `package.json#pi` manifests (via
+//! persistence, identity dedupe, `package.json#rpi` manifests (via
 //! `pi-manifest.ts`), resource
 //! filters, and the package slice of `resolve()`.
 //!
@@ -42,7 +42,7 @@
 //!   package-manager.ts:2263-2278) use the built-in glob matcher of
 //!   `skills.rs` instead of the `glob` package's `globSync`.
 //! - The managed npm root sentinel `package.json` keeps the upstream
-//!   literal name `pi-extensions` (invisible implementation detail).
+//!   literal name `rpi-extensions` (invisible implementation detail; upstream
 //! - Rpi-specific addition (extension-distribution design §7, documented
 //!   in [`crate::core::extension_registry`]): two new package sources —
 //!   bare `<name>[@<range>]` (revpi.dev registry) and
@@ -1803,7 +1803,7 @@ impl DefaultPackageManager {
         self.ensure_git_ignore(install_root)?;
         let package_json_path = install_root.join("package.json");
         if !package_json_path.exists() {
-            let package_json = serde_json::json!({ "name": "pi-extensions", "private": true });
+            let package_json = serde_json::json!({ "name": "rpi-extensions", "private": true });
             let content = serde_json::to_string_pretty(&package_json).map_err(|e| e.to_string())?;
             std::fs::write(&package_json_path, content).map_err(|e| e.to_string())?;
         }
@@ -4496,7 +4496,8 @@ fn has_glob_pattern(s: &str) -> bool {
 }
 
 /// `readPiManifest` / `readPiManifestFile` (pi-manifest.ts,
-/// package-manager.ts:536-544 / 2228-2241 @ pi 0.84.1+): `package.json#pi`;
+/// package-manager.ts:536-544 / 2228-2241 @ pi 0.84.1+): `package.json#rpi`
+/// (legacy `package.json#pi` still accepted; `"rpi"` wins on conflict);
 /// malformed JSON, a missing `pi`, or a non-object `pi` yields `None`.
 /// Individual resource fields are only collected when the value is a
 /// `string[]`; a non-array or non-string-element field is left `None`
@@ -4516,7 +4517,10 @@ fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
     if !parsed.is_object() {
         return None;
     }
-    let pi = parsed.get("pi")?;
+    // Resource manifest key: `"rpi"` (ADR-0001 brand rename); the
+    // upstream `"pi"` key is still accepted so upstream-style packages
+    // keep working. `"rpi"` wins when both are present.
+    let pi = parsed.get("rpi").or_else(|| parsed.get("pi"))?;
     // isObject(pkg.pi): must be a JSON object (not array / primitive / null).
     if !pi.is_object() {
         return None;
@@ -5356,7 +5360,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             package_json,
-            serde_json::json!({"name": "pi-extensions", "private": true})
+            serde_json::json!({"name": "rpi-extensions", "private": true})
         );
         assert_eq!(
             std::fs::read_to_string(dirs.agent_dir.join("npm/.gitignore")).unwrap(),
@@ -5855,6 +5859,26 @@ mod tests {
         // The raw directory is added as a fallback extension entry.
         assert_eq!(resolved.extensions.len(), 1);
         assert_eq!(resolved.extensions[0].path, pkg_dir);
+    }
+
+    #[test]
+    fn test_read_pi_manifest_rpi_key_wins_over_legacy_pi_key() {
+        // ADR-0001 brand rename: the resource manifest key is `"rpi"`; the
+        // upstream `"pi"` key is still accepted, and `"rpi"` wins when a
+        // package carries both.
+        let dirs = TestDirs::new();
+        let pkg_dir = dirs.cwd.join("pkg");
+        write_file(
+            &pkg_dir.join("package.json"),
+            r#"{"name": "pkg", "pi": {"extensions": ["src/legacy.ts"]}, "rpi": {"extensions": ["src/main.rs"]}}"#,
+        );
+        write_file(&pkg_dir.join("src/main.rs"), "fn main() {}");
+        let manager = test_manager(&dirs, FakeRunner::ok());
+        let resolved = manager
+            .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
+            .unwrap();
+        assert_eq!(resolved.extensions.len(), 1);
+        assert_eq!(resolved.extensions[0].path, pkg_dir.join("src/main.rs"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// `SUBAGENT_ORCHESTRATION_SKILL` (skills.ts): children never resolve the
 /// bundled orchestration skill — asking for it surfaces as missing.
-pub const SUBAGENT_ORCHESTRATION_SKILL: &str = "pi-subagents";
+pub const SUBAGENT_ORCHESTRATION_SKILL: &str = "rpi-subagents";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedSkill {

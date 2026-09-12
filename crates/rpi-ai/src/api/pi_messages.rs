@@ -6,7 +6,7 @@
 //! response is an SSE stream of serialized assistant-message events plus a
 //! terminal `done`/`error` event. This is the wire protocol spoken by the
 //! Radius gateway, usable by any backend via a models.json custom provider
-//! with `"api": "pi-messages"`.
+//! with `"api": "rpi-messages"` (legacy `"pi-messages"` still accepted).
 //!
 //! `pi-messages.lazy.ts` (`lazyApi(() => import("./pi-messages.ts"))`) is a
 //! code-splitting shim; Rust links statically, so [`PiMessages`] is always
@@ -965,7 +965,7 @@ pub fn stream_simple(
     ))
 }
 
-/// `ProviderStreams` implementation for `ApiKind::PI_MESSAGES`.
+/// `ProviderStreams` implementation for `ApiKind::RPI_MESSAGES`.
 ///
 /// The trait carries plain [`StreamOptions`]; pi-messages extras
 /// ([`PiMessagesOptions`]) reach [`stream`] only through direct calls or via

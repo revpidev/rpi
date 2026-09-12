@@ -482,12 +482,12 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         .join("\n");
 
     let mut prompt = format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}"
+        "You are an expert coding assistant operating inside rpi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}"
     );
 
     if let Some(doc_paths) = &options.doc_paths {
         prompt.push_str(&format!(
-            "\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {}\n- Additional docs: {}\n- Examples: {} (extensions, custom tools, SDK)\n- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+            "\n\nRpi documentation (read only when the user asks about rpi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {}\n- Additional docs: {}\n- Examples: {} (extensions, custom tools, SDK)\n- When reading rpi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), rpi packages (docs/packages.md), environment variables (docs/environment-variables.md)\n- When working on rpi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read rpi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
             doc_paths.readme_path, doc_paths.docs_path, doc_paths.examples_path
         ));
     }
@@ -677,7 +677,7 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             ..Default::default()
         };
-        assert!(!build_system_prompt(&options).contains("Pi documentation"));
+        assert!(!build_system_prompt(&options).contains("Rpi documentation"));
         let options = BuildSystemPromptOptions {
             doc_paths: Some(DocPaths {
                 readme_path: "/pkg/README.md".to_string(),
@@ -687,7 +687,7 @@ mod tests {
             ..options
         };
         let prompt = build_system_prompt(&options);
-        assert!(prompt.contains("Pi documentation (read only when the user asks about pi itself"));
+        assert!(prompt.contains("Rpi documentation (read only when the user asks about rpi itself"));
         assert!(prompt.contains("- Main documentation: /pkg/README.md\n"));
         assert!(prompt.contains("- Examples: /pkg/examples (extensions, custom tools, SDK)\n"));
     }

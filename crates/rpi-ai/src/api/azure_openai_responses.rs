@@ -67,8 +67,8 @@ use crate::utils::custom_fetch::send_provider_request;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
-    provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    rpi_user_agent_headers,
 };
 use crate::utils::provider_env::get_provider_env_value;
 use crate::utils::provider_retry::{
@@ -296,7 +296,7 @@ pub fn build_client_headers(
     ]
     .into();
     merge_headers_chain(&[
-        pi_user_agent_headers(),
+        rpi_user_agent_headers(),
         Some(base),
         model_headers(model),
         options_headers.cloned(),

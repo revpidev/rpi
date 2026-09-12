@@ -71,7 +71,7 @@ impl OutputState {
             return;
         }
         let id = random_hex_16();
-        let path = std::env::temp_dir().join(format!("pi-bash-{id}.log"));
+        let path = std::env::temp_dir().join(format!("rpi-bash-{id}.log"));
         match File::create(&path) {
             Ok(mut file) => {
                 for chunk in &self.output_chunks {

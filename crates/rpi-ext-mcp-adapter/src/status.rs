@@ -14,7 +14,7 @@ use crate::manager::{ConnectionStatus, McpServerManager};
 use crate::metadata::{McpConfig, ServerEntry};
 
 /// `MCP_STATUS_EVENT` (types.ts:16): versioned event channel.
-pub const MCP_STATUS_EVENT: &str = "pi-mcp-adapter/status/v1";
+pub const MCP_STATUS_EVENT: &str = "rpi-mcp-adapter/status/v1";
 
 /// `MCP_STATUS_SNAPSHOT_VERSION` (types.ts:18).
 pub const MCP_STATUS_SNAPSHOT_VERSION: u32 = 1;

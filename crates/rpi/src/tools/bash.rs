@@ -539,7 +539,7 @@ impl AgentTool for BashTool {
         let spawn_ctx = self.resolve_spawn_context(&resolved);
         let accumulator: Arc<Mutex<OutputAccumulator>> = Arc::new(Mutex::new(
             OutputAccumulator::new(OutputAccumulatorOptions {
-                temp_file_prefix: "pi-bash".into(),
+                temp_file_prefix: "rpi-bash".into(),
                 ..Default::default()
             }),
         ));

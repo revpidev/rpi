@@ -895,7 +895,7 @@ mod tests {
         install_global_keybindings();
         let mut component = dialog();
         component.show_info(
-            "Authentication is configured outside pi.",
+            "Authentication is configured outside rpi.",
             vec![AuthInfoLink {
                 url: "https://example.com/docs".to_string(),
                 label: Some("Docs".to_string()),

@@ -91,8 +91,8 @@ use crate::types::{
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
-    provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    rpi_user_agent_headers,
 };
 use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
@@ -550,7 +550,7 @@ fn build_request_headers(
     let mut base = crate::types::ProviderHeaders::new();
     base.insert(auth_header.0.to_owned(), Some(auth_header.1));
     merge_headers_chain(&[
-        pi_user_agent_headers(),
+        rpi_user_agent_headers(),
         Some(base),
         model_headers(model),
         options_headers.cloned(),

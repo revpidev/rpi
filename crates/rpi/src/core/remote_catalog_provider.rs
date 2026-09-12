@@ -124,7 +124,7 @@ pub(crate) fn encode_uri_component(value: &str) -> String {
 /// `getPiUserAgent` (utils/pi-user-agent.ts) — `pi/{version} ({platform};
 /// {runtime}; {arch})` with the rpi naming (ADR-0001) and a `rust` runtime
 /// marker (D-036).
-fn pi_user_agent() -> String {
+fn rpi_user_agent() -> String {
     format!(
         "rpi/{VERSION} ({}; rust; {})",
         std::env::consts::OS,
@@ -272,7 +272,7 @@ impl Provider for RemoteCatalogProvider {
                     // `fetchWithRetry` (46b53b995) wraps this management-plane
                     // GET; the factory rebuilds the request per attempt so
                     // headers are always set correctly.
-                    let ua = pi_user_agent();
+                    let ua = rpi_user_agent();
                     let url_clone = url.clone();
                     let validator_clone = validator.clone();
                     let response = send_with_retry(

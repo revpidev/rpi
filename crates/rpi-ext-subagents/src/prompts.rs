@@ -8,7 +8,7 @@
 //! adapt to structured delegation calls (ADR-0018 W12: `chain:` maps to
 //! `steps`, not workflowScript). Template and skill bodies are localized for
 //! the structured entry points per ADR-0021 (no `workflowScript` teaching;
-//! parity exemption recorded there). The bundled `pi-subagents` orchestration
+//! parity exemption recorded there). The bundled `rpi-subagents` orchestration
 //! skill ships to the user skill dir at install (parent sessions only —
 //! children never resolve it, `SUBAGENT_ORCHESTRATION_SKILL`); a layout
 //! version marker re-ships rewritten bodies over the pre-ADR-0021 byte-exact
@@ -46,33 +46,35 @@ pub const BUNDLED_PROMPTS: [(&str, &str); 5] = [
 
 /// The bundled orchestration skill body (SKILL.md + references).
 pub const ORCHESTRATION_SKILL_SKILL_MD: &str =
-    include_str!("../assets/skills/pi-subagents/SKILL.md");
+    include_str!("../assets/skills/rpi-subagents/SKILL.md");
 pub const ORCHESTRATION_SKILL_REFERENCES: [(&str, &str); 4] = [
     (
         "constraints-and-recipes.md",
-        include_str!("../assets/skills/pi-subagents/references/constraints-and-recipes.md"),
+        include_str!("../assets/skills/rpi-subagents/references/constraints-and-recipes.md"),
     ),
     (
         "execution-controls.md",
-        include_str!("../assets/skills/pi-subagents/references/execution-controls.md"),
+        include_str!("../assets/skills/rpi-subagents/references/execution-controls.md"),
     ),
     (
         "management-authoring-rpc.md",
-        include_str!("../assets/skills/pi-subagents/references/management-authoring-rpc.md"),
+        include_str!("../assets/skills/rpi-subagents/references/management-authoring-rpc.md"),
     ),
     (
         "prompting-and-roles.md",
-        include_str!("../assets/skills/pi-subagents/references/prompting-and-roles.md"),
+        include_str!("../assets/skills/rpi-subagents/references/prompting-and-roles.md"),
     ),
 ];
 
 /// Layout version of the shipped orchestration skill (ADR-0021). v1 was the
 /// byte-exact upstream copy with no version marker; v2 is the localized
-/// rewrite (no `workflowScript` teaching). Bump this whenever the bundled
+/// rewrite (no `workflowScript` teaching); v3 renames the skill directory
+/// `pi-subagents` → `rpi-subagents` (de-pi brand pass) and removes a
+/// previously-shipped legacy directory. Bump this whenever the bundled
 /// bodies change so existing installs are upgraded in place.
-const ORCHESTRATION_SKILL_LAYOUT_VERSION: u32 = 2;
+const ORCHESTRATION_SKILL_LAYOUT_VERSION: u32 = 3;
 
-/// Install the orchestration skill into `<agentDir>/skills/pi-subagents/`
+/// Install the orchestration skill into `<agentDir>/skills/rpi-subagents/`
 /// (upstream ships it with the package; rpi has no package skill path, so the
 /// plugin materializes it). Idempotent per layout version: the marker file
 /// `.rpi-layout-version` gates re-shipping — missing or older marker rewrites
@@ -86,7 +88,8 @@ pub fn install_orchestration_skill() {
 /// Directory-parameterized core for tests: the agent-dir env var is
 /// process-global, so concurrent integration tests must not race through it.
 pub fn install_orchestration_skill_at(agent_dir: &Path) {
-    let skill_dir = agent_dir.join("skills").join("pi-subagents");
+    let skill_dir = agent_dir.join("skills").join("rpi-subagents");
+    remove_legacy_orchestration_skill_at(agent_dir);
     let references = skill_dir.join("references");
     let version_path = skill_dir.join(".rpi-layout-version");
     let installed = std::fs::read_to_string(&version_path)
@@ -104,6 +107,27 @@ pub fn install_orchestration_skill_at(agent_dir: &Path) {
         &version_path,
         ORCHESTRATION_SKILL_LAYOUT_VERSION.to_string(),
     );
+}
+
+/// Remove a pre-v3 `<agentDir>/skills/pi-subagents/` install shipped by older
+/// rpi builds, so the renamed `rpi-subagents` skill does not coexist with a
+/// stale duplicate. Conservative: only delete a directory that is provably
+/// ours — it carries our `.rpi-layout-version` marker (v2+ installs) or its
+/// `SKILL.md` is the byte-exact upstream v1 body (the only v1 shape we ever
+/// wrote, identified by the `workflowScript`-only teaching upstream shipped).
+/// A user-customized directory without either signature is left untouched.
+fn remove_legacy_orchestration_skill_at(agent_dir: &Path) {
+    let legacy = agent_dir.join("skills").join("pi-subagents");
+    if !legacy.is_dir() {
+        return;
+    }
+    let ours = legacy.join(".rpi-layout-version").is_file()
+        || std::fs::read_to_string(legacy.join("SKILL.md"))
+            .map(|body| body.contains("workflowScript"))
+            .unwrap_or(false);
+    if ours {
+        let _ = std::fs::remove_dir_all(&legacy);
+    }
 }
 
 /// `getPromptDirectories` (prompt-workflows.ts:23-32) — project then user

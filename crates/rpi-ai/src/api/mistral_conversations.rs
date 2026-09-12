@@ -74,8 +74,8 @@ use crate::utils::custom_fetch::{send_provider_request, SendFailure};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
-    provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    rpi_user_agent_headers,
 };
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::provider_retry::{
@@ -269,7 +269,7 @@ fn build_request_headers(
     .into();
 
     let mut headers = merge_headers_chain(&[
-        pi_user_agent_headers(),
+        rpi_user_agent_headers(),
         Some(base),
         model_headers(model),
         options.stream.headers.clone(),

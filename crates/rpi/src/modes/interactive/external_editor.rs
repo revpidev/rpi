@@ -55,7 +55,7 @@ impl InteractiveUi {
 
         // Temp dir `pi-editor-{pid}/prompt.md` (external-editor.ts:14-17;
         // pid-scoped instead of mkdtemp so the path is reproducible).
-        let dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rpi-editor-{}", std::process::id()));
         let file_path = dir.join("prompt.md");
         let prepare = (|| -> std::io::Result<()> {
             let _ = std::fs::remove_dir_all(&dir); // stale dir from a crashed run
@@ -104,7 +104,7 @@ impl InteractiveUi {
     /// cleanup (external-editor.ts:39-43), restart the TUI, force a full
     /// re-render.
     fn resume_after_external_editor(&self) {
-        let dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rpi-editor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         self.ui.start();
         self.ui.request_render(true);
@@ -346,7 +346,7 @@ mod tests {
         // stripped, external-editor.ts:37).
         assert_eq!(lock(&ui.editor).get_text(), "edited");
         // Temp dir removed (external-editor.ts:39-43).
-        let dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rpi-editor-{}", std::process::id()));
         assert!(!dir.exists(), "temp editor dir must be cleaned up");
         // TUI restarted after the editor exits (interactive-mode.ts:3859).
         assert!(terminal.is_started(), "TUI must be restarted");
@@ -393,7 +393,7 @@ mod tests {
             "status must report the spawn failure: {rendered}"
         );
         assert!(terminal.is_started(), "TUI must be restarted");
-        let dir = std::env::temp_dir().join(format!("pi-editor-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rpi-editor-{}", std::process::id()));
         assert!(!dir.exists(), "temp editor dir must be cleaned up");
     }
 
