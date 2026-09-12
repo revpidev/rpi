@@ -1,0 +1,54 @@
+name: ci
+
+# Quality gates (review finding: the tag-triggered build.yml only builds and
+# publishes — fmt/clippy/test were manual-only, so races (P1-7 class) and
+# regressions had no automatic interception). Runs on every push to main and
+# every PR; zero release side effects.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Mirrors the local gate: -D warnings across all targets.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --no-fail-fast so a single failing binary does not mask others; the
+      # job fails on any failing test binary.
+      - run: cargo test --workspace --no-fail-fast
