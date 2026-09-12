@@ -670,7 +670,12 @@ pub async fn complete_summarization(
 ) -> AssistantMessage {
     let request_options = StreamOptions {
         cache_retention: Some(CacheRetention::None),
-        session_id: Some(uuidv7_now()),
+        // Upstream `options.sessionId ?? uuidv7()` (compaction.ts:592): reuse
+        // caller-supplied routing when available (routing/cache affinity);
+        // callers without a session id — including branch summaries — get a
+        // fresh routing id. P2-11: the port previously overwrote the id
+        // unconditionally.
+        session_id: Some(options.session_id.clone().unwrap_or_else(uuidv7_now)),
         ..options.clone()
     };
     let produce = || async {

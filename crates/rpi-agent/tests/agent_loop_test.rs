@@ -2588,3 +2588,98 @@ async fn after_tool_call_hook_error_degrades_to_error_result() {
     assert_eq!(call_count(&state), 2);
     assert_eq!(message_roles(&messages).last().copied(), Some("assistant"));
 }
+
+// ---------------------------------------------------------------------------
+// P1-4: a panicking parallel tool task must still pair its start with an
+// end event — start is emitted before spawn, the task dies before its own
+// end emit, so the fill loop must emit the replacement end (still before
+// the tool-result message).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn parallel_task_panic_still_emits_tool_execution_end_for_missing_slot() {
+    let ok_tool = TestTool::new(
+        "echo",
+        Arc::new(|params, _on_update| {
+            Box::pin(async move {
+                let value = params
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                Ok(AgentToolResult {
+                    content: vec![ToolResultContent::Text(TextContent {
+                        text: format!("echoed: {value}"),
+                        text_signature: None,
+                    })],
+                    details: json!({ "value": value }),
+                    terminate: None,
+                    ..Default::default()
+                })
+            })
+        }),
+    );
+    let boom_tool = TestTool::new(
+        "boom",
+        Arc::new(|_params, _on_update| {
+            Box::pin(async move {
+                panic!("intentional parallel task panic (P1-4 regression)");
+            })
+        }),
+    );
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(ok_tool), Arc::new(boom_tool)]),
+    };
+
+    let mut config = test_config();
+    config.tool_execution = ToolExecutionMode::Parallel;
+    let script = vec![
+        assistant_message(
+            vec![
+                tool_call("tool-1", "echo", json!({ "value": "first" })),
+                tool_call("tool-2", "boom", json!({ "value": "second" })),
+            ],
+            StopReason::ToolUse,
+        ),
+        text_assistant("done"),
+    ];
+    let (stream_fn, state) = mock_stream_fn(script);
+    let stream = agent_loop(
+        vec![user_message("run both")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    // Both starts must be paired with ends — the panicked task's end comes
+    // from the JoinError fill loop ("Tool task failed"), not the task body.
+    let start_ids: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let end_ids = tool_execution_end_ids(&events);
+    assert_eq!(start_ids.len(), 2, "both tools started");
+    assert!(
+        end_ids.iter().any(|id| id == "tool-1") && end_ids.iter().any(|id| id == "tool-2"),
+        "every start paired with an end: starts={start_ids:?} ends={end_ids:?}"
+    );
+    // The panicked slot's end is an error result emitted before the turn ends.
+    let boom_end = events.iter().find_map(|e| match e {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            is_error,
+            ..
+        } if tool_call_id == "tool-2" => Some(*is_error),
+        _ => None,
+    });
+    assert_eq!(boom_end, Some(true), "panicked slot ends as error");
+    // The loop still converges to the next assistant turn.
+    assert_eq!(call_count(&state), 2);
+}

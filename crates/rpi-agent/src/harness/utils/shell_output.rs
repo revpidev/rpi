@@ -387,12 +387,18 @@ pub async fn execute_shell_with_capture(
     let writer = drain_write_chain(env, write_rx, Arc::clone(&state));
     tokio::pin!(writer);
     let mut writer_done = false;
+    // P2-12: when the select below observes the writer completing, its
+    // result is captured here — polling an already-ready future again at
+    // the final `await` site would be a poll-after-ready contract violation
+    // (previously the code relied on the "unreachable" invariant alone).
+    let mut writer_result: Option<Option<ExecutionError>> = None;
     let exec_result = loop {
         tokio::select! {
             result = &mut exec_fut => break result,
-            _ = &mut writer, if !writer_done => {
+            res = &mut writer, if !writer_done => {
                 // Unreachable while exec holds a sender; keep the loop alive.
                 writer_done = true;
+                writer_result = Some(res);
             }
         }
     };
@@ -416,8 +422,13 @@ pub async fn execute_shell_with_capture(
     };
     drop(write_tx);
 
-    // `await writeChain` (shell-output.ts:159).
-    let chain_error = writer.await;
+    // `await writeChain` (shell-output.ts:159). P2-12: only await when the
+    // writer was NOT already observed completing in the select above —
+    // re-awaiting a ready future is a poll-after-ready violation.
+    let chain_error = match writer_result {
+        Some(observed) => observed,
+        None => writer.await,
+    };
     if let Some(error) = chain_error {
         return Err(error);
     }

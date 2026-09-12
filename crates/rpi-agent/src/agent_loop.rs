@@ -1216,6 +1216,13 @@ async fn execute_tool_calls_parallel(
                     result: create_error_tool_result(format!("Tool task failed: {message}")),
                     is_error: true,
                 });
+                // P1-4: the `tool_execution_start` for this call was already
+                // emitted before spawn, and the panicking task died before
+                // its final `emit_tool_execution_end` — pair the event here
+                // (still before the tool-result message) so start/end
+                // consumers (`pending_tool_calls`, extension spinners, RPC)
+                // do not leak a permanently "running" tool.
+                emit_tool_execution_end(slot.as_ref().expect("just filled"), emit).await;
             }
         }
     }

@@ -100,7 +100,9 @@ impl Default for BranchSummarySettings {
 /// `GenerateBranchSummaryOptions` (branch-summarization.ts:67-90). `args`
 /// carries api key / headers / env / signal / retry; `thinking_level` is
 /// intentionally unused — the upstream branch request options set only
-/// `maxTokens: 2048`, never `reasoning` (branch-summarization.ts:350).
+/// `maxTokens: min(4096, model.maxTokens)` (branch-summarization.ts:345, cap
+/// introduced by e44d75c20 / #8845), never `reasoning`. (P2-14: this
+/// comment previously said 2048 — the pre-#8845 value.)
 pub struct GenerateBranchSummaryOptions<'a> {
     pub model: &'a Model,
     pub stream_fn: &'a StreamFn,
