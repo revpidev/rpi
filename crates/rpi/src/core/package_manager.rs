@@ -2138,17 +2138,11 @@ impl DefaultPackageManager {
     /// Everything needed for install steps 6–7, resolved upfront.
     /// Registry channel: index fetch → version selection → compatibility
     /// precheck → artifact selection (design §7.2 steps 1–4).
-    fn resolve_registry_install(
-        &self,
-        source: &RegistrySource,
-    ) -> Result<ResolvedArtifactInstall, String> {
-        self.resolve_registry_install_with_channel(source, UpdateChannel::Stable)
-    }
-
-    /// [`Self::resolve_registry_install`] 带 V14-19 更新通道（rpi 自有）：
-    /// registry/`github:` 的安装路径恒为 [`UpdateChannel::Stable`]（安装
-    /// 不引入 `--rc`，非目标），仅 `rpi update --extensions [--rc]` 走
-    /// [`UpdateChannel::PreRelease`]（R6.3.1/R6.3.2）。
+    /// V14-19 更新通道（rpi 自有）：
+    /// `rpi install <name> --rc` 与 `rpi update --extensions [--rc]` 走
+    /// [`UpdateChannel::PreRelease`]（R6.3.1/R6.3.2 + R6.7 增补——安装
+    /// 通道选择器随 2026-09-12 用户拍板引入，解锁 rc 窗口安装尚无
+    /// stable 版本的第一方插件）；默认安装与更新仍为 Stable。
     fn resolve_registry_install_with_channel(
         &self,
         source: &RegistrySource,
@@ -2521,6 +2515,7 @@ impl DefaultPackageManager {
         &self,
         source: &RegistrySource,
         scope: SourceScope,
+        channel: UpdateChannel,
     ) -> Result<(), String> {
         if self.offline {
             return Err(format!(
@@ -2528,7 +2523,7 @@ impl DefaultPackageManager {
                 source.name
             ));
         }
-        let resolved = self.resolve_registry_install(source)?;
+        let resolved = self.resolve_registry_install_with_channel(source, channel)?;
         self.run_registry_install(&resolved, scope)
     }
 
@@ -2698,7 +2693,7 @@ impl DefaultPackageManager {
 
     /// Whether a registry resolution error means "the registry has no
     /// such extension" (HTTP 404), as opposed to transport/artifact
-    /// failures. Binds to the message [`Self::resolve_registry_install`]
+    /// failures. Binds to the message [`Self::resolve_registry_install_with_channel`]
     /// builds; `test_is_registry_not_found_binds_to_resolve_error`
     /// guards the coupling.
     fn is_registry_not_found(error: &str) -> bool {
@@ -2727,6 +2722,19 @@ impl DefaultPackageManager {
 
     /// `install` (package-manager.ts:994-1016).
     pub fn install(&self, source: &str, local: bool) -> Result<(), String> {
+        self.install_with_channel(source, local, UpdateChannel::Stable)
+    }
+
+    /// [`Self::install`] 带 V14-19 更新通道（rpi 自有增补）：`rpi install
+    /// <name> --rc` 按 [`UpdateChannel::PreRelease`] 解析 registry 源
+    /// （rc 窗口安装尚无 stable 版本的第一方插件，如
+    /// rpiv-ask-user-question）；其余源不受通道影响。
+    pub fn install_with_channel(
+        &self,
+        source: &str,
+        local: bool,
+        channel: UpdateChannel,
+    ) -> Result<(), String> {
         let parsed = parse_source(source);
         let scope = if local {
             SourceScope::Project
@@ -2748,7 +2756,9 @@ impl DefaultPackageManager {
                     }
                     Ok(())
                 }
-                ParsedSource::Registry(registry) => self.install_registry_source(registry, scope),
+                ParsedSource::Registry(registry) => {
+                    self.install_registry_source(registry, scope, channel)
+                }
                 ParsedSource::GithubRelease(github) => {
                     self.install_github_source(github, scope, source)
                 }
@@ -2758,7 +2768,17 @@ impl DefaultPackageManager {
 
     /// `installAndPersist` (package-manager.ts:1018-1021).
     pub fn install_and_persist(&mut self, source: &str, local: bool) -> Result<(), String> {
-        self.install(source, local)?;
+        self.install_and_persist_with_channel(source, local, UpdateChannel::Stable)
+    }
+
+    /// [`Self::install_and_persist`] 带更新通道（`rpi install --rc`）。
+    pub fn install_and_persist_with_channel(
+        &mut self,
+        source: &str,
+        local: bool,
+        channel: UpdateChannel,
+    ) -> Result<(), String> {
+        self.install_with_channel(source, local, channel)?;
         self.add_source_to_settings(source, local)?;
         Ok(())
     }
@@ -7806,6 +7826,75 @@ mod registry_tests {
         );
     }
 
+    /// V14-19 增补（R6.7，`rpi install <name> --rc`，2026-09-12 用户拍板）：
+    /// 安装通道选择器——rc 窗口安装尚无 stable 版本的第一方插件
+    /// （rpiv-ask-user-question 的 registry 索引在 0.1.4 stable 前只有
+    /// 预发布条目）。同一双版本索引上：stable 安装仍取 stable（零回归），
+    /// `--rc` 安装取最新预发布；预检（rpiAbi/minHostVersion）全 semver
+    /// 感知，rc 宿主可装对应 rc 插件。
+    #[test]
+    fn test_install_rc_channel_picks_prerelease() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let target = config::build_target().unwrap();
+        let name = "ext-install-rc";
+        let rc_version = "0.1.4-rc.6";
+        let rc_archive = build_rpix(name, rc_version, true, &[]);
+        let index = serde_json::json!({
+            "schemaVersion": 1,
+            "name": name,
+            "repository": format!("acme/{name}"),
+            "author": "acme",
+            "kind": "native",
+            "versions": [
+                {"version": rc_version, "rpiAbi": 1, "capabilities": ["tools"],
+                 "artifacts": [{
+                     "target": target,
+                     "file": format!("{name}-{rc_version}-{target}.rpix"),
+                     "sha256": sha256_hex(&rc_archive),
+                     "release": format!("v{rc_version}")}]}
+            ]
+        })
+        .to_string();
+        // rc 窗口形态：索引只有预发布条目（无 stable）。
+        transport.insert(
+            &extension_registry::registry_index_url(REGISTRY_BASE, name),
+            index.into_bytes(),
+        );
+        let file = format!("{name}-{rc_version}-{target}.rpix");
+        let download =
+            extension_registry::github_download_url("acme", name, &format!("v{rc_version}"), &file);
+        transport.insert(&download, rc_archive);
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        // 默认（stable 通道）：无可装版本——与线上 rc.6 实测报错同形。
+        let error = manager
+            .install_and_persist(name, false)
+            .expect_err("stable install must not see the prerelease-only index");
+        assert!(
+            error.contains("No installable version") && error.contains(rc_version),
+            "stable-channel error mentions the available prerelease: {error}"
+        );
+
+        // `--rc`：解析预发布条目并落盘安装。
+        manager
+            .install_and_persist_with_channel(name, false, UpdateChannel::PreRelease)
+            .unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join(format!("extensions/{name}"))
+            )
+            .as_deref(),
+            Some(rc_version),
+            "--rc install must resolve and install the prerelease entry"
+        );
+        assert!(
+            settings_packages(&dirs).contains(format!("\"{name}\"").as_str()),
+            "source persisted to settings: {}",
+            settings_packages(&dirs)
+        );
+    }
+
     /// rpi#34（R6.1.3 任何通道不降级）：stable 毕业后索引同时含
     /// `0.1.4`（stable）与 `0.1.4-rc.4`，已装 stable 的用户跑
     /// `update --extensions --rc` 解析到 `0.1.4-rc.4` —— semver 全序下
@@ -8158,7 +8247,9 @@ mod registry_tests {
         let ParsedSource::Registry(registry) = parse_source("never-published") else {
             panic!("bare name must parse as a registry source");
         };
-        let error = manager.resolve_registry_install(&registry).unwrap_err();
+        let error = manager
+            .resolve_registry_install_with_channel(&registry, UpdateChannel::Stable)
+            .unwrap_err();
         assert!(
             DefaultPackageManager::is_registry_not_found(&error),
             "resolve error must be classified not-found: {error}"

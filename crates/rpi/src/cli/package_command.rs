@@ -856,7 +856,7 @@ pub fn run_self_uninstall(args: &[String]) -> i32 {
 
 /// `getPackageCommandUsage("install")` (package-manager-cli.ts:81-82);
 /// `--yes` is rpi-specific (extension-distribution design §7.2 step 5).
-pub const INSTALL_USAGE: &str = "rpi install <source> [-l] [--yes] [--approve|--no-approve]";
+pub const INSTALL_USAGE: &str = "rpi install <source> [-l] [--rc] [--yes] [--approve|--no-approve]";
 /// `getPackageCommandUsage("remove")` (package-manager-cli.ts:83-84).
 pub const REMOVE_USAGE: &str = "rpi remove <source> [-l] [--approve|--no-approve]";
 /// `getPackageCommandUsage("list")` (package-manager-cli.ts:87-88).
@@ -902,6 +902,10 @@ pub struct ParsedPackageCommand {
     /// `--yes` — rpi-specific (install only): skip the native-extension
     /// confirmation prompt.
     pub yes: bool,
+    /// `--rc` — rpi-specific (install only, V14-19 增补): resolve registry
+    /// sources on the pre-release channel (same semantics as
+    /// `rpi update --extensions --rc`).
+    pub rc: bool,
     pub help: bool,
     pub invalid_option: Option<String>,
     pub invalid_argument: Option<String>,
@@ -931,6 +935,7 @@ pub fn parse_package_command(args: &[String]) -> Option<ParsedPackageCommand> {
         local: false,
         project_trust_override: None,
         yes: false,
+        rc: false,
         help: false,
         invalid_option: None,
         invalid_argument: None,
@@ -955,6 +960,15 @@ pub fn parse_package_command(args: &[String]) -> Option<ParsedPackageCommand> {
             // gate; extension-distribution design §7.2 step 5).
             if command == PackageCommandKind::Install {
                 parsed.yes = true;
+            } else {
+                parsed.invalid_option.get_or_insert_with(|| arg.clone());
+            }
+        } else if arg == "--rc" {
+            // Rpi-specific (V14-19 增补, install only): pre-release channel
+            // for registry sources — the same selector `rpi update --rc`
+            // uses. Invalid for remove/list like every install-only flag.
+            if command == PackageCommandKind::Install {
+                parsed.rc = true;
             } else {
                 parsed.invalid_option.get_or_insert_with(|| arg.clone());
             }
@@ -1012,6 +1026,8 @@ Sources:
 
 Options:
   -l, --local       Install project-locally ({config_dir}/settings.json)
+  --rc              Resolve registry sources on the pre-release channel
+                    (rpi-specific; same selector as `rpi update --rc`)
   --yes             Skip the native (L0) extension confirmation prompt
   -a, --approve     Trust project-local files for this command
   -na, --no-approve Ignore project-local files for this command
@@ -1019,6 +1035,7 @@ Options:
 Examples:
   {APP_NAME} install subagents
   {APP_NAME} install subagents@^0.2
+  {APP_NAME} install rpiv-ask-user-question --rc
   {APP_NAME} install github:revpidev/rpi-subagents
   {APP_NAME} install npm:@foo/bar
   {APP_NAME} install git:github.com/user/repo
@@ -1123,7 +1140,15 @@ fn execute_package_command(
                 eprintln!("Usage: {}", parsed.command.usage());
                 return 1;
             };
-            match manager.install_and_persist(source, parsed.local) {
+            match manager.install_and_persist_with_channel(
+                source,
+                parsed.local,
+                if parsed.rc {
+                    UpdateChannel::PreRelease
+                } else {
+                    UpdateChannel::Stable
+                },
+            ) {
                 Ok(()) => {
                     println!("Installed {source}");
                     0
@@ -1532,6 +1557,25 @@ mod package_command_tests {
         assert_eq!(parsed.project_trust_override, Some(false));
     }
 
+    // V14-19 增补（R6.7）：`--rc` 安装通道选择器——仅 install 接受。
+    #[test]
+    fn test_parse_install_rc_flag() {
+        let parsed = parse(&["install", "rpiv-ask-user-question", "--rc"]);
+        assert!(parsed.rc);
+        assert_eq!(parsed.source.as_deref(), Some("rpiv-ask-user-question"));
+        assert!(parsed.invalid_option.is_none());
+
+        // Orthogonal to the other install flags.
+        let parsed = parse(&["install", "ext", "--rc", "-l", "--yes"]);
+        assert!(parsed.rc && parsed.local && parsed.yes);
+
+        // remove/list reject it like every install-only flag.
+        let parsed = parse(&["remove", "ext", "--rc"]);
+        assert_eq!(parsed.invalid_option.as_deref(), Some("--rc"));
+        let parsed = parse(&["list", "--rc"]);
+        assert_eq!(parsed.invalid_option.as_deref(), Some("--rc"));
+    }
+
     #[test]
     fn test_parse_uninstall_alias_maps_to_remove() {
         let parsed = parse(&["uninstall", "npm:@foo/bar"]);
@@ -1602,6 +1646,9 @@ mod package_command_tests {
         assert!(install.contains(INSTALL_USAGE));
         assert!(install.contains("rpi install npm:@foo/bar"));
         assert!(install.contains("-l, --local"));
+        // V14-19 增补（R6.7）：安装通道选择器在 Options 与示例里可见。
+        assert!(install.contains("--rc"));
+        assert!(install.contains("rpi install rpiv-ask-user-question --rc"));
         let remove = package_command_help(PackageCommandKind::Remove);
         assert!(remove.contains(REMOVE_USAGE));
         assert!(remove.contains("rpi uninstall <source> [-l]"));
