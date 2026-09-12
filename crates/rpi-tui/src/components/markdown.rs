@@ -2344,6 +2344,15 @@ impl Component for Markdown {
         // the transformed text is part of the cache key, so a stateful
         // transform (e.g. the mermaid streaming/final switch) cannot serve
         // stale lines.
+        //
+        // P2-1 (registered deviation, not yet fixed): this re-runs the
+        // transform inside the render path — for wasm-backed transforms
+        // that is a host call bounded by the 2s host-call budget while the
+        // caller holds the TUI render lock, so a pathological transform
+        // can stall a frame for up to 2s. Fixing it requires an
+        // invalidation protocol for stateful transforms (transform result
+        // keyed by (text, width) + explicit bust) — deferred to avoid
+        // serving stale mermaid frames; see the review registry.
         let transformed_text = self
             .options
             .transform
