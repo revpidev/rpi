@@ -884,7 +884,7 @@ pub fn prepare_compaction(
         boundary_start = path_entries
             .iter()
             .position(|entry| Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref())
-            .map_or(index + 1, |kept| kept);
+            .unwrap_or(index + 1);
     }
     let boundary_end = path_entries.len();
 

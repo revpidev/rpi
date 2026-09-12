@@ -507,7 +507,7 @@ fn prepare_harness_compaction(
                     .position(|entry| {
                         Some(entry.id()) == prev_compaction.first_kept_entry_id.as_deref()
                     })
-                    .map_or(index + 1, |kept| kept);
+                    .unwrap_or(index + 1);
                 compactable = std::borrow::Cow::Borrowed(&branch_entries[boundary_start..]);
             }
         }

@@ -38,7 +38,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # Mirrors the local gate: -D warnings across all targets.
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # --keep-going surfaces every crate's lints in one run (a failing crate
+      # otherwise masks later crates' errors — batch-by-batch discovery).
+      - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
 
   test:
     name: cargo test
