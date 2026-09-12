@@ -52,8 +52,8 @@ use crate::types::{
 use crate::utils::cost::calculate_cost;
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
-    provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    rpi_user_agent_headers,
 };
 use crate::utils::provider_retry::ProviderErrorInfo;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
@@ -382,7 +382,7 @@ fn build_request_headers(
         base.insert("x-goog-api-key".to_owned(), Some(api_key.to_owned()));
     }
     merge_headers_chain(&[
-        pi_user_agent_headers(),
+        rpi_user_agent_headers(),
         Some(base),
         model_headers(model),
         options_headers.cloned(),

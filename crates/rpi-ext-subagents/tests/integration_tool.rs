@@ -216,17 +216,20 @@ fn tool_surface_integration() {
 fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
     let dir = sandbox();
     let agent_dir = dir.join("agent");
-    let skill_dir = agent_dir.join("skills").join("pi-subagents");
-    std::fs::create_dir_all(skill_dir.join("references")).unwrap();
-    // v1 install shape: upstream body mentioning workflowScript, no marker.
+    // Legacy pre-v3 install under `skills/pi-subagents`: upstream v1 body
+    // mentioning workflowScript, no marker. The install must move the skill
+    // to `skills/rpi-subagents` and remove the provably-ours legacy copy.
+    let legacy_dir = agent_dir.join("skills").join("pi-subagents");
+    std::fs::create_dir_all(legacy_dir.join("references")).unwrap();
     std::fs::write(
-        skill_dir.join("SKILL.md"),
+        legacy_dir.join("SKILL.md"),
         "---\nname: pi-subagents\n---\n\nUse `workflowScript` for all execution.\n",
     )
     .unwrap();
 
     rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
 
+    let skill_dir = agent_dir.join("skills").join("rpi-subagents");
     let upgraded = std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
     assert!(!upgraded.contains("workflowScript"), "{upgraded}");
     assert!(upgraded.contains("tasks"), "{upgraded}");
@@ -244,21 +247,54 @@ fn orchestration_skill_marker_gates_upgrade_and_reinstall() {
     }
     assert_eq!(
         std::fs::read_to_string(skill_dir.join(".rpi-layout-version")).unwrap(),
-        "2"
+        "3"
+    );
+    assert!(
+        !legacy_dir.exists(),
+        "legacy ours-directory must be removed"
     );
 
     // User customization at the current layout version must survive a
     // reinstall.
     std::fs::write(
         skill_dir.join("SKILL.md"),
-        "---\nname: pi-subagents\n---\n\nCustomized locally.\n",
+        "---\nname: rpi-subagents\n---\n\nCustomized locally.\n",
     )
     .unwrap();
     rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
     assert_eq!(
         std::fs::read_to_string(skill_dir.join("SKILL.md")).unwrap(),
-        "---\nname: pi-subagents\n---\n\nCustomized locally.\n"
+        "---\nname: rpi-subagents\n---\n\nCustomized locally.\n"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A user-customized legacy `skills/pi-subagents` directory (no marker, no
+// upstream v1 workflowScript signature) is left untouched by the rename
+// cleanup: only provably-ours installs are removed.
+#[test]
+fn orchestration_skill_legacy_user_copy_is_preserved() {
+    let dir = sandbox();
+    let agent_dir = dir.join("agent");
+    let legacy_dir = agent_dir.join("skills").join("pi-subagents");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(
+        legacy_dir.join("SKILL.md"),
+        "---\nname: pi-subagents\n---\n\nMy own local tweaks.\n",
+    )
+    .unwrap();
+
+    rpi_ext_subagents::test_support::install_orchestration_skill_at(&agent_dir);
+
+    assert_eq!(
+        std::fs::read_to_string(legacy_dir.join("SKILL.md")).unwrap(),
+        "---\nname: pi-subagents\n---\n\nMy own local tweaks.\n"
+    );
+    assert!(agent_dir
+        .join("skills/rpi-subagents")
+        .join("SKILL.md")
+        .is_file());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

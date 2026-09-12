@@ -485,7 +485,7 @@ pub fn print_help(extension_flags: &[ExtensionFlag], use_ansi: bool) -> String {
   {APP_NAME} install <source> [-l]     Install extension source (registry name, github:, npm:, git:, path)
   {APP_NAME} remove <source> [-l]      Remove extension source from settings
   {APP_NAME} uninstall <source> [-l]   Alias for remove
-  {APP_NAME} update [source|self|pi]   Update pi, extensions, or model catalogs
+  {APP_NAME} update [source|self|rpi]  Update rpi, extensions, or model catalogs
   {APP_NAME} self-uninstall [--purge]  Uninstall this rpi binary installation
   {APP_NAME} list                      List installed extensions from settings
   {APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)

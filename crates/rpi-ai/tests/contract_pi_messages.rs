@@ -639,7 +639,9 @@ async fn test_errors_when_the_stream_ends_without_a_terminal_event() {
 /// what a registry entry would wrap.
 #[tokio::test]
 async fn test_is_a_known_api_usable_on_models() {
-    assert_eq!(ApiKind::PI_MESSAGES, "pi-messages");
+    assert_eq!(ApiKind::RPI_MESSAGES, "rpi-messages");
+    // Legacy alias from the pre-rename spelling still resolves.
+    assert_eq!(ApiKind::from("pi-messages").as_str(), "rpi-messages");
     let streams: &dyn ProviderStreams = &PiMessages;
     let model = create_model("http://127.0.0.1:1/v1");
     // Dispatching through the trait yields the same missing-key error stream.

@@ -522,7 +522,7 @@ pub fn should_register_proxy_tool(
 /// deliberately absent so re-registering the proxy tool never rewrites the
 /// cached prompt prefix; `mcp({ })` carries the runtime counts.
 pub fn build_proxy_description(config: &McpConfig) -> String {
-    let mut desc = "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcpScript. Non-MCP Pi tools should be called directly, not through mcp.\n".to_string();
+    let mut desc = "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. When one request needs several MCP calls with logic between them, use mcpScript. Non-MCP rpi tools should be called directly, not through mcp.\n".to_string();
 
     let server_names: Vec<&str> = config
         .mcp_servers

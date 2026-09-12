@@ -88,14 +88,14 @@ pub fn merge_headers(
 /// Folds several header sources into one with [`merge_headers`] semantics.
 /// Mirrors the Anthropic/OpenAI SDK `buildHeaders` net behavior: sources are
 /// applied in order, later ones win case-insensitively, `None` suppresses.
-/// `87af49dec` (pi-user-agent.ts): the default pi `User-Agent` as the first
+/// `87af49dec` (rpi-user-agent.ts (upstream pi-user-agent.ts)): the default pi `User-Agent` as the first
 /// merge source — later sources (`model.headers`, request headers) override
 /// it case-insensitively, and a `None` value suppresses it.
-pub fn pi_user_agent_headers() -> Option<ProviderHeaders> {
+pub fn rpi_user_agent_headers() -> Option<ProviderHeaders> {
     Some(
         [(
             "User-Agent".to_owned(),
-            Some(crate::utils::pi_user_agent::get_pi_user_agent()),
+            Some(crate::utils::rpi_user_agent::get_rpi_user_agent()),
         )]
         .into(),
     )

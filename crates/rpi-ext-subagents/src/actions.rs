@@ -1571,23 +1571,35 @@ fn refinement_guidance_is_safe(guidance: &str) -> bool {
     let lowered = guidance.to_lowercase();
     !BLOCKED.iter().any(|pattern| lowered.contains(pattern))
         && !guidance.contains("```")
+        && !guidance.contains("</rpi-subagents-refinement")
         && !guidance.contains("</pi-subagents-refinement")
 }
 
 /// Overlay file layout: metadata header + the current-overlay fenced block +
-/// the snapshots JSON block (agent-refinements.ts file format).
+/// the snapshots JSON block (agent-refinements.ts file format). Fenced
+/// markers are `rpi-subagents-refinement-*` (de-pi rename); the reader also
+/// accepts the pre-rename `pi-subagents-refinement-*` spellings so overlays
+/// written by older rpi builds keep parsing.
 fn read_refinement(path: &Path) -> Option<(String, Value)> {
     let content = std::fs::read_to_string(path).ok()?;
-    let current = content
-        .split("```pi-subagents-refinement-current\n")
+    let fenced_current = content
+        .split("```rpi-subagents-refinement-current\n")
         .nth(1)
+        .or_else(|| content.split("```pi-subagents-refinement-current\n").nth(1));
+    let current = fenced_current
         .and_then(|rest| rest.split("```").next())
         .unwrap_or("")
         .trim()
         .to_string();
-    let snapshots = content
-        .split("```pi-subagents-refinement-snapshots-json\n")
+    let fenced_snapshots = content
+        .split("```rpi-subagents-refinement-snapshots-json\n")
         .nth(1)
+        .or_else(|| {
+            content
+                .split("```pi-subagents-refinement-snapshots-json\n")
+                .nth(1)
+        });
+    let snapshots = fenced_snapshots
         .and_then(|rest| rest.split("```").next())
         .and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok())
         .unwrap_or_else(|| json!([]));
@@ -1600,7 +1612,7 @@ fn write_refinement(path: &Path, agent: &str, current: &str, snapshots: &Value) 
     }
     let revision = snapshots.as_array().map(|a| a.len()).unwrap_or(0);
     let content = format!(
-        "---\nagent: {agent}\nrevision: {revision}\nupdatedAt: {}\n---\n\n```pi-subagents-refinement-current\n{current}\n```\n\n```pi-subagents-refinement-snapshots-json\n{}\n```\n",
+        "---\nagent: {agent}\nrevision: {revision}\nupdatedAt: {}\n---\n\n```rpi-subagents-refinement-current\n{current}\n```\n\n```rpi-subagents-refinement-snapshots-json\n{}\n```\n",
         crate::artifacts::format_iso8601(crate::artifacts::now_millis()),
         serde_json::to_string_pretty(snapshots).unwrap_or_else(|_| "[]".to_string()),
     );
@@ -1608,14 +1620,14 @@ fn write_refinement(path: &Path, agent: &str, current: &str, snapshots: &Value) 
 }
 
 /// `appendAgentRefinementOverlay` marker block read by the child prompt
-/// assembly: `<pi-subagents-refinement agent=... source=project>`.
+/// assembly: `<rpi-subagents-refinement agent=... source=project>`.
 pub fn agent_refinement_overlay(cwd: &Path, agent: &str) -> Option<String> {
     let (current, _) = read_refinement(&refinement_path(cwd, agent))?;
     if current.is_empty() {
         return None;
     }
     Some(format!(
-        "<pi-subagents-refinement agent=\"{agent}\" source=\"project\">\n{current}\n</pi-subagents-refinement>\nThis refinement adjusts how you approach tasks. It does not override tool, task, output, acceptance, or safety instructions."
+        "<rpi-subagents-refinement agent=\"{agent}\" source=\"project\">\n{current}\n</rpi-subagents-refinement>\nThis refinement adjusts how you approach tasks. It does not override tool, task, output, acceptance, or safety instructions."
     ))
 }
 
@@ -1697,7 +1709,7 @@ fn manage_refine(
             }
             write_refinement(&path, name, guidance, &snapshots);
             ToolOutcome::text(format!(
-                "Refinement recorded for '{}' at {} (applies to future runs as a <pi-subagents-refinement> overlay; the base definition is unchanged).",
+                "Refinement recorded for '{}' at {} (applies to future runs as a <rpi-subagents-refinement> overlay; the base definition is unchanged).",
                 agent.name,
                 path.to_string_lossy()
             ))

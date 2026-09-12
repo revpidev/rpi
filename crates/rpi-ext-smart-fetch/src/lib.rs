@@ -79,7 +79,7 @@ fn tool_description() -> String {
     [
         "Fetch a URL with browser-grade TLS fingerprinting and extract clean, readable content.",
         "Uses wreq-js for browser-like TLS/HTTP2 impersonation and Defuddle for article extraction.",
-        "Returns full metadata plus the extracted document to the agent while keeping the pi history preview brief.",
+        "Returns full metadata plus the extracted document to the agent while keeping the rpi history preview brief.",
         "Does NOT execute JavaScript — use a browser automation tool for JS-heavy pages.",
     ]
     .join(" ")
@@ -90,17 +90,17 @@ fn batch_tool_description() -> String {
     [
         "Fetch multiple URLs with browser-grade TLS fingerprinting and readable extraction.",
         "Each request accepts the same parameters as web_fetch and fans out with bounded concurrency.",
-        "Returns full per-item metadata to the agent and streams compact per-item progress in the pi TUI.",
+        "Returns full per-item metadata to the agent and streams compact per-item progress in the rpi TUI.",
         "Does NOT execute JavaScript — use a browser automation tool for JS-heavy pages.",
     ]
     .join(" ")
 }
 
 /// Upstream `promptSnippet` (index.ts:477-479), verbatim.
-const TOOL_PROMPT_SNIPPET: &str = "web_fetch(url, browser?, os?, headers?, maxChars?, timeoutMs?, format?, removeImages?, includeReplies?, proxy?, verbose?): fetch browser-fingerprinted readable web content with full agent metadata and a compact pi preview";
+const TOOL_PROMPT_SNIPPET: &str = "web_fetch(url, browser?, os?, headers?, maxChars?, timeoutMs?, format?, removeImages?, includeReplies?, proxy?, verbose?): fetch browser-fingerprinted readable web content with full agent metadata and a compact rpi preview";
 
 /// Upstream batch `promptSnippet` (index.ts:671-672), verbatim.
-const BATCH_TOOL_PROMPT_SNIPPET: &str = "batch_web_fetch(requests, verbose?): fetch multiple URLs concurrently with full agent metadata and per-item progress in the pi TUI";
+const BATCH_TOOL_PROMPT_SNIPPET: &str = "batch_web_fetch(requests, verbose?): fetch multiple URLs concurrently with full agent metadata and per-item progress in the rpi TUI";
 
 /// The shared parameter surface (tool.ts:52-116, `createBaseFetchToolParameterProperties`):
 /// field names, types and descriptions carried 1:1; the five-literal format
@@ -168,7 +168,7 @@ fn verbose_property(batch: bool) -> Value {
     };
     json!({
         "type": "boolean",
-        "description": format!("Compatibility flag. pi currently returns the full metadata header {kept} regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from pi settings.")
+        "description": format!("Compatibility flag. rpi currently returns the full metadata header {kept} regardless, while keeping the history preview compact. Default: false, or smartFetchVerboseByDefault from rpi settings.")
     })
 }
 

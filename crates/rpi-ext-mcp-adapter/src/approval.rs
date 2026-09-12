@@ -25,7 +25,7 @@ use crate::session_approvals::{
 };
 
 /// `MCP_TOOL_APPROVAL_REQUEST_EVENT` (types.ts:527 @ 10a45367).
-pub const MCP_TOOL_APPROVAL_REQUEST_EVENT: &str = "pi-mcp-adapter:tool-approval-request";
+pub const MCP_TOOL_APPROVAL_REQUEST_EVENT: &str = "rpi-mcp-adapter:tool-approval-request";
 
 /// `McpToolApprovalDecision` (types.ts:463).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -900,7 +900,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let namespaced =
-            NamespacedUiBridge::new(Arc::clone(&inner) as Arc<dyn UiBridge>, "pi-subagents");
+            NamespacedUiBridge::new(Arc::clone(&inner) as Arc<dyn UiBridge>, "rpi-subagents");
         namespaced.set_widget(
             "subagent-fleet-status",
             Some(WidgetContent::Lines(vec!["line".to_owned()])),
@@ -910,8 +910,8 @@ mod tests {
         assert_eq!(
             recorded(&inner.calls),
             vec![
-                ("pi-subagents:subagent-fleet-status".to_owned(), true),
-                ("pi-subagents:subagent-fleet-status".to_owned(), false),
+                ("rpi-subagents:subagent-fleet-status".to_owned(), true),
+                ("rpi-subagents:subagent-fleet-status".to_owned(), false),
             ]
         );
     }

@@ -620,7 +620,7 @@ async fn test_sse_contract_headers_and_zstd_body() {
         request.header("openai-beta"),
         Some("responses=experimental")
     );
-    assert_eq!(request.header("originator"), Some("pi"));
+    assert_eq!(request.header("originator"), Some("rpi"));
     assert_eq!(request.header("accept"), Some("text/event-stream"));
     assert_eq!(request.header("content-encoding"), Some("zstd"));
     // Cache-affinity alignment: session-id / x-client-request-id headers and
@@ -1004,7 +1004,7 @@ async fn test_websocket_basic_flow() {
         header("openai-beta"),
         Some("responses_websockets=2026-02-06")
     );
-    assert_eq!(header("originator"), Some("pi"));
+    assert_eq!(header("originator"), Some("rpi"));
     assert_eq!(header("chatgpt-account-id"), Some("acc_test"));
     assert_eq!(header("session-id"), Some("sess-ws"));
     assert_eq!(header("x-client-request-id"), Some("sess-ws"));

@@ -54,8 +54,8 @@ use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::error_body::{format_provider_error, NormalizedProviderError};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::headers::{
-    headers_to_record, merge_headers_chain, model_headers, pi_user_agent_headers,
-    provider_headers_to_header_map,
+    headers_to_record, merge_headers_chain, model_headers, provider_headers_to_header_map,
+    rpi_user_agent_headers,
 };
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::provider_env::get_provider_env_value;
@@ -505,7 +505,7 @@ fn build_request_headers(
             );
         }
         let headers = merge_headers_chain(&[
-            pi_user_agent_headers(),
+            rpi_user_agent_headers(),
             Some(base),
             model_headers(model),
             dynamic_headers,
@@ -530,7 +530,7 @@ fn build_request_headers(
                 Some(format!("Bearer {api_key}")),
             );
             let headers = merge_headers_chain(&[
-                pi_user_agent_headers(),
+                rpi_user_agent_headers(),
                 Some(base),
                 model_headers(model),
                 options.stream.headers.clone(),
@@ -550,7 +550,7 @@ fn build_request_headers(
         .filter(|_| compat.send_session_affinity_headers)
         .map(|session_id| [("x-session-affinity".to_owned(), Some(session_id.to_owned()))].into());
     let headers = merge_headers_chain(&[
-        pi_user_agent_headers(),
+        rpi_user_agent_headers(),
         Some(base),
         session_affinity_headers,
         model_headers(model),

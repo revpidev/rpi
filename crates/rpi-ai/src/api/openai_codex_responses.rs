@@ -291,7 +291,7 @@ fn extract_account_id(token: &str) -> Result<String, CodexError> {
 
 /// `pi (<platform> <release>; <arch>)` — shared consolidation of the
 /// pre-existing local implementation (pi-user-agent.ts:18).
-use crate::utils::pi_user_agent::get_pi_user_agent;
+use crate::utils::rpi_user_agent::get_rpi_user_agent;
 
 /// Case-insensitive header record (JS `Headers` lowercases all names).
 type HeaderRecord = BTreeMap<String, String>;
@@ -319,8 +319,8 @@ fn build_base_codex_headers(
     headers.insert("authorization".to_owned(), format!("Bearer {token}"));
     headers.insert("chatgpt-account-id".to_owned(), account_id.to_owned());
     // Literal "pi" (upstream openai-codex-responses.ts:1593); do not rename.
-    headers.insert("originator".to_owned(), "pi".to_owned());
-    headers.insert("user-agent".to_owned(), get_pi_user_agent());
+    headers.insert("originator".to_owned(), "rpi".to_owned());
+    headers.insert("user-agent".to_owned(), get_rpi_user_agent());
     headers
 }
 
@@ -2194,8 +2194,8 @@ mod tests {
             headers.get("chatgpt-account-id"),
             Some(&"acc_test".to_owned())
         );
-        // originator is the literal "pi" (upstream :1593).
-        assert_eq!(headers.get("originator"), Some(&"pi".to_owned()));
+        // originator is "rpi" (upstream used "pi", :1593; ADR-0001 brand rename).
+        assert_eq!(headers.get("originator"), Some(&"rpi".to_owned()));
         assert_eq!(
             headers.get("openai-beta"),
             Some(&"responses=experimental".to_owned())
@@ -2209,7 +2209,7 @@ mod tests {
         assert_eq!(headers.get("x-client-request-id"), Some(&"sess".to_owned()));
         assert!(headers
             .get("user-agent")
-            .is_some_and(|ua| ua.starts_with("pi (")));
+            .is_some_and(|ua| ua.starts_with("rpi (")));
     }
 
     #[test]
@@ -2227,7 +2227,7 @@ mod tests {
             Some(&"req_1".to_owned())
         );
         assert_eq!(headers.get("session-id"), Some(&"req_1".to_owned()));
-        assert_eq!(headers.get("originator"), Some(&"pi".to_owned()));
+        assert_eq!(headers.get("originator"), Some(&"rpi".to_owned()));
     }
 
     #[test]
@@ -2243,7 +2243,7 @@ mod tests {
         assert!(!headers.contains_key("x-custom"));
         assert_eq!(headers.get("x-extra"), Some(&"1".to_owned()));
         // Auth/originator headers always win over model headers.
-        assert_eq!(headers.get("originator"), Some(&"pi".to_owned()));
+        assert_eq!(headers.get("originator"), Some(&"rpi".to_owned()));
         assert_eq!(
             headers.get("authorization"),
             Some(&"Bearer token".to_owned())

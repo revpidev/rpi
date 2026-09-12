@@ -328,8 +328,9 @@ pub fn resolve_required_subagent_model_candidate(
     available_models: Option<&[AvailableModel]>,
     preferred_provider: Option<&str>,
 ) -> Result<String, String> {
-    resolve_subagent_model_candidate(model, available_models, preferred_provider)
-        .ok_or_else(|| format!("Unknown subagent model '{model}' in the active Pi model registry."))
+    resolve_subagent_model_candidate(model, available_models, preferred_provider).ok_or_else(|| {
+        format!("Unknown subagent model '{model}' in the active rpi model registry.")
+    })
 }
 
 /// R7.1.4.4 (TE18 FR-D): the explicit empty-registry branch — fuzzy
@@ -1631,7 +1632,7 @@ mod te18_model_tests {
         // mean" suggestion is not ported — in-process registry dependency.)
         assert_eq!(
             error,
-            "Unknown subagent model 'faux/primary' in the active Pi model registry."
+            "Unknown subagent model 'faux/primary' in the active rpi model registry."
         );
         // Empty registry never fails (passthrough is correct there).
         assert_eq!(

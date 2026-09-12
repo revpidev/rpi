@@ -118,7 +118,7 @@ pub fn get_radius_models_from_config(
         .map(|model| Model {
             id: model.id.clone(),
             name: model.name.clone(),
-            api: ApiKind::from(ApiKind::PI_MESSAGES),
+            api: ApiKind::from(ApiKind::RPI_MESSAGES),
             provider: provider_id.to_owned(),
             base_url: config.base_url.clone(),
             reasoning: model.reasoning,
@@ -283,7 +283,7 @@ mod tests {
         let models = get_radius_models_from_config("radius", &config);
         assert_eq!(models.len(), 1);
         let model = &models[0];
-        assert_eq!(model.api.as_str(), ApiKind::PI_MESSAGES);
+        assert_eq!(model.api.as_str(), ApiKind::RPI_MESSAGES);
         assert_eq!(model.provider, "radius");
         assert_eq!(model.base_url, "https://radius.pi.dev/api");
         assert_eq!(model.input, vec![InputModality::Text, InputModality::Image]);

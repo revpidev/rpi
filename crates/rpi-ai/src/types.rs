@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 /// API kind identifier. Mirrors `Api = KnownApi | (string & {})`: an open
 /// string with associated constants for the ten known APIs (requirements §5.1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ApiKind(pub String);
 
@@ -63,10 +63,32 @@ impl ApiKind {
     pub const BEDROCK_CONVERSE_STREAM: &'static str = "bedrock-converse-stream";
     pub const GOOGLE_GENERATIVE_AI: &'static str = "google-generative-ai";
     pub const GOOGLE_VERTEX: &'static str = "google-vertex";
-    pub const PI_MESSAGES: &'static str = "pi-messages";
+    /// `"rpi-messages"` (de-pi brand rename; upstream value was
+    /// `"pi-messages"`, still accepted on input as a legacy alias —
+    /// [`normalize_api_kind`]).
+    pub const RPI_MESSAGES: &'static str = "rpi-messages";
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Legacy config-level alias: the pre-rename `"pi-messages"` spelling reads
+/// back as `"rpi-messages"`. The kind string never appears on the wire (the
+/// pi/rpi messages API is addressed via `{baseUrl}/messages`), so this is a
+/// pure models.json/catalog compatibility shim.
+fn normalize_api_kind(raw: String) -> String {
+    if raw == "pi-messages" {
+        "rpi-messages".to_owned()
+    } else {
+        raw
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(ApiKind(normalize_api_kind(raw)))
     }
 }
 
@@ -78,13 +100,13 @@ impl fmt::Display for ApiKind {
 
 impl From<&str> for ApiKind {
     fn from(s: &str) -> Self {
-        Self(s.to_owned())
+        Self(normalize_api_kind(s.to_owned()))
     }
 }
 
 impl From<String> for ApiKind {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(normalize_api_kind(s))
     }
 }
 
@@ -2557,7 +2579,7 @@ mod tests {
             ApiKind::BEDROCK_CONVERSE_STREAM,
             ApiKind::GOOGLE_GENERATIVE_AI,
             ApiKind::GOOGLE_VERTEX,
-            ApiKind::PI_MESSAGES,
+            ApiKind::RPI_MESSAGES,
         ];
         assert_eq!(
             known,
@@ -2571,9 +2593,15 @@ mod tests {
                 "bedrock-converse-stream",
                 "google-generative-ai",
                 "google-vertex",
-                "pi-messages",
+                "rpi-messages",
             ]
         );
+        // Legacy alias: the pre-rename "pi-messages" spelling normalizes to
+        // "rpi-messages" on every input path (From and JSON deserialize).
+        assert_eq!(ApiKind::from("pi-messages").as_str(), "rpi-messages");
+        assert_eq!(to_json(&ApiKind::from("pi-messages")), "\"rpi-messages\"");
+        let from_json: ApiKind = serde_json::from_str("\"pi-messages\"").unwrap();
+        assert_eq!(from_json.as_str(), "rpi-messages");
         // Custom API strings stay possible (Api = KnownApi | (string & {})).
         assert_eq!(
             to_json(&ApiKind::from("my-custom-api")),

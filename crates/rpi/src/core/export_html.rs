@@ -603,11 +603,22 @@ mod tests {
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
     }
 
+    /// template.js differs from the pinned upstream file only by the three
+    /// documented brand renames (de-pi pass, ADR-0028): `pi-url-params` /
+    /// `pi-share-base-url` meta names and the `pi-share:v1:` localStorage
+    /// key prefix.
+    fn upstream_template_js_with_documented_renames() -> String {
+        upstream_asset("template.js")
+            .replace("pi-url-params", "rpi-url-params")
+            .replace("pi-share-base-url", "rpi-share-base-url")
+            .replace("pi-share:v1:", "rpi-share:v1:")
+    }
+
     #[test]
     fn embedded_assets_match_upstream_byte_for_byte() {
         assert_eq!(TEMPLATE_HTML, upstream_asset("template.html"));
         assert_eq!(TEMPLATE_CSS, upstream_asset("template.css"));
-        assert_eq!(TEMPLATE_JS, upstream_asset("template.js"));
+        assert_eq!(TEMPLATE_JS, upstream_template_js_with_documented_renames());
         assert_eq!(MARKED_JS, upstream_asset("vendor/marked.min.js"));
         assert_eq!(HIGHLIGHT_JS, upstream_asset("vendor/highlight.min.js"));
     }
