@@ -100,6 +100,16 @@ const SUBMIT_FOOTER_ROWS: usize = 5;
 /// rendered pane at the model width with `option_index` overridden. Pure —
 /// `preview::compose`/`multi_select::render` are stateless functions of
 /// the state clone.
+///
+/// `input_mode` is forced **off** in every probe: the worst-case footprint
+/// must stay invariant while the highlight sits on the "Type something."
+/// row (where `preview::compose` collapses to the bare full-width list —
+/// the input-mode body is provably ≤ the preview-mode body: the list
+/// wraps no wider at the full pane width than the side-by-side left
+/// column does, and every layout adds the preview block on top). Probing
+/// with the live `input_mode` made the worst case itself collapse, so
+/// nothing padded the input-mode frame and the overlay jumped as focus
+/// entered/left the input row (real-session report after rc.8).
 fn tab_body_height(model: &DialogModel<'_>, tab: usize, option_index: usize) -> usize {
     let Some(question) = model.questions.get(tab) else {
         return 0;
@@ -112,6 +122,7 @@ fn tab_body_height(model: &DialogModel<'_>, tab: usize, option_index: usize) -> 
     let mut state = model.state.clone();
     state.current_tab = tab;
     state.option_index = option_index;
+    state.input_mode = false;
     if question.multi_select == Some(true) {
         multi_select::render(
             &state,
@@ -185,24 +196,42 @@ fn residual_spacer_rows(
     (global_body_height(model) + max_footer).saturating_sub(active_body + active_footer)
 }
 
-/// `renderFitsTerminal` (dialog-builder.ts:65-67 + 216-218): append the
-/// residual spacer rows, but only when the padded frame still fits the
-/// height budget — the overflow branch (scroll window) never pads.
-fn append_residual_spacer(
+/// `renderFitsTerminal` (dialog-builder.ts:65-67 + 216-218): pad the
+/// active body up to the worst-case footprint, but only when the padded
+/// frame still fits the height budget — the overflow branch (scroll
+/// window) never pads.
+///
+/// [VARIANT] placement: upstream appends the blank rows **after** the
+/// footer hint (`[...natural, ...spacer]`), which is invisible under its
+/// bottom border — but the rpi frame has no border and the overlay is
+/// bottom-anchored, so trailing blanks left the hint `spacer` rows above
+/// the terminal bottom edge (real-session report after rc.8: the
+/// Submit-tab hint floated far above the bottom, reading as dead space).
+/// Inserting the pad **above** the footer block keeps the row total — the
+/// height-stability contract — identical while the hint stays the frame's
+/// last row, flush with the overlay's bottom edge.
+fn insert_residual_spacer(
     model: &DialogModel<'_>,
     active_body: usize,
     active_footer: usize,
+    footer_start: usize,
     lines: &mut Vec<String>,
-) {
+) -> usize {
     let spacer = residual_spacer_rows(model, active_body, active_footer);
     if spacer == 0 {
-        return;
+        return 0;
     }
     let fits = model
         .height
         .is_none_or(|budget| lines.len() + spacer <= budget);
     if fits {
-        lines.extend(std::iter::repeat_n(String::new(), spacer));
+        lines.splice(
+            footer_start..footer_start,
+            std::iter::repeat_n(String::new(), spacer),
+        );
+        spacer
+    } else {
+        0
     }
 }
 
@@ -322,6 +351,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             model.width,
         ));
         let answers_rows = lines.len() - answers_start;
+        let footer_start = lines.len();
         lines.push(String::new());
         lines.push(submit::render_prompt(
             model.state,
@@ -354,7 +384,18 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         // notes editor above is mid-rows, excluded like upstream's
         // `midRows`, tab-content-strategy.ts:181-186). Body = answers.
         let submit_footer_rows = 1 + 1 + picker_rows + 1;
-        append_residual_spacer(model, answers_rows, submit_footer_rows, &mut lines);
+        let inserted = insert_residual_spacer(
+            model,
+            answers_rows,
+            submit_footer_rows,
+            footer_start,
+            &mut lines,
+        );
+        // The pad lands above the footer block, so every row anchor at or
+        // below `footer_start` (picker focus, notes cursor) shifts down.
+        let picker_start = picker_start + inserted;
+        focused_range = focused_range.map(|(start, end)| (start + inserted, end + inserted));
+        cursor = cursor.map(|(row, column)| (row + inserted, column));
         return finish(model, lines, cursor, focused_range, picker_start);
     }
 
@@ -421,6 +462,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         }
         cursor = cursor.or(notes_cursor);
     }
+    let footer_start = lines.len();
     lines.push(String::new());
     lines.push(truncate_line(
         &model.theme.dim(&build_hint_text(
@@ -436,7 +478,13 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
     // Height stabilization (dialog-builder.ts:207-218): body = the pane
     // rows just rendered; footer = blank + one-line hint (the notes editor
     // above the footer is mid-rows, excluded from the residual math).
-    append_residual_spacer(model, body_rows, QUESTION_FOOTER_ROWS, &mut lines);
+    insert_residual_spacer(
+        model,
+        body_rows,
+        QUESTION_FOOTER_ROWS,
+        footer_start,
+        &mut lines,
+    );
 
     finish(model, lines, cursor, focused_range, body_start)
 }
@@ -642,6 +690,28 @@ mod tests {
         }
     }
 
+    /// Preview-bearing fixture whose worst-case preview body is clearly
+    /// taller than the bare option list (the input-mode body).
+    fn preview_question() -> QuestionData {
+        QuestionData {
+            question: "Pick one?".to_owned(),
+            header: "H".to_owned(),
+            options: vec![
+                OptionData {
+                    label: "Short".to_owned(),
+                    description: "one-line summary".to_owned(),
+                    preview: Some("# Long\n\n## Header\n\n- Item one\n- Item two\n- Item three\n\n```\ncode block row\n```\n\nTrailing paragraph.".to_owned()),
+                },
+                OptionData {
+                    label: "Tiny".to_owned(),
+                    description: "tiny preview".to_owned(),
+                    preview: Some("# Tiny\n\n`ok`".to_owned()),
+                },
+            ],
+            multi_select: None,
+        }
+    }
+
     #[test]
     fn single_question_layout_has_header_heading_options_and_hint() {
         let i18n = I18n::for_locale("en");
@@ -679,14 +749,44 @@ mod tests {
         let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
         assert!(plain[0].contains("□ H"), "{plain:?}");
         assert_eq!(plain[2], "Review your answers");
+        // The residual spacer pads the empty answers body up to the
+        // worst-case footprint ABOVE the footer block, so the prompt /
+        // picker / hint anchor at the bottom of the frame — locate them by
+        // content, not fixed offsets.
+        let prompt = plain
+            .iter()
+            .position(|line| line.starts_with("⚠ Answer remaining questions"))
+            .expect("prompt");
         assert_eq!(
-            plain[5],
+            plain[prompt],
             "⚠ Answer remaining questions before submitting: H, H"
         );
-        assert!(plain[6].starts_with("→ 1. Submit answers"), "{plain:?}");
-        assert!(plain[7].starts_with("  2. Cancel"), "{plain:?}");
-        assert!(plain[8].starts_with("Enter to select"), "{plain:?}");
-        assert!(!plain[8].contains("collapse"), "off disables the hint");
+        assert!(
+            plain[prompt + 1].starts_with("→ 1. Submit answers"),
+            "{plain:?}"
+        );
+        assert!(plain[prompt + 2].starts_with("  2. Cancel"), "{plain:?}");
+        let hint = plain.last().expect("hint");
+        assert!(hint.starts_with("Enter to select"), "{plain:?}");
+        assert!(!hint.contains("collapse"), "off disables the hint");
+        // Height stability across tabs: the submit frame is as tall as the
+        // worst-case question frame (spacer rows included).
+        let question_state = QuestionnaireState::initial();
+        let question_frame = render(&model(
+            &question_state,
+            &questions,
+            &items,
+            &i18n,
+            &theme,
+            "",
+            "off",
+            60,
+        ));
+        assert_eq!(
+            frame.lines.len(),
+            question_frame.lines.len(),
+            "submit and question frames share the stable footprint"
+        );
     }
 
     #[test]
@@ -712,6 +812,102 @@ mod tests {
         let editing = build_submit_hint_text(&editing, &i18n);
         assert!(!editing.contains("n to add a note"), "{editing}");
         assert!(editing.contains("Shift+Enter for newline"), "{editing}");
+    }
+
+    /// Real-session regression (post-rc.8): moving the highlight onto the
+    /// "Type something." row enters input mode, which hides the preview
+    /// pane — the worst-case footprint must stay computed WITHOUT input
+    /// mode so the residual spacer absorbs the shorter body and the total
+    /// frame height does not jump. Both layouts (side-by-side 120,
+    /// stacked 80) and the hint-pinned-at-bottom invariant are covered.
+    #[test]
+    fn focus_on_type_something_keeps_total_frame_height() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![preview_question()];
+        let items = vec![build_items_for_question(&questions[0], &i18n)];
+        for width in [80, 120] {
+            let resting = render(&model(
+                &QuestionnaireState::initial(),
+                &questions,
+                &items,
+                &i18n,
+                &theme,
+                "",
+                "ctrl+]",
+                width,
+            ));
+            let mut input = QuestionnaireState::initial();
+            input.option_index = 2; // onto "Type something."
+            input.input_mode = true;
+            let typing = render(&model(
+                &input, &questions, &items, &i18n, &theme, "", "ctrl+]", width,
+            ));
+            assert_eq!(
+                resting.lines.len(),
+                typing.lines.len(),
+                "width {width}: focus entering the input row must not change the frame height"
+            );
+            // The preview really is hidden in input mode (the body IS
+            // shorter) — the equality above is the spacer doing its job.
+            assert!(
+                resting.lines.iter().any(|line| line.contains('┌')),
+                "width {width}: resting frame shows the preview box"
+            );
+            assert!(
+                !typing.lines.iter().any(|line| line.contains('┌')),
+                "width {width}: input-mode frame hides the preview box"
+            );
+            // The residual pad sits ABOVE the footer: the hint is the
+            // frame's last row, flush with the overlay's bottom edge.
+            for frame in [&resting, &typing] {
+                let last = strip_ansi(frame.lines.last().expect("hint"));
+                assert!(
+                    last.starts_with("Enter to select"),
+                    "width {width}: hint pinned to the bottom, got {last:?}"
+                );
+            }
+        }
+    }
+
+    /// Real-session regression (post-rc.8): the Submit tab's residual pad
+    /// used to trail BELOW the hint, floating it far above the overlay's
+    /// bottom edge. The pad now lands between the answers and the footer
+    /// block, and every row anchor below the insertion (picker focus,
+    /// notes cursor) shifts with it.
+    #[test]
+    fn submit_tab_spacer_pads_above_the_footer_and_shifts_cursors() {
+        let i18n = I18n::for_locale("en");
+        let theme = Theme::dark();
+        let questions = vec![preview_question(), question(false)];
+        let items = vec![
+            build_items_for_question(&questions[0], &i18n),
+            build_items_for_question(&questions[1], &i18n),
+        ];
+        let mut state = QuestionnaireState::initial();
+        state.current_tab = 2; // Submit
+        state.notes_visible = true;
+        let mut m = model(&state, &questions, &items, &i18n, &theme, "", "off", 100);
+        m.notes_text = "global remark";
+        m.notes_cursor = Some(0);
+        let frame = render(&m);
+        let plain: Vec<String> = frame.lines.iter().map(|line| strip_ansi(line)).collect();
+        let hint = plain.last().expect("hint");
+        assert!(hint.starts_with("Enter to select"), "{plain:?}");
+        assert!(
+            !plain.iter().rev().take(2).any(|line| line.is_empty()),
+            "no blank rows below the footer block: {plain:?}"
+        );
+        // The notes-editor cursor row must land on the draft text after the
+        // spacer insertion shifted the footer block down.
+        if let Some((row, _)) = frame.cursor {
+            assert!(
+                plain[row].contains("global remark"),
+                "cursor row {row} must sit on the notes draft: {plain:?}"
+            );
+        } else {
+            panic!("submit-tab notes editor must report a cursor");
+        }
     }
 
     #[test]
