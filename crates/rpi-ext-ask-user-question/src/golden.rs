@@ -155,6 +155,35 @@ fn preview_question() -> QuestionData {
     }
 }
 
+/// Height-stability scenario (dialog-builder.ts:123/207-212 port gap,
+/// closed after a real-session report): two options whose previews render at
+/// clearly different heights + a second short question — cycling the focused
+/// option and switching tabs must keep the total frame height constant (the
+/// residual spacer pads every shorter body up to the worst-case footprint).
+fn height_stability_questions() -> Vec<QuestionData> {
+    vec![
+        QuestionData {
+            question: "Which report format should the build emit?".to_owned(),
+            header: "Format".to_owned(),
+            options: vec![
+                preview_option(
+                    "Short",
+                    "One-line summary",
+                    "# Short\n\n`ok`",
+                ),
+                preview_option(
+                    "Long",
+                    "Full markdown report",
+                    "# Long\n\n## Header\n\n- Item one with a longer line that wraps\n- Item two\n- Item three\n\n```\ncode block row\n```\n\nTrailing paragraph.",
+                ),
+                preview_option("Medium", "Two sections", "# Medium\n\n- a\n- b\n\n## Tail"),
+            ],
+            multi_select: None,
+        },
+        multi_select_question(),
+    ]
+}
+
 /// Scenario name, questions, and the key script (each event yields one frame).
 fn scenarios() -> Vec<(&'static str, Vec<QuestionData>, Vec<&'static str>)> {
     vec![
@@ -240,6 +269,15 @@ fn scenarios() -> Vec<(&'static str, Vec<QuestionData>, Vec<&'static str>)> {
                 "\r",   // confirm
             ],
         ),
+        // Height stability (dialog-builder.ts:207-212): cycle Short → Long →
+        // Medium (three distinct preview heights), then Tab to the
+        // multi-select tab and on to Submit — every frame must have the SAME
+        // total line count (residual spacer pads to the worst case).
+        (
+            "height_stability",
+            height_stability_questions(),
+            vec!["", "\x1b[B", "\x1b[B", "\t", "\t"],
+        ),
     ]
 }
 
@@ -296,6 +334,26 @@ mod tests {
                     .find(|(name, _, _)| render.file.starts_with(name))
                     .map(|(_, _, events)| events.len())
                     .expect("scenario")
+            );
+        }
+    }
+
+    /// dialog-builder.ts:207-212（高度稳定，TE31 移植缺口修复）：同一场景内
+    /// 切换选项（不同预览高度）与切换 tab（题目 tab → 多选 tab → Submit），
+    /// 每帧总行数必须恒等——残差垫行把较矮的 body 垫到 worst-case 足迹。
+    #[test]
+    fn height_stability_scenario_keeps_total_frame_height_constant() {
+        for width in WIDTHS {
+            let renders = renders();
+            let scenario = renders
+                .iter()
+                .find(|render| render.file == format!("height_stability-{width}.jsonl"))
+                .expect("height_stability frames");
+            let heights: Vec<usize> = scenario.frames.iter().map(|f| f.lines.len()).collect();
+            let first = heights[0];
+            assert!(
+                heights.iter().all(|&h| h == first),
+                "width {width}: frame heights must be constant across option/tab switches, got {heights:?}"
             );
         }
     }

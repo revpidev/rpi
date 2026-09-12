@@ -34,8 +34,8 @@ fn golden_frames_match_committed_baseline() {
     let renders = golden::renders();
     assert_eq!(
         renders.len(),
-        24,
-        "8 scenarios x 3 widths (single / four / multi / input / submit / preview / notes / collapse)"
+        27,
+        "9 scenarios x 3 widths (single / four / multi / input / submit / preview / notes / collapse / height-stability)"
     );
 
     let mut expected_files: BTreeSet<String> = BTreeSet::new();

@@ -86,6 +86,126 @@ pub struct DialogModel<'a> {
     pub height: Option<usize>,
 }
 
+/// `QuestionTabStrategy.footerRowCount` (tab-content-strategy.ts:96-97):
+/// `Spacer(1)` + the one-line hint = 2 rendered rows.
+const QUESTION_FOOTER_ROWS: usize = 2;
+
+/// `SubmitTabStrategy.footerRowCount` (tab-content-strategy.ts:171-172):
+/// `Spacer(1)` + prompt + submit picker (2 rows) + hint = 5 rendered rows.
+const SUBMIT_FOOTER_ROWS: usize = 5;
+
+/// Body height of one tab with a hypothetical focused option
+/// (`PreviewPane.naturalHeight` / `MultiSelectView.naturalHeight` via the
+/// per-tab body-height computers, build-questionnaire.ts:65-91): the
+/// rendered pane at the model width with `option_index` overridden. Pure —
+/// `preview::compose`/`multi_select::render` are stateless functions of
+/// the state clone.
+fn tab_body_height(model: &DialogModel<'_>, tab: usize, option_index: usize) -> usize {
+    let Some(question) = model.questions.get(tab) else {
+        return 0;
+    };
+    let items = model
+        .items_by_tab
+        .get(tab)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut state = model.state.clone();
+    state.current_tab = tab;
+    state.option_index = option_index;
+    if question.multi_select == Some(true) {
+        multi_select::render(
+            &state,
+            question,
+            model.i18n,
+            model.theme,
+            model.input_text,
+            model.input_cursor,
+            model.width,
+            tab + 1 == model.questions.len(),
+        )
+        .lines
+        .len()
+    } else {
+        preview::compose(
+            &state,
+            question,
+            items,
+            model.questions,
+            model.items_by_tab,
+            model.i18n,
+            model.theme,
+            model.input_text,
+            model.input_cursor,
+            model.terminal_width,
+            model.width,
+        )
+        .lines
+        .len()
+    }
+}
+
+/// `buildHeightComputers.global` (build-questionnaire.ts:232-240): the
+/// worst-case body height across **all tabs and options** — "Determines
+/// the stable overall dialog footprint" (dialog-builder.ts:123).
+/// Multi-select tabs contribute their single natural height
+/// (`current == max`, build-questionnaire.ts:85-91); preview tabs
+/// contribute the max over every option's pane (`maxNaturalHeight`,
+/// preview-pane.ts:176+). Floored at 1 like upstream.
+fn global_body_height(model: &DialogModel<'_>) -> usize {
+    let mut max = 0usize;
+    for tab in 0..model.questions.len() {
+        if let Some(question) = model.questions.get(tab) {
+            let option_count = question.options.len().max(1);
+            for option in 0..option_count {
+                max = max.max(tab_body_height(model, tab, option));
+            }
+        }
+    }
+    max.max(1)
+}
+
+/// `DialogView.render`'s residual spacer (dialog-builder.ts:207-212):
+/// `max(0, getBodyHeight + maxFooterRowCount − bodyHeight −
+/// footerRowCount)` — pads the currently active (possibly shorter) body up
+/// to the worst-case footprint so the total dialog height stays stable
+/// across option switches and tab switches (TE31 port gap closed after a
+/// real-session report: switching between options whose previews render at
+/// different heights made the overlay jump).
+fn residual_spacer_rows(
+    model: &DialogModel<'_>,
+    active_body: usize,
+    active_footer: usize,
+) -> usize {
+    let is_multi = model.questions.len() > 1;
+    let max_footer = if is_multi {
+        QUESTION_FOOTER_ROWS.max(SUBMIT_FOOTER_ROWS)
+    } else {
+        QUESTION_FOOTER_ROWS
+    };
+    (global_body_height(model) + max_footer).saturating_sub(active_body + active_footer)
+}
+
+/// `renderFitsTerminal` (dialog-builder.ts:65-67 + 216-218): append the
+/// residual spacer rows, but only when the padded frame still fits the
+/// height budget — the overflow branch (scroll window) never pads.
+fn append_residual_spacer(
+    model: &DialogModel<'_>,
+    active_body: usize,
+    active_footer: usize,
+    lines: &mut Vec<String>,
+) {
+    let spacer = residual_spacer_rows(model, active_body, active_footer);
+    if spacer == 0 {
+        return;
+    }
+    let fits = model
+        .height
+        .is_none_or(|budget| lines.len() + spacer <= budget);
+    if fits {
+        lines.extend(std::iter::repeat_n(String::new(), spacer));
+    }
+}
+
 /// `buildHintText` — the question-tab footer.
 pub fn build_hint_text(
     question: Option<&QuestionData>,
@@ -193,6 +313,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             model.width,
         ));
         lines.push(String::new());
+        let answers_start = lines.len();
         lines.extend(submit::render_answers(
             model.state,
             model.questions,
@@ -200,6 +321,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
             model.theme,
             model.width,
         ));
+        let answers_rows = lines.len() - answers_start;
         lines.push(String::new());
         lines.push(submit::render_prompt(
             model.state,
@@ -210,6 +332,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         ));
         let picker_start = lines.len();
         let picker = submit::render_picker(model.state, model.i18n, model.theme, model.width);
+        let picker_rows = picker.lines.len();
         lines.extend(picker.lines);
         if let Some((start, end)) = picker.focused_range {
             focused_range = Some((picker_start + start, picker_start + end));
@@ -227,6 +350,11 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
                 .dim(&build_submit_hint_text(model.state, model.i18n)),
             model.width,
         ));
+        // Submit-tab footer = blank + prompt + picker rows + hint (the
+        // notes editor above is mid-rows, excluded like upstream's
+        // `midRows`, tab-content-strategy.ts:181-186). Body = answers.
+        let submit_footer_rows = 1 + 1 + picker_rows + 1;
+        append_residual_spacer(model, answers_rows, submit_footer_rows, &mut lines);
         return finish(model, lines, cursor, focused_range, picker_start);
     }
 
@@ -284,6 +412,7 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
     if let Some((start, end)) = body.focused_range {
         focused_range = Some((body_start + start, body_start + end));
     }
+    let body_rows = body.lines.len();
     lines.extend(body.lines);
     if model.state.notes_visible {
         let (range, notes_cursor) = push_notes_editor(model, &mut lines, false);
@@ -303,6 +432,11 @@ pub fn render(model: &DialogModel<'_>) -> RenderedFrame {
         )),
         model.width,
     ));
+
+    // Height stabilization (dialog-builder.ts:207-218): body = the pane
+    // rows just rendered; footer = blank + one-line hint (the notes editor
+    // above the footer is mid-rows, excluded from the residual math).
+    append_residual_spacer(model, body_rows, QUESTION_FOOTER_ROWS, &mut lines);
 
     finish(model, lines, cursor, focused_range, body_start)
 }

@@ -1,6 +1,6 @@
 # ask-user-question parity report (TE28/TE29/TE30/TE31 G3/G12 — preview group added by TE31)
 
-generated: 2026-09-11T14:34:31.155Z
+generated: 2026-09-12T02:40:30.130Z
 upstream submodule: external/rpiv-mono/packages/rpiv-ask-user-question
 submodule HEAD: 338b264c1ca4fd8828cc849b632f4f7ad88d2e78 (pinned 338b264c1ca4fd8828cc849b632f4f7ad88d2e78)
 typebox: 1.3.6
@@ -256,6 +256,9 @@ typebox: 1.3.6
 - four_questions-100.jsonl: MATCH (6 frames)
 - four_questions-120.jsonl: MATCH (6 frames)
 - four_questions-80.jsonl: MATCH (6 frames)
+- height_stability-100.jsonl: MATCH (5 frames)
+- height_stability-120.jsonl: MATCH (5 frames)
+- height_stability-80.jsonl: MATCH (5 frames)
 - input_draft-100.jsonl: MATCH (9 frames)
 - input_draft-120.jsonl: MATCH (9 frames)
 - input_draft-80.jsonl: MATCH (9 frames)
