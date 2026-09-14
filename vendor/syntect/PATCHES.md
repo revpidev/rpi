@@ -29,7 +29,7 @@ linking, which needs the grammar YAML sources syntect-assets does not ship).
 
 ## Patches
 
-Exactly two, additive, no behavior change:
+Two source patches (additive, no behavior change):
 
 ```diff
 --- a/src/parsing/syntax_set.rs
@@ -58,6 +58,12 @@ Exactly two, additive, no behavior change:
 (The enum itself keeps its `#[non_exhaustive]`; only the variant attributes
 are dropped so the variants can be constructed from `build.rs`.)
 
+Plus one mechanical layout conversion, no code change: the two `mod.rs`
+files were moved to sibling files (`src/parsing/mod.rs` → `src/parsing.rs`,
+`src/highlighting/mod.rs` → `src/highlighting.rs`) to satisfy the repo's
+mandatory "no `mod.rs`" module-style rule (rpi-docs coding-standards §3.1);
+module resolution is identical in the Rust 2018 layout.
+
 ## Trimmed relative to the registry archive
 
 Not needed to build the library as a dependency (keeps the vendored tree at
@@ -70,7 +76,9 @@ dependency manifests are ignored by cargo anyway).
 ## Upgrading
 
 When bumping syntect: re-vendor the new registry archive, re-apply the two
-patches above (they are intentionally trivial), and re-trim as listed.
-`crates/rpi/build.rs` then fails the build loudly if the new version's syntax
-dump contains fancy-incompatible regexes outside `FANCY_INCOMPATIBLE`, or if
-any rewritten reference cannot be resolved.
+patches above (they are intentionally trivial), re-apply the layout
+conversion (`git mv src/parsing/mod.rs src/parsing.rs` and
+`git mv src/highlighting/mod.rs src/highlighting.rs`), and re-trim as
+listed. `crates/rpi/build.rs` then fails the build loudly if the new
+version's syntax dump contains fancy-incompatible regexes outside
+`FANCY_INCOMPATIBLE`, or if any rewritten reference cannot be resolved.
