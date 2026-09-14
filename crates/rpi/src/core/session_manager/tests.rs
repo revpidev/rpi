@@ -3098,3 +3098,51 @@ fn branch_summary_from_id_is_pre_navigation_leaf() {
     }
     let _ = id1;
 }
+
+/// rc.12 review (test gap): a corrupted `parent_id` chain that loops back on
+/// itself (a << b, b << a) must terminate at the first revisit in
+/// `build_session_path` — the P2-6 guard had zero coverage, so a regression
+/// would hang every session load on such a file instead of failing a test.
+#[test]
+fn build_session_context_parent_id_cycle_stops_at_revisit() {
+    let entries = vec![
+        msg("m1", Some("m2"), user_msg("a")),
+        msg("m2", Some("m1"), user_msg("b")),
+    ];
+    let context = build_session_context(&entries, Some("m2"));
+    // The walk from m2 visits m2 then m1, then revisits m2 and stops —
+    // each entry appears exactly once, and the call returns.
+    let texts: Vec<&str> = context
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => match &user.content {
+                UserContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["a", "b"],
+        "cycle walked once, leaf-to-root order"
+    );
+}
+
+/// Same guard for `path_to_root_or_compaction` (the harness-side consumer
+/// of the stored history).
+#[test]
+fn path_to_root_or_compaction_parent_id_cycle_stops_at_revisit() {
+    let entries = vec![
+        msg("m1", Some("m2"), user_msg("a")),
+        msg("m2", Some("m1"), user_msg("b")),
+    ];
+    let path = path_to_root_or_compaction(&entries, Some("m2")).expect("path");
+    let ids: Vec<&str> = path.iter().map(|entry| entry.id()).collect();
+    assert_eq!(
+        ids,
+        vec!["m1", "m2"],
+        "cycle walked once, root-to-leaf order"
+    );
+}

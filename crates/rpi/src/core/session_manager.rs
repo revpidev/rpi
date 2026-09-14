@@ -596,24 +596,24 @@ pub fn load_entries_from_file(file_path: &Path) -> Vec<Value> {
     }
     // Repair an unterminated final line: append a `\n` so the next
     // `appendEntry` cannot glue onto the partial tail (0b5ee5d8b, #8345,
-    // session-manager.ts:555 — runs only after the header validates; an
-    // append failure propagates like upstream `appendFileSync`).
+    // session-manager.ts:555 — runs only after the header validates). An
+    // append failure propagates like upstream `appendFileSync` throwing
+    // out of the loader: a half-repaired file is exactly the glued-line
+    // corruption the repair exists to prevent, so the load fails (rc.12
+    // review — previously warned and continued, contradicting this
+    // comment).
     if trailing_partial {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new().append(true).open(&resolved);
-        match &mut file {
-            Ok(handle) => {
-                if let Err(error) = handle.write_all(b"\n") {
-                    tracing::warn!(
-                        "failed to terminate partial session line in {}: {error}",
-                        resolved.display()
-                    );
-                }
-            }
-            Err(error) => tracing::warn!(
-                "failed to open session file for line termination {}: {error}",
+        let repair = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&resolved)
+            .and_then(|mut handle| handle.write_all(b"\n"));
+        if let Err(error) = repair {
+            tracing::error!(
+                "failed to terminate partial session line in {}: {error}",
                 resolved.display()
-            ),
+            );
+            return Vec::new();
         }
     }
     entries
