@@ -201,8 +201,9 @@ mod tests {
             .iter()
             .map(|provider| catalog.models(provider).len())
             .sum();
-        // V14-09 regen @ 9841914 rules (models.dev snapshot 2026-09-05).
-        assert_eq!(total, 1354);
+        // rc.13 catalog-only regen @ 71dca871b rules (models.dev snapshot
+        // 2026-09-14).
+        assert_eq!(total, 1397);
         // The dynamic radius provider has no catalog entry (upstream all.ts).
         assert!(!catalog.providers().contains(&"radius"));
     }

@@ -155,7 +155,7 @@ fn test_catalog_field_by_field_roundtrip() {
             total += 1;
         }
     }
-    assert_eq!(total, 1354);
+    assert_eq!(total, 1397);
 }
 
 /// FR-E R2 (V14-09): every `compat` key present in the vendored JSON must
@@ -202,10 +202,10 @@ fn test_catalog_accessors_and_generated_at() {
         }
     }
     // Pinned to the vendored .manifest.json generatedAt
-    // (2026-09-05T15:49:58.041Z); update on catalog refresh.
+    // (2026-09-14T02:27:28.134Z); update on catalog refresh.
     assert_eq!(
         get_builtin_model_data_generated_at(),
-        Some(1_788_623_398_041)
+        Some(1_789_352_848_134)
     );
 }
 
@@ -314,13 +314,13 @@ fn test_baseten_env_key_resolution() {
 #[test]
 fn test_baseten_deprecated_models_filtered() {
     let models = get_builtin_models("baseten");
-    // 20 models = upstream catalog after deprecated filtering (V14-09
-    // regen; models.dev added the GLM-5.3 family, Kimi K2.7-Code, Nemotron-3
-    // Ultra and inkling-small since the previous vendored snapshot).
+    // 21 models = upstream catalog after deprecated filtering (rc.13 regen;
+    // models.dev added DeepSeek-V4.1-Flash since the previous vendored
+    // snapshot).
     assert_eq!(
         models.len(),
-        20,
-        "Baseten should have 20 non-deprecated models"
+        21,
+        "Baseten should have 21 non-deprecated models"
     );
     // No model name or id contains "deprecated".
     for model in models.iter() {

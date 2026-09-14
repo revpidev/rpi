@@ -84,7 +84,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.deepseek.com",
         "DeepSeek API key",
         "DEEPSEEK_API_KEY",
-        3,
+        2, // rc.13 catalog refresh: v4-flash/v4-flash-vision-exp consolidated to deepseek-flash
     ),
     spec(
         fireworks_provider,
@@ -93,7 +93,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.fireworks.ai/inference",
         "Fireworks API key",
         "FIREWORKS_API_KEY",
-        20,
+        23, // rc.13 catalog refresh
     ),
     spec(
         groq_provider,
@@ -111,7 +111,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://router.huggingface.co/v1",
         "Hugging Face token",
         "HF_TOKEN",
-        71,
+        75, // rc.13 catalog refresh
     ),
     spec(
         nvidia_provider,
@@ -129,7 +129,7 @@ const FACTORIES: [FactorySpec; 12] = [
         "https://api.together.ai/v1",
         "Together API key",
         "TOGETHER_API_KEY",
-        21,
+        22, // rc.13 catalog refresh
     ),
     spec(
         xai_provider,
@@ -453,6 +453,10 @@ fn fireworks_kimi_k2_6_anthropic_catalog_entry() {
             supports_eager_tool_input_streaming: Some(false),
             supports_cache_control_on_tools: Some(false),
             supports_long_cache_retention: Some(false),
+            // rc.13 catalog refresh (upstream 6b94ae2ec/d92eb8d4b-era
+            // Fireworks compat updates).
+            allow_empty_signature: Some(true),
+            supports_tool_references: Some(true),
             ..ModelCompat::default()
         })
     );

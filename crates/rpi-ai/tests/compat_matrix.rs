@@ -330,7 +330,9 @@ fn test_catalog_openai_grammar_tools_baked() {
     assert_eq!(compat.supports_open_ai_grammar_tools, Some(true));
     assert_eq!(compat.supports_strict_mode, Some(true));
 
-    let codex = get_builtin_model("openai-codex", "gpt-5.4").expect("codex gpt-5.4");
+    // GPT-5.4 retired upstream (2e6fe2f98); the grammar-tool assertion moved
+    // to gpt-5.5 with it.
+    let codex = get_builtin_model("openai-codex", "gpt-5.5").expect("codex gpt-5.5");
     let compat = codex.compat.as_ref().expect("compat");
     assert_eq!(compat.supports_open_ai_grammar_tools, Some(true));
     assert_eq!(compat.supports_tool_search, Some(true));

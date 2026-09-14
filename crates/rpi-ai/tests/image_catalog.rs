@@ -4,10 +4,13 @@
 //! (`model_catalog.rs`); the image catalog
 //! (`src/images/generated.rs`, upstream
 //! `packages/ai/src/image-models.generated.ts`) had zero coverage and
-//! silently fell two models behind upstream. This test parses the checked-in
-//! upstream TS literal and compares it model-by-model against
-//! `rpi_ai::images::generated::image_models()`, so upstream drift fails CI
-//! loudly instead of lagging unnoticed.
+//! silently fell two models behind upstream. This test parses the vendored
+//! reference TS literal (`src/images/image-models.generated.ts`, rc.13:
+//! checked in next to the transcription — the pinned `external/pi`
+//! submodule's generated data is intentionally stale after catalog-only
+//! refreshes, same rationale as `model_catalog.rs` V14-09) and compares it
+//! model-by-model against `rpi_ai::images::generated::image_models()`, so
+//! transcription drift fails the gate loudly instead of lagging unnoticed.
 
 use std::path::PathBuf;
 
@@ -16,11 +19,11 @@ use rpi_ai::types::{ImagesModel, ImagesOutputModality, InputModality};
 
 fn upstream_ts_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../external/pi/packages/ai/src/image-models.generated.ts")
+        .join("src/images/image-models.generated.ts")
         .canonicalize()
         .expect(
-            "upstream image-models.generated.ts not found \
-             (submodule external/pi must be checked out)",
+            "vendored image-models.generated.ts reference not found \
+             (refresh flow: regenerate upstream, vendor here + transcribe)",
         )
 }
 
@@ -63,9 +66,15 @@ fn ts_array_field(line: &str, key: &str) -> Option<Vec<String>> {
 }
 
 /// Extract a number from a line like `cacheRead: 0,` inside a `cost` block.
+/// The generator quotes the cost keys in newer formats (71dca871b+:
+/// `"cacheRead": 0,`) — accept both shapes.
 fn ts_number_field(line: &str, key: &str) -> Option<f64> {
     let t = line.trim();
-    let rest = t.strip_prefix(key)?.strip_prefix(':')?.trim_start();
+    let unquoted = t.strip_prefix(key).and_then(|rest| rest.strip_prefix(':'));
+    let quoted = t
+        .strip_prefix(&format!("\"{key}\""))
+        .and_then(|rest| rest.strip_prefix(':'));
+    let rest = unquoted.or(quoted)?.trim_start();
     rest.trim_end_matches(',').parse().ok()
 }
 
@@ -80,8 +89,10 @@ fn parse_upstream_models(ts: &str) -> Vec<UpstreamImageModel> {
     while let Some(line) = lines.next() {
         let t = line.trim();
         // Model entry header: a quoted key followed by `: {`. The provider
-        // group key (`openrouter: {`) is unquoted and skipped.
-        if !(t.starts_with('"') && t.ends_with(": {")) {
+        // group key is skipped whether unquoted (`openrouter: {`, generator
+        // @ 9841914) or quoted (`"openrouter": {`, @ 71dca871b+).
+        let is_provider_group = t == "openrouter: {" || t == "\"openrouter\": {";
+        if is_provider_group || !(t.starts_with('"') && t.ends_with(": {")) {
             continue;
         }
         let key = t[1..t.len() - 4].to_owned();
@@ -102,7 +113,7 @@ fn parse_upstream_models(ts: &str) -> Vec<UpstreamImageModel> {
             if t.starts_with("} satisfies") {
                 break;
             }
-            if t.starts_with("cost: {") {
+            if t.starts_with("cost:") && t.trim_end().ends_with('{') {
                 for cost_line in lines.by_ref() {
                     let c = cost_line.trim();
                     if c.starts_with('}') {
@@ -163,13 +174,13 @@ fn test_image_catalog_matches_upstream_model_for_model() {
     let ts = std::fs::read_to_string(&ts_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", ts_path.display()));
     let upstream = parse_upstream_models(&ts);
-    // Pin the upstream total (pi @ 9841914, image literal refreshed by
-    // 5ce4afbd9): guards against the parser silently dropping blocks after
-    // an upstream format change.
+    // Pin the vendored-reference total (rc.13 catalog-only refresh @
+    // 71dca871b, 54 models): guards against the parser silently dropping
+    // blocks after an upstream format change.
     assert_eq!(
         upstream.len(),
-        50,
-        "upstream parser found {} model blocks, expected 50 \
+        54,
+        "upstream parser found {} model blocks, expected 54 \
          (upstream format may have changed)",
         upstream.len()
     );

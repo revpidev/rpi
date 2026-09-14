@@ -1,5 +1,5 @@
-//! Port of `packages/ai/src/image-models.generated.ts` @ 9841914 (5ce4afbd9
-//! refreshed the generated literal; 42 → 50 models).
+//! Port of `packages/ai/src/image-models.generated.ts` @ 71dca871b (rc.13 catalog-only refresh of 5ce4afbd9
+//! refreshed the generated literal; 42 → 50 models, rc.13 → 54).
 //!
 //! The image-generation catalog (upstream `IMAGE_MODELS`), transcribed
 //! structure-identically from the checked-in TS literal: one provider
@@ -349,7 +349,7 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 },
                 ImagesModel {
                     id: "microsoft/mai-image-2.5".to_owned(),
-                    name: "Microsoft: MAI-Image-2.5".to_owned(),
+                    name: "Microsoft AI: MAI-Image-2.5".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
@@ -368,7 +368,7 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 },
                 ImagesModel {
                     id: "microsoft/mai-image-2.5-pro".to_owned(),
-                    name: "Microsoft: MAI-Image-2.5 Pro".to_owned(),
+                    name: "Microsoft AI: MAI-Image-2.5 Pro".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
@@ -377,6 +377,44 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                     cost: ModelCost {
                         rates: ModelCostRates {
                             input: 5.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "microsoft/mai-image-2.6".to_owned(),
+                    name: "Microsoft AI: MAI-Image-2.6".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 5.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "microsoft/mai-image-2.6-flash".to_owned(),
+                    name: "Microsoft AI: MAI-Image-2.6 Flash".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 1.75,
                             output: 0.0,
                             cache_read: 0.0,
                             cache_write: 0.0,
@@ -483,6 +521,44 @@ pub fn image_models() -> &'static [(&'static str, Vec<ImagesModel>)] {
                 ImagesModel {
                     id: "openai/gpt-image-2".to_owned(),
                     name: "OpenAI: GPT Image 2".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 8.0,
+                            output: 8.0,
+                            cache_read: 2.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "openai/gpt-image-2.5-flare".to_owned(),
+                    name: "OpenAI: GPT Image 2.5 Flare".to_owned(),
+                    api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
+                    provider: "openrouter".to_owned(),
+                    base_url: "https://openrouter.ai/api/v1".to_owned(),
+                    input: vec![InputModality::Text, InputModality::Image],
+                    output: vec![ImagesOutputModality::Image],
+                    cost: ModelCost {
+                        rates: ModelCostRates {
+                            input: 8.0,
+                            output: 8.0,
+                            cache_read: 2.0,
+                            cache_write: 0.0,
+                        },
+                        tiers: None,
+                    },
+                    headers: None,
+                },
+                ImagesModel {
+                    id: "openai/gpt-image-2.5-sunburst".to_owned(),
+                    name: "OpenAI: GPT Image 2.5 Sunburst".to_owned(),
                     api: ImagesApiKind(ImagesApiKind::OPENROUTER_IMAGES.to_owned()),
                     provider: "openrouter".to_owned(),
                     base_url: "https://openrouter.ai/api/v1".to_owned(),
