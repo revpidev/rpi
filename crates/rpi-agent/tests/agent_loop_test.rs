@@ -2683,3 +2683,70 @@ async fn parallel_task_panic_still_emits_tool_execution_end_for_missing_slot() {
     // The loop still converges to the next assistant turn.
     assert_eq!(call_count(&state), 2);
 }
+
+// ---------------------------------------------------------------------------
+// rc.12 review (P2): the same containment for SEQUENTIAL batches — a
+// panicking tool must produce an error tool-result pair, not kill the run
+// task (pre-fix: the panic skipped `run_agent_prompt` cleanup and every
+// later prompt was rejected with "Agent is already processing").
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn sequential_task_panic_is_contained_as_error_tool_result() {
+    let boom_tool = TestTool::new(
+        "boom",
+        Arc::new(|_params, _on_update| {
+            Box::pin(async move {
+                panic!("intentional sequential task panic (rc.12 regression)");
+            })
+        }),
+    );
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools: Some(vec![Arc::new(boom_tool)]),
+    };
+
+    let mut config = test_config();
+    config.tool_execution = ToolExecutionMode::Sequential;
+    let script = vec![
+        assistant_message(
+            vec![tool_call("tool-1", "boom", json!({ "value": "x" }))],
+            StopReason::ToolUse,
+        ),
+        text_assistant("done"),
+    ];
+    let (stream_fn, state) = mock_stream_fn(script);
+    let stream = agent_loop(
+        vec![user_message("run it")],
+        context,
+        config,
+        None,
+        stream_fn,
+    );
+    let (events, _messages) = collect(stream).await;
+
+    // start/end pair with an error result, and the loop converges.
+    let start_ids: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(start_ids, vec!["tool-1".to_owned()]);
+    let boom_end = events.iter().find_map(|e| match e {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            is_error,
+            ..
+        } if tool_call_id == "tool-1" => Some(*is_error),
+        _ => None,
+    });
+    assert_eq!(
+        boom_end,
+        Some(true),
+        "panicked sequential tool ends as error: {events:?}"
+    );
+    assert_eq!(call_count(&state), 2, "loop converged to the next turn");
+}

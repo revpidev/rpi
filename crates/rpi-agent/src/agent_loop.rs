@@ -1065,16 +1065,46 @@ async fn execute_tool_calls_sequential(
                 is_error,
             },
             Preparation::Prepared(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, signal, emit).await;
-                finalize_executed_tool_call(
-                    current_context,
-                    assistant_message,
-                    &prepared,
-                    executed,
-                    &config.after_tool_call,
-                    signal,
-                )
-                .await
+                // rc.12 review (P2): a panicking tool must not kill the whole
+                // run — this path previously awaited
+                // `execute_prepared_tool_call` directly on the run task, so a
+                // panic skipped `run_agent_prompt`'s cleanup (the run stayed
+                // active forever; every later prompt was rejected with
+                // "Agent is already processing" until restart). Spawn like
+                // the parallel path and fill the JoinError with an error
+                // result (same containment rc.11 P1-4 established there).
+                let task_emit = emit.clone();
+                let task_context = current_context.clone();
+                let task_assistant_message = assistant_message.clone();
+                let task_after_tool_call = config.after_tool_call.clone();
+                let task_signal = signal.clone();
+
+                let handle = tokio::spawn(async move {
+                    let executed =
+                        execute_prepared_tool_call(&prepared, &task_signal, &task_emit).await;
+                    finalize_executed_tool_call(
+                        &task_context,
+                        &task_assistant_message,
+                        &prepared,
+                        executed,
+                        &task_after_tool_call,
+                        &task_signal,
+                    )
+                    .await
+                });
+                match handle.await {
+                    Ok(finalized) => finalized,
+                    Err(join_error) => {
+                        tracing::error!(%join_error, "sequential tool task failed");
+                        FinalizedToolCallOutcome {
+                            tool_call: tool_call.clone(),
+                            result: create_error_tool_result(format!(
+                                "Tool task failed: {join_error}"
+                            )),
+                            is_error: true,
+                        }
+                    }
+                }
             }
         };
 

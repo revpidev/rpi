@@ -22,8 +22,9 @@ use rpi_agent::compaction::utils::{
     FileOperations, SUMMARIZATION_SYSTEM_PROMPT,
 };
 use rpi_agent::compaction::{
-    calculate_context_tokens, compact, estimate_context_tokens, estimate_tokens, find_cut_point,
-    generate_summary_with_usage, prepare_compaction, CompactionSettings, SummarizationArgs,
+    calculate_context_tokens, compact, complete_summarization, estimate_context_tokens,
+    estimate_tokens, find_cut_point, generate_summary_with_usage, prepare_compaction,
+    CompactionSettings, SummarizationArgs,
 };
 use rpi_agent::messages::AgentMessage;
 use rpi_agent::session::SessionEntry;
@@ -1258,4 +1259,44 @@ async fn branch_summary_output_cap_min_4096_model_max_tokens() {
             "model.maxTokens = {model_max_tokens}"
         );
     }
+}
+
+/// rc.12 review (P2-11 pin): the `options.sessionId ?? uuidv7()` LEFT branch —
+/// a caller-supplied routing id must reach the stream options verbatim. The
+/// existing `sessionId present` assertion only covers the right branch (fresh
+/// uuidv7 when unset), so a regression back to unconditional overwrite would
+/// have passed silently.
+#[tokio::test]
+async fn complete_summarization_preserves_caller_session_id() {
+    let capture = capture_stream_fn(&["SUMMARY"]);
+    let context = Context {
+        system_prompt: None,
+        messages: Vec::new(),
+        tools: None,
+    };
+    let options = rpi_ai::types::StreamOptions {
+        session_id: Some("sess-caller-1".to_owned()),
+        ..rpi_ai::types::StreamOptions::default()
+    };
+    let _ = complete_summarization(
+        &test_model(),
+        &context,
+        &options,
+        &capture.stream_fn,
+        None,
+        None,
+    )
+    .await;
+
+    let (_, captured) = &capture.calls.lock().expect("calls")[0];
+    assert_eq!(
+        captured.session_id.as_deref(),
+        Some("sess-caller-1"),
+        "caller-supplied routing id preserved (not overwritten by uuidv7)"
+    );
+    assert_eq!(
+        captured.cache_retention,
+        Some(rpi_ai::types::CacheRetention::None),
+        "summaries stay cache-skip regardless of caller options"
+    );
 }
