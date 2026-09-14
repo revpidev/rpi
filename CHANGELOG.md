@@ -30,6 +30,13 @@
 - **P1**：`read` 负 `limit` 回归 JS 语义不 panic；Windows bash 工具 kill/超时收敛；subagents `syntheticPaths` 越界校验（不再可能删除 worktree 外目录）；并行工具批 panic 补发 `tool_execution_end`；mcp adapter Ready/on_ready 竞态窗口消除（门禁抖动根因）；8 个 SSE adapter 取消立即中断体读。
 - **P2 加固**：wasm guest 内存 128 MiB 上限；SSE/Bedrock 帧上限 fail-fast；空 `data` 事件容错；`auth.json` 原子写；会话 `parent_id` 环防护；smart-fetch 响应体 32 MiB 上限（登记偏离）；compaction `session_id` 上游语义；`--rc` 无预发布降级已是最新；扩展名单组件校验；`parity_runner` 唯一命名等（全项见 `changes/v0.1.4.md`）。
 
+### 发布终态复审修复（rc.12）
+
+- **P1**：三处 SSE `finish().unwrap()` 改错误传播（1 MiB 未换行尾巴 + 不完整 UTF-8 + EOF 的畸形流此前 panic 挂起 turn，无终态事件——rc.11 fail-fast 声明的缺口）；codex SSE 体读改与取消信号 race（Esc/abort 不再等 `httpTimeoutMs`，rc.11 P1-5 的同类残留）。
+- **P2**：顺序工具批 panic 防护；SSE 行上限只界未终结尾巴；pi-messages reader 1 MiB 上限；`streamSimple toolChoice` 八 adapter 补齐；会话换行修复失败传播；`--rc` range 失配不再静默降级；Editor stale-render 点击焦点；mcp `session_tree` 门窗口审批恢复；subagents syntheticPaths 采集期 fail-closed + tracked 预检；openrouter-images 取消。
+- **测试缺口**：parent_id 环防护、compaction session_id 保留、顺序批 panic、`--rc` 降级等 rc.11 审查点名的零覆盖面全部钉死。
+- **文档**：四处 changelog 失实声明更正（`immediate_retry` 事件名、`x-api-source` 头名、`imageGenerationModels`/mlx、验证式复制回读缺口登记）；CI 条目改为本地门禁终态。
+
 ### 内部
 
 - workspace 版本 bump 0.1.4 + Cargo.lock 同步；全量门禁零失败（用例数以 `changes/v0.1.4.md` 终态为准）。
