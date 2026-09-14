@@ -1399,7 +1399,9 @@ async fn run(
             }
         }
     }
-    for sse in decoder.finish().unwrap() {
+    // P1 (rc.12 review): same as the other SSE adapters — propagate the
+    // end-of-stream line-cap failure instead of panicking the task.
+    for sse in decoder.finish()? {
         processor.handle_sse(&sse, events)?;
     }
     processor.finish(events);
@@ -1494,6 +1496,15 @@ pub fn stream_simple(
     };
 
     let base = build_base_options(model, context, options.as_ref(), Some(api_key));
+    // `base` carries `toolChoice` on every branch upstream
+    // (mistral-conversations.ts:193 — rc.12 review: previously dropped).
+    let tool_choice = options
+        .as_ref()
+        .and_then(|o| o.tool_choice)
+        .map(|choice| match choice {
+            crate::types::SimpleToolChoice::Auto => MistralToolChoice::Auto,
+            crate::types::SimpleToolChoice::None => MistralToolChoice::None,
+        });
     let reasoning = options
         .as_ref()
         .and_then(|o| o.reasoning)
@@ -1506,7 +1517,7 @@ pub fn stream_simple(
         context,
         MistralOptions {
             stream: base,
-            tool_choice: None,
+            tool_choice,
             prompt_mode: (should_use_reasoning && uses_prompt_mode_reasoning(model))
                 .then_some(MistralPromptMode::Reasoning),
             reasoning_effort: if should_use_reasoning && uses_reasoning_effort(model) {

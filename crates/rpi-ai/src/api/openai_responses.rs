@@ -745,6 +745,15 @@ pub fn stream_simple(
         OpenAIResponsesOptions {
             stream: base,
             reasoning_effort,
+            // #8607 / rc.12 review: the simple `"auto" | "none"` choice
+            // forwards verbatim (openai-responses.ts:220 — Responses accepts
+            // both as plain strings; same shape as the completions adapter).
+            tool_choice: options.as_ref().and_then(|o| o.tool_choice).map(|choice| {
+                serde_json::json!(match choice {
+                    crate::types::SimpleToolChoice::Auto => "auto",
+                    crate::types::SimpleToolChoice::None => "none",
+                })
+            }),
             ..OpenAIResponsesOptions::default()
         },
     ))

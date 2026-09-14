@@ -645,6 +645,13 @@ fn parse_pi_messages_event(raw: &str) -> Result<Option<PiMessagesEvent>, String>
 
 /// `readPiMessagesEvents`: buffer chunks, normalize `\r\n` to `\n`, and split
 /// events on blank lines; a non-empty tail is parsed at end-of-stream.
+///
+/// P2 (rc.12 review): like the shared [`SseDecoder`](crate::api::sse), the
+/// *unterminated* tail is capped — a gateway streaming bytes without a
+/// blank-line separator would otherwise grow the buffer unbounded until the
+/// idle timeout (same memory-amplification class rc.11 P2-4 closed for SSE).
+const MAX_PI_MESSAGES_TAIL_BYTES: usize = 1024 * 1024;
+
 #[derive(Default)]
 struct PiMessagesEventReader {
     utf8_tail: Vec<u8>,
@@ -665,6 +672,7 @@ impl PiMessagesEventReader {
                 events.push(event);
             }
         }
+        self.check_tail_bound()?;
         Ok(events)
     }
 
@@ -672,11 +680,24 @@ impl PiMessagesEventReader {
         let decoded = decode_utf8_streaming(&mut self.utf8_tail, true);
         self.buffer.push_str(&decoded);
         self.buffer = self.buffer.replace("\r\n", "\n");
+        self.check_tail_bound()?;
         if self.buffer.trim().is_empty() {
             return Ok(Vec::new());
         }
         let raw = std::mem::take(&mut self.buffer);
         Ok(parse_pi_messages_event(&raw)?.into_iter().collect())
+    }
+
+    /// The unterminated tail must stay bounded (see
+    /// [`MAX_PI_MESSAGES_TAIL_BYTES`]).
+    fn check_tail_bound(&self) -> Result<(), String> {
+        if self.buffer.len() > MAX_PI_MESSAGES_TAIL_BYTES {
+            return Err(format!(
+                "pi-messages event exceeds {MAX_PI_MESSAGES_TAIL_BYTES} bytes \
+                 without a blank-line separator — malformed stream"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -960,9 +981,11 @@ pub fn stream(
     event_stream
 }
 
-/// `streamSimple` (pi-messages). Upstream also smuggles `toolChoice`/`debug`
-/// off the options object; rpi's [`SimpleStreamOptions`] has no such fields,
-/// so only `reasoning` is mapped here (use [`stream`] for the extras).
+/// `streamSimple` (pi-messages). Upstream also smuggles `debug` off the
+/// options object; `toolChoice` forwards verbatim into the request options
+/// (pi-messages.ts:438 — the gateway takes the same `"auto" | "none"`
+/// literals). rpi's [`SimpleStreamOptions`] has no `debug` field, so only
+/// `reasoning`/`tool_choice` are mapped here (use [`stream`] for `debug`).
 pub fn stream_simple(
     model: &Model,
     context: &Context,
@@ -973,9 +996,17 @@ pub fn stream_simple(
         model,
         context,
         PiMessagesOptions {
-            stream: options.map(|options| options.stream).unwrap_or_default(),
+            stream: options
+                .as_ref()
+                .map(|options| options.stream.clone())
+                .unwrap_or_default(),
             reasoning,
-            tool_choice: None,
+            tool_choice: options.as_ref().and_then(|o| o.tool_choice).map(|choice| {
+                serde_json::json!(match choice {
+                    crate::types::SimpleToolChoice::Auto => "auto",
+                    crate::types::SimpleToolChoice::None => "none",
+                })
+            }),
             debug: None,
         },
     ))

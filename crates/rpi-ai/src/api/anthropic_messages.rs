@@ -1944,7 +1944,13 @@ async fn run(
             processor.handle_sse(&sse, events)?;
         }
     }
-    for sse in decoder.finish().unwrap() {
+    // P1 (rc.12 review): `finish()` fails when the unterminated tail crosses
+    // the line cap after the end-of-stream U+FFFD flush (buffer at the cap +
+    // an incomplete UTF-8 sequence) — propagate like every other malformed-
+    // stream error instead of panicking the adapter task (a panic here never
+    // reaches the event stream, so the turn would hang without a terminal
+    // event).
+    for sse in decoder.finish()? {
         processor.handle_sse(&sse, events)?;
     }
     processor.finish(options.stream.signal.as_ref())
@@ -2035,6 +2041,16 @@ fn map_thinking_level_to_effort(model: &Model, level: Option<ThinkingLevel>) -> 
     .to_owned()
 }
 
+/// `SimpleToolChoice` → [`AnthropicToolChoice`] (the simple union has no
+/// forced-tool variant; upstream forwards the literal verbatim,
+/// anthropic-messages.ts:858).
+fn simple_tool_choice_to_anthropic(choice: crate::types::SimpleToolChoice) -> AnthropicToolChoice {
+    match choice {
+        crate::types::SimpleToolChoice::Auto => AnthropicToolChoice::Auto,
+        crate::types::SimpleToolChoice::None => AnthropicToolChoice::None,
+    }
+}
+
 /// `streamSimple` (anthropic-messages).
 pub fn stream_simple(
     model: &Model,
@@ -2052,6 +2068,12 @@ pub fn stream_simple(
 
     let api_key = options.as_ref().and_then(|o| o.stream.api_key.clone());
     let base = build_base_options(model, context, options.as_ref(), api_key);
+    // `base` carries `toolChoice` on every branch upstream — mirror that
+    // for each construction site below (rc.12 review: previously dropped).
+    let tool_choice = options
+        .as_ref()
+        .and_then(|o| o.tool_choice)
+        .map(simple_tool_choice_to_anthropic);
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
         return Ok(stream(
             model,
@@ -2059,6 +2081,7 @@ pub fn stream_simple(
             AnthropicOptions {
                 stream: base,
                 thinking_enabled: Some(false),
+                tool_choice,
                 ..AnthropicOptions::default()
             },
         ));
@@ -2080,6 +2103,7 @@ pub fn stream_simple(
                 stream: base,
                 thinking_enabled: Some(true),
                 effort: Some(effort),
+                tool_choice,
                 ..AnthropicOptions::default()
             },
         ));
@@ -2101,6 +2125,7 @@ pub fn stream_simple(
                 .thinking_budget
                 .min(max_tokens.saturating_sub(1024)),
         ),
+        tool_choice,
         ..AnthropicOptions::default()
     };
     anthropic_options.stream.max_tokens = Some(max_tokens);
@@ -3633,6 +3658,72 @@ pub(crate) mod tests {
             stream_simple(&model, &context(vec![user_text("hi")], None), None).err(),
             Some("No API key for provider: anthropic".to_owned())
         );
+    }
+
+    /// rc.12 review (P1): a malformed body whose unterminated tail sits at
+    /// the 1 MiB line cap with an incomplete UTF-8 sequence at EOF makes
+    /// `SseDecoder::finish` fail — the adapter must surface that as a
+    /// terminal `Error` event (fail-fast, rc.11 P2-4 semantics) instead of
+    /// panicking the transport task (a panic never reaches the event
+    /// stream — the shared `Arc<Inner>` sender keeps the channel open, so
+    /// the turn would hang without a terminal event).
+    #[tokio::test]
+    async fn stream_line_cap_finish_failure_terminates_with_error_event() {
+        use crate::api::sse::MAX_SSE_LINE_BYTES;
+        use crate::types::{FetchError, FetchRequest, FetchResponse};
+
+        // `data: ` + 'x' * (MAX - 7) + b'\xF0' — exactly MAX bytes, no
+        // newline, ending in an incomplete UTF-8 sequence.
+        let mut body = Vec::with_capacity(MAX_SSE_LINE_BYTES);
+        body.extend_from_slice(b"data: ");
+        body.resize(MAX_SSE_LINE_BYTES - 1, b'x');
+        body.push(0xF0);
+        assert_eq!(body.len(), MAX_SSE_LINE_BYTES);
+
+        let fetch: crate::types::FetchFn = std::sync::Arc::new(move |_request: FetchRequest| {
+            let body = body.clone();
+            Box::pin(async move {
+                Ok::<_, FetchError>(FetchResponse {
+                    status: 200,
+                    headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+                    body: Box::pin(futures::stream::once(
+                        async move { Ok::<_, FetchError>(body) },
+                    )),
+                })
+            })
+        });
+
+        let model = make_model(json!({}));
+        let ctx = context(vec![user_text("hi")], None);
+        let stream = stream(
+            &model,
+            &ctx,
+            AnthropicOptions {
+                stream: crate::types::StreamOptions {
+                    request: crate::types::ProviderRequestOptions {
+                        api_key: Some("sk-test".to_owned()),
+                        fetch: Some(fetch),
+                        ..crate::types::ProviderRequestOptions::default()
+                    },
+                    ..crate::types::StreamOptions::default()
+                },
+                ..AnthropicOptions::default()
+            },
+        );
+        let events: Vec<StreamEvent> =
+            tokio::time::timeout(std::time::Duration::from_secs(10), stream.collect())
+                .await
+                .expect("stream must terminate instead of hanging");
+        match events.last() {
+            Some(StreamEvent::Error { error, .. }) => assert!(
+                error
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("SSE line exceeds")),
+                "terminal Error must carry the line-cap message: {events:?}"
+            ),
+            other => panic!("terminal Error event expected, got {other:?} ({events:?})"),
+        }
     }
 }
 

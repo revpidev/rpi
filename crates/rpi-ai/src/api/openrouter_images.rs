@@ -193,7 +193,23 @@ async fn generate_images_inner(
         .await;
     }
 
-    let body = response.text().await.map_err(|error| error.to_string())?;
+    // P2 (rc.12 review): race the body read against the abort signal —
+    // upstream hands the signal to fetch, so cancellation interrupts the
+    // in-flight body read; a bare `.text().await` would otherwise stall
+    // until the optional total timeout (unbounded when unset).
+    let body_fut = response.text();
+    let body = match options.and_then(|options| options.signal.as_ref()) {
+        Some(signal) => {
+            tokio::select! {
+                body = body_fut => body,
+                () = signal.cancelled() => {
+                    return Err("Request was aborted".to_owned());
+                }
+            }
+        }
+        None => body_fut.await,
+    }
+    .map_err(|error| error.to_string())?;
     let parsed: OpenRouterImageGenerationResponse =
         serde_json::from_str(&body).map_err(|error| error.to_string())?;
 

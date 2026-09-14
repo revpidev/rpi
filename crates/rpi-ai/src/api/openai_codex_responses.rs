@@ -32,7 +32,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
-use futures::StreamExt;
 use regex::Regex;
 use serde_json::{json, Map, Value};
 
@@ -48,6 +47,7 @@ use crate::api::openai_responses_shared::{
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::SseDecoder;
+use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::{clamp_thinking_level, ProviderStreams};
 use crate::types::{
     AssistantMessage, AssistantMessageDiagnostic, CacheRetention, Context, DiagnosticErrorInfo,
@@ -1437,15 +1437,26 @@ async fn run(
         if aborted() {
             return Err(CodexError::Aborted);
         }
-        let next = byte_stream.next();
+        // P1-5 (rc.12 review): race the body read against the abort token as
+        // well — upstream hands the signal to fetch, so cancellation
+        // interrupts an in-flight body read immediately; racing only the
+        // header deadline left Esc/abort stalled on a silent body until
+        // `httpTimeoutMs` (5 min default, ~unbounded when disabled). The
+        // synchronous `aborted()` check above stays for the no-newline
+        // fast path.
+        let next = next_chunk_or_cancelled(&mut byte_stream, signal.as_ref());
         let chunk = match deadline {
             Some(deadline) => match tokio::time::timeout_at(deadline, next).await {
-                Ok(chunk) => chunk,
                 // The internal header-timeout signal aborting mid-body
                 // surfaces upstream as an AbortError.
                 Err(_) => return Err(CodexError::Other("Request was aborted".to_owned())),
+                Ok(StreamNext::Item(chunk)) => chunk,
+                Ok(StreamNext::Cancelled) => return Err(CodexError::Aborted),
             },
-            None => next.await,
+            None => match next.await {
+                StreamNext::Item(chunk) => chunk,
+                StreamNext::Cancelled => return Err(CodexError::Aborted),
+            },
         };
         let Some(chunk) = chunk else { break };
         let bytes = chunk.map_err(|error| CodexError::Transport(error.to_string()))?;
@@ -1581,6 +1592,16 @@ pub fn stream_simple(
         OpenAiCodexResponsesOptions {
             stream: base,
             reasoning_effort,
+            // #8607 / rc.12 review: the simple choice forwards verbatim
+            // (openai-codex-responses.ts:504 — codex accepts the string
+            // form directly).
+            tool_choice: options.as_ref().and_then(|o| o.tool_choice).map(|choice| {
+                match choice {
+                    crate::types::SimpleToolChoice::Auto => "auto",
+                    crate::types::SimpleToolChoice::None => "none",
+                }
+                .to_owned()
+            }),
             ..OpenAiCodexResponsesOptions::default()
         },
     ))

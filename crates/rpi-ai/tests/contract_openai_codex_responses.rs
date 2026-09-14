@@ -83,6 +83,13 @@ type HandshakeHook = Arc<dyn Fn(usize) -> bool + Send + Sync>;
 type RequestHook = Arc<dyn Fn(usize, usize, &Value) -> Vec<Value> + Send + Sync>;
 type HttpHook = Arc<dyn Fn(usize) -> (u16, String) + Send + Sync>;
 
+/// `HttpHook` status sentinel for a "silent body": 200 headers whose
+/// content-length promises bytes that never arrive, then the socket is held
+/// open — the client's body read pends indefinitely. Used by the
+/// cancellation race tests (rc.12 review, P1-5): only the abort token can
+/// interrupt the in-flight body read.
+const HTTP_SILENT_BODY: u16 = 0;
+
 fn accept_all() -> HandshakeHook {
     Arc::new(|_| true)
 }
@@ -264,6 +271,24 @@ async fn handle_http(
     .expect("send capture");
 
     let (status, body) = (config.http_hook)(req);
+    if status == HTTP_SILENT_BODY {
+        // Promise 1 MiB of SSE bytes, deliver none, keep the connection
+        // open (NO `connection: close` — that would let the client treat
+        // EOF as end-of-body instead of waiting).
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1048576\r\n\r\n",
+            )
+            .await
+            .expect("write silent-body headers");
+        let mut discard = [0u8; 512];
+        while let Ok(n) = socket.read(&mut discard).await {
+            if n == 0 {
+                break;
+            }
+        }
+        return;
+    }
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -594,6 +619,55 @@ async fn test_sse_eof_without_trailing_blank_line_still_completes() {
         })
         .collect::<String>();
     assert_eq!(text, "Hello");
+}
+
+/// rc.12 review (P1-5 residue): the SSE body read must race the abort token —
+/// upstream hands the signal to fetch, so cancellation interrupts an
+/// in-flight (silent) body immediately. Pre-fix shape: `aborted()` checked
+/// only synchronously before `byte_stream.next().await`, which pends on the
+/// silent body until the header deadline — here no timeout is set, so the
+/// stream would never terminate without the race.
+#[tokio::test]
+async fn test_sse_cancellation_interrupts_silent_body() {
+    let (handshake, request, http) = (
+        accept_all(),
+        no_events(),
+        http_fixed(HTTP_SILENT_BODY, String::new()),
+    );
+    let backend = serve_backend(handshake, request, http).await;
+    let m = model(&backend.base_url, json!({}));
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut options = sse_options(None);
+    options.signal = Some(token.clone());
+    tokio::spawn({
+        let token = token.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            token.cancel();
+        }
+    });
+
+    let started = std::time::Instant::now();
+    let events = collect(OpenAiCodexResponses.stream(
+        &m,
+        &context(vec![user_text("Say hello")]),
+        Some(options),
+    ))
+    .await;
+    assert!(
+        matches!(events.last(), Some(StreamEvent::Error { .. })),
+        "cancelled silent body must terminate with an Error event: {events:?}"
+    );
+    assert_eq!(
+        backend.http_requests.load(Ordering::SeqCst),
+        1,
+        "no retries after abort"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cancellation must not wait for a body/deadline"
+    );
 }
 
 #[tokio::test]

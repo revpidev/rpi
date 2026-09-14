@@ -2077,12 +2077,22 @@ pub fn stream_simple(
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     let base = build_base_options(model, context, options.as_ref(), None);
+    // `base` carries `toolChoice` on every branch upstream
+    // (bedrock-converse-stream.ts:518 — rc.12 review: previously dropped).
+    let tool_choice = options
+        .as_ref()
+        .and_then(|o| o.tool_choice)
+        .map(|choice| match choice {
+            crate::types::SimpleToolChoice::Auto => BedrockToolChoice::Auto,
+            crate::types::SimpleToolChoice::None => BedrockToolChoice::None,
+        });
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
         return Ok(stream(
             model,
             context,
             BedrockOptions {
                 stream: base,
+                tool_choice,
                 ..BedrockOptions::default()
             },
         ));
@@ -2096,6 +2106,7 @@ pub fn stream_simple(
                 BedrockOptions {
                     stream: base,
                     reasoning: Some(reasoning),
+                    tool_choice,
                     thinking_budgets: options.as_ref().and_then(|o| o.thinking_budgets.clone()),
                     ..BedrockOptions::default()
                 },
@@ -2129,6 +2140,7 @@ pub fn stream_simple(
         let mut bedrock_options = BedrockOptions {
             stream: base,
             reasoning: Some(reasoning),
+            tool_choice,
             thinking_budgets: Some(budgets),
             ..BedrockOptions::default()
         };
@@ -2142,6 +2154,7 @@ pub fn stream_simple(
         BedrockOptions {
             stream: base,
             reasoning: Some(reasoning),
+            tool_choice,
             thinking_budgets: options.as_ref().and_then(|o| o.thinking_budgets.clone()),
             ..BedrockOptions::default()
         },

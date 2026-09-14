@@ -1197,13 +1197,22 @@ pub fn stream_simple(
     options: Option<SimpleStreamOptions>,
 ) -> Result<AssistantMessageEventStream, String> {
     let base = build_base_options(model, context, options.as_ref(), None);
+    // `base` carries `toolChoice` on every branch upstream
+    // (google-vertex.ts:321 — rc.12 review: previously dropped).
+    let tool_choice = options
+        .as_ref()
+        .and_then(|o| o.tool_choice)
+        .map(|choice| match choice {
+            crate::types::SimpleToolChoice::Auto => GoogleToolChoice::Auto,
+            crate::types::SimpleToolChoice::None => GoogleToolChoice::None,
+        });
     let Some(reasoning) = options.as_ref().and_then(|o| o.reasoning) else {
         return Ok(stream(
             model,
             context,
             GoogleVertexOptions {
                 stream: base,
-                tool_choice: None,
+                tool_choice,
                 thinking: Some(GoogleThinking {
                     enabled: false,
                     budget_tokens: None,
@@ -1228,7 +1237,7 @@ pub fn stream_simple(
             context,
             GoogleVertexOptions {
                 stream: base,
-                tool_choice: None,
+                tool_choice,
                 thinking: Some(GoogleThinking {
                     enabled: true,
                     budget_tokens: None,
@@ -1246,7 +1255,7 @@ pub fn stream_simple(
         context,
         GoogleVertexOptions {
             stream: base,
-            tool_choice: None,
+            tool_choice,
             thinking: Some(GoogleThinking {
                 enabled: true,
                 budget_tokens: Some(get_google_budget(

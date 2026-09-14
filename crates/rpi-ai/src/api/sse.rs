@@ -179,9 +179,14 @@ impl SseDecoder {
         self.utf8_tail.extend_from_slice(bytes);
         let decoded = self.decode_bytes(false);
         self.buffer.push_str(&decoded);
-        self.check_line_bound()?;
         let mut events = Vec::new();
         self.drain_lines(&mut events);
+        // Bound only the *unterminated* tail (drain first, check after): a
+        // single chunk carrying several complete lines may legitimately
+        // exceed the cap as a whole — rejecting it up front would fail a
+        // well-formed stream on a fast local gateway with a large read
+        // buffer.
+        self.check_tail_bound()?;
         Ok(events)
     }
 
@@ -190,9 +195,9 @@ impl SseDecoder {
     pub fn finish(mut self) -> Result<Vec<ServerSentEvent>, String> {
         let decoded = self.decode_bytes(true);
         self.buffer.push_str(&decoded);
-        self.check_line_bound()?;
         let mut events = Vec::new();
         self.drain_lines(&mut events);
+        self.check_tail_bound()?;
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             if let Some(event) = decode_sse_line(&line, &mut self.state) {
@@ -207,8 +212,9 @@ impl SseDecoder {
 
     /// P2-4: the unterminated tail must stay bounded — a stream of bytes
     /// with no newline ever arriving would otherwise grow the line buffer
-    /// without limit.
-    fn check_line_bound(&self) -> Result<(), String> {
+    /// without limit. Checked *after* [`SseDecoder::drain_lines`] so only
+    /// the tail (not a chunk of complete lines) is bounded.
+    fn check_tail_bound(&self) -> Result<(), String> {
         if self.buffer.len() > MAX_SSE_LINE_BYTES {
             return Err(format!(
                 "SSE line exceeds {MAX_SSE_LINE_BYTES} bytes without a newline — \
@@ -339,5 +345,45 @@ mod line_bound_tests {
         let events = decoder.feed(line.as_bytes()).expect("below cap");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data, payload);
+    }
+
+    /// rc.12 review (P2): the cap bounds the *unterminated tail*, not the
+    /// chunk — a single read carrying several complete events whose total
+    // exceeds 1 MiB is a well-formed stream and must decode.
+    #[test]
+    fn multi_complete_lines_chunk_over_total_cap_decodes() {
+        let mut decoder = SseDecoder::new();
+        // Three ~384 KiB events: 1 152 KiB total > 1 MiB, each individually
+        // far below the per-line cap and newline-terminated.
+        let payload = "b".repeat(384 * 1024);
+        let chunk = format!("data: {payload}\n\ndata: {payload}\n\ndata: {payload}\n\n");
+        let events = decoder
+            .feed(chunk.as_bytes())
+            .expect("complete lines decode");
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(|event| event.data == payload));
+        // Nothing left buffered: the tail check trivially passes.
+        assert!(decoder.finish().expect("finish ok").is_empty());
+    }
+
+    /// rc.12 review (P1): the panic trigger pinned at the decoder level — a
+    /// tail of exactly `MAX_SSE_LINE_BYTES` bytes (feed passes: `>` strict)
+    /// ending in an incomplete UTF-8 sequence; `finish()` flushes U+FFFD
+    /// (3 bytes) pushing it over the cap and must return `Err`, never
+    /// panic. Adapters propagate this as a terminal fail-fast error.
+    #[test]
+    fn finish_cap_sized_tail_with_incomplete_utf8_errors() {
+        let mut decoder = SseDecoder::new();
+        let mut body = Vec::with_capacity(MAX_SSE_LINE_BYTES);
+        body.extend_from_slice(b"data: ");
+        body.resize(MAX_SSE_LINE_BYTES - 1, b'x');
+        body.push(0xF0); // incomplete 4-byte sequence start
+        assert_eq!(body.len(), MAX_SSE_LINE_BYTES);
+        assert!(decoder.feed(&body).is_ok(), "tail at the cap passes feed");
+        let result = decoder.finish();
+        assert!(
+            result.is_err(),
+            "finish must fail after the U+FFFD flush crosses the cap"
+        );
     }
 }

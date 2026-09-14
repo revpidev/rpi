@@ -14,7 +14,10 @@ use rpi_ai::api::anthropic_messages::AnthropicMessages;
 use rpi_ai::api::openai_completions::OpenAiCompletions;
 use rpi_ai::api::openai_responses::OpenAiResponses;
 use rpi_ai::models::ProviderStreams;
-use rpi_ai::types::{ApiKind, Context, Message, Model, StopReason, StreamEvent, StreamOptions};
+use rpi_ai::types::{
+    ApiKind, Context, Message, Model, SimpleStreamOptions, SimpleToolChoice, StopReason,
+    StreamEvent, StreamOptions,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -364,6 +367,85 @@ async fn test_openai_responses_contract() {
     assert_eq!(message.response_id.as_deref(), Some("resp_1"));
     assert_eq!(message.usage.input, 8);
     assert_eq!(message.usage.cache_read, 2);
+}
+
+// ---------------------------------------------------------------------------
+// streamSimple toolChoice forwarding (rc.12 review, #8607)
+// ---------------------------------------------------------------------------
+
+fn simple_options(tool_choice: SimpleToolChoice) -> SimpleStreamOptions {
+    SimpleStreamOptions {
+        stream: options(),
+        reasoning: None,
+        thinking_budgets: None,
+        tool_choice: Some(tool_choice),
+    }
+}
+
+/// anthropic-messages.ts:858 — the simple choice forwards on every branch
+/// (previously dropped in rpi; enum-mapped onto the object wire form).
+#[tokio::test]
+async fn test_stream_simple_tool_choice_anthropic() {
+    let (base_url, mut captured) = serve(vec![(200, ANTHROPIC_SSE)]).await;
+    let m = model(
+        ApiKind::ANTHROPIC_MESSAGES,
+        "anthropic",
+        &base_url,
+        json!({}),
+    );
+    let stream = AnthropicMessages
+        .stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(simple_options(SimpleToolChoice::None)),
+        )
+        .expect("stream");
+    let events = collect(stream).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.body_json()["tool_choice"], json!({"type": "none"}));
+}
+
+/// openai-completions streamSimple already forwarded the choice — pinned
+/// here because it had zero coverage (upstream
+/// openai-completions-tool-choice.test.ts streamSimple intent).
+#[tokio::test]
+async fn test_stream_simple_tool_choice_completions() {
+    let (base_url, mut captured) = serve(vec![(200, COMPLETIONS_SSE)]).await;
+    let m = model(ApiKind::OPENAI_COMPLETIONS, "openai", &base_url, json!({}));
+    let stream = OpenAiCompletions
+        .stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(simple_options(SimpleToolChoice::None)),
+        )
+        .expect("stream");
+    let events = collect(stream).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.body_json()["tool_choice"], json!("none"));
+}
+
+/// openai-responses.ts:220 — the simple choice forwards verbatim as the raw
+/// `tool_choice` JSON value (previously dropped in rpi).
+#[tokio::test]
+async fn test_stream_simple_tool_choice_responses() {
+    let (base_url, mut captured) = serve(vec![(200, RESPONSES_SSE)]).await;
+    let m = model(ApiKind::OPENAI_RESPONSES, "openai", &base_url, json!({}));
+    let stream = OpenAiResponses
+        .stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(simple_options(SimpleToolChoice::Auto)),
+        )
+        .expect("stream");
+    let events = collect(stream).await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.body_json()["tool_choice"], json!("auto"));
 }
 
 #[tokio::test]

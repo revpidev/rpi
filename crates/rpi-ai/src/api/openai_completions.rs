@@ -2734,15 +2734,23 @@ async fn run(
         }
     }
     if result.is_ok() && !saw_done {
-        for sse in decoder.finish().unwrap() {
-            match processor.handle_sse(&sse, events) {
-                Ok(SseOutcome::Done) => break,
-                Ok(SseOutcome::Chunk) => {}
-                Err(error) => {
-                    result = Err(error);
-                    break;
+        // P1 (rc.12 review): `finish()` fails when the unterminated tail
+        // crosses the line cap after the U+FFFD flush — feed it into the
+        // `result` channel instead of panicking the adapter task.
+        match decoder.finish() {
+            Ok(finish_events) => {
+                for sse in finish_events {
+                    match processor.handle_sse(&sse, events) {
+                        Ok(SseOutcome::Done) => break,
+                        Ok(SseOutcome::Chunk) => {}
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
+                    }
                 }
             }
+            Err(error) => result = Err(error),
         }
     }
     if let Err(error) = result {
