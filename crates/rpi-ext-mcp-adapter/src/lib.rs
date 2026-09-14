@@ -973,7 +973,19 @@ pub extern "C" fn dispatch(_cookie: PluginCookie, message: RVec<u8>) -> RVec<u8>
                         (None, true) => Some(None),
                         (None, false) => None,
                     };
-                if let Some(runtime) = state.dispatcher.try_runtime() {
+                // P2-9 (rc.12 review): `try_runtime()` returning `None` has
+                // two meanings — Initializing (the on_ready hook has not
+                // read `pending_leaf` yet, so the parked leaf IS consumed)
+                // and Ready-but-hooks-incomplete (the hook already passed
+                // its read point; the parked leaf would be silently
+                // dropped and the PREVIOUS branch's approvals would keep
+                // applying). Distinguish via the gate: park for hook
+                // completion in the latter case and restore directly.
+                let dispatcher = state.dispatcher.clone();
+                let runtime = state
+                    .runtime
+                    .block_on(async move { dispatcher.try_runtime_after_hooks().await });
+                if let Some(runtime) = runtime {
                     if explicit_null {
                         runtime.approval.restore(&[]);
                     } else {

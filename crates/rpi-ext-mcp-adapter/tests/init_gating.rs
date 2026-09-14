@@ -544,3 +544,106 @@ async fn current_gate_parks_until_on_ready_hook_completes() {
     let _ = runtime;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// P2-9 (rc.12 review): the `session_tree` consumer seam — while Ready is
+/// published but the on_ready hook is mid-flight (it has already passed its
+/// `pending_leaf` read point), `try_runtime_after_hooks` must park and
+/// return the runtime once the hook completes, so a navigation landing in
+/// that window is not silently dropped. While merely Initializing it must
+/// return `None` (the hook has not read yet — parked state IS consumed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_runtime_after_hooks_distinguishes_gate_window_from_initializing() {
+    use rpi_ext_mcp_adapter::proxy::DispatcherHooks;
+
+    // Initializing (never resolves): None — the on_ready hook will consume.
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    dispatcher.set_init_wait_timeout(std::time::Duration::from_millis(50));
+    dispatcher.start_init_with(never_resolves());
+    assert!(
+        dispatcher.try_runtime_after_hooks().await.is_none(),
+        "initializing must stay None (the hook has not read its pending state)"
+    );
+
+    // Ready-but-hooks-incomplete: parks, then resolves after hook release.
+    let dir = temp_dir("hooks-gate-tree");
+    std::fs::write(dir.join(".mcp.json"), json!({"mcpServers": {}}).to_string()).expect("config");
+
+    let dispatcher = Arc::new(ProxyDispatcher::new());
+    let started = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_started = Arc::clone(&started);
+    let hook_release = Arc::clone(&release);
+    let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        {
+            let mut flag = hook_started.0.lock().unwrap();
+            *flag = true;
+            hook_started.1.notify_all();
+        }
+        let mut released = hook_release.0.lock().unwrap();
+        if !*released {
+            let (guard, timeout) = hook_release
+                .1
+                .wait_timeout(released, std::time::Duration::from_secs(10))
+                .unwrap();
+            released = guard;
+            let _ = timeout;
+            let _ = *released;
+        }
+    });
+    dispatcher.set_hooks(DispatcherHooks {
+        on_ready: Some(hook),
+        on_connect_sync: None,
+    });
+
+    let init_dir = dir.clone();
+    let future: InitFuture = async move {
+        Ok::<Arc<McpRuntime>, Arc<String>>(initialize_mcp(&init_dir, None, None).await)
+    }
+    .boxed()
+    .shared();
+    dispatcher.start_init_with_driver(future);
+
+    // Wait for the hook to be mid-flight (Ready published, gate closed).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let flag = started.0.lock().unwrap();
+        if *flag {
+            break;
+        }
+        let (guard, timeout) = started
+            .1
+            .wait_timeout(flag, std::time::Duration::from_secs(10))
+            .unwrap();
+        drop(guard);
+        let _ = timeout;
+        assert!(std::time::Instant::now() < deadline, "hook never started");
+    }
+    assert!(
+        dispatcher.try_runtime().is_none(),
+        "precondition: gate closed while hook mid-flight"
+    );
+
+    // The parked consumer: launch before release; it must not resolve early.
+    let parked = {
+        let dispatcher = Arc::clone(&dispatcher);
+        tokio::spawn(async move { dispatcher.try_runtime_after_hooks().await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        !parked.is_finished(),
+        "must park while the hook is mid-flight"
+    );
+
+    // Release; the parked consumer resolves with the runtime.
+    {
+        let mut flag = release.0.lock().unwrap();
+        *flag = true;
+        release.1.notify_all();
+    }
+    let runtime = tokio::time::timeout(std::time::Duration::from_secs(10), parked)
+        .await
+        .expect("parked consumer resolves after hook completion")
+        .expect("join ok");
+    assert!(runtime.is_some(), "runtime observable after hooks complete");
+    let _ = std::fs::remove_dir_all(&dir);
+}

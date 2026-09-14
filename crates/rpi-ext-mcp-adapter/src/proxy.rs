@@ -3268,6 +3268,31 @@ impl ProxyDispatcher {
         }
     }
 
+    /// P2-9 (rc.12 review): consumers that store state for the on_ready
+    /// hook to pick up (e.g. the `session_tree` approval-rebuild leaf) must
+    /// distinguish "not ready yet" — the hook has not read its pending
+    /// state, so leaving it parked is correct — from "Ready published but
+    /// the hook already passed its read point": in that window
+    /// [`Self::try_runtime`] returns `None` and nothing will ever consume
+    /// the newly stored state. For the latter, park until the hook
+    /// completes (same bound as [`Self::await_hooks_complete`]) and return
+    /// the runtime; `None` while still initializing/not started/failed.
+    pub async fn try_runtime_after_hooks(&self) -> Option<Arc<McpRuntime>> {
+        if let Some(runtime) = self.try_runtime() {
+            return Some(runtime);
+        }
+        let ready_unfinished = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            matches!(&*state, InitState::Ready(_))
+        };
+        if ready_unfinished {
+            self.await_hooks_complete().await;
+            self.try_runtime()
+        } else {
+            None
+        }
+    }
+
     /// P1-7: bounded wait for the on_ready surface sync. The gate fast paths
     /// can observe `Ready` in the microseconds between publication and hook
     /// completion; park briefly (1ms slices, bounded by the gate timeout,
