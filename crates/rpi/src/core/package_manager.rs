@@ -2723,11 +2723,13 @@ impl DefaultPackageManager {
     }
 
     /// P2-7: the channel-filtered resolution found no candidate (rc channel
-    /// on a stable-only index, or an empty index). Binds to the
-    /// "No installable version" / "No version ... matches" messages that
-    /// `extension_registry::resolve_registry_entry` builds.
+    /// on a stable-only index, or an empty index). Binds ONLY to the
+    /// "No installable version" shape — the "No version ... matches" shape
+    /// is an explicit-range mismatch, which must stay a hard error on both
+    /// channels (rc.12 review: previously both were degraded, silently
+    /// masking range failures as "already up to date" on `--rc`).
     fn is_registry_no_installable_version(error: &str) -> bool {
-        error.starts_with("No installable version of") || error.starts_with("No version of")
+        error.starts_with("No installable version of")
     }
 
     /// `installParsedSource` (package-manager.ts:1347-1356).
@@ -8465,5 +8467,74 @@ mod registry_tests {
         );
         manager.update(None).unwrap();
         assert!(transport.calls().len() < 4, "no new fetches");
+    }
+
+    /// rc.12 review（P2-7 降级分支）：rc 毕业窗口——索引仅含 stable 条目，
+    /// `update --extensions --rc` 应降级为「已是最新（无预发布）」进度提示
+    /// 而非硬报错（此前该分支零测试）。
+    #[test]
+    fn test_update_rc_channel_degrades_stable_only_index_to_already_up_to_date() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let name = "ext-degrade";
+        serve_registry_extension(&transport, name, "0.2.0", true);
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager.install_and_persist(name, false).unwrap();
+        assert_eq!(
+            extension_registry::installed_extension_version(
+                &dirs.agent_dir.join("extensions/ext-degrade")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+
+        let messages: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        manager.set_progress_callback(Some({
+            let messages = messages.clone();
+            Box::new(move |event: &ProgressEvent| {
+                if let Some(message) = &event.message {
+                    messages.lock().unwrap().push(message.clone());
+                }
+            })
+        }));
+        manager
+            .update_with_channel(None, UpdateChannel::PreRelease)
+            .expect("stable-only index degrades to a no-op note on the rc channel");
+        assert!(
+            messages
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message.contains("no pre-release versions published")),
+            "degradation emits the already-up-to-date note: {:?}",
+            messages.lock().unwrap()
+        );
+    }
+
+    /// rc.12 review（P2-7 收紧）：显式 range 失配（"No version … matches"）
+    /// 在 `--rc` 下必须保持硬错误——修复前谓词同时匹配两种错误形态，把
+    /// range 失配静默降级成「已是最新」的误导性 no-op。
+    #[test]
+    fn test_update_rc_channel_range_mismatch_stays_an_error() {
+        let dirs = TestDirs::new();
+        let transport = MapTransport::new();
+        let name = "ext-range";
+        serve_registry_extension(&transport, name, "0.1.0", true);
+
+        let mut manager = manager_ok(&dirs, transport.clone());
+        manager
+            .install_and_persist(&format!("{name}@^0.1.0"), false)
+            .unwrap();
+
+        // 索引前进到 0.2.0：`^0.1.0` 不再命中任何条目。
+        serve_registry_extension(&transport, name, "0.2.0", true);
+        let error = manager
+            .update_with_channel(None, UpdateChannel::PreRelease)
+            .expect_err("explicit-range mismatch must stay a hard error on --rc");
+        assert!(
+            error.contains("No version of") && error.contains("^0.1.0"),
+            "range mismatch surfaces verbatim: {error}"
+        );
     }
 }
