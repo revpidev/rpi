@@ -440,17 +440,35 @@ fn run_worktree_setup_hook(
     if !parsed.is_object() {
         return Err("worktree setup hook stdout must be a JSON object".to_string());
     }
-    Ok(parsed
-        .get("syntheticPaths")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default())
+    let Some(items) = parsed.get("syntheticPaths").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    // Collection-phase validation (rc.12 review, upstream worktree.ts:824-836
+    // parseWorktreeSetupHookOutput loop): every entry must be a string and
+    // pass the same normalize checks the deletion phase applies — an
+    // invalid path FAILS setup here (the allocation is preserved for manual
+    // recovery per #1902) instead of being silently dropped with a warn;
+    // tracked paths are rejected so the later `git add -A` cannot record
+    // mass deletions of tracked directories.
+    let mut unique: Vec<String> = Vec::new();
+    for item in items {
+        let raw = item.as_str().ok_or_else(|| {
+            "worktree setup hook output field 'syntheticPaths' must contain only strings"
+                .to_string()
+        })?;
+        let normalized = normalize_synthetic_path_relative(worktree_path, raw)?;
+        let tracked = run_git(worktree_path, &["ls-files", "--", &normalized])
+            .map_err(|error| format!("git ls-files failed: {error}"))?;
+        if !String::from_utf8_lossy(&tracked.stdout).trim().is_empty() {
+            return Err(format!(
+                "worktree setup hook cannot mark tracked paths as synthetic: {normalized}"
+            ));
+        }
+        if !unique.contains(&normalized) {
+            unique.push(normalized);
+        }
+    }
+    Ok(unique)
 }
 
 fn wait_with_timeout(
@@ -512,6 +530,56 @@ fn kill_hook_process(pid: u32) {
 /// `normalizeSyntheticPath` (worktree.ts:297-315): relative only, no escapes,
 /// not repo root; synthetic paths are unlinked before diffs/cleanup.
 ///
+/// Collection-phase form of the synthetic-path checks (upstream
+/// `normalizeSyntheticPath`, worktree.ts:769-781): returns the normalized
+/// RELATIVE path string or the upstream error message — consumed by the
+/// setup-hook output parser, where an invalid path must FAIL setup
+/// (fail-closed) rather than be skipped with a warning.
+fn normalize_synthetic_path_relative(
+    worktree_path: &Path,
+    raw_path: &str,
+) -> Result<String, String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("synthetic path cannot be empty".to_owned());
+    }
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err(format!("synthetic path must be relative: {raw_path}"));
+    }
+    let mut resolved = worktree_path.to_path_buf();
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => {
+                resolved.push(part);
+                parts.push(part.to_owned());
+            }
+            // ParentDir (and, unreachable for relative inputs, Prefix/Root)
+            // escape the worktree root — same message as upstream.
+            _ => {
+                return Err(format!(
+                    "synthetic path escapes the worktree root: {raw_path}"
+                ));
+            }
+        }
+    }
+    if resolved == worktree_path {
+        return Err(format!(
+            "synthetic path cannot target the worktree root: {raw_path}"
+        ));
+    }
+    // `path.normalize(relative)` equivalent (forward slashes — git accepts
+    // them on every platform and the deletion-phase normalizer re-walks
+    // components anyway).
+    Ok(parts
+        .iter()
+        .map(|part| part.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
 /// P1-3: the validation is load-bearing, not documentation — a
 /// `worktreeSetupHook` returning an absolute path or a `..` escape must be
 /// rejected (skipped with a warning) instead of unlinking outside the
@@ -1041,6 +1109,10 @@ fn resolve_repo_base(cwd: &Path) -> Result<(PathBuf, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(crate) fn test_repo_shared(tag: &str) -> (PathBuf, PathBuf, String) {
+        test_repo(tag)
+    }
 
     fn git_available() -> bool {
         Command::new("git").arg("--version").output().is_ok()
@@ -1694,5 +1766,98 @@ mod synthetic_path_tests {
         assert!(!base.join("build").exists(), "legit synthetic dir removed");
         let _ = std::fs::remove_dir_all(&outside);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// rc.12 review (P2, upstream worktree.ts:824-836): collection-phase
+    /// fail-closed semantics — an invalid synthetic path (absolute / `..`
+    /// escape / root / non-string) must FAIL the hook parse (setup fails,
+    /// allocation preserved) instead of being silently dropped with a warn.
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_paths_invalid_entries_fail_setup_at_collection() {
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-sub-syninv-{}-{}",
+            std::process::id(),
+            crate::artifacts::now_millis()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases: &[(&str, &str)] = &[
+            ("absolute", "echo '{\"syntheticPaths\":[\"/etc\"]}'"),
+            ("escape", "echo '{\"syntheticPaths\":[\"../outside\"]}'"),
+            ("root", "echo '{\"syntheticPaths\":[\".\"]}'"),
+            ("empty", "echo '{\"syntheticPaths\":[\"  \"]}'"),
+            ("non-string", "echo '{\"syntheticPaths\":[42]}'"),
+        ];
+        for (label, script) in cases {
+            let hook = dir.join(format!("hook-{label}.sh"));
+            std::fs::write(&hook, format!("#!/bin/sh\n{script}\n")).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let result = run_worktree_setup_hook(
+                &hook, 5000, &dir, &dir, &dir, "branch", 0, "run", "deadbeef", None,
+            );
+            let error = result.expect_err(label);
+            assert!(
+                error.contains("synthetic path") || error.contains("syntheticPaths"),
+                "{label}: error mentions the synthetic-path contract: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tracked path declared synthetic must fail setup (upstream
+    /// `git ls-files` pre-check) — otherwise the pre-add removal would turn
+    /// into a mass tracked deletion in the patch.
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_paths_tracked_path_rejected() {
+        // test_repo returns (versioned parent dir, git toplevel, commit) —
+        // cleanup must target the versioned parent, never its parent.
+        let (base_dir, repo, _commit) = super::tests::test_repo_shared("syntracked");
+        let hook = repo.join("tracked-hook.sh");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho '{\"syntheticPaths\":[\"base.txt\"]}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = run_worktree_setup_hook(
+            &hook, 5000, &repo, &repo, &repo, "branch", 0, "run", "deadbeef", None,
+        );
+        let error = result.expect_err("tracked path must fail setup");
+        assert!(
+            error.contains("cannot mark tracked paths as synthetic"),
+            "upstream message: {error}"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    /// The happy path still works: a valid relative untracked path is
+    /// collected (normalized + deduped).
+    #[cfg(unix)]
+    #[test]
+    fn synthetic_paths_valid_entries_collected_normalized() {
+        let (base_dir, repo, _commit) = super::tests::test_repo_shared("synok");
+        let hook = repo.join("ok-hook.sh");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho '{\"syntheticPaths\":[\"gen/\", \"./gen/x\", \"gen\"]}'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let collected = run_worktree_setup_hook(
+            &hook, 5000, &repo, &repo, &repo, "branch", 0, "run", "deadbeef", None,
+        )
+        .expect("valid paths collect");
+        assert_eq!(
+            collected,
+            vec!["gen".to_owned(), "gen/x".to_owned()],
+            "normalized (trailing slash and ./ collapse) + exact-duplicate dedup, \
+             distinct paths kept"
+        );
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }
