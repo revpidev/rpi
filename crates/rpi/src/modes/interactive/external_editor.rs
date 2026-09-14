@@ -71,7 +71,7 @@ impl InteractiveUi {
 
         // external-editor.ts:19-20 — printed while the TUI is stopped, so it
         // lands on the live terminal instead of the alternate screen.
-        println!("Launching external editor: {command}\nPi will resume when the editor exits.");
+        println!("Launching external editor: {command}\nrpi will resume when the editor exits.");
 
         let exit_code = spawn_and_wait(program, editor_args, &file_path);
 
@@ -197,7 +197,7 @@ impl InteractiveUi {
         self.ui.stop(TuiStopOptions::default());
         // Printed while the TUI is stopped, so it lands on the live terminal
         // (external-editor.ts:19-20 shape).
-        println!("Launching external editor: {command}\nPi will resume when the editor exits.");
+        println!("Launching external editor: {command}\nrpi will resume when the editor exits.");
 
         let exit_code = spawn_and_wait(program, editor_args, &file_path);
         let result = match exit_code {

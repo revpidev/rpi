@@ -137,9 +137,16 @@ images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text file
 output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit \
 for large files. When you need the full file, continue with offset until complete.";
 
-/// Format a number for display in error messages (JS `${offset}` semantics).
+/// Format a number for display in error messages (JS `${offset}` semantics —
+/// including `Infinity` for non-finite values, rc.12 review nit).
 fn format_number(v: f64) -> String {
-    if v.fract() == 0.0 && v.is_finite() {
+    if v.is_infinite() {
+        if v > 0.0 {
+            "Infinity".to_owned()
+        } else {
+            "-Infinity".to_owned()
+        }
+    } else if v.fract() == 0.0 {
         format!("{}", v as i64)
     } else {
         format!("{v}")
