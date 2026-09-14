@@ -96,9 +96,11 @@ semver = "1"
 # fancy-regex backend, no oniguruma C dependency (musl static target).
 # The syntax set is bat's curated set, filtered and re-dumped compressed by
 # crates/rpi/build.rs; the runtime crate only loads the embedded dump.
+# Resolves to the vendored fork under vendor/syntect (two additive visibility
+# patches, PATCHES.md there; issue #47) via [patch.crates-io] below.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "dump-load", "regex-fancy"] }
 # Build-time asset source only: bat's ~200-syntax set (syntect-assets embeds
-# its own syntect copy, unified to 5.3 via the caret range).
+# its own syntect copy, unified to the vendored 5.3 fork via the patch below).
 syntect-assets = { version = "0.23.6", default-features = false }
 
 # T18 binary self-update (ADR-0011): unpack the release asset
@@ -132,3 +134,11 @@ debug = "line-tables-only"
 lto = true
 codegen-units = 1
 strip = true
+
+# Issue #47: vendored syntect (registry 5.3.0 + two additive visibility
+# patches, see vendor/syntect/PATCHES.md). crates/rpi/build.rs rewrites the
+# embedded syntax dump's context references to filter the fancy-regex
+# incompatible grammars before re-linking; that needs `get_context` and
+# constructing `ContextReference` variants, which upstream keeps crate-private.
+[patch.crates-io]
+syntect = { path = "vendor/syntect" }
