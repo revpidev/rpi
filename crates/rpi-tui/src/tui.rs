@@ -418,6 +418,19 @@ impl Component for Container {
                 .map(|child| child.render(width).len())
                 .collect::<Vec<_>>()
         };
+        // Stale-cache guard (rc.12 review nit): children added/removed
+        // since the last render must not be zipped with the old heights —
+        // that would dispatch to the WRONG child. Upstream pairs the old
+        // component with its old height; with owned children the closest
+        // equivalent is to treat a count mismatch as a cache miss.
+        let heights = if heights.len() != self.children.len() {
+            self.children
+                .iter()
+                .map(|child| child.render(width).len())
+                .collect::<Vec<_>>()
+        } else {
+            heights
+        };
         let mut child_y: isize = 0;
         for (child, child_height) in self.children.iter_mut().zip(heights) {
             let child_height = child_height as isize;

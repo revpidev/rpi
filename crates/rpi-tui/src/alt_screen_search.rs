@@ -24,7 +24,8 @@ use crate::components::input::{Input, PlaceholderStyleFn};
 use crate::keybindings::get_keybindings;
 use crate::tui::{Component, Focusable};
 use crate::utils::{
-    get_grapheme_segmenter, strip_terminal_sequences, truncate_to_width, visible_width,
+    get_grapheme_segmenter, is_js_whitespace_char, strip_terminal_sequences, truncate_to_width,
+    visible_width,
 };
 
 // =============================================================================
@@ -136,8 +137,9 @@ fn build_search_corpus(lines: &[String]) -> SearchCorpus {
             for grapheme in get_grapheme_segmenter().segment(&line) {
                 let width = visible_width(grapheme);
                 // `/^\s+$/u.test(text)` on a single cluster: whitespace iff
-                // every char is whitespace.
-                if !grapheme.is_empty() && grapheme.chars().all(char::is_whitespace) {
+                // every char is JS `\s` whitespace (U+FEFF included — rc.12
+                // review nit: `char::is_whitespace` diverges on U+FEFF).
+                if !grapheme.is_empty() && grapheme.chars().all(is_js_whitespace_char) {
                     if builder.text_length > 0 {
                         builder.pending_separator = true;
                     }
@@ -179,7 +181,7 @@ fn normalize_query(query: &str) -> String {
     let mut result = String::with_capacity(query.len());
     let mut pending_space = false;
     for ch in query.chars() {
-        if ch.is_whitespace() {
+        if is_js_whitespace_char(ch) {
             pending_space = !result.is_empty();
         } else {
             if pending_space {

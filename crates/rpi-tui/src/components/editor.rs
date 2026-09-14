@@ -3390,8 +3390,26 @@ impl Component for Editor {
 
         let visual_lines = self.build_visual_line_map(self.last_width.get());
         let visual_line_index = self.scroll_offset.get() + (event.y as usize - 1);
-        let visual_line = visual_lines.get(visual_line_index)?;
-        let logical_line = self.state.lines.get(visual_line.logical_line)?.clone();
+        // Stale-render window (lines changed since the last render):
+        // upstream swallows the click and focuses the editor
+        // (editor.ts:651-652) — returning `None` here instead let the click
+        // fall through to the renderer's selection fallback without a
+        // focus transfer (rc.12 review).
+        let Some(visual_line) = visual_lines.get(visual_line_index) else {
+            return Some(TuiMouseHandlerResult::Event(TuiMouseEventResult {
+                handled: true,
+                focus: true,
+                ..Default::default()
+            }));
+        };
+        // `this.state.lines[...] ?? ""` — a vanished logical line walks the
+        // empty-chunk path below (upstream slice on "" is a no-op).
+        let logical_line = self
+            .state
+            .lines
+            .get(visual_line.logical_line)
+            .cloned()
+            .unwrap_or_default();
         // Visual-line columns are character indices; convert to byte
         // offsets for the slice (upstream `slice` on UTF-16 indices).
         let chunk_start_byte = char_to_byte(&logical_line, visual_line.start_col);
@@ -8850,5 +8868,33 @@ mod tests {
             ))
             .is_some());
         assert_eq!(ed.get_cursor(), (0, 11));
+    }
+
+    #[test]
+    fn stale_render_click_is_consumed_and_focuses_the_editor() {
+        // rc.12 review (P2): upstream editor.ts:651-652 swallows a click
+        // whose visual line no longer exists (lines changed since the last
+        // render) with `{ handled: true, focus: true }` — the port
+        // previously returned None, letting the click fall through to the
+        // renderer's selection fallback without a focus transfer.
+        let mut ed = editor();
+        type_text(&mut ed, "hello");
+        let _ = ed.render(80);
+        // Shrink the buffer without re-rendering: the clicked row (y=1 →
+        // visual line index 0 + scroll 0 still exists, so target a scrolled
+        // case) — set a scroll offset pointing past the shrunken map.
+        ed.scroll_offset.set(5);
+        match ed.handle_mouse(&editor_mouse_event(
+            TuiMouseEventType::Click,
+            TuiMouseButton::Left,
+            3,
+            1,
+        )) {
+            Some(TuiMouseHandlerResult::Event(event)) => {
+                assert!(event.handled, "stale click consumed");
+                assert!(event.focus, "stale click focuses the editor");
+            }
+            _ => panic!("stale-render click must be consumed with focus"),
+        }
     }
 }

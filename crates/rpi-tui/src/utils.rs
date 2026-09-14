@@ -1095,8 +1095,11 @@ pub fn get_active_background_ansi(text: &str) -> String {
 
 /// ECMA-262 `\s` (WhiteSpace + LineTerminator + U+FEFF). Differs from Rust's
 /// `char::is_whitespace` (White_Space property): JS includes U+FEFF and
-/// excludes U+0085.
-fn is_js_whitespace(c: char) -> bool {
+/// excludes U+0085. Public char-level form for consumers normalizing
+/// user text against JS regex `\s` semantics (e.g. the alt-screen search
+/// corpus/query normalization — rc.12 review nit: those previously used
+/// `char::is_whitespace`, diverging on U+FEFF).
+pub fn is_js_whitespace_char(c: char) -> bool {
     matches!(
         c,
         '\u{0009}'..='\u{000d}'
@@ -1111,6 +1114,10 @@ fn is_js_whitespace(c: char) -> bool {
             | '\u{3000}'
             | '\u{feff}'
     )
+}
+
+fn is_js_whitespace(c: char) -> bool {
+    is_js_whitespace_char(c)
 }
 
 /// JS `trimEnd` semantics (ECMA-262 `\s` set).

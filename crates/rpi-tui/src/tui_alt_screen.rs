@@ -492,6 +492,17 @@ impl Component for ImplicitDocument {
                 .map(|child| lock_component(child).render(width).len())
                 .collect::<Vec<_>>(),
         };
+        // Stale-cache guard (rc.12 review nit): a children count change
+        // since the cached render must re-measure — zipping new children
+        // with old heights would dispatch to the wrong child.
+        let heights = if heights.len() != children.len() {
+            children
+                .iter()
+                .map(|child| lock_component(child).render(width).len())
+                .collect::<Vec<_>>()
+        } else {
+            heights
+        };
         let mut child_y: isize = 0;
         for (child, child_height) in children.iter().zip(heights) {
             let child_height = child_height as isize;
