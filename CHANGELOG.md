@@ -30,6 +30,10 @@
 - **P1**：`read` 负 `limit` 回归 JS 语义不 panic；Windows bash 工具 kill/超时收敛；subagents `syntheticPaths` 越界校验（不再可能删除 worktree 外目录）；并行工具批 panic 补发 `tool_execution_end`；mcp adapter Ready/on_ready 竞态窗口消除（门禁抖动根因）；8 个 SSE adapter 取消立即中断体读。
 - **P2 加固**：wasm guest 内存 128 MiB 上限；SSE/Bedrock 帧上限 fail-fast；空 `data` 事件容错；`auth.json` 原子写；会话 `parent_id` 环防护；smart-fetch 响应体 32 MiB 上限（登记偏离）；compaction `session_id` 上游语义；`--rc` 无预发布降级已是最新；扩展名单组件校验；`parity_runner` 唯一命名等（全项见 `changes/v0.1.4.md`）。
 
+### 模型目录刷新（rc.13）
+
+- **内置模型目录刷新至 2026-09-14 快照**（catalog-only，行为 pin 保持 `9841914`，偏离 D-101）：聊天 1354 → 1397 模型（Bedrock 区域族 +34、GPT-5.4 Codex 退役、DeepSeek Flash 合并、OpenRouter 批量/别名族扩充等）；图片 50 → 54；行为面零变化；rpi-pages 远程目录同步。v0.1.5 上游追平后收敛。
+
 ### 发布终态复审修复（rc.12）
 
 - **P1**：三处 SSE `finish().unwrap()` 改错误传播（1 MiB 未换行尾巴 + 不完整 UTF-8 + EOF 的畸形流此前 panic 挂起 turn，无终态事件——rc.11 fail-fast 声明的缺口）；codex SSE 体读改与取消信号 race（Esc/abort 不再等 `httpTimeoutMs`，rc.11 P1-5 的同类残留）。
