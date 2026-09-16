@@ -226,12 +226,12 @@ fn handle_dispatch(message: &Value) -> Value {
             Trigger::Live
         }
         "message_update" => {
-            // FR-A: O(1) per delta — read {type, delta}, accumulate chars.
+            // FR-A + #45: O(1) amortized per delta — count the chars,
+            // retain the raw delta text and read the cumulative partial's
+            // provider usage; all inside LiveMeasure.
             with_engine(|engine| {
                 if let Some(live) = engine.live.as_mut() {
-                    live.on_message_update(
-                        payload.get("assistantMessageEvent").unwrap_or(&Value::Null),
-                    );
+                    live.on_message_update(&payload);
                 }
             });
             Trigger::Live
