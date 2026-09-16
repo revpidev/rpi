@@ -218,7 +218,11 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
             "message_update",
             json!({
                 "type": "message_update",
-                "message": {"role": "assistant", "content": []},
+                // #45 A: the cumulative partial carries the provider's
+                // running output totals (OpenAI chunk usage / Anthropic
+                // message_delta land exactly here).
+                "message": {"role": "assistant", "content": [],
+                            "usage": {"output": (i + 1) * 5}},
                 "assistantMessageEvent": {
                     "type": if i % 2 == 0 { "text_delta" } else { "thinking_delta" },
                     "contentIndex": 0,
@@ -302,6 +306,71 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
         "measurements grow across ticks"
     );
 
+    // ── #45: the raw material rides the same payloads — streaming
+    //      usage, cumulative raw text, the decode anchor (set once per
+    //      message) and the message id (stable within, moves across). ─
+    let streaming_tokens: Vec<u64> = with_live
+        .iter()
+        .filter_map(|payload| {
+            payload
+                .pointer("/rpi/live_output/output_tokens")
+                .and_then(Value::as_u64)
+        })
+        .collect();
+    assert_eq!(
+        streaming_tokens.len(),
+        with_live.len(),
+        "provider running usage on every tick"
+    );
+    assert!(
+        streaming_tokens.windows(2).all(|pair| pair[0] <= pair[1]),
+        "streaming usage is cumulative"
+    );
+    let anchors: Vec<Option<u64>> = with_live
+        .iter()
+        .map(|payload| {
+            payload
+                .pointer("/rpi/live_output/decode_started_at_ms")
+                .and_then(Value::as_u64)
+        })
+        .collect();
+    assert!(
+        anchors.iter().all(Option::is_some),
+        "decode anchor present on every live tick"
+    );
+    let anchor = anchors[0].expect("anchor");
+    assert!(
+        anchors.iter().all(|value| *value == Some(anchor)),
+        "anchor is the FIRST delta, never re-based by later ticks"
+    );
+    for payload in &with_live {
+        let live = payload.pointer("/rpi/live_output").expect("live block");
+        assert_eq!(live["message_id"], "1", "stable within the message");
+        // Raw text is the cumulative delta concatenation, in lockstep
+        // with the counters (the chars/buffers invariant).
+        assert_eq!(
+            live["text"].as_str().unwrap_or_default().chars().count() as u64,
+            live["text_chars"].as_u64().unwrap_or(0),
+            "text == Σ text_delta"
+        );
+        assert_eq!(
+            live["thinking"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .count() as u64,
+            live["thinking_chars"].as_u64().unwrap_or(0),
+            "thinking == Σ thinking_delta"
+        );
+        assert_eq!(live["toolcall"], "");
+        assert!(
+            live["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("0123456789")),
+            "raw text visible to the script"
+        );
+    }
+
     // ── ⑫ message_end: exact tokens land, streaming freezes. ────────────
     send_event(
         "message_end",
@@ -329,6 +398,14 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
     assert_eq!(final_live["output_tokens_exact"], 123);
     assert_eq!(final_live["text_chars"], 100);
     assert_eq!(final_live["thinking_chars"], 100);
+    // #45: frozen raw material alongside the frozen counters.
+    assert_eq!(
+        final_live["output_tokens"], 100,
+        "frozen at the last report"
+    );
+    assert_eq!(final_live["text"], "0123456789".repeat(10));
+    assert_eq!(final_live["thinking"], "0123456789".repeat(10));
+    assert_eq!(final_live["message_id"], "1");
     // Regular (non-live) runs keep the CC hook name (A4).
     assert_eq!(stdins.last().unwrap()["hook_event_name"], "Status");
 
@@ -371,6 +448,10 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
         .clone();
     assert_eq!(second_live["text_chars"], 2 * 13, "second-stream chars");
     assert_eq!(second_live["output_tokens_exact"], 7);
+    // #45: the id moved; no provider usage this message → omitted
+    // (the per-message reset clears the previous message's latch).
+    assert_eq!(second_live["message_id"], "2", "id moves per message");
+    assert!(second_live.get("output_tokens").is_none());
 
     // ── A8: ctx.sessionFile is authoritative — an mtime-newer sibling
     //      file in the heuristic directory must NOT win. ─────────────────
@@ -449,6 +530,16 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
                     .is_some_and(|exact| exact.is_null())
         })
     });
+    let third_live = captured_stdins(&stdin_log)
+        .iter()
+        .rev()
+        .find(|payload| payload.pointer("/rpi/live_output/text_chars") == Some(&json!(12)))
+        .expect("third live payload")
+        .pointer("/rpi/live_output")
+        .unwrap()
+        .clone();
+    assert_eq!(third_live["message_id"], "3");
+    assert_eq!(third_live["text"], "third-0-xxxx");
 
     // ── session_start resets the live measurements (FR-D). ─────────────
     send_event(

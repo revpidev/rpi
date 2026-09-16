@@ -20,6 +20,10 @@ use crate::paths::{find_latest_session_file, resolve_session_dir, session_id_fro
 /// Live streaming measurements for the CURRENT assistant message
 /// (03-realtime-token-count §1.4/§2.3): native measures, python computes.
 /// All values are raw measurements — no token conversion, no rate.
+/// Since #45 the raw material rides along too: the cumulative raw text
+/// per category and the provider-reported streaming output tokens —
+/// still measurements; any (language-aware) token estimation stays in
+/// the script.
 #[derive(Debug, Default)]
 pub struct LiveMeasure {
     /// An assistant message is in flight (`message_start` seen, matching
@@ -29,6 +33,36 @@ pub struct LiveMeasure {
     text_chars: u64,
     thinking_chars: u64,
     toolcall_chars: u64,
+    /// Cumulative raw text of the current message per category (#45 B):
+    /// the concatenation of every `*_delta` since `message_start`, reset
+    /// per message, frozen after `message_end`. Deltas build exactly the
+    /// partial's block bodies, so `text.chars().count() == text_chars`
+    /// always holds (the invariant is asserted in tests). Known benign
+    /// gaps vs the authoritative `message_end` content: no signatures,
+    /// no block structure (multi-block concatenation), redacted thinking
+    /// absent — none affect the script-side token estimation this exists
+    /// for.
+    text: String,
+    thinking: String,
+    toolcall: String,
+    /// Cumulative provider-reported output tokens of the current message
+    /// (#45 A), read from the `message_update` cumulative partial's
+    /// `usage.output` — OpenAI-compatible chunk usage and Anthropic
+    /// `message_delta` usage both land there. `None` while the provider
+    /// reports nothing (0/absent); a reported value is never overwritten
+    /// by later silence.
+    streaming_output_tokens: Option<u64>,
+    /// Wall clock of the FIRST delta of the current message (#45
+    /// companion): the TTFT-exclusion anchor scripts anchor the speed
+    /// clock on, jitter-free vs observing the first non-zero char count
+    /// at refresh cadence. `Instant` cannot serve — scripts compare
+    /// against their own wall clock.
+    decode_started_at: Option<SystemTime>,
+    /// Monotonic per-LiveMeasure message counter (#45): serialized as
+    /// `message_id`. Deliberately NOT reset by `on_message_start` — its
+    /// job is to CHANGE there, so stateless scripts detect the message
+    /// switch and reset their own smoothing state.
+    message_seq: u64,
     /// Chars accumulated since the last snapshot advance — a SEPARATE
     /// monotonic counter cleared ONLY when the snapshot advances, so it
     /// survives the `message_start` block reset (FR-B: cross-message
@@ -47,11 +81,25 @@ pub struct LiveMeasure {
 }
 
 /// Read-side projection of [`LiveMeasure`] at one payload assembly
-/// instant (the §1.6 `rpi.live_output` block, snake_case).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// instant (the §1.6 `rpi.live_output` block, snake_case). Carries the
+/// #45 raw material (cumulative text, streaming usage, decode anchor,
+/// message id) alongside the original counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct LiveSnapshot {
     pub streaming: bool,
+    /// `message_id`: plugin-local monotonic id, changes per message.
+    pub message_id: String,
+    /// Provider-reported cumulative output tokens while streaming
+    /// (#45 A); `None` = provider not reporting (field omitted).
+    pub output_tokens: Option<u64>,
+    /// Cumulative raw text of the current message (#45 B).
+    pub text: String,
+    pub thinking: String,
+    pub toolcall: String,
+    /// Wall-clock epoch ms of the first delta (#45 companion); `None`
+    /// until the first delta (field omitted).
+    pub decode_started_at_ms: Option<u64>,
     pub text_chars: u64,
     pub thinking_chars: u64,
     pub toolcall_chars: u64,
@@ -63,7 +111,9 @@ pub struct LiveSnapshot {
 
 impl LiveMeasure {
     /// FR-D: an assistant `message_start` resets the per-message block
-    /// accumulators and clock; the delta window base is untouched.
+    /// accumulators and clock; the delta window base is untouched. #45:
+    /// the raw-text buffers, streaming usage and decode anchor reset with
+    /// the block; `message_seq` moves instead of resetting (see field).
     pub fn on_message_start(&mut self, role: Option<&str>) {
         if role != Some("assistant") {
             return;
@@ -72,28 +122,66 @@ impl LiveMeasure {
         self.text_chars = 0;
         self.thinking_chars = 0;
         self.toolcall_chars = 0;
+        self.text.clear();
+        self.thinking.clear();
+        self.toolcall.clear();
+        self.streaming_output_tokens = None;
+        self.decode_started_at = None;
+        self.message_seq += 1;
         self.message_started_at = Some(Instant::now());
         self.message_ended_elapsed_ms = None;
         self.output_tokens_exact = None;
     }
 
     /// FR-A: per-delta bookkeeping — only `assistantMessageEvent.{type,
-    /// delta}` is read; `*_start`/`*_end` events carry no delta and add
+    /// delta}` is counted; `*_start`/`*_end` events carry no delta and add
     /// nothing. Category by event type (no contentIndex dimension —
-    /// char sums are block-independent). O(1) per delta.
-    pub fn on_message_update(&mut self, assistant_message_event: &Value) {
-        let event_type = assistant_message_event.get("type").and_then(Value::as_str);
-        let Some(delta) = assistant_message_event.get("delta").and_then(Value::as_str) else {
+    /// char sums are block-independent). O(1) amortized per delta.
+    ///
+    /// #45 takes the WHOLE event payload: besides the delta counters it
+    /// retains the raw delta text (buffer append) and reads the cumulative
+    /// partial's `usage.output` (`{message, assistantMessageEvent}` — the
+    /// host forwards the partial verbatim, provider running totals
+    /// included; zero/absent = not reporting, never overwrite a reported
+    /// value).
+    pub fn on_message_update(&mut self, payload: &Value) {
+        let event_type = payload
+            .pointer("/assistantMessageEvent/type")
+            .and_then(Value::as_str);
+        let Some(delta) = payload
+            .pointer("/assistantMessageEvent/delta")
+            .and_then(Value::as_str)
+        else {
             return;
         };
         let chars = delta.chars().count() as u64;
         match event_type {
-            Some("text_delta") => self.text_chars += chars,
-            Some("thinking_delta") => self.thinking_chars += chars,
-            Some("toolcall_delta") => self.toolcall_chars += chars,
+            Some("text_delta") => {
+                self.text_chars += chars;
+                self.text.push_str(delta);
+            }
+            Some("thinking_delta") => {
+                self.thinking_chars += chars;
+                self.thinking.push_str(delta);
+            }
+            Some("toolcall_delta") => {
+                self.toolcall_chars += chars;
+                self.toolcall.push_str(delta);
+            }
             _ => return,
         }
+        if self.decode_started_at.is_none() {
+            self.decode_started_at = Some(SystemTime::now());
+        }
         self.pending_delta_chars += chars;
+        if let Some(output) = payload
+            .pointer("/message/usage/output")
+            .and_then(Value::as_u64)
+        {
+            if output > 0 {
+                self.streaming_output_tokens = Some(output);
+            }
+        }
     }
 
     /// FR-C/FR-D: assistant `message_end` — capture the exact provider
@@ -131,7 +219,7 @@ impl LiveMeasure {
     /// FR-E); once frozen (message_end) it is stable.
     pub fn peek_fingerprint(&self, now: Instant) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}",
             self.streaming,
             self.text_chars,
             self.thinking_chars,
@@ -139,7 +227,9 @@ impl LiveMeasure {
             self.pending_delta_chars,
             self.elapsed_ms(now),
             self.output_tokens_exact,
-            self.message_started_at
+            self.message_started_at,
+            self.streaming_output_tokens,
+            self.message_seq
         )
     }
 
@@ -155,6 +245,10 @@ impl LiveMeasure {
     /// Advance the delta window and project the §1.6 block — called at
     /// the payload-assembly instant (FR-B: the snapshot base IS this
     /// script run's input). First advance bases on the message start.
+    /// The #45 raw material is CLONED, not taken: cumulative text,
+    /// streaming usage and the decode anchor belong to the message
+    /// lifetime, not the delta window (only `pending_delta_chars` is
+    /// window-scoped and cleared here).
     pub fn snapshot(&mut self, now: Instant) -> LiveSnapshot {
         let base = self.advanced_at.or(self.message_started_at);
         let delta_ms = base.map_or(0, |base| now.duration_since(base).as_millis());
@@ -163,6 +257,12 @@ impl LiveMeasure {
         self.advanced_at = Some(now);
         LiveSnapshot {
             streaming: self.streaming,
+            message_id: self.message_seq.to_string(),
+            output_tokens: self.streaming_output_tokens,
+            text: self.text.clone(),
+            thinking: self.thinking.clone(),
+            toolcall: self.toolcall.clone(),
+            decode_started_at_ms: self.decode_started_at.map(Self::epoch_millis),
             text_chars: self.text_chars,
             thinking_chars: self.thinking_chars,
             toolcall_chars: self.toolcall_chars,
@@ -171,6 +271,15 @@ impl LiveMeasure {
             elapsed_ms: self.elapsed_ms(now),
             output_tokens_exact: self.output_tokens_exact,
         }
+    }
+
+    /// Wall-clock epoch ms for `decode_started_at_ms` (#45): scripts
+    /// compare against their own clock. Pre-epoch clocks clamp to 0
+    /// (never occurs in practice).
+    fn epoch_millis(time: SystemTime) -> u64 {
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -400,8 +509,20 @@ mod tests {
     /// `RPI_CODING_AGENT_SESSION_DIR` (parallel set/remove_var races).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// The dispatch payload shape: `{message, assistantMessageEvent}`
+    /// (the host forwards the cumulative partial verbatim, #45 reads its
+    /// usage); tests default to no usage reporting.
     fn delta(kind: &str, text: &str) -> Value {
-        json!({"type": kind, "contentIndex": 0, "delta": text})
+        json!({"assistantMessageEvent": {"type": kind, "contentIndex": 0, "delta": text}})
+    }
+
+    /// A `message_update` payload whose cumulative partial carries
+    /// provider running usage (#45 A).
+    fn delta_with_usage(kind: &str, text: &str, output: u64) -> Value {
+        json!({
+            "message": {"role": "assistant", "usage": {"output": output}},
+            "assistantMessageEvent": {"type": kind, "contentIndex": 0, "delta": text},
+        })
     }
 
     #[test]
@@ -425,6 +546,138 @@ mod tests {
         assert!(snapshot.streaming);
         // Chars, not bytes: "…" is 3 bytes but 1 char.
         assert_eq!("pondering…".chars().count(), 10);
+    }
+
+    /// #45 B: the raw-text buffers are the cumulative per-category delta
+    /// concatenation, byte-for-byte what the script needs for its own
+    /// (language-aware) token estimation; `*_chars` stays in lockstep
+    /// (the invariant), `message_id` moves per message, and the snapshot
+    /// CLONES rather than drains (cumulative ≠ delta window).
+    #[test]
+    fn live_measure_retains_raw_text_and_moves_message_id_per_message() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        live.on_message_update(&delta("thinking_delta", "中文思考"));
+        live.on_message_update(&delta("text_delta", "hello "));
+        live.on_message_update(&delta("text_delta", "世界"));
+        live.on_message_update(&delta("toolcall_delta", "{\"cmd\":true}"));
+        let first = live.snapshot(Instant::now());
+        assert_eq!(first.thinking, "中文思考");
+        assert_eq!(first.text, "hello 世界");
+        assert_eq!(first.toolcall, "{\"cmd\":true}");
+        assert_eq!(first.message_id, "1");
+        // Invariant: counters and buffers agree (chars, not bytes).
+        assert_eq!(first.text.chars().count() as u64, first.text_chars);
+        assert_eq!(first.thinking.chars().count() as u64, first.thinking_chars);
+        assert_eq!(first.toolcall.chars().count() as u64, first.toolcall_chars);
+        // The snapshot clones: a second advance sees the same cumulative
+        // text (only the delta window drained).
+        let second = live.snapshot(Instant::now());
+        assert_eq!(second.text, first.text);
+        assert_eq!(second.delta_chars, 0);
+        // message_end freezes, the next message resets buffers + moves id.
+        live.on_message_end(&json!({"role": "assistant"}));
+        live.on_message_start(Some("assistant"));
+        live.on_message_update(&delta("text_delta", "next"));
+        let third = live.snapshot(Instant::now());
+        assert_eq!(third.text, "next");
+        assert_eq!(third.thinking, "");
+        assert_eq!(third.message_id, "2");
+        // A non-assistant start neither resets nor moves the id.
+        live.on_message_start(Some("user"));
+        let fourth = live.snapshot(Instant::now());
+        assert_eq!(fourth.message_id, "2");
+        assert_eq!(fourth.text, "next");
+    }
+
+    /// #45 A: the cumulative partial's `usage.output` is the provider's
+    /// running total — latched when > 0, never overwritten by later
+    /// silence (0/absent), reset per message, frozen after message_end
+    /// (where `output_tokens_exact` takes over).
+    #[test]
+    fn live_measure_latches_streaming_usage_with_zero_guard() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        // Not reporting yet → omitted.
+        live.on_message_update(&delta("text_delta", "a"));
+        assert_eq!(live.snapshot(Instant::now()).output_tokens, None);
+        // Running totals land cumulatively.
+        live.on_message_update(&delta_with_usage("text_delta", "b", 7));
+        assert_eq!(live.snapshot(Instant::now()).output_tokens, Some(7));
+        live.on_message_update(&delta_with_usage("text_delta", "c", 19));
+        assert_eq!(live.snapshot(Instant::now()).output_tokens, Some(19));
+        // Later silence (0 / absent usage) keeps the last report.
+        live.on_message_update(&delta_with_usage("text_delta", "d", 0));
+        live.on_message_update(&delta("text_delta", "e"));
+        assert_eq!(live.snapshot(Instant::now()).output_tokens, Some(19));
+        // message_end: exact takes over; streaming value frozen alongside.
+        live.on_message_end(&json!({"role": "assistant", "usage": {"output": 23}}));
+        let frozen = live.snapshot(Instant::now());
+        assert_eq!(frozen.output_tokens, Some(19));
+        assert_eq!(frozen.output_tokens_exact, Some(23));
+        // Per-message reset.
+        live.on_message_start(Some("assistant"));
+        live.on_message_update(&delta("text_delta", "x"));
+        assert_eq!(live.snapshot(Instant::now()).output_tokens, None);
+    }
+
+    /// #45 companion: the decode anchor is the wall clock of the FIRST
+    /// delta (any category), cleared per message; set before the first
+    /// delta it is absent (scripts fall back to `elapsed_ms`).
+    #[test]
+    fn live_measure_decode_anchor_on_first_delta_only() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        // The pre-first-delta window carries no anchor yet.
+        assert_eq!(live.snapshot(Instant::now()).decode_started_at_ms, None);
+        let before = SystemTime::now();
+        live.on_message_update(&delta("text_delta", "a"));
+        let after = SystemTime::now();
+        let anchor = live
+            .snapshot(Instant::now())
+            .decode_started_at_ms
+            .expect("first delta sets the anchor");
+        let clamp = |time: SystemTime| {
+            time.duration_since(SystemTime::UNIX_EPOCH)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        assert!(anchor >= clamp(before) && anchor <= clamp(after));
+        // Non-delta events never arm it; later deltas never move it.
+        live.on_message_update(&delta("text_start", ""));
+        live.on_message_update(&delta("thinking_delta", "t"));
+        assert_eq!(
+            live.snapshot(Instant::now()).decode_started_at_ms,
+            Some(anchor)
+        );
+        // Per-message reset.
+        live.on_message_end(&json!({"role": "assistant"}));
+        live.on_message_start(Some("assistant"));
+        assert_eq!(live.snapshot(Instant::now()).decode_started_at_ms, None);
+    }
+
+    /// #45: streaming usage and the message counter join the fingerprint
+    /// — running totals can advance without char movement (reasoning
+    /// tokens), and a frozen stream must still self-heal a dropped
+    /// `message_end` when the NEXT message starts.
+    #[test]
+    fn fingerprint_moves_with_streaming_usage_and_message_seq() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        live.on_message_end(&json!({"role": "assistant"}));
+        let frozen = live.peek_fingerprint(Instant::now());
+        // Same measurements, later instant: frozen fingerprint stable.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(live.peek_fingerprint(Instant::now()), frozen);
+        // Streaming usage alone moves it.
+        live.streaming_output_tokens = Some(4);
+        let with_usage = live.peek_fingerprint(Instant::now());
+        assert_ne!(with_usage, frozen);
+        live.streaming_output_tokens = Some(5);
+        assert_ne!(live.peek_fingerprint(Instant::now()), with_usage);
+        // Message seq alone moves it (frozen-state message switch).
+        live.message_seq += 1;
+        assert_ne!(live.peek_fingerprint(Instant::now()), with_usage);
     }
 
     #[test]

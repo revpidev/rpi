@@ -105,18 +105,36 @@ pub fn build_stdin_json(snapshot: &Snapshot) -> Value {
     Value::Object(root)
 }
 
-/// §1.6 `rpi.live_output`: all snake_case measurement values.
+/// §1.6 `rpi.live_output`: all snake_case measurement values. The #45
+/// raw material (message id, streaming provider usage, cumulative raw
+/// text, decode anchor) leads; the original 8 counters follow unchanged.
+/// Optional #45 fields are OMITTED when absent (same discipline as the
+/// top-level CC fields), unlike `output_tokens_exact` which is
+/// explicitly-null-while-streaming by contract.
 fn live_output_object(live: &LiveSnapshot) -> Value {
-    json!({
-        "streaming": live.streaming,
-        "text_chars": live.text_chars,
-        "thinking_chars": live.thinking_chars,
-        "toolcall_chars": live.toolcall_chars,
-        "delta_chars": live.delta_chars,
-        "delta_ms": live.delta_ms,
-        "elapsed_ms": live.elapsed_ms,
-        "output_tokens_exact": live.output_tokens_exact,
-    })
+    let mut object = Map::new();
+    object.insert("streaming".into(), json!(live.streaming));
+    object.insert("message_id".into(), json!(live.message_id));
+    if let Some(tokens) = live.output_tokens {
+        object.insert("output_tokens".into(), json!(tokens));
+    }
+    object.insert("text".into(), json!(live.text));
+    object.insert("thinking".into(), json!(live.thinking));
+    object.insert("toolcall".into(), json!(live.toolcall));
+    if let Some(decode_started_at_ms) = live.decode_started_at_ms {
+        object.insert("decode_started_at_ms".into(), json!(decode_started_at_ms));
+    }
+    object.insert("text_chars".into(), json!(live.text_chars));
+    object.insert("thinking_chars".into(), json!(live.thinking_chars));
+    object.insert("toolcall_chars".into(), json!(live.toolcall_chars));
+    object.insert("delta_chars".into(), json!(live.delta_chars));
+    object.insert("delta_ms".into(), json!(live.delta_ms));
+    object.insert("elapsed_ms".into(), json!(live.elapsed_ms));
+    object.insert(
+        "output_tokens_exact".into(),
+        json!(live.output_tokens_exact),
+    );
+    Value::Object(object)
 }
 
 /// `context_window` object: `context_window_size` always present (0 when
@@ -327,9 +345,16 @@ mod tests {
     #[test]
     fn live_output_block_shape_and_omission() {
         // §1.6: all snake_case measurement values, explicitly-null exact.
+        // #45: raw material leads — optional fields omitted when absent.
         let mut snapshot = full_snapshot();
         snapshot.live_output = Some(crate::state::LiveSnapshot {
             streaming: true,
+            message_id: "3".into(),
+            output_tokens: Some(1234),
+            text: "hello 世界".into(),
+            thinking: String::new(),
+            toolcall: "{\"a\":1}".into(),
+            decode_started_at_ms: Some(9_000),
             text_chars: 300,
             thinking_chars: 160,
             toolcall_chars: 52,
@@ -340,6 +365,12 @@ mod tests {
         });
         let payload = build_stdin_json(&snapshot);
         assert_eq!(payload["rpi"]["live_output"]["streaming"], true);
+        assert_eq!(payload["rpi"]["live_output"]["message_id"], "3");
+        assert_eq!(payload["rpi"]["live_output"]["output_tokens"], 1234);
+        assert_eq!(payload["rpi"]["live_output"]["text"], "hello 世界");
+        assert_eq!(payload["rpi"]["live_output"]["thinking"], "");
+        assert_eq!(payload["rpi"]["live_output"]["toolcall"], "{\"a\":1}");
+        assert_eq!(payload["rpi"]["live_output"]["decode_started_at_ms"], 9_000);
         assert_eq!(payload["rpi"]["live_output"]["text_chars"], 300);
         assert_eq!(payload["rpi"]["live_output"]["thinking_chars"], 160);
         assert_eq!(payload["rpi"]["live_output"]["toolcall_chars"], 52);
@@ -350,6 +381,13 @@ mod tests {
             payload["rpi"]["live_output"]["output_tokens_exact"],
             Value::Null
         );
+        // #45 optional fields are OMITTED when absent (explicitly unlike
+        // the explicitly-null `output_tokens_exact`).
+        snapshot.live_output.as_mut().unwrap().output_tokens = None;
+        snapshot.live_output.as_mut().unwrap().decode_started_at_ms = None;
+        let block = build_stdin_json(&snapshot)["rpi"]["live_output"].clone();
+        assert!(block.get("output_tokens").is_none());
+        assert!(block.get("decode_started_at_ms").is_none());
         // Exact present when the provider reported n > 0.
         snapshot.live_output.as_mut().unwrap().output_tokens_exact = Some(812);
         assert_eq!(
