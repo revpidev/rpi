@@ -24,6 +24,10 @@
 
 - **结构化 ask_user_question 工具**（第一方插件，上游 rpiv-mono @ v2.9.0+）：模型在需求不清时发起 1–4 题问卷（选项/预览/多选/备注），交互终端经交互式 UI ABI 渲染底部 tabbed overlay；RPC/ACP 宿主降级为宿主原生逐题 walker；非交互运行从工具列表摘除。契约面与上游逐字节对拍（231 条断言全 MATCH）；对话框高度稳定两轮修复（rc.8/rc.10，垫行基准恒非 input-mode + 垫行移至页脚块之前，总高恒定、hint 贴底）；随宿主 Release 锁步发布 `.rpix` 并入 registry 索引。
 
+### statusline live_output 原始材料透传（rc.15）
+
+- **`rpi.live_output` 原始材料透传**（#45；`rpi-statusline`，PR #49）：新增 6 个 additive 字段——`output_tokens`（流中 provider 累积 output tokens，仅 >0 出现、沉默不回写）、`text`/`thinking`/`toolcall`（当前消息累积原文，与 `*_chars` 恒等）、`decode_started_at_ms`（首个 delta 墙钟锚点，TTFT 排除）、`message_id`（逐消息变化）——让脚本自做语言感知 token 估算，替代单一 chars/token 因子（中文/英文双向偏差）。宿主早已把累积 partial（全文 + usage）送进扩展事件，修复为插件内留存并透传：宿主/ABI/订阅集零改动，原 8 字段逐字节不变，native 只测量不换算红线维持。
+
 ### 高亮引擎跨语法 panic 根治（rc.14）
 
 - **syntect（fancy-regex）跨语法 panic 根治**（#47；v0.1.3 T17 起存在，非 rc 回归）：39 个语法（HTML / Markdown→HTML / PHP / Vue / Svelte / QML / JSP / Elixir 等）解析到 `<script>`、`~r` 等内容时 push 进 6 个不兼容语法的 context，首次命中即 panic（`catch_unwind` 兜住但 stderr 污染 TUI、整块退纯文本）。build 期剔除 + 21,692 个 `Direct` 引用全量改写（Named 19,858 / File 按名 1,799 / 同 scope 重绑 34 / 未解析 1 例降级）+ 重链接（198→192）；引入 vendored fork `vendor/syntect`（5.3.0 + 两处可见性补丁，行为与注册表版一致）。HTML 内嵌 JS 着色恢复；Elixir `~r` 行纯文本降级；全仓 mod.rs 清零（规范 §3.1）。
