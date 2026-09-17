@@ -24,6 +24,10 @@
 
 - **结构化 ask_user_question 工具**（第一方插件，上游 rpiv-mono @ v2.9.0+）：模型在需求不清时发起 1–4 题问卷（选项/预览/多选/备注），交互终端经交互式 UI ABI 渲染底部 tabbed overlay；RPC/ACP 宿主降级为宿主原生逐题 walker；非交互运行从工具列表摘除。契约面与上游逐字节对拍（231 条断言全 MATCH）；对话框高度稳定两轮修复（rc.8/rc.10，垫行基准恒非 input-mode + 垫行移至页脚块之前，总高恒定、hint 贴底）；随宿主 Release 锁步发布 `.rpix` 并入 registry 索引。
 
+### statusline live_output 冻结 decode_ms（rc.16）
+
+- **无状态 tok/s 的 decode 时长透传**（#50；`rpi-statusline`，PR #51）：`rpi.live_output` 新增 `decode_ms`（首 delta→now 流式活更新 / `message_end` 冻结为首 delta→end，始终存在、首 delta 前 0）——空闲 tick 从未变 payload 重算同一速率，TTFT = `elapsed_ms − decode_ms` 同钟同时刻差（`Instant` 双子锚点，墙钟跳变单调保持），精准 tok/s 脚本从此单快照纯函数渲染，不再需要 per-session state file（三类持久化状态全数收编；resume 孤儿/陈旧两失败模式构造性消除）。宿主/ABI/订阅集零改动，原 15 字段逐字节不变。
+
 ### statusline live_output 原始材料透传（rc.15）
 
 - **`rpi.live_output` 原始材料透传**（#45；`rpi-statusline`，PR #49）：新增 6 个 additive 字段——`output_tokens`（流中 provider 累积 output tokens，仅 >0 出现、沉默不回写）、`text`/`thinking`/`toolcall`（当前消息累积原文，与 `*_chars` 恒等）、`decode_started_at_ms`（首个 delta 墙钟锚点，TTFT 排除）、`message_id`（逐消息变化）——让脚本自做语言感知 token 估算，替代单一 chars/token 因子（中文/英文双向偏差）。宿主早已把累积 partial（全文 + usage）送进扩展事件，修复为插件内留存并透传：宿主/ABI/订阅集零改动，原 8 字段逐字节不变，native 只测量不换算红线维持。
