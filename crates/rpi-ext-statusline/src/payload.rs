@@ -108,9 +108,12 @@ pub fn build_stdin_json(snapshot: &Snapshot) -> Value {
 /// §1.6 `rpi.live_output`: all snake_case measurement values. The #45
 /// raw material (message id, streaming provider usage, cumulative raw
 /// text, decode anchor) leads; the original 8 counters follow unchanged.
-/// Optional #45 fields are OMITTED when absent (same discipline as the
-/// top-level CC fields), unlike `output_tokens_exact` which is
-/// explicitly-null-while-streaming by contract.
+/// #50 appends the decode duration `decode_ms` as the anchor's companion
+/// (always present, 0 until the first delta — same discipline as
+/// `delta_ms`/`elapsed_ms`, unlike the Optional #45 fields). Optional
+/// #45 fields are OMITTED when absent (same discipline as the top-level
+/// CC fields), unlike `output_tokens_exact` which is explicitly-null-
+/// while-streaming by contract.
 fn live_output_object(live: &LiveSnapshot) -> Value {
     let mut object = Map::new();
     object.insert("streaming".into(), json!(live.streaming));
@@ -124,6 +127,10 @@ fn live_output_object(live: &LiveSnapshot) -> Value {
     if let Some(decode_started_at_ms) = live.decode_started_at_ms {
         object.insert("decode_started_at_ms".into(), json!(decode_started_at_ms));
     }
+    // #50: first-delta→now while streaming, frozen at message_end — the
+    // stateless tok/s denominator (and, with elapsed_ms, the stateless
+    // TTFT = elapsed_ms − decode_ms). Always present: 0 pre-first-delta.
+    object.insert("decode_ms".into(), json!(live.decode_ms));
     object.insert("text_chars".into(), json!(live.text_chars));
     object.insert("thinking_chars".into(), json!(live.thinking_chars));
     object.insert("toolcall_chars".into(), json!(live.toolcall_chars));
@@ -355,6 +362,7 @@ mod tests {
             thinking: String::new(),
             toolcall: "{\"a\":1}".into(),
             decode_started_at_ms: Some(9_000),
+            decode_ms: 2_400,
             text_chars: 300,
             thinking_chars: 160,
             toolcall_chars: 52,
@@ -371,6 +379,9 @@ mod tests {
         assert_eq!(payload["rpi"]["live_output"]["thinking"], "");
         assert_eq!(payload["rpi"]["live_output"]["toolcall"], "{\"a\":1}");
         assert_eq!(payload["rpi"]["live_output"]["decode_started_at_ms"], 9_000);
+        // #50: always present (0 default pre-first-delta), companion of
+        // the anchor.
+        assert_eq!(payload["rpi"]["live_output"]["decode_ms"], 2_400);
         assert_eq!(payload["rpi"]["live_output"]["text_chars"], 300);
         assert_eq!(payload["rpi"]["live_output"]["thinking_chars"], 160);
         assert_eq!(payload["rpi"]["live_output"]["toolcall_chars"], 52);
@@ -382,12 +393,15 @@ mod tests {
             Value::Null
         );
         // #45 optional fields are OMITTED when absent (explicitly unlike
-        // the explicitly-null `output_tokens_exact`).
+        // the explicitly-null `output_tokens_exact`) — but #50 `decode_ms`
+        // stays present at 0 (duration discipline: delta_ms/elapsed_ms).
         snapshot.live_output.as_mut().unwrap().output_tokens = None;
         snapshot.live_output.as_mut().unwrap().decode_started_at_ms = None;
+        snapshot.live_output.as_mut().unwrap().decode_ms = 0;
         let block = build_stdin_json(&snapshot)["rpi"]["live_output"].clone();
         assert!(block.get("output_tokens").is_none());
         assert!(block.get("decode_started_at_ms").is_none());
+        assert_eq!(block["decode_ms"], 0);
         // Exact present when the provider reported n > 0.
         snapshot.live_output.as_mut().unwrap().output_tokens_exact = Some(812);
         assert_eq!(

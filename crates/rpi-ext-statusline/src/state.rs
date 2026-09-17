@@ -58,6 +58,19 @@ pub struct LiveMeasure {
     /// at refresh cadence. `Instant` cannot serve — scripts compare
     /// against their own wall clock.
     decode_started_at: Option<SystemTime>,
+    /// Monotonic twin of [`Self::decode_started_at`] (#50): the duration
+    /// anchor `decode_ms` is measured from. Set at the same instant as
+    /// the wall-clock anchor; `Instant` because `decode_ms` is
+    /// host-computed (never compared against a script clock) and must
+    /// stay monotonic across NTP/wall-clock jumps — and because
+    /// `snapshot` samples it with the SAME `now` as `elapsed_ms`, making
+    /// `TTFT = elapsed_ms − decode_ms` exact by construction.
+    decode_started: Option<Instant>,
+    /// Frozen decode duration at `message_end` (#50): first delta → end,
+    /// measured on the same monotonic clock as the streaming value, so
+    /// idle ticks recompute the identical rate from the unchanged frozen
+    /// payload (scripts stay pure functions — no cached denominator).
+    message_ended_decode_ms: Option<u128>,
     /// Monotonic per-LiveMeasure message counter (#45): serialized as
     /// `message_id`. Deliberately NOT reset by `on_message_start` — its
     /// job is to CHANGE there, so stateless scripts detect the message
@@ -100,6 +113,13 @@ pub struct LiveSnapshot {
     /// Wall-clock epoch ms of the first delta (#45 companion); `None`
     /// until the first delta (field omitted).
     pub decode_started_at_ms: Option<u64>,
+    /// Decode duration ms: first delta → now while `streaming`, FROZEN
+    /// at `message_end` (#50). Always present, `0` until the first
+    /// delta — same always-present-with-0 discipline as `delta_ms` /
+    /// `elapsed_ms` (durations, not #45 Optional raw material), so
+    /// scripts index it unconditionally and the `decode_s < 0.5`-style
+    /// guard absorbs the pre-first-delta window.
+    pub decode_ms: u128,
     pub text_chars: u64,
     pub thinking_chars: u64,
     pub toolcall_chars: u64,
@@ -127,9 +147,11 @@ impl LiveMeasure {
         self.toolcall.clear();
         self.streaming_output_tokens = None;
         self.decode_started_at = None;
+        self.decode_started = None;
         self.message_seq += 1;
         self.message_started_at = Some(Instant::now());
         self.message_ended_elapsed_ms = None;
+        self.message_ended_decode_ms = None;
         self.output_tokens_exact = None;
     }
 
@@ -172,6 +194,7 @@ impl LiveMeasure {
         }
         if self.decode_started_at.is_none() {
             self.decode_started_at = Some(SystemTime::now());
+            self.decode_started = Some(Instant::now());
         }
         self.pending_delta_chars += chars;
         if let Some(output) = payload
@@ -197,6 +220,12 @@ impl LiveMeasure {
         }
         if let Some(started) = self.message_started_at {
             self.message_ended_elapsed_ms = Some(started.elapsed().as_millis());
+        }
+        // #50: freeze the decode duration on the same monotonic clock the
+        // streaming snapshots used (Instant twin anchor) — the frozen
+        // `elapsed_ms − decode_ms` pair stays an exact TTFT.
+        if let Some(decode) = self.decode_started {
+            self.message_ended_decode_ms = Some(decode.elapsed().as_millis());
         }
         self.streaming = false;
     }
@@ -242,6 +271,18 @@ impl LiveMeasure {
         }
     }
 
+    /// #50: decode duration at the snapshot instant — live while
+    /// streaming (same `now` as [`Self::elapsed_ms`], so the difference
+    /// is the exact TTFT), frozen after `message_end`.
+    fn decode_ms(&self, now: Instant) -> u128 {
+        if self.streaming {
+            self.decode_started
+                .map_or(0, |started| now.duration_since(started).as_millis())
+        } else {
+            self.message_ended_decode_ms.unwrap_or(0)
+        }
+    }
+
     /// Advance the delta window and project the §1.6 block — called at
     /// the payload-assembly instant (FR-B: the snapshot base IS this
     /// script run's input). First advance bases on the message start.
@@ -263,6 +304,7 @@ impl LiveMeasure {
             thinking: self.thinking.clone(),
             toolcall: self.toolcall.clone(),
             decode_started_at_ms: self.decode_started_at.map(Self::epoch_millis),
+            decode_ms: self.decode_ms(now),
             text_chars: self.text_chars,
             thinking_chars: self.thinking_chars,
             toolcall_chars: self.toolcall_chars,
@@ -654,6 +696,74 @@ mod tests {
         live.on_message_end(&json!({"role": "assistant"}));
         live.on_message_start(Some("assistant"));
         assert_eq!(live.snapshot(Instant::now()).decode_started_at_ms, None);
+    }
+
+    /// #50: `decode_ms` — 0 until the first delta (always present, never
+    /// omitted), live-updating while streaming on the monotonic twin
+    /// anchor, sampled at the SAME `now` as `elapsed_ms` (so
+    /// `elapsed_ms − decode_ms` is the exact TTFT window, never
+    /// negative), frozen at `message_end` (idle snapshots recompute the
+    /// identical value — pure-function scripts), reset per message.
+    #[test]
+    fn live_measure_decode_ms_lives_then_freezes() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        // Pre-first-delta window: 0, present.
+        assert_eq!(live.snapshot(Instant::now()).decode_ms, 0);
+        // TTFT window: message start → first delta.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        live.on_message_update(&delta("text_delta", "a"));
+        let armed = live.snapshot(Instant::now());
+        assert!(
+            armed.decode_ms < 5,
+            "armed at the first delta: {}",
+            armed.decode_ms
+        );
+        // Decode window grows; the same-instant difference is the TTFT.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let live_snap = live.snapshot(Instant::now());
+        assert!(
+            live_snap.decode_ms >= 40,
+            "live-updating while streaming: {}",
+            live_snap.decode_ms
+        );
+        let ttft = live_snap.elapsed_ms - live_snap.decode_ms;
+        assert!(
+            (8..40).contains(&ttft),
+            "TTFT = elapsed_ms − decode_ms is the start→first-delta window: {ttft}"
+        );
+        // message_end freezes; idle ticks recompute identical values.
+        live.on_message_end(&json!({"role": "assistant", "usage": {"output": 9}}));
+        let frozen = live.snapshot(Instant::now());
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let idle = live.snapshot(Instant::now());
+        assert_eq!(
+            frozen.decode_ms, idle.decode_ms,
+            "frozen at message_end — pure-function idle ticks"
+        );
+        assert_eq!(frozen.elapsed_ms, idle.elapsed_ms);
+        assert!(
+            idle.elapsed_ms >= idle.decode_ms,
+            "frozen pair stays a consistent TTFT (never negative)"
+        );
+        // Per-message reset.
+        live.on_message_start(Some("assistant"));
+        assert_eq!(live.snapshot(Instant::now()).decode_ms, 0);
+    }
+
+    /// #50 edge: a message that ends without any delta (aborted before
+    /// the first token) keeps `decode_ms` at 0 — there is no decode
+    /// window to measure, matching `output_tokens_exact: None`.
+    #[test]
+    fn live_measure_decode_ms_zero_when_message_ends_before_first_delta() {
+        let mut live = LiveMeasure::default();
+        live.on_message_start(Some("assistant"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        live.on_message_end(&json!({"role": "assistant", "usage": {"output": 0}}));
+        let snapshot = live.snapshot(Instant::now());
+        assert_eq!(snapshot.decode_ms, 0);
+        assert_eq!(snapshot.output_tokens_exact, None);
+        assert!(snapshot.elapsed_ms >= 10);
     }
 
     /// #45: streaming usage and the message counter join the fingerprint
