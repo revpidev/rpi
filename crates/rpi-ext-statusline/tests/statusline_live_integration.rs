@@ -343,6 +343,31 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
         anchors.iter().all(|value| *value == Some(anchor)),
         "anchor is the FIRST delta, never re-based by later ticks"
     );
+    // #50: decode_ms on every tick — always present, live-updating on the
+    // monotonic anchor, and never exceeding the same-snapshot elapsed_ms
+    // (the TTFT window elapsed_ms − decode_ms is non-negative).
+    let decode_ms: Vec<u64> = with_live
+        .iter()
+        .map(|payload| {
+            payload
+                .pointer("/rpi/live_output/decode_ms")
+                .and_then(Value::as_u64)
+                .expect("decode_ms always present while streaming")
+        })
+        .collect();
+    assert!(
+        decode_ms.windows(2).all(|pair| pair[0] <= pair[1]),
+        "decode duration is monotonic across ticks"
+    );
+    for payload in &with_live {
+        let live = payload.pointer("/rpi/live_output").expect("live block");
+        let elapsed = live["elapsed_ms"].as_u64().expect("elapsed_ms");
+        let decode = live["decode_ms"].as_u64().expect("decode_ms");
+        assert!(
+            elapsed >= decode,
+            "TTFT window = elapsed_ms − decode_ms must be non-negative"
+        );
+    }
     for payload in &with_live {
         let live = payload.pointer("/rpi/live_output").expect("live block");
         assert_eq!(live["message_id"], "1", "stable within the message");
@@ -406,6 +431,19 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
     assert_eq!(final_live["text"], "0123456789".repeat(10));
     assert_eq!(final_live["thinking"], "0123456789".repeat(10));
     assert_eq!(final_live["message_id"], "1");
+    // #50: the decode duration froze at message_end — a stable denominator
+    // for stateless tok/s (exact 123 tokens / this window); idle ticks
+    // recompute the identical value instead of drifting with `now`.
+    let frozen_decode = final_live["decode_ms"].as_u64().expect("frozen decode_ms");
+    assert!(frozen_decode > 0, "~1s of streaming armed the anchor");
+    assert!(
+        frozen_decode >= decode_ms.last().copied().unwrap_or(0),
+        "frozen after every streaming tick"
+    );
+    assert!(
+        frozen_decode <= final_live["elapsed_ms"].as_u64().unwrap_or(0),
+        "frozen TTFT pair stays consistent"
+    );
     // Regular (non-live) runs keep the CC hook name (A4).
     assert_eq!(stdins.last().unwrap()["hook_event_name"], "Status");
 
@@ -452,6 +490,14 @@ fn live_tokens_lifecycle_over_the_carrier_seam() {
     // (the per-message reset clears the previous message's latch).
     assert_eq!(second_live["message_id"], "2", "id moves per message");
     assert!(second_live.get("output_tokens").is_none());
+    // #50: per-message reset — the second message's decode window is its
+    // own (two deltas 40ms apart), not the first message's ~1s.
+    let second_decode = second_live["decode_ms"].as_u64().expect("decode_ms");
+    assert!(second_decode > 0);
+    assert!(
+        second_decode < frozen_decode,
+        "decode_ms resets per message: {second_decode} < {frozen_decode}"
+    );
 
     // ── A8: ctx.sessionFile is authoritative — an mtime-newer sibling
     //      file in the heuristic directory must NOT win. ─────────────────
