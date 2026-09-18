@@ -1,67 +1,68 @@
-# interactive-ui-parity（V14-22 C2 双载体一致性 harness）
+# interactive-ui-parity (V14-22 C2 dual-carrier consistency harness)
 
-R-U7.4 / G11 第 2 条的验收装置：同一 JSONL 输入脚本驱动 **native**
-（`crates/rpi-test-native-plugin` cdylib）与 **wasm**
-（`examples/wasm-extension`）两个 fixture guest，在真实 host-call JSON 通道
-（`rpi-ext-host` 的 `rpi_host_call` 分发 + `ScriptedUiBridge`）上跑同一个
-scripted 组件，逐帧 diff `{lines,cursor?,done?}` 与终止结果。
+The acceptance apparatus for R-U7.4 / G11 item 2: the same JSONL input script drives both the **native**
+(`crates/rpi-test-native-plugin` cdylib) and **wasm**
+(`examples/wasm-extension`) fixture guests, running the same
+scripted component over the real host-call JSON channel
+(`rpi-ext-host`'s `rpi_host_call` dispatch + `ScriptedUiBridge`), diffing `{lines,cursor?,done?}` frame by frame together with the terminal result.
 
-## 运行
+## Running
 
 ```bash
-# 从仓库根执行（自动构建两个 fixture；wasm32 目标缺失时回退到用户级 rustup）
+# From the repository root (builds both fixtures automatically; falls back to the user-level rustup
+# when the wasm32 target is missing)
 python3 scripts/interactive-ui-parity/run.py
 
-# 只跑二进制（fixture 已构建时）
+# Binary only (when the fixtures are already built)
 cargo run -p rpi-test-support --bin interactive-ui-parity -- \
   --fixture scripts/interactive-ui-parity/corpus \
   --out fixtures/generated/interactive-ui-parity
 ```
 
-产物：
+Outputs:
 
-- `fixtures/generated/interactive-ui-parity/parity-report.md` —— 报告（构建/逐场景/fuzz/结论）；
-- `<scenario>.native.json` / `<scenario>.wasm.json` —— 各载体完整转录（frames / terminal /
-  toolResult / mountOptions）；
-- `<scenario>.diff.json` —— 一致性判定（parity 投影 + 文档化约束标记）。
+- `fixtures/generated/interactive-ui-parity/parity-report.md` — the report (build/per-scenario/fuzz/conclusion);
+- `<scenario>.native.json` / `<scenario>.wasm.json` — each carrier's complete transcript (frames / terminal /
+  toolResult / mountOptions);
+- `<scenario>.diff.json` — the consistency verdict (parity projection + documented-constraint markers).
 
-退出码非 0 = 任何帧序列/终止结果差异、fixture 缺失或加载失败。
+A non-zero exit code = any frame-sequence/terminal-result difference, a missing fixture, or a load failure.
 
-## 语料格式（`corpus/*.jsonl`）
+## Corpus format (`corpus/*.jsonl`)
 
-一行一个宿主事件（顺序即投递顺序），文件名为场景名：
+One host event per line (in delivery order); the file name is the scenario name:
 
-| 行 | 事件 |
+| Line | Event |
 |---|---|
-| `{"input":"a"}` | `input`（原始按键字节，不归一化） |
+| `{"input":"a"}` | `input` (raw key bytes, not normalized) |
 | `{"resize":[80,24]}` | `resize` |
 | `{"tick":1}` | `tick` |
 | `{"hidden":true}` / `{"hidden":false}` | `visibility` |
 | `{"wake":1}` | `render` |
 | `{"theme":{"name":"light"}}` | `theme` |
 | `{"focus":true}` / `{"blur":true}` | `focus` / `blur` |
-| `{"dispose":"sessionReload"}` | `dispose`（终止路径） |
+| `{"dispose":"sessionReload"}` | `dispose` (an exit path) |
 
-每个场景必须以能触发 `done` 的输入（`q`）或 `dispose` 结束；脚本提前耗尽会被
-harness 判为失败（`scriptExhausted`）。
+Every scenario must end with an input that triggers `done` (`q`) or a `dispose`; a script that runs out early is judged a
+failure by the harness (`scriptExhausted`).
 
-> 驱动在系统临时目录下拷贝 fixture 包（逐场景清理）；若 `/tmp` 空间不足，
-> 先设置 `TMPDIR=<大容量目录>` 再运行（例如 `TMPDIR=$HOME/.cache/rpi-ui-parity-tmp`）。
+> The driver copies the fixture packages under the system temp directory (cleaned per scenario); if `/tmp` is tight,
+> set `TMPDIR=<a large directory>` before running (e.g. `TMPDIR=$HOME/.cache/rpi-ui-parity-tmp`).
 
-## fuzz（§4.5）
+## fuzz (§4.5)
 
-`run.py` 默认追加 24 个 seed 固定（`20260910`）的随机事件序列（长度/交错/
-隐藏态/主题/焦点/tick/wake/宽字符），同样双载体对拍；差异即非 0 退出，可用
-`--fuzz N --seed S` 复现。
+`run.py` appends 24 random event sequences with a fixed seed (`20260910`) by default (lengths/interleavings/
+hidden state/themes/focus/tick/wake/wide characters), likewise diffed across both carriers; any difference is a non-zero
+exit, reproducible with `--fuzz N --seed S`.
 
-## 允许的差异（文档化执行约束）
+## Allowed differences (documented execution constraints)
 
-只允许设计 §4.4 已定约束出现在对拍中，且 harness 会显式标注：
+Only the constraints already established in design §4.4 may appear in the comparison, and the harness marks them explicitly:
 
-- **wasm 帧预算**：`mountOptions.maxFrameBytes` 由 wasm 载体钳到 512 KiB
-  （native 保持 guest 请求值）。这不是行为差异，`documented_constraint_only`
-  会验证「除该字段外两条转录完全相等」后才判 MATCH。
+- **wasm frame budget**: `mountOptions.maxFrameBytes` is clamped to 512 KiB by the wasm carrier
+  (native keeps the guest's requested value). This is not a behavioral difference; `documented_constraint_only`
+  verifies that "the two transcripts are otherwise completely equal" before ruling MATCH.
 
-其余任何帧序列/终止结果差异都判失败（R-U7.4）。宿主侧注册表行为（tick
-暂停/恢复、wake 线程安全、限额、fuel/trap 卸载）由
-`crates/rpi` / `crates/rpi-ext-host` 的单元测试覆盖，不在此 harness 重复。
+Any other frame-sequence/terminal-result difference is a failure (R-U7.4). Host-side registry behavior (tick
+pause/resume, wake thread safety, limits, fuel/trap unloading) is covered by the
+unit tests of `crates/rpi` / `crates/rpi-ext-host`, not duplicated in this harness.

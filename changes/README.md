@@ -1,7 +1,7 @@
-# 版本变更记录(changes/)
+# Version changelog (changes/)
 
-每个版本一个文件:`v<version>.md`,内容即发布 changelog 的单一事实源。
+One file per version: `v<version>.md`. The file's content is the single source of truth for that release's changelog.
 
-- 撰写时机:发版前整理(依据 git log 与 rpi-docs 的任务/ADR 文档),随发版 PR 合入,再打 tag。
-- 同步:revpi.dev 的 changelog 页(rpi-pages 仓库 `changelog.html`)记录相同内容,发版时随站点生成一并更新。
-- 历史版本:目录保持全量;`v0.1.0.md` 为 v0.1.2 整理时补录。
+- Timing: finalized before each release (derived from the git log and the task/ADR documents in the rpi-docs repository), merged with the release PR, then tagged.
+- Sync: the revpi.dev changelog page (`changelog.html` in the rpi-pages repository) records the same content and is updated together with site generation at release time.
+- History: this directory keeps a full record of every version; `v0.1.0.md` was backfilled during the v0.1.2 cleanup.

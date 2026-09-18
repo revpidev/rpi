@@ -1,78 +1,78 @@
-# rpi JSON / RPC 线协议契约
+# rpi JSON / RPC wire protocol contract
 
-> 本文档是 rpi 自身 `--mode json`（print 模式）与 `--mode rpc`（RPC 模式）stdout 线协议的用户向契约说明。rpi 与上游 Pi v0.85.0+（`9841914`，ADR-0023）逐字节对拍；完整的 33 个 RPC 命令表与逐字段说明见上游文档 `external/pi/packages/coding-agent/docs/rpc.md` 与 `docs/json.md`，本文档只固化 rpi 侧已验证的契约要点（每条都有对应的测试锚点）。
+> This document is the user-facing contract for rpi's own stdout wire protocol in `--mode json` (print mode) and `--mode rpc` (RPC mode). rpi is byte-compared against upstream Pi v0.85.0+ (`9841914`, ADR-0023); the full 33-command RPC table and per-field documentation live in the upstream docs `external/pi/packages/coding-agent/docs/rpc.md` and `docs/json.md` — this document only pins the contract points verified on the rpi side (each has a corresponding test anchor).
 
-## 两种模式共用一个转换点
+## Both modes share one conversion point
 
-print 模式与 RPC 模式的事件流共用同一个转换函数（`crates/rpi/src/modes/json_event.rs::to_json_event`，对应上游 `json-event.ts`）。因此两种模式的 `message_update` 线格式完全一致。
+The event streams of print mode and RPC mode share the same conversion function (`crates/rpi/src/modes/json_event.rs::to_json_event`, mirroring upstream `json-event.ts`). The `message_update` wire format is therefore identical in both modes.
 
-## 首行：session header
+## First line: session header
 
-两种模式的首行均为 session header：
+The first line of both modes is the session header:
 
 ```json
 {"type":"session","version":3,...}
 ```
 
-## 事件序列
+## Event sequence
 
-一轮 prompt 的事件序为 `agent_start → message_start → message_update* →message_end → turn_end → … → agent_end`（retry/compaction/排队续体可能插入更多轮次；`agent_settled` 表示完全收敛）。
+One prompt round emits `agent_start → message_start → message_update* → message_end → turn_end → … → agent_end` (retries/compaction/queued continuations may insert further rounds; `agent_settled` marks full quiescence).
 
-## `message_update`：delta-only（v0.11 破坏性变更）
+## `message_update`: delta-only (v0.11 breaking change)
 
-自 v0.11 起，`message_update` **只携带增量 delta 与常量大小的元数据**，不再携带累积字段：
+Since v0.11, `message_update` carries **only incremental deltas and constant-size metadata** — no cumulative fields:
 
-- 顶层的累积 `message` 字段已移除，替换为常量大小的 `usage`（v0.1.4 / c93ea6ccf）：最新一次 provider 上报的**累计** usage；provider 只在完成时上报 usage 时，流式期间保持为零；
-- `assistantMessageEvent.partial` 已移除；
-- `toolcall_start` 增附带常量大小的 `id` 与 `toolName`（v0.1.4 / 830a0a59e），取自被剥掉的 `partial.content[contentIndex]` 的 toolCall 块，客户端可在首个参数 delta 前标注工具调用。
+- the top-level cumulative `message` field is gone, replaced by a constant-size `usage` (v0.1.4 / c93ea6ccf): the **cumulative** usage from the most recent provider report; when the provider only reports usage at completion, it stays zero during streaming;
+- `assistantMessageEvent.partial` is gone;
+- `toolcall_start` deltas carry a constant-size `id` and `toolName` (v0.1.4 / 830a0a59e), taken from the toolCall block of the stripped `partial.content[contentIndex]` — clients can label the tool call before the first argument delta arrives.
 
 ```json
 {"type":"message_update","usage":{...},"assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"Hello "}}
 ```
 
-键序钉死：顶层 `type → usage → assistantMessageEvent`；`toolcall_start` 增为 `type → contentIndex → id → toolName`（均与上游返回字面量一致，`json_event.rs` 单测逐字节断言）。
+Key order is pinned: top level `type → usage → assistantMessageEvent`; `toolcall_start` deltas `type → contentIndex → id → toolName` (both match upstream's returned literals; `json_event.rs` unit tests assert them byte-for-byte).
 
-delta 类型表（`assistantMessageEvent.type`）：
+Delta type table (`assistantMessageEvent.type`):
 
-| 类型 | 含义 |
-|------|------|
-| `text_start` / `text_delta` / `text_end` | 文本块的开始 / 增量 / 结束 |
-| `thinking_start` / `thinking_delta` / `thinking_end` | 思考块的开始 / 增量 / 结束 |
-| `toolcall_start` / `toolcall_delta` / `toolcall_end` | 工具调用的开始（含 `id`/`toolName`）/ 参数增量 / 结束 |
+| Type | Meaning |
+|------|---------|
+| `text_start` / `text_delta` / `text_end` | text block start / increment / end |
+| `thinking_start` / `thinking_delta` / `thinking_end` | thinking block start / increment / end |
+| `toolcall_start` / `toolcall_delta` / `toolcall_end` | tool call start (with `id`/`toolName`) / argument increment / end |
 
-注意：**`start` / `done` / `error` 不再是 delta 类型表条目**（v0.11 移除）。`toolcall_end` 携带完整的 `toolCall` 对象（含可选 `namespace`）；`toolcall_delta` 需由客户端按 `contentIndex` 缓冲拼接。
+Note: **`start` / `done` / `error` are no longer delta-type table entries** (removed in v0.11). `toolcall_end` carries the complete `toolCall` object (including optional `namespace`); `toolcall_delta` must be buffered and joined by the client per `contentIndex`.
 
-### 客户端拼装规则
+### Client assembly rules
 
-需要实时部分消息的客户端必须自行拼装：`message_start` 给出初始消息，后续 delta 按 `contentIndex` 应用；**`message_end.message` 是权威终态**。不要依赖任何中间事件的累积快照（它们已不在线上）。
+Clients that need live partial messages must assemble them: `message_start` provides the initial message, subsequent deltas apply by `contentIndex`; **`message_end.message` is the authoritative terminal state**. Do not rely on cumulative snapshots in intermediate events (they no longer exist on the wire).
 
-## 队列命令与 Esc 组合（`abort` / `clear_queue`）
+## Queue commands and the Esc combination (`abort` / `clear_queue`)
 
-### `abort`：等待 idle 才响应
+### `abort`: responds only once idle
 
-`abort` 中止当前运行，且**响应前等待会话完全 idle**（含 compaction，v0.1.4 / bea67d90d）：
+`abort` cancels the current run and **waits for the session to be fully idle (including compaction) before responding** (v0.1.4 / bea67d90d):
 
 ```json
 {"type": "abort"}
 ```
 
-响应：
+Response:
 
 ```json
 {"type": "response", "command": "abort", "success": true}
 ```
 
-注意：`abort` 本身**不清空队列**——队列中残留的 steering/followUp 会在中止后续驱动会话。需要清空时先发 `clear_queue`。
+Note: `abort` itself does **not** drain the queue — steering/followUp items left in the queue keep driving the session after the abort. Send `clear_queue` first when a clean slate is needed.
 
-### `clear_queue`：取回并清空队列（v0.1.4 / a79b37334）
+### `clear_queue`: retrieve and drain the queues (v0.1.4 / a79b37334)
 
-取出并清空 steering 与 follow-up 队列，返回其文本：
+Takes out and clears the steering and follow-up queues, returning their texts:
 
 ```json
 {"type": "clear_queue"}
 ```
 
-响应：
+Response:
 
 ```json
 {
@@ -86,19 +86,19 @@ delta 类型表（`assistantMessageEvent.type`）：
 }
 ```
 
-**交互式 Esc 语义**：客户端实现 Esc 行为应先 `clear_queue` 再 `abort`，然后把返回的文本还原进编辑器（上游 docs/rpc.md:155-158 的推荐组合）。`clear_queue` 只读清队列，不触发 turn、不与 abort 耦合；两命令的响应顺序与队列消费语义由客户端组合保证。
+**Interactive Esc semantics**: a client implementing Esc should send `clear_queue` then `abort`, and restore the returned texts into its editor (the recommended combination per upstream docs/rpc.md:155-158). `clear_queue` only reads and drains the queues — it triggers no turn and is not coupled to abort; response ordering and queue-consumption semantics are the client's to compose.
 
-## 背压与写错误
+## Backpressure and write errors
 
-- print/rpc 模式的事件写出经过统一的背压写路径（`crates/rpi/src/core/output_guard.rs::RawStdout`）：管道对端消费缓慢时事件源会被自然地限速，事件不丢弃、不合并、无中间缓冲增长。
-- 写出失败（如对端关闭管道）时进程以**退出码 1** 结束：RPC 模式在首次写错误时立即退出；print 模式在 run 自然结束时映射为退出码 1。
+- Event writes in print/rpc mode go through a unified backpressure write path (`crates/rpi/src/core/output_guard.rs::RawStdout`): when the pipe peer consumes slowly, event sources are throttled naturally — events are never dropped, merged, or buffered unboundedly.
+- On write failure (e.g. the peer closes the pipe) the process exits with **exit code 1**: RPC mode exits immediately on the first write error; print mode maps it to exit code 1 when the run ends naturally.
 
-## 测试锚点
+## Test anchors
 
-| 契约 | 锚点 |
+| Contract | Anchor |
 |------|------|
-| delta-only 转换 + `usage`/`id`/`toolName` 增量（键序钉死） | `json_event.rs` 单测（7 个） |
-| 二次方输出回归（#7290） | `crates/rpi/tests/regression_7290_json_stream_linear.rs` |
-| 背压慢消费者 | `crates/rpi/tests/json_rpc_backpressure_test.rs` |
-| 33 命令契约 | `crates/rpi` `rpc_mode_test.rs`（20 个契约测试） |
-| `clear_queue` 取回/清空 + Esc 组合（clear_queue + abort 后 idle、不消费已清 steering） | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |
+| delta-only conversion + `usage`/`id`/`toolName` increments (key order pinned) | `json_event.rs` unit tests (7) |
+| quadratic-output regression (#7290) | `crates/rpi/tests/regression_7290_json_stream_linear.rs` |
+| backpressure against a slow consumer | `crates/rpi/tests/json_rpc_backpressure_test.rs` |
+| 33-command contract | `crates/rpi` `rpc_mode_test.rs` (20 contract tests) |
+| `clear_queue` retrieve/drain + Esc combination (idle after clear_queue + abort; drained steering not consumed) | `rpc_mode_test.rs` `clear_queue_returns_and_purges_queues` |

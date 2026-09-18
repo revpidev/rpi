@@ -1,92 +1,98 @@
-# mcp-parity 目标轨骨架与重录清单（TE13 交付；实际重录归 TE23/TE24）
+# mcp-parity target-track skeleton and re-record list (delivered by TE13; the actual re-records belong to TE23/TE24)
 
-> **pin 已切换（TE27，2026-09-11；ADR-0025 已采纳）**：`external/pi-mcp-adapter` @
-> `10a45367e033a32026987a75d6f401e37340c86f`（v2.32.1，90 commits）。
-> 本文件保留作目标轨历史记录；缺省驱动（submodule 工作树）即 v2.32.1，快照路径
-> `/tmp/rpi-mcp-parity-target-v2321` 仅作独立对照源使用。
+> **The pin switched (TE27, 2026-09-11; ADR-0025 adopted)**: `external/pi-mcp-adapter` @
+> `10a45367e033a32026987a75d6f401e37340c86f` (v2.32.1, 90 commits).
+> This file is kept as the target-track historical record; the default driver (the submodule worktree) is already v2.32.1, and the snapshot path
+> `/tmp/rpi-mcp-parity-target-v2321` serves only as an independent reference source.
 
-## 1. 骨架就位内容（TE13 已完成）
+## 1. What the skeleton delivered (TE13, complete)
 
-| 项 | 落点 | 说明 |
+| Item | Location | Notes |
 |----|------|------|
-| 上游根可切换 | `run-mcp-parity.mjs` / `run-oauth-parity.mjs` / `render-call-upstream.mjs` | 均读 `RPI_MCP_PARITY_UPSTREAM`，缺省 = submodule 工作树（TE27 起 = v2.32.1） |
-| 目标源码/依赖外置 | `setup-target-source.sh` | `git archive` 抽取 v2.32.1 到 `/tmp/rpi-mcp-parity-target-v2321` 并用其 lockfile `npm ci`（external/ 零写入） |
-| conformance 基线重生成入口 | 本文件 §3 + `run-parity-suite.sh conformance` | 基线为 rpi 客户端预期失败清单（与上游 tag 无关；重生成入口 TE24 已验收） |
-| 行为对拍新增面清单 | 本文件 §4 | 审批作用域/退避可见性/503·202·401 分类/嵌套参数/OAuth 401（均已由 TE21/TE22 落地验收） |
+| Switchable upstream root | `run-mcp-parity.mjs` / `run-oauth-parity.mjs` / `render-call-upstream.mjs` | All read `RPI_MCP_PARITY_UPSTREAM`, default = the submodule worktree (since TE27 = v2.32.1) |
+| Target source/deps externalized | `setup-target-source.sh` | `git archive` extracts v2.32.1 into `/tmp/rpi-mcp-parity-target-v2321` and runs `npm ci` from its lockfile (zero writes to external/) |
+| Conformance baseline regeneration entry | This file §3 + `run-parity-suite.sh conformance` | The baseline is the rpi client's expected-failures list (independent of the upstream tag; the regeneration entry was accepted with TE24) |
+| New behavioral-parity surface list | This file §4 | Approval scoping/backoff visibility/503·202·401 classification/nested parameters/OAuth 401 (all landed and accepted by TE21/TE22) |
 
-**本骨架不做**：不切换默认驱动、不重录 `conformance-baseline.yml`、不重录任何 golden
-向量、不改 crate 实现——这些分别属 TE23/TE24/TE21/TE22（G10「对拍先于实现」的落地顺序见
-各任务文档）。
+**What this skeleton deliberately does not do**: no default-driver switch, no `conformance-baseline.yml` re-record, no golden
+vector re-records, no crate implementation changes — those belong to
+TE23/TE24/TE21/TE22 respectively (the landing order of G10's "parity before implementation" is in
+each task's document).
 
-## 2. 目标轨跑法（骨架验证）
+## 2. Running the target track (skeleton verification)
 
 ```bash
-# 一次性：外置快照 + 其 lockfile 闭包
+# One-time: external snapshot + its lockfile closure
 bash scripts/mcp-parity/setup-target-source.sh
 export RPI_MCP_PARITY_UPSTREAM=/tmp/rpi-mcp-parity-target-v2321
 export RPI_MCP_PARITY_DEPS=/tmp/rpi-mcp-parity-target-v2321
 
-# 协议腿 / renderCall 腿（用目标 pin 源码 + 目标闭包）
+# Protocol leg / renderCall leg (target-pin sources + target closure)
 node scripts/mcp-parity/run-mcp-parity.mjs --out-dir /tmp/mcp-target-parity
 node scripts/mcp-parity/run-render-call-parity.mjs
 ```
 
-目标轨在 M1–M3 完成前**预期产生差异**（新 namespace 工具、请求头、退避、命名等）；
-差异清单即 §4 各承接任务的验收入口。TE23/TE24 完成对应批次后，目标轨须逐步收敛为
-零差异（golden 按新 pin 重录）。
+Until M1–M3 complete, the target track is **expected to produce differences** (new namespace
+tools, request headers, backoff, naming, …);
+the difference list is the acceptance entry for the §4 owning tasks. After TE23/TE24 complete their
+batches, the target track must converge to
+zero differences (goldens re-recorded against the new pin).
 
-### TE13 骨架实测（2026-09-08）
+### TE13 skeleton field test (2026-09-08)
 
-| 腿 | 目标轨结果 | 说明 |
+| Leg | Target-track result | Notes |
 |----|------------|------|
-| renderCall 纯函数（24 例） | **24/24 逐字节一致**（exit 0） | v2.32.1 renderer 新增 `truncateToWidth`/`visibleWidth` 运行时导入；stub 已按 pi-tui 的 printable-ASCII 快路径补齐（`render-call-host-pi-tui.mjs`），用例均为短 ASCII 行 |
-| 协议腿（7 场景） | 6 DIFF + `http-auth-401` MATCH（exit 1） | DIFF 均为 v2.32.1 新增面（namespace 工具/请求头等），属预期，归 TE23/TE24 重录后收敛 |
+| renderCall pure functions (24 cases) | **24/24 byte-identical** (exit 0) | v2.32.1's renderer newly imports `truncateToWidth`/`visibleWidth` at runtime; the stub was completed per pi-tui's printable-ASCII fast path (`render-call-host-pi-tui.mjs`), all cases being short ASCII lines |
+| Protocol leg (7 scenarios) | 6 DIFF + `http-auth-401` MATCH (exit 1) | All DIFFs are v2.32.1-new surfaces (namespace tools/request headers, …), expected, converging after the TE23/TE24 re-records |
 
-- 报告头 pin 由 `RPI_MCP_PARITY_UPSTREAM_PIN` 控制（缺省 `3d953f90`；目标轨设 `10a45367`），
-  避免目标轨报告误标旧 pin。
-- 目标轨输出务必用 `--out-dir` / `RPI_MCP_PARITY_OUT_DIR` 指向 scratch 目录，避免覆盖
-  `fixtures/generated/mcp-parity/` 的回归证据。
-- **stub 局限**（§4.3 输入）：当前 pi-tui stub 只实现 printable-ASCII 快路径；若 TE24
-  重录的 render 向量含 ANSI/宽字符，需把 `@earendil-works/pi-tui` 映射切到目标依赖根里的
-  真实包（`render-call-hooks.mjs` 的映射点），并在任务文档登记。
+- The report-header pin is controlled by `RPI_MCP_PARITY_UPSTREAM_PIN` (default `3d953f90`; set `10a45367` for the target track),
+  preventing target-track reports from mislabeling the old pin.
+- Target-track output must use `--out-dir` / `RPI_MCP_PARITY_OUT_DIR` pointing at a scratch directory, never overwriting
+  the regression evidence in `fixtures/generated/mcp-parity/`.
+- **Stub limitations** (§4.3 input): the current pi-tui stub implements only the printable-ASCII fast path; if the TE24
+  re-recorded render vectors contain ANSI/wide characters, map `@earendil-works/pi-tui` to the
+  real package inside the target dependency root (the mapping point in `render-call-hooks.mjs`) and register it in the
+  task document.
 
-## 3. 重录清单：命名类 golden（D-R6，承接 **TE23**，先重录后改实现）
+## 3. Re-record list: naming goldens (D-R6, owned by **TE23**; re-record before changing the implementation)
 
-> **TE23 落地（2026-09-09）**：3.1/3.2 已按目标轨重录（`RPI_MCP_FIXTURE_UPSTREAM` /
-> `RPI_MCP_FIXTURE_PIN=10a45367` / `RPI_MCP_FIXTURE_ONLY=names,glob`）；`glob_cases.json`
-> 因候选集语义属 FR-B，同批重录（期望布尔值零变化、候选列表扩展）。
-> `golden_names.rs`/`golden_glob.rs` 未改断言形状，仅补齐新签名的 `other_current_candidates` 参数。
+> **TE23 landing (2026-09-09)**: 3.1/3.2 were re-recorded via the target track (`RPI_MCP_FIXTURE_UPSTREAM` /
+> `RPI_MCP_FIXTURE_PIN=10a45367` / `RPI_MCP_FIXTURE_ONLY=names,glob`); `glob_cases.json`
+> was re-recorded in the same batch because the candidate-set semantics belong to FR-B
+> (zero expectation-boolean changes, candidate lists extended).
+> `golden_names.rs`/`golden_glob.rs` kept their assertion shapes, only gaining the new signature's `other_current_candidates` parameter.
 
-| # | 对象 | 动作 | 依据 |
+| # | Object | Action | Basis |
 |---|------|------|------|
-| 3.1 | `crates/rpi-ext-mcp-adapter/tests/fixtures/name_format_cases.json` | **已完成**（TE23）：按 v2.32.1 命名规则重录（BREAKING：server 前缀保留 `-`/`_`，`a-b` 不再编码为 `a_2d_b`） | R7.2.4、需求附录 A |
-| 3.2 | `crates/rpi-ext-mcp-adapter/tests/golden_names.rs` | **已完成**（TE23）：期望由 3.1 驱动；「旧期望 → 新期望 + 上游 commit」在 TE23 §7 逐类登记（G2） | R7.2.4.4 |
-| 3.3 | `changes/` 单列 | **已完成**（TE23）：BREAKING 条目 + `toolPrefix:"none"` 兼容指引；不做新旧双注册 | G10 |
+| 3.1 | `crates/rpi-ext-mcp-adapter/tests/fixtures/name_format_cases.json` | **Done** (TE23): re-recorded against the v2.32.1 naming rules (BREAKING: server prefixes keep `-`/`_`; `a-b` is no longer encoded as `a_2d_b`) | R7.2.4, requirements appendix A |
+| 3.2 | `crates/rpi-ext-mcp-adapter/tests/golden_names.rs` | **Done** (TE23): expectations driven by 3.1; "old expectation → new expectation + upstream commit" registered case by case in TE23 §7 (G2) | R7.2.4.4 |
+| 3.3 | `changes/` callout | **Done** (TE23): a BREAKING entry + the `toolPrefix:"none"` migration guide; no dual old/new registration | G10 |
 
-## 4. 重录清单：conformance 与 golden 向量（D-R7，承接 **TE24**）
+## 4. Re-record list: conformance and golden vectors (D-R7, owned by **TE24**)
 
-| # | 对象 | 动作 | 依据 |
+| # | Object | Action | Basis |
 |---|------|------|------|
-| 4.1 | `scripts/mcp-parity/conformance-baseline.yml` | 用目标快照重跑官方 referee 后重生成（含新 namespace/请求头/bearer 面）；本文件 §2 命令 + `run-parity-suite.sh conformance` 的归档路径 | R7.2.4.4、设计 §4.9 |
-| 4.2 | `tests/golden_config_merge.rs` / `golden_config_hash.rs` / `golden_glob.rs` / `golden_search.rs` / `golden_tsshape.rs` | 按 v2.32.1 纯函数语义重录；逐条登记 G2 期望变更 | 设计 §4.9 |
-| 4.3 | `scripts/mcp-parity/render-call-fixtures.json` + `render-call-parity` 产物 | 渲染面按新 tag 重录（工具名/描述/渲染分支） | R7.2.10 |
+| 4.1 | `scripts/mcp-parity/conformance-baseline.yml` | Re-generate by re-running the official referee against the target snapshot (covering the new namespace/header/bearer surfaces); this file §2's commands + the archive path of `run-parity-suite.sh conformance` | R7.2.4.4, design §4.9 |
+| 4.2 | `tests/golden_config_merge.rs` / `golden_config_hash.rs` / `golden_glob.rs` / `golden_search.rs` / `golden_tsshape.rs` | Re-record against the v2.32.1 pure-function semantics; register every G2 expectation change case by case | design §4.9 |
+| 4.3 | `scripts/mcp-parity/render-call-fixtures.json` + the `render-call-parity` outputs | Re-record the rendering surface against the new tag (tool names/descriptions/render branches) | R7.2.10 |
 
-## 5. 行为对拍新增面（D-R7b，承接 TE21/TE22/TE24）
+## 5. New behavioral-parity surfaces (D-R7b, owned by TE21/TE22/TE24)
 
-| 面 | 承接 | 验收形态 |
+| Surface | Owner | Acceptance form |
 |----|------|----------|
-| 审批参数作用域（参数 A 批准后参数 B 仍拦截） | TE21 | fixture 用例 + 持久化 `/resume` 恢复 |
-| 退避可见性（连续失败后的状态/诊断） | TE22 | **已落地**（`tests/te22_backoff_oauth.rs`：失败注入 → status/list/search/describe/instructions/direct 逐面断言 + 过期恢复 + `/mcp status|tools`） |
-| 503/202/401 分类 | TE22 | 协议腿响应分类向量（401 腿 `http-auth-401` 回归轨/目标轨均 MATCH；503/202 归 TE24） |
-| 嵌套参数（对象/数组参数哈希稳定） | TE21 | 参数作用域向量 |
-| OAuth 401 与重注册 | TE22 | **已落地**（`tests/te22_backoff_oauth.rs`：MemorySecretStore 注入 + 401 compare-and-delete；stub AS `invalid_grant` → DCR 请求体逐字段断言）；`run-oauth-parity.mjs` 回归轨/目标轨均 MATCH |
+| Approval argument scoping (argument B still intercepted after argument A was approved) | TE21 | fixture cases + persistence across `/resume` restore |
+| Backoff visibility (status/diagnostics after consecutive failures) | TE22 | **Landed** (`tests/te22_backoff_oauth.rs`: failure injection → per-surface assertions over status/list/search/describe/instructions/direct + expiry recovery + `/mcp status\|tools`) |
+| 503/202/401 classification | TE22 | protocol-leg response-classification vectors (the 401 leg `http-auth-401` MATCHes on both the regression and target tracks; 503/202 belong to TE24) |
+| Nested parameters (stable hashing for object/array arguments) | TE21 | argument-scoping vectors |
+| OAuth 401 and re-registration | TE22 | **Landed** (`tests/te22_backoff_oauth.rs`: MemorySecretStore injection + 401 compare-and-delete; stub AS `invalid_grant` → DCR request body asserted field by field); `run-oauth-parity.mjs` MATCHes on both the regression and target tracks |
 
-## 6. 形状/口径
+## 6. Shapes/policies
 
-- 目标轨复用现有 harness 的归一化白名单与豁免（见 `README.md`）；新增面在对应任务
-  文档中登记豁免与依据。
-- 重录产物进 git 作证据链（与现有 `fixtures/generated/mcp-parity/` 一致），归一化
-  剔除运行期易变值。
-- 本文件与 `scripts/subagents-parity/expected-target-diffs.json` 的分工：mcp 侧重录
-  在 TE23/TE24 一次完成（golden 直接替换）；subagents 侧因实现分批，目标轨用归因
-  清单过渡。
+- The target track reuses the existing harness's normalization allowlist and exemptions (see `README.md`); new surfaces register their
+  exemptions and rationale in the corresponding task
+  documents.
+- Re-recorded outputs are committed to git as evidence chains (consistent with the existing `fixtures/generated/mcp-parity/`), with normalization
+  stripping run-time-volatile values.
+- Division of labor between this file and `scripts/subagents-parity/expected-target-diffs.json`: the mcp-side re-records were done in one
+  pass by TE23/TE24 (goldens replaced directly); the subagents side, implemented in batches, transitioned through the target track's attribution
+  list.

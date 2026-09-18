@@ -10,23 +10,26 @@
 fixtures/
 ├── README.md                # This file: runbook + itemized parity baseline list
 ├── generate-fixtures.mjs    # Generation script (pinned commit + fixed prompt scripts)
-├── subagents-v066/          # subagents 目标轨录制 fixture（pin 已随 TE27 切换，本目录锚点即当前基线；见该目录 README）
+├── subagents-v066/          # subagents target-track recorded fixtures (the pin switched with TE27; this directory is the current baseline — see its README)
 └── generated/
     ├── <scenario>/
     │   ├── session.jsonl    # Real on-disk session file (file-backed SessionManager)
     │   └── events.jsonl     # AgentSession event transcript (same event shape as json mode)
-    └── subagents-parity-v066/  # subagents 目标轨对拍报告（pin 切换后唯一活跃轨）
+    └── subagents-parity-v066/  # subagents target-track parity reports (the only active track since the pin switch)
 ```
 
-> **插件重定基（已生效，TE27 2026-09-11）**：`external/pi-subagents` @ `0fc0eebb`（v0.66.0）、
-> `external/pi-mcp-adapter` @ `10a45367`（v2.32.1）——pin 随 TE27 原子切换（ADR-0025 已采纳，见 rpi-docs `adr/0025-extension-upstream-rebase.md`）；
-> `external/pi` @ `9841914` 与 `external/agent-smart-fetch` @ `b0111612` 不变。
-> `fixtures/subagents-v066/` 与 `fixtures/generated/subagents-parity-v066/` 锚点即当前基线。
-> **旧 tag 回归轨（subagents v0.48.0 / mcp v2.24.0）生命周期随 pin 切换结束**：历史报告保留于
-> `fixtures/generated/subagents-parity/`（subagents，零回归红线使命完成）与
-> `fixtures/generated/mcp-parity/` 的 tag 前归档版本，不删除；驱动旧轨需要旧 pin 工作树
-> （`git -C external/pi-subagents checkout 56f97234`，用后复位）。
-> mcp 侧目标轨记录见 `scripts/mcp-parity/TARGET-TRACK.md`（重录已由 TE23/TE24 完成，黄金按 v2.32.1/`7a7b01b` 快照）。
+> **Plugin rebases (effective, TE27 2026-09-11)**: `external/pi-subagents` @ `0fc0eebb` (v0.66.0),
+> `external/pi-mcp-adapter` @ `10a45367` (v2.32.1) — the pins switched atomically with TE27 (ADR-0025 adopted;
+> see rpi-docs `adr/0025-extension-upstream-rebase.md`);
+> `external/pi` @ `9841914` and `external/agent-smart-fetch` @ `b0111612` are unchanged.
+> `fixtures/subagents-v066/` and `fixtures/generated/subagents-parity-v066/` are the current baseline anchors.
+> **The old-tag regression tracks (subagents v0.48.0 / mcp v2.24.0) reached end-of-life with the pin switch**:
+> historical reports are preserved under `fixtures/generated/subagents-parity/` (subagents — its
+> zero-regression red-line mission complete) and the pre-tag archived versions of
+> `fixtures/generated/mcp-parity/`, not deleted; driving the old tracks requires an old-pin worktree
+> (`git -C external/pi-subagents checkout 56f97234`, reset afterwards).
+> The mcp-side target-track record is `scripts/mcp-parity/TARGET-TRACK.md` (the re-record was completed by
+> TE23/TE24, with goldens snapshotted against v2.32.1/`7a7b01b`).
 
 ## 2. Runbook (repeatable generation)
 

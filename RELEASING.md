@@ -1,6 +1,6 @@
 # Releasing rpi
 
-Release checklist. The order is pinned by ADR-0011 ("端点与 Release 同步约束"): the version endpoint (`https://revpi.dev/api/latest-version`) and the GitHub Release have no automatic linkage, so they must be published in this exact sequence.
+Release checklist. The order is pinned by ADR-0011 ("endpoint and Release synchronization constraint"): the version endpoint (`https://revpi.dev/api/latest-version`) and the GitHub Release have no automatic linkage, so they must be published in this exact sequence.
 
 ## Checklist
 
@@ -27,29 +27,29 @@ Release checklist. The order is pinned by ADR-0011 ("端点与 Release 同步约
 
 The official-site asset mirror (`https://revpi.dev/releases/download/...`) is a Pages Function that proxies GitHub — zero storage, nothing to upload; it works as soon as the Release assets exist. (`install.sh` / `install.ps1` themselves are synced to the site root by `generate-site.py`.)
 
-## RC 预发布（pre-release channel）
+## RC pre-releases (pre-release channel)
 
-V14-19（rpi 自有需求，无上游对照；设计见 rpi-docs v0.1.4 需求基线 §6）。RC 是**发布预览通道**：`rpi update --rc` / `rpi update --extensions --rc`，不带 `--rc` 恒为 stable。
+V14-19 (an rpi-native requirement with no upstream counterpart; design in the rpi-docs v0.1.4 requirements baseline §6). RC is a **release preview channel**: `rpi update --rc` / `rpi update --extensions --rc`; without `--rc` the channel is always stable.
 
-### RC 版本号规范（硬约束）
+### RC version-number rules (hard constraints)
 
-- `<stable>-rc.<N>`（如 `0.1.5-rc.1`），tag `v0.1.5-rc.1`；基线必须是**候选目标版本**（`0.1.5-rc.1` 是 0.1.5 的候选，不是 0.1.4 的后缀）；
-- 小写 `rc`、点分数字段（`rc.10 > rc.9`；无点 `rc10` 会按 ASCII 序排错）；N 从 1 起单调递增不复用；
-- SemVer 强制项适用：数字标识符禁前导零（`rc.01` 非法）；
-- workspace 版本与四款 lockstep 扩展同 bump（`version.workspace = true` 自然传播）。
+- `<stable>-rc.<N>` (e.g. `0.1.5-rc.1`), tag `v0.1.5-rc.1`; the baseline must be the **candidate target version** (`0.1.5-rc.1` is a candidate for 0.1.5, not a suffix of 0.1.4);
+- lowercase `rc`, dotted numeric fields (`rc.10 > rc.9`; without the dot, `rc10` sorts wrong under ASCII ordering); N starts at 1, increases monotonically, and is never reused;
+- SemVer mandates apply: numeric identifiers must not have leading zeros (`rc.01` is invalid);
+- the workspace version and the four lockstep extensions bump together (`version.workspace = true` propagates naturally).
 
-### 发版顺序（与 stable 同构；顺序约束对 RC 端点同样成立）
+### Release sequence (isomorphic to stable; the ordering constraint applies equally to the RC endpoint)
 
-1. workspace 版本 bump `<stable>-rc.N` + `changes/v<stable>-rc.N.md`（发布说明；正式版发布时条目并入 `changes/v<stable>.md`），合入 `main`。
-2. 打 tag `v<stable>-rc.N` 并推送——build.yml 触发（`v*` 通配已覆盖），六目标资产 + `.rpix` 扩展资产 + `.sha256` sidecar 自动产出；**Release 自动标记 prerelease**（tag 含 `-rc`），`releases/latest` 与 install.sh 回退路径保持 stable。
-3. 等资产齐（同 stable 清单：12 个本体文件 + 扩展资产）。
-4. **才**刷新 RC 端点：rpi-pages `python3 scripts/generate-site.py --rc-version <stable>-rc.N` → commit + push。客户端探测 `https://revpi.dev/api/latest-rc-version.json`（由 stable 端点同目录推导）。
+1. Bump the workspace version to `<stable>-rc.N` + write `changes/v<stable>-rc.N.md` (the release notes; at stable-release time its entries fold into `changes/v<stable>.md`), merge to `main`.
+2. Tag `v<stable>-rc.N` and push — build.yml fires (the `v*` wildcard already covers it), producing the six-target assets + `.rpix` extension assets + `.sha256` sidecars; **the Release is automatically marked prerelease** (tag contains `-rc`), and `releases/latest` plus the install.sh fallback path stay stable.
+3. Wait for the assets (same manifest as stable: 12 core files + extension assets).
+4. **Only then** refresh the RC endpoint: in rpi-pages, `python3 scripts/generate-site.py --rc-version <stable>-rc.N` → commit + push. Clients probe `https://revpi.dev/api/latest-rc-version.json` (derived from the stable endpoint's directory).
 
-### 与 stable 发布的交互
+### Interaction with stable releases
 
-- **stable 发布不触碰 RC 端点**（旧 RC 会被客户端 semver 判为不新，无副作用）；
-- 正式版发布后该基线不再追加 rc；rc 用户切 stable：直接 `rpi update`（无旗标）——semver 全序 `0.1.5 > 0.1.5-rc.N` 使同基线切换自然成立；
-- 预发布构建的启动版本检查自动改探 RC 端点（横幅标注 pre-release，指引 `rpi update --rc`）；stable 用户不会被 RC 打扰。
+- **A stable release never touches the RC endpoint** (old RCs are judged not-newer by client semver, so there is no side effect);
+- after a stable release ships, no further rc is appended to that baseline; rc users switch to stable by running `rpi update` (no flag) — the semver total order `0.1.5 > 0.1.5-rc.N` makes the same-baseline switch fall out naturally;
+- pre-release builds probe the RC endpoint for the startup version check (the banner is marked pre-release and points to `rpi update --rc`); stable users are never bothered by RCs.
 
 ## Why the order matters
 

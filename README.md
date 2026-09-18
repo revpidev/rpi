@@ -2,7 +2,7 @@
 
 **The AI coding partner in your terminal — written in Rust, derived from [Pi](https://github.com/earendil-works/pi).**
 
-[English](./README.md) · [中文](./README.zh-CN.md)
+[English](./README.md) · [Chinese](./README.zh-CN.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Language: Rust](https://img.shields.io/badge/Language-Rust-orange?logo=rust&logoColor=white)](./Cargo.toml)

@@ -1,194 +1,205 @@
-# subagents 对拍 harness（TE04 G3；双轨重定基 TE13）
+# subagents parity harness (TE04 G3; dual-track rebase TE13)
 
-驱动钉死版上游 pi-subagents 与本 crate 的 `build_rpi_args` / frontmatter 解析器 /
-`get_finalOutput` / fallback 模式表 / 发现入口跑同一组 fixture，归一化后逐项 diff。
+Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / frontmatter parser /
+`get_finalOutput` / fallback mode table / discovery entry points with the same fixture set, then diffs the normalized outputs item by item.
 
-## 双轨
+## Dual tracks
 
-| 轨 | 上游 | 用途 | 报告目录 |
+| Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `target`（**默认，TE27 起**） | 新 pin v0.66.0（`0fc0eebb`，仓库外快照；submodule 已随 TE27 切至该 pin） | 新语义对拍与 golden 重录（ADR-0025） | `fixtures/generated/subagents-parity-v066/` |
-| `regression`（**已退役，TE27**） | 旧 pin v0.48.0（`56f97234`，需手动 checkout 旧 pin 工作树） | 保证 v0.48 基线零回归（使命已完成） | `fixtures/generated/subagents-parity/`（历史报告保留） |
+| `target` (**default since TE27**) | the new pin v0.66.0 (`0fc0eebb`, an out-of-repository snapshot; the submodule was switched to this pin with TE27) | new-semantics parity and golden re-records (ADR-0025) | `fixtures/generated/subagents-parity-v066/` |
+| `regression` (**retired with TE27**) | the old pin v0.48.0 (`56f97234`; requires manually checking out an old-pin worktree) | guaranteeing zero regression against the v0.48 baseline (mission complete) | `fixtures/generated/subagents-parity/` (historical reports preserved) |
 
-旧轨生命周期随 TE27 pin 切换结束（04 §1.3）：rpi 实现已落 v0.66 语义，旧轨黄金不再成立；
-复跑旧轨需 `git -C external/pi-subagents checkout 56f97234`（用后复位 `0fc0eebb`）。
-两轨 fixture 输入分离：基线用例在 `fixtures.json`，目标轨新增用例在 `fixtures-target.json`（目标轨按模式拼接两者）。
+The old track reached end-of-life with the TE27 pin switch (04 §1.3): the rpi implementation has
+landed v0.66 semantics, so the old-track goldens no longer hold;
+re-running the old track requires `git -C external/pi-subagents checkout 56f97234` (reset to `0fc0eebb` afterwards).
+The two tracks' fixture inputs are separate: baseline cases live in `fixtures.json`, target-track additions in `fixtures-target.json` (the target track concatenates both by mode).
 
-## 运行
+## Running
 
 ```bash
-# 一次性准备：tsx 外置安装，绝不写入 external/
+# One-time prep: tsx installed externally; never written into external/
 mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
   && npm init -y && npm install tsx@4 --no-save
 
 cd <repo-root>
 
-# 回归轨（已退役；复跑需旧 pin 工作树）
+# Regression track (retired; re-running requires an old-pin worktree)
 node scripts/subagents-parity/run-parity.mjs --track=regression
 
-# 目标轨（v0.66.0，默认）
-bash scripts/subagents-parity/setup-target-source.sh   # 抽取仓库外快照 + 其 prod 依赖
-node scripts/subagents-parity/run-parity.mjs            # TE27 起默认 target 轨
+# Target track (v0.66.0, default)
+bash scripts/subagents-parity/setup-target-source.sh   # extract the out-of-repo snapshot + its prod dependencies
+node scripts/subagents-parity/run-parity.mjs            # target track by default since TE27
 
-# 重录 argv/env 冻结基线（[RPI-OWN]，ADR-0025 §4）
+# Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4)
 node scripts/subagents-parity/run-parity.mjs --record-args-golden
 ```
 
-Rust 腿由 `run-parity.mjs` 自己构建（cargo 缓存命中时近零开销）并**拷贝到私有路径后执行**：
-各插件 crate 的 parity example 名称唯一（本 crate 为 `subagents_parity_runner`），`target/debug/examples/` 不再发生同名碰撞（P2-9）
-归最后构建的 crate 所有，mcp harness 会把它覆盖掉（TE13 实测发现的 harness 缺陷）。
-私有拷贝使两套 harness 互不干扰，example 名称与既有文档保持兼容。
+The Rust leg is built by `run-parity.mjs` itself (near-zero cost on cargo cache hits) and **executed from a private copy**:
+each plugin crate's parity example is uniquely named (here `subagents_parity_runner`), so `target/debug/examples/`
+no longer suffers name collisions (P2-9), where the example would belong to whichever crate built
+last and the mcp harness would overwrite it (a harness defect found during TE13 testing).
+The private copy keeps the two harnesses out of each other's way while keeping example names compatible with existing docs.
 
-退出码：目标轨非 0 = 存在**未归因**差异；回归轨（已退役）非 0 = 有差异。
+Exit code: non-zero on the target track = **unattributed** differences exist; on the regression track (retired) non-zero = differences exist.
 
-### 目标轨 discovery 腿（TE15，R7.1.3）
+### Target-track discovery leg (TE15, R7.1.3)
 
-`--track=target` 多跑一个 `discovery` 模式：同一条 tree 用例由**两侧各自物化**——
-上游腿把 fixture 里的 `<CFGDIR>` 落为 `.pi`，Rust 腿落为 `.rpi`，输出再把该段归一
-回 `<CFGDIR>`；两侧都调用**真实发现入口**（上游 v0.66 `discoverAgents(cwd, "user")`，
-rpi `discover_agents_with_user_dirs_with_diagnostics`），比较过滤到该树后的
-`agents`（name/source/path）与 `diagnostics`（path/source/error）。上游腿把 HOME /
-USERPROFILE / `PI_CODING_AGENT_DIR` 指向仓库外 sandbox 并设 `PI_OFFLINE=1`（跳过
-`npm root -g`），scope `user` 使 v0.66 走 `discoverAgentsUncached`，同一进程内多
-用例互不污染；内建 agent 与 `~/.agents` 由两侧按路径过滤排除。symlink 用例仅
-非 Windows 平台创建（两侧一致跳过，见 `fixtures/subagents-v066/discovery/materialize.json`）。
+`--track=target` runs an extra `discovery` mode: the same tree case is materialized **by both sides** —
+the upstream leg places the fixture's `<CFGDIR>` as `.pi`, the Rust leg as `.rpi`, and the output normalizes that
+segment back to `<CFGDIR>`; both sides call the **real discovery entry points** (upstream v0.66
+`discoverAgents(cwd, "user")`, rpi `discover_agents_with_user_dirs_with_diagnostics`), comparing
+`agents` (name/source/path) and `diagnostics` (path/source/error) filtered to that tree. The upstream leg points HOME /
+USERPROFILE / `PI_CODING_AGENT_DIR` at an out-of-repo sandbox and sets `PI_OFFLINE=1` (skipping
+`npm root -g`); scope `user` makes v0.66 take the `discoverAgentsUncached` path, so multiple cases
+within one process don't pollute each other; built-in agents and `~/.agents` are filtered out by
+path on both sides. Symlink cases are created on non-Windows platforms only (both sides skip
+them consistently; see `fixtures/subagents-v066/discovery/materialize.json`).
 
-## 目标轨上游来源（仓库外，external/ 零写入）
+## Target-track upstream source (out-of-repo; zero writes to external/)
 
-`setup-target-source.sh` 用 `git -C external/pi-subagents archive <pin>` 把 v0.66 源码抽取到
-`/tmp/rpi-subagents-parity-target-v066`（`RPI_SUBAGENTS_TARGET_SRC` 可覆盖），不 checkout、
-不 `git worktree add`、不改 submodule HEAD——`git -C external/pi-subagents status --porcelain`
-保持为空。快照内 `npm install --omit=dev` 装的是快照自带 `package.json` 的 prod 依赖
-（v0.66 `utils.ts → formatters.ts → settings.ts → agents/agents.ts` 在运行时 import `yaml`；
-v0.48 的链路止于 settings.ts，因此回归轨不需要依赖）。fetch 区间只需一次
-`git -C external/pi-subagents fetch --deepen=700 origin`（只读）。
+`setup-target-source.sh` uses `git -C external/pi-subagents archive <pin>` to extract the v0.66 sources into
+`/tmp/rpi-subagents-parity-target-v066` (overridable via `RPI_SUBAGENTS_TARGET_SRC`) — no checkout,
+no `git worktree add`, no submodule HEAD changes — so
+`git -C external/pi-subagents status --porcelain`
+stays empty. Inside the snapshot, `npm install --omit=dev` installs the prod dependencies of the snapshot's own
+`package.json`
+(v0.66 `utils.ts → formatters.ts → settings.ts → agents/agents.ts` imports `yaml` at runtime;
+the v0.48 chain stops at settings.ts, hence the regression track needs no dependencies). The fetch range needs only one
+`git -C external/pi-subagents fetch --deepen=700 origin` (read-only).
 
-## argv/env 的 [RPI-OWN] 基线
+## The [RPI-OWN] argv/env baseline
 
-上游 v0.65+ 删除了 `src/runs/shared/pi-args.ts` / `buildPiArgs`（子 agent 改进程内
-AgentSession），rpi 子进程模型的 argv/env 组装不再有上游对照物（R7.1.0.4、ADR-0025 §4）：
+Upstream v0.65+ deleted `src/runs/shared/pi-args.ts` / `buildPiArgs` (sub agents moved to in-process
+AgentSession), so the rpi subprocess model's argv/env assembly has no upstream counterpart (R7.1.0.4, ADR-0025 §4):
 
-- 回归轨仍跑 v0.48 `pi-args.ts`（旧轨即现状）；
-- 目标轨改为对**冻结黄金文件** `args-golden-v048.json` 比较——该文件由
-  `--record-args-golden` 从 v0.48 上游腿录制（session 基座占位化为 `<SESSION_BASE>`；
-  只重录 fixtures.json 的非内联用例）；
-- M2/M3 因 R7.1.4 系列改动 argv/env 时，由对应任务更新黄金文件并按 G2 登记
-  「旧期望 → 新期望 + 依据」；
-- **TE18 增补**：无上游录制器的新语义（`--exclude-tools` 等上游从未在 argv 面
-  存在的行为）以**内联 [RPI-OWN] 黄金**落在 `fixtures-target.json` 用例的
-  `expected` 字段，由编排器 `compareArgsTarget` 直接对 Rust 腿比较（不经上游腿）；
-  语义正确性由任务 §3.3 规则 + crate 单测钉死，内联黄金防未来回归。
+- the regression track still runs v0.48 `pi-args.ts` (the old track is the status quo);
+- the target track instead compares against the **frozen golden file** `args-golden-v048.json` — recorded from
+  the v0.48 upstream leg by `--record-args-golden` (session-base placeholders normalized to `<SESSION_BASE>`;
+  only the non-inline cases of fixtures.json are re-recorded);
+- when M2/M3 change argv/env via the R7.1.4 series, the corresponding task updates the golden file and registers
+  "old expectation → new expectation + evidence" per G2;
+- **TE18 addendum**: new semantics with no upstream recorder (`--exclude-tools` and other behaviors upstream never
+  had on the argv surface) land as **inline [RPI-OWN] goldens** in the `expected` field of
+  `fixtures-target.json` cases, compared by the orchestrator's `compareArgsTarget` directly against the Rust leg
+  (bypassing the upstream leg);
+  semantic correctness is pinned by the task's §3.3 rules + crate unit tests, with the inline goldens guarding
+  against future regressions.
 
-### TE18 新增：model 解析腿（目标轨）
+### TE18 addition: the model-resolution leg (target track)
 
-`--track=target` 多跑一个 `model` 模式：共享 fixture（registry/parentModel/origin）
-同时驱动 v0.66 快照的 `resolveSubagentModelOverride` / `buildModelCandidates` 与
-rpi 对应实现（`parity::resolve_subagent_model_override_public` /
-`build_model_candidates_public`），两侧输出 `{resolved|candidates}` 或 `{error}`
-（fail-closed 抛错两侧同形 diff），覆盖空 registry 透传 / 命中规范化 / thinking
-后缀重试 / 未命中 fail-closed（#1093）与 origin 感知候选链。
+`--track=target` runs an extra `model` mode: shared fixtures (registry/parentModel/origin) drive both the v0.66
+snapshot's `resolveSubagentModelOverride` / `buildModelCandidates` and the corresponding rpi implementations
+(`parity::resolve_subagent_model_override_public` /
+`build_model_candidates_public`), both sides emitting `{resolved|candidates}` or `{error}`
+(fail-closed throws diff identically on both sides), covering empty-registry passthrough / hit normalization /
+thinking-suffix retry / miss fail-closed (#1093) and the origin-aware candidate chain.
 
-## 归因规则（目标轨）
+## Attribution rules (target track)
 
-目标轨的每条差异必须命中 `expected-target-diffs.json`，否则报告落 `### unattributed` 且退出码非 0：
+Every target-track difference must hit `expected-target-diffs.json`, or the report lands in `### unattributed` with a non-zero exit code:
 
-- `upstream-semantics`：新 tag 行为、rpi 尚未采纳（挂 R 条目 + 承接任务）；
-- `rpi-deviation`：rpi 既有实现与两个 pin 都不一致的偏差；
-- 每条含 `mode/case`、`section`、`r`、`owner`；报告按两节汇总。
-- 差异字段为 `null` 表示 Rust 侧函数尚未实现（如 M0 的 `isContextOverflow` /
-  `isRetryableModelFailureAttempt`），同样按上述两节归因，不静默跳过。
+- `upstream-semantics`: new-tag behavior rpi hasn't adopted yet (attached R entry + owning task);
+- `rpi-deviation`: deviations where rpi's existing implementation disagrees with both pins;
+- each entry carries `mode/case`, `section`, `r`, `owner`; the report summarizes in two sections.
+- A difference field of `null` means the Rust-side function isn't implemented yet (e.g. M0's `isContextOverflow` /
+  `isRetryableModelFailureAttempt`), attributed through the same two sections — never silently skipped.
 
-> **TE14 落地注记（2026-09-09）**：`expected-target-diffs.json` 已清空——
-> R7.1.2.1 模式表五项补齐（`REQUEST_LIMIT_EXCEEDED`/`usage limit`/
-> `connection (error|reset|closed|aborted)`/`\b500\b`/`internal server error`）、
-> `isContextOverflow`（R7.1.2.2）与 `isRetryableModelFailureAttempt`（R7.1.2.3）
-> 落地后，fallback 16 用例全部 `MATCH`（目标轨 43/43），报告落
-> `fixtures/generated/subagents-parity-v066/parity-report.md`（`RESULT: MATCH`）。
-> 后续 TE15–TE18 若产生新差异，按原规则在清单追加归因。
+> **TE14 landing note (2026-09-09)**: `expected-target-diffs.json` has been emptied —
+> after R7.1.2.1's five mode-table entries landed (`REQUEST_LIMIT_EXCEEDED`/`usage limit`/
+> `connection (error|reset|closed|aborted)`/`\b500\b`/`internal server error`) together with
+> `isContextOverflow` (R7.1.2.2) and `isRetryableModelFailureAttempt` (R7.1.2.3),
+> all 16 fallback cases `MATCH` (target track 43/43), with the report at
+> `fixtures/generated/subagents-parity-v066/parity-report.md` (`RESULT: MATCH`).
+> If TE15–TE18 produce new differences later, attribute them by appending to the list under the original rules.
 
-## 组成
+## Composition
 
-| 文件 | 职责 |
+| File | Responsibility |
 |------|------|
-| `fixtures.json` | 基线共享用例：9 组 argv/env 输入、6 组 frontmatter 内容、5 组 message 数组 |
-| `fixtures-target.json` | 目标轨新增：frontmatter（inherit/false、excludeTools、坏 frontmatter、thinking）、final-output、fallback 向量、discovery tree（TE15）、notify（TE17）、**argv 内联 [RPI-OWN] 黄金（TE18：excludeTools 面，无上游录制器，期望内联在用例里）与 model 解析向量（TE18 R7.1.4.4/.5，直接对拍 v0.66 `model-fallback.ts`）** |
-| `args-golden-v048.json` | argv/env 冻结黄金文件（[RPI-OWN]；只覆盖 fixtures.json 的 9 例，`--record-args-golden` 只重录非内联用例） |
-| `expected-target-diffs.json` | 目标轨差异归因清单（R + 承接任务） |
-| `upstream-runner.mjs` | tsx 直跑上游模块：回归轨 v0.48；目标轨 frontmatter/final-output/fallback 走 v0.66 快照、args 走黄金文件、discovery 走 v0.66 `discoverAgents` |
-| `setup-target-source.sh` | 仓库外抽取 v0.66 快照 + 安装其 prod 依赖（external/ 零写入） |
-| `examples/subagents_parity_runner.rs` | 本 crate 同 fixture 驱动（parity facade，`lib.rs::parity`）；由编排器构建并私有拷贝后执行 |
-| `run-parity.mjs` | 编排 + 归一化 diff + 归因 + 报告落盘；物化 fixture 与 Rust 二进制拷贝落仓库外临时目录 |
+| `fixtures.json` | Shared baseline cases: 9 groups of argv/env inputs, 6 groups of frontmatter content, 5 groups of message arrays |
+| `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors, discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, diffed directly against v0.66 `model-fallback.ts`)** |
+| `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
+| `expected-target-diffs.json` | The target-track difference attribution list (R entries + owning tasks) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx: regression track v0.48; target track frontmatter/final-output/fallback via the v0.66 snapshot, args via the golden file, discovery via v0.66 `discoverAgents` |
+| `setup-target-source.sh` | Extracts the v0.66 snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
+| `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
+| `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
 
-`PI_CODING_AGENT_PACKAGE_ROOT=/tmp` 短路上游 `resolvePiPackageRoot` 的
-`import.meta.resolve`（包未安装时该函数抛错，上游以 env 优先）。
+`PI_CODING_AGENT_PACKAGE_ROOT=/tmp` short-circuits upstream `resolvePiPackageRoot`'s
+`import.meta.resolve` (the function throws when the package isn't installed; upstream prioritizes the env).
 
-## 归一化白名单（豁免与依据）
+## Normalization allowlist (exemptions and rationale)
 
-1. **session 路径具象化**：fixture 中 `/sess/root` 由编排器重写为共享
-   temp 目录（两侧同值原样比较，`--session-dir`/`--session` 值逐字节一致）；
-   比较时 `${SESSION_BASE}/sess/root` → `<SESSION_BASE>`，使跨运行录制的
-   冻结黄金文件可直接比较。
-2. **temp 目录名**：mkdtemp 前缀 `pi-subagent-*` / `rpi-subagent-*`
-   （ADR-0001 改名）→ `<TMPDIR>`。
-3. **`--extension` 值**：上游注入自身源文件（prompt-runtime.ts /
-   fanout-child.ts / 权限系统），rpi 注入本插件 cdylib（一个库承担
-   prompt-runtime + fanout-child 两职，TE-D17）→ 全部归一为 `<EXT>`；
-   连续的 `<EXT> --extension <EXT>` 运行折叠为一项（上游双源文件 vs
-   rpi 单 cdylib 的已知差）。
-4. **env 键序**：JS 插入序 vs Rust BTreeMap 序 → 两侧按键排序比较。
-5. **上游专属 env 键丢弃**：`PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS`
-   （runtime-ack 扩展回执，P1）、`PI_CODING_AGENT_PACKAGE_ROOT` /
-   `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`（node 包根传播，rpi 无对应物，
-   两个历史名都丢弃）。其余键含 `PI_SUBAGENT_*` → `RPI_SUBAGENT_*`
-   改名对齐。
-6. **rpi 专属 env 键丢弃（TE05 新增；TE18 增补）**：`RPI_SUBAGENT_STEER_INBOX`、
-   `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR`——rpi 原生的 steer 收件箱与
-   supervisor 通道目录槽位（FR-P1-04/10）；`RPI_NO_GLOBAL_CONTEXT`（TE18 /
-   ADR-0026，上游 #1560 的进程内 `inheritGlobalContext:false` 默认在 rpi 侧的
-   env 开关，两 pin 均无 argv/env 对应物；其存在性由 crate 单测 + e2e env dump
-   钉死而非本 diff）。上述键从 diff 中剔除。
-7. **prompt 临时文件内容不比较**：rpi 在文件头额外前置边界指令块
-   （`<active_agent>` 之后、正文之前，TE-D17 机制等价替代）；argv/env
-   层面的路径与 flag 一致即可。
+1. **Session-path concretization**: the fixture's `/sess/root` is rewritten by the orchestrator to a shared
+   temp directory (compared as-is with the same value on both sides; `--session-dir`/`--session` values byte-identical);
+   at comparison time `${SESSION_BASE}/sess/root` → `<SESSION_BASE>`, letting the
+   frozen golden files recorded across runs compare directly.
+2. **Temp directory names**: mkdtemp prefixes `pi-subagent-*` / `rpi-subagent-*`
+   (the ADR-0001 rename) → `<TMPDIR>`.
+3. **`--extension` values**: upstream injects its own source files (prompt-runtime.ts /
+   fanout-child.ts / the permission system), rpi injects this plugin's cdylib (one library serving
+   both prompt-runtime and fanout-child roles, TE-D17) → all normalized to `<EXT>`;
+   consecutive `<EXT> --extension <EXT>` runs collapse into one entry (a known difference:
+   upstream's two source files vs rpi's single cdylib).
+4. **env key order**: JS insertion order vs Rust BTreeMap order → both sides compared sorted by key.
+5. **Upstream-exclusive env keys dropped**: `PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS`
+   (the runtime-ack extension receipt, P1), `PI_CODING_AGENT_PACKAGE_ROOT` /
+   `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` (node package-root propagation; rpi has no
+   counterpart — both historical names dropped). All other keys align through the
+   `PI_SUBAGENT_*` → `RPI_SUBAGENT_*` rename.
+6. **rpi-exclusive env keys dropped (added in TE05; TE18 addendum)**: `RPI_SUBAGENT_STEER_INBOX` and
+   `RPI_SUBAGENT_SUPERVISOR_CHANNEL_DIR` — rpi-native slots for the steer inbox and the
+   supervisor channel directory (FR-P1-04/10); `RPI_NO_GLOBAL_CONTEXT` (TE18 /
+   ADR-0026 — the env-switch form on the rpi side of upstream #1560's in-process
+   `inheritGlobalContext:false` default; neither pin has an argv/env counterpart; its presence is
+   pinned by crate unit tests + an e2e env dump, not by this diff). The above keys are excluded from the diff.
+7. **Prompt temp-file contents not compared**: rpi additionally prepends a boundary-instruction block at the
+   file head (after `<active_agent>`, before the body — the TE-D17 mechanism-equivalent replacement);
+   path-and-flag equality at the argv/env layer suffices.
 
-## v0.66 共享面变化（目标轨实读，ADR-0025 附录 D）
+## v0.66 shared-surface changes (target-track close reads, ADR-0025 appendix D)
 
-- `src/runs/shared/pi-args.ts` **已删除** → argv/env 转 [RPI-OWN]（上节）；
-- `src/agents/frontmatter.ts` v0.48→v0.66 **逐字节不变**（frontmatter 用例两轨同形）；
-- `src/shared/utils.ts`：`getFinalOutput` 增 `stripPiTurnTimingFooter`（#1792，rpi 无该输出、
-  [N/A]，故不设 footer 用例）；`hasEmptyTerminalAssistantResponse` 扩「空文本终态」语义
-  （R7.1.1.2，TE14）；
-- `src/runs/shared/model-fallback.ts`：新增 `REQUEST_LIMIT_EXCEEDED`/`usage limit`/
-  `connection (error|reset|closed|aborted)`/`500`/`internal server error` 模式与
+- `src/runs/shared/pi-args.ts` **deleted** → argv/env moved to [RPI-OWN] (previous section);
+- `src/agents/frontmatter.ts` is **byte-identical** v0.48→v0.66 (frontmatter cases share one shape across tracks);
+- `src/shared/utils.ts`: `getFinalOutput` gained `stripPiTurnTimingFooter` (#1792; rpi has no such output,
+  [N/A], hence no footer cases); `hasEmptyTerminalAssistantResponse` extended with the "empty-text terminal state"
+  semantics (R7.1.1.2, TE14);
+- `src/runs/shared/model-fallback.ts`: new `REQUEST_LIMIT_EXCEEDED`/`usage limit`/
+  `connection (error|reset|closed|aborted)`/`500`/`internal server error` patterns plus
   `isRetryableModelFailureAttempt`/`isContextOverflow`/`recordRetryableModelFailure`
-  （R7.1.2.1–.3，TE14）；`isRetryableModelFailure` 与 `formatModelAttemptNote` 语义未变。
-- `src/agents/agents.ts` 发现面：`DISCOVERY_PRUNED_DIR_NAMES` 补 `.pi`/`sync-backups`
-  （#1596/671bc27c）；symlink 目录按目录跟随 + `visitedDirectories` realpath 集
-  （#1505/#1510/9433419a）；单文件 try/catch → `AgentDiscoveryDiagnostic`
-  （#1200/e973fa3c）。rpi 以 `.rpi` 替代 `.pi`（ADR-0001），其余按同语义对拍（TE15）。
+  (R7.1.2.1–.3, TE14); `isRetryableModelFailure` and `formatModelAttemptNote` semantics unchanged.
+- `src/agents/agents.ts` discovery surface: `DISCOVERY_PRUNED_DIR_NAMES` gained `.pi`/`sync-backups`
+  (#1596/671bc27c); symlinked directories followed as directories + a `visitedDirectories` realpath set
+  (#1505/#1510/9433419a); single-file try/catch → `AgentDiscoveryDiagnostic`
+  (#1200/e973fa3c). rpi substitutes `.rpi` for `.pi` (ADR-0001); everything else is parity-checked with
+  the same semantics (TE15).
 
-## 环境隔离（运行前须知）
+## Environment isolation (read before running)
 
-`run-parity.mjs` 两条腿都以**清除后的环境**启动子进程：所有 `PI_SUBAGENT*` /
-`RPI_SUBAGENT*` 前缀的环境键一律删除（`cleanSessionEnv`，harness 自己的
-`RPI_SUBAGENTS_PARITY_TRACK` 在清除之后再加）。原因：
+`run-parity.mjs` starts both legs' subprocesses with a **cleaned environment**: every environment key
+prefixed `PI_SUBAGENT*` / `RPI_SUBAGENT*` is deleted (`cleanSessionEnv`; the harness's own
+`RPI_SUBAGENTS_PARITY_TRACK` is added after cleaning). Reasons:
 
-- 上游腿的 `pi-args.ts` 会回退读取 shell 里的 `PI_*` 值，rust 腿读 `RPI_*`
-  （桥接层把 `PI_SUBAGENT_*` 改名为 `RPI_SUBAGENT_*`）——若在外层 shell 导出过
-  其中任一键，它的值只到达一条腿，args 模式会有假 MISMATCH（`fork-session-file`
-  之外的用例都走环境回退）。2026-08-15 前的 harness 未做此隔离；如需复现旧行为
-  可手动导出该键并观察误报。
-- **pi 子代理会话**会把父进程环境以 `PI_SUBAGENTS_` 前缀转发给子代理（实见
-  `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`，即 `pi-args.ts:641` 复制进子
-  进程 env 的包根键），因此只清 `PI_SUBAGENT_PARENT_SESSION` 不够——在 pi 子
-  代理会话里跑对拍会出现 8 个 args 假 MISMATCH。2026-09-09 修复后前缀键全清，
-  两种环境（普通 shell / pi 子代理）均 `MATCH`。
+- the upstream leg's `pi-args.ts` falls back to reading `PI_*` values from the shell, while the Rust leg reads
+  `RPI_*` (the bridge renames `PI_SUBAGENT_*` to `RPI_SUBAGENT_*`) — if any of those keys were exported
+  in the outer shell, its value would reach only one leg and the args mode would show false MISMATCHes
+  (every case except `fork-session-file` goes through the environment fallback). Harnesses before
+  2026-08-15 lacked this isolation; to reproduce the old behavior, export a key manually and watch
+  the false positives.
+- **pi subagent sessions** forward the parent environment to sub agents with a `PI_SUBAGENTS_` prefix
+  (seen in the wild: `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT`, the package-root key copied into the
+  child's env by `pi-args.ts:641`), so cleaning only `PI_SUBAGENT_PARENT_SESSION` is not enough — running
+  the parity inside a pi subagent session used to produce 8 args false MISMATCHes. After the
+  2026-09-09 fix all prefix keys are cleaned and both environments (plain shell / pi subagent)
+  report `MATCH`.
 
-## 已知不适用面
+## Known non-applicable surfaces
 
-- 工具描述全文：入口从 workflowScript 换成结构化参数（ADR-0016），
-  文案必然不同；custom 模板机制与 SAFETY 段结构由 crate 单测覆盖。
-- 会话条目过滤：上游在子进程 context 事件内过滤，rpi 在 fork 分支文件
-  上过滤（设计 §3.4），结果等价但层不同（e2e 场景 3 覆盖）。
-- turn-timing footer（#1792）：rpi 无该输出，按 [N/A] 不设对拍用例
-  （03 附录 C.3）。
+- Full tool descriptions: the entry point changed from workflowScript to structured parameters (ADR-0016),
+  so the copy necessarily differs; the custom-template mechanism and SAFETY-section structure are covered by
+  crate unit tests.
+- Session entry filtering: upstream filters inside the subprocess context event, rpi filters on the fork branch's
+  file (design §3.4) — equivalent results at different layers (e2e scenario 3 covers it).
+- The turn-timing footer (#1792): rpi has no such output; no parity cases per [N/A]
+  (03 appendix C.3).

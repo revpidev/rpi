@@ -1,77 +1,84 @@
-# subagents target-track recorded fixtures（pi-subagents v0.66.0）
+# subagents target-track recorded fixtures (pi-subagents v0.66.0)
 
-> **pin 已随 TE27 切换（2026-09-11，ADR-0025 已采纳）**：`external/pi-subagents` submodule HEAD 即
-> `0fc0eebb9604970c506708b7508d6aa38921fde2`（v0.66.0），本目录锚点即当前基线（TE13 录制时为仓库外只读快照，`external/` 零写入）。
+> **The pin switched with TE27 (2026-09-11, ADR-0025 adopted)**: the `external/pi-subagents` submodule HEAD is
+> `0fc0eebb9604970c506708b7508d6aa38921fde2` (v0.66.0), and this directory is the current baseline (recorded by TE13 as a read-only snapshot outside the repository; zero writes to `external/`).
 
-## 用途与消费者
+## Purpose and consumers
 
-| 文件 | 形状内容 | 需求 | 承接任务 |
+| File | Shape/content | Requirement | Owning task |
 |------|----------|------|----------|
-| `events/*.jsonl` + `events/expected.json` | 子进程 stdout 事件流三组（willRetry 失败后成功 / 空终态文本 / 工具错误+空回复）与期望终态 | R7.1.1.3 | TE14 |
-| `discovery/agents-tree/` + `discovery/materialize.json` | 发现目录树：坏 frontmatter、嵌套、`sync-backups` 剪枝、`.rpi` 剪枝、符号链接目录（含环） | R7.1.3.1–.4 | TE15 |
-| `terminal-classification.json` | 子步终态分类向量 + async step effective thinking | R7.1.6.1/.2 | TE16 |
-| `notify-fields.json` | 完成通知字段/行格式黄金 | R7.1.7.2 | TE17 |
+| `events/*.jsonl` + `events/expected.json` | Three groups of subprocess stdout event streams (willRetry failure-then-success / empty terminal text / tool error + empty reply) with expected terminal states | R7.1.1.3 | TE14 |
+| `discovery/agents-tree/` + `discovery/materialize.json` | A discovery directory tree: broken frontmatter, nesting, `sync-backups` pruning, `.rpi` pruning, symlinked directories (including cycles) | R7.1.3.1–.4 | TE15 |
+| `terminal-classification.json` | Sub-step terminal-state classification vectors + async-step effective thinking | R7.1.6.1/.2 | TE16 |
+| `notify-fields.json` | Completion-notification field/line-format goldens | R7.1.7.2 | TE17 |
 
-## 事件流（`events/`）
+## Event streams (`events/`)
 
-- JSONL 每行 = 子进程 stdout 的一行 JSON 事件（与
-  `crates/rpi-ext-subagents/tests/fixtures/child_stream.jsonl` 同形：
-  `session` 头 + `agent_start`/`turn_start`/`message_start`/`message_update`
-  （`assistantMessageEvent`）/`message_end`/`turn_end`/`tool_execution_*`/
-  `tool_result_end`/`agent_end`/`agent_settled`）。
-- `expected.json` 的 `expected` 字段由 v0.66 源码实读推导（每条 `anchors`
-  给出文件:行）；`currentRpiAtM0` 记录 TE13 时的 rpi 现状（即目标轨报告
-  中被归因的差异）。TE14 用 `ChildRunState` 回放 JSONL 并断言
-  `finalOutput`/`error`/`exitCode` 与 `expected` 一致。
-- **三组的语义**：
-  1. `will-retry-then-success.jsonl`：第一次 provider 尝试 `errorMessage` +
-     `stopReason:"error"` + `agent_end willRetry:true`，随后成功——恢复后
-     `errorMessage` 不得残留（R7.1.1.1 #1919）；
-  2. `empty-terminal-text.jsonl`：`stopReason:"stop"` 且 content 为空文本、
-     `usage.output==0`——空终态按 empty-output 诊断（R7.1.1.2 #1921）；
-  3. `tool-error-empty-reply.jsonl`：探索性工具报错后模型空回复——
-     empty-output 诊断优先于旧工具错（R7.1.1.2 #1921）。
+- Each JSONL line = one JSON event from the subprocess stdout (same shape as
+  `crates/rpi-ext-subagents/tests/fixtures/child_stream.jsonl`:
+  the `session` header + `agent_start`/`turn_start`/`message_start`/`message_update`
+  (`assistantMessageEvent`)/`message_end`/`turn_end`/`tool_execution_*`/
+  `tool_result_end`/`agent_end`/`agent_settled`).
+- `expected.json`'s `expected` field was derived by reading the v0.66 sources (each entry's `anchors`
+  gives file:line); `currentRpiAtM0` records rpi's state at TE13 (the differences attributed
+  in the target-track report). TE14 replays the JSONL with `ChildRunState` and asserts
+  `finalOutput`/`error`/`exitCode` match `expected`.
+- **Semantics of the three groups**:
+  1. `will-retry-then-success.jsonl`: the first provider attempt ends with `errorMessage` +
+     `stopReason:"error"` + `agent_end willRetry:true`, then succeeds — after recovery the
+     `errorMessage` must not linger (R7.1.1.1 #1919);
+  2. `empty-terminal-text.jsonl`: `stopReason:"stop"` with empty-text content and
+     `usage.output==0` — an empty terminal state diagnosed as empty-output
+     (R7.1.1.2 #1921);
+  3. `tool-error-empty-reply.jsonl`: an exploratory tool errors and the model replies empty —
+     the empty-output diagnosis takes precedence over the stale tool error
+     (R7.1.1.2 #1921).
 
-> **TE14 落地注记（2026-09-09）**：三组 JSONL + `expected.json` 已被
-> `crates/rpi-ext-subagents/src/runner/foreground.rs` 的
-> `terminal_classification_tests::recorded_event_stream_groups_match_upstream_expected`
-> 直接消费（`ChildRunState` 回放 + `synthesize_exit_from_parts`），逐组断言
-> `exitCode`/`error`/`finalOutput` 与 `expected` 一致，全绿；`currentRpiAtM0`
-> 记录的 M0 行为已被 R7.1.1.1/.2 修正取代。
+> **TE14 landing note (2026-09-09)**: the three JSONL groups + `expected.json` are consumed directly by
+> `terminal_classification_tests::recorded_event_stream_groups_match_upstream_expected` in
+> `crates/rpi-ext-subagents/src/runner/foreground.rs` (`ChildRunState` replay +
+> `synthesize_exit_from_parts`), asserting per group that `exitCode`/`error`/`finalOutput`
+> match `expected`, all green; the M0 behaviors recorded in `currentRpiAtM0`
+> have been superseded by the R7.1.1.1/.2 fixes.
 
-## 发现目录（`discovery/`）
+## Discovery directory (`discovery/`)
 
-- `agents-tree/` 提交的文件覆盖：合法 agent、未闭合 frontmatter、
-  无冒号行、**fatal frontmatter 两例**（`async: maybe` / `timeoutMs: not-a-number`）、
-  嵌套 agent、`sync-backups/`（应剪枝）。
-- `.rpi/` 与符号链接**不提交**，由 `materialize.json` 在测试临时目录重建：
-  `.rpi/` 被仓库 `.gitignore` 全局忽略（`.rpi/`），符号链接在 Windows
-  checkout 不可靠。`materialize.json` 钉死路径、目标、环与期望
-  （可见 agent 集合、剪枝路径、静默跳过集合、诊断集合）。
-- **TE15 复核修正（2026-09-09）**：TE13 初版把 `broken-frontmatter.md` /
-  `broken-no-colon.md` 列为诊断，与上游 v0.66.0 实读不符——两文件在
-  `loadAgentsFromDefinitionFiles` 里因缺 name/description 走 `continue`
-  （静默跳过，无诊断）；TE15 新增两例 fatal frontmatter 作为真正的诊断
-  来源，并把原两例改列 `expected_silent_skips`。
-- 消费方式：crate 单测按 `materialize.json` 物化后断言；目标轨 harness 的
-  `discovery` 模式用同一树用例与上游 `discoverAgents` 逐字段对拍
-  （`scripts/subagents-parity/README.md`「目标轨 discovery 腿」）。
+- Files committed under `agents-tree/` cover: a valid agent, unclosed frontmatter,
+  a line without a colon, **two fatal-frontmatter cases** (`async: maybe` / `timeoutMs: not-a-number`),
+  a nested agent, and `sync-backups/` (to be pruned).
+- `.rpi/` and symlinks are **not committed**; `materialize.json` rebuilds them in the test's
+  temp directory: `.rpi/` is globally ignored by the repository `.gitignore` (`.rpi/`), and
+  symlinks are unreliable on Windows checkouts. `materialize.json` pins the paths, targets,
+  cycles, and expectations (the visible-agent set, pruned paths, silently-skipped set, and
+  diagnostics set).
+- **TE15 review correction (2026-09-09)**: TE13's initial version listed `broken-frontmatter.md` /
+  `broken-no-colon.md` as diagnostics, which contradicts a close read of upstream v0.66.0 — both files
+  hit `continue` in `loadAgentsFromDefinitionFiles` for missing name/description
+  (silently skipped, no diagnostics); TE15 added the two fatal-frontmatter cases as the real
+  diagnostics source and moved the original two to `expected_silent_skips`.
+- Consumption: crate unit tests materialize per `materialize.json` and assert; the target-track
+  harness's `discovery` mode uses the same tree cases for a field-by-field comparison against
+  upstream `discoverAgents` (the "target-track discovery leg" in
+  `scripts/subagents-parity/README.md`).
 
-## 终态分类与通知
+## Terminal classification and notifications
 
-- `terminal-classification.json`：`child_status_union`/`projection_status_union`
-  取自 v0.66 `src/shared/types.ts:398/537`；聚合语义锚点
-  `src/runs/foreground/subagent-executor.ts:4228-4237`（stopped/timedOut/
-  interrupted）。TE16 补齐完整向量后本文件可扩面（不得静默改语义）。
-- **TE16 扩面（2026-09-09）**：新增 `terminal_vectors.cases`（7 例，含 precedence
-  与 `stop-wins-over-timeout`），由 `crates/rpi-ext-subagents/src/p1/parallel.rs`
-  单测消费；`cases`/`thinking` 原形状未改（仅追加节）。
-- `notify-fields.json`：行格式锚点 `src/runs/background/notify.ts:213-232`。
-  TE17 落地后 `cases.expected_lines` 作为 renderer 往返断言输入。
+- `terminal-classification.json`: `child_status_union`/`projection_status_union` taken from
+  v0.66 `src/shared/types.ts:398/537`; aggregation-semantics anchors at
+  `src/runs/foreground/subagent-executor.ts:4228-4237` (stopped/timedOut/
+  interrupted). After TE16 completes the full vector set this file can be extended
+  (never silently changing semantics).
+- **TE16 extension (2026-09-09)**: added `terminal_vectors.cases` (7 cases, including precedence
+  and `stop-wins-over-timeout`), consumed by unit tests in
+  `crates/rpi-ext-subagents/src/p1/parallel.rs`; the original `cases`/`thinking`
+  shapes unchanged (append-only sections).
+- `notify-fields.json`: line-format anchor at `src/runs/background/notify.ts:213-232`.
+  After TE17 lands, `cases.expected_lines` serve as renderer round-trip assertion input.
 
-## 形状钉死与变更口径
+## Shape pinning and change policy
 
-本目录的形状（字段名、目录结构、状态集合）在 TE13 钉死，TE14–TE17 直接
-消费。实现期若发现形状需要调整（例如上游字段名与实读不符），按 G2 口径
-登记「旧形状 → 新形状 + 上游依据」，并同步本 README 与对应任务文档；
-**不得静默改写**。
+The shapes in this directory (field names, directory layout, status sets) were pinned by TE13
+and consumed directly by TE14–TE17. If implementation work finds a shape needs adjusting
+(e.g. an upstream field name contradicting the close read), register it per the G2 policy as
+"old shape → new shape + upstream evidence" and sync this README with the corresponding task
+document; **never rewrite silently**.

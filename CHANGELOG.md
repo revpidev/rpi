@@ -1,127 +1,143 @@
 # Changelog
 
-## [0.1.4] - 2026-09-08
+## [0.1.4] - 2026-09-18
 
-### 主线
+### Main line
 
-- **上游追平 v0.85.0**（V14-01…18，ADR-0023）：行为金标准从 `4181f66`（v0.84.1+）升级到 `9841914`（v0.85.0+，698 commits / 866 文件），18 个对拍任务按「上游锚点 → rpi 落点 → 断言证据」三元组逐条恢复行为对拍绿。分域摘要见 `changes/v0.1.4.md`（发布 changelog 单一事实源），关键用户可观测面：
-  - **协议与会话**：compaction 触发时机对齐（#6879 BREAKING——终轮不再触发）；会话管理修复九项（fork compaction 重映射 #8989 / import 同名 #8985 / RPC abort 取消手动 compaction #8920 等）；`message_update` 恢复累计 usage（#7982）、`toolcall_start` 附 id/toolName（#7953）、新命令 `clear_queue`（#8432）。
-  - **Providers**：Anthropic 每轮 effort 持久化与 refusal fallback（managed Claude 请求体组合 + providerThinkingLevel 落盘）；Bedrock 原始响应头转发；NO_PROXY 语义重写（#8737：根域/子域/IPv6/host:port/`*`）；七 adapter 默认 User-Agent；模型目录重生成至 v0.85.0 数据（GPT-6 Astra、compat 字段）。
-  - **工具 / CLI / 扩展**：七内建工具 cwd 改执行时会话基准（#8627）；skills 三修复（#8552/#7805/#8255）；`--` 分隔符（#7269）、`--use-theme`（#7722）、选择器会话级作用域（#8356：Ctrl+S 才写全局）、Windows/WSL 默认键位（#8372）、配置健壮性（BOM #8337 / 权限 #7779 / 带路径错误 #7829）。
-  - **TUI**：鼠标分发基础设施全套 + 选择修复族（双击选词/右键粘贴去重/hover 不改选择）；全屏 transcript 搜索与跳转指示（#8800）；滚动条重设计 + 验证式复制（OSC 52 + 回读 + toast）；LaTeX/表格渲染修复族；working indicator 内嵌 editor 边框；thinking 切换就地更新；终端能力覆盖三 env（`RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + `terminal.*` 设置）与 SSH 下 Alt+Enter 双超时（#7899）；rpi-tui 与配置 env 离婚（`c505f4c19`，`RPI_TUI_DEBUG_REDRAW`/`rpi-tui-*.log` 改名，二进制行为不变）。
-- **M5 收口**：主题校验拆分移植（eb3e9feed——库路径 lenient cast + 应用层安装式校验器）；fixtures 全量重录钉死 9841914；偏离 D-092…D-100 全闭环（3 登记 + 5 核销 + 2 未触发转正）。
+- **Upstream parity to v0.85.0** (V14-01…18, ADR-0023): the behavioral gold standard moves from `4181f66` (v0.84.1+) to `9841914` (v0.85.0+, 698 commits / 866 files); eighteen parity tasks restored behavioral parity green item by item with an "upstream anchor → rpi landing → assertion evidence" triple each. Domain summaries in `changes/v0.1.4.md` (the release changelog's single source of truth); key user-observable surfaces:
+  - **Protocol & sessions**: compaction trigger timing aligned (#6879 breaking — terminal turns no longer fire it); nine session-management repairs (fork compaction remap #8989 / import same-name #8985 / RPC abort cancelling manual compaction #8920, …); `message_update` restores cumulative usage (#7982), `toolcall_start` carries id/toolName (#7953), and the new `clear_queue` command (#8432).
+  - **Providers**: Anthropic per-turn effort persistence and refusal fallback (managed-Claude request composition + providerThinkingLevel persisted); Bedrock raw response-header forwarding; the NO_PROXY semantics rewrite (#8737: root-domain/subdomain/IPv6/host:port/`*`); the default User-Agent across seven adapters; the model catalog regenerated against v0.85.0 data (GPT-6 Astra, compat fields).
+  - **Tools / CLI / extensions**: the seven built-in tools resolve cwd at execution time against the session (#8627); three skills fixes (#8552/#7805/#8255); the `--` separator (#7269), `--use-theme` (#7722), session-scoped selector changes (#8356: Ctrl+S persists globally), Windows/WSL default bindings (#8372), config robustness (BOM #8337 / permissions #7779 / errors with paths #7829).
+  - **TUI**: the full mouse-dispatch infrastructure + the selection-fix family (double-click word selection/right-click paste dedup/hover keeping list selection); fullscreen transcript search and jump indicators (#8800); the scrollbar redesign + verified copying (OSC 52 + readback + toasts); the LaTeX/table rendering fix family; the working indicator embedded in the editor border; in-place thinking toggles; three terminal-capability override envs (`RPI_HYPERLINKS`/`RPI_IMAGE_PROTOCOL`/`RPI_TRUE_COLOR` + `terminal.*` settings) and Alt+Enter's dual timeouts over SSH (#7899); the rpi-tui/config env divorce (`c505f4c19`, `RPI_TUI_DEBUG_REDRAW`/`rpi-tui-*.log` renamed, binary behavior unchanged).
+- **M5 closeout**: the theme-validation split port (eb3e9feed — a lenient library cast + an app-installed validator); all fixtures re-recorded and pinned to 9841914; deviations D-092…D-100 all closed (3 registered + 5 retired + 2 retired-untriggered).
+- **RC update channel** (V14-19, an rpi-native requirement with no upstream counterpart): `rpi update --rc` / `rpi update --extensions --rc` / `rpi install <name> --rc` pre-release channel flags (flagless always means stable; every update decision falls out of the semver total order); the new endpoint `api/latest-rc-version.json`; registry resolution gains channel filtering (stable excludes pre-releases); build.yml auto-marks `-rc` tags prerelease, with `releases/latest` and the install.sh fallback staying stable.
+- **Sixteen rounds of RC pre-release verification** (`v0.1.4-rc.1`…`rc.16`): field-verification fixes (rc.1–rc.4, rc.8/rc.10 — see the sections below and the plugin section), three comprehensive review closures (rc.5 / rc.11 / rc.12), the de-branding pass (rc.9), the model-catalog refresh (rc.13), the highlight-engine eradication (rc.14), and two statusline enhancements (rc.15/rc.16) — each detailed below.
 
-### 插件重定基（pin 已随 TE27 切换生效：subagents v0.66.0 / mcp-adapter v2.32.1，ADR-0025）
+### Plugin rebases (pins switched atomically with TE27: subagents v0.66.0 / mcp-adapter v2.32.1, ADR-0025)
 
-- **BREAKING：mcp direct 工具命名**（TE23，R7.2.4 / #342/#346/#463/#455）：server 前缀保留 provider-valid `-`/`_`，含 `-`/`_` 的 server 名 direct/proxy 工具名改变（`my-server` 不再生成 `my_2d_server_<tool>`）；工具名候选集改「原始名优先 + legacy 兜底」，server 级调用优先解析原始上游工具名并对歧义 fail-closed。兼容指引：`settings.toolPrefix: "none"` 或 per-server `toolPrefix: "none"` 改用裸工具名，或按新前缀名更新引用；**不做新旧双注册**。分域细节见 `changes/v0.1.4.md`。
+- **BREAKING: mcp direct tool naming** (TE23, R7.2.4 / #342/#346/#463/#455): server prefixes keep provider-valid `-`/`_`; direct/proxy tool names change for server names containing `-`/`_` (`my-server` no longer generates `my_2d_server_<tool>`); the candidate set becomes "original name first + legacy fallback", and server-level calls resolve the original upstream tool name first, failing closed on ambiguity. Migration: `settings.toolPrefix: "none"` or per-server `toolPrefix: "none"` for bare tool names, or update references to the new prefixed names; **no dual old/new registration**. Domain detail in `changes/v0.1.4.md`.
 
-### 交互式自定义 UI ABI（V14-20–V14-25，ADR-0024/ADR-0027）
+### Interactive custom-UI ABI (V14-20–V14-25, ADR-0024/ADR-0027)
 
-- **扩展可挂载交互组件的宿主 ABI（native + wasm 双载体）**（[RPI-OWN]——上游 `ctx.ui.custom()`/`Component` 为同进程对象契约，rpi 以行帧 + 轮询 JSON ABI 等价重建）：7 个 additive `ui.*` host-call、组件注册表与 overlay/editor 区域挂载、行帧合成与输入分发、隐藏态与对话框 blur/focus、帧限额与 wasm fuel 预算（trap 结构化 `fuelExhausted`/`handlerError` + 强制卸载，宿主不崩溃）、七结束路径清理矩阵、`ui.editExternal` 外部编辑器链；双载体一致性 harness 零差异。
-- **`ctx.sessionEntries` additive host-call**（ADR-0027）：活动分支 custom entries 只读（fail-closed）；mcp 审批恢复已迁移消费（TE33，ABI 优先 + JSONL 旧宿主降级）。
+- **A host ABI for extension-mounted interactive components (native + wasm dual carriers)** ([RPI-OWN] — upstream's `ctx.ui.custom()`/`Component` is an in-process object contract; rpi rebuilds the equivalent as a line-frame + polling JSON ABI): 7 additive `ui.*` host-calls, a component registry with overlay/editor-area mounting, line-frame composition with input dispatch, frame caps and wasm fuel budgets (traps surface as structured `fuelExhausted`/`handlerError` + forced unload; the host never crashes), a seven-exit-path cleanup matrix, and `ui.editExternal`; the dual-carrier consistency harness shows zero differences.
+- **`ctx.sessionEntries` additive host-call** (ADR-0027): read-only active-branch entries (fail-closed); the mcp approval restore migrated to consume it (TE33, ABI-first + JSONL fallback for old hosts).
 
-### 新插件：rpiv-ask-user-question（TE28–TE32）
+### New plugin: rpiv-ask-user-question (TE28–TE32)
 
-- **结构化 ask_user_question 工具**（第一方插件，上游 rpiv-mono @ v2.9.0+）：模型在需求不清时发起 1–4 题问卷（选项/预览/多选/备注），交互终端经交互式 UI ABI 渲染底部 tabbed overlay；RPC/ACP 宿主降级为宿主原生逐题 walker；非交互运行从工具列表摘除。契约面与上游逐字节对拍（231 条断言全 MATCH）；对话框高度稳定两轮修复（rc.8/rc.10，垫行基准恒非 input-mode + 垫行移至页脚块之前，总高恒定、hint 贴底）；随宿主 Release 锁步发布 `.rpix` 并入 registry 索引。
+- **The structured ask_user_question tool** (a first-party plugin; upstream rpiv-mono @ v2.9.0+): when requirements are unclear the model issues a 1–4 question questionnaire (options/previews/multi-select/notes); interactive terminals render a bottom tabbed overlay via the interactive UI ABI; RPC/ACP hosts degrade to a host-native per-question walker; non-interactive runs remove the tool. The contract surface matches upstream byte-for-byte (231 assertions all MATCH); two rounds of dialog-height stabilization (rc.8/rc.10 — padding always computed in non-input mode + padding inserted before the footer block, constant total height, hint hugging the bottom); ships lockstep with host Releases as `.rpix` and is indexed in the registry.
 
-### statusline live_output 冻结 decode_ms（rc.16）
+### statusline live_output frozen decode_ms (rc.16)
 
-- **无状态 tok/s 的 decode 时长透传**（#50；`rpi-statusline`，PR #51）：`rpi.live_output` 新增 `decode_ms`（首 delta→now 流式活更新 / `message_end` 冻结为首 delta→end，始终存在、首 delta 前 0）——空闲 tick 从未变 payload 重算同一速率，TTFT = `elapsed_ms − decode_ms` 同钟同时刻差（`Instant` 双子锚点，墙钟跳变单调保持），精准 tok/s 脚本从此单快照纯函数渲染，不再需要 per-session state file（三类持久化状态全数收编；resume 孤儿/陈旧两失败模式构造性消除）。宿主/ABI/订阅集零改动，原 15 字段逐字节不变。
+- **Decode-duration passthrough for stateless tok/s** (#50; `rpi-statusline`, PR #51): `rpi.live_output` gains `decode_ms` (first delta→now while streaming / frozen at first delta→end after `message_end`; always present, 0 before the first delta) — idle ticks recompute the same rate, and TTFT becomes the same-clock difference `elapsed_ms − decode_ms` (`Instant` twin anchors, monotonic across wall-clock jumps); precise tok/s scripts now render from a single snapshot as pure functions, with no per-session state file (all three persisted-state classes absorbed; the resume-orphan and stale-rate failure modes structurally eliminated). Zero changes to the host/ABI/subscription set; the previous 15 fields stay byte-identical.
 
-### statusline live_output 原始材料透传（rc.15）
+### statusline live_output raw-material passthrough (rc.15)
 
-- **`rpi.live_output` 原始材料透传**（#45；`rpi-statusline`，PR #49）：新增 6 个 additive 字段——`output_tokens`（流中 provider 累积 output tokens，仅 >0 出现、沉默不回写）、`text`/`thinking`/`toolcall`（当前消息累积原文，与 `*_chars` 恒等）、`decode_started_at_ms`（首个 delta 墙钟锚点，TTFT 排除）、`message_id`（逐消息变化）——让脚本自做语言感知 token 估算，替代单一 chars/token 因子（中文/英文双向偏差）。宿主早已把累积 partial（全文 + usage）送进扩展事件，修复为插件内留存并透传：宿主/ABI/订阅集零改动，原 8 字段逐字节不变，native 只测量不换算红线维持。
+- **`rpi.live_output` raw-material passthrough** (#45; `rpi-statusline`, PR #49): 6 additive fields — `output_tokens` (provider-cumulative output tokens during the stream, present only when >0, never rewritten on silence), `text`/`thinking`/`toolcall` (the current message's accumulated raw text, identity to `*_chars`), `decode_started_at_ms` (the first delta's wall-clock anchor, TTFT excluded), and `message_id` (changing per message) — letting scripts do their own language-aware token estimation instead of a single chars/token factor (biased both ways for Chinese vs English). The host had long delivered the accumulated partial (full text + usage) into extension events; the fix retains and passes it through: zero changes to the host/ABI/subscription set, the original 8 fields byte-identical, and the native-measures-but-never-converts red line preserved.
 
-### 高亮引擎跨语法 panic 根治（rc.14）
+### Highlight-engine cross-syntax panic eradication (rc.14)
 
-- **syntect（fancy-regex）跨语法 panic 根治**（#47；v0.1.3 T17 起存在，非 rc 回归）：39 个语法（HTML / Markdown→HTML / PHP / Vue / Svelte / QML / JSP / Elixir 等）解析到 `<script>`、`~r` 等内容时 push 进 6 个不兼容语法的 context，首次命中即 panic（`catch_unwind` 兜住但 stderr 污染 TUI、整块退纯文本）。build 期剔除 + 21,692 个 `Direct` 引用全量改写（Named 19,858 / File 按名 1,799 / 同 scope 重绑 34 / 未解析 1 例降级）+ 重链接（198→192）；引入 vendored fork `vendor/syntect`（5.3.0 + 两处可见性补丁，行为与注册表版一致）。HTML 内嵌 JS 着色恢复；Elixir `~r` 行纯文本降级；全仓 mod.rs 清零（规范 §3.1）。
+- **syntect (fancy-regex) cross-syntax panics eradicated** (#47; present since v0.1.3 T17, not an rc regression): 39 grammars (HTML / Markdown→HTML / PHP / Vue / Svelte / QML / JSP / Elixir, …) panicked on first hit when parsing `<script>` blocks, `~r` literals, and the like, pushing into the six incompatible grammars' contexts (catch_unwind contained it, but stderr polluted the TUI and whole blocks fell back to plain text). Build-time excision + a full rewrite of 21,692 `Direct` references (Named 19,858 / File by name 1,799 / same-scope rebound 34 / 1 case left degrading) + relinking (198→192); the vendored fork `vendor/syntect` introduced (5.3.0 + two visibility patches, behaviorally identical to the registry version). Embedded JS in HTML regains coloring; Elixir `~r` lines degrade to plain text; mod.rs files eliminated repo-wide (standard §3.1).
 
-### 模型目录刷新（rc.13）
+### Model catalog refresh (rc.13)
 
-- **内置模型目录刷新至 2026-09-14 快照**（catalog-only，行为 pin 保持 `9841914`，偏离 D-101）：聊天 1354 → 1397 模型（Bedrock 区域族 +34、GPT-5.4 Codex 退役、DeepSeek Flash 合并、OpenRouter 批量/别名族扩充等）；图片 50 → 54；行为面零变化；rpi-pages 远程目录同步。v0.1.5 上游追平后收敛。
+- **Built-in model catalog refreshed to the 2026-09-14 snapshot** (catalog-only; the behavioral pin stays `9841914`, deviation D-101): chat 1354 → 1397 models (Bedrock regional families +34, GPT-5.4 Codex retired, DeepSeek Flash merged, OpenRouter bulk/alias families expanded, …); images 50 → 54; zero behavioral change; the rpi-pages remote catalog synced. Converges after v0.1.5's upstream parity raise.
 
-### 发布终态复审修复（rc.12）
+### Final pre-release re-review fixes (rc.12)
 
-- **P1**：三处 SSE `finish().unwrap()` 改错误传播（1 MiB 未换行尾巴 + 不完整 UTF-8 + EOF 的畸形流此前 panic 挂起 turn，无终态事件——rc.11 fail-fast 声明的缺口）；codex SSE 体读改与取消信号 race（Esc/abort 不再等 `httpTimeoutMs`，rc.11 P1-5 的同类残留）。
-- **P2**：顺序工具批 panic 防护；SSE 行上限只界未终结尾巴；pi-messages reader 1 MiB 上限；`streamSimple toolChoice` 八 adapter 补齐；会话换行修复失败传播；`--rc` range 失配不再静默降级；Editor stale-render 点击焦点；mcp `session_tree` 门窗口审批恢复；subagents syntheticPaths 采集期 fail-closed + tracked 预检；openrouter-images 取消。
-- **测试缺口**：parent_id 环防护、compaction session_id 保留、顺序批 panic、`--rc` 降级等 rc.11 审查点名的零覆盖面全部钉死。
+- **P1**: the three SSE `finish().unwrap()` sites now propagate errors (a malformed stream — a 1 MiB unwritten tail + incomplete UTF-8 + EOF — previously panicked and hung the turn with no terminal event, a gap in rc.11's fail-fast claim); the codex SSE body read now races the cancel signal (Esc/abort no longer waits out `httpTimeoutMs`, a same-class residue of rc.11 P1-5).
+- **P2**: sequential tool-batch panic guards; the SSE line cap bounding only the unterminated tail; a 1 MiB cap on the pi-messages reader; `streamSimple toolChoice` forwarded by eight adapters; session newline-repair failure propagation; no silent `--rc` downgrade on range mismatch; the Editor stale-render click focus; the mcp `session_tree` approval restore across the gate window; subagents syntheticPaths fail-closed at collection + a tracked-path pre-check; openrouter-images cancellation.
+- **Test gaps**: parent_id cycle guards, compaction session_id retention, the sequential-batch panic, the `--rc` downgrade — every zero-coverage area rc.11 named is now pinned.
 
-### 发布前审查修复（rc.11）
+### Pre-release review fixes (rc.11)
 
-- **P0**：交互模式 panic hook 接线（主屏/alt-screen 双变体，任一 panic 后终端必恢复）；首次设置流程错误路径 raw mode 泄漏修复。
-- **P1**：`read` 负 `limit` 回归 JS 语义不 panic；Windows bash 工具 kill/超时收敛；subagents `syntheticPaths` 越界校验（不再可能删除 worktree 外目录）；并行工具批 panic 补发 `tool_execution_end`；mcp adapter Ready/on_ready 竞态窗口消除（门禁抖动根因）；8 个 SSE adapter 取消立即中断体读。
-- **P2 加固**：wasm guest 内存 128 MiB 上限；SSE/Bedrock 帧上限 fail-fast；空 `data` 事件容错；`auth.json` 原子写；会话 `parent_id` 环防护；smart-fetch 响应体 32 MiB 上限（登记偏离）；compaction `session_id` 上游语义；`--rc` 无预发布降级已是最新；扩展名单组件校验；`parity_runner` 唯一命名等（全项见 `changes/v0.1.4.md`）。
-- **文档**：四处 changelog 失实声明更正（`immediate_retry` 事件名、`x-api-source` 头名、`imageGenerationModels`/mlx、验证式复制回读缺口登记）；CI 条目改为本地门禁终态。
+- **P0**: interactive-mode panic-hook wiring (both main-screen/alt-screen variants; the terminal always recovers after any panic); raw-mode leak fixes on the first-run setup flow's error paths.
+- **P1**: `read` negative `limit` back to JS semantics without panicking; Windows bash tool kill/timeout convergence; subagents `syntheticPaths` escape validation (directories outside the worktree can no longer be deleted); parallel tool batches emitting the missing `tool_execution_end` on panics; the mcp adapter Ready/on_ready race window eliminated (the gate-flakiness root cause); all eight SSE adapters aborting body reads immediately.
+- **P2 hardening**: wasm guest memory caps; SSE/Bedrock frame caps; empty-`data` event tolerance; atomic `auth.json` writes; session `parent_id` cycle guards; a 32 MiB smart-fetch response cap (deviation registered); compaction `session_id` upstream semantics; `--rc` without a pre-release index degrading to "already up to date"; extension-name component validation; unique `parity_runner` names, etc. (the full list in `changes/v0.1.4.md`).
+- **Docs**: four inaccurate changelog claims corrected (the `immediate_retry` event name, the `x-api-source` header name, `imageGenerationModels`/mlx, the verified-copy readback gap registration); the CI entry rewritten to the local-gate end state.
 
-### 内部
+### Residual pi-identifier de-branding (rc.9, ADR-0028)
 
-- workspace 版本 bump 0.1.4 + Cargo.lock 同步；全量门禁零失败（用例数以 `changes/v0.1.4.md` 终态为准）。
-- parity-checklist §3.8 v0.1.4 增量映射补录；rpi-pages changelog/latest-version 同步。
+- **de-pi pass** (a one-shot cleanup, after a repo-wide scan, of `pi` identifiers still appearing in rpi's own name): the default system prompt's `operating inside pi` → `rpi` (models stop introducing themselves as pi) and the "Pi documentation" section rewritten; CLI help changed from "Update pi" to "Update rpi" throughout and the positional alias `update pi` → `update rpi` (**`pi` no longer accepted**); Provider User-Agents and the Codex `originator` → `rpi`; temp-file prefixes `pi-*` → `rpi-*`; the orchestration skill renamed `pi-subagents` → `rpi-subagents` (skill layout bumped to v3, old installs migrating automatically on upgrade, user copies preserved); the ecosystem data plane (read-compatible) — the manifest key `#pi`→`#rpi`, mcp-adapter event names, and the model catalog api kind `"pi-messages"`→`"rpi-messages"` (old values auto-normalized). Real-defect fix: the skill doc's `PI_SUBAGENT_WAIT_TOOL_ENABLED` spelling unified with the code's `RPI_`. Deliberately kept: the `radius.pi.dev` gateway / OAuth `client_id` (external dependencies) and the "derived from Pi" acknowledgment.
+- **Behavior changes (upgrade notes)**: `rpi update pi` is no longer accepted (use `rpi update rpi` / `rpi update self`); Provider-side UA/originator statistics change; the share page's local-preference keys change once; old `pi-subagents` skill installs migrate to `rpi-subagents`.
+
+### RC-window comprehensive review closure (rc.5, 1 Blocker + 6 Majors)
+
+- **Blocker rpi#33**: RPC abort hanging forever while manual compaction/branch summary was in flight (a V14-02 regression) — all four upstream `_resolveIdleWaitIfIdle` call sites restored (manual/auto compaction completion and the navigateTree finally).
+- **Majors**: rpi#34 `update --extensions --rc` no longer downgrading installed stable extensions (unified `is_newer_package_version`, both directions); rpi#35 `pi.getFlag` seeing pending defaults during factory (upstream #8423); rpi#36 `/llama` explicit refresh forcing `allowNetwork:true` (the live catalog no longer overwritten by the stored snapshot under RPI_OFFLINE, plus the `providers` passthrough); rpi#37 `/model` search default-pinning semantics aligned upstream (`" default"` + prefix matching); rpi#38 `Box::handle_mouse` x-boundary guards (padding clicks no longer mis-trigger); rpi-pages#4 the site's stable-endpoint pre-release guard.
+- **Backlogged fixes**: rpi#29 real-time step status for parallel batches (the subagent_wait list no longer stuck at "queued"); rpi#30 `globalConcurrencyLimit` wired as a run-scoped concurrency semaphore; rpi#27 in-place replacement of same-key belowEditor widgets (no more multi-widget flashing/sinking).
+
+### RC-window verification fixes (rc.1–rc.4, field feedback)
+
+- **rc.1**: a permanent one-row gap above the editor (the upstream ever-present `Spacer(1)` gap — output no longer touching the `⠋ Working` border); two DBG debug prints removed from the fullscreen mouse-dispatch path (+ a structural `deny(print_*)` guard in rpi-tui).
+- **rc.3**: settings-list value-column alignment (the upstream label width `min(36)` mistyped as `min(30)`, misaligning once 32-column labels passed the cap); investigation closure: "borders wrap to two rows" on fullscreen↔normal switching is the terminal's Ambiguous-width rendering (upstream reproduces it too, an ADR-0020 residual risk; fullscreen being full-bleed matches upstream).
+- **rc.4**: event-driven refresh dying after hot-switching TUI modes in `/settings` ("one keystroke, one frame") — `render_handle` now resolves the current renderer at call time (aligned with upstream's Proxy semantics); keyboard input dying after clicking the dock editor/selector in fullscreen — `SharedEntry::handle_mouse` returning gesture/focus targets to the inner shared component (aligned with upstream's `dispatchMouseEvent` forwarding).
+
+### Internal
+
+- workspace version bumped to 0.1.4 + Cargo.lock synced; full gates zero failures (case counts per the `changes/v0.1.4.md` end state).
+- parity-checklist §3.8 v0.1.4 increment mapping recorded; rpi-pages changelog/latest-version synced.
 
 ## [0.1.3] - 2026-09-03
 
-### 新增
+### Added
 
-- **statusline 实时 token 计数**（V13-10，先行 PR）：`statusLine.liveTokens` 键开启流式期间 1Hz 级脚本重跑；stdin 新增 `rpi.live_output` 纯测量块；随行宿主八事件载荷转发 parity 补齐 + `ctx.sessionFile` additive host-call（ADR-0022），双开同 cwd 串数据治本（TE-D34 §1）。
-- **subagents 父会话权威定位**（V13-02）：`parent_session` 优先 `ctx.sessionFile`，目录启发式降级为兜底并加固（mtime 下界 + stem 形状过滤），四消费点改用权威 session id（关闭 TE-D16）。
+- **statusline live token counting** (V13-10, lead-in PR): the `statusLine.liveTokens` key enables ~1Hz script re-runs during streaming; stdin gains a pure-measurement `rpi.live_output` block; riders — eight-event payload forwarding parity completed + the `ctx.sessionFile` additive host-call (ADR-0022), fixing dual-instance same-cwd data mix-ups at the root (TE-D34 §1).
+- **subagents authoritative parent-session location** (V13-02): `parent_session` prefers `ctx.sessionFile`, with the directory heuristic demoted to a hardened fallback (mtime floor + stem-shape filtering); four consumers switched to the authoritative session id (closing TE-D16).
 
-### 修复
+### Fixed
 
-- **statusline / smart-fetch 同族：`/resume` 后事件死亡或宿主通道悬垂**（v0.1.3 追补，同根因）：statusline install 早退 → 新宿主零事件订阅（footer 冻结）+ 旧通道 poll 定时器烧悬垂 cookie + 旧循环已退出无人重启；smart-fetch `STATE.host` 冻结在宿主 1 → ctx.cwd/toolUpdate 走旧 cookie（悬垂或 cwd 回退）。修复同 mcp-adapter 纪律：事件订阅无条件化 + CHANNEL/host 可重绑 + rebind 重启 refresh_loop；双插件各补 rebind_second_host 回归（已验证还原修复后变红）。
-- **`/resume` 后「🔌 MCP」状态行消失且 MCP 扩展整体缺失**（v0.1.3 追补）：会话替换重载同路径 cdylib，dlopen 记忆化使插件 `STATE: OnceLock` 跨宿主存活，第二次 `install` 报 `plugin already initialized` 整体失败——状态行已清空无人重推，且 mcp 工具/flag/事件在新会话静默缺失。修复：宿主通道（fn 指针 + cookie）改 `RwLock` 可重绑——rebind 保留进程级 runtime + dispatcher，新宿主上重注册 flag/事件、重置 direct 工具面、按新 cwd 重发现配置、重推工具面与状态行并重臂 bridge-retry（新宿主 UI 桥后接，直推会被 null bridge 丢弃）；调用点全部改为调用时读当前通道，旧宿主 rebind 后零推送。双端回归：rebind_second_host（完整 /resume 生命周期）+ native_same_path_reload（同路径二宿主重载）。
-- **edit 工具误报 `Could not find edits[N]` 但编辑实际成功**（V13-11 追补，rpi#18）：预览竞态（UI 排空滞后于 agent 写盘）叠加 `update_display` 先建 call 组件后回填，红色错误永久残留；改为 result 组件先构建（对齐上游 renderResult 就地重建语义），伤害降为一闪而过。
-- **`rpi update --extensions` 漏更新未跟踪插件**（v0.1.3 追补）：update/list 只认 settings `packages` 条目而加载器加载安装根目录全部 manifest 目录——未跟踪安装（早期版本/手工复制）被静默跳过，多插件场景即“只升级一个”；update 与加载器发现对齐（identity 去重并入、不回写 settings，`rpi update <name>` 可命中），`rpi list` 标注 `(untracked)`；registry 批量单个失败不再短路其余，未收录（404）的未跟踪安装降级为跳过提示。
-- **流式请求总超时误杀活跃流**（V13-08，先行）：总 deadline 误映射 → 三段式超时（connect/headers/body 块间静默 idle，每 chunk 重置）；9 个 SSE adapter 全覆盖，codex / openrouter_images 两处有意例外。
-- **write 大文件流式渲染 O(n²)**（V13-09，先行）：分层缓存（稳定前缀窗口跳重算 + 可见内容指纹跳重建 + repair_json 惰性化 + 拷贝瘦身 3→2，勘误 v0.1.3 首发：state 拷贝已除，context 尾更新为上游 parity 必需、事件载荷需独占所有权，各留 1 次）；400 行流式 2250ms → 245ms（9.2×）。
-- **扩展 UI 换装撕帧**（V13-05，并发正确性）：widget 单锁原子化（跨容器 add-then-remove）+ selector 单锁 clear+add+set_focus——不再有缺失帧 / 裸 editor 帧。
-- **流式渲染热路径**（V13-06）：MessageUpdate 队列连续段折叠保尾（同帧 K 条 delta → 1 次 update_content）+ update_content 引用化消除调用侧深拷贝。
-- **subagents 子进程事件落盘治理**（V13-01）：events.jsonl / transcript 持久单句柄（50MiB 上限静默丢弃）+ status.json 100ms 写入门控（终态/state 变化同步落盘）。
-- **子进程 update 帧节流**（V13-03）：事件路径帧签名门控（同活动跳推 + 1s 心跳 + 首帧/终态必推）+ subagent_wait 轮询脏检查——50 相同事件 toolUpdate 从 50 帧压到 3 帧。
-- **smart-fetch 进度节流**（V13-04）：body_progress 100ms/64KiB 门控 + batch 快照 1% 签名短路；终态帧与帧形状零变化。
+- **statusline / smart-fetch, same family: events dead or host channel dangling after `/resume`** (v0.1.3 follow-up, same root cause): statusline's install early-return meant zero event subscriptions on the new host (frozen footer) + the old channel's poll timer burning a dangling cookie + the old loop exited with nothing restarting it; smart-fetch's `STATE.host` frozen on host 1 → ctx.cwd/toolUpdate going through the old cookie (dangling, or cwd falling back to the process directory). Fixed with the mcp-adapter discipline: unconditional event subscriptions + rebindable CHANNEL/host + refresh_loop restarted on rebind; each plugin gained a rebind_second_host regression (verified red with the fix reverted).
+- **The "🔌 MCP" status line vanishing after `/resume` (and the MCP extension going missing entirely)** (v0.1.3 follow-up): session replacement reloads the same-path cdylib; dlopen's per-path memoization let the plugin's `STATE: OnceLock` survive across hosts, and the second `install` failed wholesale with `plugin already initialized` — the status line had been cleared with nothing to re-push it, and mcp tools/flags/events silently went missing in the new session. Fix: the host channel (fn pointer + cookie) became a rebindable `RwLock` — the rebind keeps the process-wide runtime + dispatcher, re-registers flags/events on the new host, resets the direct-tool surface, rediscovers config from the new cwd, re-pushes the tool surface and status line, and re-arms bridge-retry (the new host's UI bridge attaches only after switch_session returns; direct pushes land on a null bridge); every call site reads the current channel, and the old host receives zero pushes after the rebind. Dual-end regressions: rebind_second_host (the full /resume lifecycle) + native_same_path_reload (same-path second-host reload).
+- **edit falsely reporting `Could not find edits[N]` while the edit succeeded** (V13-11 follow-up, rpi#18): a preview race (the UI draining slower than the agent writes) stacked with `update_display` building the call component before the backfill, freezing the red error on screen; the result component is now built first (aligned with upstream's renderResult in-place rebuild), reducing the race damage to upstream's flash-and-gone.
+- **`rpi update --extensions` missing untracked plugins** (v0.1.3 follow-up): update/list only iterated the settings `packages` entries while the loader loads every manifest directory under the install roots — untracked installs (legacy versions / hand copies) were silently skipped, surfacing as "only one updates" in multi-plugin setups; update now matches the loader's discovery (identity-deduped into the batch, never written back to settings; `rpi update <name>` can target them), `rpi list` marks them `(untracked)`; a failing registry source no longer short-circuits the batch, and an untracked install absent from the registry (404) downgrades to a skip note.
+- **Streaming request total timeouts killing active streams** (V13-08, lead-in): the total-deadline mis-mapping replaced with a three-stage timeout (connect/headers/inter-chunk body idle, reset per chunk); all 9 SSE adapters covered, with codex / openrouter_images as two intentional exceptions.
+- **write large-file streaming rendering O(n²)** (V13-09, lead-in): layered caches (stable-prefix window skipping recomputation + visible-content fingerprint skipping rebuilds + lazy repair_json + copy dieting 3→2; erratum vs the first announcement — the state copy is gone, the context-tail update and event payloads each keep one); 400-line streaming 2250ms → 245ms (9.2×).
+- **Extension UI swap tearing** (V13-05, concurrency correctness): widget swaps atomized under a single lock (cross-container add-then-remove) + selector's single-lock clear+add+set_focus — no more missing or bare-editor frames.
+- **Streaming render hot path** (V13-06): MessageUpdate queue consecutive-segment folding keeping the tail (K deltas in one drain → exactly 1 update_content) + update_content taking references to eliminate caller-side deep copies.
 
-### 内部
+### Internal
 
-- **低档杂项清理**（V13-07）：mcp-adapter `!command` 秘钥解析改 spawn_blocking；无 UI 期重试免推 status bar；`getAllTools` 惰性查询；statusline 变化 tick 复用 fetch_ctx（12→6 host call）；TUI 每帧尺寸读取 4→1 次 ioctl。
-- 偏离登记汇总：TE-D16 关闭、TE-D35/36/37、D-088/089/090/091。
-- M0 收口：两支先行 PR（`fix/stream-idle-timeout-write-perf` / `feat/statusline-live-token-count`）合入 main + 门禁清账（clippy 1.97 lint）。
-- workspace 版本 bump 0.1.3 + Cargo.lock 同步；全量门禁 5367 用例零失败。
+- **Low-tier miscellany cleanup** (V13-07): mcp-adapter `!command` secret parsing moved to spawn_blocking; status-bar pushes skipped during no-UI bridge retries; `getAllTools` lazy queries; statusline change-ticks reusing fetch_ctx (12→6 host calls); TUI per-frame size reads 4→1 ioctl.
+- Deviation registry summary: TE-D16 closed, TE-D35/36/37, D-088/089/090/091.
+- M0 closeout: two lead-in PRs (`fix/stream-idle-timeout-write-perf` / `feat/statusline-live-token-count`) merged to main + gate cleanup (clippy 1.97 lints).
+- workspace version bumped to 0.1.3 + Cargo.lock synced; full gates 5367 cases zero failures.
 
 ## [0.1.2] - 2026-08-19
 
-### 新增
+### Added
 
-- **第一方插件 rpi-ext-statusline**：CC 兼容脚本式自定义 statusline（L0 原生插件）。`settings.json` 写 `statusLine` 键即启用（命令 + padding/裁剪参数），两档 placement；脚本按 CC statusline JSON 协议 stdin/stdout 驱动，零新增 ABI。含实机追补：切换模型/思考档位/分支即时刷新、新会话 transcript latch 竞态修复、数据指纹轮询自愈。
+- **First-party plugin rpi-ext-statusline**: the CC-compatible scriptable custom statusline (an L0 native plugin). Writing a `statusLine` key in `settings.json` enables it (command + padding/cropping parameters), with two placements; the script is driven via stdin/stdout following the CC statusline JSON protocol, zero new ABI. Field follow-ups: instant refresh on model/thinking-level/branch switches, a new-session transcript latch race fix, and data-fingerprint polling self-healing.
 
-### 修复
+### Fixed
 
-- `/new` 与 `/resume` 切换 session 后 extension host 丢失 UI bridge——mcp 状态栏消失、MCP 工具审批被静默拒绝（#1）。
-- `models.json` 配置 apiKey 后仍强制要求 `auth.json`——字面 key 被误当环境变量名，改按上游 config-value DSL 解析（#3）。
-- `/changelog` 恒显示 "No changelog entries found."——changelog 资产从未落地；现 `CHANGELOG.md` 嵌入二进制 + `parseChangelog` 移植 + onboarding 显示半链（#5）。
-- `model_select` 事件从未发出——切换后捕获 previous 恒等短路。
-- onboarding 启动 header 品牌残留：上游 "Pi" 逐字文案改 rpi 实际能力表述，去掉 rpi 未带的 docs 查询承诺、指向官网（#7）。
+- The extension host losing its UI bridge after `/new` and `/resume` session switches — the mcp status bar vanished and MCP tool approvals were silently rejected (#1).
+- With `apiKey` configured in `models.json`, `auth.json` was still forcibly required — a literal key mistaken for an environment variable name; now parsed per the upstream config-value DSL (#3).
+- `/changelog` always showing the empty-entries placeholder — the changelog asset never landed; now `CHANGELOG.md` is embedded in the binary + the `parseChangelog` port + half of the onboarding display chain (#5).
+- The `model_select` event never emitted — a captured-previous identity check short-circuited.
+- Onboarding startup header branding residue: the upstream "Pi" verbatim copy replaced with rpi's actual capabilities, dropping the docs-query promise rpi doesn't ship and pointing to the official site (#7).
 
-### 内部
+### Internal
 
-- subagents 编排 skill 文档与 prompt 模板按结构化入口本地化（ADR-0021）：去除 `workflowScript` 教学与未实现机制段落，安装侧 `.rpi-layout-version` marker 自动升级旧版；工具描述补齐 `tasks`/`steps` 组合入口（ADR-0018 决策 5）。
-- registry / package_manager / package_command rustfmt 清账（纯格式化）。
+- subagents orchestration skill docs and prompt templates localized for the structured entry (ADR-0021): removed the `workflowScript` teaching and unimplemented-mechanism sections; the installer auto-upgrades old versions via the `.rpi-layout-version` marker; tool descriptions completed with the `tasks`/`steps` composition entries (ADR-0018 decision 5).
+- registry / package_manager / package_command rustfmt cleanup (formatting only).
 
 ## [0.1.1] - 2026-08-16
 
-### 新增
+### Added
 
-- **扩展分发与安装**：`rpi install <name>`（revpi.dev registry 渠道，semver 选版 + sha256 校验）、`rpi install github:<owner>/<repo>`（Release artifact 渠道）、`.rpix` 包格式与原子安装；`remove` / `list` / `update` 全链路支持。
-- **第一方插件**：rpi-ext-mcp-adapter（MCP 客户端适配器）、rpi-ext-subagents（结构化子代理委派）、rpi-ext-smart-fetch（web_fetch 全管线）随主版本发布，官网索引自动收录。
-- **上游对齐 Pi v0.84.1**：rpi-ai 消息类型与流终止语义、provider 修复簇、models refresh 事务化、rpi-tui 渲染器重构 / LaTeX 与 Mermaid 渲染 / 布局引擎 / 全屏渲染器（alt screen / mouse / kitty）、UI 模式接线。
-- 官网 revpi.dev：扩展索引 API、下载边缘代理、插件目录页。
+- **Extension distribution and installation**: `rpi install <name>` (the revpi.dev registry channel, semver selection + sha256 verification), `rpi install github:<owner>/<repo>` (the Release-artifact channel), the `.rpix` package format with atomic installs; `remove` / `list` / `update` support it all end-to-end.
+- **First-party plugins**: rpi-ext-mcp-adapter (the MCP client adapter), rpi-ext-subagents (structured subagent delegation), and rpi-ext-smart-fetch (the full web_fetch pipeline) ship with host releases, auto-indexed on the official site.
+- **Upstream alignment with Pi v0.84.1**: rpi-ai message types and stream-termination semantics, the provider fix cluster, transactional models refresh; the rpi-tui renderer refactor / LaTeX and Mermaid rendering / the layout engine / the fullscreen renderer (alt screen / mouse / kitty); UI-mode wiring.
+- The official site revpi.dev: the extension index API, the edge download proxy, and the plugin catalog page.
 
-### 修复
+### Fixed
 
-- 主屏渲染器超宽行 `panic!` 杀死会话、满宽行换行漂移花屏——改截断继续渲染 + 悲观宽度保守截断（ADR-0020 / D-086）。
-- `$$`/`\[` 公式块内孤行 `=`/`-` 被误解析为 setext 标题，公式在进入数学渲染前被切断——parse 前 shadow source 等长改写（D-078 补记）。
-- LaTeX 遇符号表不认识的命令时整块公式回退原文——按 KaTeX 清单全量补全 78 项缺口（`\blacksquare`/`\Box`/箭头长尾/否定关系单宏/带参宏降级渲染，D-087）。
-- 词级 diff 多字节字符（中文/全角）`not a char boundary` panic 杀死渲染线程——按末字符长度推进 trim 边界。
-- 多 native 插件共载失败（abi_stable 按类型 memoize 根因，改 per-path 加载）；SSE 行上限对齐 10MiB；全屏热切换输入失效与 `/settings` 卡死。
+- The main-screen renderer's `panic!` on over-wide rows killing sessions, and full-width rows drifting into garbled wraps — truncation-with-continued-rendering + pessimistic-width conservative truncation (ADR-0020 / D-086).
+- Lone `=`/`-` rows inside `$$`/`\[` formula blocks mis-parsed as setext headings, cutting formulas before math rendering — an equal-length shadow-source rewrite before parsing (D-078 backfill).
+- LaTeX falling back to raw text for the whole block on unknown commands — all 78 gaps filled per the KaTeX list (`\blacksquare`/`\Box`/long-arrow tails/negation macros as single symbols/parameterized macros with degraded rendering, D-087).
+- Word-level diff panicking with `not a char boundary` on multi-byte characters (Chinese/full-width), killing the render thread — the trim boundary now advances by the last character's length.
+- Multiple native plugins failing to co-load (abi_stable memoizing by type; switched to per-path loading); the SSE line limit aligned to 10MiB; input dead after fullscreen hot-switches and `/settings` hangs.
 
 ## [0.1.0] - 2026-08-15
 
-- Initial release：交互 TUI / JSON-RPC / print 三模式，多 provider 模型运行时（rpi-ai），agent 会话与压缩，技能 / 提示模板 / 主题资源体系，bash / read / edit / write 内置工具，扩展宿主（wasm 沙箱 + native L0）。
+- Initial release: interactive TUI / JSON-RPC / print three modes, a multi-provider model runtime (rpi-ai), agent sessions with compaction, the skills / prompt templates / themes resource system, the bash / read / edit / write built-in tools, and the extension host (wasm sandbox + native L0).
