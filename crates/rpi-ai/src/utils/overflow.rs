@@ -45,13 +45,21 @@ fn overflow_patterns() -> &'static [Regex] {
             r"(?i)context[_ ]length[_ ]exceeded",
             r"(?i)too many tokens",
             r"(?i)token limit exceeded",
-            r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)",
         ]
         .iter()
         .map(|pattern| build_pattern(pattern))
         .collect()
     });
     &PATTERNS
+}
+
+/// `CEREBRAS_BODYLESS_OVERFLOW_PATTERN` (#9482, 661619e87 @ d1230ea20):
+/// bodyless 400/413 responses are only an overflow signal from Cerebras —
+/// other providers report genuine bad requests / payload limits that way.
+fn cerebras_bodyless_overflow_pattern() -> &'static Regex {
+    static PATTERN: LazyLock<Regex> =
+        LazyLock::new(|| build_pattern(r"(?i)^4(?:00|13)\s*(?:status code)?\s*\(no body\)"));
+    &PATTERN
 }
 
 /// `NON_OVERFLOW_PATTERNS`.
@@ -80,12 +88,19 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: Option<u6
             let is_non_overflow = non_overflow_patterns()
                 .iter()
                 .any(|pattern| pattern.is_match(error_message));
-            if !is_non_overflow
-                && overflow_patterns()
+            if !is_non_overflow {
+                if overflow_patterns()
                     .iter()
                     .any(|pattern| pattern.is_match(error_message))
-            {
-                return true;
+                {
+                    return true;
+                }
+                // #9482: bodyless 400/413 is overflow only from Cerebras.
+                if message.provider == "cerebras"
+                    && cerebras_bodyless_overflow_pattern().is_match(error_message)
+                {
+                    return true;
+                }
             }
         }
     }
@@ -132,11 +147,21 @@ mod tests {
     use crate::types::{ApiKind, AssistantRole, Usage};
 
     fn assistant(stop_reason: StopReason, error_message: Option<&str>) -> AssistantMessage {
+        assistant_for_provider(stop_reason, error_message, "openai")
+    }
+
+    /// #9482 (661619e87): bodyless-overflow cases need a provider-aware
+    /// fixture (upstream `createErrorMessage(message, provider)`).
+    fn assistant_for_provider(
+        stop_reason: StopReason,
+        error_message: Option<&str>,
+        provider: &str,
+    ) -> AssistantMessage {
         AssistantMessage {
             role: AssistantRole::Assistant,
             content: vec![],
             api: ApiKind::from("openai-completions"),
-            provider: "openai".to_owned(),
+            provider: provider.to_owned(),
             model: "m".to_owned(),
             response_model: None,
             response_id: None,
@@ -169,8 +194,6 @@ mod tests {
             "invalid params, context window exceeds limit",
             "Your request exceeded model token limit: 5 (requested: 6)",
             "Prompt has 5 tokens, but the configured context size is 4 tokens",
-            "400 status code (no body)",
-            "413 (no body)",
             "Range of input length should be [1, 100]",
             "tokens to keep from the initial prompt is greater than the context length",
             "Prompt contains 100 tokens ... too large for model with 50 maximum context length",
@@ -196,6 +219,28 @@ mod tests {
             assert!(
                 !is_context_overflow(&assistant(StopReason::Error, Some(case)), None),
                 "should exclude: {case}"
+            );
+        }
+    }
+
+    /// #9482 (661619e87 @ d1230ea20): bodyless 400/413 counts as overflow
+    /// only for Cerebras; other providers keep it unclassified.
+    #[test]
+    fn test_bodyless_overflow_scoped_to_cerebras() {
+        for message in ["400 status code (no body)", "413 status code (no body)"] {
+            assert!(
+                is_context_overflow(
+                    &assistant_for_provider(StopReason::Error, Some(message), "cerebras"),
+                    Some(131_072)
+                ),
+                "cerebras should detect: {message}"
+            );
+            assert!(
+                !is_context_overflow(
+                    &assistant_for_provider(StopReason::Error, Some(message), "opencode-go"),
+                    Some(1_000_000)
+                ),
+                "non-cerebras should not detect: {message}"
             );
         }
     }

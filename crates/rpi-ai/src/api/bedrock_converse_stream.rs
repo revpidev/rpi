@@ -1615,6 +1615,25 @@ impl<'a> StreamProcessor<'a> {
         self.output.usage.output = number("outputTokens");
         self.output.usage.cache_read = number("cacheReadInputTokens");
         self.output.usage.cache_write = number("cacheWriteInputTokens");
+        // #9457 (8a7b0c03d @ d1230ea20): cache writes with a 1h TTL bill at
+        // 2x base input — split them out of the aggregate
+        // `cacheWriteInputTokens` so `calculateCost` prices the long
+        // retention writes at the 1h rate. Absent `cacheDetails` leaves
+        // `cacheWrite1h` unset (upstream `undefined`).
+        if let Some(details) = usage.get("cacheDetails").and_then(Value::as_array) {
+            self.output.usage.cache_write1h = Some(
+                details
+                    .iter()
+                    .filter(|detail| detail.get("ttl").and_then(Value::as_str) == Some("1h"))
+                    .map(|detail| {
+                        detail
+                            .get("inputTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    })
+                    .sum(),
+            );
+        }
         let total = number("totalTokens");
         // JS `totalTokens || input + output` (0 is falsy).
         self.output.usage.total_tokens = if total > 0 {

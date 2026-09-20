@@ -488,6 +488,42 @@ async fn test_normal_text_stream() {
     }
 }
 
+/// bedrock-cache-write-1h-cost.test.ts (8a7b0c03d @ d1230ea20, #9457):
+/// "prices the 1h cache details at 2x while preserving the total cache
+/// write" — 600k billed at the cacheWrite rate + 400k at 2x base input.
+/// The model mirrors upstream's `us.anthropic.claude-opus-4-8` rates
+/// (input 5 / output 25 / cacheRead 0.5 / cacheWrite 6.25 per MTok).
+#[tokio::test]
+async fn test_1h_cache_write_details_price_at_2x_input() {
+    let mut body = event_frame("messageStart", r#"{"role":"assistant"}"#);
+    body.extend_from_slice(&event_frame(
+        "metadata",
+        r#"{"usage":{"inputTokens":100,"outputTokens":5,"totalTokens":1000105,"cacheWriteInputTokens":1000000,"cacheDetails":[{"ttl":"1h","inputTokens":150000},{"ttl":"5m","inputTokens":600000},{"ttl":"1h","inputTokens":250000}]}}"#,
+    ));
+    body.extend_from_slice(&event_frame("messageStop", r#"{"stopReason":"end_turn"}"#));
+
+    let model = make_model(
+        "us.anthropic.claude-opus-4-8",
+        "Claude Opus 4.8",
+        "http://unused",
+        json!({"cost": {"input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25}}),
+    );
+    let (events, _request) = drive(
+        &model,
+        &context(vec![user_text("hi")]),
+        no_cache_options(),
+        (200, "application/vnd.amazon.eventstream", body),
+    )
+    .await;
+    let Some(StreamEvent::Done { message, .. }) = events.last() else {
+        panic!("expected done event");
+    };
+    assert_eq!(message.usage.cache_write, 1_000_000);
+    assert_eq!(message.usage.cache_write1h, Some(400_000));
+    // 600k × 6.25/MTok + 400k × (2 × 5)/MTok = 3.75 + 4.0 = 7.75.
+    assert!((message.usage.cost.cache_write - 7.75).abs() < 1e-9);
+}
+
 // ---------------------------------------------------------------------------
 // Raw stop reasons (bedrock-raw-stop-reason.test.ts: 637737ca7, text unified
 // by 5a2539a7b @ 4181f66)

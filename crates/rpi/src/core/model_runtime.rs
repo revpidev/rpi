@@ -744,14 +744,18 @@ impl ApiKeyAuth for ConfigApiKeyAuth {
     }
 }
 
-/// Base passthrough with auth resolution overridden by configured
-/// headers/`authHeader` (models.json/extension overlay without its own `api`).
-struct AuthOverridingProvider {
+/// Overlay without its own api that still changes the composed model list
+/// (`modelOverrides`, provider-composer.ts:434-437) and optionally wraps
+/// auth resolution (`composeApiKeyAuth`). Streaming, model filtering, and
+/// dynamic refresh delegate to the base (provider-composer.ts:475-478,
+/// 492-494).
+struct ModelOverridingProvider {
     base: Arc<dyn Provider>,
-    auth: ProviderAuth,
+    models: Vec<Model>,
+    auth: Option<ProviderAuth>,
 }
 
-impl Provider for AuthOverridingProvider {
+impl Provider for ModelOverridingProvider {
     fn id(&self) -> &str {
         self.base.id()
     }
@@ -769,11 +773,11 @@ impl Provider for AuthOverridingProvider {
     }
 
     fn auth(&self) -> &ProviderAuth {
-        &self.auth
+        self.auth.as_ref().unwrap_or_else(|| self.base.auth())
     }
 
     fn get_models(&self) -> Vec<Model> {
-        self.base.get_models()
+        self.models.clone()
     }
 
     /// `filterModels` forwards to the base (provider-composer.ts:493-494).
@@ -1214,7 +1218,11 @@ impl ModelRuntime {
         // error (provider-composer.ts validates `getModels()` first).
         // The base-passthrough branch skips construction entirely.
         let mut models = match (&api, base) {
-            (None, Some(_)) => Vec::new(),
+            // No api of its own: the overlay composes over the base catalog
+            // (custom model definitions need an api somewhere and stay
+            // unsupported here, as before); `modelOverrides` still apply
+            // below (provider-composer.ts:434-437, #9294).
+            (None, Some(_)) => base.map(|b| b.get_models()).unwrap_or_default(),
             _ => match extension.and_then(|e| e.models.clone()) {
                 Some(models) => models
                     .into_iter()
@@ -1255,13 +1263,24 @@ impl ModelRuntime {
             (None, Some(base)) => {
                 // Overlay without its own api: stream through the base
                 // provider; configured headers/authHeader still wrap auth
-                // resolution (`composeApiKeyAuth`, provider-composer.ts:293).
-                if configured_headers.is_none() && !auth_header {
+                // resolution (`composeApiKeyAuth`, provider-composer.ts:293),
+                // and `modelOverrides` still compose over the base catalog
+                // (provider-composer.ts:434-437 — upstream builds the model
+                // list unconditionally; #9294 configures built-in providers
+                // via modelOverrides alone).
+                let has_model_overrides = config
+                    .and_then(|c| c.model_overrides.as_ref())
+                    .is_some_and(|overrides| !overrides.is_empty());
+                if !has_model_overrides && configured_headers.is_none() && !auth_header {
                     return Ok(base.clone());
                 }
-                return Ok(Arc::new(AuthOverridingProvider {
+                let auth = (configured_headers.is_some() || auth_header).then(|| {
+                    wrap_provider_auth(base.auth().clone(), &configured_headers, auth_header)
+                });
+                return Ok(Arc::new(ModelOverridingProvider {
                     base: base.clone(),
-                    auth: wrap_provider_auth(base.auth().clone(), &configured_headers, auth_header),
+                    models,
+                    auth,
                 }));
             }
             (None, None) => {
@@ -2337,6 +2356,7 @@ fn config_model_to_model(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use serde_json::json;
     use tokio::io::AsyncReadExt;
 
     use rpi_ai::auth::helpers::env_api_key_auth;
@@ -2740,6 +2760,126 @@ mod tests {
         assert!(model.reasoning);
         assert_eq!(model.context_window, 64000);
         assert_eq!(model.max_tokens, 4096);
+    }
+
+    /// model-registry.test.ts (b03a367a4 @ d1230ea20, #9294): "Anthropic
+    /// model override replaces allowed fallback metadata" — a models.json
+    /// `modelOverrides.compat.allowedFallbackModels` entry replaces the
+    /// value visible before the override (catalog value, or a custom
+    /// model's definition compat) wholesale; an unset override keeps it.
+    #[tokio::test]
+    async fn anthropic_model_override_replaces_allowed_fallback_metadata() {
+        let allowed_fallback_models = json!([
+            {
+                "provider": "anthropic",
+                "model": "claude-opus-5",
+                "cost": {"input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25}
+            },
+            {
+                "provider": "anthropic",
+                "model": "claude-opus-4-8",
+                "cost": {"input": 4.0, "output": 20.0, "cacheRead": 0.4, "cacheWrite": 5.0}
+            }
+        ]);
+        let override_json = json!({
+            "providers": {"anthropic": {
+                "modelOverrides": {
+                    "claude-opus-4-8": {
+                        "compat": {"allowedFallbackModels": allowed_fallback_models}
+                    }
+                }
+            }}
+        });
+        let (_tmp, runtime) = runtime_with_models_json(&override_json.to_string()).await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+        let model = runtime
+            .get_model("anthropic", "claude-opus-4-8")
+            .expect("catalog model");
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(
+            serde_json::to_value(&compat.allowed_fallback_models).unwrap(),
+            allowed_fallback_models
+        );
+
+        // Replacement over an *existing* list: a custom model's definition
+        // compat carries one fallback target, the override replaces it.
+        let definition_fallbacks = json!([
+            {
+                "provider": "anthropic",
+                "model": "claude-haiku-9",
+                "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0}
+            }
+        ]);
+        let (_tmp, runtime) = runtime_with_models_json(
+            &json!({
+                "providers": {"custom": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "api": "anthropic-messages",
+                    "apiKey": "RPI_TEST_FALLBACK_OVERRIDE_KEY",
+                    "models": [{
+                        "id": "m1",
+                        "compat": {"allowedFallbackModels": definition_fallbacks}
+                    }],
+                    "modelOverrides": {
+                        "m1": {"compat": {"allowedFallbackModels": allowed_fallback_models}}
+                    }
+                }}
+            })
+            .to_string(),
+        )
+        .await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+        let model = runtime.get_model("custom", "m1").expect("custom model");
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(
+            serde_json::to_value(&compat.allowed_fallback_models).unwrap(),
+            allowed_fallback_models,
+            "override replaces the definition-level fallback list"
+        );
+
+        // Unset override keeps the definition-level value (three-state:
+        // unset → lower layer).
+        let (_tmp, runtime) = runtime_with_models_json(
+            &json!({
+                "providers": {"custom": {
+                    "baseUrl": "https://api.example.com/v1",
+                    "api": "anthropic-messages",
+                    "apiKey": "RPI_TEST_FALLBACK_OVERRIDE_KEY",
+                    "models": [{
+                        "id": "m1",
+                        "compat": {"allowedFallbackModels": definition_fallbacks}
+                    }]
+                }}
+            })
+            .to_string(),
+        )
+        .await;
+        let model = runtime.get_model("custom", "m1").expect("custom model");
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(
+            serde_json::to_value(&compat.allowed_fallback_models).unwrap(),
+            definition_fallbacks
+        );
+    }
+
+    /// model-registry.test.ts (b03a367a4, #9294): "empty allowed fallback
+    /// model override disables server-side fallback".
+    #[tokio::test]
+    async fn empty_allowed_fallback_override_disables_server_side_fallback() {
+        let (_tmp, runtime) = runtime_with_models_json(
+            r#"{"providers": {"anthropic": {
+                "modelOverrides": {
+                    "claude-opus-4-8": {"compat": {"allowedFallbackModels": []}}
+                }
+            }}}"#,
+        )
+        .await;
+        assert!(runtime.get_error().is_none(), "no composition error");
+        let model = runtime
+            .get_model("anthropic", "claude-opus-4-8")
+            .expect("catalog model");
+        let compat = model.compat.as_ref().expect("compat");
+        assert_eq!(compat.allowed_fallback_models, Some(Vec::new()));
     }
 
     /// Upstream model-registry.test.ts (25a2c8dcf @ 4181f66, #7568): "custom

@@ -40,6 +40,9 @@ fn retryable_provider_error_pattern() -> &'static Regex {
     static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         build_provider_error_pattern(&[
             "overloaded",
+            // #9669 (e98f287ee): Azure peak-load capacity errors are
+            // transient — retry instead of surfacing a hard failure.
+            "currently experiencing high demand",
             "rate.?limit",
             "too many requests",
             "429",
@@ -47,6 +50,9 @@ fn retryable_provider_error_pattern() -> &'static Regex {
             "502",
             "503",
             "504",
+            // #9627 (e5d18382a): Cloudflare-origin 520s are retryable,
+            // like the 52x/54x statuses already listed.
+            "520",
             "524",
             "service.?unavailable",
             "server.?error",
@@ -255,6 +261,17 @@ mod tests {
         }
     }
 
+    /// #9669 (e98f287ee @ d1230ea20): Azure peak-load capacity errors are
+    /// retryable (full upstream error string).
+    #[test]
+    fn test_retryable_azure_peak_load_capacity_errors() {
+        const AZURE_PEAK_LOAD_ERROR: &str = "The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.";
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some(AZURE_PEAK_LOAD_ERROR)
+        )));
+    }
+
     #[test]
     fn test_is_retryable_assistant_error_classification() {
         assert!(is_retryable_assistant_error(&assistant(
@@ -273,6 +290,11 @@ mod tests {
         assert!(is_retryable_assistant_error(&assistant(
             StopReason::Error,
             Some("Error: exceeded request buffer limit while retrying upstream")
+        )));
+        // #9627 (e5d18382a): Cloudflare 520 with no body is retryable.
+        assert!(is_retryable_assistant_error(&assistant(
+            StopReason::Error,
+            Some("520 status code (no body)")
         )));
         // Quota/billing exhaustion: not retryable.
         assert!(!is_retryable_assistant_error(&assistant(

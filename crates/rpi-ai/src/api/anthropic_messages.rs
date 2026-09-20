@@ -43,10 +43,10 @@ use crate::api::sse::{ServerSentEvent, SseDecoder};
 use crate::api::stream_cancel::{next_chunk_or_cancelled, StreamNext};
 use crate::models::ProviderStreams;
 use crate::types::{
-    AssistantContent, AssistantMessage, CacheRetention, Context, DoneReason, ErrorReason, Message,
-    Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders, ProviderResponse, SimpleStreamOptions,
-    StopReason, StreamEvent, StreamOptions, ThinkingLevel, Tool, ToolResultContent,
-    ToolResultMessage, Usage, UserContent, UserContentBlock,
+    AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, Context,
+    DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders,
+    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingLevel,
+    Tool, ToolResultContent, ToolResultMessage, Usage, UserContent, UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
@@ -75,13 +75,26 @@ const SERVER_SIDE_FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MID_CONVERSATION_OUTPUT_CONFIG_BETA: &str = "mid-conversation-output-config-2026-07-01";
 const THINKING_BINDING_CONTROLS_BETA: &str = "thinking-binding-controls-2026-08-01";
 
-/// `shouldUseServerSideFallbackBeta` (:184-186, eb1f87fa9).
-fn should_use_server_side_fallback_beta(model: &Model) -> bool {
+/// Effective `allowedFallbackModels` read seam (#9294, b03a367a4 @
+/// d1230ea20): the composed model already carries the user models.json
+/// `modelOverrides.compat.allowedFallbackModels` value when set — an
+/// explicit array replaces the catalog value wholesale, and an empty array
+/// disables server-side fallback; absent keeps the catalog value. The
+/// beta-header gate, request assembly, and fallback cost attribution all
+/// read through here (the per-model override seam V15-07's settings layer
+/// reuses in shape).
+fn allowed_fallback_models(model: &Model) -> Option<&[AnthropicAllowedFallbackModel]> {
     model
         .compat
-        .as_ref()
-        .and_then(|compat| compat.allowed_fallback_models.as_ref())
-        .is_some_and(|fallbacks| !fallbacks.is_empty())
+        .as_ref()?
+        .allowed_fallback_models
+        .as_deref()
+        .filter(|fallbacks| !fallbacks.is_empty())
+}
+
+/// `shouldUseServerSideFallbackBeta` (:184-186, eb1f87fa9).
+fn should_use_server_side_fallback_beta(model: &Model) -> bool {
+    allowed_fallback_models(model).is_some()
 }
 
 /// `getBetaFeatures` (:978-1018 @ 9841914, 4e69b0c28): the single beta-set
@@ -1185,15 +1198,11 @@ fn build_params(
 
     // Server-side refusal fallback (eb1f87fa9, :1168-1172): only when the
     // compat lists permitted targets — Anthropic rejects `fallbacks` for
-    // models with none.
-    let allowed_fallback_models = model
-        .compat
-        .as_ref()
-        .and_then(|compat| compat.allowed_fallback_models.as_ref());
-    if allowed_fallback_models.is_some_and(|fallbacks| !fallbacks.is_empty()) {
+    // models with none (user override / disable via #9294 flows through
+    // the same seam).
+    if let Some(fallbacks) = allowed_fallback_models(model) {
         params["fallbacks"] = Value::Array(
-            allowed_fallback_models
-                .expect("non-empty checked")
+            fallbacks
                 .iter()
                 .map(|fallback| json!({"model": fallback.model}))
                 .collect(),
@@ -1267,7 +1276,8 @@ struct StreamProcessor<'a> {
     model: &'a Model,
     /// `usageModel` (:599-605): the model used for cost calculation — the
     /// requested model, or the fallback model (with its compat-listed cost)
-    /// when the server reports a different one (eb1f87fa9).
+    /// when the server reports a different one (eb1f87fa9; response-model
+    /// split per #9188, 1283afd0d).
     usage_model: Model,
     is_oauth_token: bool,
     tools: Option<&'a [Tool]>,
@@ -1366,34 +1376,35 @@ impl<'a> StreamProcessor<'a> {
                         self.input_transformations = Some(transformations.clone());
                     }
                 }
-                // :598 — the server may have served a fallback model; the
-                // returned id is authoritative for the final message.
-                if let Some(served) = message.get("model").and_then(Value::as_str) {
-                    self.output.model = served.to_owned();
+                // :598 — keep the requested model ID on the assistant message
+                // and record the provider-reported model separately (#9188,
+                // 1283afd0d @ d1230ea20): a relay relabeling the model used to
+                // overwrite `output.model`, making the cross-model transform
+                // downgrade signed thinking replay to plain text.
+                let response_model = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|served| *served != self.model.id);
+                if let Some(served) = response_model {
+                    self.output.response_model = Some(served.to_owned());
                 }
                 // :599-605 — cost follows the served model when it matches a
-                // permitted fallback target (same provider + exact model).
-                let fallback_cost = if self.output.model == self.model.id {
-                    None
-                } else {
-                    self.model
-                        .compat
-                        .as_ref()
-                        .and_then(|compat| compat.allowed_fallback_models.as_ref())
-                        .and_then(|fallbacks| {
-                            fallbacks
-                                .iter()
-                                .find(|fallback| {
-                                    fallback.provider == self.model.provider
-                                        && fallback.model == self.output.model
-                                })
-                                .map(|fallback| fallback.cost.clone())
-                        })
-                };
-                self.usage_model = match fallback_cost {
-                    Some(cost) => {
+                // permitted fallback target (same provider + exact model);
+                // fallback pricing is retained (#9188).
+                let fallback_cost = response_model.and_then(|served| {
+                    allowed_fallback_models(self.model).and_then(|fallbacks| {
+                        fallbacks
+                            .iter()
+                            .find(|fallback| {
+                                fallback.provider == self.model.provider && fallback.model == served
+                            })
+                            .map(|fallback| fallback.cost.clone())
+                    })
+                });
+                self.usage_model = match response_model.zip(fallback_cost) {
+                    Some((served, cost)) => {
                         let mut served_model = self.model.clone();
-                        served_model.id = self.output.model.clone();
+                        served_model.id = served.to_owned();
                         served_model.cost = cost;
                         served_model
                     }
@@ -3253,11 +3264,13 @@ pub(crate) mod tests {
         (collected, reason, output)
     }
 
-    /// FR-G R3 (eb1f87fa9): `message_start` may report a fallback model; the
-    /// returned id overrides `output.model` and cost follows the fallback
-    /// target's compat-listed pricing.
+    /// FR-G R3 (eb1f87fa9) + #9188 (1283afd0d): `message_start` may report
+    /// a fallback model; the requested id stays on `output.model` (signed
+    /// thinking replay stays valid), the served model is recorded on
+    /// `response_model`, and cost follows the fallback target's
+    /// compat-listed pricing.
     #[test]
-    fn message_start_fallback_model_overrides_output_and_bills_fallback_cost() {
+    fn message_start_fallback_model_bills_fallback_cost() {
         let model = make_model(json!({
             "compat": {
                 "allowedFallbackModels": [
@@ -3278,14 +3291,17 @@ pub(crate) mod tests {
         );
         let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
         assert_eq!(reason, Ok(DoneReason::Stop));
-        assert_eq!(output.model, "claude-haiku-9");
+        // #9188: the requested model id is authoritative on the message.
+        assert_eq!(output.model, "claude-sonnet-4-5");
+        assert_eq!(output.response_model.as_deref(), Some("claude-haiku-9"));
         // 100 × 2,000,000/1e6 = 200; 50 × 4,000,000/1e6 = 200 — the
         // requested model's rates (3/15) would have given 0.3/0.75.
         assert_eq!(output.usage.cost.input, 200.0);
         assert_eq!(output.usage.cost.output, 200.0);
     }
 
-    /// FR-G R3: an unknown served model keeps the requested model's rates.
+    /// FR-G R3: an unknown served model keeps the requested model's rates
+    /// (recorded on `response_model`, #9188).
     #[test]
     fn message_start_unknown_model_keeps_requested_rates() {
         let model = make_model(json!({}));
@@ -3299,9 +3315,54 @@ pub(crate) mod tests {
         );
         let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
         assert_eq!(reason, Ok(DoneReason::Stop));
-        assert_eq!(output.model, "claude-unknown-9");
+        assert_eq!(output.model, "claude-sonnet-4-5");
+        assert_eq!(output.response_model.as_deref(), Some("claude-unknown-9"));
         // Requested model rates: 3.0/M input.
         assert_eq!(output.usage.cost.input, 3.0);
+    }
+
+    /// #9188 (1283afd0d): a relay relabeling the response model must not
+    /// break signed thinking replay — the assistant message keeps the
+    /// requested model id, so the same-model transform preserves the
+    /// thinking block with its signature.
+    #[test]
+    fn renamed_response_model_keeps_signed_thinking_replayable() {
+        let model = make_model(json!({}));
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_response_model\",\"model\":\"kimi-for-coding\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"reasoning\",\"signature\":\"signature\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":20}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (_events, reason, output) = drive_sse(&model, sse.as_bytes());
+        assert_eq!(reason, Ok(DoneReason::Stop));
+        assert_eq!(output.model, "claude-sonnet-4-5");
+        assert_eq!(output.response_model.as_deref(), Some("kimi-for-coding"));
+
+        // Replay through the transform keeps the signed thinking block.
+        let messages = vec![user_text("Hello"), Message::Assistant(output)];
+        let transformed = transform_messages(&messages, &model, None);
+        let Message::Assistant(replayed) = transformed
+            .iter()
+            .find(|message| matches!(message, Message::Assistant(_)))
+            .expect("assistant message")
+        else {
+            unreachable!()
+        };
+        assert_eq!(replayed.content.len(), 1);
+        match &replayed.content[0] {
+            AssistantContent::Thinking(thinking) => {
+                assert_eq!(thinking.thinking, "reasoning");
+                assert_eq!(thinking.thinking_signature.as_deref(), Some("signature"));
+            }
+            other => panic!("expected thinking block, got {other:?}"),
+        }
     }
 
     /// FR-G R4 (:618-623): a `fallback` marker block opening the output is
@@ -4014,6 +4075,41 @@ mod mid_convo_effort_tests {
             .expect("anthropic-beta header");
         assert!(beta.contains("mid-conversation-output-config-2026-07-01"));
         assert!(beta.contains("thinking-binding-controls-2026-08-01"));
+    }
+
+    /// #9294 (b03a367a4 @ d1230ea20): the server-side-fallback beta header
+    /// follows the effective `allowedFallbackModels` — set (non-empty)
+    /// sends it; empty (user-disabled) or absent does not. The fallbacks
+    /// body field itself is covered by
+    /// `test_build_params_fallbacks_only_with_allowed_models`.
+    #[test]
+    fn server_side_fallback_beta_header_follows_effective_fallbacks() {
+        let with_fallbacks = make_model(json!({
+            "compat": {"allowedFallbackModels": [
+                {"provider": "anthropic", "model": "claude-haiku-9", "cost": {"input": 1.0, "output": 2.0, "cacheRead": 0.0, "cacheWrite": 0.0}}
+            ]}
+        }));
+        let betas = get_beta_features(
+            &with_fallbacks,
+            &Context::default(),
+            false,
+            &AnthropicOptions::default(),
+        );
+        assert!(betas.contains(&SERVER_SIDE_FALLBACK_BETA.to_owned()));
+
+        for compat in [json!({"allowedFallbackModels": []}), json!({})] {
+            let model = make_model(json!({"compat": compat}));
+            let betas = get_beta_features(
+                &model,
+                &Context::default(),
+                false,
+                &AnthropicOptions::default(),
+            );
+            assert!(
+                !betas.contains(&SERVER_SIDE_FALLBACK_BETA.to_owned()),
+                "no fallback beta for compat {compat}"
+            );
+        }
     }
 
     /// Header override rules (:985-1000): an explicit `anthropic-beta`
