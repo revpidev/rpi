@@ -1,0 +1,4 @@
+{
+	"//": "Target-track attribution manifest for the v0.1.5 rebase window (TE37, ADR-0029): expected-source pin = pi-subagents v0.70.0 @ b72714de. Starts EMPTY by design — TE38/TE39 append one entry per triaged diff ({mode, case, section: upstream-semantics|rpi-deviation, r, owner}). Known pre-triage faces (skeleton-level, TE37): upstream removed automatic model fallback (#2270 / f58dfcb5) so the fallback/model upstream legs are frozen on the v0.66 regression-snapshot face until TE39 triages the removal; the args leg is the frozen v0.48 golden on both tracks ([RPI-OWN], ADR-0025 §4).",
+	"cases": []
+}

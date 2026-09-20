@@ -3,17 +3,21 @@
 Drives the pinned upstream pi-subagents and this crate's `build_rpi_args` / frontmatter parser /
 `get_finalOutput` / fallback mode table / discovery entry points with the same fixture set, then diffs the normalized outputs item by item.
 
-## Dual tracks
+## Dual tracks (v0.1.5 rotation, TE37 / ADR-0029)
 
 | Track | Upstream | Purpose | Report directory |
 |----|------|------|----------|
-| `target` (**default since TE27**) | the new pin v0.66.0 (`0fc0eebb`, an out-of-repository snapshot; the submodule was switched to this pin with TE27) | new-semantics parity and golden re-records (ADR-0025) | `fixtures/generated/subagents-parity-v066/` |
-| `regression` (**retired with TE27**) | the old pin v0.48.0 (`56f97234`; requires manually checking out an old-pin worktree) | guaranteeing zero regression against the v0.48 baseline (mission complete) | `fixtures/generated/subagents-parity/` (historical reports preserved) |
+| `regression` (**default for the v0.1.5 window**) | the current pin v0.66.0 (`0fc0eebb`, an out-of-repo snapshot of the submodule HEAD) | zero-regression baseline of the window (full mode set) | `fixtures/generated/subagents-parity-v066/` (the TE27-era baseline directory, kept comparable) |
+| `target` | the new pin v0.70.0 (`b72714de`, an out-of-repo snapshot until TE39 switches the pin) | new-semantics parity and golden re-records | `fixtures/generated/subagents-parity-v070/` |
 
-The old track reached end-of-life with the TE27 pin switch (04 §1.3): the rpi implementation has
-landed v0.66 semantics, so the old-track goldens no longer hold;
-re-running the old track requires `git -C external/pi-subagents checkout 56f97234` (reset to `0fc0eebb` afterwards).
-The two tracks' fixture inputs are separate: baseline cases live in `fixtures.json`, target-track additions in `fixtures-target.json` (the target track concatenates both by mode).
+Track names rotate each rebase cycle (TE13 convention): during v0.1.4 the current pin was named
+`target`; for v0.1.5 it is named `regression` (the default), and `target` denotes the new pin.
+TE39 flips the default back to `target` together with the pin switch. The retired v0.48
+archaeology face (live `pi-args.ts`) was removed with the TE37 rotation — the args leg is the
+frozen v0.48 golden on both tracks. The two fixture files (`fixtures.json`, `fixtures-target.json`)
+are shared and concatenated on both tracks. Both upstream legs read **snapshots** extracted by
+`setup-target-source.sh` (the live worktree cannot serve: v0.66's discovery chain imports `yaml`,
+unresolvable from a pristine `external/`).
 
 ## Running
 
@@ -24,14 +28,14 @@ mkdir -p /tmp/rpi-subagents-parity-deps && cd /tmp/rpi-subagents-parity-deps \
 
 cd <repo-root>
 
-# Regression track (retired; re-running requires an old-pin worktree)
-node scripts/subagents-parity/run-parity.mjs --track=regression
+# Regression track (v0.66.0 = the submodule pin; default for the window)
+bash scripts/subagents-parity/setup-target-source.sh   # extracts BOTH snapshots (target v0.70 + regression v0.66) + prod deps
+node scripts/subagents-parity/run-parity.mjs
 
-# Target track (v0.66.0, default)
-bash scripts/subagents-parity/setup-target-source.sh   # extract the out-of-repo snapshot + its prod dependencies
-node scripts/subagents-parity/run-parity.mjs            # target track by default since TE27
+# Target track (v0.70.0 snapshot)
+node scripts/subagents-parity/run-parity.mjs --track=target
 
-# Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4)
+# Re-record the argv/env frozen baseline ([RPI-OWN], ADR-0025 §4; v0.48-era worktree + RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 required)
 node scripts/subagents-parity/run-parity.mjs --record-args-golden
 ```
 
@@ -41,7 +45,8 @@ no longer suffers name collisions (P2-9), where the example would belong to whic
 last and the mcp harness would overwrite it (a harness defect found during TE13 testing).
 The private copy keeps the two harnesses out of each other's way while keeping example names compatible with existing docs.
 
-Exit code: non-zero on the target track = **unattributed** differences exist; on the regression track (retired) non-zero = differences exist.
+Exit code: non-zero = **unattributed** differences exist (both tracks); `ATTRIBUTED-OK` = every
+difference is triaged in the track's manifest.
 
 ### Target-track discovery leg (TE15, R7.1.3)
 
@@ -58,25 +63,26 @@ them consistently; see `fixtures/subagents-v066/discovery/materialize.json`).
 
 ## Target-track upstream source (out-of-repo; zero writes to external/)
 
-`setup-target-source.sh` uses `git -C external/pi-subagents archive <pin>` to extract the v0.66 sources into
-`/tmp/rpi-subagents-parity-target-v066` (overridable via `RPI_SUBAGENTS_TARGET_SRC`) — no checkout,
+`setup-target-source.sh` uses `git -C external/pi-subagents archive <pin>` to extract BOTH snapshots —
+the v0.70 target into `/tmp/rpi-subagents-parity-target-v070` and the current-pin (v0.66)
+regression source into `/tmp/rpi-subagents-parity-regression-v066` (each overridable via
+`RPI_SUBAGENTS_TARGET_SRC` / `RPI_SUBAGENTS_REGRESSION_SRC`; `--skip-regression` skips the latter) —
+no checkout,
 no `git worktree add`, no submodule HEAD changes — so
 `git -C external/pi-subagents status --porcelain`
-stays empty. Inside the snapshot, `npm install --omit=dev` installs the prod dependencies of the snapshot's own
-`package.json`
-(v0.66 `utils.ts → formatters.ts → settings.ts → agents/agents.ts` imports `yaml` at runtime;
-the v0.48 chain stops at settings.ts, hence the regression track needs no dependencies). The fetch range needs only one
-`git -C external/pi-subagents fetch --deepen=700 origin` (read-only).
+stays empty. Inside each snapshot, `npm install --omit=dev` installs the prod dependencies of the snapshot's own
+`package.json` (the frontmatter/agents chain imports `yaml` at runtime). The fetch range needs only one
+`git -C external/pi-subagents fetch --deepen=350 origin` (read-only).
 
 ## The [RPI-OWN] argv/env baseline
 
 Upstream v0.65+ deleted `src/runs/shared/pi-args.ts` / `buildPiArgs` (sub agents moved to in-process
 AgentSession), so the rpi subprocess model's argv/env assembly has no upstream counterpart (R7.1.0.4, ADR-0025 §4):
 
-- the regression track still runs v0.48 `pi-args.ts` (the old track is the status quo);
-- the target track instead compares against the **frozen golden file** `args-golden-v048.json` — recorded from
+- both tracks compare against the **frozen golden file** `args-golden-v048.json` — recorded from
   the v0.48 upstream leg by `--record-args-golden` (session-base placeholders normalized to `<SESSION_BASE>`;
-  only the non-inline cases of fixtures.json are re-recorded);
+  only the non-inline cases of fixtures.json are re-recorded; re-recording requires a v0.48-era
+  worktree and `RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1` since every reachable pin deleted pi-args.ts);
 - when M2/M3 change argv/env via the R7.1.4 series, the corresponding task updates the golden file and registers
   "old expectation → new expectation + evidence" per G2;
 - **TE18 addendum**: new semantics with no upstream recorder (`--exclude-tools` and other behaviors upstream never
@@ -97,7 +103,8 @@ thinking-suffix retry / miss fail-closed (#1093) and the origin-aware candidate 
 
 ## Attribution rules (target track)
 
-Every target-track difference must hit `expected-target-diffs.json`, or the report lands in `### unattributed` with a non-zero exit code:
+Every target-track difference must hit `expected-target-diffs-v070.json` (the v0.1.5 manifest; the regression
+track keeps the historical, emptied `expected-target-diffs.json`), or the report lands in `### unattributed` with a non-zero exit code:
 
 - `upstream-semantics`: new-tag behavior rpi hasn't adopted yet (attached R entry + owning task);
 - `rpi-deviation`: deviations where rpi's existing implementation disagrees with both pins;
@@ -120,9 +127,10 @@ Every target-track difference must hit `expected-target-diffs.json`, or the repo
 | `fixtures.json` | Shared baseline cases: 9 groups of argv/env inputs, 6 groups of frontmatter content, 5 groups of message arrays |
 | `fixtures-target.json` | Target-track additions: frontmatter (inherit/false, excludeTools, broken frontmatter, thinking), final-output, fallback vectors, discovery tree (TE15), notify (TE17), **inline argv [RPI-OWN] goldens (TE18: the excludeTools surface, no upstream recorder; expectations inline in the cases) and model-resolution vectors (TE18 R7.1.4.4/.5, diffed directly against v0.66 `model-fallback.ts`)** |
 | `args-golden-v048.json` | The frozen argv/env golden file ([RPI-OWN]; covers only the 9 cases of fixtures.json; `--record-args-golden` re-records only the non-inline cases) |
-| `expected-target-diffs.json` | The target-track difference attribution list (R entries + owning tasks) |
-| `upstream-runner.mjs` | Runs upstream modules directly via tsx: regression track v0.48; target track frontmatter/final-output/fallback via the v0.66 snapshot, args via the golden file, discovery via v0.66 `discoverAgents` |
-| `setup-target-source.sh` | Extracts the v0.66 snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
+| `expected-target-diffs.json` | The regression-track difference attribution list (historical, emptied by TE14) |
+| `expected-target-diffs-v070.json` | The v0.1.5 target-track attribution manifest (TE37 seed, empty by design; TE38/TE39 append) |
+| `upstream-runner.mjs` | Runs upstream modules directly via tsx from the track root (live submodule = regression; v0.70 snapshot = target); args via the golden file on both tracks; fallback/model frozen on the live-submodule v0.66 face (v0.70 removed model fallback, #2270) |
+| `setup-target-source.sh` | Extracts the v0.70 snapshot out-of-repo + installs its prod dependencies (zero writes to external/) |
 | `examples/subagents_parity_runner.rs` | Drives this crate with the same fixtures (parity facade, `lib.rs::parity`); built by the orchestrator and executed from a private copy |
 | `run-parity.mjs` | Orchestration + normalized diff + attribution + report writing; fixture materialization and the Rust binary copy land in out-of-repo temp directories |
 
@@ -157,6 +165,25 @@ Every target-track difference must hit `expected-target-diffs.json`, or the repo
 7. **Prompt temp-file contents not compared**: rpi additionally prepends a boundary-instruction block at the
    file head (after `<active_agent>`, before the body — the TE-D17 mechanism-equivalent replacement);
    path-and-flag equality at the argv/env layer suffices.
+8. **Brand-mapped strings (ADR-0028)**: the debrand pass renamed model-visible strings on the rpi side
+   (e.g. `"the active Pi model registry"` → `"the active rpi model registry"` in launch/model.rs); the
+   upstream leg emits the upstream spelling, so `normalizeOutput` maps the pair onto each other before
+   diffing (error fields; extend `BRAND_MAP` as more debranded surfaces enter the fixtures). Surfaced by
+   the TE37 rotation re-run — the drift existed since the debrand commit but the pre-rotation baseline
+   report predated it.
+
+## v0.70 skeleton facts (TE37 close reads, ADR-0029)
+
+- `src/runs/shared/model-fallback.ts` **deleted** (#2270 / f58dfcb5, "remove automatic model
+  fallback") — no replacement module; `isRetryableModelFailure` has no src occurrence at v0.70.
+  The fallback/model upstream legs are therefore **frozen on the v0.66 submodule face** on both
+  tracks during the v0.1.5 window; TE39 must triage the removal (follow upstream and drop/replace
+  the rpi fallback surface, or freeze a recorded golden as [RPI-OWN]) before flipping the pin.
+- `src/runs/shared/pi-args.ts` stays absent (deleted v0.65) — the argv/env face remains the frozen
+  v0.48 golden ([RPI-OWN], ADR-0025 §4).
+- Unchanged faces at v0.70 (verified): `src/agents/frontmatter.ts` (`parseFrontmatter`),
+  `src/shared/utils.ts` (`getFinalOutput`), `src/agents/agents.ts` (`discoverAgents`),
+  `src/runs/background/notify.ts` (`formatSingleCompletion` / `parseSubagentNotifyContent`).
 
 ## v0.66 shared-surface changes (target-track close reads, ADR-0025 appendix D)
 

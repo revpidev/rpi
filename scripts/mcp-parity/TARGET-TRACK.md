@@ -1,9 +1,19 @@
-# mcp-parity target-track skeleton and re-record list (delivered by TE13; the actual re-records belong to TE23/TE24)
+# mcp-parity target-track skeleton and re-record list (delivered by TE13; the actual re-records belonged to TE23/TE24;
+# re-rotated to v2.34.0+9 by TE37 under ADR-0029 for the v0.1.5 window — the new re-records belong to TE40)
 
-> **The pin switched (TE27, 2026-09-11; ADR-0025 adopted)**: `external/pi-mcp-adapter` @
+> **v0.1.5 rotation (TE37, 2026-09-20; ADR-0029 adopted)**: the target pin is now
+> `97435aabf74e5fbcf1112e7244f931172b9db624` (v2.34.0+9, 59 commits / 156 files over v2.32.1).
+> `setup-target-source.sh` extracts it into `/tmp/rpi-mcp-parity-target-v2340` (lockfile closure
+> included). The default driver stays the submodule worktree = the OLD pin (v2.32.1) — the
+> zero-regression baseline of the window — until TE40 performs the atomic switch. The §3/§4/§5
+> re-record lists below are the **completed v0.1.4 record**; the v0.1.5 equivalents (conformance
+> baseline refresh, golden re-records against v2.34.0+9 semantics, OAuth-credentials/config-editor
+> surfaces) are owned by TE40 and get appended as a new section by that task.
+>
+> **The v0.1.4 switch (TE27, 2026-09-11; ADR-0025 adopted)**: `external/pi-mcp-adapter` @
 > `10a45367e033a32026987a75d6f401e37340c86f` (v2.32.1, 90 commits).
-> This file is kept as the target-track historical record; the default driver (the submodule worktree) is already v2.32.1, and the snapshot path
-> `/tmp/rpi-mcp-parity-target-v2321` serves only as an independent reference source.
+> This file keeps the target-track historical record; the default driver (the submodule worktree) is v2.32.1, and the snapshot path
+> `/tmp/rpi-mcp-parity-target-v2321` served as the pre-switch stand-in (now superseded by the v2340 snapshot above).
 
 ## 1. What the skeleton delivered (TE13, complete)
 
@@ -22,10 +32,10 @@ each task's document).
 ## 2. Running the target track (skeleton verification)
 
 ```bash
-# One-time: external snapshot + its lockfile closure
+# One-time: external snapshot + its lockfile closure (v2.34.0+9 target, TE37)
 bash scripts/mcp-parity/setup-target-source.sh
-export RPI_MCP_PARITY_UPSTREAM=/tmp/rpi-mcp-parity-target-v2321
-export RPI_MCP_PARITY_DEPS=/tmp/rpi-mcp-parity-target-v2321
+export RPI_MCP_PARITY_UPSTREAM=/tmp/rpi-mcp-parity-target-v2340
+export RPI_MCP_PARITY_DEPS=/tmp/rpi-mcp-parity-target-v2340
 
 # Protocol leg / renderCall leg (target-pin sources + target closure)
 node scripts/mcp-parity/run-mcp-parity.mjs --out-dir /tmp/mcp-target-parity
@@ -38,6 +48,19 @@ the difference list is the acceptance entry for the §4 owning tasks. After TE23
 batches, the target track must converge to
 zero differences (goldens re-recorded against the new pin).
 
+### TE37 skeleton field test (2026-09-20, v2.34.0+9 @ 97435aab)
+
+| Leg | Target-track result | Notes |
+|----|------------|------|
+| Protocol leg (7 scenarios) | **7/7 MATCH** (exit 0) | stdio / http-streamable / 404/405/406/415 fallbacks / http-auth-401 — the pinned fixture surfaces are unchanged by the 59-commit span |
+| renderCall leg (24 cases) | **24/24 byte-identical** (exit 0) | v2.34.0+9 keeps the renderer pure-function surface the stub drives |
+
+Interpretation: the *existing* fixture surfaces see zero drift at the new pin; the v0.1.5 new surfaces
+(OAuth encrypted credentials store #580/#571/#546/#565/#552, config editor #601/#556/#568,
+namespace/tool-surface changes #599/#600/#566, structured output #605, footer state #604, …) are **not
+covered by current fixtures** — TE40 extends the fixture/conformance/golden sets per its §4 and
+re-runs both tracks (G10 "parity before implementation": fixtures first, then implementation).
+
 ### TE13 skeleton field test (2026-09-08)
 
 | Leg | Target-track result | Notes |
@@ -45,7 +68,7 @@ zero differences (goldens re-recorded against the new pin).
 | renderCall pure functions (24 cases) | **24/24 byte-identical** (exit 0) | v2.32.1's renderer newly imports `truncateToWidth`/`visibleWidth` at runtime; the stub was completed per pi-tui's printable-ASCII fast path (`render-call-host-pi-tui.mjs`), all cases being short ASCII lines |
 | Protocol leg (7 scenarios) | 6 DIFF + `http-auth-401` MATCH (exit 1) | All DIFFs are v2.32.1-new surfaces (namespace tools/request headers, …), expected, converging after the TE23/TE24 re-records |
 
-- The report-header pin is controlled by `RPI_MCP_PARITY_UPSTREAM_PIN` (default `3d953f90`; set `10a45367` for the target track),
+- The report-header pin is controlled by `RPI_MCP_PARITY_UPSTREAM_PIN` (default `10a45367` = the submodule pin until TE40; set `97435aab` for the v0.1.5 target track),
   preventing target-track reports from mislabeling the old pin.
 - Target-track output must use `--out-dir` / `RPI_MCP_PARITY_OUT_DIR` pointing at a scratch directory, never overwriting
   the regression evidence in `fixtures/generated/mcp-parity/`.

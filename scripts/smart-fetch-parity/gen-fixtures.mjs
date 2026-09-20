@@ -881,22 +881,33 @@ const batchProgressOut = [];
 rmSync(DOWNLOAD_TEMP_DIR, { recursive: true, force: true });
 for (const scenario of batchProgressScenarios) {
   const { snapshots, result } = await driveBatchProgress(scenario);
+  // V13-04 FR-B / TE-D37: rpi's BatchProgressState snapshot dirty-check
+  // merges consecutive identical full-table states (upstream tool.ts pushes
+  // a frame per update; rpi throttles the identical middle frames across
+  // the FFI boundary). The merge is applied HERE (TE37 hardening — it used
+  // to be a documented manual post-processing step and a regeneration
+  // trap: a bare regen re-introduced the duplicate frames and failed the
+  // replay). Terminal frames stay byte-exact.
+  const merged = [];
+  for (const snapshot of snapshots) {
+    const stable = JSON.stringify(snapshot);
+    if (merged.length > 0 && JSON.stringify(merged[merged.length - 1]) === stable) continue;
+    merged.push(snapshot);
+  }
   batchProgressOut.push({
     name: scenario.name,
     input: { requests: scenario.requests, fetchScript: scenario.fetchScript, defuddleResult: scenario.defuddleResult ?? { content: undefined, wordCount: 0 } },
-    output: { snapshots, result },
+    output: { snapshots: merged, result },
   });
 }
 writeFileSync(join(OUT_DIR, "batch-progress.json"), JSON.stringify(batchProgressOut, null, 2) + "\n");
 
-// NOTE (V13-04 FR-B): the committed batch-progress.json is DELIBERATELY
-// post-processed — rpi's BatchProgressState snapshot dirty-check merges
-// consecutive identical full-table states (upstream tool.ts pushes a frame
-// per update; rpi throttles the identical middle frames across the FFI
-// boundary, TE-D37). When regenerating here, re-apply the merge: for each
-// scenario remove snapshots entries identical (by stable JSON) to the
-// previous one. The terminal frames stay byte-exact (parity fixture test
-// asserts the post-merge sequence).
+// NOTE (V13-04 FR-B, automated by TE37): upstream tool.ts pushes one frame
+// per update; rpi merges consecutive identical full-table states (TE-D37
+// dirty-check). The consecutive-duplicate merge is now applied in the
+// generator loop above — a bare regeneration reproduces the committed
+// byte-exact post-merge sequence, and the parity fixture test asserts that
+// sequence directly.
 
 console.log(
   `wrote: format.json (${Object.entries(formatOut).reduce((n, [, v]) => n + v.length, 0)} cases), ` +

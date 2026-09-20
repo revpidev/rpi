@@ -1,38 +1,42 @@
 // Orchestrator of the subagents parity harness (TE04 G3; dual-track TE13;
-// target track made the default by TE27 when the submodule pin switched to
-// v0.66.0 — the old-pin regression track's lifecycle ended there, its
-// historical reports are kept under fixtures/generated/subagents-parity/).
+// re-rotated by TE37 for the v0.1.5 rebase window under ADR-0029).
 //
-//   node scripts/subagents-parity/run-parity.mjs [--track=target|regression]
+//   node scripts/subagents-parity/run-parity.mjs [--track=regression|target]
 //   node scripts/subagents-parity/run-parity.mjs --record-args-golden
+//
+// v0.1.5 rotation (TE37; until TE39 flips the submodule pin):
+//   - `regression` (DEFAULT) = the CURRENT-pin snapshot, pi-subagents
+//     v0.66.0 @ 0fc0eebb — the zero-regression baseline of the window.
+//     Extracted read-only by setup-target-source.sh into
+//     /tmp/rpi-subagents-parity-regression-v066 (the live worktree cannot
+//     serve as the upstream leg: v0.66's discovery chain imports `yaml`,
+//     unresolvable from a pristine external/). Runs the full mode set and
+//     writes fixtures/generated/subagents-parity-v066/ (the TE27-era
+//     baseline directory, kept comparable). At the v0.1.4 switch this role
+//     was named "target"; the name rotates each rebase cycle (TE13
+//     convention).
+//   - `target` = the NEW pin snapshot pi-subagents v0.70.0 @ b72714de
+//     (ADR-0029), extracted read-only by setup-target-source.sh into
+//     /tmp/rpi-subagents-parity-target-v070. Writes
+//     fixtures/generated/subagents-parity-v070/. Diffs are attributed
+//     through expected-target-diffs-v070.json (`upstream-semantics` vs
+//     `rpi-deviation`, each with R + owner task); TE38/TE39 fill it as they
+//     triage. Non-zero exit = any UNATTRIBUTED diff.
+//   - Both tracks share the same fixture set (fixtures.json +
+//     fixtures-target.json) and the frozen argv/env golden
+//     (args-golden-v048.json, [RPI-OWN] per ADR-0025 §4 — upstream deleted
+//     pi-args.ts in v0.65 and it stayed deleted at v0.70).
+//   - Upstream v0.70 removed automatic model fallback entirely (#2270,
+//     f58dfcb5: src/runs/shared/model-fallback.ts deleted). The
+//     fallback/model upstream legs therefore freeze on the live-submodule
+//     (v0.66) face on both tracks during the window — see upstream-runner.mjs;
+//     TE39 must triage the removal (follow it or freeze a golden) before
+//     flipping the pin.
 //
 // The Rust leg is built by this script and copied to a private path before
 // execution: both plugin crates ship an example named `subagents_parity_runner`, and
 // the unsuffixed target/debug/examples/subagents_parity_runner belongs to whichever
 // crate built last (the mcp harness would shadow it otherwise).
-//
-// Track `target` (default since TE27; pi-subagents v0.66.0, ADR-0025):
-//   1. argv/env: Rust vs the frozen v0.48 golden ([RPI-OWN], ADR-0025 §4;
-//      upstream deleted `pi-args.ts` in v0.65).
-//   2. frontmatter/final-output/fallback: Rust vs the v0.66 snapshot modules
-//      extracted by setup-target-source.sh.
-//   3. discovery (TE15): the case tree is materialized per side (`.pi`
-//      upstream / `.rpi` rpi, both normalized to `<CFGDIR>`) and both legs
-//      run their real discovery entry point; agents + diagnostics are diffed.
-//   4. Diffs are attributed through expected-target-diffs.json
-//      (`upstream-semantics` vs `rpi-deviation`, each with R + owner task);
-//      writes fixtures/generated/subagents-parity-v066/parity-report.md.
-//   Non-zero exit = any UNATTRIBUTED diff.
-//
-// Track `regression` (retired by TE27; kept for archaeology — requires the
-// old-pin worktree, i.e. `git -C external/pi-subagents checkout 56f97234`
-// followed by restoring the v0.66.0 pin afterwards):
-//   1. Runs the pinned upstream v0.48 modules (tsx) on the shared fixtures.
-//   2. Runs the Rust subagents_parity_runner example on the same fixtures.
-//   3. Normalizes both sides and diffs; writes
-//      fixtures/generated/subagents-parity/parity-report.md.
-//   Non-zero exit = any case mismatched (expects the rpi crate at v0.48
-//   semantics — will not hold after the rebase batches).
 import { spawnSync } from "node:child_process";
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -42,26 +46,31 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const TSX = "/tmp/rpi-subagents-parity-deps/node_modules/.bin/tsx";
 const GOLDEN_PATH = `${HERE}/args-golden-v048.json`;
-const TARGET_MANIFEST = `${HERE}/expected-target-diffs.json`;
 
 const TRACK_FLAG = process.argv.find((arg) => arg.startsWith("--track="));
-const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "target";
+// Default = regression (the live submodule pin) for the whole v0.1.5 window;
+// TE39 flips the default back to `target` together with the pin switch.
+const TRACK = TRACK_FLAG ? TRACK_FLAG.slice("--track=".length) : "regression";
 if (!["regression", "target"].includes(TRACK)) {
 	console.error(`unknown track: ${TRACK}`);
 	process.exit(2);
 }
+// Per-track attribution manifests (TE37 rotation): the v066 manifest is the
+// historical (converged-to-empty) TE13-era list kept for the regression
+// track; the v070 manifest starts empty and is filled by TE38/TE39.
+const TARGET_MANIFEST = `${HERE}/expected-target-diffs${TRACK === "target" ? "-v070" : ""}.json`;
 const RECORD_ARGS_GOLDEN = process.argv.includes("--record-args-golden");
 
 const GENERATED = resolve(
 	REPO,
 	TRACK === "target"
-		? "fixtures/generated/subagents-parity-v066"
-		: "fixtures/generated/subagents-parity",
+		? "fixtures/generated/subagents-parity-v070"
+		: "fixtures/generated/subagents-parity-v066",
 );
-const MODES =
-	TRACK === "target"
-		? ["args", "frontmatter", "final-output", "fallback", "model", "discovery", "notify"]
-		: ["args", "frontmatter", "final-output"];
+// Both tracks run the full mode set (the v0.48-only archaeology face was
+// removed with the TE37 rotation; the args leg is golden-based on both
+// tracks).
+const MODES = ["args", "frontmatter", "final-output", "fallback", "model", "discovery", "notify"];
 
 // Session paths in fixtures.json use the /sess/root placeholder; both legs
 // run against the same rewritten copy in a fresh temp dir so buildPiArgs /
@@ -85,10 +94,10 @@ const placeholderizePaths = (value) =>
 function loadCases(mode) {
 	const base = JSON.parse(readFileSync(`${HERE}/fixtures.json`, "utf-8"));
 	let cases = base[mode]?.cases ?? [];
-	if (TRACK === "target") {
-		const extra = JSON.parse(readFileSync(`${HERE}/fixtures-target.json`, "utf-8"));
-		cases = cases.concat(extra[mode]?.cases ?? []);
-	}
+	// Both tracks share the extended case set (TE18+ semantics cases carry
+	// inline [RPI-OWN] expected objects).
+	const extra = JSON.parse(readFileSync(`${HERE}/fixtures-target.json`, "utf-8"));
+	cases = cases.concat(extra[mode]?.cases ?? []);
 	return cases;
 }
 
@@ -196,6 +205,21 @@ function parseLines(stdout, label) {
 // in another run) stays comparable.
 function normalizeOutput(output) {
 	const clone = structuredClone(output);
+	// ADR-0028 brand mapping (parity-equivalent): the debrand pass renamed
+	// user/model-visible strings like "the active Pi model registry" to the
+	// rpi spelling; the upstream leg keeps the upstream wording, so the two
+	// spellings are mapped onto each other at compare time (same philosophy as
+	// the PI_SUBAGENT_ -> RPI_SUBAGENT_ env-key rename). Extend the list as
+	// more debranded surfaces enter the fixtures.
+	const BRAND_MAP = [
+		["the active Pi model registry", "the active rpi model registry"],
+	];
+	const mapBrand = (text) => {
+		let out = text;
+		for (const [from, to] of BRAND_MAP) out = out.replaceAll(from, to);
+		return out;
+	};
+	if (typeof clone?.error === "string") clone.error = mapBrand(clone.error);
 	if (clone?.argv) {
 		// Upstream injects its runtime extensions as separate source files
 		// (prompt-runtime.ts + fanout-child.ts when authorized); rpi injects a
@@ -284,16 +308,16 @@ function loadManifest() {
 	return byKey;
 }
 
-const manifest = TRACK === "target" ? loadManifest() : new Map();
+const manifest = loadManifest();
 const attribution = { "upstream-semantics": [], "rpi-deviation": [] };
 const unattributed = [];
 let ok = true;
 
-// TE18: target-track args face = frozen v0.48 golden cases (upstream leg
-// reads the golden) + [RPI-OWN] inline-expected cases for semantics no
-// upstream recorder has (upstream deleted pi-args.ts before gaining
-// --exclude-tools; ADR-0025 §4). Inline cases compare the Rust leg against
-// the `expected` object shipped in the fixture.
+// The args face = frozen v0.48 golden cases (upstream leg reads the golden,
+// both tracks) + [RPI-OWN] inline-expected cases for semantics no upstream
+// recorder has (upstream deleted pi-args.ts before gaining --exclude-tools;
+// ADR-0025 §4). Inline cases compare the Rust leg against the `expected`
+// object shipped in the fixture.
 function compareArgsTarget(report) {
 	const all = loadCases("args");
 	const goldenCases = all.filter((entry) => !entry.expected);
@@ -353,7 +377,7 @@ function compareMode(mode, report, caseSubset) {
 			continue;
 		}
 		const entry = manifest.get(`${mode}/${up.name}`);
-		if (TRACK === "target" && entry) {
+		if (entry) {
 			const fieldNote = diff.fields.length > 0 ? ` fields: ${diff.fields.join(", ")}` : "";
 			lines.push(
 				`- ${up.name}: ATTRIBUTED [${entry.section}] ${entry.r} → ${entry.owner}${fieldNote}`,
@@ -362,15 +386,11 @@ function compareMode(mode, report, caseSubset) {
 			continue;
 		}
 		lines.push(
-			`- ${up.name}: ${TRACK === "target" ? "UNATTRIBUTED" : "MISMATCH"}\n` +
+			`- ${up.name}: UNATTRIBUTED\n` +
 				`  upstream: ${JSON.stringify(diff.upstream)}\n` +
 				`  rust:     ${JSON.stringify(diff.rust)}`,
 		);
-		if (TRACK === "target") {
-			unattributed.push(`${mode}/${up.name}`);
-		} else {
-			ok = false;
-		}
+		unattributed.push(`${mode}/${up.name}`);
 	}
 	report.push(`## ${mode}\n\n${lines.join("\n")}\n`);
 }
@@ -400,20 +420,20 @@ if (RECORD_ARGS_GOLDEN) {
 mkdirSync(GENERATED, { recursive: true });
 const report = [
 	TRACK === "target"
-		? "# subagents parity report (target track: pi-subagents v0.66.0 @ 0fc0eebb)"
-		: "# subagents parity report (TE04 G3)",
+		? "# subagents parity report (target track: pi-subagents v0.70.0 @ b72714de snapshot, ADR-0029)"
+		: "# subagents parity report (regression track: pi-subagents v0.66.0 @ 0fc0eebb, submodule pin)",
 	"",
 	`generated: ${new Date().toISOString()}`,
 	"",
 ];
 for (const mode of MODES) {
-	if (mode === "args" && TRACK === "target") {
+	if (mode === "args") {
 		compareArgsTarget(report);
 	} else {
 		compareMode(mode, report);
 	}
 }
-if (TRACK === "target") {
+{
 	report.push("## Attribution summary", "");
 	for (const section of ["upstream-semantics", "rpi-deviation"]) {
 		report.push(`### ${section}`, "");
@@ -431,8 +451,6 @@ if (TRACK === "target") {
 	const attributedCount = attribution["upstream-semantics"].length + attribution["rpi-deviation"].length;
 	const result = !ok ? "UNATTRIBUTED DIFF" : attributedCount === 0 ? "MATCH" : "ATTRIBUTED-OK";
 	report.push("", `## RESULT: ${result}`);
-} else {
-	report.push("", ok ? "## RESULT: MATCH" : "## RESULT: MISMATCH");
 }
 const reportPath = `${GENERATED}/parity-report.md`;
 writeFileSync(reportPath, report.join("\n") + "\n");

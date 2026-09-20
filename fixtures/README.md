@@ -18,6 +18,18 @@ fixtures/
     └── subagents-parity-v066/  # subagents target-track parity reports (the only active track since the pin switch)
 ```
 
+> **The v0.1.5 window (TE37, 2026-09-20; ADR-0029 adopted)**: `external/pi` switched to `d1230ea`
+> (v0.86.0+2); the plugin pins stay at their v0.1.4 baselines until their atomic switch tasks —
+> `external/pi-subagents` @ `0fc0eebb` (v0.66.0) until TE39, `external/pi-mcp-adapter` @ `10a45367`
+> (v2.32.1) until TE40, `external/rpiv-mono` @ `338b264` until TE41; `external/agent-smart-fetch` @
+> `b0111612` unchanged (upstream HEAD, zero-diff re-verified). The committed goldens above remain
+> recorded against `9841914` until the v0.1.5 host re-record tasks (V15-xx) land; the pi submodule
+> at `d1230ea` is the read source for those tasks. New **target tracks** (expectation source = new
+> pins, read-only snapshots): `fixtures/generated/subagents-parity-v070/` (v0.70.0 @ `b72714de`)
+> and the mcp v2.34.0+9 snapshot via `scripts/mcp-parity/TARGET-TRACK.md` — both start as skeleton
+> (TE37); the current-pin regression tracks (`subagents-parity-v066/`, default driver = submodule)
+> stay green as the zero-regression baselines of the window.
+>
 > **Plugin rebases (effective, TE27 2026-09-11)**: `external/pi-subagents` @ `0fc0eebb` (v0.66.0),
 > `external/pi-mcp-adapter` @ `10a45367` (v2.32.1) — the pins switched atomically with TE27 (ADR-0025 adopted;
 > see rpi-docs `adr/0025-extension-upstream-rebase.md`);

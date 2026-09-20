@@ -64,6 +64,15 @@ fn cleanup(dirs: &[PathBuf]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_native_plugin_gets_its_own_module_table() {
+    // Isolate from the AMBIENT user MCP config: on a machine with configured
+    // MCP servers (e.g. a developer box running the tavily gateway) the
+    // adapter would register their direct proxy tools at load time and the
+    // `vec!["mcp"]` assertion below fails — a pre-existing isolation gap
+    // (noted at TE13 §7, resurfaced by the TE37 gate re-run). The adapter's
+    // designed test seam `MCP_DIRECT_TOOLS=__none__` suppresses direct-tool
+    // resolution; this binary runs a single test, so the process-wide env is
+    // contained (TE37 hardening).
+    std::env::set_var("MCP_DIRECT_TOOLS", "__none__");
     let plugin_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");

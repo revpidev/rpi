@@ -1,13 +1,25 @@
-// Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13).
+// Upstream leg of the subagents parity harness (TE04 G3; dual-track TE13;
+// re-rotated by TE37 for the v0.1.5 window, ADR-0029).
 //
-// Track `regression` (default): executes the pinned v0.48 modules directly
-// (tsx, no build step) from `external/pi-subagents` — the pre-TE13 behavior.
+// Track `regression` (default): the live submodule worktree — pi-subagents
+// v0.66.0 @ 0fc0eebb until TE39 switches the pin (the zero-regression
+// baseline of the window).
 //
-// Track `target` (pi-subagents v0.66.0, ADR-0025):
-//   - argv/env: the frozen v0.48 golden (upstream deleted `pi-args.ts` /
-//     `buildPiArgs` in v0.65, so this surface is [RPI-OWN], ADR-0025 §4);
-//   - frontmatter / final-output / fallback: the v0.66 snapshot extracted by
-//     `setup-target-source.sh` (never a checkout of `external/`).
+// Track `target`: the v0.70.0 snapshot extracted by `setup-target-source.sh`
+// (never a checkout of `external/`) into /tmp/rpi-subagents-parity-target-v070.
+//
+// Mode roots (TE37 skeleton facts, verified against both pins):
+//   - frontmatter / final-output / discovery / notify: the track root
+//     (all four module faces exist unchanged at v0.70).
+//   - argv/env (`args`): the frozen v0.48 golden on BOTH tracks
+//     ([RPI-OWN], ADR-0025 §4 — upstream deleted pi-args.ts in v0.65 and it
+//     stayed deleted at v0.70; there is no live upstream face to drive).
+//   - fallback / model: FROZEN on the live-submodule (v0.66) face on both
+//     tracks — upstream removed automatic model fallback entirely at v0.70
+//     (#2270 / f58dfcb5 deletes src/runs/shared/model-fallback.ts; no
+//     replacement module). TE39 must triage the removal (follow it or
+//     freeze a recorded golden) before flipping the pin; until then the
+//     v0.66 worktree at the submodule pin is the expectation source.
 //
 // Prints normalized JSON lines that the orchestrator diffs against the Rust
 // parity_runner example.
@@ -21,9 +33,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const TRACK = process.env.RPI_SUBAGENTS_PARITY_TRACK ?? "regression";
-const REGRESSION_ROOT = resolve(HERE, "../../external/pi-subagents");
+// regression = the CURRENT-pin snapshot (v0.66.0 @ 0fc0eebb until TE39; the
+// live worktree cannot serve directly — its discovery chain imports `yaml`,
+// unresolvable from a pristine external/); target = the v0.70.0 snapshot
+// (TE37, ADR-0029). Both are extracted by setup-target-source.sh.
+const REGRESSION_ROOT =
+	process.env.RPI_SUBAGENTS_REGRESSION_SRC ?? "/tmp/rpi-subagents-parity-regression-v066";
 const TARGET_ROOT =
-	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v066";
+	process.env.RPI_SUBAGENTS_TARGET_SRC ?? "/tmp/rpi-subagents-parity-target-v070";
 const ARGS_GOLDEN = resolve(HERE, "args-golden-v048.json");
 
 // Normalize an argv array the same way the Rust runner does.
@@ -77,24 +94,47 @@ function moduleUrl(root, relative) {
 }
 
 async function loadUpstream() {
-	const root = TRACK === "target" ? TARGET_ROOT : REGRESSION_ROOT;
+	const root = trackRoot();
 	const frontmatter = await import(moduleUrl(root, "src/agents/frontmatter.ts"));
 	const utils = await import(moduleUrl(root, "src/shared/utils.ts"));
-	const modelFallback =
-		TRACK === "target"
-			? await import(moduleUrl(root, "src/runs/shared/model-fallback.ts"))
-			: undefined;
-	// v0.48 only: argv/env source. Absent at v0.66 (ADR-0025 §4).
-	const piArgs =
-		TRACK === "target"
-			? undefined
-			: await import(moduleUrl(root, "src/runs/shared/pi-args.ts"));
-	return { piArgs, frontmatter, utils, modelFallback };
+	// fallback/model face: frozen on the regression (current-pin, v0.66)
+	// snapshot on both tracks — v0.70 removed automatic model fallback
+	// (#2270 / f58dfcb5 deleted src/runs/shared/model-fallback.ts). TE39
+	// triages the removal before the pin switch; this freeze is the TE37
+	// skeleton placeholder.
+	const modelFallback = await import(
+		moduleUrl(REGRESSION_ROOT, "src/runs/shared/model-fallback.ts"),
+	);
+	return { frontmatter, utils, modelFallback };
 }
 
-function buildArgsCase(piArgs, input) {
+// The track's expectation root: the current-pin regression snapshot or the
+// v0.70 target snapshot (both extracted by setup-target-source.sh).
+function trackRoot() {
+	return TRACK === "target" ? TARGET_ROOT : REGRESSION_ROOT;
+}
+
+// The v0.48 pi-args face (buildPiArgs) is gone from every reachable pin
+// (deleted upstream in v0.65). The args mode reads the frozen golden on
+// both tracks; buildArgsCase survives only for --record-args-golden runs
+// against a v0.48-era worktree, gated behind
+// RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 (it throws otherwise).
+let legacyPiArgsModule;
+function legacyPiArgs() {
+	if (!process.env.RPI_SUBAGENTS_PARITY_ARGS_LEGACY) {
+		throw new Error(
+			"pi-args.ts is deleted at every reachable pin (v0.65+); the args face "
+				+ "is the frozen golden — set RPI_SUBAGENTS_PARITY_ARGS_LEGACY=1 with a "
+				+ "v0.48-era worktree to re-record",
+		);
+	}
+	legacyPiArgsModule ??= import(moduleUrl(REGRESSION_ROOT, "src/runs/shared/pi-args.ts"));
+	return legacyPiArgsModule;
+}
+
+function buildArgsCase(input) {
 	try {
-		const result = piArgs.buildPiArgs({
+		const result = legacyPiArgs().buildPiArgs({
 			baseArgs: ["--mode", "json", "-p"],
 			task: input.task ?? "",
 			taskDelivery: input.taskDelivery === "file" ? "file" : undefined,
@@ -164,10 +204,11 @@ function fallbackCase(modelFallback, fixture) {
 	}
 }
 
-// TE17 notify leg (R7.1.7.2): drive the real v0.66 formatSingleCompletion /
-// parseSubagentNotifyContent. The parse projection mirrors the Rust leg's
+// TE17 notify leg (R7.1.7.2): drive the real track-root
+// formatSingleCompletion / parseSubagentNotifyContent (both faces exist
+// unchanged at v0.70). The parse projection mirrors the Rust leg's
 // notify_projection (undefined-dropping serializer == null-stripping).
-// TE18 (R7.1.4.4/.5, #1093): model-resolution leg — drive the real v0.66
+// TE18 (R7.1.4.4/.5, #1093): model-resolution leg — drive the frozen v0.66
 // resolveSubagentModelOverride / buildModelCandidates with the shared
 // fixture registry. Throws surface as { error } so a fail-closed throw on
 // this side diffs against a value (or error) from the Rust leg.
@@ -288,7 +329,7 @@ async function discoveryCase(fixture) {
 	process.env.PI_OFFLINE = "1";
 	delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
 	try {
-		const { discoverAgents } = await import(moduleUrl(TARGET_ROOT, "src/agents/agents.ts"));
+		const { discoverAgents } = await import(moduleUrl(trackRoot(), "src/agents/agents.ts"));
 		const result = discoverAgents(projectDir, "user");
 		const under = (filePath) => {
 			const rel = relative(userDir, filePath);
@@ -325,20 +366,20 @@ async function main() {
 		);
 		process.exit(2);
 	}
-	const { piArgs, frontmatter, utils, modelFallback } = await loadUpstream();
-	// TE17: the notify modules only exist in the v0.66 snapshot (v0.48 has
-	// no childRuns face), so the notify mode is target-track only.
+	const { frontmatter, utils, modelFallback } = await loadUpstream();
+	// TE17: the notify module exists on both pins (face unchanged at v0.70),
+	// loaded from the track root.
 	const notify = mode === "notify"
-		? await import(moduleUrl(TARGET_ROOT, "src/runs/background/notify.ts"))
+		? await import(moduleUrl(trackRoot(), "src/runs/background/notify.ts"))
 		: undefined;
 	const fixtures = JSON.parse(readFileSync(fixturePath, "utf-8"));
-	const golden = mode === "args" && TRACK === "target" ? loadArgsGolden() : null;
+	const golden = mode === "args" ? loadArgsGolden() : null;
 	for (const fixture of fixtures.cases ?? []) {
 		let output;
 		if (mode === "args") {
 			output = golden
 				? golden.get(fixture.name)
-				: buildArgsCase(piArgs, fixture.input ?? {});
+				: buildArgsCase(fixture.input ?? {});
 			if (output === undefined) {
 				throw new Error(`args golden missing case ${fixture.name}`);
 			}
