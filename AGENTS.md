@@ -25,6 +25,11 @@ Chinese is allowed **only** in these deliberate exceptions:
 - The bilingual user-facing copy of the revpi.dev website (rpi-pages
   `changelog.html` and friends), which carries parallel `l-zh`/`l-en` spans
   as a product surface for Chinese users.
+- The internal version-planning documents of the docs repository — the
+  `v0.1.x/` baselines, `plan/` task catalogs (including `plan/extensions/`),
+  `extensions/` port specs, and `adr/` records in `rpi-docs`. These stay a
+  standing Chinese surface (the planning back catalog, confirmed 2026-09-20);
+  commit messages in `rpi-docs` follow the English rule regardless.
 
 Legacy Chinese that still exists (comments inside source code, generated
 harness reports, the internal planning back catalog in the docs repository)
