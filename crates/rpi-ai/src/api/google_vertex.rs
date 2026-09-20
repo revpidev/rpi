@@ -71,13 +71,12 @@ use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::google_adc::{resolve_access_token, AdcEndpoints};
-use crate::api::google_generative_ai::{
-    is_gemini_3_flash_model, is_gemini_3_pro_model, GoogleThinking, GoogleToolChoice,
-};
+use crate::api::google_generative_ai::{GoogleThinking, GoogleToolChoice};
 use crate::api::google_shared::{
-    convert_messages, convert_tools, is_thinking_part, map_stop_reason,
-    resolve_google_function_calling_mode, resolve_google_thinking_level, retain_thought_signature,
-    retry_google_request, supports_google_strict_tool_sampling, GoogleThinkingLevel,
+    convert_messages, convert_tools, get_disabled_google_thinking_config, is_thinking_part,
+    map_stop_reason, resolve_google_function_calling_mode, resolve_google_thinking_level,
+    retain_thought_signature, retry_google_request, supports_google_strict_tool_sampling,
+    to_google_thinking_level, uses_google_thinking_level,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
@@ -214,47 +213,10 @@ pub fn base_url_includes_api_version(base_url: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Thinking configuration (vertex variant: no Gemma 4, no 2.5-flash-lite)
+// Thinking configuration (#9455: the vertex-local disabled config and the
+// per-family collapse table moved to google-shared / map metadata; only the
+// budget table remains adapter-local)
 // ---------------------------------------------------------------------------
-
-/// `getDisabledThinkingConfig` (vertex): Gemini 3 Pro cannot disable thinking
-/// and Gemini 3 Flash / Flash-Lite do not support full thinking-off either —
-/// use the lowest supported `thinkingLevel` without `includeThoughts`.
-/// Gemini 2.x disables via `thinkingBudget = 0`. Unlike the Gemini API
-/// adapter there is no Gemma 4 arm upstream.
-fn get_disabled_thinking_config(model: &Model) -> Value {
-    if is_gemini_3_pro_model(model) {
-        return json!({"thinkingLevel": GoogleThinkingLevel::Low.as_str()});
-    }
-    if is_gemini_3_flash_model(model) {
-        return json!({"thinkingLevel": GoogleThinkingLevel::Minimal.as_str()});
-    }
-    json!({"thinkingBudget": 0})
-}
-
-/// `getGemini3ThinkingLevel` (vertex): Gemini 3 Pro collapses minimal/low →
-/// LOW and medium/high → HIGH; other Gemini 3 models map 1:1. Upstream's
-/// `ClampedThinkingLevel` excludes xhigh/max via a type cast; they fall into
-/// the "high" arms here (same latent upstream edge case as D-023).
-fn get_gemini_3_thinking_level(effort: ThinkingLevel, model: &Model) -> GoogleThinkingLevel {
-    if is_gemini_3_pro_model(model) {
-        return match effort {
-            ThinkingLevel::Minimal | ThinkingLevel::Low => GoogleThinkingLevel::Low,
-            ThinkingLevel::Medium
-            | ThinkingLevel::High
-            | ThinkingLevel::Xhigh
-            | ThinkingLevel::Max => GoogleThinkingLevel::High,
-        };
-    }
-    match effort {
-        ThinkingLevel::Minimal => GoogleThinkingLevel::Minimal,
-        ThinkingLevel::Low => GoogleThinkingLevel::Low,
-        ThinkingLevel::Medium => GoogleThinkingLevel::Medium,
-        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
-            GoogleThinkingLevel::High
-        }
-    }
-}
 
 /// `getGoogleBudget` (vertex): `options.thinkingBudgets` wins per level;
 /// otherwise the model-family table — unlike the Gemini API adapter there is
@@ -354,7 +316,7 @@ fn build_params(
         } else if model.reasoning && !thinking.enabled {
             config.insert(
                 "thinkingConfig".to_owned(),
-                get_disabled_thinking_config(model),
+                get_disabled_google_thinking_config(model),
             );
         }
     }
@@ -1226,12 +1188,31 @@ pub fn stream_simple(
     };
 
     let clamped = clamp_thinking_level(model, reasoning.to_model_level());
-    // `resolveGoogleThinkingLevel(model, clampedReasoning)`
-    // (af2c35223/#8135): off → high; thinkingLevelMap entries win; xhigh/max
-    // without a mapping are an error (was: silently clamped to high).
+    // #9455 (16235fd93): a clamped "off" disables thinking outright (no
+    // resolve — `off` is no longer force-mapped to `high`).
+    if clamped == crate::types::ModelThinkingLevel::Off {
+        return Ok(stream(
+            model,
+            context,
+            GoogleVertexOptions {
+                stream: base,
+                tool_choice,
+                thinking: Some(GoogleThinking {
+                    enabled: false,
+                    budget_tokens: None,
+                    level: None,
+                }),
+                project: None,
+                location: None,
+                adc_endpoints: None,
+            },
+        ));
+    }
+    // `resolveGoogleThinkingLevel(model, clampedReasoning)` (af2c35223/#8135):
+    // thinkingLevelMap entries win; xhigh/max without a mapping are an error.
     let effort = resolve_google_thinking_level(model, clamped)?;
 
-    if is_gemini_3_pro_model(model) || is_gemini_3_flash_model(model) {
+    if uses_google_thinking_level(model) {
         return Ok(stream(
             model,
             context,
@@ -1241,7 +1222,7 @@ pub fn stream_simple(
                 thinking: Some(GoogleThinking {
                     enabled: true,
                     budget_tokens: None,
-                    level: Some(get_gemini_3_thinking_level(effort, model)),
+                    level: Some(to_google_thinking_level(effort)),
                 }),
                 project: None,
                 location: None,

@@ -1625,13 +1625,16 @@ pub struct ModelCompat {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control_format: Option<CacheControlFormat>,
     /// Whether to send session-affinity data from `options.session_id`.
+    /// Default: true for OpenRouter endpoints, false otherwise (#9102).
     /// Also in AnthropicMessagesCompat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub send_session_affinity_headers: Option<bool>,
     /// Provider-specific deferred tool serialization mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred_tools_mode: Option<DeferredToolsMode>,
-    /// Session-affinity header format. Also in OpenAIResponsesCompat.
+    /// Session-affinity header format. Also in OpenAIResponsesCompat; the
+    /// Anthropic Messages adapter consumes it too (#9102: `openrouter`
+    /// selects `x-session-id`, unset keeps `x-session-affinity`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_affinity_format: Option<SessionAffinityFormat>,
     /// Whether the provider supports long prompt cache retention. Also in

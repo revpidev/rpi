@@ -10,6 +10,7 @@ use std::sync::Arc;
 use crate::api::anthropic_messages::AnthropicMessages;
 use crate::api::openai_completions::OpenAiCompletions;
 use crate::api::openai_responses::OpenAiResponses;
+use crate::api::session_affinity::with_opencode_session_header;
 use crate::auth::{env_api_key_auth, ProviderAuth};
 use crate::generated::get_builtin_models;
 use crate::models::{
@@ -37,20 +38,21 @@ pub fn opencode_go_provider() -> Arc<dyn Provider> {
     })
 }
 
-/// Mixed-API dispatch table (opencode-go.ts:13-17).
+/// Mixed-API dispatch table (opencode-go.ts:13-17). #9326 (561a2e066):
+/// every adapter is wrapped with the `x-opencode-session` header decorator.
 fn api_map() -> HashMap<String, Arc<dyn ProviderStreams>> {
     HashMap::from([
         (
             ApiKind::ANTHROPIC_MESSAGES.to_owned(),
-            Arc::new(AnthropicMessages) as Arc<dyn ProviderStreams>,
+            with_opencode_session_header(Arc::new(AnthropicMessages) as Arc<dyn ProviderStreams>),
         ),
         (
             ApiKind::OPENAI_COMPLETIONS.to_owned(),
-            Arc::new(OpenAiCompletions) as Arc<dyn ProviderStreams>,
+            with_opencode_session_header(Arc::new(OpenAiCompletions) as Arc<dyn ProviderStreams>),
         ),
         (
             ApiKind::OPENAI_RESPONSES.to_owned(),
-            Arc::new(OpenAiResponses) as Arc<dyn ProviderStreams>,
+            with_opencode_session_header(Arc::new(OpenAiResponses) as Arc<dyn ProviderStreams>),
         ),
     ])
 }
@@ -78,5 +80,42 @@ mod tests {
                 model.api
             );
         }
+    }
+
+    /// #9326 (561a2e066): provider dispatch wraps every adapter with the
+    /// `x-opencode-session` decorator — e2e through the real api map.
+    #[tokio::test]
+    async fn api_map_dispatch_sends_opencode_session_header() {
+        let (base_url, raw_rx) = crate::api::session_affinity::tests::capture_server().await;
+        let model: crate::types::Model = serde_json::from_value(serde_json::json!({
+            "id": "glm-5.2", "name": "m", "api": "anthropic-messages",
+            "provider": "opencode-go", "baseUrl": base_url, "reasoning": false, "input": ["text"],
+            "cost": {"input": 1.0, "output": 1.0, "cacheRead": 0.1, "cacheWrite": 1.0},
+            "contextWindow": 1000, "maxTokens": 100
+        }))
+        .expect("model");
+        let streams = api_map()
+            .get(ApiKind::ANTHROPIC_MESSAGES)
+            .expect("dispatch entry")
+            .clone();
+        let mut options = crate::types::StreamOptions {
+            session_id: Some("ocgo-provider-sess".to_owned()),
+            ..Default::default()
+        };
+        options.request.api_key = Some("test-key".to_owned());
+        let stream = streams.stream(&model, &crate::types::Context::default(), Some(options));
+        let _ = stream.result().await;
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(5), raw_rx)
+            .await
+            .expect("captured")
+            .expect("server sent");
+        assert!(
+            crate::api::session_affinity::tests::captured_has_header(
+                &raw,
+                "x-opencode-session",
+                "ocgo-provider-sess"
+            ),
+            "x-opencode-session must be sent via provider dispatch; raw:\n{raw}"
+        );
     }
 }

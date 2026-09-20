@@ -29,16 +29,15 @@
 //!   `{model, contents, config}` (as upstream); the wire conversion happens
 //!   after the hook, mirroring the SDK pipeline.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::LazyLock;
-
 use serde_json::{json, Map, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::google_shared::{
-    convert_messages, convert_tools, is_thinking_part, map_stop_reason,
-    resolve_google_function_calling_mode, resolve_google_thinking_level, retain_thought_signature,
-    retry_google_request, supports_google_strict_tool_sampling, GoogleThinkingLevel,
+    convert_messages, convert_tools, get_disabled_google_thinking_config, is_thinking_part,
+    map_stop_reason, resolve_google_function_calling_mode, resolve_google_thinking_level,
+    retain_thought_signature, retry_google_request, supports_google_strict_tool_sampling,
+    to_google_thinking_level, uses_google_thinking_level, GoogleThinkingLevel,
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::sse::{ServerSentEvent, SseDecoder};
@@ -99,99 +98,11 @@ pub struct GoogleOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Model family predicates
+// Thinking configuration (#9455, 16235fd93: the per-family predicates and
+// collapse tables moved to google-shared `usesGoogleThinkingLevel` /
+// `toGoogleThinkingLevel` / `getDisabledGoogleThinkingConfig`; only the
+// budget table remains adapter-local)
 // ---------------------------------------------------------------------------
-
-static GEMMA_4_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    // invariant: literal pattern compiles
-    #[allow(clippy::expect_used)]
-    regex::Regex::new(r"gemma-?4").expect("static regex")
-});
-
-static GEMINI_3_PRO_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    // invariant: literal pattern compiles
-    #[allow(clippy::expect_used)]
-    regex::Regex::new(r"gemini-3(?:\.\d+)?-pro").expect("static regex")
-});
-
-static GEMINI_3_FLASH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    // invariant: literal pattern compiles
-    #[allow(clippy::expect_used)]
-    regex::Regex::new(r"gemini-3(?:\.\d+)?-flash").expect("static regex")
-});
-
-/// `isGemma4Model`.
-pub fn is_gemma_4_model(model: &Model) -> bool {
-    GEMMA_4_RE.is_match(&model.id.to_lowercase())
-}
-
-/// `isGemini3ProModel`.
-pub fn is_gemini_3_pro_model(model: &Model) -> bool {
-    GEMINI_3_PRO_RE.is_match(&model.id.to_lowercase())
-}
-
-/// `isGemini3FlashModel`.
-pub fn is_gemini_3_flash_model(model: &Model) -> bool {
-    let id = model.id.to_lowercase();
-    GEMINI_3_FLASH_RE.is_match(&id)
-        || id == "gemini-flash-latest"
-        || id == "gemini-flash-lite-latest"
-}
-
-// ---------------------------------------------------------------------------
-// Thinking configuration
-// ---------------------------------------------------------------------------
-
-/// `getDisabledThinkingConfig`. Gemini 3 Pro cannot disable thinking and
-/// Gemini 3 Flash / Flash-Lite do not support full thinking-off either: use
-/// the lowest supported `thinkingLevel` without `includeThoughts` so hidden
-/// thinking stays invisible. Gemini 2.x disables via `thinkingBudget = 0`.
-fn get_disabled_thinking_config(model: &Model) -> Value {
-    if is_gemini_3_pro_model(model) {
-        return json!({"thinkingLevel": GoogleThinkingLevel::Low.as_str()});
-    }
-    if is_gemini_3_flash_model(model) {
-        return json!({"thinkingLevel": GoogleThinkingLevel::Minimal.as_str()});
-    }
-    if is_gemma_4_model(model) {
-        return json!({"thinkingLevel": GoogleThinkingLevel::Minimal.as_str()});
-    }
-    json!({"thinkingBudget": 0})
-}
-
-/// `getThinkingLevel`: maps the (clamped) effort to a `GoogleThinkingLevel`.
-/// Upstream's `ClampedThinkingLevel` excludes xhigh/max via a type cast; those
-/// values can still arrive when a model's `thinkingLevelMap` enables them, so
-/// they fall into the "high" arms here (upstream's switch would return
-/// `undefined` — a latent upstream edge case).
-fn get_thinking_level(effort: ThinkingLevel, model: &Model) -> GoogleThinkingLevel {
-    if is_gemini_3_pro_model(model) {
-        return match effort {
-            ThinkingLevel::Minimal | ThinkingLevel::Low => GoogleThinkingLevel::Low,
-            ThinkingLevel::Medium
-            | ThinkingLevel::High
-            | ThinkingLevel::Xhigh
-            | ThinkingLevel::Max => GoogleThinkingLevel::High,
-        };
-    }
-    if is_gemma_4_model(model) {
-        return match effort {
-            ThinkingLevel::Minimal | ThinkingLevel::Low => GoogleThinkingLevel::Minimal,
-            ThinkingLevel::Medium
-            | ThinkingLevel::High
-            | ThinkingLevel::Xhigh
-            | ThinkingLevel::Max => GoogleThinkingLevel::High,
-        };
-    }
-    match effort {
-        ThinkingLevel::Minimal => GoogleThinkingLevel::Minimal,
-        ThinkingLevel::Low => GoogleThinkingLevel::Low,
-        ThinkingLevel::Medium => GoogleThinkingLevel::Medium,
-        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
-            GoogleThinkingLevel::High
-        }
-    }
-}
 
 /// `getGoogleBudget`: `options.thinkingBudgets` wins per level; otherwise the
 /// model-family table; -1 (dynamic) for everything else.
@@ -290,7 +201,7 @@ fn build_params(
         } else if model.reasoning && !thinking.enabled {
             config.insert(
                 "thinkingConfig".to_owned(),
-                get_disabled_thinking_config(model),
+                get_disabled_google_thinking_config(model),
             );
         }
     }
@@ -1037,12 +948,28 @@ pub fn stream_simple(
     };
 
     let clamped = clamp_thinking_level(model, reasoning.to_model_level());
-    // `resolveGoogleThinkingLevel(model, clampedReasoning)`
-    // (af2c35223/#8135): off → high; thinkingLevelMap entries win; xhigh/max
-    // without a mapping are an error (was: silently clamped to high).
+    // #9455 (16235fd93): a clamped "off" disables thinking outright (no
+    // resolve — `off` is no longer force-mapped to `high`).
+    if clamped == crate::types::ModelThinkingLevel::Off {
+        return Ok(stream(
+            model,
+            context,
+            GoogleOptions {
+                stream: base,
+                tool_choice,
+                thinking: Some(GoogleThinking {
+                    enabled: false,
+                    budget_tokens: None,
+                    level: None,
+                }),
+            },
+        ));
+    }
+    // `resolveGoogleThinkingLevel(model, clampedReasoning)` (af2c35223/#8135):
+    // thinkingLevelMap entries win; xhigh/max without a mapping are an error.
     let effort = resolve_google_thinking_level(model, clamped)?;
 
-    if is_gemini_3_pro_model(model) || is_gemini_3_flash_model(model) || is_gemma_4_model(model) {
+    if uses_google_thinking_level(model) {
         return Ok(stream(
             model,
             context,
@@ -1052,7 +979,7 @@ pub fn stream_simple(
                 thinking: Some(GoogleThinking {
                     enabled: true,
                     budget_tokens: None,
-                    level: Some(get_thinking_level(effort, model)),
+                    level: Some(to_google_thinking_level(effort)),
                 }),
             },
         ));

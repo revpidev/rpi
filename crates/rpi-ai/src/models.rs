@@ -2363,6 +2363,47 @@ mod tests {
         );
     }
 
+    /// #9485 (bb0f4aa60): provider-supplied DeepSeek V4.1 effort metadata is
+    /// preserved through relays — the map the generator bakes from
+    /// models.dev reasoning options (not the generic deepseek-v4 default)
+    /// drives the supported levels. Fixture mirrors of upstream
+    /// `supports-xhigh.test.ts` "preserves low/high/max metadata for DeepSeek
+    /// V4.1 Flash on OpenRouter / opencode-go" (the catalog data lands with
+    /// the V15-03 regen; the level-derivation behavior is adapter-side).
+    #[test]
+    fn test_get_supported_thinking_levels_deepseek_v41_flash_effort_metadata() {
+        // OpenRouter deepseek/deepseek-v4.1-flash: models.dev effort metadata
+        // (off/low/high/max) — preserved instead of the generic deepseek-v4
+        // default map (which would lose low and max).
+        let model = thinking_model(Some(json!({
+            "off": "none", "minimal": null, "low": "low",
+            "medium": null, "high": "high", "xhigh": null, "max": "max"
+        })));
+        assert_eq!(
+            get_supported_thinking_levels(&model),
+            vec![
+                ModelThinkingLevel::Off,
+                ModelThinkingLevel::Low,
+                ModelThinkingLevel::High,
+                ModelThinkingLevel::Max,
+            ]
+        );
+
+        // opencode-go deepseek-v4.1-flash: low/high/max only (no off).
+        let model = thinking_model(Some(json!({
+            "off": null, "minimal": null, "low": "low", "medium": null,
+            "high": "high", "xhigh": null, "max": "max"
+        })));
+        assert_eq!(
+            get_supported_thinking_levels(&model),
+            vec![
+                ModelThinkingLevel::Low,
+                ModelThinkingLevel::High,
+                ModelThinkingLevel::Max,
+            ]
+        );
+    }
+
     #[test]
     fn test_clamp_thinking_level_up_first_then_down() {
         // low unsupported: clamp up to medium (not down to minimal).

@@ -104,7 +104,7 @@ pub struct OpenAIResponsesOptions {
 /// `detectSessionAffinityFormat`: openrouter (provider id or base URL) vs
 /// openai.
 pub fn detect_session_affinity_format(model: &Model) -> SessionAffinityFormat {
-    if model.provider == "openrouter" || model.base_url.contains("openrouter.ai") {
+    if crate::api::session_affinity::is_openrouter(&model.provider, &model.base_url) {
         SessionAffinityFormat::Openrouter
     } else {
         SessionAffinityFormat::Openai
@@ -546,12 +546,21 @@ async fn run(
                                 Some(body),
                                 format!("Request failed with status {status}"),
                             );
+                            // #9298 (0c7bb7c5c): label OpenAI-compatible Responses
+                            // errors with the actual provider, not a constant
+                            // "OpenAI" (`${provider === "openai" ? "OpenAI" :
+                            // provider} API error`).
+                            let prefix = if model.provider == "openai" {
+                                "OpenAI".to_owned()
+                            } else {
+                                model.provider.clone()
+                            };
                             Err(ProviderErrorInfo {
                                 status: Some(status),
                                 headers: Some(response_headers),
                                 message: format_provider_error(
                                     &normalized,
-                                    Some("OpenAI API error"),
+                                    Some(&format!("{prefix} API error")),
                                 ),
                             })
                         }

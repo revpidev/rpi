@@ -481,21 +481,33 @@ pub fn build_request_body(
         )?);
     }
 
+    // #9191 (e86102f18): `off` must be sent explicitly — reasoning-capable
+    // Codex models default to their off mapping (or the literal "none") when
+    // no effort was chosen, and a `null` off mapping (reasoning cannot be
+    // disabled) omits the reasoning block instead of falling back to "none".
     if let Some(reasoning_effort) = &options.reasoning_effort {
-        let effort = if reasoning_effort == "none" {
-            // `model.thinkingLevelMap?.off ?? "none"`
-            model
-                .thinking_level_map
-                .as_ref()
-                .and_then(|map| map.get(&ModelThinkingLevel::Off))
-                .cloned()
-                .flatten()
-                .unwrap_or_else(|| "none".to_owned())
+        let off_mapping = model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get(&ModelThinkingLevel::Off));
+        if reasoning_effort == "none" {
+            // `model.thinkingLevelMap?.off === undefined ? "none" : .off`;
+            // `if (effort !== null)` skips the block when off maps to null.
+            if !matches!(off_mapping, Some(None)) {
+                let effort = off_mapping
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| "none".to_owned());
+                body["reasoning"] = json!({
+                    "effort": effort,
+                    "summary": options.reasoning_summary.as_deref().unwrap_or("auto"),
+                });
+            }
         } else {
             // `model.thinkingLevelMap?.[effort] ?? effort` (a null mapped value
             // falls back to the level name, matching JS `??`).
             let level = serde_json::from_value::<ModelThinkingLevel>(json!(reasoning_effort)).ok();
-            level
+            let effort = level
                 .and_then(|level| {
                     model
                         .thinking_level_map
@@ -504,12 +516,31 @@ pub fn build_request_body(
                         .cloned()
                         .flatten()
                 })
-                .unwrap_or_else(|| reasoning_effort.clone())
-        };
-        body["reasoning"] = json!({
-            "effort": effort,
-            "summary": options.reasoning_summary.as_deref().unwrap_or("auto"),
-        });
+                .unwrap_or_else(|| reasoning_effort.clone());
+            body["reasoning"] = json!({
+                "effort": effort,
+                "summary": options.reasoning_summary.as_deref().unwrap_or("auto"),
+            });
+        }
+    } else if model.reasoning
+        && !matches!(
+            model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ModelThinkingLevel::Off)),
+            Some(None)
+        )
+    {
+        // `else if (model.reasoning && model.thinkingLevelMap?.off !== null)`:
+        // send the off effort explicitly (no summary field on this branch).
+        let effort = model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|map| map.get(&ModelThinkingLevel::Off))
+            .cloned()
+            .flatten()
+            .unwrap_or_else(|| "none".to_owned());
+        body["reasoning"] = json!({ "effort": effort });
     }
 
     Ok(body)
@@ -2076,18 +2107,99 @@ mod tests {
             json!({"effort": "high-mapped", "summary": "auto"})
         );
 
-        // "none" resolves through thinkingLevelMap.off; a JSON null falls back
-        // to the literal "none" (JS `?? "none"`).
+        // #9191 (e86102f18): "none" resolves through thinkingLevelMap.off;
+        // an explicit null (off unsupported) now OMITS the reasoning block
+        // instead of falling back to the literal "none" (G2: old expectation
+        // `{"effort":"none","summary":"detailed"}`).
         let options = OpenAiCodexResponsesOptions {
             reasoning_effort: Some("none".to_owned()),
             reasoning_summary: Some("detailed".to_owned()),
             ..OpenAiCodexResponsesOptions::default()
         };
         let body = build_request_body(&m, &ctx, &options, None, &HashMap::new()).expect("body");
+        assert!(body.get("reasoning").is_none());
+    }
+
+    /// #9191 (e86102f18) upstream `send Codex Off reasoning effort` — the
+    /// off mapping is sent explicitly, and reasoning-capable models default
+    /// to their off effort when none was chosen.
+    #[test]
+    fn test_build_request_body_off_effort_explicit() {
+        let ctx = || common::context(vec![common::user_text("hi")], None);
+
+        // A string off mapping wins for effort "none".
+        let m = model(json!({"reasoning": true, "thinkingLevelMap": {"off": "low"}}));
+        let options = OpenAiCodexResponsesOptions {
+            reasoning_effort: Some("none".to_owned()),
+            ..OpenAiCodexResponsesOptions::default()
+        };
+        let body = build_request_body(&m, &ctx(), &options, None, &HashMap::new()).expect("body");
         assert_eq!(
             body["reasoning"],
-            json!({"effort": "none", "summary": "detailed"})
+            json!({"effort": "low", "summary": "auto"})
         );
+
+        // No effort chosen: reasoning-capable models without a map send
+        // effort "none" explicitly (no summary field on this branch).
+        let m = model(json!({"reasoning": true}));
+        let body = build_request_body(
+            &m,
+            &ctx(),
+            &OpenAiCodexResponsesOptions::default(),
+            None,
+            &HashMap::new(),
+        )
+        .expect("body");
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+
+        // A missing off key behaves like an absent map: literal "none".
+        let m = model(json!({"reasoning": true, "thinkingLevelMap": {"low": "low"}}));
+        let body = build_request_body(
+            &m,
+            &ctx(),
+            &OpenAiCodexResponsesOptions::default(),
+            None,
+            &HashMap::new(),
+        )
+        .expect("body");
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+
+        // A string off mapping is the default when no effort was chosen.
+        let m = model(json!({"reasoning": true, "thinkingLevelMap": {"off": "minimal"}}));
+        let body = build_request_body(
+            &m,
+            &ctx(),
+            &OpenAiCodexResponsesOptions::default(),
+            None,
+            &HashMap::new(),
+        )
+        .expect("body");
+        assert_eq!(body["reasoning"], json!({"effort": "minimal"}));
+
+        // A null off mapping (reasoning cannot be disabled) omits the
+        // default reasoning block as well.
+        let m = model(json!({"reasoning": true, "thinkingLevelMap": {"off": null}}));
+        let body = build_request_body(
+            &m,
+            &ctx(),
+            &OpenAiCodexResponsesOptions::default(),
+            None,
+            &HashMap::new(),
+        )
+        .expect("body");
+        assert!(body.get("reasoning").is_none());
+
+        // Non-reasoning models never send a default effort.
+        let m = model(json!({"reasoning": false}));
+        let body = build_request_body(
+            &m,
+            &ctx(),
+            &OpenAiCodexResponsesOptions::default(),
+            None,
+            &HashMap::new(),
+        )
+        .expect("body");
+        assert!(body.get("reasoning").is_none());
     }
 
     /// e47b8e37a @ 4181f66 (#7709), upstream deferred-tools.test.ts "selects

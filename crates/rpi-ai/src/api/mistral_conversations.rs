@@ -643,11 +643,14 @@ fn build_tool_result_text(
 // ---------------------------------------------------------------------------
 
 /// `usesReasoningEffort`: models that take `reasoningEffort` instead of
-/// `promptMode`.
+/// `promptMode`. #8700 (96617628e): all reasoning-capable `mistral-medium-*`
+/// models; #9375 (4bd3f48df): Mistral-hosted GLM-5.2 (`zai-glm-5-2` — the
+/// ignored `prompt_mode` parameter is replaced by `reasoning_effort`).
 fn uses_reasoning_effort(model: &Model) -> bool {
     model.id == "mistral-small-2603"
         || model.id == "mistral-small-latest"
-        || model.id == "mistral-medium-3.5"
+        || model.id.starts_with("mistral-medium-")
+        || model.id == "zai-glm-5-2"
 }
 
 /// `usesPromptModeReasoning`.
@@ -2135,20 +2138,27 @@ mod tests {
 
     #[test]
     fn test_reasoning_mode_selection() {
-        // Mistral Small 4 / Medium 3.5: reasoning_effort.
+        // Mistral Small 4 / Medium family: reasoning_effort (#8700: the
+        // whole mistral-medium-* family, not just 3.5).
         for id in [
             "mistral-small-2603",
             "mistral-small-latest",
             "mistral-medium-3.5",
+            "mistral-medium-2506",
+            "mistral-medium-latest",
         ] {
             let model = reasoning_model(id);
-            assert!(uses_reasoning_effort(&model));
-            assert!(!uses_prompt_mode_reasoning(&model));
+            assert!(uses_reasoning_effort(&model), "{id}");
+            assert!(!uses_prompt_mode_reasoning(&model), "{id}");
         }
         // Magistral: prompt_mode.
         let model = reasoning_model("magistral-medium-latest");
         assert!(!uses_reasoning_effort(&model));
         assert!(uses_prompt_mode_reasoning(&model));
+        // #9375 (4bd3f48df): Mistral-hosted GLM-5.2 uses reasoning_effort.
+        let model = reasoning_model("zai-glm-5-2");
+        assert!(uses_reasoning_effort(&model));
+        assert!(!uses_prompt_mode_reasoning(&model));
         // Non-reasoning model: neither.
         let model = make_model(json!({}));
         assert!(!uses_prompt_mode_reasoning(&model));

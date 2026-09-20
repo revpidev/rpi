@@ -414,6 +414,63 @@ fn test_correction_copilot_grok45_responses() {
     assert_eq!(model.api.as_str(), "openai-responses");
 }
 
+/// 2c. #9423 (12f59336a, FR-D R2): the retired deepseek-v4-flash / vision
+/// aliases are gone, the canonical `deepseek-flash` (V4.1 Flash) is
+/// published with refreshed pricing. (Catalog data was refreshed with the
+/// 2026-09-14 D-101 snapshot which already includes this fix; the assertion
+/// pins the shipped state.)
+#[test]
+fn test_correction_deepseek_flash_catalog() {
+    let ids: Vec<&str> = get_builtin_models("deepseek")
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect();
+    assert!(ids.contains(&"deepseek-flash"), "ids: {ids:?}");
+    assert!(
+        !ids.contains(&"deepseek-v4-flash"),
+        "retired alias present: {ids:?}"
+    );
+    assert!(
+        !ids.contains(&"deepseek-v4-flash-vision-exp"),
+        "retired alias present: {ids:?}"
+    );
+    let model = get_model("deepseek", "deepseek-flash");
+    let cost = &model.cost.rates;
+    assert_eq!(cost.input, 0.3);
+    assert_eq!(cost.output, 1.2);
+}
+
+/// 2b. All Copilot GPT models route through the Responses API (#9253,
+/// 7d8ab31a4 — upstream `model-catalog-types.test.ts` "routes all GitHub
+/// Copilot GPT models through the Responses API"; generator rule
+/// `needsResponsesApi = gpt- | grok- | oswe | mai-`, incl. GPT-6 Astra).
+#[test]
+fn test_correction_copilot_gpt_models_responses() {
+    let gpt_models: Vec<rpi_ai::types::Model> =
+        rpi_ai::generated::get_builtin_models("github-copilot")
+            .iter()
+            .filter(|model| model.id.starts_with("gpt-"))
+            .cloned()
+            .collect();
+    assert!(
+        !gpt_models.is_empty(),
+        "catalog must contain Copilot GPT models"
+    );
+    for model in &gpt_models {
+        assert_eq!(
+            model.api.as_str(),
+            "openai-responses",
+            "Copilot model {} must route via Responses",
+            model.id
+        );
+    }
+    // GPT-6 Astra is the #9253 regression model (upstream #9209).
+    assert_eq!(
+        get_model("github-copilot", "gpt-6-astra").api.as_str(),
+        "openai-responses"
+    );
+}
+
 /// 3. Fireworks Kimi K3: openai-completions + reasoning-effort + deferred
 ///    tools (a688e257c, #7199).
 #[test]

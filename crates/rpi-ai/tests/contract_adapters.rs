@@ -382,6 +382,89 @@ fn simple_options(tool_choice: SimpleToolChoice) -> SimpleStreamOptions {
     }
 }
 
+/// #9102 (bbb61e34a, FR-C R1): OpenRouter anthropic-compatible models send
+/// `x-session-id` (not `x-session-affinity`) on the wire by default, and
+/// `cacheRetention: "none"` suppresses the header entirely (upstream
+/// `fireworks-models.test.ts` regression ports).
+#[tokio::test]
+async fn test_anthropic_openrouter_session_affinity_headers() {
+    let openrouter = |base_url: &str| {
+        model(
+            ApiKind::ANTHROPIC_MESSAGES,
+            "openrouter",
+            base_url,
+            json!({"id": "anthropic/claude-opus-4.8", "baseUrl": format!("{base_url}/api")}),
+        )
+    };
+
+    // Default retention: x-session-id only.
+    let (base_url, mut captured) = serve(vec![(200, ANTHROPIC_SSE)]).await;
+    let mut stream_options = options();
+    stream_options.session_id = Some("openrouter-session-1".to_owned());
+    let events = collect(AnthropicMessages.stream(
+        &openrouter(&base_url),
+        &context(vec![user_text("hi")]),
+        Some(stream_options),
+    ))
+    .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.header("x-session-id"), Some("openrouter-session-1"));
+    assert_eq!(request.header("x-session-affinity"), None);
+
+    // cacheRetention none: no affinity header at all.
+    let (base_url, mut captured) = serve(vec![(200, ANTHROPIC_SSE)]).await;
+    let mut stream_options = options();
+    stream_options.session_id = Some("openrouter-session-2".to_owned());
+    stream_options.cache_retention = Some(rpi_ai::types::CacheRetention::None);
+    let _ = collect(AnthropicMessages.stream(
+        &openrouter(&base_url),
+        &context(vec![user_text("hi")]),
+        Some(stream_options),
+    ))
+    .await;
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(request.header("x-session-id"), None);
+    assert_eq!(request.header("x-session-affinity"), None);
+}
+
+/// #9629 (6671c6047, FR-C R3): Baseten-style session affinity (catalog
+/// `sendSessionAffinityHeaders: true`, OpenAI format) routes requests to the
+/// same replica — asserted at the wire with an explicit compat overlay (the
+/// vendored catalog data lands with the V15-03 regen; adapter behavior is
+/// upstream-test-equivalent).
+#[tokio::test]
+async fn test_openai_completions_baseten_session_affinity_headers() {
+    let (base_url, mut captured) = serve(vec![(200, COMPLETIONS_SSE)]).await;
+    let m = model(
+        ApiKind::OPENAI_COMPLETIONS,
+        "baseten",
+        &base_url,
+        json!({
+            "id": "zai-org/GLM-5.2",
+            "baseUrl": format!("{base_url}/v1"),
+            "compat": {"sendSessionAffinityHeaders": true}
+        }),
+    );
+    let mut stream_options = options();
+    stream_options.session_id = Some("baseten-catalog-session".to_owned());
+    let _ = collect(OpenAiCompletions.stream(
+        &m,
+        &context(vec![user_text("hi")]),
+        Some(stream_options),
+    ))
+    .await;
+    let request = captured.recv().await.expect("request captured");
+    assert_eq!(
+        request.header("x-session-affinity"),
+        Some("baseten-catalog-session")
+    );
+    assert_eq!(
+        request.header("x-client-request-id"),
+        Some("baseten-catalog-session")
+    );
+}
+
 /// anthropic-messages.ts:858 — the simple choice forwards on every branch
 /// (previously dropped in rpi; enum-mapped onto the object wire form).
 #[tokio::test]
@@ -500,6 +583,46 @@ async fn test_responses_interleaved_content_index() {
     };
     assert_eq!(call.id, "call_1|fc_1");
     assert_eq!(call.arguments["cmd"], json!("ls"));
+}
+
+/// #9298 (0c7bb7c5c, FR-H R1): OpenAI-compatible Responses errors carry the
+/// actual provider name, not a constant "OpenAI" prefix.
+#[tokio::test]
+async fn test_responses_error_names_the_actual_provider() {
+    for provider in ["github-copilot", "openrouter"] {
+        let (base_url, _captured) =
+            serve(vec![(400, "{\"error\":{\"message\":\"bad request\"}}")]).await;
+        let m = model(ApiKind::OPENAI_RESPONSES, provider, &base_url, json!({}));
+        let events =
+            collect(OpenAiResponses.stream(&m, &context(vec![user_text("hi")]), Some(options())))
+                .await;
+        let StreamEvent::Error { error, .. } = events.last().expect("error") else {
+            panic!("expected error event for {provider}");
+        };
+        assert_eq!(
+            error.error_message.as_deref(),
+            Some(
+                format!(
+                    "{provider} API error (400): {{\"error\":{{\"message\":\"bad request\"}}}}"
+                )
+                .as_str()
+            ),
+            "{provider}"
+        );
+    }
+    // First-party OpenAI keeps the human-readable "OpenAI" name.
+    let (base_url, _captured) =
+        serve(vec![(400, "{\"error\":{\"message\":\"bad request\"}}")]).await;
+    let m = model(ApiKind::OPENAI_RESPONSES, "openai", &base_url, json!({}));
+    let events =
+        collect(OpenAiResponses.stream(&m, &context(vec![user_text("hi")]), Some(options()))).await;
+    let StreamEvent::Error { error, .. } = events.last().expect("error") else {
+        panic!("expected error event");
+    };
+    assert_eq!(
+        error.error_message.as_deref(),
+        Some("OpenAI API error (400): {\"error\":{\"message\":\"bad request\"}}")
+    );
 }
 
 #[tokio::test]

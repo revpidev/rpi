@@ -1,7 +1,8 @@
 //! Port of `packages/ai/src/utils/overflow.ts` @ pi 0.84.1+ (4181f66).
 //!
 //! Three-branch context-overflow detection: error-text pattern table (with a
-//! non-overflow exclusion table), z.ai silent overflow, Xiaomi truncation;
+//! non-overflow exclusion table), z.ai explicit/silent overflow, Xiaomi
+//! truncation;
 //! plus `isRecoverableLength` (32850ef7c).
 
 use std::sync::LazyLock;
@@ -17,11 +18,15 @@ fn build_pattern(pattern: &str) -> Regex {
 }
 
 /// `OVERFLOW_PATTERNS` — order preserved from upstream (comments there name
-/// the provider each pattern belongs to).
+/// the provider each pattern belongs to; the first pattern covers Anthropic
+/// and z.ai per #9805).
 fn overflow_patterns() -> &'static [Regex] {
     static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         [
-            r"(?i)prompt is too long",
+            // #9805 (0e283203c): generalized to cover z.ai's explicit
+            // `Prompt too long` (code 1261) alongside Anthropic's
+            // `prompt is too long`.
+            r"(?i)prompt (?:is )?too long",
             r"(?i)request_too_large",
             r"(?i)input is too long for requested model",
             r"(?i)exceeds the context window",
@@ -181,6 +186,10 @@ mod tests {
     fn test_overflow_pattern_hits() {
         let cases = [
             "prompt is too long: 213462 tokens > 200000 maximum",
+            // #9805 (0e283203c): z.ai's explicit form (`{"code":"1261",
+            // "message":"Prompt too long"}`) — upstream overflow.test.ts
+            // "detects z.ai prompt-too-long errors".
+            "400 {\"code\":\"1261\",\"message\":\"Prompt too long\"}",
             "413 {\"error\":{\"type\":\"request_too_large\",\"message\":\"Request exceeds the maximum size\"}}",
             "Your input exceeds the context window of this model",
             "Requested token count exceeds the model's maximum context length of 131072 tokens",

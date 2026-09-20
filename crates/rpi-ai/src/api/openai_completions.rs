@@ -230,17 +230,20 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
     let is_moonshot = provider == "moonshotai"
         || provider == "moonshotai-cn"
         || base_url.contains("api.moonshot.");
-    let is_openrouter = provider == "openrouter" || base_url.contains("openrouter.ai");
+    let is_openrouter = crate::api::session_affinity::is_openrouter(provider, base_url);
     let is_cloudflare_workers_ai =
         provider == "cloudflare-workers-ai" || base_url.contains("api.cloudflare.com");
     let is_cloudflare_ai_gateway =
         provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
     let is_nvidia = provider == "nvidia" || base_url.contains("integrate.api.nvidia.com");
     let is_ant_ling = provider == "ant-ling" || base_url.contains("api.ant-ling.com");
+    // #9804 (af7359b90): Cerebras rejects mixed strict/non-strict tools with
+    // a 400, so it never declares strict support (shared by the non-standard
+    // gate and `supports_strict_mode` below).
+    let is_cerebras = provider == "cerebras" || base_url.contains("cerebras.ai");
 
     let is_non_standard = is_nvidia
-        || provider == "cerebras"
-        || base_url.contains("cerebras.ai")
+        || is_cerebras
         || provider == "xai"
         || base_url.contains("api.x.ai")
         || is_together
@@ -321,13 +324,18 @@ pub fn detect_compat(model: &Model) -> ResolvedOpenAICompletionsCompat {
         supports_thinking_token_budget: false,
         thinking_token_budget_field: None,
         vllm_priority: None,
+        // #9804 (af7359b90): mixed strict/unstrict tool usage 400s on
+        // Cerebras — never declare strict support.
         supports_strict_mode: !is_moonshot
             && !is_together
             && !is_cloudflare_ai_gateway
-            && !is_nvidia,
+            && !is_nvidia
+            && !is_cerebras,
         supports_open_ai_grammar_tools: false,
         cache_control_format,
-        send_session_affinity_headers: false,
+        // #9102 (bbb61e34a): OpenRouter endpoints derive session affinity
+        // headers by default (`x-session-id`, see [`session_affinity`]).
+        send_session_affinity_headers: is_openrouter,
         deferred_tools_mode: None,
         session_affinity_format: if is_openrouter {
             SessionAffinityFormat::Openrouter
@@ -3871,6 +3879,44 @@ mod build_and_stream_tests {
     }
 
     // -- chat template kwargs ------------------------------------------------------
+
+    /// #9804 (af7359b90, FR-J): mixed strict/non-strict tool usage 400s on
+    /// Cerebras — the runtime detection never declares strict support, so
+    /// `strict` is omitted from every tool (upstream
+    /// `cache-retention.test.ts` "should omit strict field on tools for
+    /// cerebras/$id").
+    #[test]
+    fn test_convert_tools_cerebras_omits_strict_field() {
+        for model in [
+            make_model(json!({"provider": "cerebras", "id": "gpt-oss-120b"})),
+            make_model(
+                json!({"provider": "custom", "baseUrl": "https://api.cerebras.ai/v1", "id": "qwen-3.8-27b"}),
+            ),
+        ] {
+            let compat = get_compat(&model);
+            assert!(!compat.supports_strict_mode, "{}", model.id);
+
+            // Mixed constrained-sampling (strict) and plain tools: neither
+            // may carry `strict`.
+            let strict_tool: Tool = serde_json::from_value(json!({
+                "name": "t1", "description": "strict tool",
+                "parameters": {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+                "constrainedSampling": {"type": "json_schema", "strict": "prefer"}
+            }))
+            .expect("tool");
+            let plain_tool = tool("t2");
+            let converted = convert_tools(&[strict_tool, plain_tool], &compat).expect("tools");
+            assert_eq!(converted.len(), 2);
+            for converted_tool in &converted {
+                assert!(
+                    converted_tool["function"].get("strict").is_none(),
+                    "{}: strict must be omitted for {}",
+                    model.id,
+                    converted_tool["function"]["name"]
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_resolve_chat_template_kwarg_value() {

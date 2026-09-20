@@ -804,9 +804,15 @@ async fn test_custom_thinking_budgets_win() {
     .await;
 }
 
+/// #9455 (16235fd93): native levels are preserved — the per-family
+/// collapse tables (gemini-3-pro medium→HIGH, gemma-4 low→MINIMAL) are gone;
+/// each model's `thinkingLevelMap` carries family capability. G2: old
+/// expectations `{medium → HIGH}` / `{low → MINIMAL}` were the pre-#9455
+/// collapse behavior.
 #[tokio::test]
 async fn test_thinking_level_split_gemini_3_and_gemma_4() {
-    // Gemini 3 Pro: minimal/low → LOW, medium/high → HIGH.
+    // Gemini 3 Pro: native levels (upstream "preserves native medium effort
+    // for Gemini 3.1 Pro").
     assert_thinking_config(
         "gemini-3-pro-preview",
         Some(ThinkingLevel::Low),
@@ -818,7 +824,7 @@ async fn test_thinking_level_split_gemini_3_and_gemma_4() {
         "gemini-3.1-pro-preview",
         Some(ThinkingLevel::Medium),
         None,
-        json!({"includeThoughts": true, "thinkingLevel": "HIGH"}),
+        json!({"includeThoughts": true, "thinkingLevel": "MEDIUM"}),
     )
     .await;
     // Gemini 3 Flash: full level range.
@@ -836,12 +842,12 @@ async fn test_thinking_level_split_gemini_3_and_gemma_4() {
         json!({"includeThoughts": true, "thinkingLevel": "MEDIUM"}),
     )
     .await;
-    // Gemma 4: minimal/low → MINIMAL, medium/high → HIGH.
+    // Gemma 4: native levels too (low → LOW, medium → MEDIUM).
     assert_thinking_config(
         "gemma-4-27b-it",
         Some(ThinkingLevel::Low),
         None,
-        json!({"includeThoughts": true, "thinkingLevel": "MINIMAL"}),
+        json!({"includeThoughts": true, "thinkingLevel": "LOW"}),
     )
     .await;
     assert_thinking_config(
@@ -853,40 +859,52 @@ async fn test_thinking_level_split_gemini_3_and_gemma_4() {
     .await;
 }
 
+/// #9455 (16235fd93): disabling uses each model's own supported levels —
+/// mapless models (off available) fully disable via `thinkingBudget: 0`;
+/// level-controlled models whose map excludes off fall back to their lowest
+/// supported discrete level. G2: old expectations pinned family-hardcoded
+/// LOW/MINIMAL for every level-controlled model regardless of map.
 #[tokio::test]
 async fn test_thinking_disable_configs() {
     // Gemini 2.x disables via thinkingBudget = 0.
     assert_thinking_config("gemini-2.5-flash", None, None, json!({"thinkingBudget": 0})).await;
-    // Gemini 3 / Gemma 4 cannot disable thinking: lowest level, no
-    // includeThoughts.
+    // Mapless Gemini 3 / Gemma 4 (off available): budget-based disable too.
     assert_thinking_config(
         "gemini-3-pro-preview",
         None,
         None,
-        json!({"thinkingLevel": "LOW"}),
+        json!({"thinkingBudget": 0}),
     )
     .await;
-    assert_thinking_config(
-        "gemini-3-flash-preview",
-        None,
-        None,
-        json!({"thinkingLevel": "MINIMAL"}),
+    assert_thinking_config("gemma-4-27b-it", None, None, json!({"thinkingBudget": 0})).await;
+    // Upstream #9455 regression "uses the lowest supported level when
+    // reasoning is omitted": gemini-3.8-flash without off falls back to LOW
+    // (no includeThoughts — hidden thinking stays invisible).
+    let (base_url, mut captured) = serve(vec![(200, GOOGLE_TEXT_SSE)]).await;
+    let m = model_with_id(
+        "gemini-3.8-flash",
+        &base_url,
+        json!({"thinkingLevelMap": {
+            "off": null, "minimal": null, "low": "low", "medium": "medium",
+            "high": "high", "xhigh": null, "max": null
+        }}),
+    );
+    let events = collect(
+        stream_simple(
+            &m,
+            &context(vec![user_text("hi")]),
+            Some(simple_options(None, None)),
+        )
+        .expect("stream_simple"),
     )
     .await;
-    assert_thinking_config(
-        "gemini-flash-lite-latest",
-        None,
-        None,
-        json!({"thinkingLevel": "MINIMAL"}),
-    )
-    .await;
-    assert_thinking_config(
-        "gemma-4-27b-it",
-        None,
-        None,
-        json!({"thinkingLevel": "MINIMAL"}),
-    )
-    .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let request = captured.recv().await.expect("request captured");
+    let body = request.body_json();
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"],
+        json!({"thinkingLevel": "LOW"})
+    );
 }
 
 // ---------------------------------------------------------------------------

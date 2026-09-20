@@ -711,6 +711,64 @@ async fn test_thinking_level_models_use_thinking_level_config() {
     );
 }
 
+/// #9455 (16235fd93) vertex counterpart of the upstream regression matrix
+/// (google-thinking-level-map.test.ts `googleAdapters` it.each): omitted
+/// reasoning disables thinking through each model's own supported levels.
+#[tokio::test]
+async fn test_thinking_disable_uses_supported_levels() {
+    // gemini-3.8-flash without off: lowest supported discrete level, no
+    // includeThoughts.
+    let (base_url, mut rx) = serve(vec![sse(VERTEX_TEXT_SSE)]).await;
+    let model = model_with_id(
+        "gemini-3.8-flash",
+        &base_url,
+        json!({"thinkingLevelMap": {
+            "off": null, "minimal": null, "low": "low", "medium": "medium",
+            "high": "high", "xhigh": null, "max": null
+        }}),
+    );
+    let options = SimpleStreamOptions {
+        stream: api_key_options(),
+        reasoning: None,
+        thinking_budgets: None,
+        tool_choice: None,
+    };
+    let events = collect(
+        GoogleVertex
+            .stream_simple(&model, &context(vec![user_text("hi")]), Some(options))
+            .expect("stream_simple"),
+    )
+    .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let request = rx.recv().await.expect("captured request");
+    assert_eq!(
+        request.body_json()["generationConfig"]["thinkingConfig"],
+        json!({"thinkingLevel": "LOW"})
+    );
+
+    // gemini-2.5-flash (budget family): full disable via thinkingBudget = 0.
+    let (base_url, mut rx) = serve(vec![sse(VERTEX_TEXT_SSE)]).await;
+    let model = model_with_id("gemini-2.5-flash", &base_url, json!({}));
+    let options = SimpleStreamOptions {
+        stream: api_key_options(),
+        reasoning: None,
+        thinking_budgets: None,
+        tool_choice: None,
+    };
+    let events = collect(
+        GoogleVertex
+            .stream_simple(&model, &context(vec![user_text("hi")]), Some(options))
+            .expect("stream_simple"),
+    )
+    .await;
+    assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    let request = rx.recv().await.expect("captured request");
+    assert_eq!(
+        request.body_json()["generationConfig"]["thinkingConfig"],
+        json!({"thinkingBudget": 0})
+    );
+}
+
 #[tokio::test]
 async fn test_tool_call_flow() {
     let (base_url, mut rx) = serve(vec![sse(VERTEX_TOOL_CALL_SSE)]).await;

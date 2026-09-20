@@ -45,8 +45,9 @@ use crate::models::ProviderStreams;
 use crate::types::{
     AnthropicAllowedFallbackModel, AssistantContent, AssistantMessage, CacheRetention, Context,
     DoneReason, ErrorReason, Message, Model, ModelThinkingLevel, ProviderEnv, ProviderHeaders,
-    ProviderResponse, SimpleStreamOptions, StopReason, StreamEvent, StreamOptions, ThinkingLevel,
-    Tool, ToolResultContent, ToolResultMessage, Usage, UserContent, UserContentBlock,
+    ProviderResponse, SessionAffinityFormat, SimpleStreamOptions, StopReason, StreamEvent,
+    StreamOptions, ThinkingLevel, Tool, ToolResultContent, ToolResultMessage, Usage, UserContent,
+    UserContentBlock,
 };
 use crate::utils::cost::calculate_cost;
 use crate::utils::custom_fetch::send_provider_request;
@@ -315,12 +316,15 @@ pub struct AnthropicOptions {
 // Compat
 // ---------------------------------------------------------------------------
 
-/// `Required<Omit<AnthropicMessagesCompat, "forceAdaptiveThinking">>`.
+/// `Required<Omit<AnthropicMessagesCompat, "forceAdaptiveThinking">>` —
+/// `sessionAffinityFormat` stays optional (unset means the default
+/// `x-session-affinity` header; #9102).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedAnthropicCompat {
     pub supports_eager_tool_input_streaming: bool,
     pub supports_long_cache_retention: bool,
     pub send_session_affinity_headers: bool,
+    pub session_affinity_format: Option<SessionAffinityFormat>,
     pub supports_cache_control_on_tools: bool,
     pub supports_temperature: bool,
     pub allow_empty_signature: bool,
@@ -328,9 +332,12 @@ pub struct ResolvedAnthropicCompat {
     pub supports_tool_references: bool,
 }
 
-/// `getAnthropicCompat`.
+/// `getAnthropicCompat` (#9102, bbb61e34a: OpenRouter endpoints derive
+/// session affinity headers by default, with the OpenRouter header format).
 pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
     let compat = model.compat.as_ref();
+    let is_openrouter =
+        crate::api::session_affinity::is_openrouter(&model.provider, &model.base_url);
     ResolvedAnthropicCompat {
         supports_eager_tool_input_streaming: compat
             .and_then(|c| c.supports_eager_tool_input_streaming)
@@ -340,7 +347,10 @@ pub fn get_anthropic_compat(model: &Model) -> ResolvedAnthropicCompat {
             .unwrap_or(true),
         send_session_affinity_headers: compat
             .and_then(|c| c.send_session_affinity_headers)
-            .unwrap_or(false),
+            .unwrap_or(is_openrouter),
+        session_affinity_format: compat
+            .and_then(|c| c.session_affinity_format)
+            .or_else(|| is_openrouter.then_some(SessionAffinityFormat::Openrouter)),
         supports_cache_control_on_tools: compat
             .and_then(|c| c.supports_cache_control_on_tools)
             .unwrap_or(true),
@@ -559,9 +569,11 @@ fn build_request_headers(
     if let Some(api_key) = api_key {
         base.insert("x-api-key".to_owned(), Some(api_key.to_owned()));
     }
-    let session_affinity_headers: Option<ProviderHeaders> = session_id
-        .filter(|_| compat.send_session_affinity_headers)
-        .map(|session_id| [("x-session-affinity".to_owned(), Some(session_id.to_owned()))].into());
+    let session_affinity_headers = crate::api::session_affinity::anthropic_session_affinity_headers(
+        compat.send_session_affinity_headers,
+        compat.session_affinity_format,
+        session_id,
+    );
     let headers = merge_headers_chain(&[
         rpi_user_agent_headers(),
         Some(base),
@@ -2496,6 +2508,89 @@ pub(crate) mod tests {
         );
     }
 
+    /// #9102 (bbb61e34a, FR-C R1): OpenRouter anthropic-compatible models
+    /// derive session affinity headers by default and select the
+    /// `x-session-id` format — port of upstream `fireworks-models.test.ts`
+    /// "sends only x-session-id for OpenRouter models" /
+    /// "omits OpenRouter session headers when cacheRetention is none" /
+    /// "allows OpenRouter session headers to be disabled" (header-level
+    /// assertions; the cacheRetention gate itself lives in `stream`, covered
+    /// by `test_stream_cache_session_id_none` semantics below).
+    #[test]
+    fn test_build_request_headers_openrouter_session_affinity() {
+        let openrouter = make_model(json!({
+            "id": "anthropic/claude-opus-4.8",
+            "provider": "openrouter",
+            "baseUrl": "https://openrouter.ai/api"
+        }));
+
+        // Default: on, x-session-id only.
+        let compat = get_anthropic_compat(&openrouter);
+        assert!(compat.send_session_affinity_headers);
+        assert_eq!(
+            compat.session_affinity_format,
+            Some(SessionAffinityFormat::Openrouter)
+        );
+        let (headers, _) = build_request_headers(
+            &openrouter,
+            &Context::default(),
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            Some("openrouter-session-1"),
+        );
+        assert_eq!(
+            headers.get("x-session-id").and_then(|v| v.as_deref()),
+            Some("openrouter-session-1")
+        );
+        assert!(!headers.contains_key("x-session-affinity"));
+
+        // Explicit opt-out: `compat.sendSessionAffinityHeaders: false`.
+        let disabled = make_model(json!({
+            "id": "anthropic/claude-opus-4.8",
+            "provider": "openrouter",
+            "baseUrl": "https://openrouter.ai/api",
+            "compat": {"sendSessionAffinityHeaders": false}
+        }));
+        let compat = get_anthropic_compat(&disabled);
+        assert!(!compat.send_session_affinity_headers);
+        let (headers, _) = build_request_headers(
+            &disabled,
+            &Context::default(),
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            Some("openrouter-session-3"),
+        );
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
+
+        // Non-OpenRouter anthropic models stay off by default (Fireworks
+        // catalog entries opt in explicitly with the unset format →
+        // x-session-affinity).
+        let fireworks = make_model(json!({
+            "id": "accounts/fireworks/models/deepseek-v4-flash-0731",
+            "provider": "fireworks",
+            "baseUrl": "https://api.fireworks.ai",
+            "compat": {"sendSessionAffinityHeaders": true}
+        }));
+        let compat = get_anthropic_compat(&fireworks);
+        assert!(compat.send_session_affinity_headers);
+        assert_eq!(compat.session_affinity_format, None);
+        let (headers, _) = build_request_headers(
+            &fireworks,
+            &Context::default(),
+            Some("sk-key"),
+            &AnthropicOptions::default(),
+            None,
+            Some("fireworks-session"),
+        );
+        assert_eq!(
+            headers.get("x-session-affinity").and_then(|v| v.as_deref()),
+            Some("fireworks-session")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Message conversion
     // -----------------------------------------------------------------------
@@ -4244,5 +4339,272 @@ mod header_semantics_tests {
         assert_eq!(headers.get("x-api-key"), Some(&None));
         let map = provider_headers_to_header_map(&headers).expect("header map");
         assert!(map.get("x-api-key").is_none());
+    }
+}
+
+#[cfg(test)]
+mod fireworks_deferred_tools_tests {
+    //! Port of `packages/ai/test/fireworks-deferred-tools.test.ts` @ 19451accd
+    //! (d92eb8d4b + 6b94ae2ec, #9323) — discovery/replay serialization for
+    //! Fireworks Messages models, asserted via the on_payload capture seam
+    //! (upstream captures the SDK payload; rpi captures at the same point and
+    //! lets the unreachable `http://127.0.0.1:9` endpoint fail the request).
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::tests::{assistant_message, context, user_text};
+    use super::*;
+    use crate::types::{AssistantContent, ToolResultContent};
+    fn fireworks_catalog_model() -> Model {
+        // The vendored catalog entry carries supportsToolReferences +
+        // allowEmptySignature + forceAdaptiveThinking (generator @ 2026-09-14
+        // snapshot ≥ #9323); only the endpoint is overridden for capture.
+        let mut model = crate::generated::get_builtin_model(
+            "fireworks",
+            "accounts/fireworks/models/deepseek-v4-flash-0731",
+        )
+        .expect("catalog model")
+        .clone();
+        model.base_url = "http://127.0.0.1:9".to_owned();
+        model
+    }
+
+    fn lookup_tool() -> Tool {
+        serde_json::from_value(json!({
+            "name": "lookup", "description": "Look up a synthetic key",
+            "parameters": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]}
+        }))
+        .expect("tool")
+    }
+
+    fn discovery_context(loader_name: &str) -> Context {
+        let model = fireworks_catalog_model();
+        let assistant = assistant_message(
+            vec![
+                AssistantContent::Thinking(crate::types::ThinkingContent {
+                    thinking: "Find a lookup tool.".to_owned(),
+                    thinking_signature: Some("".to_owned()),
+                    redacted: None,
+                }),
+                AssistantContent::ToolCall(crate::types::ToolCall {
+                    id: "search1".to_owned(),
+                    name: loader_name.to_owned(),
+                    arguments: json!({"query": "lookup"})
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default(),
+                    thought_signature: None,
+                    namespace: None,
+                }),
+            ],
+            &model.provider,
+            &model.id,
+        );
+        let mut assistant = match assistant {
+            Message::Assistant(mut message) => {
+                message.stop_reason = StopReason::ToolUse;
+                message
+            }
+            _ => unreachable!("assistant"),
+        };
+        assistant.stop_reason = StopReason::ToolUse;
+        let _ = &mut assistant;
+        let tool_result = Message::ToolResult(crate::types::ToolResultMessage {
+            role: crate::types::ToolResultRole::ToolResult,
+            tool_call_id: "search1".to_owned(),
+            tool_name: loader_name.to_owned(),
+            content: vec![ToolResultContent::Text(crate::types::TextContent {
+                text: "Found lookup.".to_owned(),
+                text_signature: None,
+            })],
+            added_tool_names: Some(vec!["lookup".to_owned()]),
+            details: None,
+            usage: None,
+            is_error: false,
+            timestamp: 0,
+        });
+        context(
+            vec![user_text("Look up alpha."), Message::Assistant(assistant), tool_result],
+            Some(vec![
+                serde_json::from_value(json!({
+                    "name": loader_name, "description": "Find tools",
+                    "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+                }))
+                .expect("loader tool"),
+                lookup_tool(),
+            ]),
+        )
+    }
+
+    async fn capture(model: &Model, context: &Context) -> Value {
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let slot = payload.clone();
+        let options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    on_payload: Some(Arc::new(move |value, _model| {
+                        let slot = slot.clone();
+                        Box::pin(async move {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                            None
+                        })
+                    })),
+                    ..Default::default()
+                },
+                cache_retention: Some(CacheRetention::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let event_stream = stream(model, context, options);
+        let _ = event_stream
+            .result()
+            .await
+            .expect("error message from unreachable endpoint");
+        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        captured
+    }
+
+    /// "serializes discovery and replay" — payload assertions for each
+    /// accepted loader name (ToolSearch / tool_search / discover_tools).
+    #[tokio::test]
+    async fn serializes_discovery_and_replay_for_fireworks_messages_models() {
+        for loader_name in ["ToolSearch", "tool_search", "discover_tools"] {
+            let model = fireworks_catalog_model();
+            let context = discovery_context(loader_name);
+            let payload = capture(&model, &context).await;
+
+            // Tools: the loader stays immediate; lookup is deferred.
+            assert_eq!(
+                payload["tools"],
+                json!([
+                    {
+                        "name": loader_name,
+                        "description": "Find tools",
+                        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+                    },
+                    {
+                        "name": "lookup",
+                        "description": "Look up a synthetic key",
+                        "input_schema": {"type": "object", "properties": {"key": {"type": "string"}}, "required": ["key"]},
+                        "defer_loading": true
+                    }
+                ]),
+                "loader {loader_name}"
+            );
+
+            // Unsigned thinking replays with `signature: ""` (allowEmptySignature).
+            assert_eq!(
+                payload["messages"][1]["content"][0],
+                json!({"type": "thinking", "thinking": "Find a lookup tool.", "signature": ""}),
+                "loader {loader_name}"
+            );
+
+            // Discovery result: tool_reference block plus displaced text.
+            assert_eq!(
+                payload["messages"][2]["content"],
+                json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "search1",
+                        "content": [{"type": "tool_reference", "tool_name": "lookup"}],
+                        "is_error": false
+                    },
+                    {"type": "text", "text": "Found lookup."}
+                ]),
+                "loader {loader_name}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod vercel_unsigned_thinking_tests {
+    //! Port of `packages/ai/test/anthropic-empty-thinking-signature-compat.test.ts`
+    //! "allows empty thinking signatures for every Vercel AI Gateway model"
+    //! (#9676, 3955b27a1) — adapter-level replay behavior. The Vercel catalog
+    //! `compat.allowEmptySignature: true` data lands with the V15-03 regen;
+    //! this asserts the replay semantics with an explicit compat overlay.
+    use std::sync::{Arc, Mutex};
+
+    use serde_json::{json, Value};
+
+    use super::tests::{assistant_message, context, make_model, user_text};
+    use super::*;
+    use crate::types::AssistantContent;
+
+    async fn capture(model: &Model) -> Value {
+        let payload = Arc::new(Mutex::new(Value::Null));
+        let slot = payload.clone();
+        let assistant = assistant_message(
+            vec![AssistantContent::Thinking(crate::types::ThinkingContent {
+                thinking: "internal reasoning".to_owned(),
+                thinking_signature: Some("".to_owned()),
+                redacted: None,
+            })],
+            &model.provider,
+            &model.id,
+        );
+        let options = AnthropicOptions {
+            stream: crate::types::StreamOptions {
+                request: crate::types::ProviderRequestOptions {
+                    api_key: Some("test-key".to_owned()),
+                    on_payload: Some(Arc::new(move |value, _model| {
+                        let slot = slot.clone();
+                        Box::pin(async move {
+                            *slot.lock().unwrap_or_else(|e| e.into_inner()) = value;
+                            None
+                        })
+                    })),
+                    ..Default::default()
+                },
+                cache_retention: Some(CacheRetention::None),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let context = context(vec![user_text("hi"), assistant, user_text("again")], None);
+        let event_stream = stream(model, &context, options);
+        let _ = event_stream
+            .result()
+            .await
+            .expect("error message from unreachable endpoint");
+        let captured = payload.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        captured
+    }
+
+    /// #9676: Vercel AI Gateway emits unsigned thinking for translated
+    /// models; with `allowEmptySignature` the empty signature survives replay
+    /// (instead of converting thinking to a text block).
+    #[tokio::test]
+    async fn replays_empty_signature_thinking_for_vercel_gateway_models() {
+        let model = make_model(json!({
+            "id": "anthropic/claude-sonnet-4.6",
+            "provider": "vercel-ai-gateway",
+            "baseUrl": "http://127.0.0.1:9",
+            "compat": {"allowEmptySignature": true}
+        }));
+        let payload = capture(&model).await;
+        assert_eq!(
+            payload["messages"][1]["content"],
+            json!([{"type": "thinking", "thinking": "internal reasoning", "signature": ""}])
+        );
+
+        // Without the compat flag the unsigned thinking is NOT replayed as a
+        // thinking block (converted to text upstream semantics).
+        let model = make_model(json!({
+            "id": "anthropic/claude-sonnet-4.6",
+            "provider": "vercel-ai-gateway",
+            "baseUrl": "http://127.0.0.1:9"
+        }));
+        let payload = capture(&model).await;
+        let block_type = payload["messages"][1]["content"][0]["type"].as_str();
+        assert_ne!(
+            block_type,
+            Some("thinking"),
+            "unsigned thinking must not replay as thinking without compat"
+        );
     }
 }

@@ -132,6 +132,9 @@ fn test_detect_compat_openrouter_hits() {
     expected.supports_developer_role = false;
     expected.thinking_format = ThinkingFormat::Openrouter;
     expected.session_affinity_format = SessionAffinityFormat::Openrouter;
+    // #9102 (bbb61e34a): OpenRouter derives session affinity headers by
+    // default (`x-session-id`); explicit compat can opt out.
+    expected.send_session_affinity_headers = true;
 
     // Generic OpenRouter model: no developer role.
     let model = make_model("openrouter", "https://openrouter.ai/api/v1", "meta-llama/x");
@@ -215,10 +218,12 @@ fn test_detect_compat_nvidia_ant_ling_hits() {
 
 #[test]
 fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
-    // Cerebras: only store/developer role flip.
+    // Cerebras: store/developer role flip; #9804 (af7359b90): mixed
+    // strict/unstrict tool usage 400s, so strict mode is never declared.
     let mut cerebras = standard();
     cerebras.supports_store = false;
     cerebras.supports_developer_role = false;
+    cerebras.supports_strict_mode = false;
     let model = make_model("cerebras", "https://api.cerebras.ai/v1", "llama-4");
     assert_eq!(detect_compat(&model), cerebras);
     let model = make_model("custom", "https://api.cerebras.ai/v1", "llama-4");
@@ -227,6 +232,7 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     // xAI (Grok): additionally no reasoning effort.
     let mut xai = cerebras.clone();
     xai.supports_reasoning_effort = false;
+    xai.supports_strict_mode = true;
     let model = make_model("xai", "https://api.x.ai/v1", "grok-4");
     assert_eq!(detect_compat(&model), xai);
     let model = make_model("custom", "https://api.x.ai/v1", "grok-4");
@@ -235,6 +241,7 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     // Chutes (baseUrl-only hit): max_tokens instead of max_completion_tokens.
     let mut chutes = cerebras.clone();
     chutes.max_tokens_field = MaxTokensField::MaxTokens;
+    chutes.supports_strict_mode = true;
     let model = make_model("custom", "https://llm.chutes.ai/v1", "deepseek-x");
     assert_eq!(detect_compat(&model), chutes);
 
@@ -242,6 +249,7 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     let mut deepseek = cerebras.clone();
     deepseek.thinking_format = ThinkingFormat::Deepseek;
     deepseek.requires_reasoning_content_on_assistant_messages = true;
+    deepseek.supports_strict_mode = true;
     // c185d4123: DeepSeek APIs take `max_tokens` (T20 Wave C; was
     // MaxCompletionTokens).
     deepseek.max_tokens_field = MaxTokensField::MaxTokens;
@@ -251,11 +259,51 @@ fn test_detect_compat_cerebras_xai_chutes_deepseek_opencode_hits() {
     assert_eq!(detect_compat(&model), deepseek);
 
     // opencode provider id, and opencode-go via its opencode.ai baseUrl.
-    let opencode = cerebras;
+    let mut opencode = cerebras.clone();
+    opencode.supports_strict_mode = true;
     let model = make_model("opencode", "https://opencode.ai/zen/v1", "grok-build-0.1");
     assert_eq!(detect_compat(&model), opencode);
     let model = make_model("opencode-go", "https://opencode.ai/go/v1", "glm-5.2");
     assert_eq!(detect_compat(&model), opencode);
+}
+
+/// #9102 (bbb61e34a): explicit `sendSessionAffinityHeaders: false` opts out
+/// of the OpenRouter default (upstream
+/// `openai-completions-prompt-cache.test.ts` "allows OpenRouter session
+/// headers to be disabled").
+#[test]
+fn test_detect_compat_openrouter_session_affinity_opt_out() {
+    let model = serde_json::from_value(json!({
+        "id": "meta/llama", "name": "m", "api": "openai-completions", "provider": "openrouter",
+        "baseUrl": "https://openrouter.ai/api/v1", "reasoning": false, "input": ["text"],
+        "cost": {"input": 1.0, "output": 1.0, "cacheRead": 0.1, "cacheWrite": 1.0},
+        "contextWindow": 1000, "maxTokens": 100,
+        "compat": {"sendSessionAffinityHeaders": false}
+    }))
+    .expect("model");
+    let compat = get_compat(&model);
+    assert!(!compat.send_session_affinity_headers);
+    assert_eq!(
+        compat.session_affinity_format,
+        SessionAffinityFormat::Openrouter
+    );
+}
+
+/// #9804 (af7359b90, FR-J): the strict-mode exclusion also holds when
+/// Cerebras is reached via a `cerebras.ai` baseUrl on a custom provider id
+/// (upstream `cache-retention.test.ts` #9804 regression ports live in
+/// `openai_completions.rs` inline tests — payload-level assertions).
+#[test]
+fn test_detect_compat_cerebras_strict_mode_exclusion() {
+    for (provider, base_url) in [
+        ("cerebras", "https://example.com/v1"),
+        ("custom", "https://api.cerebras.ai/v1"),
+    ] {
+        let model = make_model(provider, base_url, "gpt-oss-120b");
+        let compat = detect_compat(&model);
+        assert!(!compat.supports_strict_mode, "{provider}/{base_url}");
+        assert!(!compat.supports_store);
+    }
 }
 
 // ---------------------------------------------------------------------------

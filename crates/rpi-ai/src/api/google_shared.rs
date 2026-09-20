@@ -55,20 +55,18 @@ impl GoogleThinkingLevel {
     }
 }
 
-/// `resolveGoogleThinkingLevel` (google-shared.ts:31-48 @ 9841914,
-/// af2c35223/#8135): resolve a supported pi level or a model-specific
-/// Google mapping to a standard level. `off` resolves to `high`; a
+/// `resolveGoogleThinkingLevel` (#9455, 16235fd93): resolve a supported pi
+/// level or a model-specific Google mapping to a standard level. A
 /// `thinkingLevelMap` string entry wins (lowercased); the result must be
-/// one of minimal/low/medium/high — anything else (including xhigh/max
-/// without a mapping) is an error.
+/// one of minimal/low/medium/high — anything else (including `off` or
+/// xhigh/max without a mapping) is an error. (`off` no longer resolves to
+/// `high`: callers disable thinking or clamp to a supported level before
+/// resolving.)
 pub fn resolve_google_thinking_level(
     model: &crate::types::Model,
     level: crate::types::ModelThinkingLevel,
 ) -> Result<crate::types::ThinkingLevel, String> {
-    use crate::types::{ModelThinkingLevel, ThinkingLevel};
-    if level == ModelThinkingLevel::Off {
-        return Ok(ThinkingLevel::High);
-    }
+    use crate::types::ThinkingLevel;
     let mapped = model
         .thinking_level_map
         .as_ref()
@@ -95,6 +93,86 @@ pub fn resolve_google_thinking_level(
                 None => "undefined".to_owned(),
             }
         )),
+    }
+}
+
+/// `usesGoogleThinkingLevel` (#9455): whether this model uses Gemini's
+/// discrete `thinkingLevel` control instead of the token-based
+/// `thinkingBudget` control. Supported levels come from the model's
+/// `thinkingLevelMap`; this only selects the Google wire format.
+pub fn uses_google_thinking_level(model: &crate::types::Model) -> bool {
+    let id = model.id.to_lowercase();
+    // Unanchored `/gemini-3(?:\.\d+)?-(?:pro|flash)/` plus the -latest
+    // flash aliases and both hosted Gemma 4 naming forms (gemma-4-* /
+    // gemma4-*). Expressed as an exact string scan (no regex on this path).
+    if gemini_3_level_pattern_matches(&id) {
+        return true;
+    }
+    id == "gemini-flash-latest"
+        || id == "gemini-flash-lite-latest"
+        || id.contains("gemma-4")
+        || id.contains("gemma4")
+}
+
+/// Substring scan for `gemini-3` + optional `.digits` + `-pro`/`-flash`
+/// (the `gemini-3(?:\.\d+)?-(?:pro|flash)` pattern is unanchored upstream).
+fn gemini_3_level_pattern_matches(id: &str) -> bool {
+    const PREFIX: &str = "gemini-3";
+    let mut from = 0;
+    while let Some(offset) = id[from..].find(PREFIX) {
+        let mut rest = &id[from + offset + PREFIX.len()..];
+        if let Some(after_dot) = rest.strip_prefix('.') {
+            let digits = after_dot.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits > 0 {
+                rest = &after_dot[digits..];
+            }
+        }
+        if rest.starts_with("-pro") || rest.starts_with("-flash") {
+            return true;
+        }
+        from += offset + 1;
+    }
+    false
+}
+
+/// `toGoogleThinkingLevel` (#9455): 1:1 enum map (the per-family collapse
+/// tables — gemini-3-pro LOW/HIGH etc. — are gone; family capability comes
+/// from the map metadata now).
+pub fn to_google_thinking_level(level: crate::types::ThinkingLevel) -> GoogleThinkingLevel {
+    use crate::types::ThinkingLevel;
+    match level {
+        ThinkingLevel::Minimal => GoogleThinkingLevel::Minimal,
+        ThinkingLevel::Low => GoogleThinkingLevel::Low,
+        ThinkingLevel::Medium => GoogleThinkingLevel::Medium,
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
+            GoogleThinkingLevel::High
+        }
+    }
+}
+
+/// `getDisabledGoogleThinkingConfig` (#9455): disabling thinking uses the
+/// model's own supported levels — a model that cannot fully turn thinking
+/// off falls back to its lowest supported discrete level (without
+/// `includeThoughts`, so hidden thinking stays invisible); everything else
+/// disables via `thinkingBudget: 0`.
+pub fn get_disabled_google_thinking_config(model: &crate::types::Model) -> serde_json::Value {
+    use crate::types::ModelThinkingLevel;
+    if !uses_google_thinking_level(model) {
+        return serde_json::json!({"thinkingBudget": 0});
+    }
+    let fallback = crate::models::clamp_thinking_level(model, ModelThinkingLevel::Off);
+    if fallback == ModelThinkingLevel::Off {
+        return serde_json::json!({"thinkingBudget": 0});
+    }
+    match resolve_google_thinking_level(model, fallback) {
+        Ok(resolved) => {
+            serde_json::json!({"thinkingLevel": to_google_thinking_level(resolved).as_str()})
+        }
+        // Upstream would throw out of getDisabledThinkingConfig; the rpi
+        // adapters return `Err` from param building, so a broken map surfaces
+        // there. A disabled config with an unresolvable fallback keeps the
+        // budget-based disable (safe for Gemini 2.x shape models).
+        Err(_) => serde_json::json!({"thinkingBudget": 0}),
     }
 }
 
@@ -637,18 +715,31 @@ mod tests {
         serde_json::from_value(value).expect("model")
     }
 
-    /// `resolveGoogleThinkingLevel` (af2c35223/#8135): `off` resolves to
-    /// `high`; `thinkingLevelMap` string entries win (lowercased); results
+    /// `resolveGoogleThinkingLevel` (#9455, 16235fd93): direct levels pass
+    /// through; `thinkingLevelMap` string entries win (lowercased); results
     /// must be one of minimal/low/medium/high — anything else is an error
-    /// with the `provider/model: level -> mapped` shape.
+    /// with the `provider/model: level -> mapped` shape. (`off` no longer
+    /// resolves to `high` — callers disable or clamp before resolving;
+    /// G2: old expectation `Ok(High)`.)
     #[test]
     fn resolve_google_thinking_level_off_map_and_errors() {
         use crate::types::{ModelThinkingLevel as M, ThinkingLevel as T};
 
         let plain = map_model(serde_json::json!({}));
-        // off → high (af2c35223 tightened this from "silently high" to the
-        // same explicit rule).
-        assert_eq!(resolve_google_thinking_level(&plain, M::Off), Ok(T::High));
+        // #9455: off without a mapping is an error (callers never pass it
+        // after the stream_simple early return / disabled-config clamp).
+        assert_eq!(
+            resolve_google_thinking_level(&plain, M::Off),
+            Err("Unsupported Google thinking level mapping for google/gemini-3-pro: off -> undefined".to_owned())
+        );
+        // A mapped off entry still resolves through the map.
+        let mapped_off = map_model(serde_json::json!({
+            "thinkingLevelMap": {"off": "low"}
+        }));
+        assert_eq!(
+            resolve_google_thinking_level(&mapped_off, M::Off),
+            Ok(T::Low)
+        );
         // Direct levels pass through.
         assert_eq!(
             resolve_google_thinking_level(&plain, M::Medium),
@@ -715,5 +806,99 @@ mod tests {
         assert!(requires_tool_call_id("gemini-live-3-001"));
         assert!(!requires_tool_call_id("gemini-live-2-001"));
         assert!(!requires_tool_call_id("gemini-2.5-pro"));
+    }
+
+    /// #9455 (16235fd93): `usesGoogleThinkingLevel` — discrete
+    /// `thinkingLevel` control for Gemini 3 Pro/Flash (with or without minor
+    /// versions), the -latest flash aliases, and hosted Gemma 4.
+    #[test]
+    fn uses_google_thinking_level_matches_discrete_level_families() {
+        let model_with_id = |id: &str| {
+            let mut model = map_model(serde_json::json!({}));
+            model.id = id.to_owned();
+            model
+        };
+        for id in [
+            "gemini-3-pro",
+            "gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3-flash-preview",
+            "gemini-3.8-flash",
+            "gemini-flash-latest",
+            "gemini-flash-lite-latest",
+            "gemma-4-27b",
+            "gemma4-31b",
+            "prefix-gemini-3.1-pro-preview",
+        ] {
+            assert!(uses_google_thinking_level(&model_with_id(id)), "{id}");
+        }
+        for id in [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-3-tts",    // not pro/flash
+            "gemini-30-pro-x", // gemini-3 followed by digits (not .digits)
+            "gemma-3-12b",
+            "claude-sonnet-4.6",
+        ] {
+            assert!(!uses_google_thinking_level(&model_with_id(id)), "{id}");
+        }
+    }
+
+    /// #9455: `getDisabledGoogleThinkingConfig` — disabling uses each model's
+    /// own supported levels (lowest supported discrete level for
+    /// level-controlled models that cannot turn thinking off; budget 0
+    /// otherwise), never a family-hardcoded MINIMAL/LOW.
+    #[test]
+    fn disabled_google_thinking_config_uses_supported_levels() {
+        // Level-controlled model without off: lowest supported level wins
+        // (upstream "uses the lowest supported level when reasoning is
+        // omitted" — gemini-3.8-flash with low/medium/high).
+        let model = map_model(serde_json::json!({
+            "id": "gemini-3.8-flash",
+            "thinkingLevelMap": {"off": null, "minimal": null, "low": "low", "medium": "medium", "high": "high", "xhigh": null, "max": null}
+        }));
+        assert_eq!(
+            get_disabled_google_thinking_config(&model),
+            serde_json::json!({"thinkingLevel": "LOW"})
+        );
+
+        // Level-controlled model with off support: full disable via budget.
+        let model = map_model(serde_json::json!({
+            "id": "gemini-3.8-flash",
+            "thinkingLevelMap": {"off": "none", "low": "low", "high": "high"}
+        }));
+        assert_eq!(
+            get_disabled_google_thinking_config(&model),
+            serde_json::json!({"thinkingBudget": 0})
+        );
+
+        // Gemini 2.x: budget-based disable.
+        let model = map_model(serde_json::json!({"id": "gemini-2.5-flash"}));
+        assert_eq!(
+            get_disabled_google_thinking_config(&model),
+            serde_json::json!({"thinkingBudget": 0})
+        );
+    }
+
+    /// #9455: `toGoogleThinkingLevel` — 1:1 map (no per-family collapse).
+    #[test]
+    fn to_google_thinking_level_is_one_to_one() {
+        use crate::types::ThinkingLevel as T;
+        assert_eq!(
+            to_google_thinking_level(T::Minimal),
+            GoogleThinkingLevel::Minimal
+        );
+        assert_eq!(to_google_thinking_level(T::Low), GoogleThinkingLevel::Low);
+        assert_eq!(
+            to_google_thinking_level(T::Medium),
+            GoogleThinkingLevel::Medium
+        );
+        assert_eq!(to_google_thinking_level(T::High), GoogleThinkingLevel::High);
+        // xhigh/max fall to high (ResolvedGoogleThinkingLevel excludes them).
+        assert_eq!(
+            to_google_thinking_level(T::Xhigh),
+            GoogleThinkingLevel::High
+        );
+        assert_eq!(to_google_thinking_level(T::Max), GoogleThinkingLevel::High);
     }
 }
