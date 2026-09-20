@@ -4344,11 +4344,16 @@ mod header_semantics_tests {
 
 #[cfg(test)]
 mod fireworks_deferred_tools_tests {
-    //! Port of `packages/ai/test/fireworks-deferred-tools.test.ts` @ 19451accd
-    //! (d92eb8d4b + 6b94ae2ec, #9323) — discovery/replay serialization for
-    //! Fireworks Messages models, asserted via the on_payload capture seam
-    //! (upstream captures the SDK payload; rpi captures at the same point and
-    //! lets the unreachable `http://127.0.0.1:9` endpoint fail the request).
+    //! Port of `packages/ai/test/fireworks-deferred-tools.test.ts` as
+    //! introduced in-range by `d92eb8d4b` (with `6b94ae2ec`, #9323). At pin
+    //! HEAD the file and the `supportsToolReferences` compat face were
+    //! reworked away by `9e05370b2` (#9548, mid-conversation tool updates —
+    //! V15-06/R3.3 scope); the rpi port targets the d92eb8d4b state and the
+    //! 2026-09-14 catalog snapshot, which predate that rework —
+    //! discovery/replay serialization for Fireworks Messages models,
+    //! asserted via the on_payload capture seam (upstream captures the SDK
+    //! payload; rpi captures at the same point and lets the unreachable
+    //! `http://127.0.0.1:9` endpoint fail the request).
     use std::sync::{Arc, Mutex};
 
     use serde_json::{json, Value};
