@@ -10,8 +10,9 @@
 //! The Rust port originally mapped `StreamOptions::timeout_ms` to
 //! `reqwest::ClientBuilder::timeout`, which is a **total** deadline covering
 //! connect + headers + the entire streamed body. Any inference streaming
-//! longer than the configured budget (default `httpIdleTimeoutMs`, 5 min)
-//! was killed mid-stream even while actively receiving chunks. This module
+//! longer than the configured budget (the then-default 5-minute
+//! `httpIdleTimeoutMs`; unlimited by default since rpi#54 / D-103) was
+//! killed mid-stream even while actively receiving chunks. This module
 //! restores the upstream idle semantics:
 //!
 //! - **connect phase**: adapters set `ClientBuilder::connect_timeout` to the
