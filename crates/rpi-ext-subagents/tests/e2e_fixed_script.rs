@@ -1403,7 +1403,7 @@ fn e2e_fixed_child_full_pipeline() {
         );
         // Load-tolerant completion poll (pre-existing flake under full-
         // workspace parallel load, reproduced on a clean tree 2026-09-20 —
-        // V15-03 §7.4): `subagent_wait` can observe the terminal status
+        // V15-03 §7.7): `subagent_wait` can observe the terminal status
         // transition before the runner's sendMessage host call lands in the
         // message registry; same fix class as the login-harness sequencing
         // note in model_runtime.rs (sequence/budget instead of a single

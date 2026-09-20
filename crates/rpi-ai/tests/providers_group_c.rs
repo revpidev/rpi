@@ -228,10 +228,11 @@ fn zai_tool_stream_compat_is_baked_into_the_catalog() {
 }
 
 /// Upstream `providers.test.ts` "uses official Kimi K3 pricing for Moonshot
-/// providers"; the vendored catalog also carries `deferredToolsMode: "kimi"`
-/// on `kimi-k3` (correction baked in at generation time).
+/// providers"; the catalog carries the post-#9548 Kimi deferred-tools face
+/// (`supportsMidConvoSystemMessages` + `supportsMidConvoToolAdditions`,
+/// 9e05370b2 — `deferredToolsMode` left the catalog).
 #[test]
-fn moonshotai_kimi_k3_pricing_and_deferred_tools() {
+fn moonshotai_kimi_k3_pricing_and_mid_convo_compat() {
     for factory in [
         moonshotai::moonshotai_provider as fn() -> Arc<dyn Provider>,
         moonshotai_cn::moonshotai_cn_provider,

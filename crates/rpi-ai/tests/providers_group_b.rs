@@ -2,18 +2,18 @@
 //! `openrouter`, `vercel-ai-gateway`, `cloudflare-ai-gateway`,
 //! `cloudflare-workers-ai`, `opencode`, `opencode-go`, `radius`.
 //!
-//! Test intents ported from `packages/ai/test/providers.test.ts` @ pi 0.82.1
-//! (2efa728) where they cover these providers ("requires Cloudflare Workers
-//! AI account config and returns scoped env", "requires Cloudflare AI
-//! Gateway account and gateway config and returns scoped env headers",
-//! "builtinModels registers every builtin provider with models" — Radius is
-//! purely dynamic), plus `test/github-copilot-anthropic.test.ts` catalog
+//! Test intents ported from `packages/ai/test/providers.test.ts` @ pi
+//! 0.82.1+ (2efa728, updated through 19451accd) where they cover these
+//! providers ("requires Cloudflare Workers AI account config and returns
+//! scoped env", "requires Cloudflare AI Gateway account config and gateway
+//! config and returns scoped env headers", "builtinModels registers every
+//! builtin provider with models" — Radius ships the static public catalog
+//! since 4d38031fb), plus `test/github-copilot-anthropic.test.ts` catalog
 //! assertions (Copilot Claude thinking-level maps / static headers).
 //! `test/cloudflare-stream.test.ts` is ported as unit tests in
 //! `src/providers/cloudflare_stream.rs`. Per the group charter every factory
-//! gets: id/name/base-url, auth shape, catalog model count (empty only for
-//! the dynamic radius); mixed-API factories assert the dispatch-key set
-//! against the catalog.
+//! gets: id/name/base-url, auth shape, catalog model count; mixed-API
+//! factories assert the dispatch-key set against the catalog.
 
 use std::collections::HashMap;
 use std::sync::Arc;
