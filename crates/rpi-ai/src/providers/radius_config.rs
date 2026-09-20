@@ -136,7 +136,8 @@ pub fn get_radius_models_from_config(
 }
 
 /// `getRadiusModels` — models from the credential's cached gateway config;
-/// empty without one (Radius is purely dynamic until refreshed).
+/// empty without one (the dynamic overlay only — the static public catalog
+/// baseline lives in `providers::radius`, 4d38031fb).
 pub fn get_radius_models(provider_id: &str, credential: Option<&OAuthCredential>) -> Vec<Model> {
     match get_radius_credential_config(credential) {
         Some(config) => get_radius_models_from_config(provider_id, &config),
